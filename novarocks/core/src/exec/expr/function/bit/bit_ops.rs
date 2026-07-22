@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::largeint;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
@@ -22,6 +21,7 @@ use arrow::array::{
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
+use novarocks_types::largeint;
 use std::sync::Arc;
 
 fn to_i64_array(array: &ArrayRef, fn_name: &str, arg_idx: usize) -> Result<Int64Array, String> {

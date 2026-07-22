@@ -17,9 +17,9 @@
 
 use arrow::datatypes::{DataType, TimeUnit};
 
-use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
-use crate::common::largeint;
-use crate::types::PrimitiveType;
+use novarocks_types::PrimitiveType;
+use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use novarocks_types::largeint;
 
 pub(crate) fn arrow_type_from_native_primitive(primitive: PrimitiveType) -> Option<DataType> {
     let data_type = match primitive {

@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::largeint;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function};
 use arrow::datatypes::DataType;
+use novarocks_types::largeint;
 
 use crate::protocol::starrocks::decode::{DraftDependencyValue, StarRocksExternalDependencyDraft};
 use crate::thrift::exprs;
@@ -60,7 +60,7 @@ fn is_varchar_castable_scalar(data_type: &DataType) -> bool {
 /// VARBINARY carriers in NovaRocks. In particular, Iceberg-backed binary
 /// columns are materialized as `LargeBinary` by the Parquet read path, and the
 /// native type encoder maps `LargeUtf8` back to VARCHAR (see
-/// `src/types/native_proto.rs`). Matching only `Utf8 | Binary`
+/// `src/protocol/native/type_mapping.rs`). Matching only `Utf8 | Binary`
 /// here would reject those Iceberg-sourced arguments.
 fn is_varchar_or_binary_type(data_type: &DataType) -> bool {
     matches!(

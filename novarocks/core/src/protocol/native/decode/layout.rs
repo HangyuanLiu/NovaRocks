@@ -242,8 +242,8 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::proto::common;
-    use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
-    use crate::types::native_proto::{encode_field_type, encode_type};
+    use crate::protocol::native::type_mapping::{encode_field_type, encode_type};
+    use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

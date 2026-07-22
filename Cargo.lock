@@ -3215,6 +3215,7 @@ dependencies = [
  "mysql",
  "mysql_common 0.32.4",
  "novarocks-state-store",
+ "novarocks-types",
  "novarocks-version",
  "num-traits",
  "num_cpus",
@@ -3294,6 +3295,13 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-types"
+version = "0.1.0"
+dependencies = [
+ "arrow",
 ]
 
 [[package]]

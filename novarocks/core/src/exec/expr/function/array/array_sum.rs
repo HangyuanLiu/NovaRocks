@@ -288,16 +288,16 @@ pub fn eval_array_sum(
             Arc::new(out) as ArrayRef
         }
         arrow::datatypes::DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
-            let values = crate::common::largeint::as_fixed_size_binary_array(
+            let values = novarocks_types::largeint::as_fixed_size_binary_array(
                 values,
                 "array_sum LARGEINT values",
             )?;
             let sums = sum_i128_rows(list, values, chunk.len(), |a, idx| {
-                crate::common::largeint::value_at(a, idx)
+                novarocks_types::largeint::value_at(a, idx)
             })?;
-            crate::common::largeint::array_from_i128(&sums)?
+            novarocks_types::largeint::array_from_i128(&sums)?
         }
         other => return Err(format!("array_sum unsupported element type: {:?}", other)),
     };

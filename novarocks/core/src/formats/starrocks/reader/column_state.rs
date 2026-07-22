@@ -33,8 +33,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_buffer::i256;
 
-use crate::common::largeint;
 use crate::formats::starrocks::plan::StarRocksNativeReadPlan;
+use novarocks_types::largeint;
 
 use super::schema_map::{
     decimal_output_meta_from_arrow_type, expected_logical_type_from_schema_type,

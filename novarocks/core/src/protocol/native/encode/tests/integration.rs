@@ -21,9 +21,9 @@ use prost::Message;
 use super::super::plan;
 use super::{column_expr, int_expr};
 use crate::coordinator::prepare::scan::ScanExecutionBindings;
+use crate::protocol::native::type_mapping::decode_type;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::column_id::ColumnId;
-use crate::types::native_proto::decode_type;
 
 fn empty_scan_bindings() -> &'static ScanExecutionBindings {
     Box::leak(Box::new(ScanExecutionBindings::default()))

@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
-use crate::types::logical::{LogicalType, logical_type_of_field};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ChunkFieldSchema {
@@ -531,7 +531,7 @@ mod tests {
     use super::{ChunkSchema, ChunkSlotSchema};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
-    use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
+    use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     #[test]
     fn strict_rejects_duplicate_slot_id() {

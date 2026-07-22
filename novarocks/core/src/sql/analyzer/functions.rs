@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::common::largeint;
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-use crate::types::{canonical_agg_decimal_type, wider_type};
+use novarocks_types::largeint;
+use novarocks_types::{canonical_agg_decimal_type, wider_type};
 
 pub(super) fn is_window_only_function(name: &str) -> bool {
     matches!(
@@ -388,7 +388,7 @@ fn arrays_overlap_numeric_like(data_type: &DataType) -> bool {
             | DataType::Float64
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
-    ) || crate::common::largeint::is_largeint_data_type(data_type)
+    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
 fn arrays_overlap_varchar_castable_scalar(data_type: &DataType) -> bool {
@@ -471,7 +471,7 @@ fn arrays_overlap_signature_type(data_type: &DataType) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        dt if crate::common::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
+        dt if novarocks_types::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
         other => format!("{other:?}").to_lowercase(),
     }
 }
@@ -958,7 +958,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
         "xx_hash3_64" => DataType::Int64,
-        "xx_hash3_128" => DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+        "xx_hash3_128" => DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
         // Symmetric ciphers / hashes: aes_*/encode_* return BE-style VARCHAR
         // (raw bytes interpreted as latin-1); to_base64 wraps them in tests.
         "aes_encrypt" | "aes_decrypt" | "encode_sort_key" => DataType::Utf8,
@@ -982,7 +982,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "bit_shift_left"
         | "bit_shift_right"
         | "bit_shift_right_logical" => arg_types.first().cloned().unwrap_or(DataType::Int64),
-        "md5sum_numeric" => DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+        "md5sum_numeric" => {
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+        }
         "hll_hash"
         | "ds_hll_count_distinct_state"
         | "to_bitmap"
@@ -1237,7 +1239,7 @@ fn infer_array_sum_return_type(arg_types: &[DataType]) -> DataType {
         }
         Some(DataType::Decimal128(_precision, scale)) => DataType::Decimal128(38, scale),
         Some(DataType::FixedSizeBinary(width))
-            if width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             DataType::FixedSizeBinary(width)
         }

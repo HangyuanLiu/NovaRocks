@@ -255,7 +255,7 @@ fn cast_array_for_local_schema(
             crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
         }
         (_, DataType::FixedSizeBinary(width))
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
         }

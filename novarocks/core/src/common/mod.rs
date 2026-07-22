@@ -17,13 +17,11 @@
 pub mod app_config;
 pub mod config;
 pub mod datasketches;
-pub mod decimal;
 pub mod engine_error;
 pub mod engine_error_codes;
 pub mod failpoint;
 pub mod file_identity;
 pub mod ids;
-pub mod largeint;
 pub mod logging;
 pub mod memory_limit;
 pub mod min_max_predicate;

@@ -18,8 +18,8 @@ use arrow::array::{ArrayRef, Decimal256Array, FixedSizeBinaryArray};
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
-use crate::common::largeint;
 use crate::exec::node::aggregate::AggFunction;
+use novarocks_types::largeint;
 
 use super::super::*;
 use super::AggregateFunction;
@@ -63,7 +63,7 @@ fn sum_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
             // Canonical sum decimal output is Decimal128(38, scale) (P2 single
             // source of truth), matching the analyzer/codegen so the same slot
             // carries an identical descriptor fleet-wide.
-            let canonical = crate::types::canonical_agg_decimal_type("sum", data_type)
+            let canonical = novarocks_types::canonical_agg_decimal_type("sum", data_type)
                 .expect("sum decimal canonical type");
             Ok(AggSpec {
                 kind: AggKind::SumDecimal128,

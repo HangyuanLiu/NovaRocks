@@ -38,10 +38,10 @@ use arrow::datatypes::DataType;
 use hashbrown::HashSet;
 
 use crate::common::ids::SlotId;
-use crate::common::largeint;
 use crate::common::min_max_predicate::MinMaxPredicateValue;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
+use novarocks_types::largeint;
 
 #[derive(Clone, Debug)]
 /// Typed IN runtime filter storing exact candidate values for one expression.

@@ -19,11 +19,11 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use tracing::debug;
 
 use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use crate::thrift::exprs;
-use crate::thrift::types;
-use crate::types::arrow_thrift::{
+use crate::protocol::starrocks::type_mapping::{
     THRIFT_TIME_UNIT_NANOS, thrift_desc_to_arrow_type as arrow_type_from_desc,
 };
+use crate::thrift::exprs;
+use crate::thrift::types;
 
 /// Parse thrift min/max conjuncts into native pruning predicates.
 pub(crate) fn parse_min_max_conjuncts_with_column_resolver<F>(
@@ -349,8 +349,8 @@ fn primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitive
 }
 
 fn arrow_type_from_primitive(primitive: types::TPrimitiveType) -> Option<DataType> {
-    crate::types::arrow_thrift::thrift_desc_to_arrow_type(
-        &crate::types::arrow_thrift::thrift_type_desc_from_primitive(primitive),
+    crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type(
+        &crate::protocol::starrocks::type_mapping::thrift_type_desc_from_primitive(primitive),
     )
 }
 

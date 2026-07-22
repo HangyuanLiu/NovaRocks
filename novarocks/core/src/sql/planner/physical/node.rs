@@ -34,7 +34,7 @@ use crate::sql::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
     PhysicalPlanStats, TopNPhase,
 };
-use crate::types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
+use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -222,7 +222,7 @@ pub(crate) enum RedistributeMode {
 // ---------------------------------------------------------------------------
 //
 // Planner-typed adapters bridging a `PhysicalHashAggregateNode`'s calls/mode to
-// the canonical aggregate type contract in `crate::types::aggregate` (which stays
+// the canonical aggregate type contract in `novarocks_types::aggregate` (which stays
 // a pure, planner-free leaf). Consumed by the distributed planner's aggregate
 // output finalization (`sql::planner::distributed::output::finalize_hash_aggregate_wire`).
 

@@ -21,10 +21,10 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use sha2::{Digest, Sha256};
 
-use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::model::contract::{
     ComparatorDigest, NullOrder, OrderContract, OrderKeyContract, SortDirection,
 };
+use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 
 use super::artifact::encode_schema;
 use super::value_domain::ContributionSizeError;

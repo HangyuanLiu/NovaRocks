@@ -21,8 +21,6 @@ use std::sync::Arc;
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
-use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{
     TabletWriteContext, get_tablet_runtime, register_tablet_runtime, remove_tablet_runtime,
@@ -30,6 +28,8 @@ use crate::connector::starrocks::lake::context::{
 use crate::connector::starrocks::lake::storage_schema_wire::decode_tablet_schema_bytes;
 use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
+use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 
 use super::model::{
     StarRocksGlobalMeta, StarRocksIndexState, StarRocksPartitionState, StarRocksTableSnapshot,

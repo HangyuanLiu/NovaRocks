@@ -23,6 +23,7 @@ use crate::coordinator::prepare::runtime_filter_binding::{
     PreparedRuntimeFilterContract, RuntimeFilterBindingTable,
 };
 use crate::proto::plan;
+use crate::protocol::native::type_mapping::encode_type;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
     ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, OrderContract,
@@ -36,7 +37,6 @@ use crate::runtime_filter::port::ordered_bound::{
 use crate::runtime_filter::port::topk_summary::{
     RuntimeTopKSummaryContract, TopKSummaryContractDigest,
 };
-use crate::types::native_proto::encode_type;
 
 pub(super) fn encode_runtime_filter_binding_table(
     enclosing_fragment_id: crate::sql::planner::distributed::FragmentId,

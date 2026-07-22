@@ -425,7 +425,7 @@ fn iceberg_table_descriptor_from_thrift(
             let data_type = column
                 .type_desc
                 .as_ref()
-                .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
+                .and_then(crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type)
                 .ok_or_else(|| {
                     format!("iceberg column {} missing type_desc", column.column_name)
                 })?;
@@ -815,7 +815,7 @@ fn arrow_data_type_from_type_desc(
     type_desc: Option<&types::TTypeDesc>,
 ) -> Result<DataType, crate::common::engine_error::EngineError> {
     type_desc
-        .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
+        .and_then(crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type)
         .ok_or_else(|| descriptor_error(format!("{label} type_desc is missing")))
 }
 

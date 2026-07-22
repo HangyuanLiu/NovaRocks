@@ -21,13 +21,13 @@ use super::expr::encode_expr;
 use crate::coordinator::prepare::PreparedFragmentSet;
 use crate::coordinator::prepare::scan::ScanExecutionBindings;
 use crate::proto::{common, plan};
+use crate::protocol::native::type_mapping::encode_type;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
     FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentStreamKind, NodeExecutionColumn,
     NodeOutputCatalog, PlanFragment, WriteContractCatalog,
 };
-use crate::types::native_proto::encode_type;
 
 use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;

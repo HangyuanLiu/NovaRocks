@@ -1081,7 +1081,7 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
         SqlType::Int => Ok(DataType::Int32),
         SqlType::BigInt => Ok(DataType::Int64),
         SqlType::LargeInt => Ok(DataType::FixedSizeBinary(
-            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+            novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
         )),
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),

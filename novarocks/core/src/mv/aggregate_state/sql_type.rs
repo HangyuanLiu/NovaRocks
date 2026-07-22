@@ -35,7 +35,7 @@ pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlTyp
         DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
         DataType::Time64(_) => Ok(SqlType::Time),
         DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             Ok(SqlType::LargeInt)
         }
@@ -94,7 +94,7 @@ mod tests {
             (DataType::Int32, SqlType::Int),
             (DataType::Int64, SqlType::BigInt),
             (
-                DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+                DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
                 SqlType::LargeInt,
             ),
             (

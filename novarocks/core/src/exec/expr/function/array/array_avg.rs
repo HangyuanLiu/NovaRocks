@@ -235,9 +235,9 @@ pub fn eval_array_avg(
             Arc::new(out) as ArrayRef
         }
         arrow::datatypes::DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
-            let values = crate::common::largeint::as_fixed_size_binary_array(
+            let values = novarocks_types::largeint::as_fixed_size_binary_array(
                 values,
                 "array_avg LARGEINT values",
             )?;
@@ -246,7 +246,7 @@ pub fn eval_array_avg(
                 if values.is_null(idx) {
                     converted.push(None);
                 } else {
-                    let value = crate::common::largeint::value_at(values, idx)?;
+                    let value = novarocks_types::largeint::value_at(values, idx)?;
                     converted.push(Some(value as f64));
                 }
             }

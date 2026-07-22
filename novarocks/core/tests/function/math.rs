@@ -554,8 +554,8 @@ fn test_cbrt_specific_values() {
 // Tests from abs.rs
 // ---------------------------------------------------------------------------
 
-use novarocks::common::largeint;
 use novarocks::exec::expr::function::FunctionKind;
+use novarocks_types::largeint;
 
 fn create_test_chunk_int(values: Vec<i64>) -> novarocks::exec::chunk::Chunk {
     use arrow::array::{ArrayRef, Int64Array};

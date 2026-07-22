@@ -33,7 +33,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_buffer::OffsetBuffer;
 use std::sync::Arc;
 
-use crate::common::largeint;
+use novarocks_types::largeint;
 
 mod chunks_sorter_full_sort;
 mod chunks_sorter_heap_sort;

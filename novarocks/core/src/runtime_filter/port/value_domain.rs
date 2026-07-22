@@ -24,8 +24,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
 use sha2::{Digest, Sha256};
 
-use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
+use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 
 use super::identity::LogicalVersion;
 use super::support::RetainedMemoryReservation;
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn port_constructs_typed_empty_largeint_without_exposing_width_to_core() {
-        let data_type = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        let data_type = DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH);
         let values = MembershipValues::empty_for_data_type(&data_type).unwrap();
 
         assert_eq!(values.data_type(), data_type);

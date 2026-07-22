@@ -24,7 +24,7 @@ use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
-use crate::types::comparison_common_type;
+use novarocks_types::comparison_common_type;
 
 use super::super::layout::Layout;
 

@@ -28,7 +28,6 @@ use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 
 use arrow::datatypes::{DataType, Field, Fields, SchemaRef, TimeUnit};
 
-use crate::common::largeint;
 use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
 };
@@ -37,6 +36,7 @@ use crate::formats::starrocks::metadata::{
     StarRocksTabletSnapshot,
 };
 use crate::formats::starrocks::segment::{StarRocksSegmentColumnMeta, StarRocksSegmentFooter};
+use novarocks_types::largeint;
 
 const STARROCKS_TYPE_TINYINT: &str = "TINYINT";
 const STARROCKS_TYPE_SMALLINT: &str = "SMALLINT";

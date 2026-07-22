@@ -302,13 +302,13 @@ fn build_local_literal_array(
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
         DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let parsed = values
                 .iter()
                 .map(|literal| literal_to_i128_for_integer(literal, "LARGEINT"))
                 .collect::<Result<Vec<_>, _>>()?;
-            crate::common::largeint::array_from_i128(&parsed)
+            novarocks_types::largeint::array_from_i128(&parsed)
         }
         DataType::Float32 => Ok(Arc::new(Float32Array::from(
             values

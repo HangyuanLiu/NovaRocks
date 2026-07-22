@@ -163,7 +163,7 @@ fn hash_value_impl(
                 .hash(hasher);
         }
         DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let arr = values
                 .as_any()

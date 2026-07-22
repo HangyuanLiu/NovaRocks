@@ -18,8 +18,8 @@ use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
-use crate::common::largeint;
 use crate::exec::node::aggregate::AggFunction;
+use novarocks_types::largeint;
 
 use super::super::*;
 use super::AggregateFunction;
@@ -548,10 +548,10 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Int32Array};
     use arrow::datatypes::DataType;
 
-    use crate::common::largeint;
     use crate::exec::expr::ExprId;
     use crate::exec::expr::agg::{AggStateArena, build_kernel_set};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use novarocks_types::largeint;
 
     #[test]
     fn test_max_int32_aligns_with_signature_type() {

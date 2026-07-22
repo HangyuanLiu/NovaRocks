@@ -24,8 +24,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
 use sha2::{Digest, Sha256};
 
-use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
+use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 
 use super::identity::LogicalVersion;
 use super::ordered_bound::{

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::largeint;
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -23,6 +22,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+use novarocks_types::largeint;
 
 pub const UNIX_EPOCH_DAY_OFFSET: i32 = 719163; // 1970-01-01 in Julian days
 pub const BC_EPOCH_JULIAN: i32 = 1721060; // from StarRocks time_types.h

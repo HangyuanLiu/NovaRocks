@@ -25,7 +25,7 @@ mod scan;
 mod sink;
 mod submission;
 
-pub(crate) use crate::types::native_proto::{decode_field_type, decode_type};
+pub(crate) use crate::protocol::native::type_mapping::{decode_field_type, decode_type};
 pub(crate) use error::NativeFragmentDecodeError;
 #[allow(unused_imports)]
 pub(crate) use instance::{
@@ -55,7 +55,7 @@ mod tests {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::proto::{common, expr, plan};
-    use crate::types::native_proto::encode_type;
+    use crate::protocol::native::type_mapping::encode_type;
 
     fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
         common::OutputColumn {

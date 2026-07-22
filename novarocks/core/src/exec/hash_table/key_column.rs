@@ -27,9 +27,9 @@ use arrow::compute::{concat, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 
-use crate::common::largeint;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::agg::AggKernelEntry;
+use novarocks_types::largeint;
 
 use super::key_builder::{
     GroupKeyArrayView, encode_group_key_row, list_int32_row_value, list_utf8_row_value,

@@ -31,7 +31,7 @@ use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, 
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
-use crate::types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
+use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 pub(super) fn lower_hash_aggregate_node(
     node: &plan::DistributedNode,

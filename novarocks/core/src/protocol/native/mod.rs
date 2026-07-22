@@ -17,3 +17,4 @@
 
 pub(crate) mod decode;
 pub(crate) mod encode;
+pub(crate) mod type_mapping;

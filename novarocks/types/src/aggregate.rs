@@ -21,11 +21,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::common::largeint;
+use crate::largeint;
 
 /// Returns (output_type, intermediate_type) for aggregate functions.
 /// `None` as intermediate_type means the execution layer should use its default.
-pub(crate) fn infer_agg_function_types(
+pub fn infer_agg_function_types(
     name: &str,
     arg_types: &[DataType],
     _is_distinct: bool,
@@ -47,20 +47,16 @@ pub(crate) fn infer_agg_function_types(
                 DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
                     DataType::FixedSizeBinary(*width)
                 }
-                DataType::Decimal128(..) => {
-                    crate::types::canonical_agg_decimal_type("sum", &first_arg)
-                        .expect("sum decimal canonical type")
-                }
+                DataType::Decimal128(..) => crate::canonical_agg_decimal_type("sum", &first_arg)
+                    .expect("sum decimal canonical type"),
                 _ => DataType::Float64,
             };
             Ok((out.clone(), Some(out)))
         }
         "avg" => {
             let out = match &first_arg {
-                DataType::Decimal128(..) => {
-                    crate::types::canonical_agg_decimal_type("avg", &first_arg)
-                        .expect("avg decimal canonical type")
-                }
+                DataType::Decimal128(..) => crate::canonical_agg_decimal_type("avg", &first_arg)
+                    .expect("avg decimal canonical type"),
                 _ => DataType::Float64,
             };
             Ok((out, Some(DataType::Utf8)))
@@ -167,7 +163,7 @@ pub(crate) fn infer_agg_function_types(
                     DataType::FixedSizeBinary(*width)
                 }
                 DataType::Decimal128(..) => {
-                    crate::types::canonical_agg_decimal_type("multi_distinct_sum", &first_arg)
+                    crate::canonical_agg_decimal_type("multi_distinct_sum", &first_arg)
                         .expect("multi_distinct_sum decimal canonical type")
                 }
                 _ => DataType::Float64,
@@ -303,7 +299,7 @@ fn list_output_type(item_type: DataType) -> DataType {
 /// proto-typed decode path (`protocol::native::decode::node::aggregate`). It is pure
 /// (`&str` in, `String` out) so this module stays a protobuf-free, planner-free
 /// leaf next to [`infer_agg_function_types`].
-pub(crate) fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
+pub fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
     let name = name.to_ascii_lowercase();
     if !distinct {
         return name;
@@ -365,9 +361,8 @@ mod tests {
     #[test]
     fn infers_decimal_and_distinct_sum_contracts() {
         let input = DataType::Decimal128(20, 2);
-        let sum = crate::types::canonical_agg_decimal_type("sum", &input).unwrap();
-        let distinct =
-            crate::types::canonical_agg_decimal_type("multi_distinct_sum", &input).unwrap();
+        let sum = crate::canonical_agg_decimal_type("sum", &input).unwrap();
+        let distinct = crate::canonical_agg_decimal_type("multi_distinct_sum", &input).unwrap();
         assert_eq!(
             infer_agg_function_types("sum", &[input.clone()], false).unwrap(),
             (sum.clone(), Some(sum))

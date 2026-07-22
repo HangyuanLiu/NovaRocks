@@ -1454,7 +1454,7 @@ struct FinalizedAggregateWire {
 /// (`Single` / `Global`) emit the final result type. The planner-typed aggregate
 /// adapters ([`hash_aggregate_outputs_intermediate`] / [`aggregate_intermediate_type`]
 /// in `crate::sql::planner::physical`), which delegate to the canonical type
-/// contract in `crate::types::aggregate`, are reused; no inference is duplicated here.
+/// contract in `novarocks_types::aggregate`, are reused; no inference is duplicated here.
 ///
 /// The `output_columns` view prefers the aggregate's visible `output_columns`
 /// (a subset-by-id, possibly reordered, of the full layout) when non-empty,

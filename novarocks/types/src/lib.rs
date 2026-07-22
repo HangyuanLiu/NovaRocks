@@ -15,19 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
+pub mod aggregate;
+mod arithmetic;
+pub mod arrow_primitive;
+pub mod coercion;
+pub mod decimal;
+pub mod largeint;
+pub mod logical;
+mod predicate;
+pub mod primitive;
 
-pub(crate) fn is_largeint(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH
-    )
-}
-
-pub(crate) fn is_integer(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}
+pub use arithmetic::{
+    arithmetic_result_type, arithmetic_result_type_with_op, canonical_agg_decimal_type,
+    decimal_arithmetic_result_type,
+};
+pub use coercion::{comparison_common_type, wider_type};
+pub use primitive::PrimitiveType;

@@ -17,7 +17,7 @@
 // under the License.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum PrimitiveType {
+pub enum PrimitiveType {
     Invalid,
     Null,
     Boolean,
@@ -51,19 +51,19 @@ pub(crate) enum PrimitiveType {
 }
 
 impl PrimitiveType {
-    pub(crate) fn is_opaque_binary(self) -> bool {
+    pub fn is_opaque_binary(self) -> bool {
         matches!(self, Self::Hll | Self::Object | Self::Percentile)
     }
 
-    pub(crate) fn is_json(self) -> bool {
+    pub fn is_json(self) -> bool {
         matches!(self, Self::Json)
     }
 
-    pub(crate) fn is_largeint(self) -> bool {
+    pub fn is_largeint(self) -> bool {
         matches!(self, Self::LargeInt)
     }
 
-    pub(crate) fn is_time(self) -> bool {
+    pub fn is_time(self) -> bool {
         matches!(self, Self::Time)
     }
 }

@@ -19,13 +19,13 @@ use std::collections::{HashMap, HashSet};
 use arrow::datatypes::DataType;
 
 use crate::common::ids::SlotId;
-use crate::common::largeint;
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
 use crate::thrift::{descriptors, plan_nodes};
+use novarocks_types::largeint;
 
 pub(crate) fn lower_table_function_node(
     child: Lowered,

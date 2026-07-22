@@ -634,8 +634,8 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
-    use crate::types::logical::{LogicalType, field_with_logical_type};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     use super::*;
 

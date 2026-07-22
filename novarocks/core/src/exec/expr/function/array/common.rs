@@ -25,11 +25,11 @@ use arrow::datatypes::{DataType, TimeUnit};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::common::decimal::LEGACY_DECIMALV2_SCALE;
-use crate::common::largeint;
 use crate::exec::expr::function::date::common::{
     naive_to_date32, naive_to_timestamp_micros, parse_date, parse_datetime,
 };
+use novarocks_types::decimal::LEGACY_DECIMALV2_SCALE;
+use novarocks_types::largeint;
 
 pub(super) fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }

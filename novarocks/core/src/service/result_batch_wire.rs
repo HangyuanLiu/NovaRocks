@@ -24,8 +24,8 @@ use crate::common::util::{
     mysql_text_row_from_arrays_with_primitives,
 };
 use crate::exec::chunk::Chunk;
-use crate::types::PrimitiveType;
-use crate::types::arrow_primitive::arrow_field_to_primitive;
+use novarocks_types::PrimitiveType;
+use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResultSinkType {
@@ -354,8 +354,8 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::common::util::FieldRenderSchema;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
-    use crate::types::PrimitiveType;
-    use crate::types::logical::{LogicalType, field_with_logical_type};
+    use novarocks_types::PrimitiveType;
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     fn chunk_with_stale_field_schema(field: Field, column: ArrayRef) -> Result<Chunk, String> {
         let chunk_schema = Arc::new(ChunkSchema::try_new(vec![

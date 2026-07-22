@@ -1036,6 +1036,7 @@ mod tests {
     use super::*;
     use crate::proto::expr;
     use crate::protocol::common::error::ProtocolErrorKind;
+    use crate::protocol::native::type_mapping::encode_type;
     use crate::runtime_filter::model::contract::{
         NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
         TopKSummaryRequirement,
@@ -1045,7 +1046,6 @@ mod tests {
         COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
     };
     use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
-    use crate::types::native_proto::encode_type;
 
     fn expression(column_id: u32) -> expr::Expr {
         expr::Expr {

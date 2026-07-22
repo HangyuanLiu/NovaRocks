@@ -76,8 +76,8 @@ pub fn eval_array_max(
         picked.push(best.map(|idx| idx as u32));
     }
 
-    if crate::common::largeint::is_largeint_data_type(values.data_type()) {
-        let typed = crate::common::largeint::as_fixed_size_binary_array(&values, "array_max")?;
+    if novarocks_types::largeint::is_largeint_data_type(values.data_type()) {
+        let typed = novarocks_types::largeint::as_fixed_size_binary_array(&values, "array_max")?;
         let mut out_values = Vec::with_capacity(picked.len());
         for picked_idx in &picked {
             let Some(idx) = picked_idx else {
@@ -88,10 +88,10 @@ pub fn eval_array_max(
             if typed.is_null(idx) {
                 out_values.push(None);
             } else {
-                out_values.push(Some(crate::common::largeint::value_at(typed, idx)?));
+                out_values.push(Some(novarocks_types::largeint::value_at(typed, idx)?));
             }
         }
-        let out = crate::common::largeint::array_from_i128(&out_values)?;
+        let out = novarocks_types::largeint::array_from_i128(&out_values)?;
         return super::common::cast_output(out, arena.data_type(expr), "array_max");
     }
 

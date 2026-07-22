@@ -22,7 +22,7 @@ use arrow::record_batch::RecordBatch;
 
 use super::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::common::ids::SlotId;
-use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
+use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
 #[test]
 fn strict_rejects_duplicate_slot_id() {

@@ -269,7 +269,7 @@ impl AggregateFunction for MultiDistinctSumAgg {
             | DataType::Boolean => DataType::Int64,
             DataType::Float32 | DataType::Float64 => DataType::Float64,
             DataType::Decimal128(..) => {
-                crate::types::canonical_agg_decimal_type("multi_distinct_sum", data_type)
+                novarocks_types::canonical_agg_decimal_type("multi_distinct_sum", data_type)
                     .ok_or_else(|| {
                         format!(
                             "multi_distinct_sum unsupported decimal input type: {:?}",

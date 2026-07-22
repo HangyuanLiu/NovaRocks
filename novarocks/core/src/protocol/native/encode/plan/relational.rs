@@ -25,9 +25,9 @@ use super::type_mapping::{
 };
 use super::{NativePlanEncodeContext, encode_exprs};
 use crate::proto::plan;
+use crate::protocol::native::type_mapping::encode_type;
 use crate::sql::planner::payload::PlanRowCountAssertion;
 use crate::sql::planner::physical::PhysicalPlanKind;
-use crate::types::native_proto::encode_type;
 
 #[cfg(test)]
 pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static str] {

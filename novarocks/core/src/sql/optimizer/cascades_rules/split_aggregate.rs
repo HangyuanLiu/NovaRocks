@@ -26,7 +26,7 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
-use crate::types::aggregate::infer_agg_function_types;
+use novarocks_types::aggregate::infer_agg_function_types;
 
 pub(crate) struct SplitAggregateRule;
 

@@ -17,11 +17,11 @@
 
 use arrow::datatypes::DataType;
 
-use crate::types::predicate::{is_integer, is_largeint};
+use crate::predicate::{is_integer, is_largeint};
 
 /// Determine the result type for a Decimal binary arithmetic operation,
 /// taking the operator into account (multiply/divide need different scale rules).
-pub(crate) fn decimal_arithmetic_result_type(p1: u8, s1: i8, p2: u8, s2: i8, op: &str) -> DataType {
+pub fn decimal_arithmetic_result_type(p1: u8, s1: i8, p2: u8, s2: i8, op: &str) -> DataType {
     let (precision, scale) = match op {
         "mul" | "*" => {
             // multiply: scale = s1+s2, precision = p1+p2
@@ -63,7 +63,7 @@ pub(crate) fn decimal_arithmetic_result_type(p1: u8, s1: i8, p2: u8, s2: i8, op:
 /// canonicalize a decimal result, so callers keep their existing non-decimal
 /// arms. `Decimal256` is intentionally out of scope: the analyzer canonicalizes
 /// only `Decimal128`, and callers retain their own `Decimal256` arms.
-pub(crate) fn canonical_agg_decimal_type(agg_name: &str, input: &DataType) -> Option<DataType> {
+pub fn canonical_agg_decimal_type(agg_name: &str, input: &DataType) -> Option<DataType> {
     let scale = match input {
         DataType::Decimal128(_, s) => *s,
         _ => return None,
@@ -90,16 +90,12 @@ fn avg_decimal_scale(scale: i8) -> i8 {
 
 /// Determine the result type for binary arithmetic operations (default: add/sub rules).
 #[allow(dead_code)] // used by legacy ExprCompiler methods, keeping for type-system completeness
-pub(crate) fn arithmetic_result_type(left: &DataType, right: &DataType) -> DataType {
+pub fn arithmetic_result_type(left: &DataType, right: &DataType) -> DataType {
     arithmetic_result_type_with_op(left, right, "add")
 }
 
 /// Determine the result type for binary arithmetic operations with a specific operator.
-pub(crate) fn arithmetic_result_type_with_op(
-    left: &DataType,
-    right: &DataType,
-    op: &str,
-) -> DataType {
+pub fn arithmetic_result_type_with_op(left: &DataType, right: &DataType, op: &str) -> DataType {
     // StarRocks behavior: integer / integer → DOUBLE (not integer).
     let is_div = op == "div";
     let both_integral = is_integer(left) && is_integer(right);
@@ -107,8 +103,8 @@ pub(crate) fn arithmetic_result_type_with_op(
         return DataType::Float64;
     }
 
-    let left_largeint = crate::common::largeint::is_largeint_data_type(left);
-    let right_largeint = crate::common::largeint::is_largeint_data_type(right);
+    let left_largeint = crate::largeint::is_largeint_data_type(left);
+    let right_largeint = crate::largeint::is_largeint_data_type(right);
     let left_integral = left_largeint
         || matches!(
             left,
@@ -120,12 +116,12 @@ pub(crate) fn arithmetic_result_type_with_op(
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         );
     if (left_largeint || right_largeint) && left_integral && right_integral {
-        return DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        return DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH);
     }
 
     match (left, right) {
         (l, r) if (is_largeint(l) && is_integer(r)) || (is_integer(l) && is_largeint(r)) => {
-            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
+            DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH)
         }
         // Decimal + Decimal -> Decimal (op-specific precision/scale)
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
@@ -200,7 +196,7 @@ mod tests {
 
     #[test]
     fn largeint_plus_integer_returns_largeint() {
-        let largeint = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        let largeint = DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH);
         let result = arithmetic_result_type_with_op(&DataType::Int64, &largeint, "add");
         assert_eq!(result, largeint);
     }

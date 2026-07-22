@@ -73,11 +73,11 @@ pub(super) fn lower_literal_at(
         Value::LargeintValue(bytes) => {
             require_literal_type(
                 data_type,
-                crate::common::largeint::is_largeint_data_type(data_type),
+                novarocks_types::largeint::is_largeint_data_type(data_type),
                 "largeint_value",
                 "largeint literal",
             )?;
-            crate::common::largeint::i128_from_be_bytes(bytes)
+            novarocks_types::largeint::i128_from_be_bytes(bytes)
                 .map(LiteralValue::LargeInt)
                 .map_err(|error| {
                     literal_value_error(ProtocolErrorKind::InvalidValue, "largeint_value", error)
@@ -308,7 +308,7 @@ pub(super) fn push_zero_literal(
             precision: *precision,
             scale: *scale,
         },
-        dt if crate::common::largeint::is_largeint_data_type(dt) => LiteralValue::LargeInt(0),
+        dt if novarocks_types::largeint::is_largeint_data_type(dt) => LiteralValue::LargeInt(0),
         _ => {
             return Err(format!(
                 "NEGATE is not supported for data type {data_type:?}"

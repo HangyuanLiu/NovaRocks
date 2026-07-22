@@ -26,8 +26,10 @@ pub(crate) fn chunk_field_schema_from_type_desc(
 ) -> Result<ChunkFieldSchema, String> {
     let name = name.into();
     validate_type_desc_nodes(&desc, "field")?;
-    let field = crate::types::arrow_thrift::thrift_desc_to_arrow_field(&name, nullable, &desc)
-        .ok_or_else(|| "field type desc has unsupported arrow mapping".to_string())?;
+    let field = crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_field(
+        &name, nullable, &desc,
+    )
+    .ok_or_else(|| "field type desc has unsupported arrow mapping".to_string())?;
     ChunkFieldSchema::from_field(&field)
 }
 
@@ -40,13 +42,15 @@ pub(crate) fn chunk_slot_schema_from_type_desc(
 ) -> Result<ChunkSlotSchema, String> {
     let name = name.into();
     validate_type_desc_nodes(&desc, "slot")?;
-    let field = crate::types::arrow_thrift::thrift_desc_to_arrow_field(&name, nullable, &desc)
-        .ok_or_else(|| {
-            format!(
-                "chunk slot {} has unsupported type desc for arrow conversion",
-                slot_id
-            )
-        })?;
+    let field = crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_field(
+        &name, nullable, &desc,
+    )
+    .ok_or_else(|| {
+        format!(
+            "chunk slot {} has unsupported type desc for arrow conversion",
+            slot_id
+        )
+    })?;
     ChunkSlotSchema::try_new_with_field(slot_id, field, None, unique_id)
 }
 
