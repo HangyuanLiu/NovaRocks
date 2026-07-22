@@ -21,9 +21,9 @@ use std::sync::Arc;
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
-    ReductionRequirement, RuntimeFilterLogicalDomain,
+    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
 };
-use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ConsumerArtifactProfile};
 use crate::runtime_filter::port::identity::DeploymentEpoch;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::producer::{
@@ -205,7 +205,9 @@ impl NativeRuntimeFilterExecutionContext {
             subscription_kind: requested_kind,
             activation: consumer.activation(),
             capabilities: consumer.capabilities().clone(),
+            artifact_profile: consumer.artifact_profile().clone(),
             contract: installed_contract(channel.logical_domain())?,
+            lifecycle: channel.lifecycle(),
             reduction_requirement: channel.reduction_requirement(),
             topk_contract_digest: installed_topk_contract_digest(
                 channel.logical_domain(),
@@ -332,7 +334,9 @@ pub(crate) struct ResolvedNativeConsumer {
     subscription_kind: SubscriptionKind,
     activation: crate::runtime_filter::model::contract::ConsumerActivation,
     capabilities: BTreeSet<ArtifactCapability>,
+    artifact_profile: ConsumerArtifactProfile,
     contract: InstalledNativeRuntimeFilterContract,
+    lifecycle: RuntimeFilterLifecycle,
     reduction_requirement: ReductionRequirement,
     topk_contract_digest: Option<[u8; 32]>,
 }
@@ -360,8 +364,16 @@ impl ResolvedNativeConsumer {
         &self.capabilities
     }
 
+    pub(crate) const fn artifact_profile(&self) -> &ConsumerArtifactProfile {
+        &self.artifact_profile
+    }
+
     pub(crate) const fn contract(&self) -> &InstalledNativeRuntimeFilterContract {
         &self.contract
+    }
+
+    pub(crate) const fn lifecycle(&self) -> RuntimeFilterLifecycle {
+        self.lifecycle
     }
 
     pub(crate) const fn reduction_requirement(&self) -> ReductionRequirement {

@@ -34,6 +34,7 @@ use crate::common::config::{
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::scan::ScanNode;
+use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -65,7 +66,9 @@ pub struct ScanSourceFactory {
 }
 
 enum ScanSourceRuntimeFilterExecution {
-    Native,
+    Native {
+        consumers: NativeRuntimeFilterConsumerSet,
+    },
     #[cfg(feature = "compat")]
     Compat {
         runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
@@ -77,8 +80,29 @@ enum ScanSourceRuntimeFilterExecution {
 }
 
 impl ScanSourceFactory {
-    pub(crate) fn new_native(scan: ScanNode, arena: Arc<ExprArena>) -> Self {
-        Self::new_in_mode(scan, arena, ScanSourceRuntimeFilterExecution::Native)
+    pub(crate) fn new_native(scan: ScanNode, arena: Arc<ExprArena>) -> Result<Self, String> {
+        let consumers = NativeRuntimeFilterConsumerSet::from_plan(
+            scan.native_runtime_filter_specs(),
+            Arc::clone(&arena),
+        )?;
+        Ok(Self::new_in_mode(
+            scan,
+            arena,
+            ScanSourceRuntimeFilterExecution::Native { consumers },
+        ))
+    }
+
+    #[cfg(test)]
+    fn new_native_with_consumers_for_test(
+        scan: ScanNode,
+        arena: Arc<ExprArena>,
+        consumers: NativeRuntimeFilterConsumerSet,
+    ) -> Self {
+        Self::new_in_mode(
+            scan,
+            arena,
+            ScanSourceRuntimeFilterExecution::Native { consumers },
+        )
     }
 
     #[cfg(feature = "compat")]
@@ -183,7 +207,9 @@ impl OperatorFactory for ScanSourceFactory {
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
         let (runtime_filter_probe, local_rf_deps, runtime_filter_exprs, runtime_filters_expected) =
             match &self.runtime_filter_execution {
-                ScanSourceRuntimeFilterExecution::Native => (None, Vec::new(), HashMap::new(), 0),
+                ScanSourceRuntimeFilterExecution::Native { .. } => {
+                    (None, Vec::new(), HashMap::new(), 0)
+                }
                 #[cfg(feature = "compat")]
                 ScanSourceRuntimeFilterExecution::Compat {
                     runtime_filter_exprs,
@@ -229,6 +255,11 @@ impl OperatorFactory for ScanSourceFactory {
             runtime_filters_expected,
             runtime_filter_lifecycle_handles: HashMap::new(),
             arena: Arc::clone(&self.arena),
+            native_runtime_filter_consumers: match &self.runtime_filter_execution {
+                ScanSourceRuntimeFilterExecution::Native { consumers } => Some(consumers.clone()),
+                #[cfg(feature = "compat")]
+                ScanSourceRuntimeFilterExecution::Compat { .. } => None,
+            },
             profiles: None,
             async_state: ScanAsyncState::new(operator_buffer_chunks().max(1), label),
             async_runners: Arc::new(Mutex::new(Vec::new())),
@@ -261,6 +292,7 @@ struct ScanSourceOperator {
     runtime_filters_expected: usize,
     runtime_filter_lifecycle_handles: HashMap<i32, RfLifecycleHandle>,
     arena: Arc<ExprArena>,
+    native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     async_state: Arc<ScanAsyncState>,
     async_runners: Arc<Mutex<Vec<ScanAsyncRunner>>>,
@@ -514,6 +546,7 @@ impl ScanSourceOperator {
                 self.runtime_filter_probe.clone(),
                 self.runtime_filter_exprs.clone(),
                 self.runtime_filters_expected,
+                self.native_runtime_filter_consumers.clone(),
                 Arc::clone(&self.arena),
                 self.profiles.clone(),
                 self.driver_id,
@@ -629,6 +662,12 @@ impl ScanSourceOperator {
                 !guard.is_empty()
             };
             if !has_runner {
+                return;
+            }
+            if let Some(consumers) = self.native_runtime_filter_consumers.as_ref()
+                && let Err(error) = consumers.acquire_configured()
+            {
+                self.async_state.set_error(error);
                 return;
             }
             if !self.try_acquire_inflight(max_io_tasks) {
@@ -782,6 +821,15 @@ impl Operator for ScanSourceOperator {
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
         self.bind_runtime_filter_lifecycle(state);
+        if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
+            consumers.set_wait_timeout(
+                state
+                    .runtime_filter_scan_wait_timeout()
+                    .or_else(|| state.runtime_filter_wait_timeout())
+                    .unwrap_or(Duration::from_secs(1)),
+            );
+            consumers.bind(state)?;
+        }
         self.register_incremental_dispatch(state)
     }
 
@@ -913,8 +961,8 @@ mod tests {
     use std::sync::{Condvar, Mutex};
 
     use crate::runtime::runtime_state::RuntimeState;
-    use arrow::array::Int32Array;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Array, DictionaryArray, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
@@ -1137,6 +1185,50 @@ mod tests {
         }
     }
 
+    struct DictionaryScanOp;
+
+    impl ScanOp for DictionaryScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
+        ) -> Result<crate::exec::node::BoxedExecIter, String> {
+            let dictionary = Arc::new(
+                vec![Some("one"), Some("two"), Some("three"), Some("four")]
+                    .into_iter()
+                    .collect::<DictionaryArray<Int32Type>>(),
+            ) as arrow::array::ArrayRef;
+            let logical_schema = Schema::new(vec![Field::new("v", DataType::Utf8, true)]);
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                &logical_schema,
+                &[SlotId::new(1)],
+            )?;
+            let chunk = Chunk::try_new_with_columns(chunk_schema, vec![dictionary])?;
+            Ok(Box::new(std::iter::once(Ok(chunk))))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            Ok(ScanMorsels::new(
+                vec![ScanMorsel::FileRange {
+                    path: "dictionary:test".to_string(),
+                    file_len: 0,
+                    offset: 0,
+                    length: 0,
+                    scan_range_id: -1,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    included_positions: None,
+                    external_datacache: None,
+                    delete_files: Vec::new(),
+                    iceberg_file_pruning: None,
+                }],
+                false,
+            ))
+        }
+    }
+
     #[test]
     fn non_runtime_materialized_scan_keeps_plain_build_morsels() {
         let op = Arc::new(PlainScanOp::new());
@@ -1144,7 +1236,7 @@ mod tests {
             .with_node_id(11)
             .with_connector_io_tasks_per_scan_operator(Some(1));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
 
         let mut source = factory.create(1, 0);
         source.prepare().expect("prepare source");
@@ -1160,7 +1252,7 @@ mod tests {
         };
         let scan = ScanNode::new(Arc::new(op)).with_connector_io_tasks_per_scan_operator(Some(1));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
 
         let dop = 4;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)
@@ -1210,6 +1302,154 @@ mod tests {
     }
 
     #[test]
+    fn native_scan_source_applies_the_shared_membership_mask() {
+        let (consumers, arena) =
+            crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
+                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
+            );
+        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+            morsels: vec![vec![1, 2, 3, 4]],
+        }))
+        .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        let state = RuntimeState::default();
+        let mut source = factory.create(1, 0);
+        source.prepare().unwrap();
+        source.bind_runtime_state(&state).unwrap();
+
+        let start = Instant::now();
+        loop {
+            let processor = source.as_processor_mut().unwrap();
+            if let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+                let values = chunk.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert_eq!(values.values(), &[2, 4]);
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn native_scan_source_acquires_before_submitting_runner() {
+        let source_thread = std::thread::current().id();
+        let (consumers, arena, observer) =
+            crate::exec::operators::runtime_filter::tests_support::observed_published_consumer_set(
+                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
+            );
+        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+            morsels: vec![vec![1, 2, 3, 4]],
+        }))
+        .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        let state = RuntimeState::default();
+        let mut source = factory.create(1, 0);
+        source.prepare().unwrap();
+        source.bind_runtime_state(&state).unwrap();
+        assert_eq!(observer.calls(), 0, "bind must only subscribe");
+
+        let start = Instant::now();
+        loop {
+            if source
+                .as_processor_mut()
+                .unwrap()
+                .pull_chunk(&state)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(observer.calls(), 1);
+        assert_eq!(observer.thread(), Some(source_thread));
+    }
+
+    #[test]
+    fn native_scan_source_hydrates_dictionary_before_membership_apply() {
+        let (consumers, arena) =
+            crate::exec::operators::runtime_filter::tests_support::published_utf8_consumer_set(
+                crate::exec::operators::runtime_filter::tests_support::utf8_membership_bundle(&[
+                    "two", "four",
+                ]),
+            );
+        let scan = ScanNode::new(Arc::new(DictionaryScanOp))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        let state = RuntimeState::default();
+        let mut source = factory.create(1, 0);
+        source.prepare().unwrap();
+        source.bind_runtime_state(&state).unwrap();
+
+        let start = Instant::now();
+        loop {
+            if let Some(chunk) = source
+                .as_processor_mut()
+                .unwrap()
+                .pull_chunk(&state)
+                .unwrap()
+            {
+                assert_eq!(chunk.columns()[0].data_type(), &DataType::Utf8);
+                let values = chunk.columns()[0]
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(values.value(0), "two");
+                assert_eq!(values.value(1), "four");
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn native_scan_runtime_filter_runs_before_scan_limit_accounting() {
+        let (consumers, arena) =
+            crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
+                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[3, 4]),
+            );
+        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+            morsels: vec![vec![1, 2], vec![3, 4]],
+        }))
+        .with_limit(Some(2))
+        .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        let state = RuntimeState::default();
+        let mut source = factory.create(1, 0);
+        source.prepare().unwrap();
+        source.bind_runtime_state(&state).unwrap();
+
+        let start = Instant::now();
+        loop {
+            if let Some(chunk) = source
+                .as_processor_mut()
+                .unwrap()
+                .pull_chunk(&state)
+                .unwrap()
+            {
+                let values = chunk.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert_eq!(values.values(), &[3, 4]);
+                break;
+            }
+            assert!(
+                !source.is_finished(),
+                "scan limit fired before native filtering"
+            );
+            assert!(start.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn scan_produces_output_when_io_executor_is_saturated() {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1245,7 +1485,7 @@ mod tests {
         };
         let scan = ScanNode::new(Arc::new(op)).with_connector_io_tasks_per_scan_operator(Some(1));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
 
         let mut driver = factory.create(2, 0);
         driver.prepare().expect("prepare scan source");
@@ -1292,7 +1532,7 @@ mod tests {
             .with_limit(Some(25));
 
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
 
         let dop = 4;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)
@@ -1357,7 +1597,7 @@ mod tests {
             .with_limit(Some(25));
 
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
 
         let dop = 2;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)

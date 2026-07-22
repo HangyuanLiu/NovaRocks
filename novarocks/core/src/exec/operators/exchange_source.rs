@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
+use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -81,7 +82,9 @@ pub struct ExchangeSourceFactory {
 }
 
 enum ExchangeSourceRuntimeFilterExecution {
-    Native,
+    Native {
+        consumers: NativeRuntimeFilterConsumerSet,
+    },
     #[cfg(feature = "compat")]
     Compat {
         runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
@@ -103,10 +106,34 @@ impl ExchangeSourceFactory {
             node.expected_senders,
             node.expected_chunk_schema(),
         )?;
+        let consumers = NativeRuntimeFilterConsumerSet::from_plan(
+            node.native_runtime_filter_specs(),
+            Arc::clone(&arena),
+        )?;
         Ok(Self {
             name,
             node,
-            runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Native,
+            runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Native { consumers },
+            arena,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_native_with_consumers_for_test(
+        node: ExchangeSourceNode,
+        arena: Arc<ExprArena>,
+        consumers: NativeRuntimeFilterConsumerSet,
+    ) -> Result<Self, String> {
+        let name = node.profile_name();
+        exchange::register_expected_chunk_schema(
+            node.key,
+            node.expected_senders,
+            node.expected_chunk_schema(),
+        )?;
+        Ok(Self {
+            name,
+            node,
+            runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Native { consumers },
             arena,
         })
     }
@@ -186,7 +213,7 @@ impl OperatorFactory for ExchangeSourceFactory {
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
         let (runtime_filter_probe, local_rf_deps, runtime_filter_exprs, runtime_filters_expected) =
             match &self.runtime_filter_execution {
-                ExchangeSourceRuntimeFilterExecution::Native => {
+                ExchangeSourceRuntimeFilterExecution::Native { .. } => {
                     (None, Vec::new(), HashMap::new(), 0)
                 }
                 #[cfg(feature = "compat")]
@@ -235,6 +262,13 @@ impl OperatorFactory for ExchangeSourceFactory {
             acquired: None,
             runtime_filters_loaded: false,
             arena: Arc::clone(&self.arena),
+            native_runtime_filter_consumers: match &self.runtime_filter_execution {
+                ExchangeSourceRuntimeFilterExecution::Native { consumers } => {
+                    Some(consumers.clone())
+                }
+                #[cfg(feature = "compat")]
+                ExchangeSourceRuntimeFilterExecution::Compat { .. } => None,
+            },
             profiles: None,
             receiver_mem_tracker_ready: false,
         })
@@ -262,6 +296,7 @@ struct ExchangeSourceOperator {
     acquired: Option<AcquiredRuntimeFilters>,
     runtime_filters_loaded: bool,
     arena: Arc<ExprArena>,
+    native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     receiver_mem_tracker_ready: bool,
 }
@@ -390,6 +425,9 @@ impl Operator for ExchangeSourceOperator {
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
         self.bind_runtime_filter_lifecycle(state);
+        if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
+            consumers.bind(state)?;
+        }
         Ok(())
     }
 
@@ -501,6 +539,16 @@ impl ProcessorOperator for ExchangeSourceOperator {
             match out {
                 Some(exchange::ExchangePopResult::Chunk(chunk)) => {
                     let input_rows = chunk.len();
+                    let chunk =
+                        if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
+                            consumers.acquire_configured()?;
+                            let Some(chunk) = consumers.apply_chunk(chunk)? else {
+                                continue;
+                            };
+                            chunk
+                        } else {
+                            chunk
+                        };
                     if let Some(filtered) = self.apply_runtime_filters(chunk)? {
                         if filtered.is_empty() {
                             debug!(
@@ -909,6 +957,88 @@ mod tests {
     }
 
     #[test]
+    fn native_exchange_source_applies_the_shared_membership_mask() {
+        let (consumers, arena) =
+            crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
+                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
+            );
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 91_001,
+            finst_id_lo: 91_002,
+            node_id: 91_003,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let node = ExchangeSourceNode::new(
+            key,
+            1,
+            Duration::from_secs(2),
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .unwrap(),
+        );
+        let factory =
+            ExchangeSourceFactory::new_native_with_consumers_for_test(node, arena, consumers)
+                .unwrap();
+        let state = RuntimeState::default();
+        let mut source = factory.create(1, 0);
+        source.prepare().unwrap();
+        source.bind_runtime_state(&state).unwrap();
+        exchange::push_chunks(key, 0, 0, vec![int32_chunk(vec![1, 2, 3, 4])], true);
+
+        let output = source
+            .as_processor_mut()
+            .unwrap()
+            .pull_chunk(&state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(int32_values(&output), vec![2, 4]);
+        exchange::remove_fragment(key.finst_id_hi, key.finst_id_lo);
+    }
+
+    #[test]
+    fn native_exchange_source_continues_after_first_chunk_is_fully_filtered() {
+        let (consumers, arena) =
+            crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
+                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
+            );
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 91_011,
+            finst_id_lo: 91_012,
+            node_id: 91_013,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let node = ExchangeSourceNode::new(
+            key,
+            1,
+            Duration::from_secs(2),
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .unwrap(),
+        );
+        let factory =
+            ExchangeSourceFactory::new_native_with_consumers_for_test(node, arena, consumers)
+                .unwrap();
+        let state = RuntimeState::default();
+        let mut source = factory.create(1, 0);
+        source.prepare().unwrap();
+        source.bind_runtime_state(&state).unwrap();
+        exchange::push_chunks(
+            key,
+            0,
+            0,
+            vec![int32_chunk(vec![1, 3]), int32_chunk(vec![2, 4])],
+            true,
+        );
+
+        let output = source
+            .as_processor_mut()
+            .unwrap()
+            .pull_chunk(&state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(int32_values(&output), vec![2, 4]);
+        exchange::remove_fragment(key.finst_id_hi, key.finst_id_lo);
+    }
+
+    #[test]
     fn exchange_runtime_filters_use_frozen_snapshot_after_load() {
         let query_id = QueryId { hi: 30_004, lo: 7 };
         let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
@@ -963,6 +1093,7 @@ mod tests {
             acquired: None,
             runtime_filters_loaded: false,
             arena: Arc::new(arena),
+            native_runtime_filter_consumers: None,
             profiles: Some(crate::runtime::profile::OperatorProfiles::new(
                 crate::runtime::profile::RuntimeProfile::new("exchange"),
             )),
@@ -1074,6 +1205,7 @@ mod tests {
             acquired: None,
             runtime_filters_loaded: false,
             arena: Arc::new(arena),
+            native_runtime_filter_consumers: None,
             profiles: None,
             receiver_mem_tracker_ready: false,
         };
@@ -1160,6 +1292,7 @@ mod tests {
             acquired: None,
             runtime_filters_loaded: false,
             arena: Arc::new(arena),
+            native_runtime_filter_consumers: None,
             profiles: None,
             receiver_mem_tracker_ready: false,
         };

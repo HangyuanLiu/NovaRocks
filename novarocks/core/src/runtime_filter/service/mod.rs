@@ -90,7 +90,7 @@ use self::materialization::{
 };
 pub(crate) use self::native_execution::{
     InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
-    ResolvedNativeProducer,
+    ResolvedNativeConsumer, ResolvedNativeProducer,
 };
 use self::producer::{RemoteProducerAdapter, RemoteProducerState, ServiceProducerAdapter};
 use self::registry::{DeploymentRegistry, InstalledDeployment};
@@ -2939,7 +2939,7 @@ pub(super) mod test_support {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex, Weak, mpsc};
@@ -3498,6 +3498,46 @@ mod tests {
                     consumer_instances.into_iter().map(uid).collect(),
                 ),
             )]),
+        )
+    }
+
+    pub(crate) fn installed_join_loopback_service_for_exec_test() -> (
+        Arc<RuntimeFilterService>,
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    ) {
+        let query_id = uid(0);
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            query_id,
+            Arc::new(DynamicClock),
+            Arc::new(Events::default()),
+            MemTrackerMemoryAccount::new_root_for_test("native-join-loopback"),
+        ));
+        service
+            .install(inbound_loopback_install_for_test(deployment(
+                1,
+                10,
+                30,
+                40,
+                [10],
+                [30],
+                1_000,
+            )))
+            .expect("install native Join loopback deployment");
+        (
+            Arc::clone(&service),
+            crate::runtime_filter::service::NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(&service),
+                query_id,
+                DeploymentEpoch::new(9),
+                uid(10),
+            ),
+            crate::runtime_filter::service::NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(&service),
+                query_id,
+                DeploymentEpoch::new(9),
+                uid(30),
+            ),
         )
     }
 

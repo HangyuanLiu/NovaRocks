@@ -39,6 +39,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
 use crate::exec::operators::FilterEncodingPolicy;
+use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::exec::row_position::LakeRowPositionSpec;
@@ -135,6 +136,7 @@ pub(super) struct ScanAsyncRunner {
     acquired: Option<AcquiredRuntimeFilters>,
     runtime_filter_ctx: Option<Arc<RuntimeFilterContext>>,
     runtime_filters_loaded: bool,
+    native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
     conjunct_predicate: Option<ExprId>,
     conjunct_encoding_policy: Option<FilterEncodingPolicy>,
     arena: Arc<ExprArena>,
@@ -309,6 +311,7 @@ impl ScanAsyncRunner {
         runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
         runtime_filter_exprs: HashMap<i32, ExprId>,
         runtime_filters_expected: usize,
+        native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
         arena: Arc<ExprArena>,
         profiles: Option<crate::runtime::profile::OperatorProfiles>,
         driver_id: i32,
@@ -334,6 +337,7 @@ impl ScanAsyncRunner {
             acquired: None,
             runtime_filter_ctx: None,
             runtime_filters_loaded: false,
+            native_runtime_filter_consumers,
             arena,
             profiles,
             last_progress: Instant::now(),
@@ -616,6 +620,12 @@ impl ScanAsyncRunner {
                         self.append_iceberg_virtual_columns(chunk, kept_positions.as_deref())?;
                     let chunk = self.append_row_position_columns(chunk)?;
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
+                        continue;
+                    };
+                    let Some(chunk) = (match self.native_runtime_filter_consumers.as_ref() {
+                        Some(consumers) => consumers.apply_chunk(chunk)?,
+                        None => Some(chunk),
+                    }) else {
                         continue;
                     };
                     if let Some(filtered) = self.apply_runtime_filters(chunk)?
@@ -2240,6 +2250,7 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
             1,
+            None,
             arena,
             None,
             0,
@@ -2289,6 +2300,7 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
             1,
+            None,
             arena,
             None,
             0,
@@ -2450,6 +2462,7 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(probe)),
             runtime_filter_exprs,
             1,
+            None,
             arena,
             Some(profiles.clone()),
             0,
@@ -2735,6 +2748,7 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(probe)),
             HashMap::from([(7, expr)]),
             1,
+            None,
             arena,
             None,
             0,
@@ -2813,6 +2827,7 @@ mod tests {
             None,
             HashMap::from([(7, expr)]),
             1,
+            None,
             arena,
             None,
             0,
@@ -2905,6 +2920,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             Arc::clone(&arena),
             None,
             0,
@@ -2919,6 +2935,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             arena,
             None,
             1,
@@ -2981,6 +2998,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             arena,
             None,
             0,
@@ -3051,6 +3069,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             arena,
             None,
             0,
@@ -3099,6 +3118,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             arena,
             None,
             0,
