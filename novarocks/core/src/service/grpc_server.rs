@@ -201,20 +201,6 @@ impl GrpcService {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn full_execution_with_runtime_filter_handlers(
-        report_handler: Arc<dyn CoordinatorReportHandler>,
-        runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
-        runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
-    ) -> Self {
-        Self::with_handlers(
-            true,
-            report_handler,
-            runtime_filter_envelope_ingress,
-            runtime_filter_deployment_ingress,
-        )
-    }
-
     fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
         if self.allow_local_execution {
             Ok(())
@@ -1689,6 +1675,12 @@ mod pr3_tests {
     use crate::common::engine_error::EngineError;
     use crate::common::types::UniqueId;
     use crate::coordinator::ports::CoordinatorReportHandler;
+    use crate::protocol::native::{
+        RuntimeFilterQueryLifecycleOptions, encode_abort_runtime_filter_deployment,
+        encode_participant_install,
+    };
+    use crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install;
+    use crate::runtime::query_context::{QueryContextManager, QueryId};
     use crate::runtime_filter::port::transport::{
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
     };
@@ -1962,6 +1954,61 @@ mod pr3_tests {
             .expect_err("report-only endpoint must reject local envelope ingress");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn deployment_handlers_publish_installed_and_aborted_on_independent_manager() {
+        let manager = QueryContextManager::new_for_test();
+        let svc = GrpcService::full_execution_with_runtime_filter_manager(
+            Arc::new(CapturingReportHandler::accepting()),
+            manager.clone(),
+        );
+        let query = QueryId {
+            hi: 92_201,
+            lo: 92_202,
+        };
+        let install = participant_install();
+        let lifecycle = RuntimeFilterQueryLifecycleOptions {
+            delivery_expire: std::time::Duration::from_secs(11),
+            query_expire: std::time::Duration::from_secs(29),
+            transport_retry_interval: std::time::Duration::from_millis(200),
+            transport_max_attempts: 3,
+            transport_deadline: std::time::Duration::from_secs(5),
+            transport_max_pending_entries: 128,
+            transport_max_pending_bytes: 1024 * 1024,
+        };
+        let wire_query = UniqueId {
+            hi: query.hi,
+            lo: query.lo,
+        };
+
+        let install_response = svc
+            .install_runtime_filter_deployment(Request::new(
+                encode_participant_install(wire_query, lifecycle, &install)
+                    .expect("encode install"),
+            ))
+            .await
+            .expect("install handler")
+            .into_inner();
+        assert_eq!(
+            install_response.status,
+            proto::filter::RuntimeFilterDeploymentResponseStatus::Applied as i32
+        );
+        assert!(manager.runtime_filter_deployment_is_installed_for_test(query));
+
+        let abort_response = svc
+            .abort_runtime_filter_deployment(Request::new(
+                encode_abort_runtime_filter_deployment(wire_query, install.epoch())
+                    .expect("encode abort"),
+            ))
+            .await
+            .expect("abort handler")
+            .into_inner();
+        assert_eq!(
+            abort_response.status,
+            proto::filter::RuntimeFilterDeploymentResponseStatus::Applied as i32
+        );
+        assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
     }
 
     #[tokio::test]

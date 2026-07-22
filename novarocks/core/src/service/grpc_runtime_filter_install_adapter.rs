@@ -133,7 +133,8 @@ fn rejection_for_error(
         RuntimeFilterDeploymentInstallErrorKind::ActiveFragments => {
             proto::filter::RuntimeFilterDeploymentRejectionCode::ActiveFragments
         }
-        RuntimeFilterDeploymentInstallErrorKind::Internal => {
+        RuntimeFilterDeploymentInstallErrorKind::TerminalCapacity
+        | RuntimeFilterDeploymentInstallErrorKind::Internal => {
             proto::filter::RuntimeFilterDeploymentRejectionCode::Internal
         }
     };
