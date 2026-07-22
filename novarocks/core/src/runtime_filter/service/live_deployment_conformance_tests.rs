@@ -22,20 +22,25 @@ use std::time::Duration;
 
 use arrow::datatypes::DataType;
 
+use crate::catalog::schema::ColumnDef;
 use crate::common::types::UniqueId;
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
+    IcebergTableInfo,
+};
 use crate::coordinator::cluster::LiveBackendSnapshot;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
-use crate::coordinator::ports::RuntimeFilterDeploymentControlPort;
-use crate::coordinator::runtime_filter_deployment::{
-    DeploymentEpochAllocator, NativeRuntimeFilterDeploymentPolicyProvider,
-    RuntimeFilterInstallBarrier, prepare_runtime_filter_deployment,
+use crate::coordinator::execution::ExecutionCoordinator;
+use crate::coordinator::ports::{
+    CoordinatorExecutionPorts, CoordinatorObserver, RuntimeFilterDeploymentControlPort,
 };
-use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
+use crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider;
+use crate::coordinator::scheduler::FragmentScheduler;
+use crate::coordinator::write::handle_fragment_report_exec_status;
+use crate::coordinator::write::report::FragmentExecStatusReport;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
-use crate::runtime_filter::deployment::compiler;
-use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
 use crate::runtime_filter::deployment::participant_id_for_backend;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
@@ -54,9 +59,7 @@ use crate::runtime_filter::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
-use crate::runtime_filter::port::producer::{
-    ProducerPortKind, RuntimeContractViolationKind, SubmitOutcome,
-};
+use crate::runtime_filter::port::producer::{ProducerPortKind, SubmitOutcome};
 use crate::runtime_filter::port::subscription::{ArtifactAcquireOutcome, SubscriptionKind};
 use crate::runtime_filter::port::transport::RuntimeFilterAcceptStatus;
 use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
@@ -65,27 +68,26 @@ use crate::service::grpc_server::IndependentGrpcRuntimeFilterNode;
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
-use crate::sql::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
-    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PlanFragment,
+use crate::sql::planner::distributed::write::sink::{
+    IcebergWriteFragmentSink, IcebergWriteInputBinding,
 };
-use crate::sql::planner::payload::PlanValuesNode;
+use crate::sql::planner::distributed::{
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
+};
+use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 use super::RuntimeFilterService;
 
-const QUERY: UniqueId = UniqueId {
-    hi: 0x6a,
-    lo: 0x800,
-};
 const CHANNEL: ChannelId = ChannelId::new(80);
 const PRODUCER_BINDING: BindingId = BindingId::new(81);
 const CONSUMER_BINDING: BindingId = BindingId::new(82);
 const WITNESS: CoverageWitnessId = CoverageWitnessId::new(83);
-const PRODUCER_FRAGMENT: u32 = 1;
+const PRODUCER_FRAGMENT: u32 = 0;
 const PRODUCER_NODE: i32 = 810;
 const CONSUMER_FRAGMENT: u32 = 0;
-const CONSUMER_NODE: i32 = 820;
+const CONSUMER_NODE: i32 = PRODUCER_NODE;
 const MAX_WAIT: Duration = Duration::from_secs(5);
 static LIVE_CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -126,12 +128,39 @@ impl FragmentDispatcher for RecordingFragmentDispatcher {
         backend_idx: usize,
         submission: NativeFragmentEnvelope,
     ) -> Result<(), String> {
+        let query_id = submission.query_id()?;
         let finst_id = submission.fragment_instance_id()?;
+        let backend_num = submission.instance_params_for_test().backend_num;
         self.submissions
             .lock()
             .unwrap()
             .push((backend_idx, submission.fragment_id(), finst_id));
         self.submit_count.fetch_add(1, Ordering::SeqCst);
+        handle_fragment_report_exec_status(FragmentExecStatusReport {
+            query_id,
+            fragment_instance_id: finst_id,
+            backend_num,
+            done: true,
+            status: crate::proto::common::Status {
+                code: 0,
+                message: String::new(),
+            },
+            iceberg_commits: vec![crate::proto::novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
+                    path: Some(format!("s3://live-conformance/be-{backend_idx}.parquet")),
+                    record_count: Some(1),
+                    file_size_in_bytes: Some(1),
+                    file_content: crate::proto::novarocks::IcebergFileContent::Data as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            load_counters: BTreeMap::new(),
+            loaded_rows: 1,
+            loaded_bytes: 1,
+            filtered_rows: 0,
+        })
+        .map_err(|error| format!("recording dispatcher writer completion failed: {error}"))?;
         Ok(())
     }
 
@@ -148,13 +177,35 @@ impl FragmentDispatcher for RecordingFragmentDispatcher {
     fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[UniqueId]) {}
 
     fn backend_count(&self) -> usize {
-        1
+        3
     }
+}
+
+#[derive(Default)]
+struct RecordingCoordinatorObserver(AtomicUsize);
+
+impl RecordingCoordinatorObserver {
+    fn scheduled_count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl CoordinatorObserver for RecordingCoordinatorObserver {
+    fn fragment_scheduled(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+struct InstallObservation {
+    query_id: UniqueId,
+    participant: RuntimeFilterParticipantId,
+    install: RuntimeFilterParticipantInstall,
 }
 
 struct AckGatedDeploymentControl {
     inner: Arc<GrpcRuntimeFilterDeploymentControl>,
-    installed: mpsc::SyncSender<RuntimeFilterParticipantId>,
+    installed: mpsc::SyncSender<InstallObservation>,
     release: Arc<tokio::sync::Semaphore>,
 }
 
@@ -168,11 +219,16 @@ impl RuntimeFilterDeploymentControlPort for AckGatedDeploymentControl {
         participant: RuntimeFilterParticipantId,
         install: RuntimeFilterParticipantInstall,
     ) -> Result<(), String> {
+        let observation = InstallObservation {
+            query_id,
+            participant,
+            install: install.clone(),
+        };
         self.inner
             .install(query_id, lifecycle, deadline, participant, install)
             .await?;
         self.installed
-            .send(participant)
+            .send(observation)
             .map_err(|_| "live install ACK observation receiver closed".to_string())?;
         tokio::time::timeout(MAX_WAIT, self.release.acquire())
             .await
@@ -209,7 +265,7 @@ fn output_column() -> OutputColumn {
     OutputColumn {
         column_id: ColumnId::new_for_test(1),
         name: "k".to_string(),
-        data_type: DataType::Int64,
+        data_type: DataType::Int32,
         nullable: false,
         is_internal: false,
     }
@@ -218,7 +274,7 @@ fn output_column() -> OutputColumn {
 fn expression() -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Int(1)),
-        data_type: DataType::Int64,
+        data_type: DataType::Int32,
         nullable: false,
     }
 }
@@ -238,7 +294,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
         .insert_channel(RuntimeFilterChannelSpec {
             channel_id: CHANNEL,
             logical_domain: RuntimeFilterLogicalDomain::Membership {
-                value_type: DataType::Int64,
+                value_type: DataType::Int32,
                 null_semantics: NullSemantics::NeverMatches,
             },
             lifecycle: RuntimeFilterLifecycle::CompleteOnce,
@@ -294,9 +350,64 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
     graph
 }
 
+fn source_column() -> ColumnDef {
+    ColumnDef {
+        name: "k".to_string(),
+        data_type: DataType::Int32,
+        nullable: false,
+        write_default: None,
+        logical_type: None,
+    }
+}
+
+fn iceberg_table() -> IcebergTableInfo {
+    IcebergTableInfo {
+        catalog: "live_conformance".to_string(),
+        namespace: "default".to_string(),
+        table: "source".to_string(),
+        table_uuid: Some("00000000-0000-0000-0000-00000000006a".to_string()),
+        current_snapshot_id: Some(1),
+        schema_id: 1,
+        location: "s3://live-conformance/source".to_string(),
+        schema: IcebergSchemaDef {
+            fields: vec![IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "k".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            }],
+        },
+        serialized_metadata: None,
+        serialized_metadata_rows: None,
+    }
+}
+
 fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distributed::DistributedPlan {
     let column = output_column();
-    let producer = PlanFragment {
+    let table = iceberg_table();
+    let source = TableDef {
+        name: "source".to_string(),
+        columns: vec![source_column()],
+        iceberg_row_lineage_metadata_columns: Vec::new(),
+        source: ScanSource::IcebergDataFiles {
+            table,
+            files: (0..3)
+                .map(|index| {
+                    IcebergDataFileInfo::for_test(
+                        &format!("s3://live-conformance/source/file-{index}.parquet"),
+                        1,
+                        1,
+                    )
+                })
+                .collect(),
+            cloud_properties: BTreeMap::new(),
+            binding: IcebergDataFileBinding::ExplicitFiles,
+        },
+    };
+    let fragment = PlanFragment {
         fragment_id: PRODUCER_FRAGMENT,
         root: DistributedNode {
             node_id: PRODUCER_NODE,
@@ -304,187 +415,50 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
             tuple_ids: vec![PRODUCER_NODE],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            runtime_filter_binding_ids: vec![PRODUCER_BINDING],
+            runtime_filter_binding_ids: vec![PRODUCER_BINDING, CONSUMER_BINDING],
             children: Vec::new(),
             stats: stats(),
-            payload: DistributedNodeKind::Values(PlanValuesNode {
-                rows: Vec::new(),
+            payload: DistributedNodeKind::Scan(PlanScanNode {
+                database: "default".to_string(),
+                table: source,
+                alias: None,
                 columns: vec![column.clone()],
+                predicates: Vec::new(),
+                required_columns: Some(vec!["k".to_string()]),
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
             }),
         },
         data_partition: DataPartition::unpartitioned(),
         output_partition: DataPartition::unpartitioned(),
-        sink: DataSink::Noop,
-        output_exprs: None,
-        output_columns: vec![column.clone()],
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-    let consumer = PlanFragment {
-        fragment_id: CONSUMER_FRAGMENT,
-        root: DistributedNode {
-            node_id: CONSUMER_NODE,
-            fragment_id: CONSUMER_FRAGMENT,
-            tuple_ids: vec![CONSUMER_NODE],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: vec![CONSUMER_BINDING],
-            children: Vec::new(),
-            stats: stats(),
-            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
-                partition: DataPartition::unpartitioned(),
-                source_fragment_id: PRODUCER_FRAGMENT,
-                output_columns: vec![column.clone()],
-                output_qualifier: None,
-                flavor: ExchangeFlavor::Distribution,
-            }),
-        },
-        data_partition: DataPartition::unpartitioned(),
-        output_partition: DataPartition::unpartitioned(),
-        sink: DataSink::Result,
+        sink: DataSink::IcebergWrite(IcebergWriteFragmentSink {
+            descriptor_database: "default".to_string(),
+            spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
+            input: IcebergWriteInputBinding::RootOutputByOrdinal,
+        }),
         output_exprs: None,
         output_columns: vec![column],
         cte_id: None,
         cte_exchange_nodes: Vec::new(),
     };
     DistributedPlanDraftBuilder::new(
-        vec![producer, consumer],
+        vec![fragment],
         Some(CONSUMER_FRAGMENT),
-        vec![FragmentEdge {
-            source_fragment_id: PRODUCER_FRAGMENT,
-            target_fragment_id: CONSUMER_FRAGMENT,
-            target_exchange_node_id: CONSUMER_NODE,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: vec![1],
-        }],
+        Vec::new(),
         runtime_filter_graph(topology),
     )
     .seal()
     .expect("conformance fixture must pass the production distributed-plan seal")
 }
 
-fn placement(
-    fragment_id: u32,
-    instance_index: usize,
-    backend_idx: usize,
-    finst_id: UniqueId,
-    endpoint: std::net::SocketAddr,
-) -> FragmentInstancePlacement {
-    FragmentInstancePlacement {
-        fragment_id,
-        instance_index,
-        finst_id,
-        backend_idx,
-        endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
-        scan_ranges: BTreeMap::new(),
-        destinations: Vec::new(),
-        per_exch_num_senders: BTreeMap::new(),
-    }
-}
-
-fn scheduling(endpoints: &[std::net::SocketAddr; 3]) -> SchedulingPlan {
-    SchedulingPlan {
-        root_fragment_id: CONSUMER_FRAGMENT,
-        by_fragment: BTreeMap::from([
-            (
-                PRODUCER_FRAGMENT,
-                vec![
-                    placement(
-                        PRODUCER_FRAGMENT,
-                        0,
-                        0,
-                        UniqueId {
-                            hi: QUERY.hi,
-                            lo: 0x101,
-                        },
-                        endpoints[0],
-                    ),
-                    placement(
-                        PRODUCER_FRAGMENT,
-                        1,
-                        1,
-                        UniqueId {
-                            hi: QUERY.hi,
-                            lo: 0x102,
-                        },
-                        endpoints[1],
-                    ),
-                ],
-            ),
-            (
-                CONSUMER_FRAGMENT,
-                vec![placement(
-                    CONSUMER_FRAGMENT,
-                    0,
-                    2,
-                    UniqueId {
-                        hi: QUERY.hi,
-                        lo: 0x201,
-                    },
-                    endpoints[2],
-                )],
-            ),
-        ]),
-        root_finst_id: UniqueId {
-            hi: QUERY.hi,
-            lo: 0x201,
-        },
-        root_backend_idx: 2,
-    }
-}
-
-fn native_submissions(
-    plan: &crate::sql::planner::distributed::DistributedPlan,
-    scheduling: &SchedulingPlan,
-) -> Vec<(usize, NativeFragmentEnvelope)> {
-    let prepared = crate::coordinator::prepare::prepare_fragments(
-        plan,
-        &crate::connector::ConnectorRegistry::new(),
-        None,
-    )
-    .expect("prepare the sealed live conformance plan");
-    let native = crate::protocol::native::encode::encode_native_fragment_bundle(plan, &prepared)
-        .expect("encode the sealed live conformance plan");
-    scheduling
-        .by_fragment
-        .iter()
-        .flat_map(|(fragment_id, placements)| {
-            let template = native
-                .get(*fragment_id)
-                .unwrap_or_else(|| panic!("native fragment {fragment_id} is present"))
-                .clone();
-            placements.iter().map(move |placement| {
-                (
-                    placement.backend_idx,
-                    NativeFragmentEnvelope::new(
-                        template.clone(),
-                        crate::proto::novarocks::InstanceParams {
-                            query_id: Some(crate::proto::common::UniqueId {
-                                hi: QUERY.hi,
-                                lo: QUERY.lo,
-                            }),
-                            fragment_instance_id: Some(crate::proto::common::UniqueId {
-                                hi: placement.finst_id.hi,
-                                lo: placement.finst_id.lo,
-                            }),
-                            ..Default::default()
-                        },
-                    ),
-                )
-            })
-        })
-        .collect()
-}
-
 fn wait_for_transport_ack(
+    query_id: UniqueId,
     sender: &RuntimeFilterService,
     sender_participant: RuntimeFilterParticipantId,
     route_edge_ids: &BTreeSet<crate::runtime_filter::port::identity::RouteEdgeId>,
 ) {
     let deadline = std::time::Instant::now() + MAX_WAIT;
-    let query = QueryKey::from_hi_lo(QUERY.hi, QUERY.lo);
+    let query = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
     loop {
         let accepted = RuntimeFilterLifecycleRegistry::global()
             .snapshot(query)
@@ -513,20 +487,16 @@ fn wait_for_transport_ack(
     }
 }
 
-fn assert_zero_fragment_submits(dispatchers: &[Arc<RecordingFragmentDispatcher>]) {
-    for (backend_idx, dispatcher) in dispatchers.iter().enumerate() {
-        assert_eq!(
-            dispatcher.submit_count(),
-            0,
-            "backend {backend_idx} submitted a fragment before the install barrier ACKed"
-        );
-    }
+fn assert_zero_fragment_submits(dispatcher: &RecordingFragmentDispatcher) {
+    assert_eq!(
+        dispatcher.submit_count(),
+        0,
+        "the coordinator submitted a fragment before the install barrier ACKed"
+    );
 }
 
 fn run_live_conformance(topology: ConformanceTopology) {
     let _serial = LIVE_CONFORMANCE_LOCK.lock().unwrap();
-    let lifecycle_query = QueryKey::from_hi_lo(QUERY.hi, QUERY.lo);
-    RuntimeFilterLifecycleRegistry::global().remove_query(lifecycle_query);
     let mut nodes = [
         IndependentGrpcRuntimeFilterNode::start().expect("start independent BE zero"),
         IndependentGrpcRuntimeFilterNode::start().expect("start independent BE one"),
@@ -539,41 +509,30 @@ fn run_live_conformance(topology: ConformanceTopology) {
     ];
     let backends = LiveBackendSnapshot::new(endpoints.into_iter().enumerate().collect());
     let sealed = sealed_plan(topology);
-    let scheduling = scheduling(&endpoints);
-    let deployment = prepare_runtime_filter_deployment(
-        sealed.runtime_filter_graph(),
-        &backends,
-        &NativeRuntimeFilterDeploymentPolicyProvider::new(2),
-        &DeploymentEpochAllocator,
-    )
-    .expect("derive live deployment policy")
-    .expect("the conformance graph is nonempty");
-    let compiled = compiler::compile(
-        sealed.runtime_filter_graph(),
-        &scheduling,
-        sealed.edges(),
-        &backends,
-        &deployment.policy.compiler,
-        deployment.epoch,
-    )
-    .expect("compile live three-BE runtime filter deployment");
-    let installs = RuntimeFilterDeploymentExtension::new()
-        .participant_installs(&compiled)
-        .expect("project per-participant installs");
-    assert_eq!(installs.len(), 3, "every BE has an authorized role");
-
-    let dispatchers = Arc::new(
-        (0..3)
-            .map(|_| Arc::new(RecordingFragmentDispatcher::default()))
-            .collect::<Vec<_>>(),
-    );
+    let mut connectors = crate::connector::ConnectorRegistry::new();
+    connectors.register_scan_planner(Arc::new(
+        crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+    ));
+    let prepared = crate::coordinator::prepare::prepare_fragments(&sealed, &connectors, None)
+        .expect("prepare the sealed live conformance plan");
+    let expected_prepared =
+        crate::coordinator::prepare::prepare_fragments(&sealed, &connectors, None)
+            .expect("prepare the expected live scheduling projection");
+    let native_bundle =
+        crate::protocol::native::encode::encode_native_fragment_bundle(&sealed, &prepared)
+            .expect("encode the sealed live conformance plan");
+    let scheduler = Arc::new(FragmentScheduler::from_live_backend_snapshot(
+        backends.clone(),
+    ));
+    let dispatcher = Arc::new(RecordingFragmentDispatcher::default());
+    let observer = Arc::new(RecordingCoordinatorObserver::default());
     let install_ack_observations = Arc::new(AtomicUsize::new(0));
     for node in &nodes {
-        let dispatchers = Arc::clone(&dispatchers);
+        let dispatcher = Arc::clone(&dispatcher);
         let observations = Arc::clone(&install_ack_observations);
         node.manager()
             .set_before_runtime_filter_installed_publish_hook_for_test(Arc::new(move || {
-                assert_zero_fragment_submits(dispatchers.as_slice());
+                assert_zero_fragment_submits(dispatcher.as_ref());
                 observations.fetch_add(1, Ordering::SeqCst);
             }));
     }
@@ -589,64 +548,81 @@ fn run_live_conformance(topology: ConformanceTopology) {
         installed: installed_tx,
         release: Arc::clone(&ack_release),
     });
-    let submissions = native_submissions(&sealed, &scheduling);
-    let dispatchers_for_submission = Arc::clone(&dispatchers);
-    let installs_for_barrier = installs.clone();
-    let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-        delivery_expire: MAX_WAIT,
-        query_expire: Duration::from_secs(30),
-        transport_retry_interval: deployment.policy.transport.retry_interval,
-        transport_max_attempts: deployment.policy.transport.max_attempts,
-        transport_deadline: deployment.policy.transport.deadline,
-        transport_max_pending_entries: deployment.policy.transport.max_pending_entries,
-        transport_max_pending_bytes: deployment.policy.transport.max_pending_bytes,
-    };
-    let (barrier_done_tx, barrier_done_rx) = mpsc::sync_channel(1);
-    let barrier_thread = std::thread::spawn(move || {
-        let result = RuntimeFilterInstallBarrier::new(control)
-            .install_all_or_rollback(
-                QUERY,
-                deployment.epoch,
-                lifecycle,
-                deployment.policy.install_rpc_deadline,
-                installs_for_barrier,
-            )
-            .and_then(|installed| {
-                installed.release();
-                for (backend_idx, submission) in submissions {
-                    dispatchers_for_submission[backend_idx]
-                        .submit_fragment(backend_idx, submission)?;
-                }
-                Ok(())
-            });
-        let _ = barrier_done_tx.send(result);
+    let mut execution_ports = CoordinatorExecutionPorts::new(
+        dispatcher.clone(),
+        RuntimeEndpoint::from_socket_addr(endpoints[0]),
+        observer.clone(),
+        control,
+    );
+    execution_ports.runtime_filter_policy_provider =
+        Arc::new(NativeRuntimeFilterDeploymentPolicyProvider::new(2));
+    let coordinator = ExecutionCoordinator::new(
+        prepared,
+        native_bundle,
+        execution_ports,
+        Arc::clone(&scheduler),
+        None,
+    );
+    let (coordinator_done_tx, coordinator_done_rx) = mpsc::sync_channel(1);
+    let coordinator_thread = std::thread::spawn(move || {
+        let _ = coordinator_done_tx.send(coordinator.execute());
     });
-    let mut installed_participants = BTreeSet::new();
+
+    let mut query_id = None;
+    let mut expected_installs = BTreeMap::new();
     for _ in 0..3 {
-        installed_participants.insert(
-            installed_rx
-                .recv_timeout(MAX_WAIT)
-                .expect("real install RPC completes before the ACK gate"),
+        let observation = installed_rx
+            .recv_timeout(MAX_WAIT)
+            .expect("real coordinator install RPC completes before the ACK gate");
+        match query_id {
+            Some(expected) => assert_eq!(observation.query_id, expected),
+            None => query_id = Some(observation.query_id),
+        }
+        assert_eq!(
+            observation.install.local_participant_id(),
+            observation.participant
+        );
+        assert!(
+            expected_installs
+                .insert(observation.participant, observation.install)
+                .is_none(),
+            "coordinator installs every participant exactly once"
         );
     }
-    assert_eq!(installed_participants.len(), 3);
-    assert_zero_fragment_submits(dispatchers.as_slice());
+    let query_id = query_id.expect("coordinator generated query id");
+    let lifecycle_query = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+    assert_eq!(
+        expected_installs.len(),
+        3,
+        "all three live BEs participate in the compiled install"
+    );
+    assert_eq!(
+        expected_installs
+            .values()
+            .map(RuntimeFilterParticipantInstall::epoch)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "all participants install the same deployment epoch"
+    );
+    assert_zero_fragment_submits(dispatcher.as_ref());
+    assert_eq!(observer.scheduled_count(), 0);
     assert_eq!(
         install_ack_observations.load(Ordering::SeqCst),
         3,
         "every install handler observed the zero-submit pre-ACK invariant"
     );
     ack_release.add_permits(3);
-    barrier_done_rx
+    coordinator_done_rx
         .recv_timeout(MAX_WAIT)
-        .expect("install barrier and post-release submission finish within the bound")
-        .expect("all three real install RPCs ACK and scheduled fragments submit");
-    barrier_thread.join().expect("install barrier thread joins");
+        .expect("production coordinator terminates within the bound")
+        .expect("production coordinator crosses install, assembly, submit, and write completion");
+    coordinator_thread.join().expect("coordinator thread joins");
 
-    let mut actual_submissions = dispatchers
-        .iter()
-        .flat_map(|dispatcher| dispatcher.submissions())
-        .collect::<Vec<_>>();
+    let scheduling = scheduler
+        .schedule(expected_prepared.scheduling_view(), query_id)
+        .expect("replay the production scheduler projection for exact comparison");
+    let mut actual_submissions = dispatcher.submissions();
     actual_submissions.sort_unstable();
     let mut expected_submissions = scheduling
         .by_fragment
@@ -660,14 +636,27 @@ fn run_live_conformance(topology: ConformanceTopology) {
     expected_submissions.sort_unstable();
     assert_eq!(
         actual_submissions, expected_submissions,
-        "the released install lease dispatches every real scheduled fragment exactly once"
+        "ExecutionCoordinator dispatches every production-scheduled placement exactly once"
+    );
+    assert_eq!(
+        actual_submissions.len(),
+        3,
+        "exactly three fragments submit"
+    );
+    assert_eq!(observer.scheduled_count(), 3);
+    assert_eq!(
+        actual_submissions
+            .iter()
+            .map(|(backend_idx, _, _)| *backend_idx)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1, 2]),
+        "the three scheduled scan placements cover all live BEs"
     );
 
     let query = QueryId {
-        hi: QUERY.hi,
-        lo: QUERY.lo,
+        hi: query_id.hi,
+        lo: query_id.lo,
     };
-    let expected_installs = installs.into_iter().collect::<BTreeMap<_, _>>();
     let mut services = Vec::new();
     for (backend_idx, node) in nodes.iter().enumerate() {
         assert_eq!(
@@ -690,48 +679,26 @@ fn run_live_conformance(topology: ConformanceTopology) {
         services.push(service);
     }
 
-    let producer_finsts = [
-        scheduling.by_fragment[&PRODUCER_FRAGMENT][0].finst_id,
-        scheduling.by_fragment[&PRODUCER_FRAGMENT][1].finst_id,
-    ];
-    let consumer_finst = scheduling.by_fragment[&CONSUMER_FRAGMENT][0].finst_id;
+    let producer_finsts = scheduling.by_fragment[&PRODUCER_FRAGMENT]
+        .iter()
+        .map(|placement| (placement.backend_idx, placement.finst_id))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(producer_finsts.len(), 3);
+    let consumer_finst = producer_finsts[&2];
     let mut producers = Vec::new();
-    for backend_idx in 0..2 {
+    for backend_idx in 0..3 {
         let producer = services[backend_idx]
             .open_producer(
                 PRODUCER_BINDING,
-                producer_finsts[backend_idx],
+                producer_finsts[&backend_idx],
                 1,
                 ProducerPortKind::Membership,
             )
-            .expect("producer role is authorized only on its installed BE")
+            .expect("producer role is authorized on every scheduled BE")
             .into_membership()
             .expect("membership producer port");
-        assert_eq!(
-            services[backend_idx]
-                .subscribe(
-                    CONSUMER_BINDING,
-                    consumer_finst,
-                    SubscriptionKind::BlockingSnapshot,
-                )
-                .expect_err("producer-only BE must reject consumer authorization")
-                .kind(),
-            RuntimeContractViolationKind::UnauthorizedBinding
-        );
         producers.push(producer);
     }
-    assert_eq!(
-        services[2]
-            .open_producer(
-                PRODUCER_BINDING,
-                producer_finsts[0],
-                1,
-                ProducerPortKind::Membership,
-            )
-            .expect_err("consumer-only BE must reject producer authorization")
-            .kind(),
-        RuntimeContractViolationKind::UnauthorizedBinding
-    );
     let subscription = services[2]
         .subscribe(
             CONSUMER_BINDING,
@@ -743,12 +710,12 @@ fn run_live_conformance(topology: ConformanceTopology) {
         .expect("blocking snapshot consumer");
 
     let submit_and_close =
-        |producer: &Arc<dyn crate::runtime_filter::port::producer::ProducerAdapter>, value: i64| {
+        |producer: &Arc<dyn crate::runtime_filter::port::producer::ProducerAdapter>, value: i32| {
             let submit = producer
                 .submit(
                     PartitionId::new(0),
                     ProducerSequence::new(0),
-                    ValueDomainDelta::new(MembershipValues::int64([value]), false),
+                    ValueDomainDelta::new(MembershipValues::int32([value]), false),
                 )
                 .expect("inject contribution through the installed producer Service");
             assert!(matches!(
@@ -766,20 +733,22 @@ fn run_live_conformance(topology: ConformanceTopology) {
         ConformanceTopology::AllOfAggregate => {
             // RFD-6A validates the query-global aggregator Core and the aggregate
             // final artifact's cross-BE delivery. Remote producer-contribution
-            // transport is explicitly deferred to RFD-6B, so both authorized
+            // transport is explicitly deferred to RFD-6B, so all authorized
             // streams enter through the actual BE0 aggregator Service here.
-            let aggregate_remote_producer = services[0]
-                .open_producer(
-                    PRODUCER_BINDING,
-                    producer_finsts[1],
-                    1,
-                    ProducerPortKind::Membership,
-                )
-                .expect("aggregator Core owns the remote producer stream")
-                .into_membership()
-                .expect("membership producer port");
             submit_and_close(&producers[0], 11);
-            submit_and_close(&aggregate_remote_producer, 22);
+            for (backend_idx, value) in [(1, 22), (2, 33)] {
+                let aggregate_remote_producer = services[0]
+                    .open_producer(
+                        PRODUCER_BINDING,
+                        producer_finsts[&backend_idx],
+                        1,
+                        ProducerPortKind::Membership,
+                    )
+                    .expect("aggregator Core owns every remote producer stream")
+                    .into_membership()
+                    .expect("membership producer port");
+                submit_and_close(&aggregate_remote_producer, value);
+            }
         }
     }
 
@@ -799,9 +768,9 @@ fn run_live_conformance(topology: ConformanceTopology) {
         .flat_map(|group| group.route_edge_ids().iter().copied())
         .collect::<BTreeSet<_>>();
     assert!(!sender_routes.is_empty(), "sender owns a delivery route");
-    wait_for_transport_ack(&services[0], sender_participant, &sender_routes);
+    wait_for_transport_ack(query_id, &services[0], sender_participant, &sender_routes);
     let rejected = RuntimeFilterLifecycleRegistry::global()
-        .snapshot(QueryKey::from_hi_lo(QUERY.hi, QUERY.lo))
+        .snapshot(lifecycle_query)
         .is_some_and(|snapshot| {
             snapshot.channel_events.values().flatten().any(|event| {
                 matches!(
@@ -820,7 +789,6 @@ fn run_live_conformance(topology: ConformanceTopology) {
         !rejected,
         "the sender route must not complete with Rejected"
     );
-
     for node in &mut nodes {
         node.shutdown().expect("shutdown independent gRPC BE");
     }
