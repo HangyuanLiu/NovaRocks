@@ -1231,12 +1231,35 @@ fn cross_process_two_be_multi_fragment() {
     );
 }
 
+#[test]
+fn cross_process_three_be_state_store_baseline() {
+    let _guard = lock_cluster_mvp();
+    let cluster = MultiBeClusterHarness::start_n_be(3, "", "");
+    eprintln!("NOVAROCKS_CLUSTER_BASELINE_READY fe=1 be=3");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let rows: Vec<i64> = conn
+        .query(multi_submit_query_sql())
+        .expect("multi-fragment CTE+JOIN query must succeed on 3-BE cluster");
+    assert_eq!(
+        rows,
+        vec![1i64, 2i64],
+        "3-BE multi-fragment query must return sorted results [1, 2]"
+    );
+    eprintln!("NOVAROCKS_CLUSTER_BASELINE_RESULT fragments=multi rows=[1,2]");
+}
+
 #[cfg(unix)]
 #[test]
 fn cross_process_three_be_sqlite_state_store_lifecycle() {
     let _guard = lock_cluster_mvp();
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create state store tempdir");
     let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
+    assert!(
+        state_store_path.is_absolute(),
+        "SQLite StateStore path must be absolute: {}",
+        state_store_path.display()
+    );
     let state_store_config = format!(
         r#"
 [state_store]
@@ -1270,6 +1293,10 @@ deployment_owner = "fe-1"
     cluster.restart_fe();
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
+    let rows: Vec<i64> = conn
+        .query(multi_submit_query_sql())
+        .expect("distributed query must succeed after immediate FE restart");
+    assert_eq!(rows, vec![1i64, 2i64]);
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }
