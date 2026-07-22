@@ -18,14 +18,6 @@
 mod consumer_ingress;
 mod dedupe;
 mod inbound;
-mod materialization;
-mod memory;
-mod producer;
-mod reliable_transport;
-// `registry` is `pub(crate)` (rather than private) solely so RFD-2's
-// deployment-compiler tests can reach `registry::validate_view_for_test`
-// (see registry.rs) to prove compiler output satisfies the BE install
-// contract. Item-level privacy inside `registry.rs` is unaffected.
 #[cfg(test)]
 mod m3a_tests;
 #[cfg(test)]
@@ -34,7 +26,11 @@ mod m3b_tests;
 mod m3c_tests;
 #[cfg(test)]
 mod m4_conformance_tests;
-pub(crate) mod registry;
+mod materialization;
+mod memory;
+mod producer;
+mod registry;
+mod reliable_transport;
 mod subscription;
 
 use std::collections::{BTreeMap, VecDeque};

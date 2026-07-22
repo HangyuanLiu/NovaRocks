@@ -1021,7 +1021,10 @@ mod tests {
         .expect("projection succeeds");
         let view = views.get(&part).expect("participant has a view");
         // Reuse the BE-side validator to prove the shard is well-formed.
-        crate::runtime_filter::service::registry::validate_view_for_test(view)
+        crate::runtime_filter::deployment::install_validation::validate_install_view_contract_for_test(
+            view,
+        )
+        .map_err(|error| error.to_string())
             .expect("compiler output must satisfy BE install contract");
     }
 

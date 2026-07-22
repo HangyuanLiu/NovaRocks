@@ -17,6 +17,7 @@
 
 pub(crate) mod compiler;
 pub(crate) mod extension;
+pub(crate) mod install_validation;
 pub(crate) mod role_graph;
 pub(crate) mod routing_shard;
 pub(crate) mod shard;

@@ -22,6 +22,7 @@ use crate::common::types::UniqueId;
 use crate::proto::{common, filter};
 use crate::protocol::common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime_filter::deployment::install_validation::validate_participant_install;
 use crate::runtime_filter::model::contract::{
     BindingId, ChannelId, CoverageWitnessId, RuntimeFilterLifecycle, RuntimeFilterPolicyRequirement,
 };
@@ -337,7 +338,8 @@ pub(crate) fn encode_participant_install(
             "core and routing participant identities differ",
         ));
     }
-    validate_install_invariants(install, root.clone().field("install"))?;
+    validate_participant_install(install)
+        .map_err(|error| invalid(root.clone().field("install"), error.to_string()))?;
     Ok(filter::InstallRuntimeFilterDeploymentRequest {
         query_id: Some(encode_unique_id(query_id, root.clone().field("query_id"))?),
         deployment_epoch: install.epoch().get(),
@@ -372,7 +374,8 @@ pub(crate) fn decode_participant_install(
         )
     })?;
     let install = decode_install(wire, epoch, participant, root.clone().field("install"))?;
-    validate_install_invariants(&install, root.field("install"))?;
+    validate_participant_install(&install)
+        .map_err(|error| invalid(root.field("install"), error.to_string()))?;
     Ok(DecodedRuntimeFilterParticipantInstall {
         query_id,
         lifecycle,
@@ -1515,148 +1518,6 @@ fn decode_envelope_kind(raw: i32, path: FieldPath) -> CodecResult<RuntimeFilterE
     }
 }
 
-fn validate_install_invariants(
-    install: &RuntimeFilterParticipantInstall,
-    path: FieldPath,
-) -> CodecResult<()> {
-    let core = install.core_view();
-    let routing = install.routing_shard();
-    if core.epoch() != routing.deployment_epoch()
-        || core.local_participant_id() != routing.local_participant_id()
-    {
-        return Err(inconsistent(
-            path,
-            "core and routing install identities differ",
-        ));
-    }
-    for (channel_id, routing_channel) in routing.channels() {
-        let core_channel = core.channels().get(channel_id);
-        let requires_core = routing_channel.local_roles().iter().any(|role| {
-            matches!(
-                role,
-                RuntimeFilterRouteRole::Producer(_)
-                    | RuntimeFilterRouteRole::Aggregator
-                    | RuntimeFilterRouteRole::Consumer(_)
-            )
-        });
-        let relay_only =
-            routing_channel.local_roles() == &BTreeSet::from([RuntimeFilterRouteRole::Relay]);
-        if requires_core != core_channel.is_some() || (!requires_core && !relay_only) {
-            return Err(inconsistent(
-                path.clone(),
-                format!(
-                    "core/routing role authority mismatch for channel {}",
-                    channel_id.get()
-                ),
-            ));
-        }
-        let Some(core_channel) = core_channel else {
-            continue;
-        };
-        let local_producers = routing_channel
-            .local_roles()
-            .iter()
-            .filter_map(|role| match role {
-                RuntimeFilterRouteRole::Producer(binding) => Some(*binding),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let local_consumers = routing_channel
-            .local_roles()
-            .iter()
-            .filter_map(|role| match role {
-                RuntimeFilterRouteRole::Consumer(binding) => Some(*binding),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let aggregator = routing_channel
-            .local_roles()
-            .contains(&RuntimeFilterRouteRole::Aggregator);
-        if !aggregator
-            && core_channel
-                .producers()
-                .keys()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                != local_producers
-        {
-            return Err(inconsistent(
-                path.clone(),
-                "core producer bindings do not match routing roles",
-            ));
-        }
-        if core_channel
-            .consumers()
-            .keys()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            != local_consumers
-        {
-            return Err(inconsistent(
-                path.clone(),
-                "core consumer bindings do not match routing roles",
-            ));
-        }
-        let expected_producers = routing_channel
-            .producer_instances()
-            .iter()
-            .filter(|(_, participant)| aggregator || **participant == core.local_participant_id())
-            .fold(
-                BTreeMap::<BindingId, BTreeSet<UniqueId>>::new(),
-                |mut map, ((binding, instance), _)| {
-                    map.entry(*binding).or_default().insert(*instance);
-                    map
-                },
-            );
-        let installed_producers = core_channel
-            .producers()
-            .iter()
-            .map(|(binding, producer)| (*binding, producer.expected_fragment_instances().clone()))
-            .collect::<BTreeMap<_, _>>();
-        if expected_producers != installed_producers {
-            return Err(inconsistent(
-                path.clone(),
-                "core producer instances do not match routing index",
-            ));
-        }
-        for (binding, consumer) in core_channel.consumers() {
-            let expected_routes = routing_channel
-                .inbound_edges()
-                .iter()
-                .filter(|edge| {
-                    edge.target().participant_id() == core.local_participant_id()
-                        && edge.target().role() == RuntimeFilterRouteRole::Consumer(*binding)
-                        && (edge
-                            .allowed_kinds()
-                            .contains(&RuntimeFilterEnvelopeKind::Artifact)
-                            || edge
-                                .allowed_kinds()
-                                .contains(&RuntimeFilterEnvelopeKind::Unavailable))
-                })
-                .map(RuntimeFilterRoutingEdgeView::route_edge_id)
-                .collect::<BTreeSet<_>>();
-            if &expected_routes != consumer.route_edge_ids() {
-                return Err(inconsistent(
-                    path.clone(),
-                    "core consumer routes do not match inbound routing edges",
-                ));
-            }
-        }
-    }
-    for channel_id in core.channels().keys() {
-        if !routing.channels().contains_key(channel_id) {
-            return Err(inconsistent(
-                path.clone(),
-                format!(
-                    "core channel {} is missing routing authority",
-                    channel_id.get()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1670,13 +1531,15 @@ mod tests {
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-        ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder, NullSemantics,
-        OrderContract, OrderKeyContract, ReductionRequirement, RuntimeFilterLifecycle,
-        RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement, SortDirection,
-        TopKSummaryRequirement,
+        ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder,
+        NullSemantics, OrderContract, OrderKeyContract, ReductionRequirement,
+        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        SortDirection, TopKSummaryRequirement,
     };
     use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerArtifactProfile};
+    use crate::runtime_filter::port::artifact::{
+        ArtifactKind, ConsumerArtifactProfile, HashContractDigest,
+    };
     use crate::runtime_filter::port::identity::{
         DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
     };
@@ -1685,6 +1548,7 @@ mod tests {
         RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
         RuntimeFilterParticipantInstall,
     };
+    use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
     use crate::runtime_filter::port::routing::{
         RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
         RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
@@ -1778,20 +1642,11 @@ mod tests {
                 null_semantics: NullSemantics::NeverMatches,
             },
             RuntimeFilterLifecycle::CompleteOnce,
-            Coverage::AllOf(vec![
-                Coverage::Leaf(CoverageWitnessId::new(channel_id)),
-                Coverage::AnyOf(vec![
-                    Coverage::Leaf(CoverageWitnessId::new(channel_id + 100)),
-                    Coverage::Leaf(CoverageWitnessId::new(channel_id + 200)),
-                ]),
-            ]),
+            Coverage::Leaf(CoverageWitnessId::new(channel_id)),
             Coverage::Leaf(CoverageWitnessId::new(channel_id)),
             ReductionRequirement::SetUnion,
             BTreeSet::from([
                 ContributionKind::ValueDomainDelta,
-                ContributionKind::FinalDomainShard,
-                ContributionKind::OrderedBoundUpdate,
-                ContributionKind::TopKSummary,
                 ContributionKind::ProducerClosed,
             ]),
             CompletionRequirement::ProducerClosed,
@@ -1802,7 +1657,7 @@ mod tests {
                 max_retries: 2,
             },
             RuntimeFilterCoreBudget::new(4096),
-            MaterializationPolicy::new(8, 5, 17, 1, 4096, 1024, 2)
+            MaterializationPolicy::new(8, 5, 17, 1, 4096, 1024, 1)
                 .expect("valid materialization policy"),
             producers,
             consumers,
@@ -1859,6 +1714,237 @@ mod tests {
         )
     }
 
+    fn replace_only_core_channel(
+        install: RuntimeFilterParticipantInstall,
+        replace: impl FnOnce(RuntimeFilterChannelDeployment) -> RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterParticipantInstall {
+        let (core, routing) = install.into_parts();
+        let participant = core.local_participant_id();
+        let epoch = core.epoch();
+        let mut channels = core.channels().clone();
+        let channel_id = *channels.keys().next().expect("one core channel");
+        let channel = channels.remove(&channel_id).expect("core channel");
+        channels.insert(channel_id, replace(channel));
+        RuntimeFilterParticipantInstall::new(
+            RuntimeFilterInstallView::new(epoch, participant, channels),
+            routing,
+        )
+    }
+
+    fn with_contributions(
+        channel: RuntimeFilterChannelDeployment,
+        contributions: BTreeSet<ContributionKind>,
+    ) -> RuntimeFilterChannelDeployment {
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            contributions,
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            channel.consumers().clone(),
+        )
+    }
+
+    fn with_core_budget(
+        channel: RuntimeFilterChannelDeployment,
+        budget: RuntimeFilterCoreBudget,
+    ) -> RuntimeFilterChannelDeployment {
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            budget,
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            channel.consumers().clone(),
+        )
+    }
+
+    fn with_empty_consumer_capabilities(
+        channel: RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterChannelDeployment {
+        let consumers = channel
+            .consumers()
+            .iter()
+            .map(|(binding, consumer)| {
+                (
+                    *binding,
+                    ConsumerDeployment::with_profile(
+                        consumer.activation(),
+                        BTreeSet::new(),
+                        consumer.artifact_profile().clone(),
+                        consumer.route_edge_ids().clone(),
+                        consumer.expected_fragment_instances().clone(),
+                    ),
+                )
+            })
+            .collect();
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            consumers,
+        )
+    }
+
+    fn with_empty_local_roles(
+        install: RuntimeFilterParticipantInstall,
+    ) -> RuntimeFilterParticipantInstall {
+        let (core, routing) = install.into_parts();
+        let channels = routing
+            .channels()
+            .iter()
+            .map(|(channel_id, _channel)| {
+                (
+                    *channel_id,
+                    RuntimeFilterChannelRoutingView::new(
+                        *channel_id,
+                        BTreeSet::new(),
+                        BTreeMap::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .expect("routing DTO permits validation-boundary role checks"),
+                )
+            })
+            .collect();
+        RuntimeFilterParticipantInstall::new(
+            core,
+            RuntimeFilterRoutingShard::new(
+                routing.deployment_epoch(),
+                routing.local_participant_id(),
+                channels,
+            )
+            .expect("valid routing shard shape"),
+        )
+    }
+
+    fn ordered_bound_channel(
+        channel: RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterChannelDeployment {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::First,
+        }];
+        let order = OrderContract {
+            comparator_digest:
+                crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                    &keys,
+                    crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                ),
+            keys,
+            inclusive: true,
+        };
+        let digest = RuntimeOrderContract::try_from_plan(&order)
+            .expect("valid order contract")
+            .digest();
+        let consumers = channel
+            .consumers()
+            .iter()
+            .map(|(binding, consumer)| {
+                (
+                    *binding,
+                    ConsumerDeployment::with_profile(
+                        ConsumerActivation::NonBlockingLive {
+                            late_apply: LateApplyGranularity::RowGroup,
+                        },
+                        BTreeSet::from([ArtifactCapability::OrderedRange]),
+                        ConsumerArtifactProfile::new_ordered_range(digest)
+                            .expect("valid range profile"),
+                        consumer.route_edge_ids().clone(),
+                        consumer.expected_fragment_instances().clone(),
+                    ),
+                )
+            })
+            .collect();
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            RuntimeFilterLogicalDomain::OrderedBound(order),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            consumers,
+        )
+    }
+
+    fn final_domain_channel(
+        channel: RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterChannelDeployment {
+        let coverage = Coverage::AllOf(vec![channel.availability_coverage().clone()]);
+        let consumers = channel
+            .consumers()
+            .iter()
+            .map(|(binding, consumer)| {
+                (
+                    *binding,
+                    ConsumerDeployment::with_profile(
+                        ConsumerActivation::NonBlockingLive {
+                            late_apply: LateApplyGranularity::File,
+                        },
+                        consumer.capabilities().clone(),
+                        consumer.artifact_profile().clone(),
+                        consumer.route_edge_ids().clone(),
+                        consumer.expected_fragment_instances().clone(),
+                    ),
+                )
+            })
+            .collect();
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NullSafeEqual,
+            },
+            RuntimeFilterLifecycle::CompleteOnce,
+            coverage.clone(),
+            coverage,
+            ReductionRequirement::SetUnion,
+            BTreeSet::from([
+                ContributionKind::FinalDomainShard,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            consumers,
+        )
+    }
+
     fn ordered_topk_channel(
         channel_id: u32,
         producer_binding: u32,
@@ -1881,8 +1967,8 @@ mod tests {
             ChannelId::new(channel_id),
             RuntimeFilterLogicalDomain::OrderedBound(order),
             RuntimeFilterLifecycle::MonotonicUpdates,
-            Coverage::Leaf(CoverageWitnessId::new(channel_id)),
-            Coverage::Leaf(CoverageWitnessId::new(channel_id)),
+            Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(channel_id))]),
+            Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(channel_id))]),
             ReductionRequirement::MergeTopKSummary(
                 TopKSummaryRequirement::try_new(3).expect("nonzero TopK"),
             ),
@@ -1890,7 +1976,7 @@ mod tests {
                 ContributionKind::TopKSummary,
                 ContributionKind::ProducerClosed,
             ]),
-            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
+            CompletionRequirement::ProducerClosed,
             RuntimeFilterPolicyRequirement {
                 max_contribution_bytes: 1024,
                 max_artifact_bytes: 2048,
@@ -2003,8 +2089,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_install_round_trips_direct_aggregate_and_relay() {
-        for install in [direct_install(), aggregate_install(), relay_install()] {
+    fn runtime_filter_install_round_trips_all_legal_domain_and_routing_fixtures() {
+        let ordered = replace_only_core_channel(direct_install(), ordered_bound_channel);
+        let final_domain = replace_only_core_channel(direct_install(), final_domain_channel);
+        for install in [
+            direct_install(),
+            ordered,
+            aggregate_install(),
+            final_domain,
+            relay_install(),
+        ] {
             let request = encode_participant_install(QUERY, lifecycle_options(), &install)
                 .expect("encode participant install");
             let decoded = decode_participant_install(&request).expect("decode participant install");
@@ -2270,6 +2364,270 @@ mod tests {
                 .expect("encode participant install");
         wire_participant_drift.participant_id = 9;
         assert!(decode_participant_install(&wire_participant_drift).is_err());
+    }
+
+    #[test]
+    fn runtime_filter_install_encoder_and_decoder_reject_same_invalid_contracts() {
+        let domain_cases = vec![
+            (
+                "empty contribution set",
+                replace_only_core_channel(direct_install(), |channel| {
+                    with_contributions(channel, BTreeSet::new())
+                }),
+            ),
+            (
+                "zero core budget",
+                replace_only_core_channel(direct_install(), |channel| {
+                    with_core_budget(channel, RuntimeFilterCoreBudget::new(0))
+                }),
+            ),
+            (
+                "empty consumer capabilities",
+                replace_only_core_channel(direct_install(), with_empty_consumer_capabilities),
+            ),
+            (
+                "empty local role set",
+                with_empty_local_roles(direct_install()),
+            ),
+            (
+                "membership contribution matrix",
+                replace_only_core_channel(direct_install(), |channel| {
+                    with_contributions(
+                        channel,
+                        BTreeSet::from([
+                            ContributionKind::FinalDomainShard,
+                            ContributionKind::ProducerClosed,
+                        ]),
+                    )
+                }),
+            ),
+        ];
+        for (name, invalid) in domain_cases {
+            assert!(
+                encode_participant_install(QUERY, lifecycle_options(), &invalid).is_err(),
+                "encoder accepted invalid contract: {name}"
+            );
+        }
+
+        type Request = filter::InstallRuntimeFilterDeploymentRequest;
+        let mutations: [(&str, fn(&mut Request)); 5] = [
+            ("empty contribution set", |request| {
+                request.install.as_mut().expect("install").core_channels[0]
+                    .allowed_contribution_kinds
+                    .clear();
+            }),
+            ("zero core budget", |request| {
+                request.install.as_mut().expect("install").core_channels[0]
+                    .core_budget
+                    .as_mut()
+                    .expect("core budget")
+                    .max_reducer_bytes = 0;
+            }),
+            ("empty consumer capabilities", |request| {
+                request.install.as_mut().expect("install").core_channels[0].consumers[0]
+                    .capabilities
+                    .clear();
+            }),
+            ("empty local role set", |request| {
+                request.install.as_mut().expect("install").routing_channels[0]
+                    .local_roles
+                    .clear();
+            }),
+            ("membership contribution matrix", |request| {
+                request.install.as_mut().expect("install").core_channels[0]
+                    .allowed_contribution_kinds = vec![
+                    crate::proto::plan::RuntimeFilterContributionKind::FinalDomainShard as i32,
+                    crate::proto::plan::RuntimeFilterContributionKind::ProducerClosed as i32,
+                ];
+            }),
+        ];
+        let valid = encode_participant_install(QUERY, lifecycle_options(), &direct_install())
+            .expect("encode valid membership install");
+        for (name, mutate) in mutations {
+            let mut invalid = valid.clone();
+            mutate(&mut invalid);
+            assert!(
+                decode_participant_install(&invalid).is_err(),
+                "decoder accepted invalid contract: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_filter_leaf_enums_and_profiles_round_trip_exhaustively() {
+        let activations = [
+            ConsumerActivation::BlockingSnapshot,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Row,
+            },
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::RowGroup,
+            },
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Split,
+            },
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::File,
+            },
+        ];
+        for activation in activations {
+            let wire = encode_runtime_filter_activation(activation);
+            assert_eq!(
+                decode_runtime_filter_activation(
+                    Some(&wire),
+                    FieldPath::root("test").field("activation"),
+                )
+                .expect("decode activation"),
+                activation
+            );
+        }
+
+        for contribution in [
+            ContributionKind::ValueDomainDelta,
+            ContributionKind::FinalDomainShard,
+            ContributionKind::OrderedBoundUpdate,
+            ContributionKind::TopKSummary,
+            ContributionKind::ProducerClosed,
+        ] {
+            assert_eq!(
+                decode_runtime_filter_contribution_kind(
+                    encode_runtime_filter_contribution_kind(contribution),
+                    FieldPath::root("test").field("contribution"),
+                )
+                .expect("decode contribution"),
+                contribution
+            );
+        }
+
+        for completion in [
+            CompletionRequirement::ProducerClosed,
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
+        ] {
+            assert_eq!(
+                decode_runtime_filter_completion(
+                    encode_runtime_filter_completion(completion),
+                    FieldPath::root("test").field("completion"),
+                )
+                .expect("decode completion"),
+                completion
+            );
+        }
+
+        for kind in [
+            RuntimeFilterEnvelopeKind::Contribution,
+            RuntimeFilterEnvelopeKind::Artifact,
+            RuntimeFilterEnvelopeKind::ProducerClosed,
+            RuntimeFilterEnvelopeKind::Unavailable,
+            RuntimeFilterEnvelopeKind::Ack,
+        ] {
+            assert_eq!(
+                decode_envelope_kind(
+                    encode_envelope_kind(kind),
+                    FieldPath::root("test").field("envelope_kind"),
+                )
+                .expect("decode envelope kind"),
+                kind
+            );
+        }
+
+        let profiles = [
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .expect("value-set profile"),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bloom, ArtifactKind::EmptyDomain]),
+                Some(HashContractDigest::new([1; 32])),
+            )
+            .expect("bloom profile"),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .expect("bitset profile"),
+            ConsumerArtifactProfile::new_ordered_range(
+                crate::runtime_filter::port::ordered_bound::OrderContractDigest::from_bytes_for_codec(
+                    [2; 32],
+                ),
+            )
+            .expect("range profile"),
+        ];
+        for profile in profiles {
+            let wire = encode_artifact_profile(&profile).expect("encode artifact profile");
+            assert_eq!(
+                decode_artifact_profile(
+                    Some(&wire),
+                    FieldPath::root("test").field("artifact_profile"),
+                )
+                .expect("decode artifact profile"),
+                profile
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_filter_coverage_round_trips_all_shapes_and_rejects_bad_composites() {
+        let leaf = Coverage::Leaf(CoverageWitnessId::new(1));
+        for coverage in [
+            leaf.clone(),
+            Coverage::AllOf(vec![
+                leaf.clone(),
+                Coverage::Leaf(CoverageWitnessId::new(2)),
+            ]),
+            Coverage::AnyOf(vec![
+                leaf.clone(),
+                Coverage::Leaf(CoverageWitnessId::new(2)),
+            ]),
+        ] {
+            let wire = encode_coverage(&coverage).expect("encode coverage");
+            assert_eq!(
+                decode_coverage(Some(&wire), FieldPath::root("test").field("coverage"))
+                    .expect("decode coverage"),
+                coverage
+            );
+        }
+
+        for invalid in [
+            Coverage::AllOf(Vec::new()),
+            Coverage::AnyOf(Vec::new()),
+            Coverage::AllOf(vec![leaf.clone(), leaf.clone()]),
+        ] {
+            assert!(encode_coverage(&invalid).is_err());
+        }
+
+        let leaf_wire = encode_coverage(&leaf).expect("encode leaf coverage");
+        let invalid_wires = [
+            filter::RuntimeFilterCoverage {
+                kind: Some(filter::runtime_filter_coverage::Kind::AllOf(
+                    filter::RuntimeFilterCoverageAllOf {
+                        children: Vec::new(),
+                    },
+                )),
+            },
+            filter::RuntimeFilterCoverage {
+                kind: Some(filter::runtime_filter_coverage::Kind::AnyOf(
+                    filter::RuntimeFilterCoverageAnyOf {
+                        children: Vec::new(),
+                    },
+                )),
+            },
+            filter::RuntimeFilterCoverage {
+                kind: Some(filter::runtime_filter_coverage::Kind::AllOf(
+                    filter::RuntimeFilterCoverageAllOf {
+                        children: vec![leaf_wire.clone(), leaf_wire],
+                    },
+                )),
+            },
+        ];
+        for wire in invalid_wires {
+            assert!(
+                decode_coverage(Some(&wire), FieldPath::root("test").field("coverage")).is_err()
+            );
+        }
     }
 
     #[test]
