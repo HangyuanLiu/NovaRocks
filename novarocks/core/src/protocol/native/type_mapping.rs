@@ -26,8 +26,7 @@ use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use crate::proto::common;
-use crate::types::logical::field_with_logical_type;
-use crate::types::logical::{LogicalType, logical_type_of_field};
+use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
 const TIME_UNIT_MICROS: i32 = 2;
 const TIME_UNIT_NANOS: i32 = 3;

@@ -45,7 +45,7 @@ use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::fragment::instance::FragmentSinkAssignment;
 use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
 use crate::thrift::{data, data_sinks, descriptors, planner};
-use crate::types::PrimitiveType;
+use novarocks_types::PrimitiveType;
 
 fn runtime_destination_from_thrift(
     dest: &data_sinks::TPlanFragmentDestination,

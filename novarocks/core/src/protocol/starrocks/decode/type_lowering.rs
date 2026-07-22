@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::util::FieldRenderSchema;
-use crate::thrift::types;
-use crate::types::PrimitiveType;
-use crate::types::arrow_thrift::{
+use crate::protocol::starrocks::type_mapping::{
     thrift_desc_to_arrow_field, thrift_desc_to_arrow_type, thrift_type_desc_from_primitive,
 };
+use crate::thrift::types;
 use arrow::datatypes::{DataType, Field};
+use novarocks_types::PrimitiveType;
 
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(

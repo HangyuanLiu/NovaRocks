@@ -70,7 +70,7 @@ pub(crate) fn lower_binary_pred(
             let right_type = arena
                 .data_type(right)
                 .ok_or_else(|| "BINARY_PRED right child type missing".to_string())?;
-            crate::types::coercion::decimal_compare_type(left_type, right_type)?
+            novarocks_types::coercion::decimal_compare_type(left_type, right_type)?
         } else {
             return Err(format!(
                 "BINARY_PRED unsupported child_type from FE plan: {:?}",

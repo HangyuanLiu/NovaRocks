@@ -1227,7 +1227,7 @@ mod tests {
     }
 
     fn get_query_profile_expr(query_id: &str) -> TExpr {
-        let string_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+        let string_type = crate::protocol::starrocks::type_mapping::thrift_type_desc_from_primitive(
             types::TPrimitiveType::VARCHAR,
         );
         let mut call = test_expr_node(TExprNodeType::FUNCTION_CALL, string_type.clone(), 1);
@@ -1960,7 +1960,7 @@ mod tests {
 
     #[test]
     fn hdfs_candidate_node_survives_typed_assignment_into_runtime_cache_options() {
-        let bigint = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+        let bigint = crate::protocol::starrocks::type_mapping::thrift_type_desc_from_primitive(
             types::TPrimitiveType::BIGINT,
         );
         let descriptors = descriptors::TDescriptorTable::new(

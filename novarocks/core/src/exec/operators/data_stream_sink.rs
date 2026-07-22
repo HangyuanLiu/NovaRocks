@@ -86,8 +86,8 @@ mod data_stream_sink_hash_partition {
     use arrow::datatypes::{DataType, Int32Type, TimeUnit};
     use std::sync::Arc;
 
-    use crate::common::largeint;
     use crate::exec::hash_table::key_builder::encode_group_key_row;
+    use novarocks_types::largeint;
 
     // FNV hash constants (from StarRocks BE)
     const FNV_SEED: u64 = 0xcbf29ce484222325;

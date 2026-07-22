@@ -27,7 +27,6 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::i256;
 
-use crate::common::largeint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -42,6 +41,7 @@ use crate::protocol::starrocks::decode::{
 };
 use crate::runtime::query_context::QueryId;
 use crate::thrift::{descriptors, plan_nodes, types};
+use novarocks_types::largeint;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MetaMetricKind {

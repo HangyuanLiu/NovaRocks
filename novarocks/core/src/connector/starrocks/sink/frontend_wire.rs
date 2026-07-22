@@ -27,6 +27,7 @@ use crate::connector::starrocks::sink::plan::{
     SinkTabletLocation,
 };
 use crate::protocol::starrocks::compat::sink::select_partition_boundary_key;
+use crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type;
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{
     FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
@@ -34,7 +35,6 @@ use crate::service::frontend_rpc::{
 use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
 use crate::thrift::status_code;
 use crate::thrift::{exprs, types};
-use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 const CREATE_PARTITION_TRANSPORT_RETRIES: usize = 4;
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;

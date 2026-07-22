@@ -82,13 +82,14 @@ pub(crate) fn descriptor_snapshot_from_thrift(
             continue;
         };
         let slot_id = SlotId::try_from(raw_slot_id)?;
-        let data_type = crate::types::arrow_thrift::thrift_desc_to_arrow_type(type_desc)
-            .ok_or_else(|| {
-                format!(
-                    "unsupported descriptor slot type for tuple_id={} slot_id={}",
-                    tuple_id, raw_slot_id
-                )
-            })?;
+        let data_type =
+            crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type(type_desc)
+                .ok_or_else(|| {
+                    format!(
+                        "unsupported descriptor slot type for tuple_id={} slot_id={}",
+                        tuple_id, raw_slot_id
+                    )
+                })?;
         let name = descriptor_slot_display_name(slot);
         let nullable = slot.is_nullable.unwrap_or(true);
         let logical = logical_type_from_desc(type_desc).unwrap_or(DescriptorLogicalType::Unknown);

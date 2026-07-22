@@ -23,9 +23,10 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 
-use crate::common::{largeint, percentile};
+use crate::common::percentile;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use novarocks_types::largeint;
 
 pub fn eval_percentile_hash(
     arena: &ExprArena,

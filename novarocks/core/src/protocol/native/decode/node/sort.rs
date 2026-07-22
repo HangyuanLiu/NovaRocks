@@ -201,7 +201,7 @@ mod tests {
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::sort::SortTopNType;
     use crate::proto::{common, expr, plan};
-    use crate::types::native_proto::encode_type;
+    use crate::protocol::native::type_mapping::encode_type;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

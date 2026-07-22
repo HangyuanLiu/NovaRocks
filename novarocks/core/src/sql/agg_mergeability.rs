@@ -149,8 +149,8 @@ mod tests {
 
     #[test]
     fn two_phase_functions_have_planning_layer_intermediate_type() {
-        use crate::types::aggregate::infer_agg_function_types;
         use arrow::datatypes::DataType;
+        use novarocks_types::aggregate::infer_agg_function_types;
 
         // Every name the oracle calls TwoPhase must be inferrable with a defined
         // intermediate type by the planning layer. `count` takes no args; the rest

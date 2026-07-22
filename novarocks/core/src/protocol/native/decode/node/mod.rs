@@ -1583,7 +1583,7 @@ mod tests {
     use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
     use crate::exec::node::set_op::SetOpKind;
     use crate::proto::{common, expr, plan};
-    use crate::types::native_proto::encode_type;
+    use crate::protocol::native::type_mapping::encode_type;
 
     struct DummyScanOp;
 

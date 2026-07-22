@@ -950,7 +950,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::types::native_proto::encode_type;
+    use crate::protocol::native::type_mapping::encode_type;
 
     fn plan_destination(id: i64) -> plan::StreamDestination {
         plan::StreamDestination {

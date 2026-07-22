@@ -20,7 +20,7 @@
 
 use arrow::datatypes::{DataType, TimeUnit};
 
-use crate::common::largeint;
+use novarocks_types::largeint;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum RuntimeFilterType {

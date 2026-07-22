@@ -1131,7 +1131,7 @@ fn normalize_comparison_types(
     // Numeric / decimal: delegate the type decision to the single authority,
     // then materialize the cast on both arrays. String / temporal pairs were
     // already handled above; everything else is incompatible.
-    match crate::types::comparison_common_type(left_type, right_type)? {
+    match novarocks_types::comparison_common_type(left_type, right_type)? {
         Some(target) => {
             let left_cast = if left_type == &target {
                 left
@@ -1247,7 +1247,7 @@ fn nested_comparison_target_type(
         return Ok(Some(left.clone()));
     }
     if !same_nested_kind(left, right) {
-        return crate::types::comparison_common_type(left, right);
+        return novarocks_types::comparison_common_type(left, right);
     }
     match (left, right) {
         (DataType::List(left_field), DataType::List(right_field)) => {
@@ -1707,7 +1707,7 @@ pub fn eval_not(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<Array
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{ids::SlotId, largeint};
+    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
         BooleanArray, Decimal128Array, DictionaryArray, Int32Array, Int32Builder, Int64Array,
@@ -1717,6 +1717,7 @@ mod tests {
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::largeint;
     use std::collections::HashMap;
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {

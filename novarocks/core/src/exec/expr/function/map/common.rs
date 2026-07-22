@@ -26,7 +26,7 @@ use arrow_buffer::OffsetBuffer;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::common::largeint;
+use novarocks_types::largeint;
 
 pub(super) fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }

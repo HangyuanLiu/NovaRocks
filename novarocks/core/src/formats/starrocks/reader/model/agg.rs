@@ -40,7 +40,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
 
-use crate::common::{largeint, percentile};
+use crate::common::percentile;
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::plan::{
@@ -48,6 +48,7 @@ use crate::formats::starrocks::plan::{
     StarRocksTableModelPlan,
 };
 use crate::formats::starrocks::segment::StarRocksSegmentFooter;
+use novarocks_types::largeint;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AggOp {

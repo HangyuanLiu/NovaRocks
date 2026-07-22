@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::largeint;
 use crate::exec::chunk::{Chunk, ChunkFieldSchema};
 use crate::exec::expr::decimal::pow10_i256;
 use crate::exec::expr::function::{parse_date_value, parse_datetime_value};
@@ -32,6 +31,7 @@ use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
+use novarocks_types::largeint;
 use num_traits::ToPrimitive;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -3883,16 +3883,16 @@ fn parse_variant(variant_arr: &LargeBinaryArray, row: usize) -> Option<VariantVa
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::common::largeint;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use crate::types::logical::{LogicalType, field_with_logical_type};
     use arrow::array::{
         ArrayRef, BinaryArray, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array,
         Int32Array, Int64Array, LargeBinaryArray, StringArray, StructArray,
     };
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::largeint;
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
     use std::sync::Arc;
 
     fn chunk_len_1() -> Chunk {

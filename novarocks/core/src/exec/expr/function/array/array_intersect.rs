@@ -29,10 +29,10 @@ use arrow_data::transform::MutableArrayData;
 use crc32c::crc32c_append;
 use hashbrown::HashMap;
 
-use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
-use crate::common::largeint;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use novarocks_types::largeint;
 
 const CRC_HASH_SEED1: u32 = 0x811C9DC5;
 const PHMAP_K: u64 = 0xde5fb9d2630458e9;

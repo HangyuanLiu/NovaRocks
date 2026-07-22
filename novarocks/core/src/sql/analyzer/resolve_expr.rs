@@ -21,7 +21,7 @@ use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
 use crate::sql::analysis::*;
-use crate::types::{arithmetic_result_type_with_op, comparison_common_type, wider_type};
+use novarocks_types::{arithmetic_result_type_with_op, comparison_common_type, wider_type};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
@@ -1039,7 +1039,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
                         data_type: DataType::FixedSizeBinary(
-                            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                            novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
                         ),
                         nullable: false,
                     })
@@ -3949,7 +3949,7 @@ fn is_numeric_type(data_type: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
             | DataType::Decimal128(_, _)
-    ) || crate::common::largeint::is_largeint_data_type(data_type)
+    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
 fn validate_percentile_numeric_arg(
@@ -3974,7 +3974,7 @@ fn percentile_argument_type_name(data_type: &DataType) -> String {
         DataType::Utf8 | DataType::LargeUtf8 => "varchar(65533)".to_string(),
         DataType::Date32 => "date".to_string(),
         DataType::Timestamp(_, _) => "datetime".to_string(),
-        dt if crate::common::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
+        dt if novarocks_types::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
         other => format!("{other:?}").to_lowercase(),
     }
 }
@@ -4843,7 +4843,7 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
         DataType::Float32 => "float".to_string(),
         DataType::Float64 => "double".to_string(),
         DataType::Decimal128(p, s) => format!("decimal128({}, {})", p, s),
-        DataType::FixedSizeBinary(w) if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH => {
+        DataType::FixedSizeBinary(w) if *w == novarocks_types::largeint::LARGEINT_BYTE_WIDTH => {
             "largeint".to_string()
         }
         DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),

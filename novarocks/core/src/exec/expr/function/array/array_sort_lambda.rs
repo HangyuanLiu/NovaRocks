@@ -95,12 +95,12 @@ fn comparator_sign(array: &ArrayRef, idx: usize) -> Result<i8, String> {
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
             Ok(sign_i128(arr.value(idx)))
         }
-        dt if crate::common::largeint::is_largeint_data_type(dt) => {
+        dt if novarocks_types::largeint::is_largeint_data_type(dt) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| "array_sort comparator failed to downcast LARGEINT".to_string())?;
-            Ok(sign_i128(crate::common::largeint::value_at(arr, idx)?))
+            Ok(sign_i128(novarocks_types::largeint::value_at(arr, idx)?))
         }
         other => Err(format!(
             "array_sort comparator must return numeric type, got {:?}",

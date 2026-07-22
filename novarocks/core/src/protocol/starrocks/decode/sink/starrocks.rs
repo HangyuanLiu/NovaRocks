@@ -47,9 +47,9 @@ use crate::protocol::starrocks::decode::layout::Layout;
 use crate::protocol::starrocks::decode::{
     FragmentExprArenaOwner, StarRocksExternalDependencyDraft, StarRocksFragmentDecodeError,
 };
+use crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type;
 use crate::runtime::fragment::instance::StarRocksTableSinkAssignment;
 use crate::thrift::{data_sinks, descriptors, exprs, types};
-use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 const LOAD_OP_COLUMN: &str = "__op";
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
@@ -1570,7 +1570,7 @@ mod tests {
     use super::lower_starrocks_table_sink;
 
     fn minimal_olap_sink() -> data_sinks::TOlapTableSink {
-        let bigint = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+        let bigint = crate::protocol::starrocks::type_mapping::thrift_type_desc_from_primitive(
             types::TPrimitiveType::BIGINT,
         );
         let slot = descriptors::TSlotDescriptor::new(

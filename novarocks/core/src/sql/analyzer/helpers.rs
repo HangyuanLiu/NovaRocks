@@ -21,7 +21,7 @@ use arrow::datatypes::{DataType, Field, Fields};
 use sqlparser::ast as sqlast;
 
 use crate::sql::analysis::JoinKind;
-use crate::types::logical::{LogicalType, field_with_logical_type};
+use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 // ---------------------------------------------------------------------------
 // SQL type -> Arrow type conversion
@@ -91,7 +91,7 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
             match type_name.as_str() {
                 "string" => Ok(DataType::Utf8),
                 "largeint" => Ok(DataType::FixedSizeBinary(
-                    crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                    novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
                 )),
                 "json" | "jsonb" => Ok(DataType::Utf8),
                 "variant" => Ok(DataType::LargeBinary),
@@ -297,7 +297,7 @@ fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
         }
         "largeint" => {
             return Ok(DataType::FixedSizeBinary(
-                crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
             ));
         }
         "json" | "jsonb" => return Ok(DataType::Utf8),

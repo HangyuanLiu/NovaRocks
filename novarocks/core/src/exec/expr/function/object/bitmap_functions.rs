@@ -26,9 +26,9 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use base64::Engine;
 
-use crate::common::largeint;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use novarocks_types::largeint;
 
 fn row_index(
     row: usize,

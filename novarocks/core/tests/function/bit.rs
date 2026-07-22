@@ -18,12 +18,12 @@
 use crate::common;
 use arrow::array::{Array, FixedSizeBinaryArray, Int64Array};
 use arrow::datatypes::DataType;
-use novarocks::common::largeint;
 use novarocks::exec::expr::function::bit::{
     eval_bit_shift_left, eval_bit_shift_right, eval_bit_shift_right_logical, eval_bitand,
     eval_bitnot, eval_bitor, eval_bitxor, eval_xx_hash3_128,
 };
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_types::largeint;
 
 fn literal_largeint(arena: &mut ExprArena, v: i128) -> ExprId {
     arena.push_typed(

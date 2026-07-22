@@ -22,12 +22,12 @@ use super::type_mapping::{
 };
 use super::{NativePlanEncodeContext, required_context_ref};
 use crate::proto::plan;
+use crate::protocol::native::type_mapping::encode_type;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamRouterSink;
 use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFileCompression, IcebergWriteInputBinding, IcebergWriteSinkSpec,
 };
-use crate::types::native_proto::encode_type;
 
 pub(super) fn encode_iceberg_change_stream_router_sink(
     src: &IcebergChangeStreamRouterSink,

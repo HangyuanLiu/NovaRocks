@@ -32,7 +32,7 @@ fn is_numeric_like_type(data_type: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
             | DataType::Decimal128(_, _)
-    ) || crate::common::largeint::is_largeint_data_type(data_type)
+    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
 fn is_varchar_castable_scalar(data_type: &DataType) -> bool {
@@ -51,7 +51,7 @@ fn is_varchar_castable_scalar(data_type: &DataType) -> bool {
             | DataType::Timestamp(_, _)
             | DataType::Utf8
             | DataType::Binary
-    ) || crate::common::largeint::is_largeint_data_type(data_type)
+    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
 fn common_overlap_value_type(left: &DataType, right: &DataType) -> Option<DataType> {

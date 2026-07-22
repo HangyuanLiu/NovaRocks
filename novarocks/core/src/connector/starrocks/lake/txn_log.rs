@@ -32,7 +32,6 @@ use arrow_buffer::i256;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use prost::Message;
 
-use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::connector::schema::{self, BeTabletWriteLoadLogRecord, BeTxnActiveRecord};
@@ -76,6 +75,7 @@ use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
     CombinedTxnLogPb, RowsetMetadataPb, TableSchemaKeyPb, TabletMetadataPb, TxnLogPb, txn_log_pb,
 };
+use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 pub(crate) fn append_lake_txn_log_with_chunk_rowset(
     ctx: &TabletWriteContext,
     chunk: &Chunk,
@@ -1737,7 +1737,7 @@ fn resolve_tablet_column_arrow_type(column: &StarRocksColumnSchema) -> Result<Da
         // failing fast when FE chooses AUTO/COLUMN_* paths.
         "OBJECT" | "BITMAP" | "HLL" | "PERCENTILE" | "JSON" | "VARIANT" => Ok(DataType::Binary),
         "LARGEINT" => Ok(DataType::FixedSizeBinary(
-            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+            novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
         )),
         "DECIMAL" | "DECIMALV2" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
             let (precision, scale) = resolve_decimal_precision_scale(column)?;
@@ -2580,7 +2580,7 @@ pub(crate) fn parse_default_literal_to_singleton_array(
             TimestampMicrosecondArray::from(vec![Some(parse_timestamp_default_literal(unquoted)?)]),
         )),
         DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let parsed = unquoted.parse::<i128>().map_err(|e| {
                 format!(
@@ -2588,7 +2588,7 @@ pub(crate) fn parse_default_literal_to_singleton_array(
                     unquoted, e
                 )
             })?;
-            crate::common::largeint::array_from_i128(&[Some(parsed)])
+            novarocks_types::largeint::array_from_i128(&[Some(parsed)])
         }
         DataType::Decimal128(precision, scale) => {
             let parsed = parse_decimal128_default_literal(unquoted, *precision, *scale)?;
@@ -2749,14 +2749,14 @@ fn json_value_to_arrow_singleton_array(
             Ok(Arc::new(array))
         }
         DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let s = json_value_to_string(json)?;
             let parsed = s
                 .trim()
                 .parse::<i128>()
                 .map_err(|e| format!("parse LARGEINT default literal '{}' failed: {}", s, e))?;
-            crate::common::largeint::array_from_i128(&[Some(parsed)])
+            novarocks_types::largeint::array_from_i128(&[Some(parsed)])
         }
         // ── ARRAY ─────────────────────────────────────────────────────────────────
         DataType::List(item_field) => {
@@ -3176,7 +3176,7 @@ fn scalar_array_gt(left: &ArrayRef, right: &ArrayRef) -> Result<bool, String> {
             Ok(left.value(0) > right.value(0))
         }
         DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let left = left
                 .as_any()
@@ -3186,8 +3186,8 @@ fn scalar_array_gt(left: &ArrayRef, right: &ArrayRef) -> Result<bool, String> {
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| "downcast merge_condition right LARGEINT failed".to_string())?;
-            Ok(crate::common::largeint::value_at(left, 0)?
-                > crate::common::largeint::value_at(right, 0)?)
+            Ok(novarocks_types::largeint::value_at(left, 0)?
+                > novarocks_types::largeint::value_at(right, 0)?)
         }
         DataType::Decimal128(_, _) => {
             let left = left

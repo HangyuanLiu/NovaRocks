@@ -518,12 +518,12 @@ mod tests {
     use crate::exec::node::ExecNodeKind;
     use crate::proto::{common, novarocks, plan};
     use crate::protocol::common::error::ProtocolErrorKind;
+    use crate::protocol::native::type_mapping::encode_type;
     use crate::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::query_state::in_flight_table;
     use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
-    use crate::types::native_proto::encode_type;
 
     static NEXT_TEST_ID: AtomicI64 = AtomicI64::new(8_600_000_000_000_000_000);
 

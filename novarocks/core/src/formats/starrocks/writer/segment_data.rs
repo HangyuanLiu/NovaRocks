@@ -155,7 +155,7 @@ fn cast_column_to_date32_for_native_writer(
     context: &str,
 ) -> Result<ArrayRef, String> {
     if let Some(fixed) = column.as_any().downcast_ref::<FixedSizeBinaryArray>()
-        && fixed.value_length() == crate::common::largeint::LARGEINT_BYTE_WIDTH
+        && fixed.value_length() == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
     {
         let values = decode_largeint_values(column, column_index, column_name, context)?;
         let mut out = Vec::with_capacity(values.len());
@@ -182,7 +182,7 @@ fn cast_column_to_timestamp_micros_for_native_writer(
     context: &str,
 ) -> Result<ArrayRef, String> {
     if let Some(fixed) = column.as_any().downcast_ref::<FixedSizeBinaryArray>()
-        && fixed.value_length() == crate::common::largeint::LARGEINT_BYTE_WIDTH
+        && fixed.value_length() == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
     {
         let values = decode_largeint_values(column, column_index, column_name, context)?;
         let mut out = Vec::with_capacity(values.len());
@@ -482,7 +482,7 @@ fn numeric_values_as_i128_for_native_writer(
                 out
             }
             arrow::datatypes::DataType::FixedSizeBinary(width)
-                if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+                if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
             {
                 decode_largeint_values(column, column_index, column_name, context)?
             }
@@ -698,7 +698,7 @@ fn numeric_values_as_f64_for_native_writer(
             out
         }
         arrow::datatypes::DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let values = decode_largeint_values(column, column_index, column_name, context)?;
             let mut out = Vec::with_capacity(values.len());
@@ -1227,11 +1227,11 @@ fn prepare_short_key_value_column(
         ),
         NativeWriterType::LargeInt => {
             if let Some(typed) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                if typed.value_length() != crate::common::largeint::LARGEINT_BYTE_WIDTH {
+                if typed.value_length() != novarocks_types::largeint::LARGEINT_BYTE_WIDTH {
                     return Err(format!(
                         "invalid LARGEINT fixed-size binary width for short key writer: column_index={}, expected={}, actual={}",
                         column_index,
-                        crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                        novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
                         typed.value_length()
                     ));
                 }
@@ -1410,7 +1410,7 @@ fn encode_short_key_value_bytes(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
             {
-                crate::common::largeint::i128_from_be_bytes(typed.value(row_idx)).map_err(|e| {
+                novarocks_types::largeint::i128_from_be_bytes(typed.value(row_idx)).map_err(|e| {
                     format!(
                         "decode LARGEINT fixed-size binary failed for short key writer: column_index={}, row_index={}, error={}",
                         column_index, row_idx, e
@@ -3117,13 +3117,13 @@ fn decode_largeint_values(
     context: &str,
 ) -> Result<Vec<Option<i128>>, String> {
     if let Some(typed) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-        if typed.value_length() != crate::common::largeint::LARGEINT_BYTE_WIDTH {
+        if typed.value_length() != novarocks_types::largeint::LARGEINT_BYTE_WIDTH {
             return Err(format!(
                 "invalid LARGEINT fixed-size binary width for native segment writer {}: column_index={}, column_name={}, expected={}, actual={}",
                 context,
                 column_index,
                 column_name,
-                crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
                 typed.value_length()
             ));
         }
@@ -3133,7 +3133,7 @@ fn decode_largeint_values(
                 values.push(None);
                 continue;
             }
-            let value = crate::common::largeint::i128_from_be_bytes(typed.value(row)).map_err(|e| {
+            let value = novarocks_types::largeint::i128_from_be_bytes(typed.value(row)).map_err(|e| {
                 format!(
                     "decode LARGEINT fixed-size binary failed for native segment writer {}: column_index={}, column_name={}, row={}, error={}",
                     context, column_index, column_name, row, e

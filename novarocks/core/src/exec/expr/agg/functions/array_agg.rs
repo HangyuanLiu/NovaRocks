@@ -27,8 +27,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 
-use crate::common::largeint;
 use crate::exec::node::aggregate::AggFunction;
+use novarocks_types::largeint;
 
 use super::super::*;
 use super::AggregateFunction;

@@ -28,7 +28,7 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use chrono::{DateTime, NaiveDate};
 use std::cmp::Ordering;
 
-use crate::common::largeint;
+use novarocks_types::largeint;
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
 
 fn date32_to_naive(days: i32) -> Option<NaiveDate> {

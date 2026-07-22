@@ -4292,14 +4292,14 @@ fn recompute_case_result_type(
         if result_type == DataType::Null {
             result_type = then_expr.data_type.clone();
         } else {
-            result_type = crate::types::wider_type(&result_type, &then_expr.data_type);
+            result_type = novarocks_types::wider_type(&result_type, &then_expr.data_type);
         }
     }
     if let Some(expr) = else_expr {
         if result_type == DataType::Null {
             result_type = expr.data_type.clone();
         } else {
-            result_type = crate::types::wider_type(&result_type, &expr.data_type);
+            result_type = novarocks_types::wider_type(&result_type, &expr.data_type);
         }
     }
     if result_type == DataType::Null {

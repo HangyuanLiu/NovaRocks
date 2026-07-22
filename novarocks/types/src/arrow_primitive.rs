@@ -18,8 +18,8 @@
 
 use arrow::datatypes::{DataType, Field};
 
-use crate::types::logical::{LogicalType, logical_type_of_field};
-use crate::types::primitive::PrimitiveType;
+use crate::logical::{LogicalType, logical_type_of_field};
+use crate::primitive::PrimitiveType;
 
 pub(crate) fn logical_type_to_primitive(logical_type: LogicalType) -> PrimitiveType {
     match logical_type {
@@ -34,7 +34,7 @@ pub(crate) fn field_logical_primitive(field: &Field) -> Option<PrimitiveType> {
     logical_type_of_field(field).map(logical_type_to_primitive)
 }
 
-pub(crate) fn arrow_field_to_primitive(field: &Field) -> Option<PrimitiveType> {
+pub fn arrow_field_to_primitive(field: &Field) -> Option<PrimitiveType> {
     field_logical_primitive(field).or_else(|| arrow_type_to_primitive(field.data_type()).ok())
 }
 
@@ -68,7 +68,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::*;
-    use crate::types::logical::{LogicalType, field_with_logical_type};
+    use crate::logical::{LogicalType, field_with_logical_type};
 
     #[test]
     fn arrow_field_to_primitive_honors_json_metadata() {

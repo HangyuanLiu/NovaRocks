@@ -34,7 +34,7 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_layout_with_nullable_tuples,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
-use crate::types::wider_type;
+use novarocks_types::wider_type;
 
 use crate::thrift::{descriptors, plan_nodes, runtime_filter, types};
 
@@ -46,7 +46,7 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
         (
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
-        ) => Ok(Some(crate::types::coercion::decimal_compare_type(
+        ) => Ok(Some(novarocks_types::coercion::decimal_compare_type(
             left, right,
         )?)),
         (DataType::List(left_field), DataType::List(right_field)) => {

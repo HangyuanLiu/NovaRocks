@@ -23,8 +23,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use std::sync::Arc;
 
-use crate::common::largeint;
 use crate::exec::expr::agg::{FloatArrayView, IntArrayView};
+use novarocks_types::largeint;
 
 use super::hash::{
     canonical_f32_bits, canonical_f64_bits, combine_hash, hash_bytes_with_seed,

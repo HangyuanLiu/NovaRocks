@@ -37,8 +37,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 
-use crate::common::largeint;
 use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+use novarocks_types::largeint;
 
 use super::codec::{read_i8, read_i16_le, read_i32_le, read_i64_le, read_u8, read_u64_le};
 use super::{RuntimeDecimalWidth, RuntimeFilterType};
@@ -1171,9 +1171,9 @@ mod tests {
     use arrow::array::Int32Array;
 
     use super::{MinMaxValue, RuntimeMinMaxFilter};
-    use crate::common::largeint;
     use crate::common::min_max_predicate::MinMaxPredicateValue;
     use crate::exec::runtime_filter::RuntimeFilterType;
+    use novarocks_types::largeint;
 
     #[test]
     fn test_largeint_min_max_from_arrays() {

@@ -17,7 +17,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::connector::starrocks::schema::{
     LakeScanColumnHint, LakeScanTableSchema, StarRocksColumnSchema, StarRocksKeysType,
     StarRocksTabletSchema,
@@ -25,6 +24,7 @@ use crate::connector::starrocks::schema::{
 use crate::service::grpc_client::proto::starrocks::{
     CompactionStrategyPb, CompressionTypePb, PersistentIndexTypePb,
 };
+use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 
 pub(crate) fn build_sink_tablet_schema(
     schema: &crate::thrift::descriptors::TOlapTableSchemaParam,

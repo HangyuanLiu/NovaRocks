@@ -20,7 +20,7 @@ use arrow::datatypes::Field;
 pub(crate) const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum LogicalType {
+pub enum LogicalType {
     Json,
     Hll,
     Bitmap,
@@ -52,14 +52,14 @@ impl LogicalType {
     }
 }
 
-pub(crate) fn logical_type_of_field(field: &Field) -> Option<LogicalType> {
+pub fn logical_type_of_field(field: &Field) -> Option<LogicalType> {
     field
         .metadata()
         .get(NR_LOGICAL_TYPE_KEY)
         .and_then(|value| LogicalType::from_metadata_value(value))
 }
 
-pub(crate) fn field_with_logical_type(field: Field, logical_type: LogicalType) -> Field {
+pub fn field_with_logical_type(field: Field, logical_type: LogicalType) -> Field {
     let mut metadata = field.metadata().clone();
     metadata.insert(
         NR_LOGICAL_TYPE_KEY.to_string(),

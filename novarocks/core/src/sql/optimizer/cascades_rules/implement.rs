@@ -33,7 +33,7 @@ use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
 #[cfg(test)]
 use crate::sql::planner::payload::WindowExpr;
-use crate::types::wider_type;
+use novarocks_types::wider_type;
 
 pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
     memo.groups

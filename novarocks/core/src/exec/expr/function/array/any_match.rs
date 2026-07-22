@@ -35,8 +35,8 @@ pub fn eval_any_match(
 
     let mut values = list.values().clone();
     if values.data_type() != &DataType::Boolean {
-        if crate::common::largeint::is_largeint_data_type(values.data_type()) {
-            let typed = crate::common::largeint::as_fixed_size_binary_array(
+        if novarocks_types::largeint::is_largeint_data_type(values.data_type()) {
+            let typed = novarocks_types::largeint::as_fixed_size_binary_array(
                 &values,
                 "any_match LARGEINT to BOOLEAN",
             )?;
@@ -45,7 +45,7 @@ pub fn eval_any_match(
                 if typed.is_null(idx) {
                     out.push(None);
                 } else {
-                    out.push(Some(crate::common::largeint::value_at(typed, idx)? != 0));
+                    out.push(Some(novarocks_types::largeint::value_at(typed, idx)? != 0));
                 }
             }
             values = Arc::new(BooleanArray::from(out)) as ArrayRef;

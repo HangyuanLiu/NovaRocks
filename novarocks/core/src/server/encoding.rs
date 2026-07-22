@@ -158,7 +158,7 @@ pub(super) fn query_result_column_to_mysql_column(
         DataType::Float32 => ColumnType::MYSQL_TYPE_FLOAT,
         DataType::Float64 => ColumnType::MYSQL_TYPE_DOUBLE,
         DataType::FixedSizeBinary(width)
-            if width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             ColumnType::MYSQL_TYPE_STRING
         }
@@ -288,10 +288,10 @@ pub(super) fn array_value_to_mysql_value(
         DataType::Float64 => downcast_array::<Float64Array>(column, "Float64Array")
             .map(|arr| StandaloneMysqlValue::Double(arr.value(row_idx))),
         DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let arr = downcast_array::<FixedSizeBinaryArray>(column, "FixedSizeBinaryArray")?;
-            let value = crate::common::largeint::i128_from_be_bytes(arr.value(row_idx))?;
+            let value = novarocks_types::largeint::i128_from_be_bytes(arr.value(row_idx))?;
             Ok(StandaloneMysqlValue::Bytes(value.to_string().into_bytes()))
         }
         DataType::Utf8 => downcast_array::<StringArray>(column, "StringArray")
@@ -568,7 +568,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-    use crate::types::logical::{LogicalType, field_with_logical_type};
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     #[test]
     fn declared_date_timestamp_value_serializes_without_time_component() {

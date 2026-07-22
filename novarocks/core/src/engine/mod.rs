@@ -5776,15 +5776,15 @@ mysql_port = 47892
         assert_eq!(
             super::sql_type_to_arrow_type(&crate::catalog::schema::SqlType::LargeInt)
                 .expect("map largeint type"),
-            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
         );
     }
 
     #[test]
     fn build_local_insert_batch_supports_largeint_columns() {
         use crate::catalog::schema::ColumnDef;
-        use crate::common::largeint;
         use crate::sql::parser::ast::Literal;
+        use novarocks_types::largeint;
 
         let columns = vec![ColumnDef {
             name: "v".to_string(),

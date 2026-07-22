@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::thrift::types;
-use crate::types::logical::{LogicalType, field_with_logical_type};
+use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 const THRIFT_TIME_UNIT_MICROS: i32 = 2;
 pub(crate) const THRIFT_TIME_UNIT_NANOS: i32 = 3;

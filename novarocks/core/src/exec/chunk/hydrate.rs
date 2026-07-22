@@ -119,7 +119,7 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
-    use crate::types::logical::{LogicalType, field_with_logical_type};
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     fn dict_utf8_with_nulls_and_empty() -> ArrayRef {
         Arc::new(

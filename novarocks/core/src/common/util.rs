@@ -28,11 +28,11 @@ use chrono::{DateTime, Datelike, NaiveDate};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use crate::common::largeint;
 use crate::exec::variant::VariantValue;
-use crate::types::PrimitiveType;
-use crate::types::arrow_primitive::arrow_field_to_primitive;
-use crate::types::logical::{LogicalType, logical_type_of_field};
+use novarocks_types::PrimitiveType;
+use novarocks_types::arrow_primitive::arrow_field_to_primitive;
+use novarocks_types::largeint;
+use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FieldRenderSchema {
@@ -1702,8 +1702,8 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray, Time64MicrosecondArray};
     use arrow::datatypes::{DataType, Field, TimeUnit};
 
-    use crate::types::PrimitiveType;
-    use crate::types::logical::{LogicalType, field_with_logical_type};
+    use novarocks_types::PrimitiveType;
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     #[test]
     fn format_timestamp_microsecond_omits_zero_fraction() {

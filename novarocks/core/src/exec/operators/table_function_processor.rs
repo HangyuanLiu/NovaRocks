@@ -40,13 +40,13 @@ use arrow::datatypes::{DataType, Field};
 use arrow_data::transform::MutableArrayData;
 
 use crate::common::ids::SlotId;
-use crate::common::largeint;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::function::object::bitmap_common;
 use crate::exec::node::table_function::TableFunctionOutputSlot;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_types::largeint;
 
 const MAX_TABLE_FUNCTION_OUTPUT_ROWS: usize = u32::MAX as usize;
 

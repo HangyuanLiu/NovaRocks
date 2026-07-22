@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use crate::types::predicate::{is_integer, is_largeint};
+use crate::predicate::{is_integer, is_largeint};
 
 fn wider_decimal_type(
     left_precision: u8,
@@ -43,14 +43,14 @@ fn wider_decimal_type(
 }
 
 /// Determine the wider type for unifying two types (comparisons, CASE, UNION, etc.).
-pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
+pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
     if a == b {
         return a.clone();
     }
     match (a, b) {
         (DataType::Null, other) | (other, DataType::Null) => other.clone(),
         (l, r) if (is_largeint(l) && is_integer(r)) || (is_integer(l) && is_largeint(r)) => {
-            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
+            DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH)
         }
         (DataType::List(left_field), DataType::List(right_field)) => {
             DataType::List(Arc::new(Field::new(
@@ -216,7 +216,7 @@ fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {
 /// Decimal256 when the precision exceeds 38 or either side is already 256;
 /// errors when it would exceed 76 (Decimal256 max). This is the single source
 /// shared by `comparison_common_type`, lower binary_pred, and lower join-key.
-pub(crate) fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
+pub fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
     let (lp, ls, left_is_256) = match left {
         DataType::Decimal128(p, s) => (*p, *s, false),
         DataType::Decimal256(p, s) => (*p, *s, true),
@@ -269,7 +269,7 @@ pub(crate) fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<
 /// -> cast BOTH operands to `t`.
 /// `Err`: decimal-compatible pair whose common precision exceeds Decimal256
 /// (> 76).
-pub(crate) fn comparison_common_type(
+pub fn comparison_common_type(
     left: &DataType,
     right: &DataType,
 ) -> Result<Option<DataType>, String> {
@@ -310,7 +310,7 @@ pub(crate) fn comparison_common_type(
         || ((is_int(left) || is_bool(left)) && is_largeint(right))
     {
         return Ok(Some(DataType::FixedSizeBinary(
-            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+            crate::largeint::LARGEINT_BYTE_WIDTH,
         )));
     }
     if (is_bool(left) && is_int(right)) || (is_int(left) && is_bool(right)) {
@@ -584,7 +584,7 @@ mod tests {
             comparison_common_type(&DataType::Utf8, &DataType::Float64),
             Ok(Some(DataType::Float64))
         );
-        let largeint = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        let largeint = DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH);
         assert_eq!(
             comparison_common_type(&largeint, &DataType::Decimal128(10, 2)),
             Ok(None)
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn comparison_common_type_boolean_null_and_largeint_edges() {
-        let largeint = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        let largeint = DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH);
 
         assert_eq!(
             comparison_common_type(&DataType::Boolean, &DataType::Int64),

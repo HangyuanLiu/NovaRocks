@@ -37,10 +37,10 @@ use crate::coordinator::prepare::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
 };
 use crate::proto::{common, plan};
+use crate::protocol::native::type_mapping::encode_type;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::table as table_model;
-use crate::types::native_proto::encode_type;
 
 pub(super) fn encode_scan_node(
     src: &crate::sql::planner::payload::PlanScanNode,

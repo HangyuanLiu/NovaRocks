@@ -17,6 +17,7 @@
 
 pub(crate) mod compat;
 pub(crate) mod decode;
+pub(crate) mod type_mapping;
 
 #[cfg(test)]
 mod tests {

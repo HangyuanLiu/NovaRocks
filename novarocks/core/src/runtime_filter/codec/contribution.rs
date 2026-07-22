@@ -20,7 +20,6 @@ use std::fmt;
 
 use arrow::datatypes::{DataType, TimeUnit};
 
-use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::final_domain::{
     CompletionFence, FinalDomainError, FinalDomainShard, RuntimeCompletionFenceContract,
@@ -34,6 +33,7 @@ use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopK
 use crate::runtime_filter::port::value_domain::{
     ContributionSizeError, FINGERPRINT_VERSION_TAG, MembershipValues, ValueDomainDelta,
 };
+use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 
 const MAGIC: &[u8; 4] = b"NRFC";
 const CODEC_VERSION: u16 = 1;
@@ -1156,7 +1156,6 @@ mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
     use super::*;
-    use crate::common::largeint::LARGEINT_BYTE_WIDTH;
     use crate::common::types::UniqueId;
     use crate::runtime_filter::model::contract::{
         BindingId, ChannelId, CompletionFenceKind, NullOrder, NullSemantics, OrderContract,
@@ -1171,6 +1170,7 @@ mod tests {
         comparator_digest_for_test,
     };
     use crate::runtime_filter::port::value_domain::MembershipValues;
+    use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 
     struct CountingAllocator {
         calls: Cell<usize>,

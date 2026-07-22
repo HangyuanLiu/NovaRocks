@@ -14,11 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::largeint;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Int64Array};
 use md5::{Digest, Md5};
+use novarocks_types::largeint;
 use std::sync::Arc;
 
 pub fn eval_md5sum_numeric(

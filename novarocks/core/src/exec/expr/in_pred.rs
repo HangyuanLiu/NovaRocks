@@ -663,7 +663,8 @@ fn normalize_scalar_candidate_types(
         return Ok((left, right));
     }
 
-    let Some(target) = crate::types::comparison_common_type(left.data_type(), right.data_type())?
+    let Some(target) =
+        novarocks_types::comparison_common_type(left.data_type(), right.data_type())?
     else {
         return Ok((left, right));
     };

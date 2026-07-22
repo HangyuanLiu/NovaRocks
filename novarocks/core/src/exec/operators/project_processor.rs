@@ -625,7 +625,7 @@ mod tests {
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::pipeline::operator::ProcessorOperator;
-    use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
+    use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)

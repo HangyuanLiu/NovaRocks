@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 use super::LiteralValue;
-use crate::common::largeint;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, NullArray,
     StringArray,
 };
+use novarocks_types::largeint;
 use std::sync::Arc;
 
 pub fn eval(value: &LiteralValue, len: usize) -> Result<ArrayRef, String> {

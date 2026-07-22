@@ -37,11 +37,11 @@ use arrow::record_batch::RecordBatch;
 use arrow_buffer::i256;
 use chrono::{DateTime, NaiveDate};
 
-use crate::common::largeint;
 use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::service::grpc_client::proto::starrocks::{
     PScalarType, PTypeDesc, PTypeNode, SegmentMetadataPb, TuplePb, VariantPb, VariantTypePb,
 };
+use novarocks_types::largeint;
 
 const TYPE_NODE_SCALAR: i32 = 0;
 const DATE32_UNIX_EPOCH_DAY_OFFSET: i32 = 719_163; // 1970-01-01 in proleptic Gregorian days

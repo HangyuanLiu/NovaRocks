@@ -33,7 +33,7 @@ use crate::exec::node::join::{
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
-use crate::types::wider_type;
+use novarocks_types::wider_type;
 
 pub(super) fn lower_hash_join_node(
     node: &plan::DistributedNode,
@@ -405,7 +405,7 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
         (
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
-        ) => Ok(Some(crate::types::coercion::decimal_compare_type(
+        ) => Ok(Some(novarocks_types::coercion::decimal_compare_type(
             left, right,
         )?)),
         (DataType::List(left_field), DataType::List(right_field)) => {
