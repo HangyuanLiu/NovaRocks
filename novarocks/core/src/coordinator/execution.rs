@@ -1676,15 +1676,15 @@ fn native_cte_multicast_contract_slot_map(
 // In-flight instance tracking (per-backend cancellation)
 // ---------------------------------------------------------------------------
 
-/// Tracks submitted fragment instances grouped by backend so that, on any
-/// failure, cancellation can fan out to every backend that accepted work.
+/// Tracks attempted fragment instances grouped by backend so that, on any
+/// failure, cancellation can cover work whose submit outcome is unknown.
 #[derive(Default)]
 pub(crate) struct InFlightTracker {
     pub(crate) by_backend: BTreeMap<usize, Vec<UniqueId>>,
 }
 
 impl InFlightTracker {
-    /// Record that `finst_id` was submitted to `backend_idx`.
+    /// Record that submission of `finst_id` is in flight on `backend_idx`.
     pub(crate) fn record_submitted(&mut self, backend_idx: usize, finst_id: UniqueId) {
         self.by_backend
             .entry(backend_idx)
@@ -1818,8 +1818,8 @@ fn prevalidate_fragment_submissions(
 /// Submit each `(backend_idx, params)` through the dispatcher in order, tracking
 /// accepted instances per backend, then poll the root fragment until EOF.
 ///
-/// On any submit failure or fetch error, all already-submitted instances are
-/// cancelled (fanned out per backend) before the error is returned.
+/// On any submit failure or fetch error, all attempted instances are cancelled
+/// (fanned out per backend) before the error is returned.
 #[cfg(test)]
 pub(crate) fn submit_and_fetch_loop(
     dispatcher: &Arc<dyn FragmentDispatcher>,
@@ -1869,7 +1869,7 @@ fn submit_and_fetch_loop_with_deployment_lease(
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
     collect_profiles: bool,
     observer: &dyn CoordinatorObserver,
-    installed_runtime_filter_deployment: Option<InstalledRuntimeFilterDeployment>,
+    mut installed_runtime_filter_deployment: Option<InstalledRuntimeFilterDeployment>,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
     let runtime_query_id = crate::runtime::query_context::QueryId {
@@ -1888,20 +1888,14 @@ fn submit_and_fetch_loop_with_deployment_lease(
         root_backend_idx,
         root_finst_id,
     ) {
-        Ok(validated_finst_ids) => {
-            if let Some(deployment) = installed_runtime_filter_deployment {
-                deployment.release();
-            }
-            validated_finst_ids
-        }
+        Ok(validated_finst_ids) => validated_finst_ids,
         Err(primary_error) => {
-            return Err(match installed_runtime_filter_deployment {
+            return Err(match installed_runtime_filter_deployment.take() {
                 Some(deployment) => deployment.abort_preserving(primary_error),
                 None => primary_error,
             });
         }
     };
-
     // Register every validated placement before the first remote submission.
     // Otherwise a backend-loss event between submit success and registration
     // can miss the query permanently because the registry emits only the state
@@ -1916,15 +1910,21 @@ fn submit_and_fetch_loop_with_deployment_lease(
     }
 
     for ((backend_idx, submission), finst_id) in submissions.into_iter().zip(validated_finst_ids) {
+        // A unary submit may return an error after the remote participant has
+        // accepted the fragment. Arm cancellation before dispatch so the
+        // unknown-outcome attempt is covered together with prior accepts.
+        tracker.record_submitted(backend_idx, finst_id.clone());
         if let Err(e) = dispatcher.submit_fragment(backend_idx, submission) {
             tracker.cancel_all(dispatcher.as_ref());
-            return Err(e);
+            return Err(match installed_runtime_filter_deployment.take() {
+                Some(deployment) => deployment.abort_preserving(e),
+                None => e,
+            });
         }
         observer.fragment_scheduled();
         if let Some(registry) = crate::coordinator::cluster::backend_registry() {
             registry.record_scheduled_fragment(backend_idx as crate::coordinator::cluster::BeId);
         }
-        tracker.record_submitted(backend_idx, finst_id.clone());
         if crate::runtime::query_state::in_flight_table().state(runtime_query_id)
             == Some(QueryState::Failed)
         {
@@ -1932,8 +1932,15 @@ fn submit_and_fetch_loop_with_deployment_lease(
                 .failure_reason(runtime_query_id)
                 .unwrap_or_else(|| format!("query {} failed", runtime_query_id));
             tracker.cancel_all(dispatcher.as_ref());
-            return Err(reason);
+            return Err(match installed_runtime_filter_deployment.take() {
+                Some(deployment) => deployment.abort_preserving(reason),
+                None => reason,
+            });
         }
+    }
+
+    if let Some(deployment) = installed_runtime_filter_deployment.take() {
+        deployment.release();
     }
 
     let mut chunks = Vec::new();
@@ -3099,7 +3106,7 @@ mod native_contract_tests {
     }
 
     #[test]
-    fn submit_failure_cancels_only_native_instances_already_accepted() {
+    fn submit_failure_cancels_accepted_and_unknown_outcome_native_instances() {
         let inner = CapturingDispatcher::new(Some(2));
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let observer = CountingCoordinatorObserver::default();
@@ -3132,7 +3139,10 @@ mod native_contract_tests {
         assert!(err.contains("native submit failed on call 2"), "{err}");
         assert_eq!(
             *inner.cancellations.lock().unwrap(),
-            vec![(1, vec![UniqueId { hi: 92_000, lo: 1 }])]
+            vec![
+                (0, vec![UniqueId { hi: 92_000, lo: 2 }]),
+                (1, vec![UniqueId { hi: 92_000, lo: 1 }]),
+            ]
         );
         assert_eq!(observer.0.load(Ordering::SeqCst), 1);
     }
@@ -4184,16 +4194,22 @@ mod native_contract_tests {
         use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
         type InstallGate = tokio::sync::oneshot::Receiver<Result<(), String>>;
+        type AbortGate = tokio::sync::oneshot::Receiver<()>;
 
         #[derive(Default)]
         struct RecordingDeploymentControl {
             install_results: Mutex<BTreeMap<u32, Result<(), String>>>,
             abort_results: Mutex<BTreeMap<u32, Result<(), String>>>,
             install_gates: Mutex<BTreeMap<u32, InstallGate>>,
+            abort_gates: Mutex<BTreeMap<u32, AbortGate>>,
             install_calls: Mutex<Vec<u32>>,
             abort_calls: Mutex<Vec<u32>>,
+            live_installations: Mutex<BTreeSet<u32>>,
+            tombstones: Mutex<BTreeSet<u32>>,
+            install_side_effect_on_error: Mutex<BTreeSet<u32>>,
             events: Arc<Mutex<Vec<String>>>,
             install_started: Mutex<Option<SyncSender<u32>>>,
+            abort_started: Mutex<Option<SyncSender<u32>>>,
         }
 
         impl RecordingDeploymentControl {
@@ -4221,6 +4237,14 @@ mod native_contract_tests {
                 self
             }
 
+            fn with_install_side_effect_on_error(self: Arc<Self>, participant: u32) -> Arc<Self> {
+                self.install_side_effect_on_error
+                    .lock()
+                    .unwrap()
+                    .insert(participant);
+                self
+            }
+
             fn gate_install(
                 &self,
                 participant: u32,
@@ -4230,12 +4254,26 @@ mod native_contract_tests {
                 tx
             }
 
+            fn gate_abort(&self, participant: u32) -> tokio::sync::oneshot::Sender<()> {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.abort_gates.lock().unwrap().insert(participant, rx);
+                tx
+            }
+
             fn install_calls(&self) -> Vec<u32> {
                 self.install_calls.lock().unwrap().clone()
             }
 
             fn abort_calls(&self) -> Vec<u32> {
                 self.abort_calls.lock().unwrap().clone()
+            }
+
+            fn live_installations(&self) -> BTreeSet<u32> {
+                self.live_installations.lock().unwrap().clone()
+            }
+
+            fn tombstones(&self) -> BTreeSet<u32> {
+                self.tombstones.lock().unwrap().clone()
             }
         }
 
@@ -4259,15 +4297,31 @@ mod native_contract_tests {
                 if let Some(started) = self.install_started.lock().unwrap().as_ref() {
                     started.send(participant).expect("bounded start receiver");
                 }
-                let gate = self.install_gates.lock().unwrap().remove(&participant);
-                if let Some(gate) = gate {
-                    return gate.await.expect("install gate sender");
+                if self.tombstones.lock().unwrap().contains(&participant) {
+                    return Err(format!(
+                        "runtime filter deployment participant {participant} is tombstoned"
+                    ));
                 }
-                self.install_results
-                    .lock()
-                    .unwrap()
-                    .remove(&participant)
-                    .unwrap_or(Ok(()))
+                let gate = self.install_gates.lock().unwrap().remove(&participant);
+                let result = if let Some(gate) = gate {
+                    gate.await.expect("install gate sender")
+                } else {
+                    self.install_results
+                        .lock()
+                        .unwrap()
+                        .remove(&participant)
+                        .unwrap_or(Ok(()))
+                };
+                if result.is_ok()
+                    || self
+                        .install_side_effect_on_error
+                        .lock()
+                        .unwrap()
+                        .remove(&participant)
+                {
+                    self.live_installations.lock().unwrap().insert(participant);
+                }
+                result
             }
 
             async fn abort(
@@ -4284,6 +4338,15 @@ mod native_contract_tests {
                     .unwrap()
                     .push(format!("abort:{participant}"));
                 self.abort_calls.lock().unwrap().push(participant);
+                if let Some(started) = self.abort_started.lock().unwrap().as_ref() {
+                    started.send(participant).expect("bounded start receiver");
+                }
+                let gate = self.abort_gates.lock().unwrap().remove(&participant);
+                if let Some(gate) = gate {
+                    gate.await.expect("abort gate sender");
+                }
+                self.tombstones.lock().unwrap().insert(participant);
+                self.live_installations.lock().unwrap().remove(&participant);
                 self.abort_results
                     .lock()
                     .unwrap()
@@ -4334,6 +4397,30 @@ mod native_contract_tests {
                 RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
                     .expect("empty test routing shard"),
             )
+        }
+
+        fn installed_deployment(
+            control: Arc<RecordingDeploymentControl>,
+            query_id: UniqueId,
+            participants: &[u32],
+        ) -> InstalledRuntimeFilterDeployment {
+            RuntimeFilterInstallBarrier::new(control)
+                .install_all_or_rollback(
+                    query_id,
+                    DeploymentEpoch::new(17),
+                    lifecycle(),
+                    Duration::from_secs(1),
+                    participants
+                        .iter()
+                        .map(|participant| {
+                            (
+                                RuntimeFilterParticipantId::new(*participant),
+                                participant_install(*participant),
+                            )
+                        })
+                        .collect(),
+                )
+                .expect("test deployment installs")
         }
 
         fn membership_graph() -> RuntimeFilterGraph {
@@ -4601,7 +4688,26 @@ mod native_contract_tests {
         }
 
         #[test]
-        fn install_failure_submits_zero_fragments_and_aborts_acked_participants() {
+        fn unreleased_deployment_drop_aborts_every_participant() {
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let deployment = installed_deployment(
+                control.clone(),
+                UniqueId {
+                    hi: 95_000,
+                    lo: 95_001,
+                },
+                &[1, 2],
+            );
+
+            drop(deployment);
+
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
+        }
+
+        #[test]
+        fn install_unknown_outcome_submits_zero_fragments_and_aborts_every_attempted_participant() {
             let integrated_control = Arc::new(RecordingDeploymentControl::default())
                 .with_install_result(1, Err("coordinator install refused".to_string()));
             let dispatcher = CapturingDispatcher::new(None);
@@ -4620,7 +4726,8 @@ mod native_contract_tests {
             assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 0);
 
             let control = Arc::new(RecordingDeploymentControl::default())
-                .with_install_result(2, Err("install refused".to_string()));
+                .with_install_result(2, Err("install ACK was lost".to_string()))
+                .with_install_side_effect_on_error(2);
             let submitted = AtomicUsize::new(0);
             let error = RuntimeFilterInstallBarrier::new(control.clone())
                 .install_all_or_rollback(
@@ -4641,8 +4748,191 @@ mod native_contract_tests {
                 .expect("install failure must trigger rollback");
 
             assert!(error.contains("participant 2"), "{error}");
+            assert!(error.contains("install ACK was lost"), "{error}");
             assert_eq!(submitted.load(Ordering::SeqCst), 0);
-            assert_eq!(control.abort_calls(), vec![1]);
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
+
+            let late_install = crate::runtime::global_async_runtime::data_block_on(async {
+                control
+                    .install(
+                        UniqueId { hi: 3, lo: 4 },
+                        lifecycle(),
+                        Duration::from_secs(1),
+                        RuntimeFilterParticipantId::new(2),
+                        participant_install(2),
+                    )
+                    .await
+            })
+            .expect("data runtime remains available")
+            .expect_err("rollback tombstone must reject a late install");
+            assert!(late_install.contains("tombstoned"), "{late_install}");
+            assert!(control.live_installations().is_empty());
+        }
+
+        #[test]
+        fn rollback_fans_out_to_every_attempted_participant_in_parallel() {
+            let (started_tx, started_rx) = sync_channel(2);
+            let control = Arc::new(RecordingDeploymentControl {
+                abort_started: Mutex::new(Some(started_tx)),
+                ..Default::default()
+            })
+            .with_install_result(2, Err("install outcome unknown".to_string()));
+            let first_abort = control.gate_abort(1);
+            let second_abort = control.gate_abort(2);
+            let (result_tx, result_rx) = sync_channel(1);
+            let barrier_control = control.clone();
+            std::thread::spawn(move || {
+                let result = RuntimeFilterInstallBarrier::new(barrier_control)
+                    .install_all_or_rollback(
+                        UniqueId { hi: 8, lo: 9 },
+                        DeploymentEpoch::new(17),
+                        lifecycle(),
+                        Duration::from_secs(1),
+                        vec![
+                            (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                            (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                        ],
+                    );
+                result_tx.send(result).expect("bounded result receiver");
+            });
+
+            let mut started = BTreeSet::new();
+            started.insert(
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("first rollback starts"),
+            );
+            started.insert(
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("second rollback starts"),
+            );
+            assert_eq!(started, BTreeSet::from([1, 2]));
+            assert!(
+                result_rx.try_recv().is_err(),
+                "rollback must wait for every participant"
+            );
+            first_abort.send(()).expect("release first rollback");
+            second_abort.send(()).expect("release second rollback");
+
+            let error = result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("barrier returns after rollback fanout")
+                .err()
+                .expect("unknown install outcome remains the primary error");
+            assert!(error.contains("install outcome unknown"), "{error}");
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+        }
+
+        #[test]
+        fn first_submit_failure_cancels_in_flight_fragment_and_aborts_entire_deployment() {
+            let query_id = UniqueId {
+                hi: 96_000,
+                lo: 96_001,
+            };
+            let first_finst_id = UniqueId { hi: 96_000, lo: 1 };
+            let root_finst_id = UniqueId { hi: 96_000, lo: 2 };
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let deployment = installed_deployment(control.clone(), query_id, &[1, 2]);
+            let dispatcher = CapturingDispatcher::new(Some(1));
+            let dispatcher_port: Arc<dyn FragmentDispatcher> = dispatcher.clone();
+            let mut tracker = InFlightTracker::default();
+
+            let error = submit_and_fetch_loop_with_deployment_lease(
+                &dispatcher_port,
+                &mut tracker,
+                vec![
+                    (1, submission(3, query_id, first_finst_id)),
+                    (0, submission(7, query_id, root_finst_id)),
+                ],
+                7,
+                0,
+                root_finst_id,
+                &query_id,
+                true,
+                1_000,
+                None,
+                None,
+                false,
+                &CountingCoordinatorObserver::default(),
+                Some(deployment),
+            )
+            .expect_err("first submit failure must abort the installed deployment");
+
+            assert!(
+                error.starts_with("native submit failed on call 1"),
+                "{error}"
+            );
+            assert_eq!(
+                *dispatcher.cancellations.lock().unwrap(),
+                vec![(1, vec![first_finst_id])]
+            );
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
+            assert_eq!(
+                crate::runtime::query_state::in_flight_table().state(
+                    crate::runtime::query_context::QueryId {
+                        hi: query_id.hi,
+                        lo: query_id.lo,
+                    }
+                ),
+                None,
+                "failed submission must not leak a query-state registration"
+            );
+        }
+
+        #[test]
+        fn middle_submit_failure_cancels_every_attempt_and_preserves_abort_context() {
+            let query_id = UniqueId {
+                hi: 97_000,
+                lo: 97_001,
+            };
+            let first_finst_id = UniqueId { hi: 97_000, lo: 1 };
+            let root_finst_id = UniqueId { hi: 97_000, lo: 2 };
+            let control = Arc::new(RecordingDeploymentControl::default())
+                .with_abort_result(2, Err("participant-two abort failed".to_string()));
+            let deployment = installed_deployment(control.clone(), query_id, &[1, 2]);
+            let dispatcher = CapturingDispatcher::new(Some(2));
+            let dispatcher_port: Arc<dyn FragmentDispatcher> = dispatcher.clone();
+            let mut tracker = InFlightTracker::default();
+
+            let error = submit_and_fetch_loop_with_deployment_lease(
+                &dispatcher_port,
+                &mut tracker,
+                vec![
+                    (1, submission(3, query_id, first_finst_id)),
+                    (0, submission(7, query_id, root_finst_id)),
+                ],
+                7,
+                0,
+                root_finst_id,
+                &query_id,
+                true,
+                1_000,
+                None,
+                None,
+                false,
+                &CountingCoordinatorObserver::default(),
+                Some(deployment),
+            )
+            .expect_err("middle submit failure must abort the installed deployment");
+
+            assert!(
+                error.starts_with("native submit failed on call 2"),
+                "{error}"
+            );
+            assert!(error.contains("rollback failures"), "{error}");
+            assert!(error.contains("participant-two abort failed"), "{error}");
+            assert_eq!(
+                *dispatcher.cancellations.lock().unwrap(),
+                vec![(0, vec![root_finst_id]), (1, vec![first_finst_id]),]
+            );
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
         }
 
         #[test]

@@ -189,25 +189,45 @@ pub(crate) struct InstalledRuntimeFilterDeployment {
     query_id: UniqueId,
     epoch: DeploymentEpoch,
     deadline: Duration,
-    acknowledged: Vec<RuntimeFilterParticipantId>,
+    armed_participants: Option<Vec<RuntimeFilterParticipantId>>,
 }
 
 impl InstalledRuntimeFilterDeployment {
-    pub(crate) fn release(self) {}
+    pub(crate) fn release(mut self) {
+        self.armed_participants.take();
+    }
 
-    pub(crate) fn abort_preserving(self, primary_error: String) -> String {
+    pub(crate) fn abort_preserving(mut self, primary_error: String) -> String {
+        let participants = self.armed_participants.take().unwrap_or_default();
         let (rollback_failures, rollback_runtime_failure) = abort_participants(
             &self.control,
             self.query_id,
             self.epoch,
             self.deadline,
-            self.acknowledged,
+            participants,
         );
         append_rollback_context(
             primary_error,
             &rollback_failures,
             rollback_runtime_failure.as_deref(),
         )
+    }
+}
+
+impl Drop for InstalledRuntimeFilterDeployment {
+    fn drop(&mut self) {
+        let Some(participants) = self.armed_participants.take() else {
+            return;
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = abort_participants(
+                &self.control,
+                self.query_id,
+                self.epoch,
+                self.deadline,
+                participants,
+            );
+        }));
     }
 }
 
@@ -242,7 +262,12 @@ impl RuntimeFilterInstallBarrier {
             }
         }
 
-        let install_results = data_block_on(async {
+        let attempted = installs
+            .iter()
+            .map(|(participant, _)| *participant)
+            .collect::<Vec<_>>();
+
+        let install_results = match data_block_on(async {
             join_all(installs.into_iter().map(|(participant, install)| {
                 let control = Arc::clone(&self.control);
                 async move {
@@ -253,14 +278,24 @@ impl RuntimeFilterInstallBarrier {
                 }
             }))
             .await
-        })
-        .map_err(|error| format!("runtime filter install runtime failed: {error}"))?;
+        }) {
+            Ok(results) => results,
+            Err(error) => {
+                let primary_error = format!("runtime filter install runtime failed: {error}");
+                let (rollback_failures, rollback_runtime_failure) =
+                    abort_participants(&self.control, query_id, epoch, deadline, attempted);
+                return Err(append_rollback_context(
+                    primary_error,
+                    &rollback_failures,
+                    rollback_runtime_failure.as_deref(),
+                ));
+            }
+        };
 
-        let mut acknowledged = Vec::new();
         let mut install_failures = Vec::new();
         for (participant, result) in install_results {
             match result {
-                Ok(()) => acknowledged.push(participant),
+                Ok(()) => {}
                 Err(error) => install_failures.push((participant, error)),
             }
         }
@@ -270,12 +305,12 @@ impl RuntimeFilterInstallBarrier {
                 query_id,
                 epoch,
                 deadline,
-                acknowledged,
+                armed_participants: Some(attempted),
             });
         }
 
         let (rollback_failures, rollback_runtime_failure) =
-            abort_participants(&self.control, query_id, epoch, deadline, acknowledged);
+            abort_participants(&self.control, query_id, epoch, deadline, attempted);
 
         let (primary_participant, primary_error) = &install_failures[0];
         let mut message = format!(
