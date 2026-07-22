@@ -18,7 +18,6 @@ pub mod backend_id;
 pub(crate) mod descriptor_snapshot;
 pub(crate) mod endpoint;
 pub mod exchange;
-pub mod exchange_scan;
 pub mod exec_env;
 pub mod execution_services;
 pub(crate) mod fragment;

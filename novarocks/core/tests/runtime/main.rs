@@ -16,12 +16,9 @@
 // under the License.
 //! Integration tests for runtime components (exchange, query context, etc.).
 
-use std::time::Duration;
-
 use crate::common::{TestConfig, test_query_id};
 use novarocks::common::types::UniqueId;
 use novarocks::runtime::exchange::{self, ExchangeKey};
-use novarocks::runtime::exchange_scan::ExchangeScanOp;
 use novarocks::runtime::profile::Profiler;
 
 #[path = "../common/mod.rs"]
@@ -54,14 +51,6 @@ fn test_profile_module() {
     let profiler = Profiler::new("runtime_profile_smoke");
     let tree = profiler.to_native_tree();
     assert_eq!(tree.root.name, "runtime_profile_smoke");
-}
-
-#[test]
-fn test_exchange_scan_module() {
-    let key = sample_exchange_key(3);
-    let scan = ExchangeScanOp::new(key, 0, Duration::from_millis(1));
-    // execute_iter would block without registered senders; we only ensure constructor works.
-    let _scan = scan;
 }
 
 #[test]

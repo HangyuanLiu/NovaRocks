@@ -716,7 +716,6 @@ fn prepare_query_handoff(
         .query_options();
     let cache_options = CacheOptions::from_query_options(Some(query_options))?;
     let (delivery_expire, query_expire) = query_expire_durations(Some(query_options));
-    let mut exchange_senders = HashMap::new();
     let mut descriptor_snapshot = None;
     let mut total_fragments = None;
     let mut row_pos_descs = HashMap::new();
@@ -732,14 +731,6 @@ fn prepare_query_handoff(
             CacheOptions::from_query_options(Some(instance.runtime_options().query_options()))?;
         if incoming_cache != cache_options {
             return Err("cache options mismatch for query".to_string());
-        }
-        for (node_id, assignment) in instance.exchange_inputs().iter() {
-            exchange_senders
-                .entry(node_id.get())
-                .and_modify(|current: &mut usize| {
-                    *current = (*current).max(assignment.sender_count().get());
-                })
-                .or_insert(assignment.sender_count().get());
         }
         if let Some(snapshot) = item.metadata.descriptor_snapshot() {
             descriptor_snapshot = Some(Arc::new(snapshot.clone()));
@@ -797,7 +788,6 @@ fn prepare_query_handoff(
         query_expire,
         fragment_count: prepared.len(),
         cache_options,
-        exchange_senders,
         descriptor_snapshot,
         total_fragments,
         row_pos_descs,
