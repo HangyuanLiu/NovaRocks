@@ -183,6 +183,34 @@ pub(crate) struct RuntimeFilterInstallBarrier {
     control: Arc<dyn RuntimeFilterDeploymentControlPort>,
 }
 
+#[must_use = "the installed deployment must be released at submission or rolled back on error"]
+pub(crate) struct InstalledRuntimeFilterDeployment {
+    control: Arc<dyn RuntimeFilterDeploymentControlPort>,
+    query_id: UniqueId,
+    epoch: DeploymentEpoch,
+    deadline: Duration,
+    acknowledged: Vec<RuntimeFilterParticipantId>,
+}
+
+impl InstalledRuntimeFilterDeployment {
+    pub(crate) fn release(self) {}
+
+    pub(crate) fn abort_preserving(self, primary_error: String) -> String {
+        let (rollback_failures, rollback_runtime_failure) = abort_participants(
+            &self.control,
+            self.query_id,
+            self.epoch,
+            self.deadline,
+            self.acknowledged,
+        );
+        append_rollback_context(
+            primary_error,
+            &rollback_failures,
+            rollback_runtime_failure.as_deref(),
+        )
+    }
+}
+
 impl RuntimeFilterInstallBarrier {
     pub(crate) fn new(control: Arc<dyn RuntimeFilterDeploymentControlPort>) -> Self {
         Self { control }
@@ -195,7 +223,7 @@ impl RuntimeFilterInstallBarrier {
         lifecycle: RuntimeFilterQueryLifecycleOptions,
         deadline: Duration,
         mut installs: Vec<(RuntimeFilterParticipantId, RuntimeFilterParticipantInstall)>,
-    ) -> Result<(), String> {
+    ) -> Result<InstalledRuntimeFilterDeployment, String> {
         installs.sort_by_key(|(participant, _)| *participant);
         let mut seen = BTreeSet::new();
         for (participant, install) in &installs {
@@ -237,30 +265,17 @@ impl RuntimeFilterInstallBarrier {
             }
         }
         if install_failures.is_empty() {
-            return Ok(());
+            return Ok(InstalledRuntimeFilterDeployment {
+                control: Arc::clone(&self.control),
+                query_id,
+                epoch,
+                deadline,
+                acknowledged,
+            });
         }
 
-        let rollback_results = data_block_on(async {
-            join_all(acknowledged.into_iter().map(|participant| {
-                let control = Arc::clone(&self.control);
-                async move {
-                    let result = control.abort(query_id, epoch, deadline, participant).await;
-                    (participant, result)
-                }
-            }))
-            .await
-        });
-        let mut rollback_runtime_failure = None;
-        let rollback_failures = match rollback_results {
-            Ok(results) => results
-                .into_iter()
-                .filter_map(|(participant, result)| result.err().map(|error| (participant, error)))
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                rollback_runtime_failure = Some(error);
-                Vec::new()
-            }
-        };
+        let (rollback_failures, rollback_runtime_failure) =
+            abort_participants(&self.control, query_id, epoch, deadline, acknowledged);
 
         let (primary_participant, primary_error) = &install_failures[0];
         let mut message = format!(
@@ -276,19 +291,62 @@ impl RuntimeFilterInstallBarrier {
                 .join("; ");
             message.push_str(&format!("; additional install failures: [{additional}]"));
         }
-        if !rollback_failures.is_empty() {
-            let rollback = rollback_failures
-                .iter()
-                .map(|(participant, error)| format!("participant {}: {error}", participant.get()))
-                .collect::<Vec<_>>()
-                .join("; ");
-            message.push_str(&format!("; rollback failures: [{rollback}]"));
-        }
-        if let Some(error) = rollback_runtime_failure {
-            message.push_str(&format!("; rollback runtime failure: {error}"));
-        }
-        Err(message)
+        Err(append_rollback_context(
+            message,
+            &rollback_failures,
+            rollback_runtime_failure.as_deref(),
+        ))
     }
+}
+
+fn abort_participants(
+    control: &Arc<dyn RuntimeFilterDeploymentControlPort>,
+    query_id: UniqueId,
+    epoch: DeploymentEpoch,
+    deadline: Duration,
+    mut participants: Vec<RuntimeFilterParticipantId>,
+) -> (Vec<(RuntimeFilterParticipantId, String)>, Option<String>) {
+    participants.sort_unstable();
+    let rollback_results = data_block_on(async {
+        join_all(participants.into_iter().map(|participant| {
+            let control = Arc::clone(control);
+            async move {
+                let result = control.abort(query_id, epoch, deadline, participant).await;
+                (participant, result)
+            }
+        }))
+        .await
+    });
+    match rollback_results {
+        Ok(results) => {
+            let mut failures = results
+                .into_iter()
+                .filter_map(|(participant, result)| result.err().map(|error| (participant, error)))
+                .collect::<Vec<_>>();
+            failures.sort_by_key(|(participant, _)| *participant);
+            (failures, None)
+        }
+        Err(error) => (Vec::new(), Some(error)),
+    }
+}
+
+fn append_rollback_context(
+    mut primary_error: String,
+    rollback_failures: &[(RuntimeFilterParticipantId, String)],
+    rollback_runtime_failure: Option<&str>,
+) -> String {
+    if !rollback_failures.is_empty() {
+        let rollback = rollback_failures
+            .iter()
+            .map(|(participant, error)| format!("participant {}: {error}", participant.get()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        primary_error.push_str(&format!("; rollback failures: [{rollback}]"));
+    }
+    if let Some(error) = rollback_runtime_failure {
+        primary_error.push_str(&format!("; rollback runtime failure: {error}"));
+    }
+    primary_error
 }
 
 #[cfg(test)]
