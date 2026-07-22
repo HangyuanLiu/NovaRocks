@@ -45,10 +45,10 @@ use crate::runtime_filter::port::install::{
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::producer::{InstallContractError, InstallContractErrorKind};
 use crate::runtime_filter::port::routing::{
-    RuntimeFilterChannelRoutingView, RuntimeFilterRouteRole, RuntimeFilterRoutingShard,
+    RuntimeFilterChannelRoutingView, RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView,
+    RuntimeFilterRoutingShard, canonical_route_allowed_kinds,
 };
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
-use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 use crate::runtime_filter::port::value_domain::MembershipValues;
 
 pub(crate) fn validate_participant_install(
@@ -107,6 +107,7 @@ fn validate_view_with_routing<'a>(
 
     if let Some(shard) = routing_shard {
         for (channel_id, routing) in shard.channels() {
+            validate_route_family_contract(routing)?;
             let requires_core = routing.local_roles().iter().any(|role| {
                 matches!(
                     role,
@@ -185,6 +186,45 @@ fn validate_view_with_routing<'a>(
         validate_channel(channel, &mut profile_encodings, role_requirements)?;
     }
     Ok(())
+}
+
+fn validate_route_family_contract(
+    routing: &RuntimeFilterChannelRoutingView,
+) -> Result<(), InstallContractError> {
+    for edge in routing
+        .inbound_edges()
+        .iter()
+        .chain(routing.outbound_edges())
+    {
+        let Some(expected) =
+            canonical_route_allowed_kinds(edge.source().role(), edge.target().role())
+        else {
+            return Err(invalid_route_family(
+                edge,
+                "endpoint role pair is not canonical",
+            ));
+        };
+        if edge.allowed_kinds() != &expected {
+            return Err(invalid_route_family(
+                edge,
+                "allowed kinds do not exactly match the endpoint route family",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_route_family(edge: &RuntimeFilterRoutingEdgeView, detail: &str) -> InstallContractError {
+    install_error(
+        InstallContractErrorKind::UnsupportedChannelContract,
+        format!(
+            "routing edge {} {detail}: source {:?}, target {:?}, allowed {:?}",
+            edge.route_edge_id().get(),
+            edge.source().role(),
+            edge.target().role(),
+            edge.allowed_kinds(),
+        ),
+    )
 }
 
 fn validate_install_identities(
@@ -365,12 +405,6 @@ fn validate_channel_routing_contract(
             .filter(|edge| {
                 edge.target().participant_id() == local_participant_id
                     && edge.target().role() == RuntimeFilterRouteRole::Consumer(*binding_id)
-                    && (edge
-                        .allowed_kinds()
-                        .contains(&RuntimeFilterEnvelopeKind::Artifact)
-                        || edge
-                            .allowed_kinds()
-                            .contains(&RuntimeFilterEnvelopeKind::Unavailable))
             })
             .map(|edge| edge.route_edge_id())
             .collect::<BTreeSet<_>>();
@@ -397,21 +431,15 @@ fn validate_outbound_materialization_contract(
     routing: &RuntimeFilterChannelRoutingView,
 ) -> Result<(), InstallContractError> {
     let mut expected = BTreeMap::new();
-    for edge in routing.outbound_edges().iter().filter(|edge| {
-        edge.allowed_kinds()
-            .contains(&RuntimeFilterEnvelopeKind::Artifact)
-    }) {
-        if edge.source().participant_id() != local_participant_id
-            || !edge
-                .allowed_kinds()
-                .contains(&RuntimeFilterEnvelopeKind::Artifact)
-            || !edge
-                .allowed_kinds()
-                .contains(&RuntimeFilterEnvelopeKind::Unavailable)
-        {
+    for edge in routing
+        .outbound_edges()
+        .iter()
+        .filter(|edge| matches!(edge.target().role(), RuntimeFilterRouteRole::Consumer(_)))
+    {
+        if edge.source().participant_id() != local_participant_id {
             return Err(install_error(
                 InstallContractErrorKind::UnsupportedChannelContract,
-                "outbound materialization edge must originate locally and allow Artifact and Unavailable",
+                "outbound materialization edge must originate locally",
             ));
         }
         let owner = match edge.source().role() {
@@ -541,19 +569,6 @@ fn validate_aggregator_edges(
                 InstallContractErrorKind::UnsupportedChannelContract,
                 format!(
                     "aggregator producer binding {} source participant {:?} requires exactly one inbound Producer-to-Aggregator edge",
-                    binding_id.get(),
-                    source_participant_id
-                ),
-            ));
-        }
-        let allowed_kinds = matching_edges[0].allowed_kinds();
-        if !allowed_kinds.contains(&RuntimeFilterEnvelopeKind::Contribution)
-            || !allowed_kinds.contains(&RuntimeFilterEnvelopeKind::ProducerClosed)
-        {
-            return Err(install_error(
-                InstallContractErrorKind::UnsupportedChannelContract,
-                format!(
-                    "aggregator producer binding {} source participant {:?} inbound edge must allow Contribution and ProducerClosed",
                     binding_id.get(),
                     source_participant_id
                 ),

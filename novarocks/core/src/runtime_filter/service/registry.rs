@@ -2791,7 +2791,7 @@ mod tests {
                 .install(participant_install(core, routing))
                 .unwrap_err(),
             InstallContractErrorKind::UnsupportedChannelContract,
-            "must allow Contribution and ProducerClosed",
+            "allowed kinds do not exactly match the endpoint route family",
         );
     }
 
@@ -2842,6 +2842,7 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Contribution,
                         RuntimeFilterEnvelopeKind::ProducerClosed,
+                        RuntimeFilterEnvelopeKind::Unavailable,
                     ]),
                 ),
                 inbound_to_aggregator_with(
@@ -2853,6 +2854,7 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Contribution,
                         RuntimeFilterEnvelopeKind::ProducerClosed,
+                        RuntimeFilterEnvelopeKind::Unavailable,
                     ]),
                 ),
             ],
@@ -2944,7 +2946,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_only_and_unavailable_only_routes_share_consumer_profile() {
+    fn multiple_canonical_delivery_routes_share_consumer_profile() {
         let full = channel(1, 10, 20, 30, 40);
         let consumer_only = without_producers(&with_consumer_routes(
             &full,
@@ -2967,7 +2969,10 @@ mod tests {
                     BindingId::new(30),
                     remote,
                     participant,
-                    BTreeSet::from([RuntimeFilterEnvelopeKind::Artifact]),
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
                 ),
                 inbound_to_consumer_with_kinds(
                     ChannelId::new(1),
@@ -2975,7 +2980,10 @@ mod tests {
                     BindingId::new(30),
                     remote,
                     participant,
-                    BTreeSet::from([RuntimeFilterEnvelopeKind::Unavailable]),
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
                 ),
             ],
         );

@@ -1095,12 +1095,24 @@ impl QueryContextManager {
 
     #[cfg(test)]
     pub(crate) fn new_for_live_test() -> (Arc<Self>, thread::JoinHandle<()>) {
+        Self::new_for_live_test_with_exit_signal(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_live_test_with_exit_signal(
+        exited: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> (Arc<Self>, thread::JoinHandle<()>) {
         let manager = Arc::new(Self {
             inner: Mutex::new(QueryContextManagerInner::default()),
             stopped: AtomicBool::new(false),
         });
         let clean_manager = Arc::clone(&manager);
-        let clean_handle = thread::spawn(move || clean_manager.clean_loop());
+        let clean_handle = thread::spawn(move || {
+            clean_manager.clean_loop();
+            if let Some(exited) = exited {
+                let _ = exited.send(());
+            }
+        });
         (manager, clean_handle)
     }
 

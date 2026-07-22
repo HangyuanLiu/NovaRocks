@@ -31,6 +31,7 @@ use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterPartic
 use crate::runtime_filter::port::routing::{
     RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
     RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
+    canonical_route_allowed_kinds,
 };
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 
@@ -49,33 +50,23 @@ fn route_roles_and_kinds(
     RuntimeFilterRouteRole,
     BTreeSet<RuntimeFilterEnvelopeKind>,
 ) {
-    match edge.kind {
+    let (source, target) = match edge.kind {
         RouteKind::Loopback | RouteKind::ReplicaDirect => (
             RuntimeFilterRouteRole::Producer(edge.from.binding),
             RuntimeFilterRouteRole::Consumer(edge.to.binding),
-            BTreeSet::from([
-                RuntimeFilterEnvelopeKind::Artifact,
-                RuntimeFilterEnvelopeKind::Unavailable,
-            ]),
         ),
         RouteKind::ToAggregator => (
             RuntimeFilterRouteRole::Producer(edge.from.binding),
             RuntimeFilterRouteRole::Aggregator,
-            BTreeSet::from([
-                RuntimeFilterEnvelopeKind::Contribution,
-                RuntimeFilterEnvelopeKind::ProducerClosed,
-                RuntimeFilterEnvelopeKind::Unavailable,
-            ]),
         ),
         RouteKind::FromAggregator => (
             RuntimeFilterRouteRole::Aggregator,
             RuntimeFilterRouteRole::Consumer(edge.to.binding),
-            BTreeSet::from([
-                RuntimeFilterEnvelopeKind::Artifact,
-                RuntimeFilterEnvelopeKind::Unavailable,
-            ]),
         ),
-    }
+    };
+    let allowed_kinds = canonical_route_allowed_kinds(source, target)
+        .expect("role-graph route kinds always map to a canonical route family");
+    (source, target, allowed_kinds)
 }
 
 fn endpoint_for(

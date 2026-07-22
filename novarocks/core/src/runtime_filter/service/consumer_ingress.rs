@@ -680,6 +680,7 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Contribution,
                     RuntimeFilterEnvelopeKind::ProducerClosed,
+                    RuntimeFilterEnvelopeKind::Unavailable,
                 ]),
             )
             .unwrap();
@@ -1118,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn split_kind_consumer_routes_dispatch_through_same_subscription() {
+    fn multiple_canonical_consumer_routes_dispatch_through_same_subscription() {
         let service = service();
         let channel = membership_channel(4096);
         let consumer = channel
@@ -1157,11 +1158,17 @@ mod tests {
             BTreeMap::from([
                 (
                     RouteEdgeId::new(CONSUMER_ROUTE),
-                    BTreeSet::from([RuntimeFilterEnvelopeKind::Artifact]),
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
                 ),
                 (
                     RouteEdgeId::new(41),
-                    BTreeSet::from([RuntimeFilterEnvelopeKind::Unavailable]),
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
                 ),
             ]),
             false,

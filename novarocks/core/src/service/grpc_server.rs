@@ -216,6 +216,11 @@ impl GrpcService {
 #[cfg(test)]
 pub(crate) struct IndependentGrpcRuntimeFilterNode {
     endpoint: SocketAddr,
+    resources: IndependentGrpcRuntimeFilterResources,
+}
+
+#[cfg(test)]
+struct IndependentGrpcRuntimeFilterResources {
     manager: Arc<crate::runtime::query_context::QueryContextManager>,
     shutdown_tx: Option<watch::Sender<bool>>,
     server_handle: Option<JoinHandle<()>>,
@@ -223,20 +228,140 @@ pub(crate) struct IndependentGrpcRuntimeFilterNode {
 }
 
 #[cfg(test)]
+impl IndependentGrpcRuntimeFilterResources {
+    fn shutdown(&mut self, wait: std::time::Duration) -> Result<(), String> {
+        self.manager.stop_clean_loop_for_test();
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(true);
+        }
+        let mut failures = Vec::new();
+        if let Some(handle) = self.server_handle.take()
+            && let Err(error) = join_independent_runtime_filter_thread(handle, "gRPC server", wait)
+        {
+            failures.push(error);
+        }
+        if let Some(handle) = self.clean_handle.take()
+            && let Err(error) =
+                join_independent_runtime_filter_thread(handle, "manager clean loop", wait)
+        {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for IndependentGrpcRuntimeFilterResources {
+    fn drop(&mut self) {
+        let _ = self.shutdown(IndependentGrpcRuntimeFilterNode::WAIT);
+    }
+}
+
+#[cfg(test)]
+struct IndependentGrpcRuntimeFilterStartupGuard {
+    resources: Option<IndependentGrpcRuntimeFilterResources>,
+}
+
+#[cfg(test)]
+impl IndependentGrpcRuntimeFilterStartupGuard {
+    fn new(resources: IndependentGrpcRuntimeFilterResources) -> Self {
+        Self {
+            resources: Some(resources),
+        }
+    }
+
+    fn resources(&self) -> &IndependentGrpcRuntimeFilterResources {
+        self.resources
+            .as_ref()
+            .expect("startup resources remain armed until readiness")
+    }
+
+    fn resources_mut(&mut self) -> &mut IndependentGrpcRuntimeFilterResources {
+        self.resources
+            .as_mut()
+            .expect("startup resources remain armed until readiness")
+    }
+
+    fn disarm(mut self) -> IndependentGrpcRuntimeFilterResources {
+        self.resources
+            .take()
+            .expect("successful startup transfers its resources to the live node")
+    }
+}
+
+#[cfg(test)]
+impl Drop for IndependentGrpcRuntimeFilterStartupGuard {
+    fn drop(&mut self) {
+        if let Some(resources) = &mut self.resources {
+            let _ = resources.shutdown(IndependentGrpcRuntimeFilterNode::WAIT);
+        }
+    }
+}
+
+#[cfg(test)]
+struct IndependentGrpcStartupProbe {
+    manager: mpsc::SyncSender<std::sync::Weak<crate::runtime::query_context::QueryContextManager>>,
+    server_exited: mpsc::SyncSender<()>,
+    clean_exited: mpsc::SyncSender<()>,
+    panic_before_ready: bool,
+}
+
+#[cfg(test)]
+struct IndependentGrpcServerExitSignal(Option<mpsc::SyncSender<()>>);
+
+#[cfg(test)]
+impl Drop for IndependentGrpcServerExitSignal {
+    fn drop(&mut self) {
+        if let Some(exited) = self.0.take() {
+            let _ = exited.send(());
+        }
+    }
+}
+
+#[cfg(test)]
 impl IndependentGrpcRuntimeFilterNode {
     const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(crate) fn start() -> Result<Self, String> {
+        Self::start_with_probe(None)
+    }
+
+    fn start_with_probe(probe: Option<IndependentGrpcStartupProbe>) -> Result<Self, String> {
         let listener = bind_tcp_listener("127.0.0.1", 0, "independent runtime-filter gRPC")?;
         let endpoint = listener
             .local_addr()
             .map_err(|error| format!("read independent runtime-filter address failed: {error}"))?;
-        let (manager, clean_handle) =
-            crate::runtime::query_context::QueryContextManager::new_for_live_test();
-        let service_manager = Arc::clone(&manager);
+        let (manager, clean_handle) = if let Some(probe) = &probe {
+            crate::runtime::query_context::QueryContextManager::new_for_live_test_with_exit_signal(
+                Some(probe.clean_exited.clone()),
+            )
+        } else {
+            crate::runtime::query_context::QueryContextManager::new_for_live_test()
+        };
+        if let Some(probe) = &probe {
+            let _ = probe.manager.send(Arc::downgrade(&manager));
+        }
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let resources = IndependentGrpcRuntimeFilterResources {
+            manager,
+            shutdown_tx: Some(shutdown_tx),
+            server_handle: None,
+            clean_handle: Some(clean_handle),
+        };
+        let mut startup = IndependentGrpcRuntimeFilterStartupGuard::new(resources);
+        let service_manager = Arc::clone(&startup.resources().manager);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let server_handle = std::thread::spawn(move || {
+            let _exit = IndependentGrpcServerExitSignal(
+                probe.as_ref().map(|probe| probe.server_exited.clone()),
+            );
+            if probe.as_ref().is_some_and(|probe| probe.panic_before_ready) {
+                panic!("injected independent runtime-filter pre-ready server panic");
+            }
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .worker_threads(2)
@@ -268,15 +393,13 @@ impl IndependentGrpcRuntimeFilterNode {
                     .expect("independent runtime-filter gRPC server failed");
             });
         });
+        startup.resources_mut().server_handle = Some(server_handle);
         ready_rx.recv_timeout(Self::WAIT).map_err(|error| {
             format!("independent runtime-filter gRPC server did not become ready: {error}")
         })?;
         Ok(Self {
             endpoint,
-            manager,
-            shutdown_tx: Some(shutdown_tx),
-            server_handle: Some(server_handle),
-            clean_handle: Some(clean_handle),
+            resources: startup.disarm(),
         })
     }
 
@@ -285,32 +408,11 @@ impl IndependentGrpcRuntimeFilterNode {
     }
 
     pub(crate) fn manager(&self) -> &Arc<crate::runtime::query_context::QueryContextManager> {
-        &self.manager
+        &self.resources.manager
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
-        self.manager.stop_clean_loop_for_test();
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(true);
-        }
-        let mut failures = Vec::new();
-        if let Some(handle) = self.server_handle.take()
-            && let Err(error) =
-                join_independent_runtime_filter_thread(handle, "gRPC server", Self::WAIT)
-        {
-            failures.push(error);
-        }
-        if let Some(handle) = self.clean_handle.take()
-            && let Err(error) =
-                join_independent_runtime_filter_thread(handle, "manager clean loop", Self::WAIT)
-        {
-            failures.push(error);
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
+        self.resources.shutdown(Self::WAIT)
     }
 }
 
@@ -1692,8 +1794,50 @@ fn start_standalone_grpc_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_bindable, parse_grpc_bind_addr, validate_grpc_ports};
+    use super::{
+        IndependentGrpcRuntimeFilterNode, IndependentGrpcStartupProbe, ensure_bindable,
+        parse_grpc_bind_addr, validate_grpc_ports,
+    };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn independent_runtime_filter_start_failure_stops_all_started_threads() {
+        let (manager_tx, manager_rx) = mpsc::sync_channel(1);
+        let (server_exited_tx, server_exited_rx) = mpsc::sync_channel(1);
+        let (clean_exited_tx, clean_exited_rx) = mpsc::sync_channel(1);
+        let result =
+            IndependentGrpcRuntimeFilterNode::start_with_probe(Some(IndependentGrpcStartupProbe {
+                manager: manager_tx,
+                server_exited: server_exited_tx,
+                clean_exited: clean_exited_tx,
+                panic_before_ready: true,
+            }));
+        assert!(result.is_err(), "injected pre-ready failure must surface");
+        let manager = manager_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup publishes the manager weak reference");
+        server_exited_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server thread exits after injected startup failure");
+        let clean_exited_before_cleanup = clean_exited_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        let leaked_manager = manager.upgrade();
+        if let Some(manager) = &leaked_manager {
+            manager.stop_clean_loop_for_test();
+            let _ = clean_exited_rx.recv_timeout(Duration::from_secs(1));
+        }
+        assert!(
+            clean_exited_before_cleanup,
+            "start returning Err must stop the manager clean loop"
+        );
+        assert!(
+            leaked_manager.is_none(),
+            "start returning Err must release the manager"
+        );
+    }
 
     #[test]
     fn grpc_stop_join_propagates_server_thread_panic() {

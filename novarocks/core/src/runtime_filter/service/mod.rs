@@ -3359,6 +3359,7 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Contribution,
                     RuntimeFilterEnvelopeKind::ProducerClosed,
+                    RuntimeFilterEnvelopeKind::Unavailable,
                 ]),
             )
             .unwrap();
@@ -4854,6 +4855,108 @@ mod tests {
                     error.kind()
                 )
             });
+        }
+    }
+
+    fn install_with_extra_route_kind(
+        install: RuntimeFilterParticipantInstall,
+        route_edge_id: RouteEdgeId,
+        extra: RuntimeFilterEnvelopeKind,
+    ) -> RuntimeFilterParticipantInstall {
+        let (core, shard) = install.into_parts();
+        let channels = shard
+            .channels()
+            .iter()
+            .map(|(channel_id, channel)| {
+                let mutate = |edge: &RuntimeFilterRoutingEdgeView| {
+                    let mut allowed = edge.allowed_kinds().clone();
+                    if edge.route_edge_id() == route_edge_id {
+                        allowed.insert(extra);
+                    }
+                    RuntimeFilterRoutingEdgeView::new(
+                        *channel_id,
+                        edge.route_edge_id(),
+                        edge.source().clone(),
+                        edge.target().clone(),
+                        edge.peer().clone(),
+                        allowed,
+                    )
+                    .unwrap()
+                };
+                (
+                    *channel_id,
+                    RuntimeFilterChannelRoutingView::new(
+                        *channel_id,
+                        channel.local_roles().clone(),
+                        channel.producer_instances().clone(),
+                        channel.inbound_edges().iter().map(&mutate).collect(),
+                        channel.outbound_edges().iter().map(&mutate).collect(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        RuntimeFilterParticipantInstall::new(
+            core,
+            RuntimeFilterRoutingShard::new(
+                shard.deployment_epoch(),
+                shard.local_participant_id(),
+                channels,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn shared_install_validator_rejects_cross_family_extra_allowed_kinds() {
+        let direct = view([deployment(1, 10, 30, 40, [10], [30], 100)]);
+        let direct_route = direct.routing_shard().channels()[&ChannelId::new(1)].outbound_edges()
+            [0]
+        .route_edge_id();
+        let direct = install_with_extra_route_kind(
+            direct,
+            direct_route,
+            RuntimeFilterEnvelopeKind::Contribution,
+        );
+        crate::runtime_filter::deployment::install_validation::validate_participant_install(
+            &direct,
+        )
+        .expect_err("direct delivery rejects contribution-family authority");
+
+        let plan = super::test_support::compiled_three_backend_all_of_plan();
+        for (_, install) in RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .expect("compiler projections pair")
+        {
+            let edges = install
+                .routing_shard()
+                .channels()
+                .values()
+                .flat_map(|channel| {
+                    channel
+                        .inbound_edges()
+                        .iter()
+                        .chain(channel.outbound_edges())
+                })
+                .map(|edge| {
+                    let extra = if edge
+                        .allowed_kinds()
+                        .contains(&RuntimeFilterEnvelopeKind::Artifact)
+                    {
+                        RuntimeFilterEnvelopeKind::Contribution
+                    } else {
+                        RuntimeFilterEnvelopeKind::Artifact
+                    };
+                    (edge.route_edge_id(), extra)
+                })
+                .collect::<BTreeSet<_>>();
+            for (route_edge_id, extra) in edges {
+                let mutated = install_with_extra_route_kind(install.clone(), route_edge_id, extra);
+                crate::runtime_filter::deployment::install_validation::validate_participant_install(
+                    &mutated,
+                )
+                .expect_err("To/FromAggregator edges reject cross-family authority");
+            }
         }
     }
 
@@ -8049,6 +8152,7 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
             ]),
         )
         .unwrap();

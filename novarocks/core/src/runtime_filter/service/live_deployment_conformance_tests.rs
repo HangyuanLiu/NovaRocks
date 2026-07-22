@@ -16,8 +16,8 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use arrow::datatypes::DataType;
@@ -25,6 +25,7 @@ use arrow::datatypes::DataType;
 use crate::common::types::UniqueId;
 use crate::coordinator::cluster::LiveBackendSnapshot;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
+use crate::coordinator::ports::RuntimeFilterDeploymentControlPort;
 use crate::coordinator::runtime_filter_deployment::{
     DeploymentEpochAllocator, NativeRuntimeFilterDeploymentPolicyProvider,
     RuntimeFilterInstallBarrier, prepare_runtime_filter_deployment,
@@ -32,6 +33,7 @@ use crate::coordinator::runtime_filter_deployment::{
 use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_context::QueryId;
+use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime_filter::deployment::compiler;
 use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
 use crate::runtime_filter::deployment::participant_id_for_backend;
@@ -47,11 +49,16 @@ use crate::runtime_filter::model::graph::{
     RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
     RuntimeFilterGraph,
 };
-use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
+use crate::runtime_filter::port::events::{RuntimeFilterEvent, TransportEventKind};
+use crate::runtime_filter::port::identity::{
+    DeploymentEpoch, PartitionId, ProducerSequence, RuntimeFilterParticipantId,
+};
+use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     ProducerPortKind, RuntimeContractViolationKind, SubmitOutcome,
 };
 use crate::runtime_filter::port::subscription::{ArtifactAcquireOutcome, SubscriptionKind};
+use crate::runtime_filter::port::transport::RuntimeFilterAcceptStatus;
 use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
 use crate::service::grpc_fragment_dispatcher::GrpcRuntimeFilterDeploymentControl;
 use crate::service::grpc_server::IndependentGrpcRuntimeFilterNode;
@@ -64,6 +71,8 @@ use crate::sql::planner::distributed::{
 };
 use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+
+use super::RuntimeFilterService;
 
 const QUERY: UniqueId = UniqueId {
     hi: 0x6a,
@@ -78,6 +87,7 @@ const PRODUCER_NODE: i32 = 810;
 const CONSUMER_FRAGMENT: u32 = 0;
 const CONSUMER_NODE: i32 = 820;
 const MAX_WAIT: Duration = Duration::from_secs(5);
+static LIVE_CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug)]
 enum ConformanceTopology {
@@ -97,20 +107,30 @@ impl ConformanceTopology {
 #[derive(Default)]
 struct RecordingFragmentDispatcher {
     submit_count: AtomicUsize,
+    submissions: Mutex<Vec<(usize, u32, UniqueId)>>,
 }
 
 impl RecordingFragmentDispatcher {
     fn submit_count(&self) -> usize {
         self.submit_count.load(Ordering::SeqCst)
     }
+
+    fn submissions(&self) -> Vec<(usize, u32, UniqueId)> {
+        self.submissions.lock().unwrap().clone()
+    }
 }
 
 impl FragmentDispatcher for RecordingFragmentDispatcher {
     fn submit_fragment(
         &self,
-        _backend_idx: usize,
-        _submission: NativeFragmentEnvelope,
+        backend_idx: usize,
+        submission: NativeFragmentEnvelope,
     ) -> Result<(), String> {
+        let finst_id = submission.fragment_instance_id()?;
+        self.submissions
+            .lock()
+            .unwrap()
+            .push((backend_idx, submission.fragment_id(), finst_id));
         self.submit_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -129,6 +149,49 @@ impl FragmentDispatcher for RecordingFragmentDispatcher {
 
     fn backend_count(&self) -> usize {
         1
+    }
+}
+
+struct AckGatedDeploymentControl {
+    inner: Arc<GrpcRuntimeFilterDeploymentControl>,
+    installed: mpsc::SyncSender<RuntimeFilterParticipantId>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl RuntimeFilterDeploymentControlPort for AckGatedDeploymentControl {
+    async fn install(
+        &self,
+        query_id: UniqueId,
+        lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+        install: RuntimeFilterParticipantInstall,
+    ) -> Result<(), String> {
+        self.inner
+            .install(query_id, lifecycle, deadline, participant, install)
+            .await?;
+        self.installed
+            .send(participant)
+            .map_err(|_| "live install ACK observation receiver closed".to_string())?;
+        tokio::time::timeout(MAX_WAIT, self.release.acquire())
+            .await
+            .map_err(|_| "live install ACK gate timed out".to_string())?
+            .map_err(|_| "live install ACK gate closed".to_string())?
+            .forget();
+        Ok(())
+    }
+
+    async fn abort(
+        &self,
+        query_id: UniqueId,
+        epoch: DeploymentEpoch,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+    ) -> Result<(), String> {
+        self.inner
+            .abort(query_id, epoch, deadline, participant)
+            .await
     }
 }
 
@@ -372,6 +435,84 @@ fn scheduling(endpoints: &[std::net::SocketAddr; 3]) -> SchedulingPlan {
     }
 }
 
+fn native_submissions(
+    plan: &crate::sql::planner::distributed::DistributedPlan,
+    scheduling: &SchedulingPlan,
+) -> Vec<(usize, NativeFragmentEnvelope)> {
+    let prepared = crate::coordinator::prepare::prepare_fragments(
+        plan,
+        &crate::connector::ConnectorRegistry::new(),
+        None,
+    )
+    .expect("prepare the sealed live conformance plan");
+    let native = crate::protocol::native::encode::encode_native_fragment_bundle(plan, &prepared)
+        .expect("encode the sealed live conformance plan");
+    scheduling
+        .by_fragment
+        .iter()
+        .flat_map(|(fragment_id, placements)| {
+            let template = native
+                .get(*fragment_id)
+                .unwrap_or_else(|| panic!("native fragment {fragment_id} is present"))
+                .clone();
+            placements.iter().map(move |placement| {
+                (
+                    placement.backend_idx,
+                    NativeFragmentEnvelope::new(
+                        template.clone(),
+                        crate::proto::novarocks::InstanceParams {
+                            query_id: Some(crate::proto::common::UniqueId {
+                                hi: QUERY.hi,
+                                lo: QUERY.lo,
+                            }),
+                            fragment_instance_id: Some(crate::proto::common::UniqueId {
+                                hi: placement.finst_id.hi,
+                                lo: placement.finst_id.lo,
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn wait_for_transport_ack(
+    sender: &RuntimeFilterService,
+    sender_participant: RuntimeFilterParticipantId,
+    route_edge_ids: &BTreeSet<crate::runtime_filter::port::identity::RouteEdgeId>,
+) {
+    let deadline = std::time::Instant::now() + MAX_WAIT;
+    let query = QueryKey::from_hi_lo(QUERY.hi, QUERY.lo);
+    loop {
+        let accepted = RuntimeFilterLifecycleRegistry::global()
+            .snapshot(query)
+            .is_some_and(|snapshot| {
+                snapshot.channel_events.values().flatten().any(|event| {
+                    matches!(
+                        event,
+                        RuntimeFilterEvent::TransportEnvelope {
+                            identity,
+                            kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
+                            ..
+                        } if identity.common().participant_id() == sender_participant
+                            && identity.common().channel_id() == CHANNEL
+                            && route_edge_ids.contains(&identity.route_edge_id())
+                    )
+                })
+            });
+        if sender.transport_pending_len_for_test() == 0 && accepted {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sender transport did not reach pending=0 plus Acked(Accepted) within {MAX_WAIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn assert_zero_fragment_submits(dispatchers: &[Arc<RecordingFragmentDispatcher>]) {
     for (backend_idx, dispatcher) in dispatchers.iter().enumerate() {
         assert_eq!(
@@ -383,6 +524,9 @@ fn assert_zero_fragment_submits(dispatchers: &[Arc<RecordingFragmentDispatcher>]
 }
 
 fn run_live_conformance(topology: ConformanceTopology) {
+    let _serial = LIVE_CONFORMANCE_LOCK.lock().unwrap();
+    let lifecycle_query = QueryKey::from_hi_lo(QUERY.hi, QUERY.lo);
+    RuntimeFilterLifecycleRegistry::global().remove_query(lifecycle_query);
     let mut nodes = [
         IndependentGrpcRuntimeFilterNode::start().expect("start independent BE zero"),
         IndependentGrpcRuntimeFilterNode::start().expect("start independent BE one"),
@@ -434,34 +578,90 @@ fn run_live_conformance(topology: ConformanceTopology) {
             }));
     }
 
-    let control = Arc::new(
+    let grpc_control = Arc::new(
         GrpcRuntimeFilterDeploymentControl::new(backends.entries())
             .expect("construct production gRPC deployment control"),
     );
-    RuntimeFilterInstallBarrier::new(control)
-        .install_all_or_rollback(
-            QUERY,
-            deployment.epoch,
-            crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-                delivery_expire: MAX_WAIT,
-                query_expire: Duration::from_secs(30),
-                transport_retry_interval: deployment.policy.transport.retry_interval,
-                transport_max_attempts: deployment.policy.transport.max_attempts,
-                transport_deadline: deployment.policy.transport.deadline,
-                transport_max_pending_entries: deployment.policy.transport.max_pending_entries,
-                transport_max_pending_bytes: deployment.policy.transport.max_pending_bytes,
-            },
-            deployment.policy.install_rpc_deadline,
-            installs.clone(),
-        )
-        .expect("all three real install RPCs ACK")
-        .release();
+    let (installed_tx, installed_rx) = mpsc::sync_channel(3);
+    let ack_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let control = Arc::new(AckGatedDeploymentControl {
+        inner: grpc_control,
+        installed: installed_tx,
+        release: Arc::clone(&ack_release),
+    });
+    let submissions = native_submissions(&sealed, &scheduling);
+    let dispatchers_for_submission = Arc::clone(&dispatchers);
+    let installs_for_barrier = installs.clone();
+    let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
+        delivery_expire: MAX_WAIT,
+        query_expire: Duration::from_secs(30),
+        transport_retry_interval: deployment.policy.transport.retry_interval,
+        transport_max_attempts: deployment.policy.transport.max_attempts,
+        transport_deadline: deployment.policy.transport.deadline,
+        transport_max_pending_entries: deployment.policy.transport.max_pending_entries,
+        transport_max_pending_bytes: deployment.policy.transport.max_pending_bytes,
+    };
+    let (barrier_done_tx, barrier_done_rx) = mpsc::sync_channel(1);
+    let barrier_thread = std::thread::spawn(move || {
+        let result = RuntimeFilterInstallBarrier::new(control)
+            .install_all_or_rollback(
+                QUERY,
+                deployment.epoch,
+                lifecycle,
+                deployment.policy.install_rpc_deadline,
+                installs_for_barrier,
+            )
+            .and_then(|installed| {
+                installed.release();
+                for (backend_idx, submission) in submissions {
+                    dispatchers_for_submission[backend_idx]
+                        .submit_fragment(backend_idx, submission)?;
+                }
+                Ok(())
+            });
+        let _ = barrier_done_tx.send(result);
+    });
+    let mut installed_participants = BTreeSet::new();
+    for _ in 0..3 {
+        installed_participants.insert(
+            installed_rx
+                .recv_timeout(MAX_WAIT)
+                .expect("real install RPC completes before the ACK gate"),
+        );
+    }
+    assert_eq!(installed_participants.len(), 3);
+    assert_zero_fragment_submits(dispatchers.as_slice());
     assert_eq!(
         install_ack_observations.load(Ordering::SeqCst),
         3,
         "every install handler observed the zero-submit pre-ACK invariant"
     );
-    assert_zero_fragment_submits(dispatchers.as_slice());
+    ack_release.add_permits(3);
+    barrier_done_rx
+        .recv_timeout(MAX_WAIT)
+        .expect("install barrier and post-release submission finish within the bound")
+        .expect("all three real install RPCs ACK and scheduled fragments submit");
+    barrier_thread.join().expect("install barrier thread joins");
+
+    let mut actual_submissions = dispatchers
+        .iter()
+        .flat_map(|dispatcher| dispatcher.submissions())
+        .collect::<Vec<_>>();
+    actual_submissions.sort_unstable();
+    let mut expected_submissions = scheduling
+        .by_fragment
+        .iter()
+        .flat_map(|(fragment_id, placements)| {
+            placements
+                .iter()
+                .map(|placement| (placement.backend_idx, *fragment_id, placement.finst_id))
+        })
+        .collect::<Vec<_>>();
+    expected_submissions.sort_unstable();
+    assert_eq!(
+        actual_submissions, expected_submissions,
+        "the released install lease dispatches every real scheduled fragment exactly once"
+    );
 
     let query = QueryId {
         hi: QUERY.hi,
@@ -590,10 +790,41 @@ fn run_live_conformance(topology: ConformanceTopology) {
         !bundle.artifacts().is_empty(),
         "the remotely delivered artifact bundle is nonempty"
     );
+    let sender_participant = participant_id_for_backend(0).expect("valid sender backend id");
+    let sender_routes = expected_installs[&sender_participant]
+        .core_view()
+        .channels()[&CHANNEL]
+        .outbound_materialization_groups()
+        .values()
+        .flat_map(|group| group.route_edge_ids().iter().copied())
+        .collect::<BTreeSet<_>>();
+    assert!(!sender_routes.is_empty(), "sender owns a delivery route");
+    wait_for_transport_ack(&services[0], sender_participant, &sender_routes);
+    let rejected = RuntimeFilterLifecycleRegistry::global()
+        .snapshot(QueryKey::from_hi_lo(QUERY.hi, QUERY.lo))
+        .is_some_and(|snapshot| {
+            snapshot.channel_events.values().flatten().any(|event| {
+                matches!(
+                    event,
+                    RuntimeFilterEvent::TransportEnvelope {
+                        identity,
+                        kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Rejected),
+                        ..
+                    } if identity.common().participant_id() == sender_participant
+                        && identity.common().channel_id() == CHANNEL
+                        && sender_routes.contains(&identity.route_edge_id())
+                )
+            })
+        });
+    assert!(
+        !rejected,
+        "the sender route must not complete with Rejected"
+    );
 
     for node in &mut nodes {
         node.shutdown().expect("shutdown independent gRPC BE");
     }
+    RuntimeFilterLifecycleRegistry::global().remove_query(lifecycle_query);
 }
 
 #[test]

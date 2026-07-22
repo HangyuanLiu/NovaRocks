@@ -2165,6 +2165,7 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
             ]),
         );
         let outbound = edge(
@@ -2220,23 +2221,11 @@ mod tests {
     fn relay_install() -> RuntimeFilterParticipantInstall {
         let local = RuntimeFilterParticipantId::new(4);
         let channel_id = ChannelId::new(30);
-        let producer = BindingId::new(31);
-        let inbound = edge(
-            channel_id.get(),
-            300,
-            endpoint(1, RuntimeFilterRouteRole::Producer(producer)),
-            endpoint(local.get(), RuntimeFilterRouteRole::Relay),
-            RuntimeFilterRoutePeer::Remote {
-                participant_id: RuntimeFilterParticipantId::new(1),
-                endpoint: RuntimeEndpoint::new("be-1", 9060).expect("endpoint"),
-            },
-            BTreeSet::from([RuntimeFilterEnvelopeKind::Contribution]),
-        );
         let routing = RuntimeFilterChannelRoutingView::new(
             channel_id,
             BTreeSet::from([RuntimeFilterRouteRole::Relay]),
             BTreeMap::new(),
-            vec![inbound],
+            Vec::new(),
             Vec::new(),
         )
         .expect("valid relay routing");
@@ -2328,6 +2317,24 @@ mod tests {
             .outbound_materialization_groups
             .clear();
         assert!(decode_participant_install(&missing_authority).is_err());
+    }
+
+    #[test]
+    fn routing_edge_wire_rejects_cross_family_extra_allowed_kind() {
+        let mut request = encode_participant_install(QUERY, lifecycle_options(), &direct_install())
+            .expect("encode direct install");
+        let channel = &mut request.install.as_mut().unwrap().routing_channels[0];
+        for edge in channel
+            .inbound_edges
+            .iter_mut()
+            .chain(channel.outbound_edges.iter_mut())
+        {
+            edge.allowed_kinds
+                .push(filter::RuntimeFilterEnvelopeKind::Contribution as i32);
+        }
+
+        decode_participant_install(&request)
+            .expect_err("direct delivery edges must reject contribution-family authority");
     }
 
     #[test]

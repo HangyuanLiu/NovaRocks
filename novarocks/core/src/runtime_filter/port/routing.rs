@@ -35,6 +35,29 @@ pub(crate) enum RuntimeFilterRouteRole {
     Consumer(BindingId),
 }
 
+pub(crate) fn canonical_route_allowed_kinds(
+    source: RuntimeFilterRouteRole,
+    target: RuntimeFilterRouteRole,
+) -> Option<BTreeSet<RuntimeFilterEnvelopeKind>> {
+    match (source, target) {
+        (RuntimeFilterRouteRole::Producer(_), RuntimeFilterRouteRole::Consumer(_))
+        | (RuntimeFilterRouteRole::Aggregator, RuntimeFilterRouteRole::Consumer(_)) => {
+            Some(BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::Unavailable,
+            ]))
+        }
+        (RuntimeFilterRouteRole::Producer(_), RuntimeFilterRouteRole::Aggregator) => {
+            Some(BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
+            ]))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterRouteEndpointView {
     participant_id: RuntimeFilterParticipantId,
