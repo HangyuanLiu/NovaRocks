@@ -19,6 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 
 use crate::common::types::UniqueId;
@@ -128,6 +130,11 @@ impl SubscriptionSlot {
 impl BlockingSnapshotSubscription for SubscriptionSlot {
     fn acquire(&self, timeout: Duration) -> ArtifactAcquireOutcome {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Signal while holding `state`, immediately before the condvar wait. A
+        // cancel observed after this point cannot acquire `state` until the wait
+        // has atomically registered this waiter and released the mutex.
+        #[cfg(test)]
+        notify_native_acquire_waiter_registered_for_test(self.identity);
         let (state, _) = self
             .changed
             .wait_timeout_while(state, timeout, |state| {
@@ -149,6 +156,107 @@ impl BlockingSnapshotSubscription for SubscriptionSlot {
             SubscriptionState::Pending | SubscriptionState::Terminal(_) => None,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) struct NativeAcquireGate {
+    entered: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl NativeAcquireGate {
+    fn wait_entered(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut entered = self.entered.lock().expect("native RF acquire gate lock");
+        while !*entered {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, wait) = self
+                .changed
+                .wait_timeout(entered, remaining)
+                .expect("native RF acquire gate lock");
+            entered = next;
+            if wait.timed_out() && !*entered {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+type NativeAcquireGateKey = (UniqueId, crate::runtime_filter::model::contract::BindingId);
+
+#[cfg(test)]
+fn native_acquire_gates() -> &'static Mutex<BTreeMap<NativeAcquireGateKey, Weak<NativeAcquireGate>>>
+{
+    static GATES: OnceLock<Mutex<BTreeMap<NativeAcquireGateKey, Weak<NativeAcquireGate>>>> =
+        OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) struct NativeAcquireGateGuard {
+    key: NativeAcquireGateKey,
+    gate: Arc<NativeAcquireGate>,
+}
+
+#[cfg(test)]
+impl NativeAcquireGateGuard {
+    pub(crate) fn wait_entered(&self, timeout: Duration) -> bool {
+        self.gate.wait_entered(timeout)
+    }
+}
+
+#[cfg(test)]
+impl Drop for NativeAcquireGateGuard {
+    fn drop(&mut self) {
+        let mut gates = native_acquire_gates()
+            .lock()
+            .expect("native RF acquire gates lock");
+        if gates
+            .get(&self.key)
+            .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(&self.gate)))
+        {
+            gates.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_native_acquire_gate_for_test(
+    query_id: UniqueId,
+    binding_id: crate::runtime_filter::model::contract::BindingId,
+) -> NativeAcquireGateGuard {
+    let key = (query_id, binding_id);
+    let gate = Arc::new(NativeAcquireGate {
+        entered: Mutex::new(false),
+        changed: Condvar::new(),
+    });
+    native_acquire_gates()
+        .lock()
+        .expect("native RF acquire gates lock")
+        .insert(key, Arc::downgrade(&gate));
+    NativeAcquireGateGuard { key, gate }
+}
+
+#[cfg(test)]
+fn notify_native_acquire_waiter_registered_for_test(identity: ConsumerEventIdentity) {
+    let key = (identity.common().query_id(), identity.consumer_binding_id());
+    let gate = native_acquire_gates()
+        .lock()
+        .expect("native RF acquire gates lock")
+        .get(&key)
+        .and_then(Weak::upgrade);
+    let Some(gate) = gate else {
+        return;
+    };
+    let mut entered = gate.entered.lock().expect("native RF acquire gate lock");
+    *entered = true;
+    gate.changed.notify_all();
 }
 
 #[derive(Default)]
@@ -536,14 +644,17 @@ mod tests {
         DeploymentEpoch, LogicalVersion, RuntimeFilterParticipantId,
     };
     use crate::runtime_filter::port::subscription::{
-        ArtifactDeliveryOutcome, LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription,
-        UnavailableReason,
+        ArtifactAcquireOutcome, ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
+        LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         ArtifactRetainedBudget, ArtifactRetention, MemoryAccountError, RuntimeFilterMemoryAccount,
     };
 
-    use super::LiveSubscriptionSlot;
+    use super::{
+        LiveSubscriptionSlot, SubscriptionSlot, install_native_acquire_gate_for_test,
+        native_acquire_gates,
+    };
 
     #[derive(Default)]
     struct NoopEvents(Mutex<Vec<RuntimeFilterEvent>>);
@@ -686,6 +797,51 @@ mod tests {
             ),
             Arc::new(NoopEvents::default()),
         )
+    }
+
+    #[test]
+    fn acquire_observer_signals_registered_waiter_and_guard_removes_registry_key() {
+        let query_id = crate::common::types::UniqueId { hi: 91, lo: 92 };
+        let binding_id = BindingId::new(93);
+        let common = RuntimeFilterEventIdentity::new(
+            query_id,
+            RuntimeFilterParticipantId::new(3),
+            ChannelId::new(1),
+            DeploymentEpoch::new(1),
+        );
+        let slot = Arc::new(SubscriptionSlot::new(
+            ConsumerEventIdentity::new(
+                common,
+                binding_id,
+                crate::common::types::UniqueId { hi: 94, lo: 95 },
+            ),
+            Arc::new(NoopEvents::default()),
+        ));
+        let gate = install_native_acquire_gate_for_test(query_id, binding_id);
+        let waiter = {
+            let slot = slot.clone();
+            std::thread::spawn(move || slot.acquire(std::time::Duration::from_secs(1)))
+        };
+
+        assert!(gate.wait_entered(std::time::Duration::from_secs(1)));
+        slot.deliver(ArtifactDeliveryOutcome::Cancelled);
+        assert!(matches!(
+            waiter.join().unwrap(),
+            ArtifactAcquireOutcome::Cancelled
+        ));
+        assert!(
+            native_acquire_gates()
+                .lock()
+                .unwrap()
+                .contains_key(&(query_id, binding_id))
+        );
+        drop(gate);
+        assert!(
+            !native_acquire_gates()
+                .lock()
+                .unwrap()
+                .contains_key(&(query_id, binding_id))
+        );
     }
 
     fn updated_version(outcome: LivePollOutcome) -> LogicalVersion {

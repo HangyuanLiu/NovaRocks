@@ -115,6 +115,14 @@ impl SchedulingPlan {
     pub(crate) fn fragment_ids(&self) -> impl ExactSizeIterator<Item = FragmentId> + '_ {
         self.by_fragment.keys().copied()
     }
+
+    #[cfg(test)]
+    pub(crate) fn placements_for_fragment_for_test(
+        &self,
+        fragment_id: FragmentId,
+    ) -> Option<&[FragmentInstancePlacement]> {
+        self.by_fragment.get(&fragment_id).map(Vec::as_slice)
+    }
 }
 
 // ---------------------------------------------------------------------------

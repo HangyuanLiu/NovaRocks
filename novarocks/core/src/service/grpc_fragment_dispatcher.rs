@@ -247,6 +247,8 @@ fn validate_deployment_response(
 pub struct RemoteDispatcher {
     clients: BTreeMap<usize, NovaRocksGrpcRemoteClient>,
     addrs: BTreeMap<usize, std::net::SocketAddr>,
+    #[cfg(test)]
+    rpc_timeout: Option<Duration>,
 }
 
 impl RemoteDispatcher {
@@ -279,7 +281,25 @@ impl RemoteDispatcher {
             );
             addrs.insert(*backend_id, *addr);
         }
-        Ok(Self { clients, addrs })
+        Ok(Self {
+            clients,
+            addrs,
+            #[cfg(test)]
+            rpc_timeout: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_backend_ids_and_rpc_timeout_for_test(
+        backends: &[(usize, SocketAddr)],
+        rpc_timeout: Duration,
+    ) -> Result<Self, String> {
+        if rpc_timeout.is_zero() || rpc_timeout > Duration::from_secs(5) {
+            return Err("test fragment RPC timeout must be within (0, 5s]".to_string());
+        }
+        let mut dispatcher = Self::new_with_backend_ids(backends)?;
+        dispatcher.rpc_timeout = Some(rpc_timeout);
+        Ok(dispatcher)
     }
 
     /// The address of `backend_idx`/backend id, if present.
@@ -334,9 +354,15 @@ impl FragmentDispatcher for RemoteDispatcher {
             plan: Some(plan),
             instance_params: Some(instance_params),
         };
-        let resp = client
-            .blocking_submit_fragment(request)
-            .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
+        #[cfg(test)]
+        let resp = if let Some(timeout) = self.rpc_timeout {
+            client.blocking_submit_fragment_with_timeout(request, timeout)
+        } else {
+            client.blocking_submit_fragment(request)
+        };
+        #[cfg(not(test))]
+        let resp = client.blocking_submit_fragment(request);
+        let resp = resp.map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         if resp.status_code != 0 {
             return Err(format!(
                 "remote submit_fragment failed on {}: {}",
@@ -364,15 +390,22 @@ impl FragmentDispatcher for RemoteDispatcher {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             return Ok(FetchOutcome::NotReady);
         }
-        let resp = client
-            .blocking_fetch_result(FetchResultRequest {
-                finst_id: Some(ProtoUniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                }),
-                max_wait_ms,
-            })
-            .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
+        let request = FetchResultRequest {
+            finst_id: Some(ProtoUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms,
+        };
+        #[cfg(test)]
+        let resp = if let Some(timeout) = self.rpc_timeout {
+            client.blocking_fetch_result_with_timeout(request, timeout)
+        } else {
+            client.blocking_fetch_result(request)
+        };
+        #[cfg(not(test))]
+        let resp = client.blocking_fetch_result(request);
+        let resp = resp.map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         let status = FetchStatus::try_from(resp.status).map_err(|_| {
             format!(
                 "BE[{backend_idx}] ({}): remote fetch_result returned unknown status {}",
@@ -437,16 +470,30 @@ impl FragmentDispatcher for RemoteDispatcher {
                 return;
             }
         };
+        #[cfg(test)]
+        let rpc_timeout = self.rpc_timeout;
         runtime_handle.spawn(async move {
             match NovaRocksGrpcRemoteClient::new(addr) {
-                Ok(client) => match client.cancel_fragment_async(req).await {
-                    Ok(resp) if resp.status_code == 0 => {}
-                    Ok(resp) => warn!(
-                        "remote cancel_fragment returned nonzero status from {}: {}",
-                        addr, resp.status_code
-                    ),
-                    Err(e) => warn!("remote cancel_fragment failed for {}: {}", addr, e),
-                },
+                Ok(client) => {
+                    #[cfg(test)]
+                    let response = if let Some(timeout) = rpc_timeout {
+                        client
+                            .cancel_fragment_async_with_timeout(req, timeout)
+                            .await
+                    } else {
+                        client.cancel_fragment_async(req).await
+                    };
+                    #[cfg(not(test))]
+                    let response = client.cancel_fragment_async(req).await;
+                    match response {
+                        Ok(resp) if resp.status_code == 0 => {}
+                        Ok(resp) => warn!(
+                            "remote cancel_fragment returned nonzero status from {}: {}",
+                            addr, resp.status_code
+                        ),
+                        Err(e) => warn!("remote cancel_fragment failed for {}: {}", addr, e),
+                    }
+                }
                 Err(e) => warn!("remote cancel_fragment failed for {}: {}", addr, e),
             }
         });

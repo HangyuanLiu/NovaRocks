@@ -233,6 +233,18 @@ pub fn submit_exec_plan_fragment_native(
     fragment: crate::proto::plan::PlanFragment,
     instance_params: crate::proto::novarocks::InstanceParams,
 ) -> Result<(), String> {
+    submit_exec_plan_fragment_native_with_manager(
+        fragment,
+        instance_params,
+        query_context_manager(),
+    )
+}
+
+pub(crate) fn submit_exec_plan_fragment_native_with_manager(
+    fragment: crate::proto::plan::PlanFragment,
+    instance_params: crate::proto::novarocks::InstanceParams,
+    mgr: Arc<QueryContextManager>,
+) -> Result<(), String> {
     let decoded = decode_fragment_submission(&fragment, &instance_params).map_err(|error| {
         FragmentLaunchError::new(
             FragmentLaunchStage::ValidateSubmission,
@@ -247,7 +259,6 @@ pub fn submit_exec_plan_fragment_native(
     let finst_id = instance.fragment_instance_id().get();
     let query_opts = instance.runtime_options().query_options().clone();
     let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts));
-    let mgr = query_context_manager();
     let runtime_filter = prepare_native_query_before_fragment_registration(
         mgr.as_ref(),
         query_id,

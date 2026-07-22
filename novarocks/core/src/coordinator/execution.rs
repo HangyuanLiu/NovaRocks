@@ -450,6 +450,11 @@ impl ExecutionCoordinator {
         self.execute_with_profile_collection(true, Some(topology))
     }
 
+    #[cfg(test)]
+    pub(crate) fn execute_with_profiles_for_test(self) -> Result<CoordinatedQueryResult, String> {
+        self.execute_with_profile_collection(true, None)
+    }
+
     fn execute_with_profile_collection(
         self,
         collect_profiles: bool,
@@ -881,20 +886,18 @@ impl ExecutionCoordinator {
             observer.as_ref(),
             installed_runtime_filter_deployment,
         )?;
-        let runtime_filter_dormancy_proof = if collect_profiles {
-            let topology = runtime_filter_dormancy_topology.as_ref().ok_or_else(|| {
-                "runtime-filter dormancy proof missing distributed topology facts".to_string()
-            })?;
-            let (expectations, same_backend_partial_completion) =
-                build_runtime_filter_dormancy_expectations(&prepared, &plan, topology)?;
-            prove_runtime_filter_dormancy(
-                &expectations,
-                &fetch_result.fragment_profiles,
-                same_backend_partial_completion,
-            )?
-        } else {
-            None
-        };
+        let runtime_filter_dormancy_proof =
+            if let Some(topology) = runtime_filter_dormancy_topology.as_ref() {
+                let (expectations, same_backend_partial_completion) =
+                    build_runtime_filter_dormancy_expectations(&prepared, &plan, topology)?;
+                prove_runtime_filter_dormancy(
+                    &expectations,
+                    &fetch_result.fragment_profiles,
+                    same_backend_partial_completion,
+                )?
+            } else {
+                None
+            };
         if let Some(commit) = fetch_result.write_commit.as_ref() {
             tracing::info!(
                 target: "novarocks::write_coordinator",

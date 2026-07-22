@@ -140,10 +140,20 @@ pub(super) fn populate_runtime_filter_candidates(
     candidates.sort_by_key(|candidate| candidate.legacy_filter_id);
     candidates.dedup_by_key(|candidate| candidate.legacy_filter_id);
     let mut binding_ids_by_node = HashMap::<(FragmentId, i32), Vec<BindingId>>::new();
-    let mut next_channel_id = u32::try_from(graph.channel_count())
-        .map_err(|_| "runtime filter channel count does not fit u32".to_string())?;
-    let mut next_binding_id = u32::try_from(graph.binding_count())
-        .map_err(|_| "runtime filter binding count does not fit u32".to_string())?;
+    let mut next_channel_id = graph
+        .channels()
+        .map(|channel| channel.channel_id.get())
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| "runtime filter channel id overflow".to_string())?;
+    let mut next_binding_id = graph
+        .bindings()
+        .map(|binding| binding.binding_id.get())
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| "runtime filter binding id overflow".to_string())?;
 
     for mut candidate in candidates {
         if candidate.consumers.is_empty()
@@ -1141,6 +1151,96 @@ mod tests {
     }
 
     #[test]
+    fn candidate_allocation_starts_after_sparse_max_ids() {
+        let seed = join_graph(&[(7, JoinExecutionMode::Broadcast)]);
+        let mut existing_channel = seed.channels().next().expect("seed channel").clone();
+        let existing_channel_id = ChannelId::new(7);
+        let existing_witness_id = CoverageWitnessId::new(existing_channel_id.get());
+        existing_channel.channel_id = existing_channel_id;
+        existing_channel.availability_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(existing_witness_id)]);
+        existing_channel.terminal_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(existing_witness_id)]);
+
+        let mut existing_producer = seed
+            .bindings()
+            .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+            .expect("seed producer")
+            .clone();
+        existing_producer.binding_id = BindingId::new(11);
+        existing_producer.channel_id = existing_channel_id;
+        existing_producer.coverage_witness_id = Some(existing_witness_id);
+
+        let mut existing_consumer = seed
+            .bindings()
+            .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
+            .expect("seed consumer")
+            .clone();
+        existing_consumer.binding_id = BindingId::new(19);
+        existing_consumer.channel_id = existing_channel_id;
+
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_channel(existing_channel)
+            .expect("insert sparse channel");
+        graph
+            .insert_binding(existing_producer)
+            .expect("insert sparse producer");
+        graph
+            .insert_binding(existing_consumer)
+            .expect("insert sparse consumer");
+
+        let mut fragments = vec![
+            fragment(0, values_node(1, 0), Vec::new()),
+            fragment(1, values_node(2, 1), Vec::new()),
+        ];
+        let mut bindings = RuntimeFilterBindings::new();
+        bindings.builds.push(RuntimeFilterBuildBinding {
+            node_id: 1,
+            fragment_id: 0,
+            intent: RuntimeFilterBuildIntent {
+                filter_id: 8,
+                build_expr: expression(),
+                probe_expr: expression(),
+                expr_order: 0,
+                execution_mode: JoinExecutionMode::Broadcast,
+            },
+        });
+        bindings.probes.push(RuntimeFilterProbeBinding {
+            node_id: 2,
+            fragment_id: 1,
+            intent: RuntimeFilterProbeIntent {
+                filter_id: 8,
+                probe_expr: expression(),
+            },
+        });
+
+        populate_runtime_filter_graph(&mut fragments, &mut graph, &bindings)
+            .expect("populate after sparse IDs");
+        graph.validate().expect("combined graph must validate");
+
+        assert_eq!(
+            graph
+                .channels()
+                .map(|channel| channel.channel_id)
+                .collect::<Vec<_>>(),
+            vec![ChannelId::new(7), ChannelId::new(8)]
+        );
+        assert_eq!(
+            graph
+                .bindings()
+                .map(|binding| binding.binding_id)
+                .collect::<Vec<_>>(),
+            vec![
+                BindingId::new(11),
+                BindingId::new(19),
+                BindingId::new(20),
+                BindingId::new(21),
+            ]
+        );
+    }
+
+    #[test]
     fn rfd_5a_generic_topn_and_aggregate_feedback_candidates_are_non_blocking_live() {
         let location = |node_id| PlanLocation {
             fragment_id: PlanFragmentId::new(0),
@@ -1263,7 +1363,15 @@ mod tests {
                 .len(),
             2
         );
-        for binding_id in [BindingId::new(1), BindingId::new(3)] {
+        let consumer_binding_ids = graph
+            .bindings()
+            .filter_map(|binding| match binding.role {
+                RuntimeFilterBindingRole::Consumer(_) => Some(binding.binding_id),
+                RuntimeFilterBindingRole::Producer(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(consumer_binding_ids.len(), 2);
+        for binding_id in consumer_binding_ids {
             let mut invalid = graph.clone();
             let RuntimeFilterBindingRole::Consumer(consumer) = &mut invalid
                 .binding_mut_for_test(binding_id)

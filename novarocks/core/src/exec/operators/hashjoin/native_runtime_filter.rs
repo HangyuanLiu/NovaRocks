@@ -18,6 +18,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex, OnceLock, Weak};
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
@@ -537,6 +541,15 @@ impl NativeMembershipProducerStream {
                 self.binding.binding_id
             )
         })?;
+        #[cfg(test)]
+        if let NativeMembershipProducerSource::Installed(context) = &self.binding.source {
+            wait_at_native_producer_close_gate_for_test(
+                context.query_id(),
+                BindingId::new(self.binding.binding_id),
+                context.fragment_instance_id(),
+                Duration::from_secs(5),
+            );
+        }
         let outcome = match adapter
             .close_partition(self.partition_id, ProducerSequence::new(self.next_sequence))
         {
@@ -597,6 +610,157 @@ impl NativeMembershipProducerStream {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct NativeProducerCloseGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl NativeProducerCloseGate {
+    pub(crate) fn wait_entered(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().expect("native producer close gate lock");
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, result) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("native producer close gate lock");
+            state = next;
+            if result.timed_out() && !state.0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self.state.lock().expect("native producer close gate lock");
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct NativeProducerCloseGateGuard {
+    key: (
+        crate::common::types::UniqueId,
+        BindingId,
+        crate::common::types::UniqueId,
+    ),
+    gate: Arc<NativeProducerCloseGate>,
+}
+
+#[cfg(test)]
+impl NativeProducerCloseGateGuard {
+    pub(crate) fn wait_entered(&self, timeout: Duration) -> bool {
+        self.gate.wait_entered(timeout)
+    }
+
+    pub(crate) fn release(&self) {
+        self.gate.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for NativeProducerCloseGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut gates = native_producer_close_gates()
+            .lock()
+            .expect("native producer close gates lock");
+        if gates
+            .get(&self.key)
+            .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(&self.gate)))
+        {
+            gates.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+fn native_producer_close_gates() -> &'static Mutex<
+    std::collections::BTreeMap<
+        (
+            crate::common::types::UniqueId,
+            BindingId,
+            crate::common::types::UniqueId,
+        ),
+        Weak<NativeProducerCloseGate>,
+    >,
+> {
+    static GATES: OnceLock<
+        Mutex<
+            std::collections::BTreeMap<
+                (
+                    crate::common::types::UniqueId,
+                    BindingId,
+                    crate::common::types::UniqueId,
+                ),
+                Weak<NativeProducerCloseGate>,
+            >,
+        >,
+    > = OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_native_producer_close_gate_for_test(
+    query_id: crate::common::types::UniqueId,
+    binding_id: BindingId,
+    fragment_instance_id: crate::common::types::UniqueId,
+) -> NativeProducerCloseGateGuard {
+    let key = (query_id, binding_id, fragment_instance_id);
+    let gate = Arc::new(NativeProducerCloseGate {
+        state: Mutex::new((false, false)),
+        changed: Condvar::new(),
+    });
+    native_producer_close_gates()
+        .lock()
+        .expect("native producer close gates lock")
+        .insert(key, Arc::downgrade(&gate));
+    NativeProducerCloseGateGuard { key, gate }
+}
+
+#[cfg(test)]
+fn wait_at_native_producer_close_gate_for_test(
+    query_id: crate::common::types::UniqueId,
+    binding_id: BindingId,
+    fragment_instance_id: crate::common::types::UniqueId,
+    timeout: Duration,
+) {
+    let gate = native_producer_close_gates()
+        .lock()
+        .expect("native producer close gates lock")
+        .get(&(query_id, binding_id, fragment_instance_id))
+        .and_then(Weak::upgrade);
+    let Some(gate) = gate else {
+        return;
+    };
+    let deadline = Instant::now() + timeout;
+    let mut state = gate.state.lock().expect("native producer close gate lock");
+    state.0 = true;
+    gate.changed.notify_all();
+    while !state.1 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let (next, result) = gate
+            .changed
+            .wait_timeout(state, remaining)
+            .expect("native producer close gate lock");
+        state = next;
+        if result.timed_out() && !state.1 {
+            return;
+        }
+    }
+}
+
 fn validate_resolved_binding(
     binding: &NativeMembershipProducerBinding,
     resolved: &crate::runtime_filter::service::ResolvedNativeProducer,
@@ -636,7 +800,11 @@ mod tests {
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::DataType;
 
-    use super::{NativeMembershipProducerBinding, NativeRuntimeFilterProducerFactory};
+    use super::{
+        NativeMembershipProducerBinding, NativeRuntimeFilterProducerFactory,
+        install_native_producer_close_gate_for_test, native_producer_close_gates,
+    };
+    use crate::runtime_filter::model::contract::BindingId;
     use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
     use crate::runtime_filter::port::producer::{
         ProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
@@ -661,6 +829,28 @@ mod tests {
     #[derive(Default)]
     struct RecordingProducer {
         events: Mutex<Vec<Event>>,
+    }
+
+    #[test]
+    fn native_producer_close_gate_guard_removes_registry_key() {
+        let query_id = crate::common::types::UniqueId { hi: 81, lo: 82 };
+        let binding_id = BindingId::new(83);
+        let finst_id = crate::common::types::UniqueId { hi: 84, lo: 85 };
+        let key = (query_id, binding_id, finst_id);
+        let guard = install_native_producer_close_gate_for_test(query_id, binding_id, finst_id);
+        assert!(
+            native_producer_close_gates()
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
+        drop(guard);
+        assert!(
+            !native_producer_close_gates()
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
     }
 
     impl RecordingProducer {

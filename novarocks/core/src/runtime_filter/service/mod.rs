@@ -21,6 +21,8 @@ mod inbound;
 #[cfg(test)]
 mod live_deployment_conformance_tests;
 #[cfg(test)]
+mod live_join_conformance_tests;
+#[cfg(test)]
 mod m3a_tests;
 #[cfg(test)]
 mod m3b_tests;
@@ -36,7 +38,10 @@ mod registry;
 mod reliable_transport;
 mod subscription;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(test)]
+pub(crate) use self::subscription::{NativeAcquireGateGuard, install_native_acquire_gate_for_test};
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
@@ -193,6 +198,8 @@ struct EventEmitter {
     sink: Arc<dyn RuntimeFilterEventSink>,
     state: Mutex<EventQueueState>,
     #[cfg(test)]
+    recorded: Mutex<Vec<RuntimeFilterEvent>>,
+    #[cfg(test)]
     after_publish_ready: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -206,6 +213,8 @@ impl EventEmitter {
                 next_batch_id: 0,
                 batches: VecDeque::new(),
             }),
+            #[cfg(test)]
+            recorded: Mutex::new(Vec::new()),
             #[cfg(test)]
             after_publish_ready: Mutex::new(None),
         }
@@ -367,6 +376,11 @@ impl EventEmitter {
             }
             drop(state);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                self.recorded
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(event.clone());
                 self.sink.record(event);
             }));
             if let Some(completion) = completion {
@@ -374,6 +388,14 @@ impl EventEmitter {
             }
             state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         }
+    }
+
+    #[cfg(test)]
+    fn recorded_for_test(&self) -> Vec<RuntimeFilterEvent> {
+        self.recorded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 }
 
@@ -1695,6 +1717,11 @@ impl RuntimeFilterService {
         Self::new_with_dependencies(query_id, clock, event_sink, memory_account)
     }
 
+    #[cfg(test)]
+    pub(crate) fn lifecycle_events_for_test(&self) -> Vec<RuntimeFilterEvent> {
+        self.dispatcher.events.recorded_for_test()
+    }
+
     pub(crate) fn install(
         &self,
         install: RuntimeFilterParticipantInstall,
@@ -2433,7 +2460,12 @@ impl RuntimeFilterService {
             }
             for (channel_id, channel) in cancelled.installed().channels() {
                 if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let action = channel.cancel();
+                    let locally_owned = cancelled
+                        .installed()
+                        .local_producer_instances(channel_id)
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    let action = channel.cancel_with_pending_producer_failures(&locally_owned);
                     let action = if matches!(action, ChannelAction::None) {
                         channel.terminal_action()
                     } else {
@@ -2520,6 +2552,20 @@ impl RuntimeFilterService {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .contains_key(&(binding_id, fragment_instance_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn producer_handle_is_live_for_test(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> bool {
+        self.producer_test_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(binding_id, fragment_instance_id))
+            .and_then(Weak::upgrade)
+            .is_some()
     }
 
     #[cfg(test)]
@@ -7860,11 +7906,24 @@ pub(crate) mod tests {
             .iter()
             .position(|event| matches!(event, RuntimeFilterEvent::DeltaAccepted { .. }))
             .unwrap();
+        let producer_failed = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeFilterEvent::ProducerInstanceFailed {
+                        reason: ProducerFailureReason::Cancelled,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
         let cancelled = events
             .iter()
             .position(|event| matches!(event, RuntimeFilterEvent::ChannelCancelled { .. }))
             .unwrap();
-        assert!(delta < cancelled);
+        assert!(delta < producer_failed);
+        assert!(producer_failed < cancelled);
     }
 
     #[test]

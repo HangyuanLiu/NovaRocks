@@ -14,6 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#[cfg(test)]
+use std::collections::BTreeSet;
 #[cfg(feature = "compat")]
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
@@ -73,6 +75,8 @@ pub use crate::proto;
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const CANCEL_FRAGMENT_OK: i32 = 0;
 const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
+#[cfg(test)]
+const CANCEL_FRAGMENT_NOT_OWNED: i32 = 3;
 static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -98,6 +102,10 @@ pub struct GrpcService {
     report_handler: Arc<dyn CoordinatorReportHandler>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
+    #[cfg(test)]
+    execution_query_manager: Option<Arc<crate::runtime::query_context::QueryContextManager>>,
+    #[cfg(test)]
+    execution_owned_finsts: Option<Arc<Mutex<BTreeSet<crate::common::types::UniqueId>>>>,
 }
 
 impl std::fmt::Debug for GrpcService {
@@ -156,6 +164,10 @@ impl GrpcService {
             report_handler,
             runtime_filter_envelope_ingress,
             runtime_filter_deployment_ingress,
+            #[cfg(test)]
+            execution_query_manager: None,
+            #[cfg(test)]
+            execution_owned_finsts: None,
         }
     }
 
@@ -190,16 +202,19 @@ impl GrpcService {
         report_handler: Arc<dyn CoordinatorReportHandler>,
         manager: Arc<crate::runtime::query_context::QueryContextManager>,
     ) -> Self {
-        Self::with_handlers(
+        let mut service = Self::with_handlers(
             true,
             report_handler,
             crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager(
                 manager.clone(),
             ),
             crate::service::grpc_runtime_filter_install_adapter::query_scoped_runtime_filter_deployment_ingress_with_manager(
-                manager,
+                manager.clone(),
             ),
-        )
+        );
+        service.execution_query_manager = Some(manager);
+        service.execution_owned_finsts = Some(Arc::new(Mutex::new(BTreeSet::new())));
+        service
     }
 
     fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
@@ -234,18 +249,11 @@ impl IndependentGrpcRuntimeFilterResources {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);
         }
-        let mut failures = Vec::new();
-        if let Some(handle) = self.server_handle.take()
-            && let Err(error) = join_independent_runtime_filter_thread(handle, "gRPC server", wait)
-        {
-            failures.push(error);
-        }
-        if let Some(handle) = self.clean_handle.take()
-            && let Err(error) =
-                join_independent_runtime_filter_thread(handle, "manager clean loop", wait)
-        {
-            failures.push(error);
-        }
+        let failures = join_independent_runtime_filter_threads(
+            self.server_handle.take(),
+            self.clean_handle.take(),
+            wait,
+        );
         if failures.is_empty() {
             Ok(())
         } else {
@@ -455,6 +463,35 @@ fn join_independent_runtime_filter_thread(
     }
 }
 
+#[cfg(test)]
+fn join_independent_runtime_filter_threads(
+    server_handle: Option<JoinHandle<()>>,
+    clean_handle: Option<JoinHandle<()>>,
+    wait: std::time::Duration,
+) -> Vec<String> {
+    let deadline_at = std::time::Instant::now() + wait;
+    let mut failures = Vec::new();
+    if let Some(handle) = server_handle
+        && let Err(error) = join_independent_runtime_filter_thread(
+            handle,
+            "gRPC server",
+            deadline_at.saturating_duration_since(std::time::Instant::now()),
+        )
+    {
+        failures.push(error);
+    }
+    if let Some(handle) = clean_handle
+        && let Err(error) = join_independent_runtime_filter_thread(
+            handle,
+            "manager clean loop",
+            deadline_at.saturating_duration_since(std::time::Instant::now()),
+        )
+    {
+        failures.push(error);
+    }
+    failures
+}
+
 #[tonic::async_trait]
 impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     type ExchangeStream = std::pin::Pin<
@@ -659,19 +696,49 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             plan,
             instance_params,
         } = request.into_inner();
+        #[cfg(test)]
+        let owned_finst = instance_params
+            .as_ref()
+            .and_then(|params| params.fragment_instance_id.as_ref())
+            .map(|id| crate::common::types::UniqueId {
+                hi: id.hi,
+                lo: id.lo,
+            });
         let result = match (plan, instance_params) {
-            (Some(plan), Some(instance_params)) => tokio::task::spawn_blocking(move || {
-                crate::service::native_fragment_service::submit_exec_plan_fragment_native(
-                    plan,
-                    instance_params,
-                )
-            })
+            (Some(plan), Some(instance_params)) => {
+                #[cfg(test)]
+                let execution_query_manager = self.execution_query_manager.clone();
+                tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(manager) = execution_query_manager {
+                        return crate::service::native_fragment_service::submit_exec_plan_fragment_native_with_manager(
+                            plan,
+                            instance_params,
+                            manager,
+                        );
+                    }
+                    crate::service::native_fragment_service::submit_exec_plan_fragment_native(
+                        plan,
+                        instance_params,
+                    )
+                })
             .await
             .map_err(|e| {
                 tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
-            })?,
+            })?
+            }
             _ => Err("SubmitFragmentRequest requires native plan and instance_params".to_string()),
         };
+        #[cfg(test)]
+        if result.is_ok()
+            && let (Some(owned), Some(finst_id)) =
+                (self.execution_owned_finsts.as_ref(), owned_finst)
+        {
+            owned
+                .lock()
+                .expect("gRPC execution ownership lock")
+                .insert(finst_id);
+        }
         match result {
             Ok(()) => Ok(tonic::Response::new(
                 proto::novarocks::SubmitFragmentResponse {
@@ -714,6 +781,23 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             }
         };
         let call_index = FETCH_RESULT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(test)]
+        if let Some(owned) = self.execution_owned_finsts.as_ref()
+            && !owned
+                .lock()
+                .expect("gRPC execution ownership lock")
+                .contains(&finst_id)
+        {
+            return Ok(tonic::Response::new(
+                proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::Error as i32,
+                    message: format!("fragment instance is not owned by this endpoint: {finst_id}"),
+                    packet_seq: 0,
+                    eos: false,
+                    result_arrow_ipc: vec![],
+                },
+            ));
+        }
         if crate::common::config::debug_fault_inject_fetch_not_ready_count()
             .is_some_and(|limit| call_index <= limit)
         {
@@ -792,11 +876,35 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 },
             ));
         }
+        #[cfg(test)]
+        if let Some(owned) = self.execution_owned_finsts.as_ref()
+            && req.finst_ids.iter().any(|id| {
+                !owned
+                    .lock()
+                    .expect("gRPC execution ownership lock")
+                    .contains(&crate::common::types::UniqueId {
+                        hi: id.hi,
+                        lo: id.lo,
+                    })
+            })
+        {
+            return Ok(tonic::Response::new(
+                proto::novarocks::CancelFragmentResponse {
+                    status_code: CANCEL_FRAGMENT_NOT_OWNED,
+                },
+            ));
+        }
         for id in &req.finst_ids {
-            crate::cancel(crate::UniqueId {
+            let finst_id = crate::UniqueId {
                 hi: id.hi,
                 lo: id.lo,
-            });
+            };
+            #[cfg(test)]
+            if let Some(manager) = self.execution_query_manager.clone() {
+                crate::service::fragment_control::cancel_with_manager(finst_id, manager);
+                continue;
+            }
+            crate::cancel(finst_id);
         }
         if crate::common::config::debug_emit_cancel_marker() {
             let count = CANCEL_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1836,6 +1944,29 @@ mod tests {
         assert!(
             leaked_manager.is_none(),
             "start returning Err must release the manager"
+        );
+    }
+
+    #[test]
+    fn independent_runtime_filter_shutdown_shares_one_deadline_across_threads() {
+        let server = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let clean = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let wait = Duration::from_millis(150);
+        let started_at = std::time::Instant::now();
+
+        let failures =
+            super::join_independent_runtime_filter_threads(Some(server), Some(clean), wait);
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("manager clean loop"), "{failures:?}");
+        assert!(
+            elapsed < Duration::from_millis(225),
+            "server and clean loop each received a fresh deadline: elapsed={elapsed:?}"
         );
     }
 

@@ -10,7 +10,7 @@ use super::runtime_filter_binding::{
     RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::model::contract::BindingId;
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
@@ -640,10 +640,8 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
     let graph = distributed.runtime_filter_graph();
     assert_eq!(graph.channel_count(), 1);
     assert_eq!(graph.binding_count(), 2);
-    assert_eq!(
-        graph.channels().next().unwrap().channel_id,
-        ChannelId::new(0)
-    );
+    let channel = graph.channels().next().expect("runtime-filter channel");
+    assert_ne!(channel.channel_id.get(), 0);
     let producer = graph
         .bindings()
         .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
@@ -652,8 +650,11 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
         .bindings()
         .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
         .expect("consumer binding");
-    assert_eq!(producer.binding_id, BindingId::new(0));
-    assert_eq!(consumer.binding_id, BindingId::new(1));
+    assert_ne!(producer.binding_id.get(), 0);
+    assert_ne!(consumer.binding_id.get(), 0);
+    assert_ne!(producer.binding_id, consumer.binding_id);
+    assert_eq!(producer.channel_id, channel.channel_id);
+    assert_eq!(consumer.channel_id, channel.channel_id);
     assert!(distributed.fragments().iter().any(|fragment| {
         fn has_binding(node: &DistributedNode, binding_id: BindingId) -> bool {
             node.runtime_filter_binding_ids.contains(&binding_id)

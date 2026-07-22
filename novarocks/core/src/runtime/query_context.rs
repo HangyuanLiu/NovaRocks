@@ -925,6 +925,8 @@ struct QueryContextManagerInner {
     runtime_filter_deployment_terminals: HashMap<QueryId, RuntimeFilterDeploymentTerminalRecord>,
     runtime_filter_query_cancellations: HashMap<QueryId, RuntimeFilterQueryCancellationRecord>,
     #[cfg(test)]
+    runtime_filter_query_cancellation_errors: HashMap<QueryId, String>,
+    #[cfg(test)]
     runtime_filter_terminal_now: Option<Instant>,
     #[cfg(test)]
     runtime_filter_terminal_capacity: Option<usize>,
@@ -1220,6 +1222,19 @@ impl QueryContextManager {
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
             .map(|context| (context.num_fragments, context.num_active_fragments))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_filter_query_cancellation_error_for_test(
+        &self,
+        query_id: QueryId,
+    ) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("query_ctx_manager lock")
+            .runtime_filter_query_cancellation_errors
+            .get(&query_id)
+            .cloned()
     }
 
     #[cfg(test)]
@@ -3337,6 +3352,11 @@ impl QueryContextManager {
     pub(crate) fn cancel_query(&self, query_id: QueryId, err: String) -> Vec<UniqueId> {
         let (cancellation, finsts, completions) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            #[cfg(test)]
+            guard
+                .runtime_filter_query_cancellation_errors
+                .entry(query_id)
+                .or_insert_with(|| err.clone());
             let cancellation =
                 Self::prepare_runtime_filter_query_cancellation(&mut guard, query_id, None);
 
@@ -3433,6 +3453,11 @@ impl QueryContextManager {
             };
             binding_observer();
             let query_id = execution.query_id();
+            #[cfg(test)]
+            guard
+                .runtime_filter_query_cancellation_errors
+                .entry(query_id)
+                .or_insert_with(|| err.clone());
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
                 &mut guard,
                 query_id,

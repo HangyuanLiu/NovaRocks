@@ -406,6 +406,20 @@ impl InstalledDeployment {
         self.install.core_view().local_participant_id()
     }
 
+    pub(super) fn local_producer_instances(
+        &self,
+        channel_id: ChannelId,
+    ) -> Vec<(BindingId, UniqueId)> {
+        let participant = self.participant_id();
+        self.install
+            .routing_shard()
+            .channel(channel_id)
+            .into_iter()
+            .flat_map(|channel| channel.producer_instances())
+            .filter_map(|(identity, owner)| (*owner == participant).then_some(*identity))
+            .collect()
+    }
+
     #[cfg(test)]
     pub(super) fn participant_install_for_test(&self) -> RuntimeFilterParticipantInstall {
         self.install.clone()
