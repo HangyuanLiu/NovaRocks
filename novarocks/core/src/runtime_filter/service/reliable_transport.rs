@@ -360,7 +360,7 @@ impl ReliableTransportTick {
 /// Query-scoped sender-side reliable transport. See the module docs for the model.
 pub(crate) struct ReliableEnvelopeTransport {
     sink: Arc<dyn RuntimeFilterEnvelopeSink>,
-    // Test-only override so a service assembled with the inert production sink can be
+    // Test-only override so a service assembled with the live production sink can be
     // pointed at a recording / drivable fake without threading the sink through the
     // ~30 `new_with_dependencies` call sites. Mirrors the service's other
     // `Mutex<Option<..>>` test seams.
@@ -1750,6 +1750,35 @@ mod tests {
         assert_eq!(tick.failed_open(), &[requested]);
         assert_eq!(transport.pending_len(), 0);
         assert_eq!(transport.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn malformed_ack_contract_failure_releases_without_retry() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(100, 3, 10_000));
+        let requested = transport
+            .send_test(&route(78), frame_sized(8, 23))
+            .expect_buffered();
+
+        sink.complete(SinkCompletion::TransportFailure(
+            requested.clone(),
+            SinkTransportError::contract("runtime filter ACK accept status must be specified"),
+        ));
+        let tick = transport.drain_completions_and_drive(clock.now());
+
+        assert_eq!(tick.failed_open(), &[requested]);
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+        clock.advance(Duration::from_millis(100));
+        assert!(
+            transport
+                .drain_completions_and_drive(clock.now())
+                .is_quiescent()
+        );
+        assert_eq!(sink.count(), 1);
     }
 
     #[test]

@@ -1602,7 +1602,7 @@ impl RuntimeFilterService {
     }
 
     /// Point the outbound remote leg at a fake transport sink. Mirrors the other
-    /// `#[cfg(test)]` seams: the service is built with the inert production sink, and
+    /// `#[cfg(test)]` seams: the service is built with the live production sink, and
     /// delivery tests override it here rather than threading a sink through every
     /// `new_with_dependencies` call site.
     #[cfg(test)]

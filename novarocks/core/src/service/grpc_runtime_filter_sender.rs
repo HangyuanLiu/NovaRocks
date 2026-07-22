@@ -54,6 +54,22 @@ impl RuntimeFilterUnaryAck {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterUnaryError {
+    Transport(String),
+    Contract(String),
+}
+
+impl RuntimeFilterUnaryError {
+    fn transport(error: impl Into<String>) -> Self {
+        Self::Transport(error.into())
+    }
+
+    fn contract(error: impl Into<String>) -> Self {
+        Self::Contract(error.into())
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait RuntimeFilterEnvelopeUnaryClient: Send + Sync + 'static {
     async fn transmit(
@@ -61,7 +77,7 @@ pub(crate) trait RuntimeFilterEnvelopeUnaryClient: Send + Sync + 'static {
         route: RuntimeFilterRemoteRoute,
         envelope: RuntimeFilterEnvelope,
         deadline: Duration,
-    ) -> Result<RuntimeFilterUnaryAck, String>;
+    ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError>;
 }
 
 struct LiveRuntimeFilterEnvelopeUnaryClient;
@@ -73,19 +89,28 @@ impl RuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryClient {
         route: RuntimeFilterRemoteRoute,
         envelope: RuntimeFilterEnvelope,
         deadline: Duration,
-    ) -> Result<RuntimeFilterUnaryAck, String> {
+    ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
         // The endpoint is install-owned route authority. The raw backend index never
         // crosses this seam and cannot be confused with participant (+1) identity.
-        let client = NovaRocksGrpcRemoteClient::new_runtime_endpoint(route.endpoint())?;
+        let client = NovaRocksGrpcRemoteClient::new_runtime_endpoint(route.endpoint())
+            .map_err(RuntimeFilterUnaryError::transport)?;
         let response = client
             .transmit_runtime_filter_envelope_async(
                 encode_runtime_filter_envelope(&envelope),
                 deadline,
             )
-            .await?;
-        let (identity, status) = decode_runtime_filter_envelope_response(response)?;
-        Ok(RuntimeFilterUnaryAck::new(identity, status))
+            .await
+            .map_err(RuntimeFilterUnaryError::transport)?;
+        decode_runtime_filter_unary_ack(response)
     }
+}
+
+fn decode_runtime_filter_unary_ack(
+    response: crate::proto::filter::RuntimeFilterEnvelopeResponse,
+) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
+    decode_runtime_filter_envelope_response(response)
+        .map(|(identity, status)| RuntimeFilterUnaryAck::new(identity, status))
+        .map_err(RuntimeFilterUnaryError::contract)
 }
 
 struct SinkRequest {
@@ -239,9 +264,13 @@ async fn run_worker(
                     requested_identity, ack.identity
                 )),
             ),
-            Err(error) => SinkCompletion::TransportFailure(
+            Err(RuntimeFilterUnaryError::Transport(error)) => SinkCompletion::TransportFailure(
                 requested_identity,
                 SinkTransportError::network(error),
+            ),
+            Err(RuntimeFilterUnaryError::Contract(error)) => SinkCompletion::TransportFailure(
+                requested_identity,
+                SinkTransportError::contract(error),
             ),
         };
         // A full completion queue retains this one completion in the worker future
@@ -269,6 +298,7 @@ mod tests {
 
     use super::{
         GrpcRuntimeFilterEnvelopeSink, RuntimeFilterEnvelopeUnaryClient, RuntimeFilterUnaryAck,
+        RuntimeFilterUnaryError, decode_runtime_filter_unary_ack,
     };
     use crate::common::types::UniqueId;
     use crate::runtime::endpoint::RuntimeEndpoint;
@@ -288,7 +318,7 @@ mod tests {
 
     struct FakeUnaryClient {
         seen: mpsc::Sender<(RuntimeFilterRemoteRoute, RuntimeFilterEnvelope)>,
-        responses: Mutex<VecDeque<Result<RuntimeFilterUnaryAck, String>>>,
+        responses: Mutex<VecDeque<Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError>>>,
         gate: Option<Arc<Semaphore>>,
     }
 
@@ -299,7 +329,7 @@ mod tests {
             route: RuntimeFilterRemoteRoute,
             envelope: RuntimeFilterEnvelope,
             _deadline: Duration,
-        ) -> Result<RuntimeFilterUnaryAck, String> {
+        ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
             self.seen
                 .send((route, envelope))
                 .await
@@ -315,6 +345,29 @@ mod tests {
                 .await
                 .pop_front()
                 .expect("fake response is configured")
+        }
+    }
+
+    struct MalformedAckUnaryClient;
+
+    #[async_trait::async_trait]
+    impl RuntimeFilterEnvelopeUnaryClient for MalformedAckUnaryClient {
+        async fn transmit(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            envelope: RuntimeFilterEnvelope,
+            _deadline: Duration,
+        ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
+            let response = crate::proto::filter::RuntimeFilterEnvelopeResponse {
+                acked_route_identity:
+                    crate::service::grpc_runtime_filter_adapter::encode_runtime_filter_envelope(
+                        &envelope,
+                    )
+                    .route_identity,
+                accept_status: crate::proto::filter::RuntimeFilterAcceptStatus::Unspecified as i32,
+                rejection_reason: String::new(),
+            };
+            decode_runtime_filter_unary_ack(response)
         }
     }
 
@@ -442,6 +495,62 @@ mod tests {
                 assert!(error.is_contract(), "{error}");
             }
             completion => panic!("expected contract rejection, got {completion:?}"),
+        }
+        sink.shutdown();
+    }
+
+    #[test]
+    fn malformed_ack_status_is_contract_rejection() {
+        let requested_identity = identity(46, 7);
+        let sink =
+            GrpcRuntimeFilterEnvelopeSink::new_for_test(Arc::new(MalformedAckUnaryClient), 4, 4)
+                .expect("live sink on shared data runtime");
+
+        assert_eq!(
+            sink.try_send(route(46), envelope(46, 7)),
+            SinkSubmitOutcome::Submitted
+        );
+        match recv_completion(&sink) {
+            SinkCompletion::TransportFailure(identity, error) => {
+                assert_eq!(identity, requested_identity);
+                assert!(error.is_contract(), "{error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("ACK accept status must be specified"),
+                    "{error}"
+                );
+            }
+            completion => panic!("expected malformed ACK contract rejection, got {completion:?}"),
+        }
+        sink.shutdown();
+    }
+
+    #[test]
+    fn rpc_failure_remains_a_transport_failure() {
+        let requested_identity = identity(47, 7);
+        let (seen_tx, mut seen_rx) = mpsc::channel(1);
+        let client = Arc::new(FakeUnaryClient {
+            seen: seen_tx,
+            responses: Mutex::new(VecDeque::from([Err(RuntimeFilterUnaryError::transport(
+                "temporary peer outage",
+            ))])),
+            gate: None,
+        });
+        let sink = GrpcRuntimeFilterEnvelopeSink::new_for_test(client, 4, 4)
+            .expect("live sink on shared data runtime");
+
+        assert_eq!(
+            sink.try_send(route(47), envelope(47, 7)),
+            SinkSubmitOutcome::Submitted
+        );
+        let _ = recv_seen(&mut seen_rx);
+        match recv_completion(&sink) {
+            SinkCompletion::TransportFailure(identity, error) => {
+                assert_eq!(identity, requested_identity);
+                assert!(!error.is_contract(), "{error}");
+            }
+            completion => panic!("expected retryable transport failure, got {completion:?}"),
         }
         sink.shutdown();
     }
