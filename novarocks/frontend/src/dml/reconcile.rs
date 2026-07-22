@@ -110,9 +110,12 @@ pub fn operation_fact_from_finalize_failure(message: String) -> OperationFact {
     }
 }
 
-/// Writer aborted before commit. Mirrors core `write_operation_lifecycle`'s
-/// abort-fact mapping: known-uncommitted, retry the abort/cleanup when staged
-/// files exist.
+/// Writer aborted before commit. Mirrors core
+/// `operation_fact_update_from_write_abort`
+/// (`novarocks/core/src/engine/write_operation_lifecycle.rs:70`): known-
+/// uncommitted; when staged files exist, record a not-yet-attempted cleanup
+/// outcome and request `RetryAbort` so recovery can distinguish "abort with
+/// cleanup pending" from "nothing to clean up".
 pub fn operation_fact_from_writer_abort(reason: String, has_staged: bool) -> OperationFact {
     let cleanup_outcome = has_staged.then_some(IcebergCleanupOutcomeRecord {
         attempted: false,
@@ -237,7 +240,15 @@ mod tests {
         let err = CommitServiceError::unknown("lost reply".to_string(), evidence());
         let fact = operation_fact_from_commit_result(Err(&err));
         assert_eq!(fact.state, OperationState::CommitUnknown);
-        assert!(fact.recovery_evidence.is_some());
+        let recovery = fact
+            .recovery_evidence
+            .as_ref()
+            .expect("recovery evidence recorded");
+        assert_eq!(recovery.table_ident, "cat.ns.tbl");
+        assert_eq!(recovery.commit_op_kind, "fast_append");
+        assert_eq!(recovery.base_snapshot_id, Some(7));
+        assert_eq!(recovery.base_sequence_number, Some(3));
+        assert_eq!(recovery.staging_dir, "/w/staging");
         assert_eq!(
             fact.failure.unwrap().next_action,
             IcebergOperationNextAction::ManualInspect
@@ -295,6 +306,37 @@ mod tests {
         assert_eq!(
             fact.failure.unwrap().next_action,
             IcebergOperationNextAction::None
+        );
+    }
+
+    // Pins the durable commit-op-kind strings that are persisted into the
+    // operation journal and read back by recovery. The frontend mirror has no
+    // compile-time parity link to core, so this guard is the only protection
+    // against a typo drifting a persisted value (mirrors core's
+    // `commit_op_kind_record_names_are_stable`).
+    #[test]
+    fn commit_op_kind_record_names_are_stable() {
+        assert_eq!(commit_op_kind_record_name(CommitOpKind::FastAppend), "fast_append");
+        assert_eq!(commit_op_kind_record_name(CommitOpKind::Overwrite), "overwrite");
+        assert_eq!(commit_op_kind_record_name(CommitOpKind::RowDelta), "row_delta");
+        assert_eq!(commit_op_kind_record_name(CommitOpKind::RowDeltaDv), "row_delta_dv");
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RowDeltaDvFromFiles),
+            "row_delta_dv_from_files"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RewriteDataFiles),
+            "rewrite_data_files"
+        );
+        assert_eq!(commit_op_kind_record_name(CommitOpKind::CowUpdate), "cow_update");
+        assert_eq!(commit_op_kind_record_name(CommitOpKind::Truncate), "truncate");
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::OverwritePartitions),
+            "overwrite_partitions"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RewriteManifests),
+            "rewrite_manifests"
         );
     }
 }
