@@ -33,8 +33,7 @@ mod registry;
 mod reliable_transport;
 mod subscription;
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
@@ -1095,6 +1094,158 @@ impl From<ArtifactWireCodecError> for ArtifactDeliveryError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LifecyclePhase {
+    Running,
+    Closing,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CloseRole {
+    Leader,
+    Follower,
+    Deferred,
+    Closed,
+}
+
+struct LifecycleState {
+    phase: LifecyclePhase,
+    in_flight: usize,
+    owners: HashMap<ThreadId, usize>,
+    finalizer: Option<ThreadId>,
+}
+
+/// Reentrant-safe lifecycle barrier shared by Service and its reliable transport.
+///
+/// A permit covers one externally observable operation. Closing rejects new permits
+/// and a non-reentrant closer waits on the condition variable until every admitted
+/// operation has left. A closer invoked synchronously from its own callback is marked
+/// deferred; the outer operation's guard claims finalization after releasing its last
+/// permit, avoiding self-wait deadlocks without weakening the external close barrier.
+pub(super) struct LifecycleBarrier {
+    state: Mutex<LifecycleState>,
+    changed: Condvar,
+}
+
+impl LifecycleBarrier {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(LifecycleState {
+                phase: LifecyclePhase::Running,
+                in_flight: 0,
+                owners: HashMap::new(),
+                finalizer: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(super) fn try_admit(&self) -> Option<LifecyclePermit<'_>> {
+        let current = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.phase != LifecyclePhase::Running {
+            return None;
+        }
+        state.in_flight += 1;
+        *state.owners.entry(current).or_insert(0) += 1;
+        Some(LifecyclePermit { barrier: self })
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase
+            == LifecyclePhase::Running
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase
+            == LifecyclePhase::Closing
+    }
+
+    pub(super) fn request_close(&self) -> CloseRole {
+        let current = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.phase == LifecyclePhase::Closed {
+            return CloseRole::Closed;
+        }
+        state.phase = LifecyclePhase::Closing;
+        if state.owners.get(&current).copied().unwrap_or(0) != 0
+            || state.finalizer.as_ref() == Some(&current)
+        {
+            return CloseRole::Deferred;
+        }
+        if state.finalizer.is_none() {
+            state.finalizer = Some(current);
+            CloseRole::Leader
+        } else {
+            CloseRole::Follower
+        }
+    }
+
+    pub(super) fn wait_for_quiescence(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.in_flight != 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub(super) fn wait_until_closed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.phase != LifecyclePhase::Closed {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub(super) fn mark_closed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.phase = LifecyclePhase::Closed;
+        state.finalizer = None;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn release(&self) {
+        let current = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let remove_owner = {
+            let count = state
+                .owners
+                .get_mut(&current)
+                .expect("lifecycle permit owner is registered");
+            *count -= 1;
+            *count == 0
+        };
+        if remove_owner {
+            state.owners.remove(&current);
+        }
+        state.in_flight -= 1;
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
+pub(super) struct LifecyclePermit<'a> {
+    barrier: &'a LifecycleBarrier,
+}
+
+impl Drop for LifecyclePermit<'_> {
+    fn drop(&mut self) {
+        self.barrier.release();
+    }
+}
+
 pub(crate) struct RuntimeFilterService {
     _query_id: UniqueId,
     _clock: Arc<dyn RuntimeFilterClock>,
@@ -1117,8 +1268,10 @@ pub(crate) struct RuntimeFilterService {
     before_inbound_typed_dispatch: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_registry_cancel_before_channel_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_deadline_dispatch: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     operation: Mutex<()>,
-    terminal: AtomicBool,
+    lifecycle: LifecycleBarrier,
     // Unified, per-channel ingress dedupe + `(query, epoch)` tombstone (M3 Task 3).
     // Both ingress directions consult it; teardown (`cancel`) retires this query/epoch
     // into its tombstone. It subsumes the former `delivered_versions` ledger (the
@@ -1135,6 +1288,27 @@ pub(crate) struct RuntimeFilterService {
 pub(super) struct OpenedProducer {
     pub(super) handle: ProducerHandle,
     pub(super) outcome: SubmitOutcome,
+}
+
+struct ServiceCall<'a> {
+    service: &'a RuntimeFilterService,
+    permit: Option<LifecyclePermit<'a>>,
+}
+
+impl<'a> ServiceCall<'a> {
+    fn admit(service: &'a RuntimeFilterService) -> Option<Self> {
+        Some(Self {
+            service,
+            permit: Some(service.lifecycle.try_admit()?),
+        })
+    }
+}
+
+impl Drop for ServiceCall<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.service.finish_close_if_requested();
+    }
 }
 
 impl RuntimeFilterService {
@@ -1192,8 +1366,10 @@ impl RuntimeFilterService {
             before_inbound_typed_dispatch: Mutex::new(None),
             #[cfg(test)]
             after_registry_cancel_before_channel_cancel: Mutex::new(None),
+            #[cfg(test)]
+            before_deadline_dispatch: Mutex::new(None),
             operation: Mutex::new(()),
-            terminal: AtomicBool::new(false),
+            lifecycle: LifecycleBarrier::new(),
             dedupe: IngressDedupe::new(query_id),
         }
     }
@@ -1212,7 +1388,7 @@ impl RuntimeFilterService {
         &self,
         install: RuntimeFilterParticipantInstall,
     ) -> Result<InstallOutcome, InstallContractError> {
-        if self.terminal.load(Ordering::Acquire) {
+        if !self.lifecycle.is_running() {
             return Err(InstallContractError::new(
                 InstallContractErrorKind::ServiceClosed,
                 "runtime filter service is terminal",
@@ -1227,7 +1403,7 @@ impl RuntimeFilterService {
         &self,
         policy: ReliableTransportPolicy,
     ) -> Result<(), String> {
-        if self.terminal.load(Ordering::Acquire) {
+        if !self.lifecycle.is_running() {
             return Err("runtime filter service is terminal".to_string());
         }
         self.reliable_transport.configure_policy(policy)
@@ -1566,9 +1742,6 @@ impl RuntimeFilterService {
     }
 
     pub(crate) fn expire_deadlines(&self, now: Instant) {
-        if self.terminal.load(Ordering::Acquire) {
-            return;
-        }
         let installed = {
             let _operation = self
                 .operation
@@ -1577,6 +1750,19 @@ impl RuntimeFilterService {
             self.registry.active_installation()
         };
         if let Some(installed) = installed {
+            #[cfg(test)]
+            if let Some(hook) = self
+                .before_deadline_dispatch
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .cloned()
+            {
+                hook();
+            }
+            let Some(_call) = ServiceCall::admit(self) else {
+                return;
+            };
             for (channel_id, channel) in installed.channels() {
                 let action = channel.expire_deadline(now);
                 if !matches!(action, ChannelAction::None) {
@@ -1590,27 +1776,35 @@ impl RuntimeFilterService {
     /// Channel deadlines and reliable transport completions/retries share this sole
     /// production driver so their lifecycle cannot drift into separate timer owners.
     pub(crate) fn tick(&self, now: Instant) {
-        if self.terminal.load(Ordering::Acquire) {
-            return;
-        }
         self.expire_deadlines(now);
-        if self.terminal.load(Ordering::Acquire) {
-            return;
-        }
         let _ = self.reliable_transport.drain_completions_and_drive(now);
     }
 
     pub(crate) fn cancel(&self) {
+        self.close_from_request();
+    }
+
+    fn finish_close_if_requested(&self) {
+        if self.lifecycle.is_closing() {
+            self.close_from_request();
+        }
+    }
+
+    fn close_from_request(&self) {
+        match self.lifecycle.request_close() {
+            CloseRole::Closed | CloseRole::Deferred => return,
+            CloseRole::Follower => {
+                self.lifecycle.wait_until_closed();
+                return;
+            }
+            CloseRole::Leader => self.lifecycle.wait_for_quiescence(),
+        }
         let installed = {
             let _operation = self
                 .operation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if self.terminal.swap(true, Ordering::AcqRel) {
-                None
-            } else {
-                self.registry.cancel()
-            }
+            self.registry.cancel()
         };
         // Terminalize outbound authority before any channel-cancellation callback can
         // reenter delivery. The transport waits for an already-admitted nonblocking
@@ -1639,6 +1833,7 @@ impl RuntimeFilterService {
             }
             cancelled.deliver_artifact_cancellation();
         }
+        self.lifecycle.mark_closed();
     }
 
     pub(crate) fn shutdown(&self) {
@@ -1826,6 +2021,14 @@ impl RuntimeFilterService {
     ) {
         *self
             .after_registry_cancel_before_channel_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_before_deadline_dispatch_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .before_deadline_dispatch
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(hook);
     }
@@ -2411,6 +2614,37 @@ mod tests {
         entered: mpsc::Sender<()>,
         release: Mutex<mpsc::Receiver<()>>,
         recorded: Mutex<Vec<RuntimeFilterEvent>>,
+    }
+
+    struct BlockingChannelDeadlineEvents {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        recorded: Mutex<Vec<RuntimeFilterEvent>>,
+    }
+
+    impl RuntimeFilterEventSink for BlockingChannelDeadlineEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if matches!(event, RuntimeFilterEvent::ChannelUnavailable { .. }) {
+                self.entered.send(()).expect("channel callback entered");
+                self.release
+                    .lock()
+                    .expect("channel callback release")
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("channel callback released");
+            }
+            self.recorded.lock().expect("recorded events").push(event);
+        }
+    }
+
+    impl BlockingChannelDeadlineEvents {
+        fn unavailable_count(&self) -> usize {
+            self.recorded
+                .lock()
+                .expect("recorded events")
+                .iter()
+                .filter(|event| matches!(event, RuntimeFilterEvent::ChannelUnavailable { .. }))
+                .count()
+        }
     }
 
     impl RuntimeFilterEventSink for BlockingLastInstallEvent {
@@ -5654,6 +5888,142 @@ mod tests {
             incomplete_subscription.acquire(Duration::ZERO),
             ArtifactAcquireOutcome::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn shutdown_linearizes_before_a_channel_deadline_callback_can_return_late() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let events = Arc::new(BlockingChannelDeadlineEvents {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            recorded: Mutex::new(Vec::new()),
+        });
+        let started = Instant::now();
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(started)),
+            events.clone(),
+            MemTrackerMemoryAccount::new_root_for_test("channel-deadline-lifecycle"),
+        ));
+        service
+            .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
+            .expect("install deadline channel");
+
+        let (tick_done_tx, tick_done_rx) = mpsc::sync_channel(1);
+        let tick_service = service.clone();
+        let tick_thread = std::thread::spawn(move || {
+            tick_service.expire_deadlines(started + Duration::from_millis(100));
+            tick_done_tx.send(()).expect("deadline tick complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("channel deadline callback entered");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_service = service.clone();
+        let shutdown_events = events.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            shutdown_done_tx
+                .send(shutdown_events.unavailable_count())
+                .expect("shutdown complete");
+        });
+        let early_count = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .ok();
+
+        release_tx.send(()).expect("release channel callback");
+        tick_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline tick joined in time");
+        let count_at_shutdown = early_count.unwrap_or_else(|| {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time")
+        });
+        tick_thread.join().expect("deadline tick thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            early_count.is_none(),
+            "shutdown returned while an admitted channel callback was still running"
+        );
+        assert_eq!(events.unavailable_count(), count_at_shutdown);
+    }
+
+    #[test]
+    fn deadline_snapshot_before_shutdown_does_not_dispatch_after_terminal() {
+        let events = Arc::new(Events::default());
+        let started = Instant::now();
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(started)),
+            events.clone(),
+            MemTrackerMemoryAccount::new_root_for_test("deadline-snapshot-lifecycle"),
+        ));
+        service
+            .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
+            .expect("install deadline channel");
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Mutex::new(release_rx);
+        let armed = Arc::new(AtomicBool::new(true));
+        service.set_before_deadline_dispatch_hook(Arc::new(move || {
+            if armed.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).expect("deadline snapshot reached");
+                release_rx
+                    .lock()
+                    .expect("deadline snapshot release")
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("deadline snapshot released");
+            }
+        }));
+
+        let (tick_done_tx, tick_done_rx) = mpsc::sync_channel(1);
+        let tick_service = service.clone();
+        let tick_thread = std::thread::spawn(move || {
+            tick_service.expire_deadlines(started + Duration::from_millis(100));
+            tick_done_tx.send(()).expect("deadline tick complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline snapshotted installation");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_service = service.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            shutdown_done_tx.send(()).expect("shutdown complete");
+        });
+        let shutdown_completed_before_release = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        release_tx.send(()).expect("release deadline snapshot");
+        tick_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline tick joined in time");
+        if !shutdown_completed_before_release {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time");
+        }
+        tick_thread.join().expect("deadline tick thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            shutdown_completed_before_release,
+            "shutdown must close while an unadmitted channel dispatch is paused"
+        );
+        assert!(
+            events
+                .0
+                .lock()
+                .expect("recorded events")
+                .iter()
+                .all(|event| !matches!(event, RuntimeFilterEvent::ChannelUnavailable { .. }))
+        );
     }
 
     #[test]

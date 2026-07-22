@@ -5279,6 +5279,7 @@ mod tests {
             completions: Mutex<VecDeque<SinkCompletion>>,
             lock_probe: Mutex<Option<(Weak<QueryContextManager>, QueryId, mpsc::SyncSender<bool>)>>,
             retry_gate: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+            shutdown_gate: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
         }
 
         impl TickSink {
@@ -5290,6 +5291,7 @@ mod tests {
                     completions: Mutex::new(VecDeque::new()),
                     lock_probe: Mutex::new(None),
                     retry_gate: Mutex::new(None),
+                    shutdown_gate: Mutex::new(None),
                 })
             }
 
@@ -5309,6 +5311,14 @@ mod tests {
                 let (entered_tx, entered_rx) = mpsc::sync_channel(1);
                 let (release_tx, release_rx) = mpsc::sync_channel(1);
                 *sink.retry_gate.lock().expect("retry gate") = Some((entered_tx, release_rx));
+                (sink, entered_rx, release_tx)
+            }
+
+            fn with_blocked_shutdown() -> (Arc<Self>, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+                let sink = Self::plain();
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                *sink.shutdown_gate.lock().expect("shutdown gate") = Some((entered_tx, release_rx));
                 (sink, entered_rx, release_tx)
             }
 
@@ -5362,6 +5372,12 @@ mod tests {
             }
 
             fn shutdown(&self) {
+                if let Some((entered, release)) =
+                    self.shutdown_gate.lock().expect("shutdown gate").take()
+                {
+                    entered.send(()).expect("shutdown entered");
+                    release.recv_timeout(WAIT).expect("shutdown released");
+                }
                 self.shutdown.store(true, Ordering::Release);
             }
         }
@@ -5593,6 +5609,58 @@ mod tests {
                     .runtime_filter_service_for_ingress(query_id)
                     .is_none()
             );
+        }
+
+        #[test]
+        fn duplicate_shutdown_waits_for_the_first_teardown_to_close() {
+            let manager = QueryContextManager::new_for_test();
+            let query_id = query_id(5);
+            let started = Instant::now();
+            let (sink, shutdown_entered_rx, release_shutdown_tx) =
+                TickSink::with_blocked_shutdown();
+            let service = install_service(&manager, query_id, started, sink.clone());
+            seed_pending(&service);
+
+            let (first_done_tx, first_done_rx) = mpsc::sync_channel(1);
+            let first_service = service.clone();
+            let first = std::thread::spawn(move || {
+                first_service.shutdown();
+                first_done_tx.send(()).expect("first shutdown complete");
+            });
+            shutdown_entered_rx
+                .recv_timeout(WAIT)
+                .expect("first shutdown entered sink teardown");
+
+            let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+            let second_service = service.clone();
+            let second = std::thread::spawn(move || {
+                second_service.cancel();
+                second_done_tx.send(()).expect("second shutdown complete");
+            });
+            let second_returned_early = second_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_ok();
+
+            release_shutdown_tx
+                .send(())
+                .expect("release first shutdown");
+            first_done_rx
+                .recv_timeout(WAIT)
+                .expect("first shutdown joined in time");
+            if !second_returned_early {
+                second_done_rx
+                    .recv_timeout(WAIT)
+                    .expect("second shutdown joined in time");
+            }
+            first.join().expect("first shutdown thread");
+            second.join().expect("second shutdown thread");
+
+            assert!(
+                !second_returned_early,
+                "a duplicate shutdown must wait until the first teardown is closed"
+            );
+            assert!(sink.shutdown.load(Ordering::Acquire));
+            assert_eq!(service.transport_pending_len_for_test(), 0);
         }
     }
 
