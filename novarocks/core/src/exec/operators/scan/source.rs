@@ -1344,11 +1344,13 @@ mod tests {
             crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
                 crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
             );
-        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2, 3, 4]],
-        }))
-        .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1377,11 +1379,13 @@ mod tests {
             crate::exec::operators::runtime_filter::tests_support::observed_published_consumer_set(
                 crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
             );
-        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2, 3, 4]],
-        }))
-        .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1415,9 +1419,11 @@ mod tests {
                     "two", "four",
                 ]),
             );
-        let scan = ScanNode::new(Arc::new(DictionaryScanOp))
+        let op: Arc<dyn ScanOp> = Arc::new(DictionaryScanOp);
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1451,12 +1457,14 @@ mod tests {
             crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
                 crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[3, 4]),
             );
-        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2], vec![3, 4]],
-        }))
-        .with_limit(Some(2))
-        .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_limit(Some(2))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();

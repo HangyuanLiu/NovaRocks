@@ -165,7 +165,6 @@ mod tests {
     use crate::runtime::profile::RuntimeProfile;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
     use super::materialize_scan_bindings;
 
@@ -275,14 +274,13 @@ mod tests {
     }
 
     fn instance_with_scan(assignments: ScanAssignments, finst: UniqueId) -> FragmentInstanceSpec {
-        FragmentInstanceSpec::new(
+        FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             QueryId { hi: 1, lo: 2 },
             FragmentInstanceId::new(finst),
             assignments,
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,
-            RuntimeFilterParams::default(),
             FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
             NonZeroUsize::new(1).expect("non-zero DOP"),
             BackendNum::try_new(1).expect("backend number"),
