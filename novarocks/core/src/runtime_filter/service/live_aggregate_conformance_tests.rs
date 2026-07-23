@@ -457,6 +457,7 @@ fn aggregate_factory(session: AggregateFinalDomainSessionBuilder) -> AggregatePr
         false,
         true,
         output_schema,
+        Vec::new(),
         Some(session),
     )
 }

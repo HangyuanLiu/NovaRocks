@@ -49,7 +49,9 @@ use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-use crate::exec::node::aggregate::{AggFunction, TopNRuntimeFilterSpec};
+use crate::exec::node::aggregate::{
+    AggFunction, NativeAggregateTopNProducerSpec, TopNRuntimeFilterSpec,
+};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
@@ -71,7 +73,9 @@ pub struct AggregateStreamingSinkFactory {
 
 #[derive(Clone)]
 enum StreamingAggregateRuntimeFilterExecution {
-    Native,
+    Native {
+        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    },
     #[cfg(feature = "compat")]
     Compat {
         topn_specs: Vec<TopNRuntimeFilterSpec>,
@@ -88,6 +92,7 @@ impl AggregateStreamingSinkFactory {
         output_intermediate: bool,
         output_chunk_schema: ChunkSchemaRef,
         state: AggregateStreamingState,
+        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
     ) -> Self {
         let name = if node_id >= 0 {
             format!("AGGREGATE_STREAMING_SINK (id={node_id})")
@@ -101,7 +106,9 @@ impl AggregateStreamingSinkFactory {
             functions,
             output_intermediate,
             output_chunk_schema,
-            runtime_filter_execution: StreamingAggregateRuntimeFilterExecution::Native,
+            runtime_filter_execution: StreamingAggregateRuntimeFilterExecution::Native {
+                topn_producers,
+            },
             streaming_state: state,
         }
     }
@@ -127,6 +134,7 @@ impl AggregateStreamingSinkFactory {
             output_intermediate,
             output_chunk_schema,
             state,
+            Vec::new(),
         );
         factory.runtime_filter_execution = StreamingAggregateRuntimeFilterExecution::Compat {
             topn_specs: topn_rf_specs,
@@ -165,6 +173,15 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             topn_rf_rows_since_publish: 0,
             streaming_state: self.streaming_state.clone(),
         })
+    }
+
+    #[cfg(test)]
+    fn native_aggregate_topn_producers(&self) -> &[NativeAggregateTopNProducerSpec] {
+        match &self.runtime_filter_execution {
+            StreamingAggregateRuntimeFilterExecution::Native { topn_producers } => topn_producers,
+            #[cfg(feature = "compat")]
+            StreamingAggregateRuntimeFilterExecution::Compat { .. } => &[],
+        }
     }
 
     fn is_sink(&self) -> bool {

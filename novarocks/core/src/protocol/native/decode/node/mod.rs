@@ -452,6 +452,7 @@ fn decode_node_inner(
     if children_are_absent(node) && !consumer_bindings.is_empty() {
         attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
     }
+    let mut lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
         attach_producers(
             node,
@@ -462,7 +463,6 @@ fn decode_node_inner(
             path.clone(),
         )?;
     }
-    let lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if let Some(ledger) = ledger {
         ledger
             .commit_consumed_many(&node.runtime_filter_binding_ids)
@@ -818,15 +818,15 @@ fn attach_hash_join_producers(
     path: FieldPath,
 ) -> Result<(), super::NativeFragmentDecodeError> {
     let binding_path = path.clone().field("runtime_filter_binding_ids");
-    let ExecNodeKind::Join(join) = &mut lowered.node.kind else {
-        return Err(super::NativeFragmentDecodeError::inconsistent(
-            binding_path,
+    let join = find_hash_join_mut(&mut lowered.node, wire_node.node_id).ok_or_else(|| {
+        super::NativeFragmentDecodeError::inconsistent(
+            binding_path.clone(),
             format!(
                 "native runtime-filter producer binding is only supported on HashJoin, node_id={}",
                 wire_node.node_id
             ),
-        ));
-    };
+        )
+    })?;
     if direct_inputs.len() != 2 {
         return Err(super::NativeFragmentDecodeError::inconsistent(
             binding_path,
@@ -1134,8 +1134,27 @@ fn find_hash_aggregate_mut(
 ) -> Option<&mut crate::exec::node::aggregate::AggregateNode> {
     match &mut node.kind {
         ExecNodeKind::Aggregate(aggregate) if aggregate.node_id == node_id => Some(aggregate),
-        ExecNodeKind::Project(project) if project.is_subordinate => {
+        ExecNodeKind::Limit(limit) if limit.node_id == node_id => {
+            find_hash_aggregate_mut(&mut limit.input, node_id)
+        }
+        ExecNodeKind::Project(project) if project.is_subordinate && project.node_id == node_id => {
             find_hash_aggregate_mut(&mut project.input, node_id)
+        }
+        _ => None,
+    }
+}
+
+fn find_hash_join_mut(
+    node: &mut ExecNode,
+    node_id: i32,
+) -> Option<&mut crate::exec::node::join::JoinNode> {
+    match &mut node.kind {
+        ExecNodeKind::Join(join) if join.node_id == node_id => Some(join),
+        ExecNodeKind::Limit(limit) if limit.node_id == node_id => {
+            find_hash_join_mut(&mut limit.input, node_id)
+        }
+        ExecNodeKind::Project(project) if project.is_subordinate && project.node_id == node_id => {
+            find_hash_join_mut(&mut project.input, node_id)
         }
         _ => None,
     }
@@ -2698,6 +2717,67 @@ mod tests {
             spec.completion_requirement,
             crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
         );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_attaches_after_distributed_limit_wrapper_is_complete() {
+        let mut wire = projected_grouped_aggregate_node(20);
+        wire.limit = 7;
+
+        let mut unbound = decode_node(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect("aggregate with a distributed limit");
+        assert!(
+            matches!(unbound.node.kind, ExecNodeKind::Limit(_)),
+            "DistributedNode.limit must be the completed outer wrapper"
+        );
+        assert!(
+            find_hash_aggregate_mut(&mut unbound.node, 20).is_some(),
+            "the controlled aggregate-owner traversal must cross only same-node wrappers"
+        );
+
+        wire.runtime_filter_binding_ids = vec![1];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![ordered_aggregate_topn_producer_wire(
+                1,
+                20,
+                column_ref(1, DataType::Int64),
+                DataType::Int64,
+                0,
+                5,
+            )],
+        };
+        let mut ledger =
+            NativeRuntimeFilterDecodeLedger::decode(1, Some(&table)).expect("decode binding table");
+        let lowered = decode_node_with_runtime_filters(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect("AggregateTopNKey binding must attach after the limit wrapper exists");
+        ledger.finish().expect("producer binding consumed");
+
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("distributed limit must remain the completed outer wrapper")
+        };
+        assert_eq!(limit.limit, Some(7));
+        let ExecNodeKind::Project(project) = limit.input.kind else {
+            panic!("visible-output projection must remain below the limit")
+        };
+        let ExecNodeKind::Aggregate(aggregate) = project.input.kind else {
+            panic!("binding must target the unique physical aggregate below controlled wrappers")
+        };
+        let AggregateRuntimeFilterSpec::Native { topn_producers } = aggregate.runtime_filter_spec
+        else {
+            panic!("native aggregate runtime-filter execution")
+        };
+        assert_eq!(topn_producers.len(), 1);
+        assert_eq!(topn_producers[0].binding_id, 1);
     }
 
     fn native_aggregate_topn_binding_error(

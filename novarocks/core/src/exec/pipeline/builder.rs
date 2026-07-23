@@ -943,6 +943,18 @@ fn resolve_aggregate_topn_producer_site_if_present(
         .transpose()
 }
 
+fn aggregate_topn_producers_for_site(
+    resolved_site: Option<AggregateTopNProducerSite>,
+    physical_site: AggregateTopNProducerSite,
+    specs: &[NativeAggregateTopNProducerSpec],
+) -> Vec<NativeAggregateTopNProducerSpec> {
+    if resolved_site == Some(physical_site) {
+        specs.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 fn native_join_producer_factory(
     specs: &[crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec],
     build_keys: &[crate::exec::expr::ExprId],
@@ -1447,7 +1459,7 @@ fn build_pipeline_for_node(
                 build = ensure_hash(build, ctx, *node_id, group_by.clone(), dop as usize);
             }
             if *need_finalize && !group_by.is_empty() && dop > 1 && all_update {
-                let _producer_site = resolve_aggregate_topn_producer_site_if_present(
+                let producer_site = resolve_aggregate_topn_producer_site_if_present(
                     native_topn_producers,
                     &[
                         AggregateTopNProducerSiteCandidate {
@@ -1480,6 +1492,11 @@ fn build_pipeline_for_node(
                                 true,
                                 false,
                                 output_chunk_schema.clone(),
+                                aggregate_topn_producers_for_site(
+                                    producer_site,
+                                    AggregateTopNProducerSite::PartialAggregateProcessor,
+                                    native_topn_producers,
+                                ),
                                 None,
                             ))
                         }
@@ -1533,6 +1550,11 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        aggregate_topn_producers_for_site(
+                            producer_site,
+                            AggregateTopNProducerSite::FinalAggregateProcessor,
+                            native_topn_producers,
+                        ),
                         None,
                     )));
                 return Ok(build);
@@ -1553,6 +1575,7 @@ fn build_pipeline_for_node(
                             true,
                             false,
                             output_chunk_schema.clone(),
+                            Vec::new(),
                             None,
                         ))
                     }
@@ -1611,6 +1634,7 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        Vec::new(),
                         None,
                     )));
 
@@ -1633,7 +1657,7 @@ fn build_pipeline_for_node(
                 streaming_preaggregation_mode,
                 Some(StreamingPreaggregationMode::ForcePreaggregation)
             ) {
-                let _producer_site = resolve_aggregate_topn_producer_site_if_present(
+                let producer_site = resolve_aggregate_topn_producer_site_if_present(
                     native_topn_producers,
                     &[
                         AggregateTopNProducerSiteCandidate {
@@ -1657,6 +1681,11 @@ fn build_pipeline_for_node(
                             !*need_finalize,
                             output_chunk_schema.clone(),
                             streaming_state.clone(),
+                            aggregate_topn_producers_for_site(
+                                producer_site,
+                                AggregateTopNProducerSite::StreamingAggregateSink,
+                                native_topn_producers,
+                            ),
                         ))
                     }
                     #[cfg(feature = "compat")]
@@ -1694,7 +1723,7 @@ fn build_pipeline_for_node(
                 });
             }
 
-            let _producer_site = resolve_aggregate_topn_producer_site_if_present(
+            let producer_site = resolve_aggregate_topn_producer_site_if_present(
                 native_topn_producers,
                 &[AggregateTopNProducerSiteCandidate {
                     site: AggregateTopNProducerSite::AggregateProcessor,
@@ -1711,6 +1740,11 @@ fn build_pipeline_for_node(
                         !*need_finalize,
                         false,
                         output_chunk_schema.clone(),
+                        aggregate_topn_producers_for_site(
+                            producer_site,
+                            AggregateTopNProducerSite::AggregateProcessor,
+                            native_topn_producers,
+                        ),
                         None,
                     ))
                 }
@@ -3088,6 +3122,113 @@ mod tests {
         assert_eq!(
             aggregate_factories, 2,
             "two-phase expansion must keep one partial helper and one final aggregate"
+        );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_factory_ownership_is_ordinary_final_or_streaming_sink_only() {
+        fn attachments(graph: &super::PipelineGraph) -> Vec<(i32, String, Vec<u32>)> {
+            graph
+                .pipelines
+                .iter()
+                .flat_map(|pipeline| {
+                    pipeline.factories.iter().map(move |factory| {
+                        (
+                            pipeline.id,
+                            factory.name().to_string(),
+                            factory
+                                .native_aggregate_topn_producers()
+                                .iter()
+                                .map(|spec| spec.binding_id)
+                                .collect(),
+                        )
+                    })
+                })
+                .filter(|(_, name, _)| name.contains("AGG"))
+                .collect()
+        }
+
+        let (_ordinary_manager, ordinary_context) = installed_native_aggregate_topn_context();
+        let ordinary = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(false, false, None),
+            false,
+            DependencyManager::new(),
+            None,
+            2,
+            Some(ordinary_context),
+        )
+        .expect("ordinary aggregate owner");
+        assert_eq!(
+            attachments(&ordinary),
+            vec![(ordinary.root_id, "AGGREGATE (id=2)".to_string(), vec![3])]
+        );
+
+        let (_final_manager, final_context) = installed_native_aggregate_topn_context();
+        let two_phase = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(false, true, None),
+            false,
+            DependencyManager::new(),
+            None,
+            2,
+            Some(final_context),
+        )
+        .expect("two-phase final aggregate owner");
+        let two_phase_attachments = attachments(&two_phase);
+        assert_eq!(
+            two_phase_attachments
+                .iter()
+                .filter(|(_, _, bindings)| !bindings.is_empty())
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(two_phase.root_id, "AGGREGATE (id=2)".to_string(), vec![3])],
+            "only the final aggregate in the root pipeline may own the binding"
+        );
+        assert_eq!(
+            two_phase_attachments
+                .iter()
+                .filter(|(pipeline_id, _, bindings)| {
+                    *pipeline_id != two_phase.root_id && bindings.is_empty()
+                })
+                .count(),
+            1,
+            "the partial helper must carry no binding"
+        );
+
+        let (_streaming_manager, streaming_context) = installed_native_aggregate_topn_context();
+        let streaming = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(
+                false,
+                false,
+                Some(
+                    crate::exec::node::aggregate::StreamingPreaggregationMode::ForcePreaggregation,
+                ),
+            ),
+            false,
+            DependencyManager::new(),
+            None,
+            2,
+            Some(streaming_context),
+        )
+        .expect("streaming sink aggregate owner");
+        let streaming_attachments = attachments(&streaming);
+        assert_eq!(
+            streaming_attachments
+                .iter()
+                .filter(|(_, _, bindings)| !bindings.is_empty())
+                .map(|(_, name, bindings)| (name.as_str(), bindings.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![("AGGREGATE_STREAMING_SINK (id=2)", &[3][..])],
+            "only the streaming sink may own the binding"
+        );
+        assert!(
+            streaming_attachments
+                .iter()
+                .any(|(pipeline_id, name, bindings)| {
+                    *pipeline_id == streaming.root_id
+                        && name == "AGG_STREAMING_SOURCE (id=2)"
+                        && bindings.is_empty()
+                }),
+            "the streaming source must carry no binding"
         );
     }
 

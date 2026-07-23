@@ -44,7 +44,9 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-use crate::exec::node::aggregate::{AggFunction, TopNRuntimeFilterSpec};
+use crate::exec::node::aggregate::{
+    AggFunction, NativeAggregateTopNProducerSpec, TopNRuntimeFilterSpec,
+};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
@@ -383,7 +385,9 @@ pub struct AggregateProcessorFactory {
 
 #[derive(Clone)]
 enum AggregateRuntimeFilterExecution {
-    Native,
+    Native {
+        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    },
     #[cfg(feature = "compat")]
     Compat {
         topn_specs: Vec<TopNRuntimeFilterSpec>,
@@ -400,6 +404,7 @@ impl AggregateProcessorFactory {
         output_intermediate: bool,
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
+        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
         final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
     ) -> Self {
         let name = if node_id >= 0 {
@@ -456,7 +461,7 @@ impl AggregateProcessorFactory {
             output_intermediate,
             direct_input,
             output_chunk_schema,
-            runtime_filter_execution: AggregateRuntimeFilterExecution::Native,
+            runtime_filter_execution: AggregateRuntimeFilterExecution::Native { topn_producers },
             final_domain_session,
             final_domain_shape_error,
             #[cfg(test)]
@@ -485,6 +490,7 @@ impl AggregateProcessorFactory {
             output_intermediate,
             direct_input,
             output_chunk_schema,
+            Vec::new(),
             None,
         );
         factory.runtime_filter_execution = AggregateRuntimeFilterExecution::Compat {
@@ -561,6 +567,15 @@ impl OperatorFactory for AggregateProcessorFactory {
             #[cfg(test)]
             fail_output_construction: self.fail_output_construction,
         })
+    }
+
+    #[cfg(test)]
+    fn native_aggregate_topn_producers(&self) -> &[NativeAggregateTopNProducerSpec] {
+        match &self.runtime_filter_execution {
+            AggregateRuntimeFilterExecution::Native { topn_producers } => topn_producers,
+            #[cfg(feature = "compat")]
+            AggregateRuntimeFilterExecution::Compat { .. } => &[],
+        }
     }
 }
 
@@ -1882,6 +1897,7 @@ mod tests {
             false,
             true,
             output_schema,
+            Vec::new(),
             session,
         )
     }
@@ -1910,6 +1926,7 @@ mod tests {
             output_intermediate,
             direct_input,
             output_schema,
+            Vec::new(),
             session,
         )
     }
