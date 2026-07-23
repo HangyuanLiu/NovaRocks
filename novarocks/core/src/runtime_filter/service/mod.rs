@@ -17,7 +17,10 @@
 
 mod consumer_ingress;
 mod dedupe;
+mod final_domain_completion;
 mod inbound;
+#[cfg(test)]
+mod live_aggregate_conformance_tests;
 #[cfg(test)]
 mod live_deployment_conformance_tests;
 #[cfg(test)]
@@ -84,6 +87,10 @@ pub(crate) use self::consumer_ingress::{
     InboundConsumerDispatchError, InboundConsumerDispatchErrorKind, InboundConsumerDispatchOutcome,
 };
 use self::dedupe::IngressDedupe;
+use self::final_domain_completion::FinalDomainCompletionSessionRegistry;
+pub(crate) use self::final_domain_completion::{
+    FinalDomainCompletionSession, FinalDomainPartitionCommitter, FinalDomainServiceIssuancePermit,
+};
 pub(crate) use self::inbound::{
     InboundProducerDispatchError, InboundProducerDispatchErrorKind, InboundProducerDispatchOutcome,
 };
@@ -1573,6 +1580,7 @@ pub(crate) struct RuntimeFilterService {
     dispatcher: Arc<ActionDispatcher>,
     producer_handles: Mutex<BTreeMap<(BindingId, UniqueId), ProducerHandleWeak>>,
     remote_producer_states: Mutex<BTreeMap<(BindingId, UniqueId), Arc<RemoteProducerState>>>,
+    final_domain_completion_sessions: FinalDomainCompletionSessionRegistry,
     #[cfg(test)]
     producer_test_handles: Mutex<BTreeMap<(BindingId, UniqueId), Weak<ServiceProducerAdapter>>>,
     // Deterministic inbound-lifecycle seams. Each is a one-shot hook taken and run
@@ -1687,6 +1695,7 @@ impl RuntimeFilterService {
             reliable_transport,
             producer_handles: Mutex::new(BTreeMap::new()),
             remote_producer_states: Mutex::new(BTreeMap::new()),
+            final_domain_completion_sessions: FinalDomainCompletionSessionRegistry::default(),
             #[cfg(test)]
             producer_test_handles: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -1771,6 +1780,79 @@ impl RuntimeFilterService {
             .registry
             .active_installation()
             .ok_or_else(service_cancelled)?;
+        self.open_producer_with_install_locked(
+            &installed,
+            binding_id,
+            fragment_instance_id,
+            local_partition_count,
+            requested,
+        )
+    }
+
+    pub(crate) fn open_final_aggregate_producer(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        local_partition_count: u32,
+    ) -> Result<FinalDomainCompletionSession, RuntimeContractViolation> {
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.final_domain_completion_sessions
+            .ensure_vacant(binding_id, fragment_instance_id)?;
+        let installed = self
+            .registry
+            .active_installation()
+            .ok_or_else(service_cancelled)?;
+        let route = installed.producer(binding_id).ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::UnauthorizedBinding,
+                "producer binding is not installed on this participant",
+            )
+        })?;
+        let contract = route
+            .final_domain_seed
+            .as_ref()
+            .ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "installed producer route has no final-domain completion authority",
+                )
+            })?
+            .contract();
+        let producer = self
+            .open_producer_with_install_locked(
+                &installed,
+                binding_id,
+                fragment_instance_id,
+                local_partition_count,
+                ProducerPortKind::FinalDomain,
+            )?
+            .into_final_domain()?;
+        let session = FinalDomainCompletionSession::new(
+            contract,
+            binding_id,
+            fragment_instance_id,
+            producer,
+            local_partition_count,
+        )?;
+        self.final_domain_completion_sessions.register(
+            binding_id,
+            fragment_instance_id,
+            session.weak(),
+        )?;
+        Ok(session)
+    }
+
+    fn open_producer_with_install_locked(
+        &self,
+        installed: &Arc<InstalledDeployment>,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        local_partition_count: u32,
+        requested: ProducerPortKind,
+    ) -> Result<ProducerHandle, RuntimeContractViolation> {
         let route = installed.producer(binding_id).ok_or_else(|| {
             violation(
                 RuntimeContractViolationKind::UnauthorizedBinding,
@@ -1815,7 +1897,7 @@ impl RuntimeFilterService {
                     && decision.loopback_route_edge_ids().is_empty() =>
             {
                 self.open_remote_producer_locked(
-                    &installed,
+                    installed,
                     route,
                     decision.remote_routes()[0].clone(),
                     binding_id,
@@ -1830,7 +1912,7 @@ impl RuntimeFilterService {
             {
                 Ok(self
                     .open_inbound_core_locked(
-                        &installed,
+                        installed,
                         binding_id,
                         fragment_instance_id,
                         local_partition_count,
@@ -1840,7 +1922,7 @@ impl RuntimeFilterService {
             }
             Err(RuntimeFilterRouteContractError::ForbiddenOutboundKind { .. }) => Ok(self
                 .open_inbound_core_locked(
-                    &installed,
+                    installed,
                     binding_id,
                     fragment_instance_id,
                     local_partition_count,
@@ -1987,6 +2069,9 @@ impl RuntimeFilterService {
                 return Ok(OpenedProducer { handle, outcome });
             }
         }
+        let final_domain_authorized =
+            requested == ProducerPortKind::FinalDomain && route.final_domain_seed.is_some();
+        #[cfg(test)]
         let final_domain_authority = if requested == ProducerPortKind::FinalDomain {
             Some(
                 route
@@ -1998,7 +2083,7 @@ impl RuntimeFilterService {
                             "installed final-domain producer route is missing its private seed",
                         )
                     })?
-                    .derive(binding_id, fragment_instance_id)?,
+                    .derive_test_authority(binding_id, fragment_instance_id)?,
             )
         } else {
             None
@@ -2010,6 +2095,8 @@ impl RuntimeFilterService {
             fragment_instance_id,
             self.memory_account.clone(),
             self.dispatcher.clone(),
+            final_domain_authorized,
+            #[cfg(test)]
             final_domain_authority,
         ));
         #[cfg(test)]
@@ -2584,6 +2671,23 @@ impl RuntimeFilterService {
         {
             handle.set_before_dispatch(hook);
         }
+    }
+
+    #[cfg(test)]
+    fn inject_final_domain_submit_failure_for_test(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: crate::runtime_filter::port::identity::PartitionId,
+        sequence: crate::runtime_filter::port::identity::ProducerSequence,
+    ) {
+        self.producer_test_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(binding_id, fragment_instance_id))
+            .and_then(Weak::upgrade)
+            .expect("selected final-domain producer handle must be live")
+            .inject_final_domain_submit_failure(partition_id, sequence);
     }
 
     #[cfg(test)]
@@ -3891,7 +3995,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn compiled_fenced_final_install() -> RuntimeFilterParticipantInstall {
+    pub(super) fn compiled_fenced_final_install() -> RuntimeFilterParticipantInstall {
         let deployment = fenced_final_deployment();
         let expression = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -4252,14 +4356,14 @@ pub(crate) mod tests {
         )
     }
 
-    struct Fixture {
-        service: Arc<RuntimeFilterService>,
+    pub(super) struct Fixture {
+        pub(super) service: Arc<RuntimeFilterService>,
         events: Arc<Events>,
         started: Instant,
         tracker: Arc<MemTrackerMemoryAccount>,
     }
 
-    fn fixture() -> Fixture {
+    pub(super) fn fixture() -> Fixture {
         let events = Arc::new(Events::default());
         let started = Instant::now();
         let tracker = MemTrackerMemoryAccount::new_root_for_test("runtime-filter-test-query");

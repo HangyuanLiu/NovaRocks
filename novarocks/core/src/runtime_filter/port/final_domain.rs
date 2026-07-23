@@ -33,7 +33,9 @@ use super::value_domain::ValueDomainDelta;
 
 const CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.completion-fence-contract";
 const CONTRACT_VERSION: u16 = 1;
+#[cfg(test)]
 const AUTHORITY_SCOPE_DOMAIN: &[u8] = b"novarocks.runtime-filter.completion-fence-authority";
+#[cfg(test)]
 const AUTHORITY_SCOPE_VERSION: u16 = 1;
 const FENCE_DOMAIN: &[u8] = b"novarocks.runtime-filter.completion-fence";
 const FENCE_VERSION: u16 = 1;
@@ -137,12 +139,14 @@ fn fence_kind_tag(kind: CompletionFenceKind) -> u8 {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CommittedDomainFrozenProof {
     authority_scope_digest: [u8; 32],
 }
 
-#[derive(Clone, Debug)]
+#[cfg(test)]
+#[derive(Debug)]
 pub(crate) struct CompletionFenceAuthority {
     contract: Arc<RuntimeCompletionFenceContract>,
     binding_id: BindingId,
@@ -150,6 +154,7 @@ pub(crate) struct CompletionFenceAuthority {
     scope_digest: [u8; 32],
 }
 
+#[cfg(test)]
 impl CompletionFenceAuthority {
     pub(crate) fn try_new(
         contract: Arc<RuntimeCompletionFenceContract>,
@@ -188,7 +193,6 @@ impl CompletionFenceAuthority {
         ))
     }
 
-    #[cfg(test)]
     fn frozen_proof_for_test(&self) -> CommittedDomainFrozenProof {
         CommittedDomainFrozenProof {
             authority_scope_digest: self.scope_digest,
@@ -262,6 +266,7 @@ impl FrozenFinalDomainTestIssuer {
     }
 }
 
+#[cfg(test)]
 fn authority_scope_digest(
     contract_digest: CompletionFenceContractDigest,
     binding_id: BindingId,
@@ -361,6 +366,20 @@ pub(crate) struct FinalDomainShard {
 }
 
 impl FinalDomainShard {
+    pub(crate) fn issue_for_service(
+        permit: crate::runtime_filter::service::FinalDomainServiceIssuancePermit,
+        contract: &RuntimeCompletionFenceContract,
+        stream: ProducerStreamId,
+        sequence: ProducerSequence,
+        domain: ValueDomainDelta,
+    ) -> Result<Self, FinalDomainError> {
+        if !permit.authorizes(stream, &domain) {
+            return Err(FinalDomainError::FrozenProofMismatch);
+        }
+        let fence = CompletionFence::issue(contract.digest(), stream, sequence);
+        Self::try_new(contract, fence, domain)
+    }
+
     pub(crate) fn try_new(
         contract: &RuntimeCompletionFenceContract,
         fence: CompletionFence,
@@ -530,12 +549,12 @@ mod tests {
         ProducerStreamId::new(BindingId::new(20), INSTANCE_ID, PartitionId::new(partition))
     }
 
-    fn authority(contract: Arc<RuntimeCompletionFenceContract>) -> CompletionFenceAuthority {
+    fn test_authority(contract: Arc<RuntimeCompletionFenceContract>) -> CompletionFenceAuthority {
         CompletionFenceAuthority::try_new(contract, BindingId::new(20), INSTANCE_ID).unwrap()
     }
 
-    fn frozen_issuer(authority: &CompletionFenceAuthority) -> FrozenFinalDomainTestIssuer {
-        match CollectingFinalDomainTestIssuer::new(authority.clone(), 1).close_driver() {
+    fn frozen_issuer(authority: CompletionFenceAuthority) -> FrozenFinalDomainTestIssuer {
+        match CollectingFinalDomainTestIssuer::new(authority, 1).close_driver() {
             FinalDomainTestIssuerTransition::Frozen(issuer) => issuer,
             FinalDomainTestIssuerTransition::Collecting(_) => {
                 panic!("the only open driver must freeze the test issuer")
@@ -624,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_issuer_cannot_issue_until_every_local_driver_closes() {
-        let authority = authority(Arc::new(contract()));
+        let authority = test_authority(Arc::new(contract()));
         let collecting = CollectingFinalDomainTestIssuer::new(authority, 2);
         let collecting = match collecting.close_driver() {
             FinalDomainTestIssuerTransition::Collecting(collecting) => collecting,
@@ -647,8 +666,8 @@ mod tests {
     #[test]
     fn authority_issues_deterministic_cloneable_stream_sequence_fences() {
         let contract = Arc::new(contract());
-        let authority = authority(contract.clone());
-        let issuer = frozen_issuer(&authority);
+        let authority = test_authority(contract.clone());
+        let issuer = frozen_issuer(authority);
         let first = issuer.issue(stream(3), ProducerSequence::new(4)).unwrap();
         let replay = first.clone();
         let deterministic = issuer.issue(stream(3), ProducerSequence::new(4)).unwrap();
@@ -686,11 +705,12 @@ mod tests {
             Err(FinalDomainError::UnauthorizedFragmentInstance)
         );
 
+        let verifier_authority = test_authority(contract.clone());
         let other_authority =
             CompletionFenceAuthority::try_new(contract, BindingId::new(30), INSTANCE_ID).unwrap();
-        let wrong_issuer = frozen_issuer(&other_authority);
+        let wrong_issuer = frozen_issuer(other_authority);
         assert_eq!(
-            authority.issue(&wrong_issuer.proof, stream(3), ProducerSequence::new(4),),
+            verifier_authority.issue(&wrong_issuer.proof, stream(3), ProducerSequence::new(4),),
             Err(FinalDomainError::FrozenProofMismatch)
         );
     }
@@ -698,8 +718,8 @@ mod tests {
     #[test]
     fn remote_fence_reconstruction_does_not_change_local_frozen_issue_path() {
         let contract = Arc::new(contract());
-        let authority = authority(contract.clone());
-        let issuer = frozen_issuer(&authority);
+        let authority = test_authority(contract.clone());
+        let issuer = frozen_issuer(authority);
         let stream = stream(3);
         let sequence = ProducerSequence::new(4);
         let local = issuer.issue(stream, sequence).unwrap();
@@ -726,7 +746,7 @@ mod tests {
             Err(FinalDomainError::FenceIntegrityMismatch)
         );
 
-        let collecting = CollectingFinalDomainTestIssuer::new(authority, 1);
+        let collecting = CollectingFinalDomainTestIssuer::new(test_authority(contract), 1);
         assert!(matches!(
             collecting.close_driver(),
             FinalDomainTestIssuerTransition::Frozen(_)
@@ -736,8 +756,8 @@ mod tests {
     #[test]
     fn shard_validates_contract_schema_and_full_scope() {
         let contract = Arc::new(contract());
-        let authority = authority(contract.clone());
-        let issuer = frozen_issuer(&authority);
+        let authority = test_authority(contract.clone());
+        let issuer = frozen_issuer(authority);
         let fence = issuer.issue(stream(3), ProducerSequence::new(4)).unwrap();
         let domain = ValueDomainDelta::new(MembershipValues::int64([1, 2]), true);
         let shard = FinalDomainShard::try_new(&contract, fence.clone(), domain).unwrap();
@@ -830,8 +850,8 @@ mod tests {
     #[test]
     fn explicit_empty_shard_is_valid_and_canonical_size_is_checked() {
         let contract = Arc::new(contract());
-        let authority = authority(contract.clone());
-        let issuer = frozen_issuer(&authority);
+        let authority = test_authority(contract.clone());
+        let issuer = frozen_issuer(authority);
         let fence = issuer.issue(stream(0), ProducerSequence::new(0)).unwrap();
         let empty = ValueDomainDelta::new(MembershipValues::int64([]), false);
         let domain_bytes = empty.estimated_contribution_bytes().unwrap();

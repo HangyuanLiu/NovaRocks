@@ -62,6 +62,7 @@ mod values_source;
 pub use crate::connector::iceberg::IcebergTableSinkFactory;
 #[cfg(feature = "compat")]
 pub use crate::connector::starrocks::sink::OlapTableSinkFactory;
+pub(crate) use aggregate::AggregateFinalDomainSessionBuilder;
 pub use aggregate::AggregateProcessorFactory;
 pub use aggregate::streaming_sink::AggregateStreamingSinkFactory;
 pub use aggregate::streaming_source::AggregateStreamingSourceFactory;

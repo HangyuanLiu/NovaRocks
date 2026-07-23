@@ -33,9 +33,9 @@ use crate::runtime_filter::port::artifact::{
 use crate::runtime_filter::port::events::{
     RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
-use crate::runtime_filter::port::final_domain::{
-    CompletionFenceAuthority, RuntimeCompletionFenceContract,
-};
+#[cfg(test)]
+use crate::runtime_filter::port::final_domain::CompletionFenceAuthority;
+use crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract;
 use crate::runtime_filter::port::identity::{
     DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
 };
@@ -196,7 +196,12 @@ impl FinalDomainAuthoritySeed {
         Self { contract }
     }
 
-    pub(super) fn derive(
+    pub(super) fn contract(&self) -> Arc<RuntimeCompletionFenceContract> {
+        self.contract.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn derive_test_authority(
         &self,
         binding_id: BindingId,
         fragment_instance_id: UniqueId,

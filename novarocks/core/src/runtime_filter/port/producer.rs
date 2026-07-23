@@ -263,6 +263,8 @@ pub(crate) trait TopKSummaryProducerAdapter: Send + Sync {
 }
 
 pub(crate) trait FinalDomainProducerAdapter: Send + Sync {
+    /// Submit an authority-signed immutable shard. Raw value domains are sealed by
+    /// the Service-owned completion session and cannot enter this transport port.
     fn complete(
         &self,
         partition_id: PartitionId,
