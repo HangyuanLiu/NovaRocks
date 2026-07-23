@@ -240,6 +240,7 @@ mod tests {
     use crate::proto::{common, expr, novarocks, plan};
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
+    use crate::runtime::query_options::QueryOptions;
     use crate::runtime_filter::model::contract::NullSemantics;
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
@@ -966,6 +967,10 @@ mod tests {
         ));
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_query_options(Some(QueryOptions {
+                connector_io_tasks_per_scan_operator: Some(1),
+                ..Default::default()
+            }))
             .with_scan_ranges(10, vec![file_range()]);
         let mut arena = ExprArena::default();
         let lowered = decode_node(&node, &mut arena, &ctx).expect("lower native scan");
@@ -973,6 +978,7 @@ mod tests {
             panic!("expected Scan");
         };
         assert_eq!(scan.node_id(), Some(10));
+        assert_eq!(scan.connector_io_tasks_per_scan_operator(), Some(1));
         assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(1)]);
     }
 
@@ -1290,8 +1296,69 @@ mod tests {
             .expect("file pruning metadata");
         let stats = pruning.columns.get("id").expect("id stats");
         assert_eq!(stats.null_count, Some(1));
+        assert_eq!(
+            stats.value_count,
+            Some(2),
+            "native has_null/all_null evidence must remain exact enough for late file pruning"
+        );
         assert_eq!(stats.lower_bound, Some(10_i64.to_le_bytes().to_vec()));
         assert_eq!(stats.upper_bound, Some(20_i64.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn lowers_iceberg_data_file_scan_pruning_metadata_at_int32_width() {
+        let mut node = scan_node_with(
+            vec![output_column(1, "id", DataType::Int32)],
+            Vec::new(),
+            Vec::new(),
+            plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            }),
+        );
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+        else {
+            panic!("expected physical scan");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut() else {
+            panic!("expected scan node");
+        };
+        scan.table
+            .as_mut()
+            .expect("scan table")
+            .columns
+            .get_mut(0)
+            .expect("id column")
+            .data_type = Some(type_desc(&DataType::Int32));
+
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![file_range_with_change_op_and_pruning()]);
+        let mut arena = ExprArena::default();
+        let lowered = decode_node(&node, &mut arena, &ctx).expect("lower native scan");
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected Scan");
+        };
+        let morsels = scan.build_morsels().expect("build morsels");
+        let [
+            ScanMorsel::FileRange {
+                iceberg_file_pruning,
+                ..
+            },
+        ] = morsels.morsels.as_slice()
+        else {
+            panic!("expected one file morsel, got {:?}", morsels.morsels);
+        };
+        let stats = iceberg_file_pruning
+            .as_ref()
+            .expect("file pruning metadata")
+            .columns
+            .get("id")
+            .expect("id stats");
+        assert_eq!(stats.lower_bound, Some(10_i32.to_le_bytes().to_vec()));
+        assert_eq!(stats.upper_bound, Some(20_i32.to_le_bytes().to_vec()));
     }
 
     #[test]

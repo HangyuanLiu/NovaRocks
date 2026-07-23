@@ -1,0 +1,121 @@
+# RFD-6C Task 7 实现报告
+
+## 状态
+
+- 状态：完成
+- 范围：production-shaped loopback 与 remote live TopN runtime-filter conformance
+- 提交：`Verify live TopN runtime filters across participants`
+
+## 实现摘要
+
+Task 7 新增了三条端到端 conformance 路径，并只修复 harness 暴露出的生产接线问题：
+
+1. loopback 路径直接构造 already-bound `RuntimeFilterGraph`，经过 coordinator prepare/binding、native encode/decode、`DeploymentCompiler`、install/epoch、fragment `NativeRuntimeFilterExecutionContext`、aggregate producer、OrderedBound adapter、Service loopback 和 live scan consumer；
+2. remote 路径使用 3 个真实 participant 与 gRPC transport，生产者、聚合者和消费者跨 participant 分布；
+3. remote transport failure 路径通过 test fixture 重写编译后 remote peer endpoint 注入不可达端点，验证 typed reliable transport fail-open，未向生产代码添加 test-only 分支。
+
+fixture 的物理计划为 Iceberg/Parquet scan、grouped hash aggregate、gather exchange、sort 和 limit。TopN runtime filter 只使用：
+
+- `AggregateTopNKey` producer；
+- `OrderedBoundUpdate` contribution；
+- `OrderedBound` artifact；
+- `ProducerClosed` terminal；
+- `NonBlockingLive` scan consumer。
+
+没有生成或传输 `TopKSummary`，没有直接调用 Channel reducer，也没有通过 legacy Hub 注册、发布或获取 artifact。
+
+## Loopback 证据
+
+`live_topn_loopback_executes_aggregate_service_and_live_scan_chain` 覆盖：
+
+- scan 在首个 artifact version 发布前已有进度；
+- 首批候选产生 v1，更优候选产生 v2；
+- 同一个 live scan consumer 观察到 v1 和 v2；
+- 受 `connector_io_tasks_per_scan_operator = 1` 约束的 unopened morsel 被 late ordered pruning；
+- runtime filter 开启和关闭时查询结果一致；
+- Service 事件链包含 install、producer contribution、artifact availability 和 terminal；
+- legacy Hub snapshot 为空。
+
+## Remote 证据
+
+`live_topn_remote_uses_contribution_ack_and_artifact_delivery` 覆盖：
+
+- compiler 生成跨 participant 的 Producer -> Aggregator routing；
+- 至少一个 sound remote producer 通过 RFD-4 transport 发送 `Contribution`，并收到 `Accepted` ACK；
+- aggregator 通过 remote artifact route 向 consumer 发送 `Artifact` / `FinalArtifact`；
+- consumer 与 loopback 使用相同实现；
+- availability 可由一个 sound producer 触发；
+- install contract 要求 3 个 producer instance 全部 terminal；
+- 两个 remote producer 的零字节 `ProducerClosed` frame 均经过 compiled route、发送并收到 `Accepted` ACK；
+- aggregate owner 最终观察到 `ChannelCompleted`；
+- transport 中没有 `TopKSummary` contribution。
+
+`live_topn_remote_timeout_fails_open_with_correct_results` 覆盖：
+
+- remote peer 不可达时出现 typed `ChannelUnavailable` / `LiveTerminal` / `FailedOpen`；
+- scan 不因 runtime filter transport failure 阻塞；
+- runtime filter 开启结果与关闭结果相同。
+
+## TDD 证据
+
+### RED
+
+完整 loopback chain 首先暴露出 late file pruning 没有发生。随后用聚焦 decoder 测试固定三个生产问题：
+
+1. native `has_null` / `all_null` 只有布尔证据，decoder 却把 `value_count` 留空，HDFS exact late pruning 无法判定；
+2. native HDFS scan decoder 没有把 `QueryOptions.connector_io_tasks_per_scan_operator` 写入 `ScanNode`，测试无法可靠保留 unopened morsel；
+3. native file-pruning assignment 的整数值统一编码为 8 字节，而 Iceberg `Int32` 边界必须是 4 字节。聚焦测试的 RED 为：
+
+```text
+left:  Some([10, 0, 0, 0, 0, 0, 0, 0])
+right: Some([10, 0, 0, 0])
+```
+
+remote chain 的 RED 还验证了：部署 deadline 不能早于 fragment install，以及 terminal 不能仅按 ingress event 数量判断，必须结合 compiled producer cardinality、可靠 transport terminal ACK 和 aggregate-owner `ChannelCompleted`。
+
+### GREEN
+
+生产修复为：
+
+- 将 exact null-state 规范化成一致的 `value_count` / `null_count` 证据；
+- 将 query option 中的 connector I/O task 数传入 native decoded `ScanNode`；
+- 使用 `ScanNode.table.columns` 的权威 Arrow type 恢复 integer/float pruning bound 宽度；
+- type 缺失、不兼容、越界或 Float32 非精确收窄时省略可选 pruning stats，使文件保持 `Keep`，不猜测 wire payload 宽度。
+
+## 最终验证
+
+```text
+cargo test -p novarocks lowers_iceberg_data_file_scan --lib
+PASS: 4 passed, 0 failed
+
+cargo test -p novarocks live_topn_loopback --lib
+PASS: 1 passed, 0 failed
+
+cargo test -p novarocks live_topn_remote --lib
+PASS: 2 passed, 0 failed
+
+cargo test -p novarocks runtime_filter::service::live_deployment_conformance_tests --lib
+PASS: 7 passed, 0 failed
+```
+
+提交前还执行：
+
+```text
+cargo fmt --all -- --check
+git diff --check
+```
+
+## 变更文件
+
+- `novarocks/core/src/runtime_filter/service/live_deployment_conformance_tests.rs`
+- `novarocks/core/src/protocol/native/decode/scan/file_range.rs`
+- `novarocks/core/src/protocol/native/decode/scan/iceberg_data.rs`
+- `novarocks/core/src/protocol/native/decode/scan/mod.rs`
+- `.superpowers/sdd/rfd-6c-task-7-report.md`
+
+## 边界与后续
+
+- 未增加 ordinary SQL planner runtime-filter generation；
+- 未增加 local/remote bool、Hub fallback、producer payload limit 或 operator-owned RPC；
+- graph 在 fixture 中按 Task 7 要求直接构造，再走生产 prepare/native/compiler/install/execution 链；
+- ordinary SQL 自动生成该 graph 以及 1FE+3BE SQL-level 验收属于后续 B4 / RFD-8，不在 Task 7 范围内。
