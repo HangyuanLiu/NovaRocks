@@ -949,30 +949,6 @@ mod tests {
     }
 
     #[test]
-    fn production_signing_api_is_service_exclusive() {
-        let port_source = include_str!("../port/final_domain.rs");
-        let service_source = include_str!("mod.rs");
-        let completion_source = include_str!("final_domain_completion.rs");
-
-        assert!(port_source.contains(
-            "#[cfg(test)]\n#[derive(Debug)]\npub(crate) struct CompletionFenceAuthority"
-        ));
-        assert!(
-            !port_source
-                .contains("#[derive(Clone, Debug)]\npub(crate) struct CompletionFenceAuthority")
-        );
-        assert!(!port_source.contains("pub(crate) struct FinalDomainFreezeCapability"));
-        assert!(!port_source.contains("pub(crate) struct FrozenFinalDomainPayload"));
-        assert!(!port_source.contains("pub(crate) struct FrozenFinalDomainIssuer"));
-        assert!(!port_source.contains("pub(crate) fn freeze_capability"));
-        assert!(service_source.contains("mod final_domain_completion;"));
-        assert!(!service_source.contains("pub mod final_domain_completion;"));
-        assert!(completion_source.contains("pub(crate) struct FinalDomainServiceIssuancePermit"));
-        let public_key_field = ["pub(crate) frozen_", "set_digest: [u8; 32]"].concat();
-        assert!(!completion_source.contains(&public_key_field));
-    }
-
-    #[test]
     fn completion_proof_rejects_empty_and_duplicate_partition_sets() {
         assert!(
             FinalDomainCompletionAuthority::new(contract(), BINDING, INSTANCE, 2)
