@@ -342,7 +342,7 @@ pub(crate) fn project_install_views(
         let mut channel_deployments = BTreeMap::new();
         for (channel_id, (producers, consumers)) in channels {
             let spec = &channel_specs[&channel_id];
-            let groups = materialization_groups
+            let groups: BTreeMap<_, _> = materialization_groups
                 .get(&participant)
                 .and_then(|channels| channels.get(&channel_id))
                 .into_iter()
@@ -354,6 +354,20 @@ pub(crate) fn project_install_views(
                     )
                 })
                 .collect();
+            let channel_materialization = if groups.is_empty() {
+                materialization
+            } else {
+                materialization
+                    .with_max_concurrent_jobs(
+                        materialization.max_concurrent_jobs().min(groups.len()),
+                    )
+                    .map_err(|error| DeploymentError::InvalidInstallProjection {
+                        detail: format!(
+                            "runtime filter channel {} materialization concurrency projection failed: {error:?}",
+                            channel_id.get()
+                        ),
+                    })?
+            };
             channel_deployments.insert(
                 channel_id,
                 RuntimeFilterChannelDeployment::new(
@@ -367,7 +381,7 @@ pub(crate) fn project_install_views(
                     spec.completion_requirement,
                     spec.policy,
                     core_budget,
-                    materialization,
+                    channel_materialization,
                     producers,
                     consumers,
                 )
@@ -804,6 +818,54 @@ mod tests {
                 .outbound_materialization_groups()
                 .is_empty(),
             "consumer-only participants never own materialization"
+        );
+    }
+
+    #[test]
+    fn projected_channel_clamps_query_concurrency_to_owned_profiles() {
+        let (role_graph, channel_specs, consumer_facts, instances) =
+            direct_projection_fixture(false);
+        let query_policy = MaterializationPolicy::new(8, 5, 17, 1, 1 << 20, 1 << 16, 2)
+            .expect("valid multi-channel query policy");
+        let views = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            query_policy,
+        )
+        .expect("projection succeeds");
+
+        for participant in [pid(2), pid(7)] {
+            let channel = &views[&participant].channels()[&ChannelId::new(5)];
+            assert_eq!(channel.outbound_materialization_groups().len(), 1);
+            assert_eq!(channel.materialization_policy().max_concurrent_jobs(), 1);
+        }
+    }
+
+    #[test]
+    fn projected_channel_preserves_concurrency_for_multiple_owned_profiles() {
+        let query_policy = MaterializationPolicy::new(8, 5, 17, 1, 1 << 20, 1 << 16, 2)
+            .expect("valid multi-channel query policy");
+
+        let projected = query_policy
+            .with_max_concurrent_jobs(query_policy.max_concurrent_jobs().min(2))
+            .expect("valid projected policy");
+
+        assert_eq!(projected.max_concurrent_jobs(), 2);
+        assert_eq!(
+            projected.bloom_bits_per_key(),
+            query_policy.bloom_bits_per_key()
+        );
+        assert_eq!(
+            projected.max_total_retained_bytes(),
+            query_policy.max_total_retained_bytes()
+        );
+        assert_eq!(
+            projected.max_scratch_bytes_per_job(),
+            query_policy.max_scratch_bytes_per_job()
         );
     }
 

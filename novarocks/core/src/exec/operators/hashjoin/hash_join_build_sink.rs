@@ -41,9 +41,12 @@ use super::native_runtime_filter::{
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::join::{CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinType};
+#[cfg(feature = "compat")]
+use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
+use crate::exec::node::join::{JoinDistributionMode, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+#[cfg(feature = "compat")]
 use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
     PartialRuntimeInFilterMerger, RUNTIME_FILTER_JOIN_MODE_BROADCAST,
@@ -53,14 +56,20 @@ use crate::exec::runtime_filter::{
     RuntimeMinMaxFilter, encode_starrocks_bitset_filter, encode_starrocks_bloom_filter,
     encode_starrocks_empty_filter, maybe_build_runtime_bitset_filter,
 };
-use crate::novarocks_logging::{debug, warn};
+use crate::novarocks_logging::debug;
+use crate::novarocks_logging::warn;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
+#[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+#[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+#[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::runtime::runtime_state::RuntimeState;
+#[cfg(feature = "compat")]
 use crate::service::exchange_sender;
+#[cfg(feature = "compat")]
 use std::collections::{HashMap, HashSet};
 
 /// Factory for hash-join build sinks that construct build-side hash structures.
@@ -808,6 +817,7 @@ impl HashJoinBuildSinkOperator {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn runtime_filter_specs(&self) -> &[CompatJoinRuntimeFilterSpec] {
         match &self.runtime_filter_execution {
             HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => &[],
@@ -892,46 +902,77 @@ impl HashJoinBuildSinkOperator {
     }
 
     fn publish_runtime_filters(&mut self, state: &RuntimeState) -> Result<(), String> {
-        if self.runtime_filter_specs().is_empty() {
-            return Ok(());
-        }
-        #[cfg(not(feature = "compat"))]
-        return Err("legacy runtime-filter execution requires compat build".to_string());
-        #[cfg(feature = "compat")]
-        {
-            if self.build_keys.is_empty() {
-                return Err("runtime filters require join build keys".to_string());
-            }
-            let _timer = self
-                .profiles
-                .as_ref()
-                .map(|p| p.common.scoped_timer("RuntimeFilterBuildTime"));
-
-            let hash_seed = self.runtime_filter_hash_seed()?;
-            self.ensure_runtime_filters(hash_seed)?;
-
-            let mut in_filters = Vec::new();
-            if self.build_row_count > 0
-                && self.build_row_count <= MAX_RUNTIME_IN_FILTER_CONDITIONS
-                && let Some(filters) = self.take_runtime_in_filters()
+        match &self.runtime_filter_execution {
+            HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => Ok(()),
+            #[cfg(feature = "compat")]
+            HashJoinBuildOperatorRuntimeFilterExecution::Compat { specs, .. }
+                if specs.is_empty() =>
             {
-                in_filters = filters.into_filters();
+                Ok(())
             }
+            #[cfg(feature = "compat")]
+            HashJoinBuildOperatorRuntimeFilterExecution::Compat { .. } => {
+                if self.build_keys.is_empty() {
+                    return Err("runtime filters require join build keys".to_string());
+                }
+                let _timer = self
+                    .profiles
+                    .as_ref()
+                    .map(|p| p.common.scoped_timer("RuntimeFilterBuildTime"));
 
-            let membership_params = self.build_membership_filter_params()?;
-            let membership_build_options = self.membership_build_options(state);
+                let hash_seed = self.runtime_filter_hash_seed()?;
+                self.ensure_runtime_filters(hash_seed)?;
 
-            if let Some(merger) = self.runtime_in_filter_merger() {
-                let merged_in =
-                    merger.add_partial(self.partition, self.build_row_count, in_filters)?;
-                let merged_membership = merger.add_partial_membership(
-                    self.partition,
-                    membership_params,
-                    membership_build_options,
-                )?;
-                self.add_runtime_filter_drop_counters_to_profile(merger.drain_drop_counters());
-                if let (Some(in_filters), Some(membership_filters)) = (merged_in, merged_membership)
+                let mut in_filters = Vec::new();
+                if self.build_row_count > 0
+                    && self.build_row_count <= MAX_RUNTIME_IN_FILTER_CONDITIONS
+                    && let Some(filters) = self.take_runtime_in_filters()
                 {
+                    in_filters = filters.into_filters();
+                }
+
+                let membership_params = self.build_membership_filter_params()?;
+                let membership_build_options = self.membership_build_options(state);
+
+                if let Some(merger) = self.runtime_in_filter_merger() {
+                    let merged_in =
+                        merger.add_partial(self.partition, self.build_row_count, in_filters)?;
+                    let merged_membership = merger.add_partial_membership(
+                        self.partition,
+                        membership_params,
+                        membership_build_options,
+                    )?;
+                    self.add_runtime_filter_drop_counters_to_profile(merger.drain_drop_counters());
+                    if let (Some(in_filters), Some(membership_filters)) =
+                        (merged_in, merged_membership)
+                    {
+                        self.log_in_filters("publish", &in_filters);
+                        self.log_membership_filters("publish", &membership_filters);
+                        if let Some(profile) = self.profiles.as_ref() {
+                            profile.common.counter_set_unit(
+                                "RuntimeFilterNum",
+                                membership_filters.len() as i64,
+                            );
+                            profile
+                                .common
+                                .counter_set_unit("RuntimeInFilterNum", in_filters.len() as i64);
+                        }
+                        let local_filters = self.build_local_filters(&in_filters);
+                        let membership_for_publish = membership_filters.clone();
+                        let membership_for_remote =
+                            self.filter_membership_for_remote(&membership_filters);
+                        self.runtime_filter_hub()?
+                            .publish_filters(&local_filters, &membership_for_publish);
+                        self.record_built_lifecycle(state, &membership_for_publish);
+                        self.send_runtime_filters_remote(state, &membership_for_remote)?;
+                    }
+                } else {
+                    let in_filters = in_filters;
+                    let membership_filters = self.build_membership_filters_from_params(
+                        self.build_row_count as u64,
+                        &membership_params,
+                        membership_build_options,
+                    )?;
                     self.log_in_filters("publish", &in_filters);
                     self.log_membership_filters("publish", &membership_filters);
                     if let Some(profile) = self.profiles.as_ref() {
@@ -951,35 +992,12 @@ impl HashJoinBuildSinkOperator {
                     self.record_built_lifecycle(state, &membership_for_publish);
                     self.send_runtime_filters_remote(state, &membership_for_remote)?;
                 }
-            } else {
-                let in_filters = in_filters;
-                let membership_filters = self.build_membership_filters_from_params(
-                    self.build_row_count as u64,
-                    &membership_params,
-                    membership_build_options,
-                )?;
-                self.log_in_filters("publish", &in_filters);
-                self.log_membership_filters("publish", &membership_filters);
-                if let Some(profile) = self.profiles.as_ref() {
-                    profile
-                        .common
-                        .counter_set_unit("RuntimeFilterNum", membership_filters.len() as i64);
-                    profile
-                        .common
-                        .counter_set_unit("RuntimeInFilterNum", in_filters.len() as i64);
-                }
-                let local_filters = self.build_local_filters(&in_filters);
-                let membership_for_publish = membership_filters.clone();
-                let membership_for_remote = self.filter_membership_for_remote(&membership_filters);
-                self.runtime_filter_hub()?
-                    .publish_filters(&local_filters, &membership_for_publish);
-                self.record_built_lifecycle(state, &membership_for_publish);
-                self.send_runtime_filters_remote(state, &membership_for_remote)?;
+                Ok(())
             }
-            Ok(())
         }
     }
 
+    #[cfg(feature = "compat")]
     fn record_built_lifecycle(&self, state: &RuntimeState, filters: &[RuntimeMembershipFilter]) {
         let Some(query_id) = state.query_id() else {
             return;
@@ -995,6 +1013,7 @@ impl HashJoinBuildSinkOperator {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn record_sent_lifecycle(
         &self,
         query_id: crate::runtime::query_context::QueryId,
@@ -1006,6 +1025,7 @@ impl HashJoinBuildSinkOperator {
             .sent_partial(filter_id, bytes as i64);
     }
 
+    #[cfg(feature = "compat")]
     fn send_runtime_filters_remote(
         &self,
         state: &RuntimeState,
@@ -1187,6 +1207,7 @@ impl HashJoinBuildSinkOperator {
         Ok(())
     }
 
+    #[cfg(feature = "compat")]
     fn filter_membership_for_remote(
         &self,
         filters: &[RuntimeMembershipFilter],
@@ -1210,6 +1231,7 @@ impl HashJoinBuildSinkOperator {
             .collect()
     }
 
+    #[cfg(feature = "compat")]
     fn log_in_filters(&self, label: &str, filters: &[RuntimeInFilter]) {
         debug!(
             "runtime in filters {}: node_id={} partition={} count={}",
@@ -1231,6 +1253,7 @@ impl HashJoinBuildSinkOperator {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn log_membership_filters(&self, label: &str, filters: &[RuntimeMembershipFilter]) {
         debug!(
             "runtime membership filters {}: node_id={} partition={} count={}",
@@ -1262,6 +1285,7 @@ impl HashJoinBuildSinkOperator {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn add_runtime_filter_drop_counters_to_profile(
         &self,
         counters: RuntimeFilterMergeDropCounters,
@@ -1282,6 +1306,7 @@ impl HashJoinBuildSinkOperator {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn build_membership_filter_params(
         &self,
     ) -> Result<Vec<RuntimeMembershipFilterBuildParam>, String> {
@@ -1343,6 +1368,7 @@ impl HashJoinBuildSinkOperator {
         Ok(params)
     }
 
+    #[cfg(feature = "compat")]
     fn build_membership_filters_from_params(
         &self,
         total_rows: u64,
@@ -1400,6 +1426,7 @@ impl HashJoinBuildSinkOperator {
         Ok(filters)
     }
 
+    #[cfg(feature = "compat")]
     fn membership_build_options(&self, state: &RuntimeState) -> RuntimeMembershipBuildOptions {
         let opts = state.query_options();
         let enabled = opts
@@ -1416,6 +1443,7 @@ impl HashJoinBuildSinkOperator {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn build_local_filters(&self, filters: &[RuntimeInFilter]) -> Vec<RuntimeInFilter> {
         if filters.len() == self.runtime_filter_specs().len() {
             return filters.to_vec();
@@ -1448,6 +1476,7 @@ impl HashJoinBuildSinkOperator {
     }
 
     #[allow(dead_code)]
+    #[cfg(feature = "compat")]
     fn build_empty_remote_filters(&self) -> Vec<RuntimeInFilter> {
         let mut filters = Vec::new();
         for spec in self.runtime_filter_specs() {
@@ -1468,6 +1497,7 @@ impl HashJoinBuildSinkOperator {
         filters
     }
 
+    #[cfg(feature = "compat")]
     fn build_empty_remote_membership_filters(
         &self,
         specs: &[&CompatJoinRuntimeFilterSpec],
@@ -1512,6 +1542,7 @@ impl HashJoinBuildSinkOperator {
         Ok(filters)
     }
 
+    #[cfg(feature = "compat")]
     fn runtime_filter_hash_seed(&self) -> Result<u64, String> {
         if let Some(table) = self.build_table.as_ref() {
             return Ok(table.hash_seed());

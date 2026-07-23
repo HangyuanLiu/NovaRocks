@@ -26,6 +26,9 @@ use crate::exec::node::runtime_filter::{
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::runtime::profile::{
+    OperatorProfiles, ProfileUnit, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS,
+};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::exec::membership_predicate::{
     MembershipPredicateContract, NativeRuntimeFilterPredicate, PredicateEvaluationError,
@@ -289,6 +292,38 @@ impl NativeRuntimeFilterConsumerSet {
     }
 
     pub(crate) fn apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+        self.apply_chunk_profiled(chunk, None)
+    }
+
+    pub(crate) fn apply_chunk_profiled(
+        &self,
+        chunk: Chunk,
+        profiles: Option<&OperatorProfiles>,
+    ) -> Result<Option<Chunk>, String> {
+        let configured = !self
+            .inner
+            .bindings
+            .lock()
+            .expect("native RF consumer lock")
+            .is_empty();
+        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+        let output = self.apply_chunk_inner(chunk)?;
+        if configured && let Some(profiles) = profiles {
+            profiles
+                .common
+                .counter_add(RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit, input_rows);
+            profiles.common.counter_add(
+                RUNTIME_FILTER_OUTPUT_ROWS,
+                ProfileUnit::Unit,
+                output
+                    .as_ref()
+                    .map_or(0, |chunk| i64::try_from(chunk.len()).unwrap_or(i64::MAX)),
+            );
+        }
+        Ok(output)
+    }
+
+    fn apply_chunk_inner(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
         let active = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
             if bindings.iter().any(|binding| {
@@ -560,6 +595,7 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
             consumers: self.consumers.clone(),
             output: None,
             finishing: false,
+            profiles: None,
         })
     }
 }
@@ -569,11 +605,16 @@ struct NativeRuntimeFilterProcessor {
     consumers: NativeRuntimeFilterConsumerSet,
     output: Option<Chunk>,
     finishing: bool,
+    profiles: Option<OperatorProfiles>,
 }
 
 impl Operator for NativeRuntimeFilterProcessor {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn set_profiles(&mut self, profiles: OperatorProfiles) {
+        self.profiles = Some(profiles);
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
@@ -611,7 +652,9 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
                 .runtime_filter_wait_timeout()
                 .unwrap_or(Duration::from_secs(1)),
         )?;
-        self.output = self.consumers.apply_chunk(chunk)?;
+        self.output = self
+            .consumers
+            .apply_chunk_profiled(chunk, self.profiles.as_ref())?;
         Ok(())
     }
 
@@ -643,6 +686,7 @@ mod tests {
     };
     use crate::exec::operators::runtime_filter::tests_support::{chunk, membership_bundle};
     use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+    use crate::runtime::profile::{RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS};
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, NullSemantics,
     };
@@ -905,7 +949,13 @@ mod tests {
             consumers,
             output: None,
             finishing: false,
+            profiles: None,
         };
+        let profiler = crate::runtime::profile::Profiler::new("native-rf-test");
+        let profiles = crate::runtime::profile::OperatorProfiles::new(
+            profiler.child("NativeRuntimeFilter (id=1)"),
+        );
+        processor.set_profiles(profiles);
         processor.bind_runtime_state(&state).unwrap();
         processor.push_chunk(&state, chunk(&[1, 2, 3, 4])).unwrap();
         let output = processor.pull_chunk(&state).unwrap().unwrap();
@@ -914,6 +964,69 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(values.values(), &[2, 4]);
+        let tree = profiler.to_native_tree();
+        let common = &tree.root.children[0].children[0];
+        let counter = |name: &str| {
+            common
+                .counters
+                .iter()
+                .find(|counter| counter.name == name)
+                .map(|counter| counter.value)
+        };
+        assert_eq!(counter("RuntimeFilterInputRows"), Some(4));
+        assert_eq!(counter("RuntimeFilterOutputRows"), Some(2));
+    }
+
+    #[test]
+    fn empty_consumer_set_does_not_record_apply_counters() {
+        let consumers =
+            NativeRuntimeFilterConsumerSet::from_plan(&[], Arc::new(ExprArena::default())).unwrap();
+        let profiler = crate::runtime::profile::Profiler::new("empty-native-rf-test");
+        let profiles = crate::runtime::profile::OperatorProfiles::new(
+            profiler.child("NativeRuntimeFilter (id=1)"),
+        );
+
+        let output = consumers
+            .apply_chunk_profiled(chunk(&[1, 2, 3, 4]), Some(&profiles))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(output.len(), 4);
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_INPUT_ROWS),
+            None
+        );
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_OUTPUT_ROWS),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_pass_through_records_equal_apply_counters() {
+        let (consumers, input) = fixture(vec![ArtifactAcquireOutcome::Unavailable(
+            UnavailableReason::ProducerFailed,
+        )]);
+        consumers.acquire_blocking(Duration::ZERO).unwrap();
+        let profiler = crate::runtime::profile::Profiler::new("pass-through-native-rf-test");
+        let profiles = crate::runtime::profile::OperatorProfiles::new(
+            profiler.child("NativeRuntimeFilter (id=1)"),
+        );
+
+        let output = consumers
+            .apply_chunk_profiled(input, Some(&profiles))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(output.len(), 4);
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_INPUT_ROWS),
+            Some(4)
+        );
+        assert_eq!(
+            profiles.common.counter_value(RUNTIME_FILTER_OUTPUT_ROWS),
+            Some(4)
+        );
     }
 
     #[test]

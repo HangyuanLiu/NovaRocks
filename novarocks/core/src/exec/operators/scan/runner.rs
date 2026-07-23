@@ -623,7 +623,9 @@ impl ScanAsyncRunner {
                         continue;
                     };
                     let Some(chunk) = (match self.native_runtime_filter_consumers.as_ref() {
-                        Some(consumers) => consumers.apply_chunk(chunk)?,
+                        Some(consumers) => {
+                            consumers.apply_chunk_profiled(chunk, self.profiles.as_ref())?
+                        }
                         None => Some(chunk),
                     }) else {
                         continue;

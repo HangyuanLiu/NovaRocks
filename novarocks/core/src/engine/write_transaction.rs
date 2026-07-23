@@ -545,7 +545,6 @@ mod tests {
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(Some(Ok(CommitOutcome {
                 new_snapshot_id: 1234,
@@ -581,7 +580,6 @@ mod tests {
                 write_commit: None,
                 write_abort: Some(one_writer_abort()),
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
@@ -639,7 +637,6 @@ mod tests {
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(Some(Err(CommitServiceError::KnownUncommitted {
                 message: "conflict".to_string(),
@@ -679,7 +676,6 @@ mod tests {
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(Some(Err(CommitServiceError::Unknown {
                 message: "rpc timeout".to_string(),
@@ -721,7 +717,6 @@ mod tests {
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(Some(Ok(CommitOutcome {
                 new_snapshot_id: 9,
@@ -756,7 +751,6 @@ mod tests {
                 write_commit: None,
                 write_abort: None,
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
@@ -784,7 +778,6 @@ mod tests {
                 write_commit: Some(write_commit_with_writer_without_files()),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
@@ -815,7 +808,6 @@ mod tests {
                 write_commit: Some(write_commit_with_writer_without_files()),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
-                runtime_filter_dormancy_proof: None,
             }))),
             commit: RefCell::new(Some(Ok(CommitOutcome {
                 new_snapshot_id: 4321,

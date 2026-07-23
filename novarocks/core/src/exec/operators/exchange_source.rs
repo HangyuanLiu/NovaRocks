@@ -542,7 +542,9 @@ impl ProcessorOperator for ExchangeSourceOperator {
                     let chunk =
                         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
                             consumers.acquire_configured()?;
-                            let Some(chunk) = consumers.apply_chunk(chunk)? else {
+                            let Some(chunk) =
+                                consumers.apply_chunk_profiled(chunk, self.profiles.as_ref())?
+                            else {
                                 continue;
                             };
                             chunk

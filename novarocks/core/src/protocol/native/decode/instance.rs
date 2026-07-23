@@ -21,11 +21,8 @@ use crate::common::types::UniqueId;
 use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::proto::novarocks;
 use crate::protocol::common::error::FieldPath;
-use crate::runtime::endpoint::{
-    FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
-};
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_options::{QueryCacheOptions, QueryOptions};
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
@@ -109,42 +106,6 @@ pub(crate) fn decode_query_options(
         },
         spill: decode_spill_config(src, path.field("spill_options"))?,
     })
-}
-
-pub(crate) fn decode_runtime_filter_params(
-    src: &novarocks::RuntimeFilterParams,
-) -> Result<RuntimeFilterParams, NativeFragmentDecodeError> {
-    let path = FieldPath::root("instance_params").field("runtime_filter_params");
-    let mut filter_ids = src.id_to_prober_params.keys().copied().collect::<Vec<_>>();
-    filter_ids.sort_unstable();
-    let mut id_to_prober_params = BTreeMap::new();
-    for filter_id in filter_ids {
-        let list = &src.id_to_prober_params[&filter_id];
-        let list_path = path
-            .clone()
-            .field("id_to_prober_params")
-            .map_key(filter_id.to_string());
-        let params = list
-            .params
-            .iter()
-            .enumerate()
-            .map(|(index, params)| {
-                decode_runtime_filter_prober(params, list_path.clone().field("params").index(index))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        id_to_prober_params.insert(filter_id, params);
-    }
-    let runtime_filter_builder_number = src
-        .runtime_filter_builder_number
-        .iter()
-        .map(|(filter_id, count)| (*filter_id, *count))
-        .collect();
-
-    Ok(RuntimeFilterParams::new(
-        id_to_prober_params,
-        runtime_filter_builder_number,
-        (src.runtime_filter_max_size > 0).then_some(src.runtime_filter_max_size),
-    ))
 }
 
 pub(crate) fn decode_endpoint(src: &str) -> Result<RuntimeEndpoint, NativeFragmentDecodeError> {
@@ -231,22 +192,6 @@ fn decode_spill_config(
             .then_some(spill.spill_mem_table_size),
         spill_mem_table_num: (spill.spill_mem_table_num > 0).then_some(spill.spill_mem_table_num),
     }))
-}
-
-fn decode_runtime_filter_prober(
-    src: &novarocks::ProberParams,
-    path: FieldPath,
-) -> Result<RuntimeFilterProberDestination, NativeFragmentDecodeError> {
-    let fragment_instance_id = src.fragment_instance_id.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(
-            path.clone().field("fragment_instance_id"),
-            "native ProberParams requires fragment_instance_id",
-        )
-    })?;
-    Ok(RuntimeFilterProberDestination::new(
-        unique_id(fragment_instance_id),
-        decode_endpoint_at(&src.endpoint, path.field("endpoint"))?,
-    ))
 }
 
 fn decode_endpoint_at(
@@ -457,14 +402,9 @@ fn unique_id(src: &crate::proto::common::UniqueId) -> UniqueId {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::protocol::common::error::{ProtocolErrorKind, ProtocolFamily};
-    use crate::protocol::native::encode::instance::{
-        encode_query_options, encode_runtime_filter_params,
-    };
-    use crate::runtime::endpoint::RuntimeFilterProberDestination;
+    use crate::protocol::native::encode::instance::encode_query_options;
 
     #[test]
     fn query_options_decode_is_owned_by_native_protocol() {
@@ -530,82 +470,5 @@ mod tests {
             ProtocolErrorKind::MissingField
         );
         assert!(error.to_string().contains("spill_options"), "{error}");
-    }
-
-    #[test]
-    fn runtime_filter_params_round_trip_through_protocol_owner() {
-        let params = RuntimeFilterParams::new(
-            BTreeMap::from([(
-                7,
-                vec![RuntimeFilterProberDestination::new(
-                    UniqueId { hi: 1, lo: 2 },
-                    RuntimeEndpoint::parse("10.0.0.7:8060").expect("endpoint"),
-                )],
-            )]),
-            BTreeMap::from([(7, 3)]),
-            Some(16 * 1024 * 1024),
-        );
-
-        let decoded = decode_runtime_filter_params(&encode_runtime_filter_params(&params))
-            .expect("round trip native runtime filter params");
-
-        assert_eq!(decoded.runtime_filter_builder_number().get(&7), Some(&3));
-        assert_eq!(decoded.runtime_filter_max_size(), Some(16 * 1024 * 1024));
-        assert_eq!(
-            decoded.id_to_prober_params()[&7][0]
-                .endpoint()
-                .as_host_port(),
-            "10.0.0.7:8060"
-        );
-    }
-
-    #[test]
-    fn runtime_filter_params_report_typed_field_errors() {
-        let missing_id =
-            decode_runtime_filter_params(&crate::proto::novarocks::RuntimeFilterParams {
-                id_to_prober_params: [(
-                    19,
-                    crate::proto::novarocks::ProberParamsList {
-                        params: vec![crate::proto::novarocks::ProberParams {
-                            fragment_instance_id: None,
-                            endpoint: "10.0.0.19:8060".to_string(),
-                        }],
-                    },
-                )]
-                .into_iter()
-                .collect(),
-                runtime_filter_builder_number: Default::default(),
-                runtime_filter_max_size: 0,
-            })
-            .expect_err("fragment instance ID is required");
-        assert_eq!(
-            missing_id.protocol().expect("protocol error").kind(),
-            ProtocolErrorKind::MissingField
-        );
-
-        let invalid_endpoint =
-            decode_runtime_filter_params(&crate::proto::novarocks::RuntimeFilterParams {
-                id_to_prober_params: [(
-                    23,
-                    crate::proto::novarocks::ProberParamsList {
-                        params: vec![crate::proto::novarocks::ProberParams {
-                            fragment_instance_id: Some(crate::proto::common::UniqueId {
-                                hi: 1,
-                                lo: 2,
-                            }),
-                            endpoint: String::new(),
-                        }],
-                    },
-                )]
-                .into_iter()
-                .collect(),
-                runtime_filter_builder_number: Default::default(),
-                runtime_filter_max_size: -1,
-            })
-            .expect_err("endpoint is invalid");
-        assert_eq!(
-            invalid_endpoint.protocol().expect("protocol error").kind(),
-            ProtocolErrorKind::InvalidValue
-        );
     }
 }

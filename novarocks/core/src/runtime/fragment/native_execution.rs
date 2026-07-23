@@ -21,9 +21,7 @@ use std::sync::mpsc::{Receiver as ReadinessReceiver, SyncSender as ReadinessSend
 use std::time::Duration;
 
 use crate::common::config::debug_exec_node_output;
-use crate::exec::fragment::program::{
-    FragmentSinkKind, RuntimeFilterApplyPoint, RuntimeFilterDormancyFact, RuntimeFilterDormancyRole,
-};
+use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::runtime::fragment::error::{FragmentExecutionError, FragmentExecutionErrorKind};
 use crate::runtime::fragment::runtime_state::{
@@ -33,11 +31,7 @@ use crate::runtime::fragment::sink::materialize_fragment_sink;
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::{
-    NATIVE_RUNTIME_FILTER_BINDING_COUNT, NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED,
-    NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE, NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP,
-    NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS, Profiler,
-};
+use crate::runtime::profile::Profiler;
 use crate::runtime::result_buffer;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
@@ -233,7 +227,7 @@ pub(crate) fn execute_native_submission(
         RuntimeStateInputs {
             query_options,
             query_id: Some(query_id),
-            runtime_filter_params: Some(instance.runtime_filter_params().clone()),
+            runtime_filter_params: None,
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker.clone(),
@@ -254,9 +248,6 @@ pub(crate) fn execute_native_submission(
             context.mem_tracker.as_ref(),
         );
         context.readiness.signal_ready();
-    }
-    if let Some(profiler) = context.profiler.as_ref() {
-        record_runtime_filter_dormancy(profiler, program.runtime_filters().dormancy_facts());
     }
     let sink = materialize_fragment_sink(program, instance).map_err(|error| {
         FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
@@ -306,39 +297,6 @@ fn prepare_result_buffer(
     }
 }
 
-fn record_runtime_filter_dormancy(profiler: &Profiler, facts: &[RuntimeFilterDormancyFact]) {
-    let dormancy = profiler.child(NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE);
-    dormancy.counter_set_unit(
-        NATIVE_RUNTIME_FILTER_BINDING_COUNT,
-        i64::try_from(facts.len()).expect("runtime-filter binding count fits i64"),
-    );
-    for fact in facts {
-        let binding = dormancy.child(format!("Binding{}", fact.binding_id));
-        binding.add_info_string("BindingId", fact.binding_id.to_string());
-        binding.add_info_string("ChannelId", fact.channel_id.to_string());
-        binding.add_info_string("NodeId", fact.node_id.to_string());
-        binding.add_info_string(
-            "ApplyPoint",
-            match fact.apply_point {
-                RuntimeFilterApplyPoint::NodeInput => "NodeInput",
-                RuntimeFilterApplyPoint::NodeOutput => "NodeOutput",
-            },
-        );
-        binding.add_info_string(
-            "Role",
-            match fact.role {
-                RuntimeFilterDormancyRole::Producer => "Producer",
-                RuntimeFilterDormancyRole::Consumer => "Consumer",
-            },
-        );
-        binding.counter_set_unit(NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP, 1);
-        binding.counter_set_unit(NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED, 1);
-        for counter in NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS {
-            binding.counter_set_unit(counter, 0);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -350,8 +308,7 @@ mod tests {
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::{
         FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
-        RuntimeFilterApplyPoint, RuntimeFilterContract, RuntimeFilterDormancyFact,
-        RuntimeFilterDormancyRole,
+        RuntimeFilterContract,
     };
     use crate::exec::fragment::sink::FragmentSinkProgram;
     use crate::exec::node::values::ValuesNode;
@@ -361,17 +318,12 @@ mod tests {
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
     use crate::runtime::fragment::submission::FragmentSubmission;
-    use crate::runtime::profile::{
-        NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE, NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS,
-        Profiler,
-    };
+    use crate::runtime::profile::Profiler;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
     use super::{
         NativeExecutionContext, execute_native_submission, native_execution_readiness_channel,
-        record_runtime_filter_dormancy,
     };
 
     fn noop_values_submission() -> FragmentSubmission {
@@ -392,14 +344,13 @@ mod tests {
             BTreeMap::new(),
             RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
         ));
-        let instance = FragmentInstanceSpec::new(
+        let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             QueryId { hi: 81, lo: 82 },
             FragmentInstanceId::new(UniqueId { hi: 83, lo: 84 }),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,
-            RuntimeFilterParams::default(),
             FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
             NonZeroUsize::new(1).expect("non-zero DOP"),
             BackendNum::try_new(1).expect("backend number"),
@@ -423,42 +374,5 @@ mod tests {
         .expect("noop submission executes");
 
         assert!(output.profile_json.is_none());
-        let dormancy = profiler
-            .get_child(NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE)
-            .expect("dormancy profile");
-        assert_eq!(dormancy.counter_value("BindingCount"), Some(0));
-    }
-
-    #[test]
-    fn records_validated_dormancy_facts_without_installing_runtime_filters() {
-        let profiler = Profiler::new("native submission");
-        record_runtime_filter_dormancy(
-            &profiler,
-            &[RuntimeFilterDormancyFact {
-                binding_id: 7,
-                channel_id: 9,
-                node_id: 11,
-                apply_point: RuntimeFilterApplyPoint::NodeInput,
-                role: RuntimeFilterDormancyRole::Consumer,
-            }],
-        );
-
-        let dormancy = profiler
-            .get_child(NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE)
-            .expect("dormancy profile");
-        assert_eq!(dormancy.counter_value("BindingCount"), Some(1));
-        let binding = dormancy.get_child("Binding7").expect("binding profile");
-        assert_eq!(binding.get_info_string("ChannelId").as_deref(), Some("9"));
-        assert_eq!(binding.get_info_string("NodeId").as_deref(), Some("11"));
-        assert_eq!(
-            binding.get_info_string("ApplyPoint").as_deref(),
-            Some("NodeInput")
-        );
-        assert_eq!(binding.get_info_string("Role").as_deref(), Some("Consumer"));
-        assert_eq!(binding.counter_value("ValidatedLookup"), Some(1));
-        assert_eq!(binding.counter_value("DeploymentNotInstalled"), Some(1));
-        for counter in NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS {
-            assert_eq!(binding.counter_value(counter), Some(0), "counter={counter}");
-        }
     }
 }

@@ -126,28 +126,6 @@ impl ExchangeInputContract {
 pub(crate) struct RuntimeFilterContract {
     build_filters: BTreeSet<RuntimeFilterId>,
     probe_filters: BTreeSet<RuntimeFilterId>,
-    dormancy_facts: Vec<RuntimeFilterDormancyFact>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterApplyPoint {
-    NodeInput,
-    NodeOutput,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterDormancyRole {
-    Producer,
-    Consumer,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterDormancyFact {
-    pub(crate) binding_id: u32,
-    pub(crate) channel_id: u32,
-    pub(crate) node_id: i32,
-    pub(crate) apply_point: RuntimeFilterApplyPoint,
-    pub(crate) role: RuntimeFilterDormancyRole,
 }
 
 impl RuntimeFilterContract {
@@ -158,16 +136,7 @@ impl RuntimeFilterContract {
         Self {
             build_filters,
             probe_filters,
-            dormancy_facts: Vec::new(),
         }
-    }
-
-    pub(crate) fn with_dormancy_facts(
-        mut self,
-        dormancy_facts: Vec<RuntimeFilterDormancyFact>,
-    ) -> Self {
-        self.dormancy_facts = dormancy_facts;
-        self
     }
 
     pub(crate) fn build_filters(&self) -> &BTreeSet<RuntimeFilterId> {
@@ -180,10 +149,6 @@ impl RuntimeFilterContract {
 
     pub(crate) fn has_bindings(&self) -> bool {
         !self.build_filters.is_empty() || !self.probe_filters.is_empty()
-    }
-
-    pub(crate) fn dormancy_facts(&self) -> &[RuntimeFilterDormancyFact] {
-        &self.dormancy_facts
     }
 }
 

@@ -160,7 +160,6 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(pruning.value_kind, 2);
     assert_eq!(pruning.min_int_value, Some(10));
     assert_eq!(pruning.max_int_value, Some(20));
-    assert!(encoded.runtime_filter_params.is_none());
     let opts = encoded.query_options.as_ref().expect("query options");
     assert_eq!(opts.batch_size, 4096);
     assert_eq!(opts.query_timeout, 60);

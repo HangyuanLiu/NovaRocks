@@ -1,7 +1,7 @@
 -- query 11
 scenario	row_count	id_sum
-partitioned_probe	1000	1001000
+broadcast_anyof	20	54400
 
 -- query 14
 scenario	row_count	id_sum
-partitioned_probe	1000	1001000
+broadcast_anyof	20	54400

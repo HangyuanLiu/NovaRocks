@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod codec;
 pub(crate) mod decode;
 pub(crate) mod encode;
 mod runtime_filter_install;

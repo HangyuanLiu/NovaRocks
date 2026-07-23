@@ -415,7 +415,6 @@ mod tests {
     };
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
     use crate::sql::common::ChangeStreamBranchKind;
 
     #[cfg(feature = "compat")]
@@ -448,14 +447,13 @@ mod tests {
     }
 
     fn instance(sink_assignment: FragmentSinkAssignment) -> FragmentInstanceSpec {
-        FragmentInstanceSpec::new(
+        FragmentInstanceSpec::new_native(
             crate::exec::fragment::program::FragmentContractVersion::CURRENT,
             QueryId { hi: 1, lo: 2 },
             FragmentInstanceId::new(UniqueId { hi: 3, lo: 4 }),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             sink_assignment,
-            RuntimeFilterParams::default(),
             FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
             NonZeroUsize::new(1).expect("non-zero DOP"),
             BackendNum::try_new(0).expect("backend number"),

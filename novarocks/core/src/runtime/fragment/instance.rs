@@ -26,6 +26,7 @@ use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId, Sc
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
+#[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
 
@@ -259,7 +260,8 @@ pub(crate) struct FragmentInstanceSpec {
     scan_assignments: ScanAssignments,
     exchange_inputs: ExchangeInputAssignments,
     sink_assignment: FragmentSinkAssignment,
-    runtime_filter_params: RuntimeFilterParams,
+    #[cfg(feature = "compat")]
+    runtime_filter_params: Option<RuntimeFilterParams>,
     runtime_options: FragmentRuntimeOptions,
     pipeline_dop: NonZeroUsize,
     backend_num: BackendNum,
@@ -267,7 +269,35 @@ pub(crate) struct FragmentInstanceSpec {
 
 impl FragmentInstanceSpec {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(crate) fn new_native(
+        contract_version: FragmentContractVersion,
+        query_id: QueryId,
+        fragment_instance_id: FragmentInstanceId,
+        scan_assignments: ScanAssignments,
+        exchange_inputs: ExchangeInputAssignments,
+        sink_assignment: FragmentSinkAssignment,
+        runtime_options: FragmentRuntimeOptions,
+        pipeline_dop: NonZeroUsize,
+        backend_num: BackendNum,
+    ) -> Self {
+        Self {
+            contract_version,
+            query_id,
+            fragment_instance_id,
+            scan_assignments,
+            exchange_inputs,
+            sink_assignment,
+            #[cfg(feature = "compat")]
+            runtime_filter_params: None,
+            runtime_options,
+            pipeline_dop,
+            backend_num,
+        }
+    }
+
+    #[cfg(feature = "compat")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_compat(
         contract_version: FragmentContractVersion,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
@@ -286,7 +316,7 @@ impl FragmentInstanceSpec {
             scan_assignments,
             exchange_inputs,
             sink_assignment,
-            runtime_filter_params,
+            runtime_filter_params: Some(runtime_filter_params),
             runtime_options,
             pipeline_dop,
             backend_num,
@@ -317,8 +347,11 @@ impl FragmentInstanceSpec {
         &self.sink_assignment
     }
 
-    pub(crate) const fn runtime_filter_params(&self) -> &RuntimeFilterParams {
-        &self.runtime_filter_params
+    #[cfg(feature = "compat")]
+    pub(crate) fn runtime_filter_params(&self) -> &RuntimeFilterParams {
+        self.runtime_filter_params
+            .as_ref()
+            .expect("StarRocks fragment instance must carry runtime filter params")
     }
 
     pub(crate) const fn runtime_options(&self) -> &FragmentRuntimeOptions {
@@ -347,7 +380,6 @@ mod tests {
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
     use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRange, ScanRangeParams};
 
     use super::*;
@@ -545,7 +577,7 @@ mod tests {
             Some(report_endpoint.clone()),
             true,
         );
-        let spec = FragmentInstanceSpec::new(
+        let spec = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             QueryId { hi: 13, lo: 17 },
             FragmentInstanceId::new(UniqueId { hi: 19, lo: 23 }),
@@ -555,7 +587,6 @@ mod tests {
                 destinations: Vec::new(),
                 sender_id: None,
             },
-            RuntimeFilterParams::default(),
             runtime_options,
             NonZeroUsize::new(4).expect("pipeline DOP"),
             BackendNum::try_new(0).expect("backend number"),
@@ -583,7 +614,6 @@ mod tests {
                 sender_id: None,
             } if destinations.is_empty()
         ));
-        assert!(spec.runtime_filter_params().is_empty());
         assert!(
             spec.runtime_options()
                 .query_options()

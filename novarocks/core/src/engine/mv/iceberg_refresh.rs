@@ -12682,7 +12682,6 @@ fn imv_change_stream_writer_abort_result_for_test(
         write_commit: None,
         write_abort: Some(abort),
         fragment_profiles: Vec::new(),
-        runtime_filter_dormancy_proof: None,
     }
 }
 
@@ -22749,7 +22748,6 @@ mod tests {
             write_commit: None,
             write_abort: None,
             fragment_profiles: Vec::new(),
-            runtime_filter_dormancy_proof: None,
         };
 
         let err = executed_change_stream_write_from_result(

@@ -624,7 +624,7 @@ fn decode_draft_parts(
                 .clone()
                 .map(StarRocksReportDestination::Coordinator)
         });
-    let instance_spec = FragmentInstanceSpec::new(
+    let instance_spec = FragmentInstanceSpec::new_compat(
         FragmentContractVersion::CURRENT,
         instance.query_id,
         instance.fragment_instance_id,

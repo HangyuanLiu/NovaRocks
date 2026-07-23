@@ -61,6 +61,7 @@ impl FragmentSubmission {
         validate_scan_assignments(&program, &instance)?;
         validate_exchange_assignments(&program, &instance)?;
         validate_sink_assignment(&program, &instance)?;
+        #[cfg(feature = "compat")]
         validate_runtime_filter_params(&instance)?;
 
         Ok(Self { program, instance })
@@ -550,6 +551,7 @@ fn sink_assignment_summary(assignment: &FragmentSinkAssignment) -> String {
     }
 }
 
+#[cfg(feature = "compat")]
 fn validate_runtime_filter_params(
     instance: &FragmentInstanceSpec,
 ) -> Result<(), FragmentBindingError> {
@@ -905,18 +907,36 @@ mod tests {
                 })
                 .collect(),
         );
-        FragmentInstanceSpec::new(
-            version,
-            query,
-            FragmentInstanceId::new(finst),
-            scans,
-            exchanges,
-            sink,
-            RuntimeFilterParams::new(prober_params, builder_counts, None),
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
-            NonZeroUsize::new(1).expect("pipeline DOP"),
-            BackendNum::try_new(0).expect("backend number"),
-        )
+        #[cfg(feature = "compat")]
+        {
+            return FragmentInstanceSpec::new_compat(
+                version,
+                query,
+                FragmentInstanceId::new(finst),
+                scans,
+                exchanges,
+                sink,
+                RuntimeFilterParams::new(prober_params, builder_counts, None),
+                FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+                NonZeroUsize::new(1).expect("pipeline DOP"),
+                BackendNum::try_new(0).expect("backend number"),
+            );
+        }
+        #[cfg(not(feature = "compat"))]
+        {
+            let _ = (prober_params, builder_counts);
+            FragmentInstanceSpec::new_native(
+                version,
+                query,
+                FragmentInstanceId::new(finst),
+                scans,
+                exchanges,
+                sink,
+                FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+                NonZeroUsize::new(1).expect("pipeline DOP"),
+                BackendNum::try_new(0).expect("backend number"),
+            )
+        }
     }
 
     fn empty_instance(finst_lo: i64) -> FragmentInstanceSpec {
@@ -1902,6 +1922,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn accepts_query_global_prober_route_without_local_build_filter() {
         // The top fragment acts as the runtime-filter coordinator: it carries the
@@ -1935,6 +1956,7 @@ mod tests {
             .expect("query-global prober route on coordinator fragment");
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn accepts_query_global_builder_count_for_unrelated_filter() {
         let program = program_with(
@@ -1960,6 +1982,7 @@ mod tests {
         .expect("query-global builder count");
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn rejects_zero_and_negative_builder_counts() {
         for (finst_lo, count) in [(52, 0), (53, -1)] {

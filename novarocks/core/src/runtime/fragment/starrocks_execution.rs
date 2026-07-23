@@ -172,7 +172,7 @@ mod tests {
             BTreeMap::new(),
             RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
         ));
-        let instance = FragmentInstanceSpec::new(
+        let instance = FragmentInstanceSpec::new_compat(
             FragmentContractVersion::CURRENT,
             QueryId {
                 hi: 86_001,

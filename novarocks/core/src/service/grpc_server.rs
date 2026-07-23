@@ -37,7 +37,7 @@ use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tonic::service::Routes;
-#[cfg(test)]
+#[cfg(any(test, feature = "compat"))]
 use tonic::transport::Server;
 
 #[cfg(feature = "compat")]
@@ -106,6 +106,8 @@ pub struct GrpcService {
     execution_query_manager: Option<Arc<crate::runtime::query_context::QueryContextManager>>,
     #[cfg(test)]
     execution_owned_finsts: Option<Arc<Mutex<BTreeSet<crate::common::types::UniqueId>>>>,
+    #[cfg(test)]
+    submit_fragment_entry_probe: Option<Arc<AtomicUsize>>,
 }
 
 impl std::fmt::Debug for GrpcService {
@@ -168,6 +170,8 @@ impl GrpcService {
             execution_query_manager: None,
             #[cfg(test)]
             execution_owned_finsts: None,
+            #[cfg(test)]
+            submit_fragment_entry_probe: None,
         }
     }
 
@@ -217,6 +221,12 @@ impl GrpcService {
         service
     }
 
+    #[cfg(test)]
+    fn with_submit_fragment_entry_probe(mut self, probe: Arc<AtomicUsize>) -> Self {
+        self.submit_fragment_entry_probe = Some(probe);
+        self
+    }
+
     fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
         if self.allow_local_execution {
             Ok(())
@@ -237,6 +247,7 @@ pub(crate) struct IndependentGrpcRuntimeFilterNode {
 #[cfg(test)]
 struct IndependentGrpcRuntimeFilterResources {
     manager: Arc<crate::runtime::query_context::QueryContextManager>,
+    submit_fragment_entry_probe: Arc<AtomicUsize>,
     shutdown_tx: Option<watch::Sender<bool>>,
     server_handle: Option<JoinHandle<()>>,
     clean_handle: Option<JoinHandle<()>>,
@@ -356,12 +367,15 @@ impl IndependentGrpcRuntimeFilterNode {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let resources = IndependentGrpcRuntimeFilterResources {
             manager,
+            submit_fragment_entry_probe: Arc::new(AtomicUsize::new(0)),
             shutdown_tx: Some(shutdown_tx),
             server_handle: None,
             clean_handle: Some(clean_handle),
         };
         let mut startup = IndependentGrpcRuntimeFilterStartupGuard::new(resources);
         let service_manager = Arc::clone(&startup.resources().manager);
+        let submit_fragment_entry_probe =
+            Arc::clone(&startup.resources().submit_fragment_entry_probe);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let server_handle = std::thread::spawn(move || {
             let _exit = IndependentGrpcServerExitSignal(
@@ -382,7 +396,8 @@ impl IndependentGrpcRuntimeFilterNode {
                 let service = GrpcService::full_execution_with_runtime_filter_manager(
                     Arc::new(CoordinatorExecStatusReportHandler),
                     service_manager,
-                );
+                )
+                .with_submit_fragment_entry_probe(submit_fragment_entry_probe);
                 let service =
                     proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service)
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
@@ -417,6 +432,12 @@ impl IndependentGrpcRuntimeFilterNode {
 
     pub(crate) fn manager(&self) -> &Arc<crate::runtime::query_context::QueryContextManager> {
         &self.resources.manager
+    }
+
+    pub(crate) fn submit_fragment_handler_calls(&self) -> usize {
+        self.resources
+            .submit_fragment_entry_probe
+            .load(Ordering::SeqCst)
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
@@ -680,6 +701,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         request: tonic::Request<proto::novarocks::SubmitFragmentRequest>,
     ) -> Result<tonic::Response<proto::novarocks::SubmitFragmentResponse>, tonic::Status> {
         self.require_local_execution("SubmitFragment")?;
+        #[cfg(test)]
+        if let Some(probe) = self.submit_fragment_entry_probe.as_ref() {
+            probe.fetch_add(1, Ordering::SeqCst);
+        }
         let call_index = SUBMIT_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         if crate::common::config::debug_emit_grpc_fragment_marker() {
             println!("NOVAROCKS_GRPC_SUBMIT call={call_index}");
@@ -1906,9 +1931,124 @@ mod tests {
         IndependentGrpcRuntimeFilterNode, IndependentGrpcStartupProbe, ensure_bindable,
         parse_grpc_bind_addr, validate_grpc_ports,
     };
+    use crate::runtime::query_context::QueryId;
+    use prost::Message;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct RawSubmitFragmentRequest {
+        #[prost(bytes = "vec", tag = "2")]
+        instance_params: Vec<u8>,
+        #[prost(bytes = "vec", tag = "7")]
+        outer_unknown_seven: Vec<u8>,
+    }
+
+    fn instance_params_wire(include_legacy_tag: bool) -> Vec<u8> {
+        let mut bytes = vec![
+            0x0a, 0x04, // query_id, length-delimited
+            0x08, 42, // query_id.hi
+            0x10, 43, // query_id.lo
+        ];
+        if include_legacy_tag {
+            bytes.extend_from_slice(&[0x3a, 0x01, 0xff]);
+        }
+        bytes
+    }
+
+    async fn send_raw_submit(
+        endpoint: std::net::SocketAddr,
+        request: RawSubmitFragmentRequest,
+    ) -> Result<tonic::Response<crate::proto::novarocks::SubmitFragmentResponse>, tonic::Status>
+    {
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))
+            .expect("raw submit endpoint")
+            .connect()
+            .await
+            .expect("connect raw submit client");
+        let mut client = tonic::client::Grpc::new(channel);
+        client.ready().await.expect("raw submit client ready");
+        client
+            .unary(
+                tonic::Request::new(request),
+                tonic::codegen::http::uri::PathAndQuery::from_static(
+                    "/novarocks.NovaRocksGrpc/SubmitFragment",
+                ),
+                tonic::codec::ProstCodec::<
+                    RawSubmitFragmentRequest,
+                    crate::proto::novarocks::SubmitFragmentResponse,
+                >::default(),
+            )
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generated_server_rejects_legacy_instance_tag_before_handler_or_query_state() {
+        let node = IndependentGrpcRuntimeFilterNode::start().expect("start generated gRPC server");
+        let query_id = QueryId { hi: 42, lo: 43 };
+
+        let error = send_raw_submit(
+            node.endpoint(),
+            RawSubmitFragmentRequest {
+                instance_params: instance_params_wire(true),
+                outer_unknown_seven: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("legacy direct InstanceParams tag 7 must fail in the generated codec");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("tag 7"), "{error}");
+        assert_eq!(node.submit_fragment_handler_calls(), 0);
+        assert_eq!(node.manager().fragment_counts_for_test(query_id), None);
+        let service = node.manager().runtime_filter_service_for_ingress(query_id);
+        let pending = service
+            .as_ref()
+            .map(|service| service.transport_pending_len_for_test())
+            .unwrap_or(0);
+        assert_eq!(
+            pending, 0,
+            "codec rejection must not enqueue transport work"
+        );
+        assert!(
+            service.is_none(),
+            "codec rejection must not create a query-owned Service"
+        );
+        assert!(
+            matches!(node.manager().get_runtime_filter_hub(query_id), Ok(None)),
+            "codec rejection must not create a legacy Hub"
+        );
+        assert!(
+            matches!(node.manager().get_runtime_filter_worker(query_id), Ok(None)),
+            "codec rejection must not create a legacy Worker"
+        );
+
+        let response = send_raw_submit(
+            node.endpoint(),
+            RawSubmitFragmentRequest {
+                instance_params: instance_params_wire(false),
+                outer_unknown_seven: Vec::new(),
+            },
+        )
+        .await
+        .expect("current request must reach the handler")
+        .into_inner();
+        assert_ne!(response.status_code, 0, "missing plan is a business error");
+        assert_eq!(node.submit_fragment_handler_calls(), 1);
+
+        let response = send_raw_submit(
+            node.endpoint(),
+            RawSubmitFragmentRequest {
+                instance_params: instance_params_wire(false),
+                outer_unknown_seven: vec![1],
+            },
+        )
+        .await
+        .expect("outer request tag 7 must remain an ordinary unknown field")
+        .into_inner();
+        assert_ne!(response.status_code, 0, "missing plan is a business error");
+        assert_eq!(node.submit_fragment_handler_calls(), 2);
+    }
 
     #[test]
     fn independent_runtime_filter_start_failure_stops_all_started_threads() {

@@ -385,10 +385,7 @@ mod tests {
         }
     }
 
-    fn native_instance_params(
-        query_id: QueryId,
-        runtime_filter_params: crate::proto::novarocks::RuntimeFilterParams,
-    ) -> crate::proto::novarocks::InstanceParams {
+    fn native_instance_params(query_id: QueryId) -> crate::proto::novarocks::InstanceParams {
         crate::proto::novarocks::InstanceParams {
             query_id: Some(crate::proto::common::UniqueId {
                 hi: query_id.hi,
@@ -403,7 +400,6 @@ mod tests {
                 ..Default::default()
             }),
             report_endpoint: Some("127.0.0.1:19030".to_string()),
-            runtime_filter_params: Some(runtime_filter_params),
             ..Default::default()
         }
     }
@@ -449,11 +445,7 @@ mod tests {
             hi: 73_901,
             lo: 73_902,
         };
-        let mut params = native_instance_params(
-            query_id,
-            crate::proto::novarocks::RuntimeFilterParams::default(),
-        );
-        params.runtime_filter_params = None;
+        let params = native_instance_params(query_id);
         let decoded = decode_fragment_submission(&valid_values_result_fragment(16, 99), &params)
             .expect("valid native fragment");
         let (submission, _) = decoded.into_parts();
@@ -628,37 +620,5 @@ mod tests {
             manager.with_context_mut(query_id, |_| Ok(())).is_err(),
             "zero registered fragments must not pin the query context"
         );
-    }
-
-    #[test]
-    fn legacy_runtime_filter_rejection_has_zero_runtime_side_effects() {
-        let query_id = QueryId {
-            hi: 73_001,
-            lo: 73_002,
-        };
-        let finst_id = UniqueId {
-            hi: query_id.hi + 1,
-            lo: query_id.lo + 1,
-        };
-        let invalid = native_instance_params(
-            query_id,
-            crate::proto::novarocks::RuntimeFilterParams {
-                runtime_filter_builder_number: HashMap::from([(7, 1)]),
-                ..Default::default()
-            },
-        );
-        let before = registration_snapshot(query_id, finst_id);
-
-        let error =
-            submit_exec_plan_fragment_native(crate::proto::plan::PlanFragment::default(), invalid)
-                .expect_err("native fragment must reject non-empty legacy runtime-filter params");
-        let after = registration_snapshot(query_id, finst_id);
-
-        assert!(
-            error.contains("instance_params.runtime_filter_params")
-                && error.contains("unsupported"),
-            "{error}"
-        );
-        assert_eq!(after, before, "legacy RF decode failure must be pure");
     }
 }

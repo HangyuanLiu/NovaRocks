@@ -29,7 +29,7 @@ use crate::runtime_filter::deployment::shard::{
     ChannelProjectionSpec, ConsumerBindingFacts, project_install_views,
 };
 use crate::runtime_filter::deployment::wait_for::{
-    ConsumerWaitInput, ExecutionDependencyGraph, validate_wait_for,
+    ConsumerWaitInput, ExecutionDependencyGraph, ProducerWaitInput, validate_wait_for,
 };
 use crate::runtime_filter::deployment::{
     DeploymentError, RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
@@ -40,7 +40,9 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-use crate::sql::planner::distributed::{FragmentEdge, FragmentId};
+use crate::sql::planner::distributed::{
+    FragmentEdge, FragmentId, RuntimeFilterJoinProgressCatalog,
+};
 
 /// Compile a query-global [`RuntimeFilterGraph`] plus COOR-2 scheduling/placement
 /// into a coordinator-side [`RuntimeFilterDeploymentPlan`]: a full role graph
@@ -60,6 +62,26 @@ pub(crate) fn compile(
     graph: &RuntimeFilterGraph,
     scheduling: &SchedulingPlan,
     edges: &[FragmentEdge],
+    backends: &LiveBackendSnapshot,
+    policy: &RuntimeFilterDeploymentPolicy,
+    epoch: DeploymentEpoch,
+) -> Result<RuntimeFilterDeploymentPlan, DeploymentError> {
+    compile_with_join_progress(
+        graph,
+        scheduling,
+        edges,
+        &RuntimeFilterJoinProgressCatalog::default(),
+        backends,
+        policy,
+        epoch,
+    )
+}
+
+pub(crate) fn compile_with_join_progress(
+    graph: &RuntimeFilterGraph,
+    scheduling: &SchedulingPlan,
+    edges: &[FragmentEdge],
+    join_progress: &RuntimeFilterJoinProgressCatalog,
     backends: &LiveBackendSnapshot,
     policy: &RuntimeFilterDeploymentPolicy,
     epoch: DeploymentEpoch,
@@ -166,13 +188,16 @@ pub(crate) fn compile(
     // wait edge, and only a real execution-topology cycle is rejected.
     let mut consumer_waits: Vec<ConsumerWaitInput> = Vec::new();
     for channel in graph.channels() {
-        let producer_fragments: Vec<FragmentId> = graph
+        let producers: Vec<ProducerWaitInput> = graph
             .bindings()
             .filter(|binding| {
                 binding.channel_id == channel.channel_id
                     && matches!(binding.role, RuntimeFilterBindingRole::Producer(_))
             })
-            .map(|binding| binding.location.fragment_id.get())
+            .map(|binding| ProducerWaitInput {
+                binding: binding.binding_id,
+                fragment: binding.location.fragment_id.get(),
+            })
             .collect();
         for binding in graph
             .bindings()
@@ -184,12 +209,12 @@ pub(crate) fn compile(
                     binding: binding.binding_id,
                     consumer_fragment: binding.location.fragment_id.get(),
                     activation: req.activation,
-                    producer_fragments: producer_fragments.clone(),
+                    producers: producers.clone(),
                 });
             }
         }
     }
-    validate_wait_for(&exec_deps, &consumer_waits)?;
+    validate_wait_for(&exec_deps, edges, &consumer_waits, join_progress)?;
 
     // 5. Role graph per channel + the per-channel projection spec the shard
     // projector needs. The completion requirement is precomputed here from

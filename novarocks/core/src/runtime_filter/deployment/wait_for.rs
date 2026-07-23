@@ -18,7 +18,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
-use crate::sql::planner::distributed::{FragmentEdge, FragmentId};
+use crate::sql::planner::distributed::{
+    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
+    RuntimeFilterJoinProgressCatalog, RuntimeFilterJoinProgressCertificate,
+};
 
 use super::DeploymentError;
 
@@ -113,14 +116,64 @@ impl ExecutionDependencyGraph {
 /// graph model (channels/bindings) by the compiler and validated against the
 /// `ExecutionDependencyGraph`.
 #[derive(Clone, Debug)]
+pub(crate) struct ProducerWaitInput {
+    pub binding: BindingId,
+    pub fragment: FragmentId,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ConsumerWaitInput {
     pub channel: ChannelId,
     pub binding: BindingId,
     /// Fragment the consumer executes on.
     pub consumer_fragment: FragmentId,
     pub activation: ConsumerActivation,
-    /// Fragments the channel's producers execute on.
-    pub producer_fragments: Vec<FragmentId>,
+    /// Exact producer bindings and the fragments on which they execute.
+    pub producers: Vec<ProducerWaitInput>,
+}
+
+fn exact_partitioned_hash_edge(
+    edges: &[FragmentEdge],
+    source: FragmentId,
+    target: FragmentId,
+    target_exchange_node: i32,
+) -> bool {
+    edges.iter().any(|edge| {
+        edge.source_fragment_id == source
+            && edge.target_fragment_id == target
+            && edge.target_exchange_node_id == target_exchange_node
+            && matches!(edge.output_partition.kind, PartitionKind::Hash)
+            && edge.stream_kind == FragmentStreamKind::Partitioned
+            && edge.edge_kind == FragmentEdgeKind::Stream
+    })
+}
+
+fn certifies_join_build_progress(
+    deps: &ExecutionDependencyGraph,
+    edges: &[FragmentEdge],
+    consumer_fragment: FragmentId,
+    certificate: RuntimeFilterJoinProgressCertificate,
+) -> bool {
+    let producer_fragment = certificate.producer_fragment;
+    let probe_input = certificate.probe_input_fragment;
+    let build_input = certificate.build_input_fragment;
+
+    exact_partitioned_hash_edge(
+        edges,
+        probe_input,
+        producer_fragment,
+        certificate.probe_target_exchange_node,
+    ) && exact_partitioned_hash_edge(
+        edges,
+        build_input,
+        producer_fragment,
+        certificate.build_target_exchange_node,
+    ) && deps.reaches(producer_fragment, probe_input)
+        && deps.reaches(producer_fragment, build_input)
+        && (consumer_fragment == probe_input || deps.reaches(probe_input, consumer_fragment))
+        && build_input != consumer_fragment
+        && !deps.reaches(build_input, consumer_fragment)
+        && !deps.reaches(consumer_fragment, build_input)
 }
 
 /// Reject any `BlockingSnapshot` consumer whose wait edge closes an execution
@@ -128,22 +181,39 @@ pub(crate) struct ConsumerWaitInput {
 /// `NonBlockingLive` consumers add no wait edge and always pass.
 pub(crate) fn validate_wait_for(
     deps: &ExecutionDependencyGraph,
+    edges: &[FragmentEdge],
     consumers: &[ConsumerWaitInput],
+    join_progress: &RuntimeFilterJoinProgressCatalog,
 ) -> Result<(), DeploymentError> {
     for c in consumers {
         if c.activation != ConsumerActivation::BlockingSnapshot {
             continue;
         }
-        for producer_fragment in &c.producer_fragments {
+        for producer in &c.producers {
             // Blocking wait: consumer waits for the producer's first version. If
             // the producer fragment depends (transitively) on the consumer
             // fragment, the producer can't run until the consumer does, but the
             // consumer is blocked on the producer → cycle.
-            if deps.reaches(*producer_fragment, c.consumer_fragment) {
-                return Err(DeploymentError::BlockingFeedbackCycle {
-                    channel: c.channel,
-                    binding: c.binding,
-                });
+            if deps.reaches(producer.fragment, c.consumer_fragment) {
+                let certificate = join_progress
+                    .get(&(c.channel, producer.binding, producer.fragment))
+                    .copied();
+                if !certificate.is_some_and(|certificate| {
+                    certificate.channel == c.channel
+                        && certificate.producer_binding == producer.binding
+                        && certificate.producer_fragment == producer.fragment
+                        && certifies_join_build_progress(
+                            deps,
+                            edges,
+                            c.consumer_fragment,
+                            certificate,
+                        )
+                }) {
+                    return Err(DeploymentError::BlockingFeedbackCycle {
+                        channel: c.channel,
+                        binding: c.binding,
+                    });
+                }
             }
         }
     }
@@ -174,6 +244,33 @@ mod tests {
         }
     }
 
+    fn partitioned_edge(source: u32, target: u32, exchange_node: i32) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id: source,
+            target_fragment_id: target,
+            target_exchange_node_id: exchange_node,
+            output_partition: DataPartition {
+                kind: PartitionKind::Hash,
+                exprs: Vec::new(),
+            },
+            stream_kind: FragmentStreamKind::Partitioned,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
+        }
+    }
+
+    fn join_certificate() -> RuntimeFilterJoinProgressCertificate {
+        RuntimeFilterJoinProgressCertificate {
+            channel: ChannelId::new(7),
+            producer_binding: BindingId::new(100),
+            producer_fragment: 1,
+            probe_input_fragment: 2,
+            probe_target_exchange_node: 20,
+            build_input_fragment: 3,
+            build_target_exchange_node: 30,
+        }
+    }
+
     fn wait(
         binding: u32,
         consumer_frag: u32,
@@ -185,8 +282,23 @@ mod tests {
             binding: BindingId::new(binding),
             consumer_fragment: consumer_frag,
             activation,
-            producer_fragments: producers,
+            producers: producers
+                .into_iter()
+                .enumerate()
+                .map(|(index, fragment)| ProducerWaitInput {
+                    binding: BindingId::new(100 + u32::try_from(index).unwrap()),
+                    fragment,
+                })
+                .collect(),
         }
+    }
+
+    fn validate(
+        deps: &ExecutionDependencyGraph,
+        edges: &[FragmentEdge],
+        consumers: &[ConsumerWaitInput],
+    ) -> Result<(), DeploymentError> {
+        validate_wait_for(deps, edges, consumers, &Default::default())
     }
 
     #[test]
@@ -233,7 +345,7 @@ mod tests {
         // scan(2) -> topn(1): producer topn(1) depends on consumer scan(2).
         let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
         let c = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let err = validate_wait_for(&deps, &[c]).unwrap_err();
+        let err = validate(&deps, &[edge(2, 1)], &[c]).unwrap_err();
         assert!(matches!(err, DeploymentError::BlockingFeedbackCycle { .. }));
     }
 
@@ -248,7 +360,7 @@ mod tests {
             },
             vec![1],
         );
-        assert!(validate_wait_for(&deps, &[c]).is_ok());
+        assert!(validate(&deps, &[edge(2, 1)], &[c]).is_ok());
     }
 
     #[test]
@@ -256,7 +368,7 @@ mod tests {
         // build(2) -> probe(1): consumer probe(1) depends on producer build(2). No cycle.
         let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
         let c = wait(10, 1, ConsumerActivation::BlockingSnapshot, vec![2]);
-        assert!(validate_wait_for(&deps, &[c]).is_ok());
+        assert!(validate(&deps, &[edge(2, 1)], &[c]).is_ok());
     }
 
     #[test]
@@ -265,7 +377,72 @@ mod tests {
         // graph) and fragment 1 (depends on 2 via edge(2,1) → closes a cycle).
         let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
         let c = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![9, 1]);
-        let err = validate_wait_for(&deps, &[c]).unwrap_err();
+        let err = validate(&deps, &[edge(2, 1)], &[c]).unwrap_err();
         assert!(matches!(err, DeploymentError::BlockingFeedbackCycle { .. }));
+    }
+
+    #[test]
+    fn partitioned_join_progress_certificate_allows_probe_side_wait_cycle() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let certificate = join_certificate();
+        let catalog = BTreeMap::from([(
+            (
+                certificate.channel,
+                certificate.producer_binding,
+                certificate.producer_fragment,
+            ),
+            certificate,
+        )]);
+
+        assert!(validate_wait_for(&deps, &edges, &[consumer], &catalog).is_ok());
+    }
+
+    #[test]
+    fn forged_join_progress_certificate_is_rejected() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let mut certificate = join_certificate();
+        certificate.build_target_exchange_node = 31;
+        let catalog = BTreeMap::from([(
+            (
+                certificate.channel,
+                certificate.producer_binding,
+                certificate.producer_fragment,
+            ),
+            certificate,
+        )]);
+
+        assert!(matches!(
+            validate_wait_for(&deps, &edges, &[consumer], &catalog),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn join_build_source_reverse_dependency_rejects_certificate() {
+        let edges = vec![
+            partitioned_edge(2, 1, 20),
+            partitioned_edge(3, 1, 30),
+            edge(2, 3),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let certificate = join_certificate();
+        let catalog = BTreeMap::from([(
+            (
+                certificate.channel,
+                certificate.producer_binding,
+                certificate.producer_fragment,
+            ),
+            certificate,
+        )]);
+
+        assert!(matches!(
+            validate_wait_for(&deps, &edges, &[consumer], &catalog),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
     }
 }

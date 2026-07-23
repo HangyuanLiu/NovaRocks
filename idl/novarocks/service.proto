@@ -109,7 +109,8 @@ message InstanceParams {
   map<int32, ScanRangeList> per_node_scan_ranges = 4;  // scan node_id -> assigned ranges
   map<int32, int32> per_exch_num_senders = 5;          // exchange node_id -> sender count
   repeated Destination destinations = 6;
-  RuntimeFilterParams runtime_filter_params = 7;
+  reserved 7;
+  reserved "runtime_filter_params";
   QueryOptions query_options = 8;
   optional string report_endpoint = 9;                 // NovaRocks coordinator gRPC endpoint.
   bool typed_result_sink = 10;                         // novarocks_typed_result_sink

@@ -36,8 +36,7 @@ use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode};
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::join::{
-    CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
-    JoinType,
+    JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
@@ -58,6 +57,7 @@ use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilter
 use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSharedState;
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
+#[cfg(feature = "compat")]
 use crate::exec::runtime_filter::{MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger};
 #[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
@@ -1546,18 +1546,16 @@ fn build_pipeline_for_node(
                     ));
                 }
             }
-            let runtime_filters: Vec<CompatJoinRuntimeFilterSpec> = match runtime_filter_execution {
-                JoinRuntimeFilterExecution::Native { .. } => Vec::new(),
+            #[cfg(feature = "compat")]
+            let compat_runtime_filters = match runtime_filter_execution {
+                JoinRuntimeFilterExecution::Native { .. } => None,
                 #[cfg(feature = "compat")]
-                JoinRuntimeFilterExecution::Compat { legacy_specs } => legacy_specs.clone(),
+                JoinRuntimeFilterExecution::Compat { legacy_specs } => Some(legacy_specs),
             };
             #[cfg(feature = "compat")]
-            if matches!(
-                runtime_filter_execution,
-                JoinRuntimeFilterExecution::Compat { .. }
-            ) {
+            if let Some(runtime_filters) = compat_runtime_filters {
                 ctx.compat_runtime_filter_hub()?
-                    .register_filter_specs(*node_id, &runtime_filters);
+                    .register_filter_specs(*node_id, runtime_filters);
             }
             let left_build = build_pipeline_for_node(left, ctx)?;
             let right_build = build_pipeline_for_node(right, ctx)?;
@@ -1578,14 +1576,15 @@ fn build_pipeline_for_node(
                     probe_build = gather_to_one(probe_build, ctx, *node_id);
                 }
                 build_build = gather_to_one(build_build, ctx, *node_id);
-                let runtime_in_filter_merger = if runtime_filters.is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(PartialRuntimeInFilterMerger::new(
-                        1,
-                        MAX_RUNTIME_IN_FILTER_CONDITIONS,
-                    )))
-                };
+                #[cfg(feature = "compat")]
+                let runtime_in_filter_merger = compat_runtime_filters
+                    .filter(|filters| !filters.is_empty())
+                    .map(|_| {
+                        Arc::new(PartialRuntimeInFilterMerger::new(
+                            1,
+                            MAX_RUNTIME_IN_FILTER_CONDITIONS,
+                        ))
+                    });
 
                 let probe_dop = probe_build.pipeline.dop.max(1) as usize;
                 let join_state = Arc::new(BroadcastJoinSharedState::new(
@@ -1666,7 +1665,7 @@ fn build_pipeline_for_node(
                             has_equi_keys,
                             build_keys.clone(),
                             eq_null_safe.clone(),
-                            runtime_filters.clone(),
+                            compat_runtime_filters.expect("compat join filters").clone(),
                             *distribution_mode,
                             build_state,
                             Arc::clone(ctx.compat_runtime_filter_hub()?),
@@ -1704,14 +1703,15 @@ fn build_pipeline_for_node(
                 .dop
                 .max(1)
                 .max(build_build.pipeline.dop.max(1)) as usize;
-            let runtime_in_filter_merger = if runtime_filters.is_empty() {
-                None
-            } else {
-                Some(Arc::new(PartialRuntimeInFilterMerger::new(
-                    join_partitions,
-                    MAX_RUNTIME_IN_FILTER_CONDITIONS,
-                )))
-            };
+            #[cfg(feature = "compat")]
+            let runtime_in_filter_merger = compat_runtime_filters
+                .filter(|filters| !filters.is_empty())
+                .map(|_| {
+                    Arc::new(PartialRuntimeInFilterMerger::new(
+                        join_partitions,
+                        MAX_RUNTIME_IN_FILTER_CONDITIONS,
+                    ))
+                });
 
             if !probe_keys.is_empty() {
                 probe_build = ensure_hash(
@@ -1808,7 +1808,7 @@ fn build_pipeline_for_node(
                     has_equi_keys,
                     build_keys.clone(),
                     eq_null_safe.clone(),
-                    runtime_filters.clone(),
+                    compat_runtime_filters.expect("compat join filters").clone(),
                     *distribution_mode,
                     build_state,
                     Arc::clone(ctx.compat_runtime_filter_hub()?),
