@@ -20,9 +20,9 @@ mod dedupe;
 mod final_domain_completion;
 mod inbound;
 #[cfg(test)]
-mod live_deployment_conformance_tests;
-#[cfg(test)]
 mod live_aggregate_conformance_tests;
+#[cfg(test)]
+mod live_deployment_conformance_tests;
 #[cfg(test)]
 mod live_join_conformance_tests;
 #[cfg(test)]
