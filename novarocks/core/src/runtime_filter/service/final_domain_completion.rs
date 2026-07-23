@@ -742,6 +742,17 @@ mod tests {
 
     use super::*;
 
+    macro_rules! assert_not_clone {
+        ($type:ty) => {{
+            trait AmbiguousIfClone<Marker> {
+                fn marker() {}
+            }
+            impl<Type: ?Sized> AmbiguousIfClone<()> for Type {}
+            impl<Type: ?Sized + Clone> AmbiguousIfClone<u8> for Type {}
+            let _ = <$type as AmbiguousIfClone<_>>::marker;
+        }};
+    }
+
     const BINDING: BindingId = BindingId::new(7);
     const INSTANCE: UniqueId = UniqueId { hi: 8, lo: 9 };
 
@@ -894,6 +905,12 @@ mod tests {
             .unwrap(),
             adapter,
         )
+    }
+
+    #[test]
+    fn final_domain_freeze_capability_cannot_be_cloned() {
+        assert_not_clone!(FinalDomainFreezeCapability);
+        assert_not_clone!(FinalDomainServiceIssuancePermit);
     }
 
     #[test]
