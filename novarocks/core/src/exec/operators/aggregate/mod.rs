@@ -55,8 +55,79 @@ use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime_filter::port::identity::PartitionId;
+use crate::runtime_filter::port::producer::{ProducerFailureReason, RuntimeContractViolationKind};
+use crate::runtime_filter::service::{FinalDomainCompletionSession, FinalDomainPartitionCommitter};
 
 pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
+
+/// Factory-owned capability for binding one final hash-aggregate driver per local partition.
+///
+/// The completion session stays here so its owner lease covers the complete factory lifetime.
+/// Operators receive only their one-shot partition committer.
+pub(crate) struct AggregateFinalDomainSessionBuilder {
+    session: FinalDomainCompletionSession,
+    declared_dop: i32,
+    max_domain_canonical_bytes: usize,
+}
+
+impl AggregateFinalDomainSessionBuilder {
+    pub(crate) fn new(
+        session: FinalDomainCompletionSession,
+        declared_dop: i32,
+        max_domain_canonical_bytes: usize,
+    ) -> Result<Self, String> {
+        if declared_dop <= 0 {
+            let _ = session.fail(ProducerFailureReason::ExecutionFailed);
+            return Err(format!(
+                "aggregate final-domain session requires positive declared DOP, got {declared_dop}"
+            ));
+        }
+        if max_domain_canonical_bytes == 0 {
+            let _ = session.fail(ProducerFailureReason::ExecutionFailed);
+            return Err(
+                "aggregate final-domain session requires a positive canonical domain budget"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            session,
+            declared_dop,
+            max_domain_canonical_bytes,
+        })
+    }
+
+    fn partition(
+        &self,
+        actual_dop: i32,
+        driver_id: i32,
+    ) -> Result<FinalDomainPartitionCommitter, String> {
+        if actual_dop != self.declared_dop {
+            let _ = self.session.fail(ProducerFailureReason::ExecutionFailed);
+            return Err(format!(
+                "aggregate final-domain DOP mismatch: declared={} actual={actual_dop}",
+                self.declared_dop
+            ));
+        }
+        if driver_id < 0 || driver_id >= actual_dop {
+            let _ = self.session.fail(ProducerFailureReason::ExecutionFailed);
+            return Err(format!(
+                "aggregate final-domain driver id is outside the actual DOP: driver_id={driver_id} dop={actual_dop}"
+            ));
+        }
+        self.session
+            .partition(PartitionId::new(driver_id as u32))
+            .map_err(|error| {
+                format!(
+                    "aggregate final-domain partition acquisition failed for driver_id={driver_id}: {error}"
+                )
+            })
+    }
+
+    fn fail(&self) {
+        let _ = self.session.fail(ProducerFailureReason::ExecutionFailed);
+    }
+}
 
 pub(super) fn build_agg_views<'a>(
     kernels: &[agg::AggKernelEntry],
@@ -268,6 +339,10 @@ pub struct AggregateProcessorFactory {
     direct_input: bool,
     output_chunk_schema: ChunkSchemaRef,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
+    final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
+    final_domain_shape_error: Option<String>,
+    #[cfg(test)]
+    fail_output_construction: bool,
 }
 
 #[derive(Clone)]
@@ -289,12 +364,40 @@ impl AggregateProcessorFactory {
         output_intermediate: bool,
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
+        final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
     ) -> Self {
         let name = if node_id >= 0 {
             format!("AGGREGATE (id={node_id})")
         } else {
             "AGGREGATE".to_string()
         };
+        let final_domain_shape_error = final_domain_session.as_ref().and_then(|session| {
+            let error = if output_intermediate || !direct_input {
+                Some(
+                    "aggregate final-domain session may bind only to a merge/final factory"
+                        .to_string(),
+                )
+            } else if group_by.len() != 1 {
+                Some(format!(
+                    "aggregate final-domain session requires exactly one group key, got {}",
+                    group_by.len()
+                ))
+            } else if functions
+                .iter()
+                .any(|function| !function.input_is_intermediate)
+            {
+                Some(
+                    "aggregate final-domain session requires merge-stage aggregate functions"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            if error.is_some() {
+                session.fail();
+            }
+            error
+        });
         Self {
             name,
             arena,
@@ -304,6 +407,10 @@ impl AggregateProcessorFactory {
             direct_input,
             output_chunk_schema,
             runtime_filter_execution: AggregateRuntimeFilterExecution::Native,
+            final_domain_session,
+            final_domain_shape_error,
+            #[cfg(test)]
+            fail_output_construction: false,
         }
     }
 
@@ -328,12 +435,18 @@ impl AggregateProcessorFactory {
             output_intermediate,
             direct_input,
             output_chunk_schema,
+            None,
         );
         factory.runtime_filter_execution = AggregateRuntimeFilterExecution::Compat {
             topn_specs: topn_rf_specs,
             hub: runtime_filter_hub,
         };
         factory
+    }
+
+    #[cfg(test)]
+    fn fail_output_construction_for_test(&mut self) {
+        self.fail_output_construction = true;
     }
 }
 
@@ -342,7 +455,21 @@ impl OperatorFactory for AggregateProcessorFactory {
         &self.name
     }
 
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        let mut final_domain_bind_error = self.final_domain_shape_error.clone();
+        let final_domain_committer = if final_domain_bind_error.is_none() {
+            self.final_domain_session.as_ref().and_then(|session| {
+                match session.partition(dop, driver_id) {
+                    Ok(committer) => Some(committer),
+                    Err(error) => {
+                        final_domain_bind_error = Some(error);
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
         Box::new(AggregateProcessorOperator {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
@@ -369,6 +496,14 @@ impl OperatorFactory for AggregateProcessorFactory {
             key_table_mem_tracker: None,
             runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
+            final_domain_committer,
+            final_domain_bind_error,
+            max_domain_canonical_bytes: self
+                .final_domain_session
+                .as_ref()
+                .map(|session| session.max_domain_canonical_bytes),
+            #[cfg(test)]
+            fail_output_construction: self.fail_output_construction,
         })
     }
 }
@@ -399,6 +534,11 @@ struct AggregateProcessorOperator {
     key_table_mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
+    final_domain_committer: Option<FinalDomainPartitionCommitter>,
+    final_domain_bind_error: Option<String>,
+    max_domain_canonical_bytes: Option<usize>,
+    #[cfg(test)]
+    fail_output_construction: bool,
 }
 
 impl Operator for AggregateProcessorOperator {
@@ -422,7 +562,15 @@ impl Operator for AggregateProcessorOperator {
     }
 
     fn prepare(&mut self) -> Result<(), String> {
-        self.init_from_plan()
+        if let Some(error) = self.final_domain_bind_error.clone() {
+            self.fail_final_domain();
+            return Err(error);
+        }
+        let result = self.init_from_plan();
+        if result.is_err() {
+            self.fail_final_domain();
+        }
+        result
     }
 
     fn is_finished(&self) -> bool {
@@ -856,7 +1004,6 @@ impl AggregateProcessorOperator {
             RecordBatch::try_new(schema, arrays)
         }
         .map_err(|e| e.to_string())?;
-        self.drop_group_states();
         Ok(Some(self.output_chunk_from_batch(batch)?))
     }
 }
@@ -881,8 +1028,15 @@ impl ProcessorOperator for AggregateProcessorOperator {
             return Err("aggregate received input while output buffer is full".to_string());
         }
         let num_rows = chunk.len();
-        let out = self.process(chunk)?;
+        let out = match self.process(chunk) {
+            Ok(out) => out,
+            Err(error) => {
+                self.fail_final_domain();
+                return Err(error);
+            }
+        };
         if out.is_some() {
+            self.fail_final_domain();
             return Err("aggregate produced output before finishing".to_string());
         }
         self.topn_rf_rows_since_publish += num_rows;
@@ -909,7 +1063,20 @@ impl ProcessorOperator for AggregateProcessorOperator {
         if self.pending_output.is_some() {
             return Ok(());
         }
-        let out = self.finish()?;
+        let out = match self.finish() {
+            Ok(out) => out,
+            Err(error) => {
+                self.fail_final_domain();
+                return Err(error);
+            }
+        };
+        if self.final_domain_committer.is_some()
+            && let Err(error) = self.seal_final_domain()
+        {
+            self.fail_final_domain();
+            return Err(error);
+        }
+        self.release_finalized_state();
         if failpoint::should_trigger(failpoint::FORCE_RESET_AGGREGATOR_AFTER_STREAMING_SINK_FINISH)
         {
             self.reset_after_streaming_finish();
@@ -934,6 +1101,53 @@ impl ProcessorOperator for AggregateProcessorOperator {
 }
 
 impl AggregateProcessorOperator {
+    fn fail_final_domain(&mut self) {
+        drop(self.final_domain_committer.take());
+    }
+
+    fn seal_final_domain(&mut self) -> Result<(), String> {
+        let max_domain_canonical_bytes = self.max_domain_canonical_bytes.ok_or_else(|| {
+            "aggregate final-domain canonical domain budget is missing".to_string()
+        })?;
+        let domain = match final_domain::extract_final_aggregate_domain(
+            self.key_table
+                .as_ref()
+                .map(|table| table.key_columns())
+                .unwrap_or(&[]),
+            max_domain_canonical_bytes,
+        ) {
+            Ok(domain) => domain,
+            Err(final_domain::FinalAggregateDomainError::ResourceOrSize) => {
+                self.fail_final_domain();
+                return Ok(());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut committer = self
+            .final_domain_committer
+            .take()
+            .expect("checked aggregate final-domain committer");
+        if let Err(error) = committer.seal(domain) {
+            if error.kind() == RuntimeContractViolationKind::ServiceUnavailable {
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+        if let Err(error) = committer.close() {
+            if error.kind() == RuntimeContractViolationKind::ServiceUnavailable {
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn release_finalized_state(&mut self) {
+        self.drop_group_states();
+        self.state_ptrs.clear();
+        self.key_table = None;
+    }
+
     fn reset_after_streaming_finish(&mut self) {
         self.drop_group_states();
         self.state_ptrs.clear();
@@ -1131,6 +1345,10 @@ impl AggregateProcessorOperator {
     }
 
     fn output_chunk_from_batch(&self, batch: RecordBatch) -> Result<Chunk, String> {
+        #[cfg(test)]
+        if self.fail_output_construction {
+            return Err("injected aggregate output construction failure".to_string());
+        }
         let output_len = batch.num_columns();
         if self.output_chunk_schema.slot_ids().len() < output_len {
             return Err(format!(
@@ -1364,17 +1582,421 @@ impl Drop for AggregateProcessorOperator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
-    use arrow::array::{ArrayRef, Int32Array, ListArray};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, ListArray};
     use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
 
     use super::{
+        AggregateFinalDomainSessionBuilder, AggregateProcessorFactory,
         is_compatible_aggregate_data_type, is_compatible_aggregate_group_data_type,
         normalize_aggregate_group_arrays,
     };
+    use crate::common::ids::SlotId;
+    use crate::common::types::UniqueId;
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::runtime_state::RuntimeState;
+    use crate::runtime_filter::model::contract::{
+        BindingId, ChannelId, CompletionFenceKind, CompletionRequirement, ContributionKind,
+        CoverageWitnessId, NullSemantics, ReductionRequirement, RuntimeFilterLifecycle,
+        RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    };
+    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
+    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+    use crate::runtime_filter::port::install::{
+        MaterializationPolicy, ProducerDeployment, RuntimeFilterChannelDeployment,
+        RuntimeFilterCoreBudget, RuntimeFilterInstallView, local_participant_install_for_test,
+    };
+    use crate::runtime_filter::port::support::{
+        MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+    };
+    use crate::runtime_filter::service::RuntimeFilterService;
+
+    const RF_BINDING: BindingId = BindingId::new(10);
+    const RF_CHANNEL: ChannelId = ChannelId::new(1);
+    const RF_INSTANCE: UniqueId = UniqueId { hi: 70, lo: 10 };
+    const GROUP_SLOT: SlotId = SlotId::new(1);
+
+    struct TestClock(Instant);
+
+    impl RuntimeFilterClock for TestClock {
+        fn now(&self) -> Instant {
+            self.0
+        }
+    }
+
+    #[derive(Default)]
+    struct TestMemory {
+        retained: AtomicUsize,
+    }
+
+    impl RuntimeFilterMemoryAccount for TestMemory {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            self.retained.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            let previous = self.retained.fetch_sub(bytes, Ordering::SeqCst);
+            assert!(previous >= bytes);
+        }
+    }
+
+    #[derive(Default)]
+    struct TestEvents(Mutex<Vec<RuntimeFilterEvent>>);
+
+    impl RuntimeFilterEventSink for TestEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            self.0.lock().expect("test event lock").push(event);
+        }
+    }
+
+    impl TestEvents {
+        fn snapshot(&self) -> Vec<RuntimeFilterEvent> {
+            self.0.lock().expect("test event lock").clone()
+        }
+    }
+
+    struct FinalDomainFixture {
+        service: Arc<RuntimeFilterService>,
+        events: Arc<TestEvents>,
+    }
+
+    impl FinalDomainFixture {
+        fn new() -> Self {
+            let witness = CoverageWitnessId::new(101);
+            let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
+            let deployment = RuntimeFilterChannelDeployment::new(
+                RF_CHANNEL,
+                RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NullSafeEqual,
+                },
+                RuntimeFilterLifecycle::CompleteOnce,
+                coverage.clone(),
+                coverage,
+                ReductionRequirement::SetUnion,
+                BTreeSet::from([
+                    ContributionKind::FinalDomainShard,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::FencedFinalDomain(
+                    CompletionFenceKind::CommittedDomainFrozen,
+                ),
+                RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 1024,
+                    deadline_ms: 1_000,
+                    max_retries: 2,
+                },
+                RuntimeFilterCoreBudget::new(8192),
+                MaterializationPolicy::for_test(),
+                BTreeMap::from([(
+                    RF_BINDING,
+                    ProducerDeployment::new(witness, BTreeSet::from([RF_INSTANCE])),
+                )]),
+                BTreeMap::new(),
+            );
+            let install = local_participant_install_for_test(RuntimeFilterInstallView::new(
+                DeploymentEpoch::new(9),
+                RuntimeFilterParticipantId::new(3),
+                BTreeMap::from([(RF_CHANNEL, deployment)]),
+            ));
+            let events = Arc::new(TestEvents::default());
+            let service = Arc::new(RuntimeFilterService::new_for_lifecycle_test(
+                UniqueId { hi: 70, lo: 0 },
+                Arc::new(TestClock(Instant::now())),
+                events.clone(),
+                Arc::new(TestMemory::default()),
+            ));
+            service.install(install).expect("final-domain install");
+            Self { service, events }
+        }
+
+        fn session_builder(&self, dop: i32) -> AggregateFinalDomainSessionBuilder {
+            let session = self
+                .service
+                .open_final_aggregate_producer(RF_BINDING, RF_INSTANCE, dop as u32)
+                .expect("final-domain completion session");
+            AggregateFinalDomainSessionBuilder::new(session, dop, 512)
+                .expect("aggregate final-domain session builder")
+        }
+
+        fn accepted_partitions(&self) -> Vec<u32> {
+            self.events
+                .snapshot()
+                .into_iter()
+                .filter_map(|event| match event {
+                    RuntimeFilterEvent::FinalDomainShardAccepted { identity } => {
+                        Some(identity.stream().partition_id().get())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn failure_count(&self) -> usize {
+            self.events
+                .snapshot()
+                .iter()
+                .filter(|event| matches!(event, RuntimeFilterEvent::ProducerInstanceFailed { .. }))
+                .count()
+        }
+    }
+
+    fn aggregate_factory(
+        session: Option<AggregateFinalDomainSessionBuilder>,
+    ) -> AggregateProcessorFactory {
+        aggregate_factory_with_output_type(session, DataType::Int64)
+    }
+
+    fn aggregate_factory_with_output_type(
+        session: Option<AggregateFinalDomainSessionBuilder>,
+        output_type: DataType,
+    ) -> AggregateProcessorFactory {
+        let mut arena = ExprArena::default();
+        let group_expr = arena.push_typed(ExprNode::SlotId(GROUP_SLOT), DataType::Int64);
+        let output_field = Field::new("group_key", output_type, true);
+        let output_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(GROUP_SLOT, &output_field, None)
+                    .expect("aggregate output slot"),
+            ])
+            .expect("aggregate output schema"),
+        );
+        AggregateProcessorFactory::new_native(
+            7,
+            Arc::new(arena),
+            vec![group_expr],
+            Vec::new(),
+            false,
+            true,
+            output_schema,
+            session,
+        )
+    }
+
+    fn group_chunk(values: impl IntoIterator<Item = i64>) -> Chunk {
+        let field = Field::new("group_key", DataType::Int64, false);
+        let values = values.into_iter().collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field.clone()])),
+            vec![Arc::new(Int64Array::from(values)) as ArrayRef],
+        )
+        .expect("aggregate input batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(GROUP_SLOT, &field, None)
+                    .expect("aggregate input slot"),
+            ])
+            .expect("aggregate input schema"),
+        );
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("aggregate input chunk")
+    }
+
+    fn malformed_group_chunk() -> Chunk {
+        let field = Field::new("wrong_slot", DataType::Int64, false);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field.clone()])),
+            vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+        )
+        .expect("malformed aggregate input batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(SlotId::new(99), &field, None)
+                    .expect("malformed aggregate input slot"),
+            ])
+            .expect("malformed aggregate input schema"),
+        );
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("malformed aggregate chunk")
+    }
+
+    fn prepare_processor(
+        factory: &AggregateProcessorFactory,
+        dop: i32,
+        driver_id: i32,
+    ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
+        let mut operator = factory.create(dop, driver_id);
+        operator.prepare().expect("prepare aggregate");
+        operator
+    }
+
+    fn finish_operator(
+        operator: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        values: impl IntoIterator<Item = i64>,
+    ) -> Chunk {
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().expect("aggregate processor");
+        processor
+            .push_chunk(&state, group_chunk(values))
+            .expect("push aggregate input");
+        processor.set_finishing(&state).expect("finish aggregate");
+        processor
+            .pull_chunk(&state)
+            .expect("pull aggregate output")
+            .expect("aggregate output")
+    }
+
+    #[test]
+    fn aggregate_freezes_domain_only_after_set_finishing() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(1)));
+        let mut operator = prepare_processor(&factory, 1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().expect("aggregate processor");
+
+        processor
+            .push_chunk(&state, group_chunk([1, 2, 2]))
+            .expect("push aggregate input");
+        assert!(fixture.accepted_partitions().is_empty());
+
+        processor.set_finishing(&state).expect("finish aggregate");
+        assert_eq!(fixture.accepted_partitions(), vec![0]);
+    }
+
+    #[test]
+    fn aggregate_rejects_input_after_domain_freeze() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(1)));
+        let mut operator = prepare_processor(&factory, 1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().expect("aggregate processor");
+        processor
+            .push_chunk(&state, group_chunk([1]))
+            .expect("push aggregate input");
+        processor.set_finishing(&state).expect("finish aggregate");
+
+        let error = processor
+            .push_chunk(&state, group_chunk([2]))
+            .expect_err("aggregate must reject post-freeze input");
+
+        assert_eq!(error, "aggregate received input after set_finishing");
+        assert_eq!(fixture.accepted_partitions(), vec![0]);
+    }
+
+    #[test]
+    fn aggregate_factory_maps_driver_id_to_partition() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(2)));
+        let mut driver_1 = prepare_processor(&factory, 2, 1);
+        let mut driver_0 = prepare_processor(&factory, 2, 0);
+
+        finish_operator(&mut driver_1, [20]);
+        finish_operator(&mut driver_0, [10]);
+
+        assert_eq!(fixture.accepted_partitions(), vec![0, 1]);
+    }
+
+    #[test]
+    fn aggregate_dop_waits_for_last_driver() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(2)));
+        let mut driver_0 = prepare_processor(&factory, 2, 0);
+        let mut driver_1 = prepare_processor(&factory, 2, 1);
+
+        finish_operator(&mut driver_0, [10]);
+        assert!(fixture.accepted_partitions().is_empty());
+
+        finish_operator(&mut driver_1, [20]);
+        assert_eq!(fixture.accepted_partitions(), vec![0, 1]);
+    }
+
+    #[test]
+    fn aggregate_error_propagates_and_fails_rf_session_once() {
+        let baseline_factory = aggregate_factory(None);
+        let mut baseline = prepare_processor(&baseline_factory, 1, 0);
+        let state = RuntimeState::default();
+        let expected = baseline
+            .as_processor_mut()
+            .expect("baseline aggregate processor")
+            .push_chunk(&state, malformed_group_chunk())
+            .expect_err("malformed input");
+
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(1)));
+        let mut operator = prepare_processor(&factory, 1, 0);
+        let processor = operator.as_processor_mut().expect("aggregate processor");
+        let actual = processor
+            .push_chunk(&state, malformed_group_chunk())
+            .expect_err("malformed input");
+        assert_eq!(actual, expected);
+        assert_eq!(fixture.failure_count(), 1);
+
+        let repeated = processor
+            .push_chunk(&state, malformed_group_chunk())
+            .expect_err("repeated malformed input");
+        assert_eq!(repeated, expected);
+        assert_eq!(fixture.failure_count(), 1);
+    }
+
+    #[test]
+    fn aggregate_drop_fails_session_once() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(1)));
+        let operator = prepare_processor(&factory, 1, 0);
+
+        drop(operator);
+        drop(factory);
+
+        assert_eq!(fixture.failure_count(), 1);
+    }
+
+    #[test]
+    fn aggregate_factory_drop_before_all_declared_drivers_fails_session() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(2)));
+        let operator = prepare_processor(&factory, 2, 0);
+
+        drop(factory);
+        assert_eq!(fixture.failure_count(), 1);
+        drop(operator);
+        assert_eq!(fixture.failure_count(), 1);
+    }
+
+    #[test]
+    fn aggregate_output_construction_failure_publishes_no_domain() {
+        let fixture = FinalDomainFixture::new();
+        let mut factory = aggregate_factory(Some(fixture.session_builder(1)));
+        factory.fail_output_construction_for_test();
+        let mut operator = prepare_processor(&factory, 1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().expect("aggregate processor");
+        processor
+            .push_chunk(&state, group_chunk([1]))
+            .expect("push aggregate input");
+
+        processor
+            .set_finishing(&state)
+            .expect_err("output type mismatch must fail finalization");
+
+        assert!(fixture.accepted_partitions().is_empty());
+        assert_eq!(fixture.failure_count(), 1);
+    }
+
+    #[test]
+    fn aggregate_without_session_is_behavior_identical() {
+        let first_factory = aggregate_factory(None);
+        let second_factory = aggregate_factory(None);
+        let mut first = prepare_processor(&first_factory, 1, 0);
+        let mut second = prepare_processor(&second_factory, 1, 0);
+
+        let first_output = finish_operator(&mut first, [3, 1, 3, 2]);
+        let second_output = finish_operator(&mut second, [3, 1, 3, 2]);
+
+        assert_eq!(
+            first_output.columns()[0].to_data(),
+            second_output.columns()[0].to_data()
+        );
+        assert_eq!(first_output.chunk_schema(), second_output.chunk_schema());
+    }
 
     #[test]
     fn aggregate_rejects_decimal_precision_drift() {

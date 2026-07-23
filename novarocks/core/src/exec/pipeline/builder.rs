@@ -1276,6 +1276,7 @@ fn build_pipeline_for_node(
                                 true,
                                 false,
                                 output_chunk_schema.clone(),
+                                None,
                             ))
                         }
                         #[cfg(feature = "compat")]
@@ -1328,6 +1329,7 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        None,
                     )));
                 return Ok(build);
             }
@@ -1347,6 +1349,7 @@ fn build_pipeline_for_node(
                             true,
                             false,
                             output_chunk_schema.clone(),
+                            None,
                         ))
                     }
                     #[cfg(feature = "compat")]
@@ -1404,6 +1407,7 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        None,
                     )));
 
                 let mut extra_pipelines = build.extra_pipelines;
@@ -1483,6 +1487,7 @@ fn build_pipeline_for_node(
                         !*need_finalize,
                         false,
                         output_chunk_schema.clone(),
+                        None,
                     ))
                 }
                 #[cfg(feature = "compat")]
