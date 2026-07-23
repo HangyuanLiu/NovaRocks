@@ -15,17 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
-use arrow::array::{Array, StringArray};
-use arrow::datatypes::DataType;
+use arrow::array::{
+    Array, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
+use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::exec::hash_table::key_column::KeyColumn;
 use crate::runtime_filter::exec::membership_delta::{
     MembershipDeltaEncoder, MembershipEncodingError, MembershipEncodingOutcome,
 };
-use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+use crate::runtime_filter::port::value_domain::{
+    CanonicalF32, CanonicalF64, MembershipValues, ValueDomainDelta,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FinalAggregateDomainError {
@@ -93,10 +101,13 @@ impl Error for FinalAggregateDomainError {}
 /// Callers must invoke this while the final aggregate's `KeyTable` still owns its
 /// key columns. The returned domain is independent of that state and retains
 /// null membership explicitly for the `NullSafeEqual` contract.
-/// `max_contribution_bytes` must be the installed membership contribution limit.
+///
+/// `max_domain_canonical_bytes` bounds only the canonical `ValueDomainDelta`
+/// payload. It excludes `FinalDomainShard` and completion-fence envelope bytes;
+/// callers must reserve those bytes before passing the remaining domain budget.
 pub(crate) fn extract_final_aggregate_domain(
     final_key_columns: &[KeyColumn],
-    max_contribution_bytes: usize,
+    max_domain_canonical_bytes: usize,
 ) -> Result<ValueDomainDelta, FinalAggregateDomainError> {
     let [final_key_column] = final_key_columns else {
         return Err(FinalAggregateDomainError::MembershipKeyCount {
@@ -120,10 +131,10 @@ pub(crate) fn extract_final_aggregate_domain(
             actual: array.data_type().clone(),
         });
     }
-    ensure_contribution_fits(array.as_ref(), &expected_type, max_contribution_bytes)?;
+    ensure_distinct_domain_fits(array.as_ref(), &expected_type, max_domain_canonical_bytes)?;
 
     let outcome =
-        MembershipDeltaEncoder::encode(array.as_ref(), &expected_type, max_contribution_bytes)
+        MembershipDeltaEncoder::encode(array.as_ref(), &expected_type, max_domain_canonical_bytes)
             .map_err(FinalAggregateDomainError::MembershipEncoding)?;
     let MembershipEncodingOutcome::Deltas(mut deltas) = outcome else {
         return Err(FinalAggregateDomainError::ResourceOrSize);
@@ -136,71 +147,167 @@ pub(crate) fn extract_final_aggregate_domain(
     Ok(deltas.pop().expect("one final aggregate domain delta"))
 }
 
-fn ensure_contribution_fits(
+fn ensure_distinct_domain_fits(
     array: &dyn Array,
     data_type: &DataType,
-    max_contribution_bytes: usize,
+    max_domain_canonical_bytes: usize,
 ) -> Result<(), FinalAggregateDomainError> {
     let empty = MembershipValues::empty_for_data_type(data_type).ok_or_else(|| {
         FinalAggregateDomainError::MembershipEncoding(MembershipEncodingError::UnsupportedType(
             data_type.clone(),
         ))
     })?;
-    let mut upper_bound = ValueDomainDelta::new(empty, false)
+    let mut canonical_len = ValueDomainDelta::new(empty, false)
         .canonical_encoded_len()
-        .map_err(|error| {
-            FinalAggregateDomainError::MembershipEncoding(MembershipEncodingError::InvalidArray {
-                data_type: data_type.clone(),
-                detail: error.to_string(),
-            })
-        })?;
-    let non_null_rows = array.len().checked_sub(array.null_count()).ok_or_else(|| {
-        FinalAggregateDomainError::MembershipEncoding(MembershipEncodingError::InvalidArray {
-            data_type: data_type.clone(),
-            detail: "Arrow null count exceeds array length".to_string(),
-        })
-    })?;
+        .map_err(|error| invalid_array(data_type, error.to_string()))?;
+    if canonical_len > max_domain_canonical_bytes {
+        return Err(FinalAggregateDomainError::ResourceOrSize);
+    }
 
     match data_type {
-        DataType::Boolean | DataType::Int8 => {
-            add_fixed_contribution(&mut upper_bound, non_null_rows, 1)?
+        DataType::Boolean => {
+            let typed = downcast_array::<BooleanArray>(array, data_type)?;
+            ensure_distinct_values(
+                (0..typed.len()).filter_map(|row| (!typed.is_null(row)).then(|| typed.value(row))),
+                |_| Ok(1),
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?;
         }
-        DataType::Int16 => add_fixed_contribution(&mut upper_bound, non_null_rows, 2)?,
-        DataType::Int32 | DataType::Float32 | DataType::Date32 => {
-            add_fixed_contribution(&mut upper_bound, non_null_rows, 4)?
+        DataType::Int8 => {
+            let typed = downcast_array::<Int8Array>(array, data_type)?;
+            ensure_fixed_width_distinct(typed, 1, &mut canonical_len, max_domain_canonical_bytes)?;
         }
-        DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) => {
-            add_fixed_contribution(&mut upper_bound, non_null_rows, 8)?
+        DataType::Int16 => {
+            let typed = downcast_array::<Int16Array>(array, data_type)?;
+            ensure_fixed_width_distinct(typed, 2, &mut canonical_len, max_domain_canonical_bytes)?;
+        }
+        DataType::Int32 => {
+            let typed = downcast_array::<Int32Array>(array, data_type)?;
+            ensure_fixed_width_distinct(typed, 4, &mut canonical_len, max_domain_canonical_bytes)?;
+        }
+        DataType::Int64 => {
+            let typed = downcast_array::<Int64Array>(array, data_type)?;
+            ensure_fixed_width_distinct(typed, 8, &mut canonical_len, max_domain_canonical_bytes)?;
         }
         DataType::FixedSizeBinary(width)
             if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
-            add_fixed_contribution(&mut upper_bound, non_null_rows, 16)?
-        }
-        DataType::Decimal128(_, _) => add_fixed_contribution(&mut upper_bound, non_null_rows, 16)?,
-        DataType::Utf8 => {
-            let typed = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    FinalAggregateDomainError::MembershipEncoding(
-                        MembershipEncodingError::InvalidArray {
-                            data_type: data_type.clone(),
-                            detail: "Arrow physical array does not match its declared data type"
-                                .to_string(),
-                        },
-                    )
-                })?;
+            let typed = downcast_array::<FixedSizeBinaryArray>(array, data_type)?;
+            let mut distinct = BTreeSet::new();
             for row in 0..typed.len() {
                 if typed.is_null(row) {
                     continue;
                 }
-                let scalar_bytes = 8usize
-                    .checked_add(typed.value(row).len())
-                    .ok_or(FinalAggregateDomainError::ResourceOrSize)?;
-                upper_bound = upper_bound
-                    .checked_add(scalar_bytes)
-                    .ok_or(FinalAggregateDomainError::ResourceOrSize)?;
+                let value = typed
+                    .value(row)
+                    .try_into()
+                    .map(i128::from_be_bytes)
+                    .map_err(|_| {
+                        invalid_array(data_type, "LargeInt scalar is not 16 bytes".to_string())
+                    })?;
+                reserve_distinct(
+                    &mut distinct,
+                    value,
+                    16,
+                    &mut canonical_len,
+                    max_domain_canonical_bytes,
+                )?;
+            }
+        }
+        DataType::Float32 => {
+            let typed = downcast_array::<Float32Array>(array, data_type)?;
+            ensure_distinct_values(
+                (0..typed.len()).filter_map(|row| {
+                    (!typed.is_null(row)).then(|| CanonicalF32::new(typed.value(row)))
+                }),
+                |_| Ok(4),
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?;
+        }
+        DataType::Float64 => {
+            let typed = downcast_array::<Float64Array>(array, data_type)?;
+            ensure_distinct_values(
+                (0..typed.len()).filter_map(|row| {
+                    (!typed.is_null(row)).then(|| CanonicalF64::new(typed.value(row)))
+                }),
+                |_| Ok(8),
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?;
+        }
+        DataType::Utf8 => {
+            let typed = downcast_array::<StringArray>(array, data_type)?;
+            ensure_distinct_values(
+                (0..typed.len()).filter_map(|row| (!typed.is_null(row)).then(|| typed.value(row))),
+                |value| {
+                    8usize
+                        .checked_add(value.len())
+                        .ok_or(FinalAggregateDomainError::ResourceOrSize)
+                },
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?;
+        }
+        DataType::Date32 => {
+            let typed = downcast_array::<Date32Array>(array, data_type)?;
+            ensure_fixed_width_distinct(typed, 4, &mut canonical_len, max_domain_canonical_bytes)?;
+        }
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => ensure_timestamp_distinct::<TimestampSecondArray>(
+                array,
+                data_type,
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?,
+            TimeUnit::Millisecond => ensure_timestamp_distinct::<TimestampMillisecondArray>(
+                array,
+                data_type,
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?,
+            TimeUnit::Microsecond => ensure_timestamp_distinct::<TimestampMicrosecondArray>(
+                array,
+                data_type,
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?,
+            TimeUnit::Nanosecond => ensure_timestamp_distinct::<TimestampNanosecondArray>(
+                array,
+                data_type,
+                &mut canonical_len,
+                max_domain_canonical_bytes,
+            )?,
+        },
+        DataType::Decimal128(precision, scale) => {
+            let typed = downcast_array::<Decimal128Array>(array, data_type)?;
+            let precision = *precision;
+            let scale = *scale;
+            let mut distinct = BTreeSet::new();
+            for row in 0..typed.len() {
+                if typed.is_null(row) {
+                    continue;
+                }
+                let value = typed.value(row);
+                MembershipValues::validate_decimal128_scalar(precision, scale, value).map_err(
+                    |error| {
+                        FinalAggregateDomainError::MembershipEncoding(
+                            MembershipEncodingError::InvalidDecimal {
+                                precision,
+                                scale,
+                                detail: error.to_string(),
+                            },
+                        )
+                    },
+                )?;
+                reserve_distinct(
+                    &mut distinct,
+                    value,
+                    16,
+                    &mut canonical_len,
+                    max_domain_canonical_bytes,
+                )?;
             }
         }
         other => {
@@ -209,25 +316,135 @@ fn ensure_contribution_fits(
             ));
         }
     }
-    if upper_bound > max_contribution_bytes {
-        return Err(FinalAggregateDomainError::ResourceOrSize);
+    Ok(())
+}
+
+fn invalid_array(data_type: &DataType, detail: String) -> FinalAggregateDomainError {
+    FinalAggregateDomainError::MembershipEncoding(MembershipEncodingError::InvalidArray {
+        data_type: data_type.clone(),
+        detail,
+    })
+}
+
+fn downcast_array<'a, T: Array + 'static>(
+    array: &'a dyn Array,
+    data_type: &DataType,
+) -> Result<&'a T, FinalAggregateDomainError> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        invalid_array(
+            data_type,
+            "Arrow physical array does not match its declared data type".to_string(),
+        )
+    })
+}
+
+fn ensure_distinct_values<T, I, F>(
+    values: I,
+    mut scalar_bytes: F,
+    canonical_len: &mut usize,
+    max_domain_canonical_bytes: usize,
+) -> Result<(), FinalAggregateDomainError>
+where
+    T: Ord,
+    I: IntoIterator<Item = T>,
+    F: FnMut(&T) -> Result<usize, FinalAggregateDomainError>,
+{
+    let mut distinct = BTreeSet::new();
+    for value in values {
+        let value_bytes = scalar_bytes(&value)?;
+        reserve_distinct(
+            &mut distinct,
+            value,
+            value_bytes,
+            canonical_len,
+            max_domain_canonical_bytes,
+        )?;
     }
     Ok(())
 }
 
-fn add_fixed_contribution(
-    upper_bound: &mut usize,
-    non_null_rows: usize,
+fn reserve_distinct<T: Ord>(
+    distinct: &mut BTreeSet<T>,
+    value: T,
     scalar_bytes: usize,
+    canonical_len: &mut usize,
+    max_domain_canonical_bytes: usize,
 ) -> Result<(), FinalAggregateDomainError> {
-    let values_bytes = non_null_rows
-        .checked_mul(scalar_bytes)
+    if distinct.contains(&value) {
+        return Ok(());
+    }
+    let candidate_len = canonical_len
+        .checked_add(scalar_bytes)
         .ok_or(FinalAggregateDomainError::ResourceOrSize)?;
-    *upper_bound = upper_bound
-        .checked_add(values_bytes)
-        .ok_or(FinalAggregateDomainError::ResourceOrSize)?;
+    if candidate_len > max_domain_canonical_bytes {
+        return Err(FinalAggregateDomainError::ResourceOrSize);
+    }
+    distinct.insert(value);
+    *canonical_len = candidate_len;
     Ok(())
 }
+
+fn ensure_fixed_width_distinct<A>(
+    array: &A,
+    scalar_bytes: usize,
+    canonical_len: &mut usize,
+    max_domain_canonical_bytes: usize,
+) -> Result<(), FinalAggregateDomainError>
+where
+    A: Array + FinalDomainValueAt,
+{
+    ensure_distinct_values(
+        (0..array.len()).filter_map(|row| (!array.is_null(row)).then(|| array.value_at(row))),
+        |_| Ok(scalar_bytes),
+        canonical_len,
+        max_domain_canonical_bytes,
+    )
+}
+
+fn ensure_timestamp_distinct<A>(
+    array: &dyn Array,
+    data_type: &DataType,
+    canonical_len: &mut usize,
+    max_domain_canonical_bytes: usize,
+) -> Result<(), FinalAggregateDomainError>
+where
+    A: Array + FinalDomainValueAt<Value = i64> + 'static,
+{
+    ensure_fixed_width_distinct(
+        downcast_array::<A>(array, data_type)?,
+        8,
+        canonical_len,
+        max_domain_canonical_bytes,
+    )
+}
+
+trait FinalDomainValueAt {
+    type Value: Ord;
+
+    fn value_at(&self, row: usize) -> Self::Value;
+}
+
+macro_rules! final_domain_value_at {
+    ($array:ty, $value:ty) => {
+        impl FinalDomainValueAt for $array {
+            type Value = $value;
+
+            fn value_at(&self, row: usize) -> Self::Value {
+                self.value(row)
+            }
+        }
+    };
+}
+
+final_domain_value_at!(Int8Array, i8);
+final_domain_value_at!(Int16Array, i16);
+final_domain_value_at!(Int32Array, i32);
+final_domain_value_at!(Int64Array, i64);
+final_domain_value_at!(Date32Array, i32);
+final_domain_value_at!(TimestampSecondArray, i64);
+final_domain_value_at!(TimestampMillisecondArray, i64);
+final_domain_value_at!(TimestampMicrosecondArray, i64);
+final_domain_value_at!(TimestampNanosecondArray, i64);
 
 fn final_key_row_count(final_key_column: &KeyColumn) -> Result<usize, FinalAggregateDomainError> {
     fn parallel_row_count(
@@ -349,7 +566,7 @@ mod tests {
     use crate::runtime_filter::exec::membership_delta::MembershipEncodingError;
     use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
 
-    const TEST_MAX_CONTRIBUTION_BYTES: usize = 64 * 1024;
+    const TEST_MAX_DOMAIN_CANONICAL_BYTES: usize = 64 * 1024;
 
     fn int64_column(values: Vec<i64>, nulls: Vec<u8>) -> KeyColumn {
         KeyColumn::Int64 { values, nulls }
@@ -358,7 +575,7 @@ mod tests {
     fn extract(
         final_key_columns: &[KeyColumn],
     ) -> Result<ValueDomainDelta, FinalAggregateDomainError> {
-        extract_final_aggregate_domain(final_key_columns, TEST_MAX_CONTRIBUTION_BYTES)
+        extract_final_aggregate_domain(final_key_columns, TEST_MAX_DOMAIN_CANONICAL_BYTES)
     }
 
     #[test]
@@ -471,6 +688,22 @@ mod tests {
             .expect_err("two exact Int64 keys exceed one-key contribution bound");
 
         assert_eq!(error, FinalAggregateDomainError::ResourceOrSize);
+    }
+
+    #[test]
+    fn duplicate_keys_fit_exact_domain_budget() {
+        let baseline = ValueDomainDelta::new(MembershipValues::int64([]), false)
+            .canonical_encoded_len()
+            .expect("empty domain length");
+        let final_key_columns = vec![int64_column(vec![1, 1], vec![1, 1])];
+
+        let domain = extract_final_aggregate_domain(&final_key_columns, baseline + 8)
+            .expect("duplicate rows must consume one canonical scalar frame");
+
+        assert_eq!(
+            domain,
+            ValueDomainDelta::new(MembershipValues::int64([1]), false)
+        );
     }
 
     #[test]
