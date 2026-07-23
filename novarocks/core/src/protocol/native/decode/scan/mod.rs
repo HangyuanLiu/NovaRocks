@@ -229,6 +229,7 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
+    use crate::connector::iceberg::file_pruning::IcebergFileNullState;
     use crate::connector::{ConnectorRegistry, HdfsScanConfig, ScanConfig, ScanConnector};
     #[cfg(feature = "compat")]
     use crate::connector::StarRocksScanConfig;
@@ -1295,11 +1296,18 @@ mod tests {
             .as_ref()
             .expect("file pruning metadata");
         let stats = pruning.columns.get("id").expect("id stats");
-        assert_eq!(stats.null_count, Some(1));
         assert_eq!(
-            stats.value_count,
-            Some(2),
-            "native has_null/all_null evidence must remain exact enough for late file pruning"
+            stats.null_count, None,
+            "native null-state booleans are not manifest null counts"
+        );
+        assert_eq!(
+            stats.value_count, None,
+            "native null-state booleans are not manifest value counts"
+        );
+        assert_eq!(
+            pruning.null_state("id"),
+            Some(IcebergFileNullState::HasNulls),
+            "native null-state evidence is preserved separately from manifest counts"
         );
         assert_eq!(stats.lower_bound, Some(10_i64.to_le_bytes().to_vec()));
         assert_eq!(stats.upper_bound, Some(20_i64.to_le_bytes().to_vec()));
@@ -1359,6 +1367,71 @@ mod tests {
             .expect("id stats");
         assert_eq!(stats.lower_bound, Some(10_i32.to_le_bytes().to_vec()));
         assert_eq!(stats.upper_bound, Some(20_i32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn omits_negative_int8_file_pruning_bounds_until_typed_consumption_is_supported() {
+        let mut node = scan_node_with(
+            vec![output_column(1, "id", DataType::Int8)],
+            Vec::new(),
+            Vec::new(),
+            plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            }),
+        );
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+        else {
+            panic!("expected physical scan");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut() else {
+            panic!("expected scan node");
+        };
+        scan.table
+            .as_mut()
+            .expect("scan table")
+            .columns
+            .get_mut(0)
+            .expect("id column")
+            .data_type = Some(type_desc(&DataType::Int8));
+
+        let mut range = file_range_with_change_op_and_pruning();
+        let Some(novarocks::scan_range::Kind::File(file)) =
+            range.range.as_mut().and_then(|range| range.kind.as_mut())
+        else {
+            panic!("expected file range");
+        };
+        let stats = file
+            .file_pruning_min_max_values
+            .get_mut(&0)
+            .expect("file pruning stats");
+        stats.min_int_value = Some(-10);
+        stats.max_int_value = Some(-1);
+
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![range]);
+        let mut arena = ExprArena::default();
+        let lowered = decode_node(&node, &mut arena, &ctx).expect("lower native scan");
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected Scan");
+        };
+        let morsels = scan.build_morsels().expect("build morsels");
+        let [
+            ScanMorsel::FileRange {
+                iceberg_file_pruning,
+                ..
+            },
+        ] = morsels.morsels.as_slice()
+        else {
+            panic!("expected one file morsel, got {:?}", morsels.morsels);
+        };
+        assert!(
+            iceberg_file_pruning.is_none(),
+            "one-byte negative Int8 bounds must not reach the untyped shared pruning decoder"
+        );
     }
 
     #[test]

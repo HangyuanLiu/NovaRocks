@@ -24,7 +24,7 @@ use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
-use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
+use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningMetadata};
 use crate::connector::iceberg::scan_model::IcebergColumnStats;
 use crate::fs::scan_context::FileScanRange;
 use crate::proto::plan;
@@ -180,6 +180,7 @@ fn file_pruning_metadata_from_assignment(
         return Ok(None);
     };
     let mut columns = HashMap::new();
+    let mut null_states = HashMap::new();
     for (ordinal, value) in values {
         let ordinal_usize = usize::try_from(*ordinal).map_err(|_| {
             NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::OutOfRange, "file_pruning_min_max_values", format!(
@@ -219,12 +220,20 @@ fn file_pruning_metadata_from_assignment(
         else {
             continue;
         };
+        if let Some(null_state) =
+            IcebergFileNullState::from_wire_flags(value.has_null, value.all_null)
+        {
+            null_states.insert(field.name.clone(), null_state);
+        }
         columns.insert(field.name.clone(), stats);
     }
     if columns.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(IcebergFilePruningMetadata { columns }))
+        Ok(Some(IcebergFilePruningMetadata {
+            columns,
+            null_states,
+        }))
     }
 }
 
@@ -294,20 +303,9 @@ fn column_stats_from_min_max_value(
         }
     };
 
-    // The native assignment carries exact null-state booleans rather than the
-    // original Iceberg row counts. Preserve that evidence with normalized
-    // counts so late ordered pruning can distinguish non-null, nullable, and
-    // all-null files without guessing an actual file row count.
-    let (value_count, null_count) = if value.all_null {
-        (1, 1)
-    } else if value.has_null {
-        (2, 1)
-    } else {
-        (1, 0)
-    };
     Ok(Some(IcebergColumnStats {
-        null_count: Some(null_count),
-        value_count: Some(value_count),
+        null_count: None,
+        value_count: None,
         column_size: None,
         lower_bound: Some(lower_bound),
         upper_bound: Some(upper_bound),
@@ -316,9 +314,6 @@ fn column_stats_from_min_max_value(
 
 fn int_bound_bytes(value: i64, data_type: &DataType) -> Option<Vec<u8>> {
     match data_type {
-        DataType::Int8 => i8::try_from(value)
-            .map(|value| value.to_le_bytes().to_vec())
-            .ok(),
         DataType::Int16 => i16::try_from(value)
             .map(|value| value.to_le_bytes().to_vec())
             .ok(),

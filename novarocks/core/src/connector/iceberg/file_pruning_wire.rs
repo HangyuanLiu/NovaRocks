@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use arrow::datatypes::DataType;
 use thrift::OrderedFloat;
 
-use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
+use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningMetadata};
 use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
 use crate::thrift::{exprs, plan_nodes};
 use novarocks_catalog::schema::ColumnDef;
@@ -58,6 +58,7 @@ pub(crate) fn iceberg_file_pruning_metadata_from_thrift(
     }
 
     let mut columns = HashMap::new();
+    let mut null_states = HashMap::new();
     for (ordinal, value) in values {
         let Ok(ordinal) = usize::try_from(*ordinal) else {
             continue;
@@ -68,13 +69,21 @@ pub(crate) fn iceberg_file_pruning_metadata_from_thrift(
         let Some(stats) = column_stats_from_thrift_min_max_value(value) else {
             continue;
         };
+        if let Some(null_state) =
+            IcebergFileNullState::from_wire_flags(value.has_null, value.all_null)
+        {
+            null_states.insert(column.clone(), null_state);
+        }
         columns.insert(column.clone(), stats);
     }
 
     if columns.is_empty() {
         None
     } else {
-        Some(IcebergFilePruningMetadata { columns })
+        Some(IcebergFilePruningMetadata {
+            columns,
+            null_states,
+        })
     }
 }
 

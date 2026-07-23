@@ -1573,7 +1573,15 @@ impl RuntimeFilterChannel {
                 });
                 snapshot
             });
-            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            if refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id) {
+                events.push(RuntimeFilterEvent::ProducerInstanceClosed {
+                    identity: ProducerEventIdentity::new(
+                        self.event_identity,
+                        binding_id,
+                        fragment_instance_id,
+                    ),
+                });
+            }
             let mut locked =
                 self.refresh_after_ordered_progress(&mut state, outcome, published, events);
             locked.add_release_after_unlock(release_after_unlock);
@@ -1836,7 +1844,15 @@ impl RuntimeFilterChannel {
                 });
                 snapshot
             });
-            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            if refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id) {
+                events.push(RuntimeFilterEvent::ProducerInstanceClosed {
+                    identity: ProducerEventIdentity::new(
+                        self.event_identity,
+                        binding_id,
+                        fragment_instance_id,
+                    ),
+                });
+            }
             let mut locked =
                 self.refresh_after_ordered_progress(&mut state, outcome, published, events);
             locked.add_release_after_unlock(release_after_unlock);
@@ -2051,7 +2067,15 @@ impl RuntimeFilterChannel {
                 });
                 snapshot
             });
-            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            if refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id) {
+                events.push(RuntimeFilterEvent::ProducerInstanceClosed {
+                    identity: ProducerEventIdentity::new(
+                        self.event_identity,
+                        binding_id,
+                        fragment_instance_id,
+                    ),
+                });
+            }
             let mut locked =
                 self.refresh_after_ordered_progress(&mut state, outcome, published, events);
             locked.add_release_after_unlock(release_after_unlock);
@@ -2159,13 +2183,22 @@ impl RuntimeFilterChannel {
                 .as_mut()
                 .expect("ordered channel owns ordered state")
                 .reducer = OrderedCoreReducer::Direct(next_reducer);
-            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            let mut events = Vec::new();
+            if refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id) {
+                events.push(RuntimeFilterEvent::ProducerInstanceClosed {
+                    identity: ProducerEventIdentity::new(
+                        self.event_identity,
+                        binding_id,
+                        fragment_instance_id,
+                    ),
+                });
+            }
             let outcome = match close_outcome {
                 OrderedCloseOutcome::Duplicate => SubmitOutcome::Duplicate,
                 OrderedCloseOutcome::PendingFinalSnapshot => SubmitOutcome::PendingFinalSnapshot,
                 OrderedCloseOutcome::Satisfied => SubmitOutcome::Applied,
             };
-            let locked = self.refresh_after_ordered_progress(&mut state, outcome, None, Vec::new());
+            let locked = self.refresh_after_ordered_progress(&mut state, outcome, None, events);
             drop(state);
             return Ok(locked.finish());
         }
@@ -3215,7 +3248,7 @@ fn refresh_ordered_instance_progress(
     state: &mut ChannelState,
     binding_id: BindingId,
     fragment_instance_id: UniqueId,
-) {
+) -> bool {
     let terminal_count = state
         .ordered
         .as_ref()
@@ -3224,6 +3257,7 @@ fn refresh_ordered_instance_progress(
         .terminal_partition_count(binding_id, fragment_instance_id);
     let instance = instance_mut(state, binding_id, fragment_instance_id)
         .expect("authorized ordered producer instance");
+    let was_pending = instance.progress == TerminalProgress::Pending;
     if instance.progress == TerminalProgress::Pending
         && instance
             .local_partition_count()
@@ -3231,7 +3265,9 @@ fn refresh_ordered_instance_progress(
     {
         instance.progress = TerminalProgress::Satisfied;
     }
+    let became_satisfied = was_pending && instance.progress == TerminalProgress::Satisfied;
     refresh_ordered_witness(state, binding_id);
+    became_satisfied
 }
 
 fn refresh_ordered_witness(state: &mut ChannelState, binding_id: BindingId) {
@@ -6281,6 +6317,35 @@ mod tests {
                 harness.close(0, 0).unwrap(),
                 super::TestAction::CompletedWithoutArtifact
             );
+        }
+
+        #[test]
+        fn ordered_close_emits_instance_closed_before_channel_completion() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            harness.submit(0, 0, int_bound(40)).unwrap();
+            let (binding_id, fragment_instance_id) = harness.streams[0];
+            let action = harness
+                .channel
+                .close_ordered_partition(
+                    binding_id,
+                    fragment_instance_id,
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                )
+                .unwrap();
+            let instance_closed = action
+                .events()
+                .iter()
+                .position(|event| {
+                    matches!(event, RuntimeFilterEvent::ProducerInstanceClosed { .. })
+                })
+                .expect("ordered terminal admission emits ProducerInstanceClosed");
+            let channel_completed = action
+                .events()
+                .iter()
+                .position(|event| matches!(event, RuntimeFilterEvent::ChannelCompleted { .. }))
+                .expect("final ordered terminal completes the channel");
+            assert!(instance_closed < channel_completed);
         }
 
         #[test]

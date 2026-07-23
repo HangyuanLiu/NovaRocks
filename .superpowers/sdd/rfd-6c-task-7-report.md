@@ -41,18 +41,18 @@ fixture 的物理计划为 Iceberg/Parquet scan、grouped hash aggregate、gathe
 `live_topn_remote_uses_contribution_ack_and_artifact_delivery` 覆盖：
 
 - compiler 生成跨 participant 的 Producer -> Aggregator routing；
-- 至少一个 sound remote producer 通过 RFD-4 transport 发送 `Contribution`，并收到 `Accepted` ACK；
-- aggregator 通过 remote artifact route 向 consumer 发送 `Artifact` / `FinalArtifact`；
+- 至少一个 sound remote producer 通过 RFD-4 transport 发送非零字节 `Contribution`，并在同一条 compiled route 上观察到匹配字节数的 `Sent` 与 `Accepted` ACK；
+- aggregator 通过 remote artifact route 向 consumer 发送非零字节 `Artifact` / `FinalArtifact`，并在同一条 compiled route 上观察到匹配字节数的 `Sent` 与 `Accepted` ACK；
 - consumer 与 loopback 使用相同实现；
-- availability 可由一个 sound producer 触发；
+- availability 可由一个 sound producer 触发，且发生在至少一个剩余 producer close 之前；
 - install contract 要求 3 个 producer instance 全部 terminal；
 - 两个 remote producer 的零字节 `ProducerClosed` frame 均经过 compiled route、发送并收到 `Accepted` ACK；
-- aggregate owner 最终观察到 `ChannelCompleted`；
+- aggregate owner 依次观察到 3 个 `ProducerInstanceClosed`，随后才观察到 `ChannelCompleted`；
 - transport 中没有 `TopKSummary` contribution。
 
 `live_topn_remote_timeout_fails_open_with_correct_results` 覆盖：
 
-- remote peer 不可达时出现 typed `ChannelUnavailable` / `LiveTerminal` / `FailedOpen`；
+- 被 fixture 重写的 compiler-produced remote route 出现精确的 `FailedOpen(Deadline)`；
 - scan 不因 runtime filter transport failure 阻塞；
 - runtime filter 开启结果与关闭结果相同。
 
@@ -62,7 +62,7 @@ fixture 的物理计划为 Iceberg/Parquet scan、grouped hash aggregate、gathe
 
 完整 loopback chain 首先暴露出 late file pruning 没有发生。随后用聚焦 decoder 测试固定三个生产问题：
 
-1. native `has_null` / `all_null` 只有布尔证据，decoder 却把 `value_count` 留空，HDFS exact late pruning 无法判定；
+1. native `has_null` / `all_null` 只有布尔证据，HDFS exact late pruning 需要显式 null-state 或真实 manifest count 才能安全判定；
 2. native HDFS scan decoder 没有把 `QueryOptions.connector_io_tasks_per_scan_operator` 写入 `ScanNode`，测试无法可靠保留 unopened morsel；
 3. native file-pruning assignment 的整数值统一编码为 8 字节，而 Iceberg `Int32` 边界必须是 4 字节。聚焦测试的 RED 为：
 
@@ -71,16 +71,29 @@ left:  Some([10, 0, 0, 0, 0, 0, 0, 0])
 right: Some([10, 0, 0, 0])
 ```
 
-remote chain 的 RED 还验证了：部署 deadline 不能早于 fragment install，以及 terminal 不能仅按 ingress event 数量判断，必须结合 compiled producer cardinality、可靠 transport terminal ACK 和 aggregate-owner `ChannelCompleted`。
+remote chain 的 RED 还验证了：部署 deadline 不能早于 fragment install，以及 terminal 不能仅按 ingress event 数量判断，必须结合 compiled producer cardinality、可靠 transport terminal ACK 和 aggregate-owner 生命周期顺序。
 
 ### GREEN
 
 生产修复为：
 
-- 将 exact null-state 规范化成一致的 `value_count` / `null_count` 证据；
+- 将 wire `has_null` / `all_null` 保存在独立的 `IcebergFileNullState` 中，不再伪造 manifest `value_count` / `null_count`；
 - 将 query option 中的 connector I/O task 数传入 native decoded `ScanNode`；
 - 使用 `ScanNode.table.columns` 的权威 Arrow type 恢复 integer/float pruning bound 宽度；
-- type 缺失、不兼容、越界或 Float32 非精确收窄时省略可选 pruning stats，使文件保持 `Keep`，不猜测 wire payload 宽度。
+- type 缺失、不兼容、越界、Int8 或 Float32 非精确收窄时省略可选 pruning stats，使文件保持 `Keep`，不猜测 wire payload 宽度；
+- ordered producer 从 Pending 进入 Satisfied 时补发 `ProducerInstanceClosed`，并保证该事件早于同一 action 中的 `ChannelCompleted`。
+
+## Review 修复
+
+controller review 的 3 条 P1 与 2 条 P2 均以聚焦 RED/GREEN 闭环：
+
+1. P1 ACK 证据：旧断言可能由零字节 terminal ACK 满足。新增 route/kind/nonzero-bytes 相关 helper，分别证明 `Contribution` 与 `Artifact` / `FinalArtifact` 的非零 frame 生命周期；
+2. P1 成功顺序：旧断言只证明 availability 与 completion 各自存在。新增严格顺序断言，要求 availability 后仍有 producer close，3 个 `ProducerInstanceClosed` 全部位于 `ChannelCompleted` 前；
+3. P1 失败证据：旧断言接受任意 typed terminal。现在只接受 fixture 实际重写的 compiler-produced route 上的 `FailedOpen(Deadline)`；
+4. P2 null-state：删除由布尔值伪造的 `(value_count, null_count)`，以独立枚举携带 `NoNulls` / `HasNulls` / `AllNull`；真实 count 不完整时保持 `Keep`；
+5. P2 Int8：shared untyped pruning decoder 会把单字节整数解释为 `u8`，因此在 typed consumption 支持前省略 Int8 file bounds，负值测试固定该边界。
+
+因果顺序 RED 进一步暴露出 production observability 缺口：direct ordered / TopK 路径的 `refresh_ordered_instance_progress` 会把实例标记为 Satisfied，却没有生成 membership 路径已有的 `ProducerInstanceClosed`。修复后四个 ordered progress 入口都在 transition 时生成该事件，`refresh_after_ordered_progress` 再追加 completion。
 
 ## 最终验证
 
@@ -88,14 +101,23 @@ remote chain 的 RED 还验证了：部署 deadline 不能早于 fragment instal
 cargo test -p novarocks lowers_iceberg_data_file_scan --lib
 PASS: 4 passed, 0 failed
 
+cargo test -p novarocks native_scan_ordered_live_hdfs_skips_only_exact_file_range_evidence --lib
+PASS: 1 passed, 0 failed
+
+cargo test -p novarocks omits_negative_int8_file_pruning_bounds --lib
+PASS: 1 passed, 0 failed
+
+cargo test -p novarocks ordered_close_emits_instance_closed_before_channel_completion --lib
+PASS: 1 passed, 0 failed
+
 cargo test -p novarocks live_topn_loopback --lib
 PASS: 1 passed, 0 failed
 
 cargo test -p novarocks live_topn_remote --lib
-PASS: 2 passed, 0 failed
+PASS: 5 passed, 0 failed
 
 cargo test -p novarocks runtime_filter::service::live_deployment_conformance_tests --lib
-PASS: 7 passed, 0 failed
+PASS: 10 passed, 0 failed
 ```
 
 提交前还执行：
@@ -108,6 +130,11 @@ git diff --check
 ## 变更文件
 
 - `novarocks/core/src/runtime_filter/service/live_deployment_conformance_tests.rs`
+- `novarocks/core/src/runtime_filter/core/channel.rs`
+- `novarocks/core/src/connector/hdfs.rs`
+- `novarocks/core/src/connector/iceberg/file_pruning.rs`
+- `novarocks/core/src/connector/iceberg/file_pruning_wire.rs`
+- `novarocks/core/src/fs/scan_context.rs`
 - `novarocks/core/src/protocol/native/decode/scan/file_range.rs`
 - `novarocks/core/src/protocol/native/decode/scan/iceberg_data.rs`
 - `novarocks/core/src/protocol/native/decode/scan/mod.rs`

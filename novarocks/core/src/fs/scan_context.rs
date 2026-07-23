@@ -149,6 +149,7 @@ mod tests {
                     upper_bound: Some(20_i64.to_le_bytes().to_vec()),
                 },
             )]),
+            null_states: HashMap::new(),
         }
     }
 

@@ -26,9 +26,39 @@ use crate::connector::iceberg::scan_model::{
 };
 use crate::fs::scan_context::FileScanRange;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IcebergFileNullState {
+    NoNulls,
+    HasNulls,
+    AllNull,
+}
+
+impl IcebergFileNullState {
+    pub(crate) const fn from_wire_flags(has_null: bool, all_null: bool) -> Option<Self> {
+        match (has_null, all_null) {
+            (false, false) => Some(Self::NoNulls),
+            (true, false) => Some(Self::HasNulls),
+            (true, true) => Some(Self::AllNull),
+            (false, true) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IcebergFilePruningMetadata {
     pub(crate) columns: HashMap<String, IcebergColumnStats>,
+    pub(crate) null_states: HashMap<String, IcebergFileNullState>,
+}
+
+impl IcebergFilePruningMetadata {
+    pub(crate) fn null_state(&self, column: &str) -> Option<IcebergFileNullState> {
+        self.null_states.get(column).copied().or_else(|| {
+            self.null_states
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                .map(|(_, state)| *state)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

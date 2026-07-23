@@ -61,9 +61,11 @@ use crate::runtime_filter::model::graph::{
     RuntimeFilterGraph,
 };
 use crate::runtime_filter::port::artifact::{ArtifactBundle, ResidentMembershipIndexView};
-use crate::runtime_filter::port::events::{RuntimeFilterEvent, TransportEventKind};
+use crate::runtime_filter::port::events::{
+    RuntimeFilterEvent, TransportEventKind, TransportFailOpenReason,
+};
 use crate::runtime_filter::port::identity::{
-    DeploymentEpoch, PartitionId, ProducerSequence, RuntimeFilterParticipantId,
+    DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{ProducerPortKind, SubmitOutcome};
@@ -1516,7 +1518,8 @@ fn sealed_topn_plan(
 struct TopNNodeEvidence {
     participant: RuntimeFilterParticipantId,
     pending_transport: usize,
-    envelopes: Vec<(RuntimeFilterRouteRole, RuntimeFilterEnvelopeKind)>,
+    envelopes: Vec<TopNAdmittedEnvelopeEvidence>,
+    transport_events: Vec<TopNTransportEventEvidence>,
     events: Vec<RuntimeFilterEvent>,
 }
 
@@ -1525,6 +1528,122 @@ struct LiveTopNRun {
     observations: Vec<TopNInstallObservation>,
     node_evidence: Vec<TopNNodeEvidence>,
     hub_snapshot_empty: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopNAdmittedEnvelopeEvidence {
+    route_edge_id: RouteEdgeId,
+    target: RuntimeFilterRouteRole,
+    kind: RuntimeFilterEnvelopeKind,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopNTransportEventEvidence {
+    route_edge_id: RouteEdgeId,
+    kind: TransportEventKind,
+    bytes: usize,
+}
+
+fn has_accepted_data_frame(
+    admitted: &[TopNAdmittedEnvelopeEvidence],
+    transport_events: &[TopNTransportEventEvidence],
+    route_edge_id: RouteEdgeId,
+    kind: RuntimeFilterEnvelopeKind,
+) -> bool {
+    admitted.iter().any(|envelope| {
+        envelope.route_edge_id == route_edge_id
+            && envelope.kind == kind
+            && envelope.bytes > 0
+            && transport_events.iter().any(|event| {
+                event.route_edge_id == route_edge_id
+                    && event.kind == TransportEventKind::Sent
+                    && event.bytes == envelope.bytes
+            })
+            && transport_events.iter().any(|event| {
+                event.route_edge_id == route_edge_id
+                    && event.kind == TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted)
+                    && event.bytes == envelope.bytes
+            })
+    })
+}
+
+fn has_deadline_failed_open(
+    transport_events: &[TopNTransportEventEvidence],
+    route_edge_ids: &BTreeSet<RouteEdgeId>,
+) -> bool {
+    transport_events.iter().any(|event| {
+        route_edge_ids.contains(&event.route_edge_id)
+            && event.kind == TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline)
+    })
+}
+
+fn topn_success_order_is_valid(
+    availability_position: usize,
+    terminal_positions: &[usize],
+    completed_position: usize,
+    expected_terminals: usize,
+) -> bool {
+    terminal_positions.len() == expected_terminals
+        && terminal_positions
+            .iter()
+            .any(|position| *position > availability_position)
+        && terminal_positions
+            .iter()
+            .all(|position| *position < completed_position)
+}
+
+#[test]
+fn live_topn_remote_data_ack_requires_route_kind_and_nonzero_frame_bytes() {
+    let route = RouteEdgeId::new(900);
+    let admitted = vec![TopNAdmittedEnvelopeEvidence {
+        route_edge_id: route,
+        target: RuntimeFilterRouteRole::Aggregator,
+        kind: RuntimeFilterEnvelopeKind::Contribution,
+        bytes: 37,
+    }];
+    let terminal_only = vec![
+        TopNTransportEventEvidence {
+            route_edge_id: route,
+            kind: TransportEventKind::Sent,
+            bytes: 0,
+        },
+        TopNTransportEventEvidence {
+            route_edge_id: route,
+            kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
+            bytes: 0,
+        },
+    ];
+    assert!(
+        !has_accepted_data_frame(
+            &admitted,
+            &terminal_only,
+            route,
+            RuntimeFilterEnvelopeKind::Contribution,
+        ),
+        "a zero-byte ProducerClosed ACK cannot prove Contribution delivery"
+    );
+}
+
+#[test]
+fn live_topn_remote_failure_evidence_requires_the_target_compiled_route() {
+    let target = RouteEdgeId::new(901);
+    let unrelated = vec![TopNTransportEventEvidence {
+        route_edge_id: RouteEdgeId::new(902),
+        kind: TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline),
+        bytes: 37,
+    }];
+    assert!(
+        !has_deadline_failed_open(&unrelated, &BTreeSet::from([target])),
+        "a different route cannot prove the redirected compiled route failed open"
+    );
+}
+
+#[test]
+fn live_topn_remote_completion_order_requires_early_availability_and_late_completion() {
+    assert!(!topn_success_order_is_valid(9, &[1, 2, 3], 10, 3));
+    assert!(!topn_success_order_is_valid(1, &[2, 8, 9], 7, 3));
+    assert!(topn_success_order_is_valid(1, &[2, 8, 9], 10, 3));
 }
 
 fn run_live_topn(
@@ -1645,14 +1764,35 @@ fn run_live_topn(
                     _ => None,
                 })
                 .expect("installed service records its authoritative participant");
+            let transport_events = events
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeFilterEvent::TransportEnvelope {
+                        identity,
+                        kind,
+                        bytes,
+                    } => Some(TopNTransportEventEvidence {
+                        route_edge_id: identity.route_edge_id(),
+                        kind: *kind,
+                        bytes: *bytes,
+                    }),
+                    _ => None,
+                })
+                .collect();
             node_evidence.push(TopNNodeEvidence {
                 participant,
                 pending_transport: service.transport_pending_len_for_test(),
                 envelopes: service
                     .admitted_transport_envelopes_for_test()
                     .into_iter()
-                    .map(|(route, envelope)| (route.target_role(), envelope.kind()))
+                    .map(|(route, envelope)| TopNAdmittedEnvelopeEvidence {
+                        route_edge_id: route.route_edge_id(),
+                        target: route.target_role(),
+                        kind: envelope.kind(),
+                        bytes: envelope.payload().len(),
+                    })
                     .collect(),
+                transport_events,
                 events,
             });
         }
@@ -1852,108 +1992,150 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
         2,
         "the compiler emits two cross-participant producer-to-aggregate routes"
     );
-    for (participant, route_edge_id) in remote_producer_routes {
+    for (participant, route_edge_id) in &remote_producer_routes {
         let evidence = on
             .node_evidence
             .iter()
-            .find(|evidence| evidence.participant == participant)
+            .find(|evidence| evidence.participant == *participant)
             .expect("remote producer service evidence");
         assert!(
-            evidence.envelopes.iter().any(|(target, kind)| {
-                *target == RuntimeFilterRouteRole::Aggregator
-                    && *kind == RuntimeFilterEnvelopeKind::ProducerClosed
+            evidence.envelopes.iter().any(|envelope| {
+                envelope.route_edge_id == *route_edge_id
+                    && envelope.target == RuntimeFilterRouteRole::Aggregator
+                    && envelope.kind == RuntimeFilterEnvelopeKind::ProducerClosed
+                    && envelope.bytes == 0
             }),
             "remote producer sends its terminal on the same compiled route"
         );
         assert!(
-            evidence.events.iter().any(|event| matches!(
-                event,
-                RuntimeFilterEvent::TransportEnvelope {
-                    identity,
-                    kind: TransportEventKind::Sent,
-                    bytes: 0,
-                } if identity.route_edge_id() == route_edge_id
-            )) && evidence.events.iter().any(|event| matches!(
-                event,
-                RuntimeFilterEvent::TransportEnvelope {
-                    identity,
-                    kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
-                    bytes: 0,
-                } if identity.route_edge_id() == route_edge_id
-            )),
+            evidence.transport_events.iter().any(|event| {
+                event.route_edge_id == *route_edge_id
+                    && event.kind == TransportEventKind::Sent
+                    && event.bytes == 0
+            }) && evidence.transport_events.iter().any(|event| {
+                event.route_edge_id == *route_edge_id
+                    && event.kind == TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted)
+                    && event.bytes == 0
+            }),
             "remote ProducerClosed frame is sent and ACKed on its compiled route"
         );
     }
     assert!(
-        aggregator_install.install.routing_shard().channels()[&TOPN_CHANNEL]
-            .outbound_edges()
+        remote_producer_routes
             .iter()
-            .any(|edge| {
-                matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
-                    && edge.source().participant_id() != edge.target().participant_id()
-                    && matches!(edge.source().role(), RuntimeFilterRouteRole::Aggregator)
-                    && matches!(edge.target().role(), RuntimeFilterRouteRole::Consumer(_))
+            .any(|(participant, route_edge_id)| {
+                on.node_evidence
+                    .iter()
+                    .find(|evidence| evidence.participant == *participant)
+                    .is_some_and(|evidence| {
+                        has_accepted_data_frame(
+                            &evidence.envelopes,
+                            &evidence.transport_events,
+                            *route_edge_id,
+                            RuntimeFilterEnvelopeKind::Contribution,
+                        )
+                    })
             }),
+        "a nonterminal Contribution has a Sent/Accepted lifecycle correlated by compiled route and nonzero frame bytes"
+    );
+    let remote_artifact_routes = aggregator_install.install.routing_shard().channels()
+        [&TOPN_CHANNEL]
+        .outbound_edges()
+        .iter()
+        .filter_map(|edge| {
+            (matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
+                && edge.source().participant_id() != edge.target().participant_id()
+                && matches!(edge.source().role(), RuntimeFilterRouteRole::Aggregator)
+                && matches!(edge.target().role(), RuntimeFilterRouteRole::Consumer(_)))
+            .then_some(edge.route_edge_id())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !remote_artifact_routes.is_empty(),
         "the same consumer implementation receives a remote aggregate artifact"
     );
     assert!(
-        on.node_evidence.iter().any(|evidence| {
-            evidence.envelopes.iter().any(|(target, kind)| {
-                *target == RuntimeFilterRouteRole::Aggregator
-                    && *kind == RuntimeFilterEnvelopeKind::Contribution
-            })
-        }),
-        "a remote producer sends a contribution through the installed RFD-4 route"
-    );
-    assert!(
-        on.node_evidence.iter().any(|evidence| {
-            evidence.envelopes.iter().any(|(target, kind)| {
-                matches!(target, RuntimeFilterRouteRole::Consumer(_))
-                    && matches!(
-                        kind,
-                        RuntimeFilterEnvelopeKind::Artifact
-                            | RuntimeFilterEnvelopeKind::FinalArtifact
-                    )
-            })
-        }),
-        "the aggregate owner delivers an ordered artifact to a remote live consumer"
-    );
-    assert!(
-        on.node_evidence
-            .iter()
-            .flat_map(|evidence| &evidence.events)
-            .any(|event| {
-                matches!(
-                    event,
-                    RuntimeFilterEvent::TransportEnvelope {
-                        kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
-                        ..
-                    }
+        remote_artifact_routes.iter().any(|route_edge_id| {
+            [
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+            ]
+            .into_iter()
+            .any(|kind| {
+                has_accepted_data_frame(
+                    &aggregator_evidence.envelopes,
+                    &aggregator_evidence.transport_events,
+                    *route_edge_id,
+                    kind,
                 )
-            }),
-        "remote contribution/artifact delivery receives an accepted ACK"
+            })
+        }),
+        "an Artifact/FinalArtifact has a Sent/Accepted lifecycle correlated by compiled route and nonzero frame bytes"
     );
-    assert!(
-        on.node_evidence
-            .iter()
-            .flat_map(|evidence| &evidence.events)
-            .any(|event| matches!(event, RuntimeFilterEvent::OrderedAvailabilityReached { .. })),
-        "one sound producer contribution reaches availability"
-    );
-    let expected_producers = aggregator_install.install.core_view().channels()[&TOPN_CHANNEL]
+    let expected_instances = aggregator_install.install.core_view().channels()[&TOPN_CHANNEL]
         .producers()[&TOPN_PRODUCER_BINDING]
         .expected_fragment_instances()
-        .len();
+        .clone();
+    let expected_producers = expected_instances.len();
     assert_eq!(
         expected_producers, 3,
         "the installed completion contract requires all three producers"
     );
+    let availability_position = aggregator_evidence
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeFilterEvent::OrderedAvailabilityReached { identity }
+                    if identity.channel_id() == TOPN_CHANNEL
+            )
+        })
+        .expect("one sound producer contribution reaches availability");
+    let terminal_admissions = aggregator_evidence
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            let RuntimeFilterEvent::ProducerInstanceClosed { identity } = event else {
+                return None;
+            };
+            (identity.common().channel_id() == TOPN_CHANNEL
+                && identity.producer_binding_id() == TOPN_PRODUCER_BINDING)
+                .then_some((position, identity.fragment_instance_id()))
+        })
+        .collect::<Vec<_>>();
+    let terminal_positions = terminal_admissions
+        .iter()
+        .map(|(position, _)| *position)
+        .collect::<Vec<_>>();
+    let terminal_instances = terminal_admissions
+        .iter()
+        .map(|(_, fragment_instance_id)| *fragment_instance_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        terminal_instances, expected_instances,
+        "aggregate owner admits exactly the compiler-required producer instances"
+    );
+    let completed_position = aggregator_evidence
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeFilterEvent::ChannelCompleted { identity, .. }
+                    if identity.channel_id() == TOPN_CHANNEL
+            )
+        })
+        .expect("aggregate owner completes");
     assert!(
-        aggregator_evidence
-            .events
-            .iter()
-            .any(|event| matches!(event, RuntimeFilterEvent::ChannelCompleted { .. })),
-        "the aggregate owner completes only after its three-producer contract is satisfied"
+        topn_success_order_is_valid(
+            availability_position,
+            &terminal_positions,
+            completed_position,
+            expected_producers,
+        ),
+        "availability precedes a remaining producer close and ChannelCompleted follows all three ProducerInstanceClosed admissions: availability={availability_position} terminals={terminal_positions:?} completed={completed_position} expected={expected_producers}"
     );
     assert!(
         on.node_evidence
@@ -1973,20 +2155,34 @@ fn live_topn_remote_timeout_fails_open_with_correct_results() {
         topn_result_values(&off.outcome),
         "deadline failure leaves the live scan in pass-through mode"
     );
+    let failed_remote_routes = timed_out
+        .observations
+        .iter()
+        .flat_map(|observation| {
+            observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+                .outbound_edges()
+                .iter()
+                .filter_map(|edge| {
+                    (edge.source().participant_id() == observation.participant
+                        && edge.source().participant_id() != edge.target().participant_id()
+                        && matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. }))
+                    .then_some(edge.route_edge_id())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !failed_remote_routes.is_empty(),
+        "failure fixture redirects compiler-produced remote routes"
+    );
     assert!(
         timed_out
             .node_evidence
             .iter()
-            .flat_map(|evidence| &evidence.events)
-            .any(|event| matches!(
-                event,
-                RuntimeFilterEvent::ChannelUnavailable { .. }
-                    | RuntimeFilterEvent::LiveSubscriptionTerminal { .. }
-                    | RuntimeFilterEvent::TransportEnvelope {
-                        kind: TransportEventKind::FailedOpen(_),
-                        ..
-                    }
+            .any(|evidence| has_deadline_failed_open(
+                &evidence.transport_events,
+                &failed_remote_routes,
             )),
-        "remote timeout reaches a typed fail-open terminal"
+        "a redirected compiler-produced route reaches exact Deadline FailedOpen"
     );
 }

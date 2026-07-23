@@ -31,7 +31,7 @@ use crate::common::runtime_scan_predicate::{
 };
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::file_pruning::{
-    IcebergFilePruningCounters, iceberg_range_may_satisfy_scan_predicates,
+    IcebergFileNullState, IcebergFilePruningCounters, iceberg_range_may_satisfy_scan_predicates,
 };
 use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::exec::node::BoxedExecIter;
@@ -65,23 +65,31 @@ fn apply_parquet_pruning_gate_for_delete_files(
 
 fn exact_ordered_file_candidates(
     stats: &crate::connector::iceberg::scan_model::IcebergColumnStats,
+    explicit_null_state: Option<IcebergFileNullState>,
     data_type: &DataType,
 ) -> Option<ArrayRef> {
-    let value_count = stats.value_count?;
-    let null_count = stats.null_count?;
-    if value_count < 0 || null_count < 0 || null_count > value_count {
-        return None;
-    }
-    if value_count == 0 {
-        return Some(new_null_array(data_type, 0));
-    }
-    if value_count == null_count {
-        return Some(new_null_array(data_type, 1));
-    }
-
+    let has_null = match (stats.value_count, stats.null_count) {
+        (Some(value_count), Some(null_count)) => {
+            if value_count < 0 || null_count < 0 || null_count > value_count {
+                return None;
+            }
+            if value_count == 0 {
+                return Some(new_null_array(data_type, 0));
+            }
+            if value_count == null_count {
+                return Some(new_null_array(data_type, 1));
+            }
+            null_count > 0
+        }
+        (None, None) => match explicit_null_state? {
+            IcebergFileNullState::NoNulls => false,
+            IcebergFileNullState::HasNulls => true,
+            IcebergFileNullState::AllNull => return Some(new_null_array(data_type, 1)),
+        },
+        (Some(_), None) | (None, Some(_)) => return None,
+    };
     let lower = stats.lower_bound.as_deref()?;
     let upper = stats.upper_bound.as_deref()?;
-    let has_null = null_count > 0;
     macro_rules! candidates {
         ($lower:expr, $upper:expr, $array:ident $(, $finish:expr)?) => {{
             let lower = $lower;
@@ -644,7 +652,11 @@ impl ScanOp for HdfsScanOp {
         }) else {
             return Ok(ScanMorselPruneDecision::Keep);
         };
-        let Some(candidates) = exact_ordered_file_candidates(stats, predicate.data_type()) else {
+        let Some(candidates) = exact_ordered_file_candidates(
+            stats,
+            metadata.null_state(column),
+            predicate.data_type(),
+        ) else {
             return Ok(ScanMorselPruneDecision::Keep);
         };
         let Ok(mask) = predicate.evaluate(candidates.as_ref()) else {
@@ -1031,7 +1043,9 @@ mod tests {
     use crate::connector::iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
-    use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
+    use crate::connector::iceberg::file_pruning::{
+        IcebergFileNullState, IcebergFilePruningMetadata,
+    };
     use crate::connector::iceberg::scan_model::IcebergColumnStats;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprId};
@@ -1196,6 +1210,7 @@ mod tests {
                     upper_bound: Some(20_i64.to_le_bytes().to_vec()),
                 },
             )]),
+            null_states: HashMap::new(),
         }
     }
 
@@ -1215,6 +1230,7 @@ mod tests {
                     upper_bound: Some(upper.to_le_bytes().to_vec()),
                 },
             )]),
+            null_states: HashMap::new(),
         }
     }
 
@@ -1349,6 +1365,33 @@ mod tests {
             ScanMorselPruneDecision::Skip
         );
 
+        let mut explicit_no_nulls = iceberg_file_pruning_metadata_for_i32_range("k1", 90, 110);
+        explicit_no_nulls
+            .null_states
+            .insert("k1".to_string(), IcebergFileNullState::NoNulls);
+        let explicit_no_nulls = iceberg_file_range_for_runtime_pruning_test(
+            "s3://bucket/path/explicit-no-nulls.parquet",
+            Some(explicit_no_nulls),
+        );
+        let explicit_no_nulls = HdfsScanOp::new(HdfsScanConfig {
+            ranges: vec![explicit_no_nulls],
+            ..op.cfg.clone()
+        })
+        .build_morsels()
+        .expect("explicit-null-state morsel")
+        .morsels
+        .pop()
+        .expect("explicit-null-state file range");
+        assert_eq!(
+            op.late_prune_morsel_with_ordered_predicate(
+                &explicit_no_nulls,
+                SlotId::new(3),
+                &predicate,
+            )
+            .expect("explicit-null-state late prune"),
+            ScanMorselPruneDecision::Skip
+        );
+
         let missing_counts = iceberg_file_range_for_runtime_pruning_test(
             "s3://bucket/path/missing-counts.parquet",
             Some(iceberg_file_pruning_metadata_for_i32_range("k1", 90, 110)),
@@ -1405,6 +1448,7 @@ mod tests {
                     upper_bound: Some(b"zz".to_vec()),
                 },
             )]),
+            null_states: HashMap::new(),
         };
         let unsupported = HdfsScanOp::new(HdfsScanConfig {
             ranges: vec![iceberg_file_range_for_runtime_pruning_test(
