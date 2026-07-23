@@ -407,6 +407,55 @@ mod tests {
         }
     }
 
+    /// Inner sink whose send queue is permanently full.
+    struct RefusingSink {
+        name: String,
+    }
+
+    impl Operator for RefusingSink {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for RefusingSink {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("refusing sink must not receive input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            None
+        }
+    }
+
     #[test]
     fn multi_cast_sink_waits_for_inner_sinks_to_finish() {
         let first_done = Arc::new(AtomicBool::new(false));
@@ -446,5 +495,32 @@ mod tests {
         second_done.store(true, Ordering::SeqCst);
         assert!(op.is_finished());
         assert!(op.sink_observable().is_none());
+    }
+
+    #[test]
+    fn one_full_branch_blocks_the_whole_multicast_sink() {
+        // One accepting inner and one refusing inner: the multicast operator
+        // must stop accepting input entirely. This is the execution fact
+        // behind the deployment-side backpressure edges.
+        let accepting_done = Arc::new(AtomicBool::new(false));
+        let op = MultiCastDataStreamSinkOperator {
+            name: "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
+            init_error: None,
+            sinks: vec![
+                InnerSinkRuntime {
+                    limit_remaining: None,
+                    op: Box::new(PendingFinishSink::new("accepting", accepting_done)),
+                },
+                InnerSinkRuntime {
+                    limit_remaining: None,
+                    op: Box::new(RefusingSink {
+                        name: "refusing".to_string(),
+                    }),
+                },
+            ],
+            finishing: false,
+        };
+
+        assert!(!op.need_input());
     }
 }
