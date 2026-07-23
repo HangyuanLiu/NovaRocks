@@ -2996,7 +2996,10 @@ pub(super) mod test_support {
                 role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                     contribution_kinds: contributions,
                     completion_requirement: CompletionRequirement::ProducerClosed,
-                    join_key_ordinal: 0,
+                    target:
+                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                            ordinal: 0,
+                        },
                 }),
             })
             .unwrap();
@@ -4038,7 +4041,10 @@ pub(crate) mod tests {
                     completion_requirement: CompletionRequirement::FencedFinalDomain(
                         CompletionFenceKind::CommittedDomainFrozen,
                     ),
-                    join_key_ordinal: 0,
+                    target:
+                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                            ordinal: 0,
+                        },
                 }),
             })
             .unwrap();

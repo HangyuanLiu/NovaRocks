@@ -25,8 +25,8 @@ use crate::runtime_filter::model::contract::{
     RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerBindingTarget, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
-    RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
+    RuntimeFilterBindingSpec, RuntimeFilterGraph,
 };
 use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ArtifactSchemaDigest};
 use crate::runtime_filter::port::ordered_bound::{
@@ -143,7 +143,7 @@ pub(crate) enum PreparedRuntimeFilterBindingRole {
     Producer {
         contribution_kinds: BTreeSet<ContributionKind>,
         completion_requirement: CompletionRequirement,
-        join_key_ordinal: usize,
+        target: ProducerBindingTarget,
     },
     Consumer {
         capabilities: BTreeSet<ArtifactCapability>,
@@ -252,7 +252,7 @@ pub(super) fn materialize_runtime_filter_binding_tables(
                     PreparedRuntimeFilterBindingRole::Producer {
                         contribution_kinds: requirement.contribution_kinds.clone(),
                         completion_requirement: requirement.completion_requirement,
-                        join_key_ordinal: requirement.join_key_ordinal,
+                        target: requirement.target,
                     }
                 }
                 RuntimeFilterBindingRole::Consumer(requirement) => {
@@ -588,7 +588,7 @@ mod tests {
             role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                 contribution_kinds,
                 completion_requirement: CompletionRequirement::ProducerClosed,
-                join_key_ordinal: 0,
+                target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
             }),
         }
     }

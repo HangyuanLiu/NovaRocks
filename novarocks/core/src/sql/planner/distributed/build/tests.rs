@@ -11,7 +11,9 @@ use super::runtime_filter_binding::{
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
 use crate::runtime_filter::model::contract::BindingId;
-use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+use crate::runtime_filter::model::graph::{
+    ProducerBindingTarget, RuntimeFilterBindingRole, RuntimeFilterGraph,
+};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
@@ -818,7 +820,12 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
     let producer_key_ordinals = producers
         .iter()
         .map(|binding| match &binding.role {
-            RuntimeFilterBindingRole::Producer(requirement) => requirement.join_key_ordinal,
+            RuntimeFilterBindingRole::Producer(requirement) => match requirement.target {
+                ProducerBindingTarget::JoinBuildKey { ordinal } => ordinal,
+                ProducerBindingTarget::AggregateTopNKey { .. } => {
+                    panic!("HashJoin planner must emit JoinBuildKey producer targets")
+                }
+            },
             RuntimeFilterBindingRole::Consumer(_) => unreachable!("filtered above"),
         })
         .collect::<Vec<_>>();

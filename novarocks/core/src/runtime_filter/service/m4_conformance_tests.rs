@@ -250,7 +250,10 @@ fn membership_graph(
                 role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                     contribution_kinds: contributions.clone(),
                     completion_requirement: CompletionRequirement::ProducerClosed,
-                    join_key_ordinal: 0,
+                    target:
+                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                            ordinal: 0,
+                        },
                 }),
             })
             .unwrap();
@@ -333,7 +336,10 @@ fn aggregate_graph(producers: &[ProducerFixture]) -> RuntimeFilterGraph {
                     completion_requirement: CompletionRequirement::FencedFinalDomain(
                         CompletionFenceKind::CommittedDomainFrozen,
                     ),
-                    join_key_ordinal: 0,
+                    target:
+                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                            ordinal: 0,
+                        },
                 }),
             })
             .unwrap();
@@ -691,7 +697,9 @@ fn ordered_binding(
         role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
             contribution_kinds: contributions.clone(),
             completion_requirement: CompletionRequirement::ProducerClosed,
-            join_key_ordinal: 0,
+            target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                ordinal: 0,
+            },
         }),
     }
 }

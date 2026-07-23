@@ -29,6 +29,7 @@ use crate::runtime_filter::model::contract::{
     OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain, SortDirection,
     TopKSummaryRequirement,
 };
+use crate::runtime_filter::model::graph::ProducerBindingTarget;
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
@@ -59,7 +60,7 @@ pub(crate) enum DecodedBindingRole {
     Producer {
         contribution_kinds: BTreeSet<ContributionKind>,
         completion_requirement: CompletionRequirement,
-        join_key_ordinal: usize,
+        target: ProducerBindingTarget,
     },
     Consumer {
         capabilities: BTreeSet<ArtifactCapability>,
@@ -908,27 +909,60 @@ fn decode_role(
                 producer.completion_requirement,
                 producer_path.clone().field("completion_requirement"),
             )?;
-            let join_key_ordinal_path = producer_path.field("join_key_ordinal");
-            let join_key_ordinal = usize::try_from(producer.join_key_ordinal.ok_or_else(|| {
+            let target_path = producer_path.field("target");
+            let target = match producer.target.as_ref().ok_or_else(|| {
                 super::NativeFragmentDecodeError::missing(
-                    join_key_ordinal_path.clone(),
+                    target_path.clone(),
                     format!(
-                        "native runtime-filter producer binding_id={binding_id} missing join_key_ordinal"
+                        "native runtime-filter producer binding_id={binding_id} missing target"
                     ),
                 )
-            })?)
-            .map_err(|_| {
-                super::NativeFragmentDecodeError::invalid_value(
-                    join_key_ordinal_path,
-                    format!(
-                        "native runtime-filter producer binding_id={binding_id} join_key_ordinal does not fit usize"
-                    ),
-                )
-            })?;
+            })? {
+                plan::runtime_filter_producer_role::Target::JoinBuildKey(join) => {
+                    ProducerBindingTarget::JoinBuildKey {
+                        ordinal: usize::try_from(join.ordinal).map_err(|_| {
+                            super::NativeFragmentDecodeError::invalid_value(
+                                target_path.clone().field("join_build_key").field("ordinal"),
+                                format!(
+                                    "native runtime-filter producer binding_id={binding_id} join build key ordinal does not fit usize"
+                                ),
+                            )
+                        })?,
+                    }
+                }
+                plan::runtime_filter_producer_role::Target::AggregateTopnKey(aggregate) => {
+                    ProducerBindingTarget::AggregateTopNKey {
+                        group_key_ordinal: usize::try_from(aggregate.group_key_ordinal).map_err(
+                            |_| {
+                                super::NativeFragmentDecodeError::invalid_value(
+                                    target_path
+                                        .clone()
+                                        .field("aggregate_topn_key")
+                                        .field("group_key_ordinal"),
+                                    format!(
+                                        "native runtime-filter producer binding_id={binding_id} aggregate TopN group key ordinal does not fit usize"
+                                    ),
+                                )
+                            },
+                        )?,
+                        limit: NonZeroU32::new(aggregate.limit).ok_or_else(|| {
+                            super::NativeFragmentDecodeError::invalid_value(
+                                target_path
+                                    .clone()
+                                    .field("aggregate_topn_key")
+                                    .field("limit"),
+                                format!(
+                                    "native runtime-filter producer binding_id={binding_id} aggregate TopN limit must be nonzero"
+                                ),
+                            )
+                        })?,
+                    }
+                }
+            };
             Ok(DecodedBindingRole::Producer {
                 contribution_kinds,
                 completion_requirement,
-                join_key_ordinal,
+                target,
             })
         }
         plan::runtime_filter_binding::Role::Consumer(consumer) => {
@@ -1109,6 +1143,7 @@ fn validate_role_contract(
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
+    use prost::Message;
 
     use super::*;
     use crate::proto::expr;
@@ -1118,6 +1153,7 @@ mod tests {
         NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
         TopKSummaryRequirement,
     };
+    use crate::runtime_filter::model::graph::ProducerBindingTarget;
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
     use crate::runtime_filter::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
@@ -1210,6 +1246,82 @@ mod tests {
             NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![missing_target])),)
                 .is_err()
         );
+    }
+
+    fn producer_role_with_target(
+        target: Option<plan::runtime_filter_producer_role::Target>,
+    ) -> plan::runtime_filter_binding::Role {
+        plan::runtime_filter_binding::Role::Producer(plan::RuntimeFilterProducerRole {
+            contribution_kinds: vec![
+                i32::from(plan::RuntimeFilterContributionKind::ValueDomainDelta),
+                i32::from(plan::RuntimeFilterContributionKind::ProducerClosed),
+            ],
+            completion_requirement: i32::from(
+                plan::RuntimeFilterCompletionRequirement::ProducerClosed,
+            ),
+            target,
+        })
+    }
+
+    fn decode_producer_binding_target(
+        target: Option<plan::runtime_filter_producer_role::Target>,
+    ) -> Result<ProducerBindingTarget, super::super::NativeFragmentDecodeError> {
+        let role = producer_role_with_target(target);
+        let DecodedBindingRole::Producer { target, .. } =
+            decode_role(17, Some(&role), FieldPath::root("binding").field("role"))?
+        else {
+            unreachable!("fixture always carries a producer role")
+        };
+        Ok(target)
+    }
+
+    #[test]
+    fn producer_binding_target_proto_round_trips_both_variants_exactly() {
+        let cases = [
+            (
+                plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                    plan::RuntimeFilterJoinBuildKey { ordinal: 7 },
+                ),
+                ProducerBindingTarget::JoinBuildKey { ordinal: 7 },
+            ),
+            (
+                plan::runtime_filter_producer_role::Target::AggregateTopnKey(
+                    plan::RuntimeFilterAggregateTopNKey {
+                        group_key_ordinal: 11,
+                        limit: 19,
+                    },
+                ),
+                ProducerBindingTarget::AggregateTopNKey {
+                    group_key_ordinal: 11,
+                    limit: NonZeroU32::new(19).unwrap(),
+                },
+            ),
+        ];
+
+        for (wire_target, expected) in cases {
+            let wire = match producer_role_with_target(Some(wire_target)) {
+                plan::runtime_filter_binding::Role::Producer(wire) => wire,
+                _ => unreachable!("helper always returns producer"),
+            };
+            let bytes = wire.encode_to_vec();
+            let round_tripped = plan::RuntimeFilterProducerRole::decode(bytes.as_slice())
+                .expect("proto round trip");
+            let decoded = decode_producer_binding_target(round_tripped.target)
+                .expect("typed producer target");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn producer_binding_target_decode_rejects_zero_limit_and_missing_target() {
+        let zero_limit = plan::runtime_filter_producer_role::Target::AggregateTopnKey(
+            plan::RuntimeFilterAggregateTopNKey {
+                group_key_ordinal: 1,
+                limit: 0,
+            },
+        );
+        assert!(decode_producer_binding_target(Some(zero_limit)).is_err());
+        assert!(decode_producer_binding_target(None).is_err());
     }
 
     fn table(
@@ -1560,7 +1672,9 @@ mod tests {
                 contribution_kinds: vec![plan::RuntimeFilterContributionKind::Unspecified as i32],
                 completion_requirement: plan::RuntimeFilterCompletionRequirement::ProducerClosed
                     as i32,
-                join_key_ordinal: Some(0),
+                target: Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                    plan::RuntimeFilterJoinBuildKey { ordinal: 0 },
+                )),
             },
         ));
 
@@ -1676,7 +1790,9 @@ mod tests {
                 completion_requirement: i32::from(
                     plan::RuntimeFilterCompletionRequirement::ProducerClosed,
                 ),
-                join_key_ordinal: Some(0),
+                target: Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                    plan::RuntimeFilterJoinBuildKey { ordinal: 0 },
+                )),
             },
         ));
         assert!(
@@ -1731,7 +1847,9 @@ mod tests {
             plan::runtime_filter_binding::Role::Producer(plan::RuntimeFilterProducerRole {
                 contribution_kinds: kinds,
                 completion_requirement: i32::from(completion),
-                join_key_ordinal: Some(0),
+                target: Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                    plan::RuntimeFilterJoinBuildKey { ordinal: 0 },
+                )),
             })
         };
         let mut extra_producer_kind = membership_binding(1, 11);
@@ -1815,7 +1933,9 @@ mod tests {
                 completion_requirement: i32::from(
                     plan::RuntimeFilterCompletionRequirement::ProducerClosed,
                 ),
-                join_key_ordinal: Some(0),
+                target: Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                    plan::RuntimeFilterJoinBuildKey { ordinal: 0 },
+                )),
             },
         ));
         let mut ledger =

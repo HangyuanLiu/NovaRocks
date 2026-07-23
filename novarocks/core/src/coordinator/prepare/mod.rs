@@ -451,7 +451,10 @@ mod tests {
                         ContributionKind::ProducerClosed,
                     ]),
                     completion_requirement: CompletionRequirement::ProducerClosed,
-                    join_key_ordinal: 0,
+                    target:
+                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                            ordinal: 0,
+                        },
                 }),
             })
             .expect("unique producer binding");

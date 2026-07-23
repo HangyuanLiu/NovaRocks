@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroU32;
 
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
@@ -25,9 +26,9 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
-    RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-    RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerBindingTarget,
+    ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+    RuntimeFilterChannelSpec, RuntimeFilterGraph,
 };
 use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
@@ -65,7 +66,7 @@ pub(super) struct RuntimeFilterBindings {
 pub(super) struct RuntimeFilterProducerCandidate {
     pub(super) location: PlanLocation,
     pub(super) expression: TypedExpr,
-    pub(super) join_key_ordinal: usize,
+    pub(super) target: ProducerBindingTarget,
     pub(super) contribution_kinds: BTreeSet<ContributionKind>,
     pub(super) completion_requirement: CompletionRequirement,
 }
@@ -215,7 +216,7 @@ pub(super) fn populate_runtime_filter_candidates(
                 role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                     contribution_kinds: candidate.producer.contribution_kinds,
                     completion_requirement: candidate.producer.completion_requirement,
-                    join_key_ordinal: candidate.producer.join_key_ordinal,
+                    target: candidate.producer.target,
                 }),
             })
             .map_err(|error| {
@@ -356,7 +357,9 @@ pub(super) fn populate_runtime_filter_graph(
                     node_id: PlanNodeId::new(build.node_id),
                 },
                 expression: build.intent.build_expr.clone(),
-                join_key_ordinal: build.intent.expr_order,
+                target: ProducerBindingTarget::JoinBuildKey {
+                    ordinal: build.intent.expr_order,
+                },
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
             },
@@ -1289,7 +1292,10 @@ mod tests {
                     producer: RuntimeFilterProducerCandidate {
                         location: location(1),
                         expression: expression(),
-                        join_key_ordinal: 0,
+                        target: ProducerBindingTarget::AggregateTopNKey {
+                            group_key_ordinal: 0,
+                            limit: NonZeroU32::new(10).unwrap(),
+                        },
                         contribution_kinds: topn_contributions,
                         completion_requirement: CompletionRequirement::ProducerClosed,
                     },
@@ -1323,7 +1329,7 @@ mod tests {
                     producer: RuntimeFilterProducerCandidate {
                         location: location(1),
                         expression: expression(),
-                        join_key_ordinal: 0,
+                        target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
                         contribution_kinds: aggregate_contributions,
                         completion_requirement: CompletionRequirement::FencedFinalDomain(
                             CompletionFenceKind::CommittedDomainFrozen,

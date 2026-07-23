@@ -37,6 +37,7 @@ mod topn;
 mod values;
 mod window;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -68,7 +69,7 @@ use crate::runtime::fragment::instance::{
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
-use std::cell::RefCell;
+use crate::runtime_filter::model::graph::ProducerBindingTarget;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedNode {
@@ -824,7 +825,7 @@ fn attach_hash_join_producers(
         let DecodedBindingRole::Producer {
             contribution_kinds,
             completion_requirement,
-            join_key_ordinal,
+            target,
         } = &binding.role
         else {
             return Err(super::NativeFragmentDecodeError::inconsistent(
@@ -835,7 +836,18 @@ fn attach_hash_join_producers(
                 ),
             ));
         };
-        let build_key_index = *join_key_ordinal;
+        let ProducerBindingTarget::JoinBuildKey {
+            ordinal: build_key_index,
+        } = *target
+        else {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("runtime_filter_binding_ids"),
+                format!(
+                    "native runtime-filter producer binding_id={} on HashJoin must target a join build key",
+                    binding.binding_id
+                ),
+            ));
+        };
         let join_key_path = path
             .clone()
             .field("payload")
@@ -1900,7 +1912,11 @@ mod tests {
                     completion_requirement: i32::from(
                         plan::RuntimeFilterCompletionRequirement::ProducerClosed,
                     ),
-                    join_key_ordinal: Some(join_key_ordinal),
+                    target: Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                        plan::RuntimeFilterJoinBuildKey {
+                            ordinal: join_key_ordinal,
+                        },
+                    )),
                 },
             )),
         }

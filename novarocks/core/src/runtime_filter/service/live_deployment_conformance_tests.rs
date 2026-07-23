@@ -329,7 +329,9 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
             role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
-                join_key_ordinal: 0,
+                target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                    ordinal: 0,
+                },
             }),
         })
         .expect("insert conformance producer binding");
