@@ -1,8 +1,8 @@
 Explain String
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 1, node = 7, expr = (a.k)
-    consumer binding 1, fragment = 2, node = 1, expr = (b.k), activation = BlockingSnapshot
+  runtime filter channel 1
+    producer binding 1, fragment = 1, node = 7, expr = (a.k)
+    consumer binding 2, fragment = 2, node = 1, expr = (b.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED

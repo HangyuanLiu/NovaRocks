@@ -1,12 +1,12 @@
 -- query 14
 Explain String
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 0, node = 6, expr = (b.b)
-    consumer binding 1, fragment = 0, node = 1, expr = (strict_eq_a.a1), activation = BlockingSnapshot
   runtime filter channel 1
-    producer binding 2, fragment = 0, node = 9, expr = (c.c)
-    consumer binding 3, fragment = 0, node = 1, expr = (strict_eq_a.a2), activation = BlockingSnapshot
+    producer binding 1, fragment = 0, node = 6, expr = (b.b)
+    consumer binding 2, fragment = 0, node = 1, expr = (strict_eq_a.a1), activation = BlockingSnapshot
+  runtime filter channel 2
+    producer binding 3, fragment = 0, node = 9, expr = (c.c)
+    consumer binding 4, fragment = 0, node = 1, expr = (strict_eq_a.a2), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -48,12 +48,12 @@ PLAN FRAGMENT 2
 -- query 16
 Explain String
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 0, node = 6, expr = (b.b)
-    consumer binding 1, fragment = 0, node = 1, expr = (strict_eq_a.a1), activation = BlockingSnapshot
   runtime filter channel 1
-    producer binding 2, fragment = 0, node = 9, expr = (c.c)
-    consumer binding 3, fragment = 0, node = 1, expr = (strict_eq_a.a2), activation = BlockingSnapshot
+    producer binding 1, fragment = 0, node = 6, expr = (b.b)
+    consumer binding 2, fragment = 0, node = 1, expr = (strict_eq_a.a1), activation = BlockingSnapshot
+  runtime filter channel 2
+    producer binding 3, fragment = 0, node = 9, expr = (c.c)
+    consumer binding 4, fragment = 0, node = 1, expr = (strict_eq_a.a2), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
