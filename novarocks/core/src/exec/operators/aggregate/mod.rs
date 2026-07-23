@@ -27,6 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+pub(crate) mod final_domain;
 pub(crate) mod streaming_sink;
 pub(crate) mod streaming_source;
 pub(crate) mod streaming_state;
