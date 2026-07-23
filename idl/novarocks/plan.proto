@@ -247,10 +247,22 @@ message RuntimeFilterTopKReduction {
   bytes contract_digest = 2;
 }
 
+message RuntimeFilterJoinBuildKey {
+  uint32 ordinal = 1;
+}
+
+message RuntimeFilterAggregateTopNKey {
+  uint32 group_key_ordinal = 1;
+  uint32 limit = 2;
+}
+
 message RuntimeFilterProducerRole {
   repeated RuntimeFilterContributionKind contribution_kinds = 1;
   RuntimeFilterCompletionRequirement completion_requirement = 2;
-  optional uint32 join_key_ordinal = 3;
+  oneof target {
+    RuntimeFilterJoinBuildKey join_build_key = 3;
+    RuntimeFilterAggregateTopNKey aggregate_topn_key = 4;
+  }
 }
 
 message RuntimeFilterConsumerRole {

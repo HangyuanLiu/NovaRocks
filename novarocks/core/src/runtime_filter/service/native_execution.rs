@@ -27,9 +27,12 @@ use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ConsumerAr
 use crate::runtime_filter::port::identity::DeploymentEpoch;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::producer::{
-    ProducerAdapter, ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
+    OrderedBoundProducerAdapter, ProducerAdapter, ProducerHandle, ProducerPortKind,
+    RuntimeContractViolation, RuntimeContractViolationKind,
 };
-use crate::runtime_filter::port::subscription::{SubscriptionHandle, SubscriptionKind};
+use crate::runtime_filter::port::subscription::{
+    NonBlockingLiveSubscription, SubscriptionHandle, SubscriptionKind,
+};
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 
 use super::RuntimeFilterService;
@@ -85,6 +88,43 @@ impl NativeRuntimeFilterExecutionContext {
 
     pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
         self.fragment_instance_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installed_ordered_consumer_context_for_exec_test()
+    -> (Self, Arc<RuntimeOrderContract>) {
+        let service = super::tests::installed_ordered_service_fixture();
+        let context = Self::new(
+            service,
+            UniqueId { hi: 70, lo: 0 },
+            DeploymentEpoch::new(9),
+            UniqueId { hi: 70, lo: 2 },
+        );
+        let resolved = context
+            .resolve_consumer(
+                BindingId::new(2),
+                ChannelId::new(1),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .expect("installed ordered test consumer resolves as live");
+        let InstalledNativeRuntimeFilterContract::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        } = resolved.contract()
+        else {
+            panic!("installed ordered test consumer must expose an ordered contract")
+        };
+        let contract = Arc::new(
+            RuntimeOrderContract::from_codec(
+                keys.to_vec(),
+                crate::runtime_filter::model::contract::ComparatorDigest::new(*comparator_digest),
+                crate::runtime_filter::port::ordered_bound::OrderContractDigest::
+                    from_bytes_for_codec(*order_contract_digest),
+            )
+            .expect("installed ordered test contract is valid"),
+        );
+        (context, contract)
     }
 
     pub(crate) fn resolve_producer(
@@ -281,6 +321,10 @@ impl std::fmt::Debug for ResolvedNativeProducer {
 }
 
 impl ResolvedNativeProducer {
+    pub(crate) const fn kind(&self) -> ProducerPortKind {
+        self.kind
+    }
+
     pub(crate) const fn contract(&self) -> &InstalledNativeRuntimeFilterContract {
         &self.contract
     }
@@ -323,6 +367,32 @@ impl ResolvedNativeProducer {
                 self.kind,
             )?
             .into_membership()
+    }
+
+    pub(crate) fn open_ordered_bound(
+        &self,
+        local_partition_count: u32,
+    ) -> Result<Arc<dyn OrderedBoundProducerAdapter>, RuntimeContractViolation> {
+        if self.kind != ProducerPortKind::OrderedBound {
+            return Err(resolution_violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "resolved producer is not an ordered-bound producer",
+            ));
+        }
+        match self.service.open_producer(
+            self.binding_id,
+            self.fragment_instance_id,
+            local_partition_count,
+            self.kind,
+        )? {
+            ProducerHandle::OrderedBound(adapter) => Ok(adapter),
+            ProducerHandle::Membership(_)
+            | ProducerHandle::TopKSummary(_)
+            | ProducerHandle::FinalDomain(_) => Err(resolution_violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "resolved ordered-bound producer opened a different typed port",
+            )),
+        }
     }
 }
 
@@ -390,6 +460,18 @@ impl ResolvedNativeConsumer {
             self.fragment_instance_id,
             self.subscription_kind,
         )
+    }
+
+    pub(crate) fn subscribe_live(
+        &self,
+    ) -> Result<Arc<dyn NonBlockingLiveSubscription>, RuntimeContractViolation> {
+        if self.subscription_kind != SubscriptionKind::NonBlockingLive {
+            return Err(resolution_violation(
+                RuntimeContractViolationKind::SubscriptionActivationMismatch,
+                "resolved consumer is not a non-blocking live consumer",
+            ));
+        }
+        self.subscribe()?.into_live()
     }
 }
 

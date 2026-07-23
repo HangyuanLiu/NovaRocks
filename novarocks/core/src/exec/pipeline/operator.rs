@@ -81,6 +81,14 @@ pub trait Operator: Send {
         // Default: nothing to cancel.
     }
 
+    /// Handles a driver execution failure before the operator is closed.
+    ///
+    /// The default preserves the existing cleanup behavior for operators that do not distinguish
+    /// execution failure from cancellation.
+    fn on_driver_failure(&mut self) {
+        self.cancel();
+    }
+
     fn is_finished(&self) -> bool {
         false
     }

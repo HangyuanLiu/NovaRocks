@@ -44,9 +44,9 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
-    RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-    RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerBindingTarget,
+    ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+    RuntimeFilterChannelSpec, RuntimeFilterGraph,
 };
 use crate::runtime_filter::port::artifact::{
     ArtifactBundle, ArtifactKind, ResidentMembershipIndexView,
@@ -306,7 +306,7 @@ fn aggregate_graph(producers: &[ProducerFixture]) -> RuntimeFilterGraph {
                     completion_requirement: CompletionRequirement::FencedFinalDomain(
                         CompletionFenceKind::CommittedDomainFrozen,
                     ),
-                    join_key_ordinal: 0,
+                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
                 }),
             })
             .expect("insert aggregate producer binding");
@@ -457,8 +457,12 @@ fn aggregate_factory(session: AggregateFinalDomainSessionBuilder) -> AggregatePr
         false,
         true,
         output_schema,
+        Vec::new(),
+        None,
+        AGGREGATE_DOP,
         Some(session),
     )
+    .expect("build aggregate factory")
 }
 
 fn group_chunk(values: &[i64]) -> Chunk {

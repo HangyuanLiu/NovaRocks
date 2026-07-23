@@ -49,7 +49,19 @@ pub(super) fn lower_iceberg_data_files_scan(
             "IcebergDataFiles table missing",
         )
     })?;
-    let ranges = decode_file_scan_ranges(node.node_id, table, ctx.scan_ranges(node.node_id)?)?;
+    let scan_table = scan.table.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "table",
+            "ScanNode table missing",
+        )
+    })?;
+    let ranges = decode_file_scan_ranges(
+        node.node_id,
+        table,
+        &scan_table.columns,
+        ctx.scan_ranges(node.node_id)?,
+    )?;
     let cache_options = CacheOptions::from_query_options(ctx.query_options()).map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
@@ -112,6 +124,10 @@ pub(super) fn lower_iceberg_data_files_scan(
         .with_output_chunk_schema(read_plan.read_schema.clone())
         .with_limit(parse_scan_limit(node.limit)?)
         .with_conjunct_predicate(predicate)
+        .with_connector_io_tasks_per_scan_operator(
+            ctx.query_options()
+                .and_then(|options| options.connector_io_tasks_per_scan_operator),
+        )
         .with_iceberg_virtual(Some(read_plan.iceberg_virtual.clone()))
         .with_accept_empty_scan_ranges(true);
     let scan_lowered = DecodedNode {

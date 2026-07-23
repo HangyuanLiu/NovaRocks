@@ -30,7 +30,7 @@ use crate::runtime_filter::model::contract::{
     OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain, SortDirection,
     TopKSummaryRequirement,
 };
-use crate::runtime_filter::model::graph::ApplyPoint;
+use crate::runtime_filter::model::graph::{ApplyPoint, ProducerBindingTarget};
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::ordered_bound::{
     OrderContractDigest, RuntimeOrderContract, RuntimeOrderKey,
@@ -76,7 +76,7 @@ fn encode_runtime_filter_binding(
         PreparedRuntimeFilterBindingRole::Producer {
             contribution_kinds,
             completion_requirement,
-            join_key_ordinal,
+            target,
         } => plan::runtime_filter_binding::Role::Producer(plan::RuntimeFilterProducerRole {
             contribution_kinds: contribution_kinds
                 .iter()
@@ -84,12 +84,10 @@ fn encode_runtime_filter_binding(
                 .map(encode_runtime_filter_contribution_kind)
                 .collect(),
             completion_requirement: encode_runtime_filter_completion(*completion_requirement),
-            join_key_ordinal: Some(u32::try_from(*join_key_ordinal).map_err(|_| {
-                format!(
-                    "runtime-filter binding_id={} join key ordinal does not fit u32",
-                    binding.binding_id().get()
-                )
-            })?),
+            target: Some(encode_runtime_filter_producer_target(
+                binding.binding_id().get(),
+                *target,
+            )?),
         }),
         PreparedRuntimeFilterBindingRole::Consumer {
             capabilities,
@@ -128,6 +126,38 @@ fn encode_runtime_filter_binding(
         contract: Some(contract),
         reduction: Some(reduction),
         role,
+    })
+}
+
+pub(in crate::protocol::native) fn encode_runtime_filter_producer_target(
+    binding_id: u32,
+    target: ProducerBindingTarget,
+) -> Result<plan::runtime_filter_producer_role::Target, String> {
+    Ok(match target {
+        ProducerBindingTarget::JoinBuildKey { ordinal } => {
+            plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                plan::RuntimeFilterJoinBuildKey {
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        format!(
+                            "runtime-filter binding_id={binding_id} join key ordinal does not fit u32"
+                        )
+                    })?,
+                },
+            )
+        }
+        ProducerBindingTarget::AggregateTopNKey {
+            group_key_ordinal,
+            limit,
+        } => plan::runtime_filter_producer_role::Target::AggregateTopnKey(
+            plan::RuntimeFilterAggregateTopNKey {
+                group_key_ordinal: u32::try_from(group_key_ordinal).map_err(|_| {
+                    format!(
+                        "runtime-filter binding_id={binding_id} aggregate TopN group key ordinal does not fit u32"
+                    )
+                })?,
+                limit: limit.get(),
+            },
+        ),
     })
 }
 

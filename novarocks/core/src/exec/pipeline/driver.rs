@@ -467,6 +467,12 @@ impl PipelineDriver {
         }
     }
 
+    fn fail_operators(&mut self) {
+        for op in self.operators.iter_mut() {
+            op.on_driver_failure();
+        }
+    }
+
     pub fn process(&mut self, time_slice: Duration) -> DriverState {
         let driver_start = Instant::now();
         if self.state == DriverState::Ready {
@@ -787,8 +793,10 @@ impl PipelineDriver {
 
     fn finish_with_state(&mut self, state: DriverState) -> DriverState {
         self.finish_blocked_interval();
-        if matches!(state, DriverState::Canceled | DriverState::Failed(_)) {
-            self.cancel_operators();
+        match &state {
+            DriverState::Canceled => self.cancel_operators(),
+            DriverState::Failed(_) => self.fail_operators(),
+            _ => {}
         }
         if matches!(
             state,

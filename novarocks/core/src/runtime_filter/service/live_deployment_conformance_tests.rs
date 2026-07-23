@@ -16,20 +16,24 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use arrow::array::Int32Array;
 use arrow::datatypes::DataType;
+use arrow::datatypes::{Field, Schema};
+use arrow::record_batch::RecordBatch;
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
-    IcebergTableInfo,
+    IcebergColumnStats, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
+    IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::coordinator::cluster::LiveBackendSnapshot;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
-use crate::coordinator::execution::ExecutionCoordinator;
+use crate::coordinator::execution::{CoordinatedQueryResult, ExecutionCoordinator};
 use crate::coordinator::ports::{
     CoordinatorExecutionPorts, CoordinatorObserver, RuntimeFilterDeploymentControlPort,
 };
@@ -38,14 +42,17 @@ use crate::coordinator::scheduler::FragmentScheduler;
 use crate::coordinator::write::handle_fragment_report_exec_status;
 use crate::coordinator::write::report::FragmentExecStatusReport;
 use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime::profile::{ProfileNode, RuntimeProfileTree};
 use crate::runtime::query_context::QueryId;
+use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime_filter::deployment::participant_id_for_backend;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-    ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
-    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-    RuntimeFilterPolicyRequirement,
+    ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, NullSemantics,
+    OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
+    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    SortDirection,
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
@@ -54,31 +61,43 @@ use crate::runtime_filter::model::graph::{
     RuntimeFilterGraph,
 };
 use crate::runtime_filter::port::artifact::{ArtifactBundle, ResidentMembershipIndexView};
-use crate::runtime_filter::port::events::{RuntimeFilterEvent, TransportEventKind};
+use crate::runtime_filter::port::events::{
+    RuntimeFilterEvent, TransportEventKind, TransportFailOpenReason,
+};
 use crate::runtime_filter::port::identity::{
-    DeploymentEpoch, PartitionId, ProducerSequence, RuntimeFilterParticipantId,
+    DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{ProducerPortKind, SubmitOutcome};
-use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
+use crate::runtime_filter::port::routing::{
+    RuntimeFilterChannelRoutingView, RuntimeFilterRoutePeer, RuntimeFilterRouteRole,
+    RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
+};
 use crate::runtime_filter::port::subscription::{ArtifactAcquireOutcome, SubscriptionKind};
 use crate::runtime_filter::port::transport::{
     RuntimeFilterAcceptStatus, RuntimeFilterEnvelopeKind,
 };
 use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
-use crate::service::grpc_fragment_dispatcher::GrpcRuntimeFilterDeploymentControl;
+use crate::service::grpc_fragment_dispatcher::{
+    GrpcRuntimeFilterDeploymentControl, RemoteDispatcher,
+};
 use crate::service::grpc_server::IndependentGrpcRuntimeFilterNode;
-use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
+use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
+use crate::sql::planner::distributed::test_support::{
+    DistributedPlanDraftBuilder, draft_builder_from_plan,
+};
 use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFragmentSink, IcebergWriteInputBinding,
 };
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
 };
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+use crate::sql::planner::payload::{PlanLimitNode, PlanScanNode, PlanSortNode};
+use crate::sql::planner::physical::{
+    AggMode, AggregateOutputLayout, PhysicalHashAggregateNode, PhysicalPlanKind, PhysicalPlanNode,
+    PhysicalPlanStats, PlannerConfidence, RedistributeMode, RedistributeNode,
+};
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 
@@ -329,7 +348,9 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
             role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
-                join_key_ordinal: 0,
+                target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                    ordinal: 0,
+                },
             }),
         })
         .expect("insert conformance producer binding");
@@ -970,4 +991,1198 @@ fn remote_membership_contribution_uses_installed_route() {
 #[test]
 fn remote_producer_closed_uses_same_route_and_terminal_sequence() {
     run_live_conformance(ConformanceTopology::AllOfAggregate);
+}
+
+const TOPN_CHANNEL: ChannelId = ChannelId::new(180);
+const TOPN_PRODUCER_BINDING: BindingId = BindingId::new(181);
+const TOPN_CONSUMER_BINDING: BindingId = BindingId::new(182);
+const TOPN_WITNESS: CoverageWitnessId = CoverageWitnessId::new(183);
+const TOPN_LIMIT: u32 = 2;
+const TOPN_ROWS_PER_PUBLISH: usize = 4096;
+
+#[derive(Clone)]
+struct TopNInstallObservation {
+    query_id: UniqueId,
+    participant: RuntimeFilterParticipantId,
+    install: RuntimeFilterParticipantInstall,
+}
+
+struct TopNRecordingDeploymentControl {
+    inner: Arc<GrpcRuntimeFilterDeploymentControl>,
+    observations: Arc<Mutex<Vec<TopNInstallObservation>>>,
+    failed_remote_endpoint: Option<RuntimeEndpoint>,
+}
+
+#[async_trait::async_trait]
+impl RuntimeFilterDeploymentControlPort for TopNRecordingDeploymentControl {
+    async fn install(
+        &self,
+        query_id: UniqueId,
+        lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+        install: RuntimeFilterParticipantInstall,
+    ) -> Result<(), String> {
+        let install = match self.failed_remote_endpoint.as_ref() {
+            Some(endpoint) => redirect_remote_routes(install, endpoint)?,
+            None => install,
+        };
+        self.inner
+            .install(
+                query_id,
+                lifecycle,
+                deadline.min(MAX_WAIT),
+                participant,
+                install.clone(),
+            )
+            .await?;
+        self.observations
+            .lock()
+            .unwrap()
+            .push(TopNInstallObservation {
+                query_id,
+                participant,
+                install,
+            });
+        Ok(())
+    }
+
+    async fn abort(
+        &self,
+        query_id: UniqueId,
+        epoch: DeploymentEpoch,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+    ) -> Result<(), String> {
+        self.inner
+            .abort(query_id, epoch, deadline.min(MAX_WAIT), participant)
+            .await
+    }
+}
+
+fn redirect_remote_routes(
+    install: RuntimeFilterParticipantInstall,
+    failed_endpoint: &RuntimeEndpoint,
+) -> Result<RuntimeFilterParticipantInstall, String> {
+    fn redirect_edge(
+        edge: &RuntimeFilterRoutingEdgeView,
+        failed_endpoint: &RuntimeEndpoint,
+    ) -> Result<RuntimeFilterRoutingEdgeView, String> {
+        let peer = match edge.peer() {
+            RuntimeFilterRoutePeer::Loopback => RuntimeFilterRoutePeer::Loopback,
+            RuntimeFilterRoutePeer::Remote { participant_id, .. } => {
+                RuntimeFilterRoutePeer::Remote {
+                    participant_id: *participant_id,
+                    endpoint: failed_endpoint.clone(),
+                }
+            }
+        };
+        RuntimeFilterRoutingEdgeView::new(
+            edge.channel_id(),
+            edge.route_edge_id(),
+            edge.source().clone(),
+            edge.target().clone(),
+            peer,
+            edge.allowed_kinds().clone(),
+        )
+        .map_err(|error| format!("redirect live TopN route: {error}"))
+    }
+
+    let (core, routing) = install.into_parts();
+    let channels = routing
+        .channels()
+        .iter()
+        .map(|(channel_id, channel)| {
+            let inbound = channel
+                .inbound_edges()
+                .iter()
+                .map(|edge| redirect_edge(edge, failed_endpoint))
+                .collect::<Result<Vec<_>, _>>()?;
+            let outbound = channel
+                .outbound_edges()
+                .iter()
+                .map(|edge| redirect_edge(edge, failed_endpoint))
+                .collect::<Result<Vec<_>, _>>()?;
+            let channel = RuntimeFilterChannelRoutingView::new(
+                *channel_id,
+                channel.local_roles().clone(),
+                channel.producer_instances().clone(),
+                inbound,
+                outbound,
+            )
+            .map_err(|error| format!("rebuild failed live TopN channel route: {error}"))?;
+            Ok((*channel_id, channel))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let routing = RuntimeFilterRoutingShard::new(
+        routing.deployment_epoch(),
+        routing.local_participant_id(),
+        channels,
+    )
+    .map_err(|error| format!("rebuild failed live TopN routing shard: {error}"))?;
+    Ok(RuntimeFilterParticipantInstall::new(core, routing))
+}
+
+struct LocalTopNFiles {
+    _dir: tempfile::TempDir,
+    files: Vec<IcebergDataFileInfo>,
+}
+
+impl LocalTopNFiles {
+    fn new(remote: bool) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-live-topn-")
+            .tempdir()
+            .expect("create live TopN tempdir");
+        let leading = if remote {
+            vec![
+                vec![20, 30],
+                vec![40, 50],
+                vec![60, 70],
+                vec![5],
+                vec![1],
+                vec![2],
+            ]
+        } else {
+            vec![vec![20, 30], vec![5]]
+        };
+        let mut files = leading
+            .into_iter()
+            .enumerate()
+            .map(|(index, values)| {
+                let repeated = values
+                    .into_iter()
+                    .cycle()
+                    .take(TOPN_ROWS_PER_PUBLISH)
+                    .collect::<Vec<_>>();
+                write_topn_file(dir.path(), index, &repeated)
+            })
+            .collect::<Vec<_>>();
+        let tail_count = if remote { 72 } else { 24 };
+        let tail_start = files.len();
+        files.extend((0..tail_count).map(|tail| {
+            let value = 100 + i32::try_from(tail).unwrap();
+            write_topn_file(
+                dir.path(),
+                tail_start + tail,
+                &vec![value; TOPN_ROWS_PER_PUBLISH],
+            )
+        }));
+        Self { _dir: dir, files }
+    }
+}
+
+fn write_topn_file(dir: &std::path::Path, index: usize, values: &[i32]) -> IcebergDataFileInfo {
+    let path = dir.join(format!("topn-{index:03}.parquet"));
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
+        .expect("build live TopN parquet batch");
+    crate::formats::parquet::local_io::write_parquet_to_path(&path, &batch)
+        .expect("write live TopN parquet");
+    let size = i64::try_from(std::fs::metadata(&path).unwrap().len()).unwrap();
+    let mut file = IcebergDataFileInfo::for_test(
+        &format!("file://{}", path.display()),
+        size,
+        i64::try_from(values.len()).unwrap(),
+    );
+    let min = *values.iter().min().expect("nonempty TopN file");
+    let max = *values.iter().max().expect("nonempty TopN file");
+    file.column_stats = Some(std::collections::HashMap::from([(
+        "k".to_string(),
+        IcebergColumnStats {
+            null_count: Some(0),
+            value_count: Some(i64::try_from(values.len()).unwrap()),
+            column_size: None,
+            lower_bound: Some(min.to_le_bytes().to_vec()),
+            upper_bound: Some(max.to_le_bytes().to_vec()),
+        },
+    )]));
+    file
+}
+
+fn topn_output_column(id: u32, name: &str) -> OutputColumn {
+    OutputColumn {
+        column_id: ColumnId::new_for_test(id),
+        name: name.to_string(),
+        data_type: DataType::Int32,
+        nullable: false,
+        is_internal: false,
+    }
+}
+
+fn topn_column_expr(id: u32, qualifier: Option<&str>, name: &str) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: ColumnId::new_for_test(id),
+            qualifier: qualifier.map(str::to_string),
+            column: name.to_string(),
+        },
+        data_type: DataType::Int32,
+        nullable: false,
+    }
+}
+
+fn topn_stats(rows: f64) -> PhysicalPlanStats {
+    PhysicalPlanStats {
+        output_row_count: rows,
+        row_count_confidence: PlannerConfidence::Exact,
+        column_statistics: Default::default(),
+        cost_estimate: None,
+        broadcast_decision: None,
+    }
+}
+
+fn topn_table_info(location: &str) -> IcebergTableInfo {
+    IcebergTableInfo {
+        catalog: "live_topn".to_string(),
+        namespace: "default".to_string(),
+        table: "source".to_string(),
+        table_uuid: Some("00000000-0000-0000-0000-000000000180".to_string()),
+        current_snapshot_id: Some(1),
+        schema_id: 1,
+        location: location.to_string(),
+        schema: IcebergSchemaDef {
+            fields: vec![IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "k".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            }],
+        },
+        serialized_metadata: None,
+        serialized_metadata_rows: None,
+    }
+}
+
+fn topn_physical_plan(files: &[IcebergDataFileInfo], remote: bool) -> PhysicalPlanNode {
+    let scan_column = topn_output_column(1, "k");
+    let scan = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Scan(PlanScanNode {
+            database: "default".to_string(),
+            table: TableDef {
+                name: "source".to_string(),
+                columns: vec![ColumnDef {
+                    name: "k".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: ScanSource::IcebergDataFiles {
+                    table: topn_table_info(
+                        files
+                            .first()
+                            .map(|file| file.path.as_str())
+                            .unwrap_or("file:///empty"),
+                    ),
+                    files: files.to_vec(),
+                    cloud_properties: BTreeMap::new(),
+                    binding: IcebergDataFileBinding::ExplicitFiles,
+                },
+            },
+            alias: Some("source".to_string()),
+            columns: vec![scan_column.clone()],
+            predicates: Vec::new(),
+            required_columns: Some(vec!["k".to_string()]),
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        }),
+        children: Vec::new(),
+        output_columns: vec![scan_column],
+        stats: topn_stats(files.len() as f64 * TOPN_ROWS_PER_PUBLISH as f64),
+        probe_runtime_filters: Vec::new(),
+    };
+    let group_output = topn_output_column(10, "k");
+    let aggregate = PhysicalPlanNode {
+        kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+            mode: AggMode::Single,
+            group_by: vec![topn_column_expr(1, Some("source"), "k")],
+            aggregates: Vec::new(),
+            is_merge: Vec::new(),
+            output_layout: AggregateOutputLayout::new(vec![group_output.clone()], Vec::new()),
+            output_columns: vec![group_output.clone()],
+        })),
+        children: vec![scan],
+        output_columns: vec![group_output.clone()],
+        stats: topn_stats(files.len() as f64),
+        probe_runtime_filters: Vec::new(),
+    };
+    let input = if remote {
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Gather,
+                partition_exprs: Vec::new(),
+                output_columns: vec![group_output.clone()],
+            }),
+            children: vec![aggregate],
+            output_columns: vec![group_output.clone()],
+            stats: topn_stats(files.len() as f64),
+            probe_runtime_filters: Vec::new(),
+        }
+    } else {
+        aggregate
+    };
+    let sort = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Sort(PlanSortNode {
+            items: vec![SortItem {
+                expr: topn_column_expr(10, None, "k"),
+                asc: true,
+                nulls_first: false,
+            }],
+            analytic_partition_by: Vec::new(),
+            output_columns: vec![group_output.clone()],
+            offset: None,
+            partition_limit: None,
+            topn_type: None,
+        }),
+        children: vec![input],
+        output_columns: vec![group_output.clone()],
+        stats: topn_stats(TOPN_LIMIT as f64),
+        probe_runtime_filters: Vec::new(),
+    };
+    PhysicalPlanNode {
+        kind: PhysicalPlanKind::Limit(PlanLimitNode {
+            limit: Some(i64::from(TOPN_LIMIT)),
+            offset: None,
+        }),
+        children: vec![sort],
+        output_columns: vec![group_output],
+        stats: topn_stats(TOPN_LIMIT as f64),
+        probe_runtime_filters: Vec::new(),
+    }
+}
+
+fn find_topn_binding_locations(fragments: &[PlanFragment]) -> ((u32, i32), (u32, i32)) {
+    fn walk(
+        node: &DistributedNode,
+        producer: &mut Option<(u32, i32)>,
+        consumer: &mut Option<(u32, i32)>,
+    ) {
+        match &node.payload {
+            DistributedNodeKind::HashAggregate(aggregate) if !aggregate.group_by.is_empty() => {
+                assert!(
+                    producer.replace((node.fragment_id, node.node_id)).is_none(),
+                    "live TopN fixture has one producer aggregate"
+                );
+            }
+            DistributedNodeKind::Scan(_) => {
+                assert!(
+                    consumer.replace((node.fragment_id, node.node_id)).is_none(),
+                    "live TopN fixture has one source scan"
+                );
+            }
+            _ => {}
+        }
+        for child in &node.children {
+            walk(child, producer, consumer);
+        }
+    }
+    let mut producer = None;
+    let mut consumer = None;
+    for fragment in fragments {
+        walk(&fragment.root, &mut producer, &mut consumer);
+    }
+    (
+        producer.expect("live TopN producer aggregate location"),
+        consumer.expect("live TopN consumer scan location"),
+    )
+}
+
+fn attach_topn_binding(node: &mut DistributedNode, location: (u32, i32), binding: BindingId) {
+    if (node.fragment_id, node.node_id) == location {
+        node.runtime_filter_binding_ids.push(binding);
+        node.runtime_filter_binding_ids.sort_unstable();
+        node.runtime_filter_binding_ids.dedup();
+    }
+    for child in &mut node.children {
+        attach_topn_binding(child, location, binding);
+    }
+}
+
+fn topn_runtime_filter_graph(
+    producer: (u32, i32),
+    consumer: (u32, i32),
+    deadline_ms: u64,
+) -> RuntimeFilterGraph {
+    let keys = vec![OrderKeyContract {
+        data_type: DataType::Int32,
+        direction: SortDirection::Ascending,
+        null_order: NullOrder::Last,
+    }];
+    let comparator_digest = crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+        &keys,
+        crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+    );
+    let contributions = BTreeSet::from([
+        ContributionKind::OrderedBoundUpdate,
+        ContributionKind::ProducerClosed,
+    ]);
+    let capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
+    let coverage = Coverage::Leaf(TOPN_WITNESS);
+    let mut graph = RuntimeFilterGraph::default();
+    graph
+        .insert_channel(RuntimeFilterChannelSpec {
+            channel_id: TOPN_CHANNEL,
+            logical_domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
+                keys,
+                inclusive: true,
+                comparator_digest,
+            }),
+            lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
+            availability_coverage: coverage.clone(),
+            terminal_coverage: coverage,
+            reduction_requirement: ReductionRequirement::TightenOrderedBound,
+            allowed_contribution_kinds: contributions.clone(),
+            required_consumer_capabilities: capabilities.clone(),
+            policy: RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 4096,
+                deadline_ms,
+                max_retries: 2,
+            },
+        })
+        .expect("insert live TopN channel");
+    graph
+        .insert_binding(RuntimeFilterBindingSpec {
+            binding_id: TOPN_PRODUCER_BINDING,
+            channel_id: TOPN_CHANNEL,
+            coverage_witness_id: Some(TOPN_WITNESS),
+            location: PlanLocation {
+                fragment_id: PlanFragmentId::new(producer.0),
+                node_id: PlanNodeId::new(producer.1),
+            },
+            expression: topn_column_expr(1, Some("source"), "k"),
+            apply_point: ApplyPoint::NodeOutput,
+            role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                contribution_kinds: contributions,
+                completion_requirement: CompletionRequirement::ProducerClosed,
+                target:
+                    crate::runtime_filter::model::graph::ProducerBindingTarget::AggregateTopNKey {
+                        group_key_ordinal: 0,
+                        limit: NonZeroU32::new(TOPN_LIMIT).unwrap(),
+                    },
+            }),
+        })
+        .expect("insert live TopN producer");
+    graph
+        .insert_binding(RuntimeFilterBindingSpec {
+            binding_id: TOPN_CONSUMER_BINDING,
+            channel_id: TOPN_CHANNEL,
+            coverage_witness_id: None,
+            location: PlanLocation {
+                fragment_id: PlanFragmentId::new(consumer.0),
+                node_id: PlanNodeId::new(consumer.1),
+            },
+            expression: topn_column_expr(1, Some("source"), "k"),
+            apply_point: ApplyPoint::NodeInput,
+            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                capabilities,
+                activation: ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Split,
+                },
+                target: ConsumerBindingTarget::SourceBoundary,
+            }),
+        })
+        .expect("insert live TopN consumer");
+    graph
+}
+
+fn sealed_topn_plan(
+    files: &[IcebergDataFileInfo],
+    remote: bool,
+    runtime_filter: bool,
+    deadline_ms: u64,
+) -> crate::sql::planner::distributed::DistributedPlan {
+    let physical = topn_physical_plan(files, remote);
+    let base = crate::sql::planner::distributed::build::build_distributed_plan(&physical)
+        .expect("build live TopN distributed plan");
+    if !runtime_filter {
+        return base;
+    }
+    let mut draft = draft_builder_from_plan(&base);
+    let (producer, consumer) = find_topn_binding_locations(draft.fragments());
+    *draft.runtime_filter_graph_mut() = topn_runtime_filter_graph(producer, consumer, deadline_ms);
+    for fragment in draft.fragments_mut() {
+        attach_topn_binding(&mut fragment.root, producer, TOPN_PRODUCER_BINDING);
+        attach_topn_binding(&mut fragment.root, consumer, TOPN_CONSUMER_BINDING);
+    }
+    draft
+        .seal()
+        .expect("explicit live TopN fixture passes the production plan seal")
+}
+
+struct TopNNodeEvidence {
+    participant: RuntimeFilterParticipantId,
+    pending_transport: usize,
+    envelopes: Vec<TopNAdmittedEnvelopeEvidence>,
+    transport_events: Vec<TopNTransportEventEvidence>,
+    events: Vec<RuntimeFilterEvent>,
+}
+
+struct LiveTopNRun {
+    outcome: CoordinatedQueryResult,
+    observations: Vec<TopNInstallObservation>,
+    node_evidence: Vec<TopNNodeEvidence>,
+    hub_snapshot_empty: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopNAdmittedEnvelopeEvidence {
+    route_edge_id: RouteEdgeId,
+    target: RuntimeFilterRouteRole,
+    kind: RuntimeFilterEnvelopeKind,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopNTransportEventEvidence {
+    route_edge_id: RouteEdgeId,
+    kind: TransportEventKind,
+    bytes: usize,
+}
+
+fn has_accepted_data_frame(
+    admitted: &[TopNAdmittedEnvelopeEvidence],
+    transport_events: &[TopNTransportEventEvidence],
+    route_edge_id: RouteEdgeId,
+    kind: RuntimeFilterEnvelopeKind,
+) -> bool {
+    admitted.iter().any(|envelope| {
+        envelope.route_edge_id == route_edge_id
+            && envelope.kind == kind
+            && envelope.bytes > 0
+            && transport_events.iter().any(|event| {
+                event.route_edge_id == route_edge_id
+                    && event.kind == TransportEventKind::Sent
+                    && event.bytes == envelope.bytes
+            })
+            && transport_events.iter().any(|event| {
+                event.route_edge_id == route_edge_id
+                    && event.kind == TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted)
+                    && event.bytes == envelope.bytes
+            })
+    })
+}
+
+fn has_deadline_failed_open(
+    transport_events: &[TopNTransportEventEvidence],
+    route_edge_ids: &BTreeSet<RouteEdgeId>,
+) -> bool {
+    transport_events.iter().any(|event| {
+        route_edge_ids.contains(&event.route_edge_id)
+            && event.kind == TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline)
+    })
+}
+
+fn topn_success_order_is_valid(
+    availability_position: usize,
+    terminal_positions: &[usize],
+    completed_position: usize,
+    expected_terminals: usize,
+) -> bool {
+    terminal_positions.len() == expected_terminals
+        && terminal_positions
+            .iter()
+            .any(|position| *position > availability_position)
+        && terminal_positions
+            .iter()
+            .all(|position| *position < completed_position)
+}
+
+#[test]
+fn live_topn_remote_data_ack_requires_route_kind_and_nonzero_frame_bytes() {
+    let route = RouteEdgeId::new(900);
+    let admitted = vec![TopNAdmittedEnvelopeEvidence {
+        route_edge_id: route,
+        target: RuntimeFilterRouteRole::Aggregator,
+        kind: RuntimeFilterEnvelopeKind::Contribution,
+        bytes: 37,
+    }];
+    let terminal_only = vec![
+        TopNTransportEventEvidence {
+            route_edge_id: route,
+            kind: TransportEventKind::Sent,
+            bytes: 0,
+        },
+        TopNTransportEventEvidence {
+            route_edge_id: route,
+            kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
+            bytes: 0,
+        },
+    ];
+    assert!(
+        !has_accepted_data_frame(
+            &admitted,
+            &terminal_only,
+            route,
+            RuntimeFilterEnvelopeKind::Contribution,
+        ),
+        "a zero-byte ProducerClosed ACK cannot prove Contribution delivery"
+    );
+}
+
+#[test]
+fn live_topn_remote_failure_evidence_requires_the_target_compiled_route() {
+    let target = RouteEdgeId::new(901);
+    let unrelated = vec![TopNTransportEventEvidence {
+        route_edge_id: RouteEdgeId::new(902),
+        kind: TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline),
+        bytes: 37,
+    }];
+    assert!(
+        !has_deadline_failed_open(&unrelated, &BTreeSet::from([target])),
+        "a different route cannot prove the redirected compiled route failed open"
+    );
+}
+
+#[test]
+fn live_topn_remote_completion_order_requires_early_availability_and_late_completion() {
+    assert!(!topn_success_order_is_valid(9, &[1, 2, 3], 10, 3));
+    assert!(!topn_success_order_is_valid(1, &[2, 8, 9], 7, 3));
+    assert!(topn_success_order_is_valid(1, &[2, 8, 9], 10, 3));
+}
+
+fn run_live_topn(
+    backend_count: usize,
+    runtime_filter: bool,
+    deadline_ms: u64,
+    fail_remote_transport: bool,
+) -> LiveTopNRun {
+    let _serial = LIVE_CONFORMANCE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let remote = backend_count > 1;
+    let files = LocalTopNFiles::new(remote);
+    let mut nodes = (0..backend_count)
+        .map(|index| {
+            IndependentGrpcRuntimeFilterNode::start()
+                .unwrap_or_else(|error| panic!("start live TopN BE {index}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    let endpoints = nodes.iter().map(|node| node.endpoint()).collect::<Vec<_>>();
+    let backends = LiveBackendSnapshot::new(endpoints.iter().copied().enumerate().collect());
+    let sealed = sealed_topn_plan(&files.files, remote, runtime_filter, deadline_ms);
+    let mut connectors = crate::connector::ConnectorRegistry::new();
+    connectors.register_scan_planner(Arc::new(
+        crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+    ));
+    let prepared = crate::coordinator::prepare::prepare_fragments(&sealed, &connectors, None)
+        .expect("prepare live TopN fragments");
+    let bundle = crate::protocol::native::encode::encode_native_fragment_bundle(&sealed, &prepared)
+        .expect("encode live TopN native bundle");
+    let scheduler = Arc::new(FragmentScheduler::from_live_backend_snapshot(
+        backends.clone(),
+    ));
+    let dispatcher: Arc<dyn FragmentDispatcher> = Arc::new(
+        RemoteDispatcher::new_with_backend_ids_and_rpc_timeout_for_test(
+            backends.entries(),
+            MAX_WAIT,
+        )
+        .expect("create live TopN dispatcher"),
+    );
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let failed_remote_endpoint = fail_remote_transport.then(|| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve an unavailable live TopN transport endpoint");
+        let endpoint = RuntimeEndpoint::from_socket_addr(
+            listener
+                .local_addr()
+                .expect("read unavailable live TopN endpoint"),
+        );
+        drop(listener);
+        endpoint
+    });
+    let control = Arc::new(TopNRecordingDeploymentControl {
+        inner: Arc::new(
+            GrpcRuntimeFilterDeploymentControl::new(backends.entries())
+                .expect("create live TopN deployment control"),
+        ),
+        observations: Arc::clone(&observations),
+        failed_remote_endpoint,
+    });
+    let mut ports = CoordinatorExecutionPorts::new(
+        dispatcher,
+        RuntimeEndpoint::from_socket_addr(endpoints[0]),
+        Arc::new(RecordingCoordinatorObserver::default()),
+        control,
+    );
+    ports.runtime_filter_policy_provider =
+        Arc::new(NativeRuntimeFilterDeploymentPolicyProvider::new(2));
+    let options = QueryOptions {
+        query_timeout: Some(10),
+        query_delivery_timeout: Some(5),
+        runtime_filter_wait_timeout_ms: Some(5_000),
+        pipeline_dop: Some(1),
+        connector_io_tasks_per_scan_operator: Some(1),
+        enable_profile: true,
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let outcome = ExecutionCoordinator::new(prepared, bundle, ports, scheduler, Some(options))
+        .execute_with_profiles_for_test()
+        .unwrap_or_else(|error| panic!("execute production-shaped live TopN: {error}"));
+    assert!(
+        started.elapsed() <= Duration::from_secs(10),
+        "live TopN execution exceeded ten seconds"
+    );
+    let observations = observations.lock().unwrap().clone();
+    let mut node_evidence = Vec::new();
+    let mut hub_snapshot_empty = true;
+    if let Some(first) = observations.first() {
+        let query_id = QueryId {
+            hi: first.query_id.hi,
+            lo: first.query_id.lo,
+        };
+        let services = nodes
+            .iter()
+            .map(|node| {
+                node.manager()
+                    .runtime_filter_service_for_ingress(query_id)
+                    .expect("completed live TopN retains query Service evidence")
+            })
+            .collect::<Vec<_>>();
+        let drain_deadline = Instant::now() + MAX_WAIT;
+        while services
+            .iter()
+            .any(|service| service.transport_pending_len_for_test() != 0)
+            && Instant::now() < drain_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for service in services {
+            let events = service.lifecycle_events_for_test();
+            let participant = events
+                .iter()
+                .find_map(|event| match event {
+                    RuntimeFilterEvent::DeploymentInstalled { participant_id, .. } => {
+                        Some(*participant_id)
+                    }
+                    _ => None,
+                })
+                .expect("installed service records its authoritative participant");
+            let transport_events = events
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeFilterEvent::TransportEnvelope {
+                        identity,
+                        kind,
+                        bytes,
+                    } => Some(TopNTransportEventEvidence {
+                        route_edge_id: identity.route_edge_id(),
+                        kind: *kind,
+                        bytes: *bytes,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            node_evidence.push(TopNNodeEvidence {
+                participant,
+                pending_transport: service.transport_pending_len_for_test(),
+                envelopes: service
+                    .admitted_transport_envelopes_for_test()
+                    .into_iter()
+                    .map(|(route, envelope)| TopNAdmittedEnvelopeEvidence {
+                        route_edge_id: route.route_edge_id(),
+                        target: route.target_role(),
+                        kind: envelope.kind(),
+                        bytes: envelope.payload().len(),
+                    })
+                    .collect(),
+                transport_events,
+                events,
+            });
+        }
+        let query = QueryKey::from_hi_lo(first.query_id.hi, first.query_id.lo);
+        if let Some(snapshot) = RuntimeFilterLifecycleRegistry::global().snapshot(query) {
+            hub_snapshot_empty = snapshot.filters.is_empty();
+        }
+        RuntimeFilterLifecycleRegistry::global().remove_query(query);
+    }
+    for node in &mut nodes {
+        node.shutdown().expect("shutdown live TopN BE");
+    }
+    LiveTopNRun {
+        outcome,
+        observations,
+        node_evidence,
+        hub_snapshot_empty,
+    }
+}
+
+fn topn_result_values(outcome: &CoordinatedQueryResult) -> Vec<i32> {
+    outcome
+        .query_result
+        .chunks
+        .iter()
+        .flat_map(|chunk| {
+            chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("live TopN returns Int32")
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn topn_counter(profiles: &[RuntimeProfileTree], name: &str) -> i64 {
+    fn sum(node: &ProfileNode, name: &str) -> i64 {
+        node.counters
+            .iter()
+            .filter(|counter| counter.name == name)
+            .map(|counter| counter.value)
+            .sum::<i64>()
+            + node
+                .children
+                .iter()
+                .map(|child| sum(child, name))
+                .sum::<i64>()
+    }
+    profiles
+        .iter()
+        .map(|profile| sum(&profile.root, name))
+        .sum()
+}
+
+fn assert_live_topn_common(on: &LiveTopNRun, off: &LiveTopNRun, expected: &[i32]) {
+    assert_eq!(topn_result_values(&on.outcome), expected);
+    assert_eq!(
+        topn_result_values(&on.outcome),
+        topn_result_values(&off.outcome),
+        "runtime filtering does not change the query fingerprint"
+    );
+    assert!(
+        topn_counter(
+            &on.outcome.fragment_profiles,
+            "NativeOrderedRuntimeFilterLatePrunedUnits"
+        ) > 0,
+        "the live ordered consumer prunes at least one unopened scan unit"
+    );
+    assert!(
+        on.hub_snapshot_empty,
+        "native TopN never records legacy Hub activity"
+    );
+    assert!(
+        on.observations.iter().all(|observation| {
+            observation.install.core_view().channels()[&TOPN_CHANNEL]
+                .allowed_contribution_kinds()
+                .contains(&ContributionKind::OrderedBoundUpdate)
+                && !observation.install.core_view().channels()[&TOPN_CHANNEL]
+                    .allowed_contribution_kinds()
+                    .contains(&ContributionKind::TopKSummary)
+        }),
+        "installed channels accept OrderedBound updates and reject TopKSummary"
+    );
+    assert!(
+        on.node_evidence
+            .iter()
+            .all(|evidence| evidence.pending_transport == 0),
+        "all reliable transports drain"
+    );
+}
+
+#[test]
+fn live_topn_loopback_executes_aggregate_service_and_live_scan_chain() {
+    let on = run_live_topn(1, true, 5_000, false);
+    let off = run_live_topn(1, false, 5_000, false);
+    assert_live_topn_common(&on, &off, &[5, 20]);
+    let events = &on
+        .node_evidence
+        .first()
+        .expect("loopback service evidence")
+        .events;
+    let first_idle = events
+        .iter()
+        .position(|event| matches!(event, RuntimeFilterEvent::LiveSubscriptionIdle { .. }))
+        .expect("scan polls before the first TopN version");
+    let first_publish = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeFilterEvent::LogicalVersionPublished { version, .. }
+                    if version.get() == 1
+            )
+        })
+        .expect("N candidates publish v1");
+    assert!(
+        first_idle < first_publish,
+        "the live scan makes progress without waiting for v1"
+    );
+    for version in [1, 2] {
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RuntimeFilterEvent::LiveSubscriptionUpdated {
+                    version: observed,
+                    ..
+                } if observed.get() == version
+            )),
+            "the loopback scan consumer observes v{version}"
+        );
+    }
+    assert!(on.observations.iter().any(|observation| {
+        observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+            .outbound_edges()
+            .iter()
+            .any(|edge| {
+                matches!(
+                    edge.peer(),
+                    crate::runtime_filter::port::routing::RuntimeFilterRoutePeer::Loopback
+                )
+            })
+    }));
+}
+
+#[test]
+fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
+    let on = run_live_topn(3, true, 5_000, false);
+    let off = run_live_topn(3, false, 5_000, false);
+    assert_live_topn_common(&on, &off, &[1, 2]);
+    assert_eq!(on.node_evidence.len(), 3);
+    let aggregator_install = on
+        .observations
+        .iter()
+        .find(|observation| {
+            observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+                .outbound_edges()
+                .iter()
+                .any(|edge| {
+                    edge.source().participant_id() == observation.participant
+                        && matches!(edge.source().role(), RuntimeFilterRouteRole::Aggregator)
+                })
+        })
+        .expect("one participant owns the ordered aggregate");
+    let aggregator_evidence = on
+        .node_evidence
+        .iter()
+        .find(|evidence| evidence.participant == aggregator_install.participant)
+        .expect("aggregate owner service evidence");
+    let remote_producer_routes = on
+        .observations
+        .iter()
+        .flat_map(|observation| {
+            observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+                .outbound_edges()
+                .iter()
+                .filter_map(|edge| {
+                    (edge.source().participant_id() == observation.participant
+                        && edge.source().participant_id() != edge.target().participant_id()
+                        && matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
+                        && matches!(
+                            edge.source().role(),
+                            RuntimeFilterRouteRole::Producer(TOPN_PRODUCER_BINDING)
+                        )
+                        && edge.target().role() == RuntimeFilterRouteRole::Aggregator)
+                        .then_some((observation.participant, edge.route_edge_id()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remote_producer_routes.len(),
+        2,
+        "the compiler emits two cross-participant producer-to-aggregate routes"
+    );
+    for (participant, route_edge_id) in &remote_producer_routes {
+        let evidence = on
+            .node_evidence
+            .iter()
+            .find(|evidence| evidence.participant == *participant)
+            .expect("remote producer service evidence");
+        assert!(
+            evidence.envelopes.iter().any(|envelope| {
+                envelope.route_edge_id == *route_edge_id
+                    && envelope.target == RuntimeFilterRouteRole::Aggregator
+                    && envelope.kind == RuntimeFilterEnvelopeKind::ProducerClosed
+                    && envelope.bytes == 0
+            }),
+            "remote producer sends its terminal on the same compiled route"
+        );
+        assert!(
+            evidence.transport_events.iter().any(|event| {
+                event.route_edge_id == *route_edge_id
+                    && event.kind == TransportEventKind::Sent
+                    && event.bytes == 0
+            }) && evidence.transport_events.iter().any(|event| {
+                event.route_edge_id == *route_edge_id
+                    && event.kind == TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted)
+                    && event.bytes == 0
+            }),
+            "remote ProducerClosed frame is sent and ACKed on its compiled route"
+        );
+    }
+    assert!(
+        remote_producer_routes
+            .iter()
+            .any(|(participant, route_edge_id)| {
+                on.node_evidence
+                    .iter()
+                    .find(|evidence| evidence.participant == *participant)
+                    .is_some_and(|evidence| {
+                        has_accepted_data_frame(
+                            &evidence.envelopes,
+                            &evidence.transport_events,
+                            *route_edge_id,
+                            RuntimeFilterEnvelopeKind::Contribution,
+                        )
+                    })
+            }),
+        "a nonterminal Contribution has a Sent/Accepted lifecycle correlated by compiled route and nonzero frame bytes"
+    );
+    let remote_artifact_routes = aggregator_install.install.routing_shard().channels()
+        [&TOPN_CHANNEL]
+        .outbound_edges()
+        .iter()
+        .filter_map(|edge| {
+            (matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
+                && edge.source().participant_id() != edge.target().participant_id()
+                && matches!(edge.source().role(), RuntimeFilterRouteRole::Aggregator)
+                && matches!(edge.target().role(), RuntimeFilterRouteRole::Consumer(_)))
+            .then_some(edge.route_edge_id())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !remote_artifact_routes.is_empty(),
+        "the same consumer implementation receives a remote aggregate artifact"
+    );
+    assert!(
+        remote_artifact_routes.iter().any(|route_edge_id| {
+            [
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+            ]
+            .into_iter()
+            .any(|kind| {
+                has_accepted_data_frame(
+                    &aggregator_evidence.envelopes,
+                    &aggregator_evidence.transport_events,
+                    *route_edge_id,
+                    kind,
+                )
+            })
+        }),
+        "an Artifact/FinalArtifact has a Sent/Accepted lifecycle correlated by compiled route and nonzero frame bytes"
+    );
+    let expected_instances = aggregator_install.install.core_view().channels()[&TOPN_CHANNEL]
+        .producers()[&TOPN_PRODUCER_BINDING]
+        .expected_fragment_instances()
+        .clone();
+    let expected_producers = expected_instances.len();
+    assert_eq!(
+        expected_producers, 3,
+        "the installed completion contract requires all three producers"
+    );
+    let availability_position = aggregator_evidence
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeFilterEvent::OrderedAvailabilityReached { identity }
+                    if identity.channel_id() == TOPN_CHANNEL
+            )
+        })
+        .expect("one sound producer contribution reaches availability");
+    let terminal_admissions = aggregator_evidence
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            let RuntimeFilterEvent::ProducerInstanceClosed { identity } = event else {
+                return None;
+            };
+            (identity.common().channel_id() == TOPN_CHANNEL
+                && identity.producer_binding_id() == TOPN_PRODUCER_BINDING)
+                .then_some((position, identity.fragment_instance_id()))
+        })
+        .collect::<Vec<_>>();
+    let terminal_positions = terminal_admissions
+        .iter()
+        .map(|(position, _)| *position)
+        .collect::<Vec<_>>();
+    let terminal_instances = terminal_admissions
+        .iter()
+        .map(|(_, fragment_instance_id)| *fragment_instance_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        terminal_instances, expected_instances,
+        "aggregate owner admits exactly the compiler-required producer instances"
+    );
+    let completed_position = aggregator_evidence
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeFilterEvent::ChannelCompleted { identity, .. }
+                    if identity.channel_id() == TOPN_CHANNEL
+            )
+        })
+        .expect("aggregate owner completes");
+    assert!(
+        topn_success_order_is_valid(
+            availability_position,
+            &terminal_positions,
+            completed_position,
+            expected_producers,
+        ),
+        "availability precedes a remaining producer close and ChannelCompleted follows all three ProducerInstanceClosed admissions: availability={availability_position} terminals={terminal_positions:?} completed={completed_position} expected={expected_producers}"
+    );
+    assert!(
+        on.node_evidence
+            .iter()
+            .flat_map(|evidence| &evidence.events)
+            .all(|event| !matches!(event, RuntimeFilterEvent::TopKSummaryApplied { .. })),
+        "no TopKSummary contribution enters the live TopN chain"
+    );
+}
+
+#[test]
+fn live_topn_remote_timeout_fails_open_with_correct_results() {
+    let timed_out = run_live_topn(3, true, 500, true);
+    let off = run_live_topn(3, false, 5_000, false);
+    assert_eq!(
+        topn_result_values(&timed_out.outcome),
+        topn_result_values(&off.outcome),
+        "deadline failure leaves the live scan in pass-through mode"
+    );
+    let failed_remote_routes = timed_out
+        .observations
+        .iter()
+        .flat_map(|observation| {
+            observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+                .outbound_edges()
+                .iter()
+                .filter_map(|edge| {
+                    (edge.source().participant_id() == observation.participant
+                        && edge.source().participant_id() != edge.target().participant_id()
+                        && matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. }))
+                    .then_some(edge.route_edge_id())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !failed_remote_routes.is_empty(),
+        "failure fixture redirects compiler-produced remote routes"
+    );
+    assert!(
+        timed_out
+            .node_evidence
+            .iter()
+            .any(|evidence| has_deadline_failed_open(
+                &evidence.transport_events,
+                &failed_remote_routes,
+            )),
+        "a redirected compiler-produced route reaches exact Deadline FailedOpen"
+    );
 }

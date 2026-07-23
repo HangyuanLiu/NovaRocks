@@ -16,8 +16,8 @@
 // under the License.
 use crate::exec::expr::ExprArena;
 use crate::exec::node::aggregate::{
-    AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, StreamingPreaggregationMode,
-    TopNRuntimeFilterSpec,
+    AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
+    StreamingPreaggregationMode, TopNRuntimeFilterSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::runtime_filter::RuntimeFilterType;
@@ -321,7 +321,9 @@ pub(crate) fn lower_aggregate_node(
                 need_finalize: agg.need_finalize,
                 input_is_intermediate,
                 output_chunk_schema,
-                topn_rf_specs,
+                runtime_filter_spec: AggregateRuntimeFilterSpec::Compat {
+                    legacy_topn_specs: topn_rf_specs,
+                },
                 streaming_preaggregation_mode,
             }),
         },
@@ -557,4 +559,148 @@ fn pack_struct_inputs(
         struct_type,
     );
     Ok(vec![struct_expr])
+}
+
+#[cfg(all(test, feature = "compat"))]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+
+    use super::lower_aggregate_node;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::aggregate::AggregateRuntimeFilterSpec;
+    use crate::exec::node::values::ValuesNode;
+    use crate::exec::node::{ExecNode, ExecNodeKind};
+    use crate::protocol::common::error::FieldPath;
+    use crate::protocol::starrocks::decode::layout::Layout;
+    use crate::protocol::starrocks::decode::node::Lowered;
+    use crate::runtime::query_options::QueryOptions;
+    use crate::thrift::{descriptors, plan_nodes};
+
+    fn empty_plan_node() -> plan_nodes::TPlanNode {
+        plan_nodes::TPlanNode::new(
+            20,
+            plan_nodes::TPlanNodeType::AGGREGATION_NODE,
+            1,
+            -1,
+            vec![],
+            vec![],
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn compat_aggregate_lowering_builds_only_legacy_runtime_filter_variant() {
+        let mut node = empty_plan_node();
+        node.agg_node = Some(plan_nodes::TAggregationNode::new(
+            None,
+            Vec::new(),
+            0,
+            0,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Vec::new()),
+            None,
+        ));
+        let layout = Layout {
+            order: Vec::new(),
+            index: HashMap::new(),
+        };
+        let schema = Arc::new(Schema::empty());
+        let child = Lowered {
+            node: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: Chunk::new_with_chunk_schema(
+                        RecordBatch::new_empty(schema),
+                        Arc::new(ChunkSchema::empty()),
+                    ),
+                    node_id: 10,
+                }),
+            },
+            layout: layout.clone(),
+        };
+        let descriptors = descriptors::TDescriptorTable::new(Vec::new(), Vec::new(), None, None);
+
+        let lowered = lower_aggregate_node(
+            child,
+            &node,
+            &mut ExprArena::default(),
+            Some(&descriptors),
+            &QueryOptions::default(),
+            &layout,
+            None,
+            None,
+            FieldPath::root("plan_node"),
+        )
+        .expect("compat aggregate lowering");
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("compat aggregate node")
+        };
+        let AggregateRuntimeFilterSpec::Compat { legacy_topn_specs } =
+            aggregate.runtime_filter_spec
+        else {
+            panic!("compat lowering must never construct native aggregate producer specs")
+        };
+        assert!(legacy_topn_specs.is_empty());
+    }
 }

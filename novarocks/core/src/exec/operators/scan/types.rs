@@ -41,6 +41,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SCAN_DEPENDENCY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+pub(super) const NATIVE_ORDERED_LATE_PRUNED_UNITS: &str =
+    "NativeOrderedRuntimeFilterLatePrunedUnits";
 
 struct ScanBufferState {
     queue: VecDeque<Chunk>,

@@ -418,8 +418,8 @@ mod tests {
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
+    use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime::runtime_state::RuntimeState;
@@ -810,7 +810,10 @@ mod tests {
                         ])),
                         &[SlotId::new(1), SlotId::new(2)],
                     ),
-                    topn_rf_specs: Vec::new(),
+                    runtime_filter_spec:
+                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
+                            topn_producers: Vec::new(),
+                        },
                     streaming_preaggregation_mode: None,
                 }),
             },
@@ -1948,7 +1951,10 @@ mod tests {
                         ])),
                         &[SlotId::new(3), SlotId::new(4)],
                     ),
-                    topn_rf_specs: Vec::new(),
+                    runtime_filter_spec:
+                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
+                            topn_producers: Vec::new(),
+                        },
                     streaming_preaggregation_mode: None,
                 }),
             },

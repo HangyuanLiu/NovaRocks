@@ -17,11 +17,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use arrow::datatypes::DataType;
+
+use super::common::column_def_data_type;
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
-use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
+use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningMetadata};
 use crate::connector::iceberg::scan_model::IcebergColumnStats;
 use crate::fs::scan_context::FileScanRange;
 use crate::proto::plan;
@@ -37,6 +40,7 @@ use crate::runtime::scan_range::{
 pub(super) fn decode_file_scan_ranges(
     node_id: i32,
     table: &plan::IcebergTableInfo,
+    table_columns: &[plan::ColumnDef],
     ranges: &[ScanRangeParams],
 ) -> Result<Vec<FileScanRange>, NativeFragmentLeafDecodeError> {
     Ok(ranges
@@ -51,7 +55,7 @@ pub(super) fn decode_file_scan_ranges(
             if range.empty.unwrap_or(false) {
                 Ok(None)
             } else {
-                decode_file_scan_range(node_id, table, idx, range)
+                decode_file_scan_range(node_id, table, table_columns, idx, range)
                     .map_err(|error| error.prepend_index(idx).prepend_field("ranges"))
                     .map(Some)
             }
@@ -63,6 +67,7 @@ pub(super) fn decode_file_scan_ranges(
 fn decode_file_scan_range(
     node_id: i32,
     table: &plan::IcebergTableInfo,
+    table_columns: &[plan::ColumnDef],
     idx: usize,
     range: &ScanRangeParams,
 ) -> Result<FileScanRange, NativeFragmentLeafDecodeError> {
@@ -146,6 +151,7 @@ fn decode_file_scan_range(
             node_id,
             idx,
             table,
+            table_columns,
             file.file_pruning_min_max_values.as_ref(),
         )?,
     })
@@ -164,6 +170,7 @@ fn file_pruning_metadata_from_assignment(
     node_id: i32,
     range_idx: usize,
     table: &plan::IcebergTableInfo,
+    table_columns: &[plan::ColumnDef],
     values: Option<&BTreeMap<i32, FilePruningMinMaxValue>>,
 ) -> Result<Option<IcebergFilePruningMetadata>, NativeFragmentLeafDecodeError> {
     let Some(values) = values else {
@@ -173,6 +180,7 @@ fn file_pruning_metadata_from_assignment(
         return Ok(None);
     };
     let mut columns = HashMap::new();
+    let mut null_states = HashMap::new();
     for (ordinal, value) in values {
         let ordinal_usize = usize::try_from(*ordinal).map_err(|_| {
             NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::OutOfRange, "file_pruning_min_max_values", format!(
@@ -189,8 +197,20 @@ fn file_pruning_metadata_from_assignment(
                 ),
             ));
         };
-        let Some(stats) =
-            column_stats_from_min_max_value(node_id, range_idx, value).map_err(|error| {
+        let Some(column) = table_columns
+            .iter()
+            .find(|column| column.name == field.name)
+        else {
+            continue;
+        };
+        // The wire kind deliberately omits integer/float width. Restore it only
+        // from the authoritative ScanNode table type; missing or incompatible
+        // type evidence omits optional pruning metadata and keeps the file.
+        let Ok(data_type) = column_def_data_type(column) else {
+            continue;
+        };
+        let Some(stats) = column_stats_from_min_max_value(node_id, range_idx, value, &data_type)
+            .map_err(|error| {
                 NativeFragmentLeafDecodeError::at_field(
                     ProtocolErrorKind::InvalidValue,
                     "file_pruning_min_max_values",
@@ -200,12 +220,20 @@ fn file_pruning_metadata_from_assignment(
         else {
             continue;
         };
+        if let Some(null_state) =
+            IcebergFileNullState::from_wire_flags(value.has_null, value.all_null)
+        {
+            null_states.insert(field.name.clone(), null_state);
+        }
         columns.insert(field.name.clone(), stats);
     }
     if columns.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(IcebergFilePruningMetadata { columns }))
+        Ok(Some(IcebergFilePruningMetadata {
+            columns,
+            null_states,
+        }))
     }
 }
 
@@ -213,9 +241,13 @@ fn column_stats_from_min_max_value(
     node_id: i32,
     range_idx: usize,
     value: &FilePruningMinMaxValue,
+    data_type: &DataType,
 ) -> Result<Option<IcebergColumnStats>, String> {
     let (lower_bound, upper_bound) = match value.value_kind {
         FilePruningValueKind::Bool => {
+            if data_type != &DataType::Boolean {
+                return Ok(None);
+            }
             let lower = bool_bound_to_byte(value.min_int_value.ok_or_else(|| {
                 format!(
                     "ScanNode node_id={node_id} range {range_idx} bool file pruning min_int_value missing"
@@ -228,26 +260,25 @@ fn column_stats_from_min_max_value(
             })?)?;
             (vec![lower], vec![upper])
         }
-        FilePruningValueKind::Int => (
-            value
-                .min_int_value
-                .ok_or_else(|| {
-                    format!(
-                        "ScanNode node_id={node_id} range {range_idx} int file pruning min_int_value missing"
-                    )
-                })?
-                .to_le_bytes()
-                .to_vec(),
-            value
-                .max_int_value
-                .ok_or_else(|| {
-                    format!(
-                        "ScanNode node_id={node_id} range {range_idx} int file pruning max_int_value missing"
-                    )
-                })?
-                .to_le_bytes()
-                .to_vec(),
-        ),
+        FilePruningValueKind::Int => {
+            let lower = value.min_int_value.ok_or_else(|| {
+                format!(
+                    "ScanNode node_id={node_id} range {range_idx} int file pruning min_int_value missing"
+                )
+            })?;
+            let upper = value.max_int_value.ok_or_else(|| {
+                format!(
+                    "ScanNode node_id={node_id} range {range_idx} int file pruning max_int_value missing"
+                )
+            })?;
+            let Some(lower) = int_bound_bytes(lower, data_type) else {
+                return Ok(None);
+            };
+            let Some(upper) = int_bound_bytes(upper, data_type) else {
+                return Ok(None);
+            };
+            (lower, upper)
+        }
         FilePruningValueKind::Float => {
             let lower = value.min_float_value.ok_or_else(|| {
                 format!(
@@ -262,17 +293,50 @@ fn column_stats_from_min_max_value(
             if lower.is_nan() || upper.is_nan() {
                 return Ok(None);
             }
-            (lower.to_le_bytes().to_vec(), upper.to_le_bytes().to_vec())
+            let Some(lower) = float_bound_bytes(lower, data_type) else {
+                return Ok(None);
+            };
+            let Some(upper) = float_bound_bytes(upper, data_type) else {
+                return Ok(None);
+            };
+            (lower, upper)
         }
     };
 
     Ok(Some(IcebergColumnStats {
-        null_count: Some(if value.has_null { 1 } else { 0 }),
+        null_count: None,
         value_count: None,
         column_size: None,
         lower_bound: Some(lower_bound),
         upper_bound: Some(upper_bound),
     }))
+}
+
+fn int_bound_bytes(value: i64, data_type: &DataType) -> Option<Vec<u8>> {
+    match data_type {
+        DataType::Int16 => i16::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .ok(),
+        DataType::Int32 => i32::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .ok(),
+        DataType::Int64 => Some(value.to_le_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+fn float_bound_bytes(value: f64, data_type: &DataType) -> Option<Vec<u8>> {
+    match data_type {
+        DataType::Float32 => {
+            let narrowed = value as f32;
+            if f64::from(narrowed) != value {
+                return None;
+            }
+            Some(narrowed.to_le_bytes().to_vec())
+        }
+        DataType::Float64 => Some(value.to_le_bytes().to_vec()),
+        _ => None,
+    }
 }
 
 fn bool_bound_to_byte(value: i64) -> Result<u8, String> {

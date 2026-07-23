@@ -20,12 +20,13 @@ use super::super::runtime_filter::{
     encode_runtime_filter_binding_table, encode_runtime_filter_capability,
     encode_runtime_filter_completion, encode_runtime_filter_contribution_kind,
     encode_runtime_filter_membership_contract, encode_runtime_filter_ordered_contract,
-    encode_runtime_filter_topk_reduction,
+    encode_runtime_filter_producer_target, encode_runtime_filter_topk_reduction,
 };
 use super::*;
 use crate::runtime_filter::model::contract::{
     NullOrder, OrderContract, OrderKeyContract, SortDirection, TopKSummaryRequirement,
 };
+use crate::runtime_filter::model::graph::ProducerBindingTarget;
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 use crate::sql::analysis::{ExprKind, TypedExpr};
@@ -53,6 +54,34 @@ fn full_plan_encoding_requires_prepared_runtime_filter_binding_tables() {
     assert_eq!(
         error,
         "native distributed plan encoding requires prepared runtime filter binding tables"
+    );
+}
+
+#[test]
+fn producer_binding_target_encoder_rejects_ordinal_overflow() {
+    let join_error = encode_runtime_filter_producer_target(
+        17,
+        ProducerBindingTarget::JoinBuildKey {
+            ordinal: usize::MAX,
+        },
+    )
+    .expect_err("join ordinal overflow must fail");
+    assert!(
+        join_error.contains("ordinal does not fit u32"),
+        "{join_error}"
+    );
+
+    let aggregate_error = encode_runtime_filter_producer_target(
+        18,
+        ProducerBindingTarget::AggregateTopNKey {
+            group_key_ordinal: usize::MAX,
+            limit: std::num::NonZeroU32::new(7).unwrap(),
+        },
+    )
+    .expect_err("aggregate ordinal overflow must fail");
+    assert!(
+        aggregate_error.contains("group key ordinal does not fit u32"),
+        "{aggregate_error}"
     );
 }
 

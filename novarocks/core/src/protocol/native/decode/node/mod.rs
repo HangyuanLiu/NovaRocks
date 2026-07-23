@@ -37,6 +37,7 @@ mod topn;
 mod values;
 mod window;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ use super::runtime_filter::{
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+use crate::exec::node::aggregate::{AggregateRuntimeFilterSpec, NativeAggregateTopNProducerSpec};
 use crate::exec::node::join::{JoinRuntimeFilterExecution, NativeJoinRuntimeFilterProducerSpec};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::runtime_filter::{
@@ -68,7 +70,7 @@ use crate::runtime::fragment::instance::{
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
-use std::cell::RefCell;
+use crate::runtime_filter::model::graph::ProducerBindingTarget;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedNode {
@@ -450,8 +452,9 @@ fn decode_node_inner(
     if children_are_absent(node) && !consumer_bindings.is_empty() {
         attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
     }
+    let mut lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
-        attach_hash_join_producers(
+        attach_producers(
             node,
             &producer_bindings,
             &direct_inputs,
@@ -460,7 +463,6 @@ fn decode_node_inner(
             path.clone(),
         )?;
     }
-    let lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if let Some(ledger) = ledger {
         ledger
             .commit_consumed_many(&node.runtime_filter_binding_ids)
@@ -756,24 +758,75 @@ fn find_exchange_source_mut(
     }
 }
 
-fn attach_hash_join_producers(
+fn attach_producers(
     wire_node: &plan::DistributedNode,
     bindings: &[DecodedRuntimeFilterBinding],
     direct_inputs: &[(Layout, ChunkSchemaRef)],
     lowered: &mut DecodedNode,
-    _arena: &mut ExprArena,
+    arena: &mut ExprArena,
     path: FieldPath,
 ) -> Result<(), super::NativeFragmentDecodeError> {
-    let binding_path = path.clone().field("runtime_filter_binding_ids");
-    let ExecNodeKind::Join(join) = &mut lowered.node.kind else {
-        return Err(super::NativeFragmentDecodeError::inconsistent(
-            binding_path,
+    let payload = wire_node.payload.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("payload"),
             format!(
-                "native runtime-filter producer binding is only supported on HashJoin, node_id={}",
+                "native runtime-filter producer node_id={} payload missing",
+                wire_node.node_id
+            ),
+        )
+    })?;
+    let plan::distributed_node::Payload::Physical(physical) = payload else {
+        return Err(super::NativeFragmentDecodeError::inconsistent(
+            path.clone().field("runtime_filter_binding_ids"),
+            format!(
+                "native runtime-filter producer node_id={} must target a physical HashJoin or HashAggregate",
                 wire_node.node_id
             ),
         ));
     };
+    match physical.kind.as_ref() {
+        Some(plan::plan_node::Kind::HashJoin(wire_join)) => {
+            attach_hash_join_producers(wire_node, wire_join, bindings, direct_inputs, lowered, path)
+        }
+        Some(plan::plan_node::Kind::HashAggregate(wire_aggregate)) => {
+            attach_hash_aggregate_producers(
+                wire_node,
+                wire_aggregate,
+                bindings,
+                direct_inputs,
+                lowered,
+                arena,
+                path,
+            )
+        }
+        kind => Err(super::NativeFragmentDecodeError::inconsistent(
+            path.field("runtime_filter_binding_ids"),
+            format!(
+                "native runtime-filter producer node_id={} must target a physical HashJoin or HashAggregate, got {kind:?}",
+                wire_node.node_id
+            ),
+        )),
+    }
+}
+
+fn attach_hash_join_producers(
+    wire_node: &plan::DistributedNode,
+    wire_join: &plan::HashJoinNode,
+    bindings: &[DecodedRuntimeFilterBinding],
+    direct_inputs: &[(Layout, ChunkSchemaRef)],
+    lowered: &mut DecodedNode,
+    path: FieldPath,
+) -> Result<(), super::NativeFragmentDecodeError> {
+    let binding_path = path.clone().field("runtime_filter_binding_ids");
+    let join = find_hash_join_mut(&mut lowered.node, wire_node.node_id).ok_or_else(|| {
+        super::NativeFragmentDecodeError::inconsistent(
+            binding_path.clone(),
+            format!(
+                "native runtime-filter producer binding is only supported on HashJoin, node_id={}",
+                wire_node.node_id
+            ),
+        )
+    })?;
     if direct_inputs.len() != 2 {
         return Err(super::NativeFragmentDecodeError::inconsistent(
             binding_path,
@@ -789,42 +842,12 @@ fn attach_hash_join_producers(
         1
     };
     let (build_layout, build_schema) = &direct_inputs[build_input_index];
-    let payload = wire_node.payload.as_ref().ok_or_else(|| {
-        super::NativeFragmentDecodeError::missing(
-            path.clone().field("payload"),
-            format!(
-                "native HashJoin node_id={} payload missing",
-                wire_node.node_id
-            ),
-        )
-    })?;
-    let plan::distributed_node::Payload::Physical(physical) = payload else {
-        return Err(super::NativeFragmentDecodeError::inconsistent(
-            path.clone().field("payload"),
-            format!(
-                "native runtime-filter producer node_id={} is not physical HashJoin",
-                wire_node.node_id
-            ),
-        ));
-    };
-    let Some(plan::plan_node::Kind::HashJoin(wire_join)) = physical.kind.as_ref() else {
-        return Err(super::NativeFragmentDecodeError::inconsistent(
-            path.clone()
-                .field("payload")
-                .field("physical")
-                .field("kind"),
-            format!(
-                "native runtime-filter producer node_id={} is not HashJoin",
-                wire_node.node_id
-            ),
-        ));
-    };
     let mut producers = Vec::with_capacity(bindings.len());
     for binding in bindings {
         let DecodedBindingRole::Producer {
             contribution_kinds,
             completion_requirement,
-            join_key_ordinal,
+            target,
         } = &binding.role
         else {
             return Err(super::NativeFragmentDecodeError::inconsistent(
@@ -835,7 +858,18 @@ fn attach_hash_join_producers(
                 ),
             ));
         };
-        let build_key_index = *join_key_ordinal;
+        let ProducerBindingTarget::JoinBuildKey {
+            ordinal: build_key_index,
+        } = *target
+        else {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("runtime_filter_binding_ids"),
+                format!(
+                    "native runtime-filter producer binding_id={} on HashJoin must target a join build key",
+                    binding.binding_id
+                ),
+            ));
+        };
         let join_key_path = path
             .clone()
             .field("payload")
@@ -918,6 +952,212 @@ fn attach_hash_join_producers(
     }
     join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
     Ok(())
+}
+
+fn attach_hash_aggregate_producers(
+    wire_node: &plan::DistributedNode,
+    wire_aggregate: &plan::HashAggregateNode,
+    bindings: &[DecodedRuntimeFilterBinding],
+    direct_inputs: &[(Layout, ChunkSchemaRef)],
+    lowered: &mut DecodedNode,
+    arena: &ExprArena,
+    path: FieldPath,
+) -> Result<(), super::NativeFragmentDecodeError> {
+    let binding_path = path.clone().field("runtime_filter_binding_ids");
+    let [(input_layout, input_schema)] = direct_inputs else {
+        return Err(super::NativeFragmentDecodeError::inconsistent(
+            binding_path,
+            format!(
+                "native HashAggregate node_id={} missing one direct input",
+                wire_node.node_id
+            ),
+        ));
+    };
+    let aggregate =
+        find_hash_aggregate_mut(&mut lowered.node, wire_node.node_id).ok_or_else(|| {
+            super::NativeFragmentDecodeError::inconsistent(
+                path.clone()
+                    .field("payload")
+                    .field("physical")
+                    .field("hash_aggregate"),
+                format!(
+                    "native HashAggregate node_id={} lowering lost its physical aggregate owner",
+                    wire_node.node_id
+                ),
+            )
+        })?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut producers = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let DecodedBindingRole::Producer {
+            contribution_kinds,
+            completion_requirement,
+            target,
+        } = &binding.role
+        else {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                binding_path.clone(),
+                format!(
+                    "native runtime-filter binding_id={} expected producer role",
+                    binding.binding_id
+                ),
+            ));
+        };
+        let ProducerBindingTarget::AggregateTopNKey {
+            group_key_ordinal,
+            limit,
+        } = *target
+        else {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                binding_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} on HashAggregate must target an aggregate TopN key",
+                    binding.binding_id
+                ),
+            ));
+        };
+        if !seen.insert((binding.binding_id, group_key_ordinal)) {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                binding_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} duplicates aggregate TopN group key ordinal={group_key_ordinal}",
+                    binding.binding_id
+                ),
+            ));
+        }
+        let group_key_path = path
+            .clone()
+            .field("payload")
+            .field("physical")
+            .field("hash_aggregate")
+            .field("group_by")
+            .index(group_key_ordinal);
+        let raw_group_key = wire_aggregate
+            .group_by
+            .get(group_key_ordinal)
+            .ok_or_else(|| {
+                super::NativeFragmentDecodeError::inconsistent(
+                    group_key_path.clone(),
+                    format!(
+                        "native runtime-filter producer binding_id={} targets missing aggregate group key ordinal={group_key_ordinal}, key_count={}",
+                        binding.binding_id,
+                        wire_aggregate.group_by.len()
+                    ),
+                )
+            })?;
+        if raw_group_key != &binding.expression {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                group_key_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} expression does not match aggregate group key ordinal={group_key_ordinal}",
+                    binding.binding_id
+                ),
+            ));
+        }
+        validate_column_refs_exact(
+            binding.binding_id,
+            raw_group_key,
+            input_layout,
+            input_schema,
+            group_key_path.clone(),
+        )?;
+        let group_key_expr_id =
+            *aggregate
+                .group_by
+                .get(group_key_ordinal)
+                .ok_or_else(|| {
+                    super::NativeFragmentDecodeError::inconsistent(
+                        group_key_path.clone(),
+                        format!(
+                            "native runtime-filter producer binding_id={} lowered aggregate group key ordinal={group_key_ordinal} is missing",
+                            binding.binding_id
+                        ),
+                    )
+                })?;
+        let group_key_type = arena.data_type(group_key_expr_id).ok_or_else(|| {
+            super::NativeFragmentDecodeError::inconsistent(
+                group_key_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} aggregate group key ordinal={group_key_ordinal} has no lowered type",
+                    binding.binding_id
+                ),
+            )
+        })?;
+        let DecodedRuntimeFilterContract::Ordered { keys, .. } = &binding.contract else {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                binding_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} aggregate TopN requires an ordered contract",
+                    binding.binding_id
+                ),
+            ));
+        };
+        if keys.len() != 1 || keys[0].data_type() != group_key_type {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                binding_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} aggregate TopN ordered contract must contain exactly one key matching group key ordinal={group_key_ordinal} type={group_key_type:?}",
+                    binding.binding_id
+                ),
+            ));
+        }
+        if binding.reduction != DecodedRuntimeFilterReduction::TightenOrderedBound {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                binding_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} aggregate TopN requires TightenOrderedBound reduction",
+                    binding.binding_id
+                ),
+            ));
+        }
+        producers.push(NativeAggregateTopNProducerSpec {
+            binding_id: binding.binding_id,
+            channel_id: binding.channel_id,
+            group_key_expr_id,
+            group_key_ordinal,
+            limit,
+            contract: native_contract(&binding.contract),
+            reduction: native_reduction(&binding.reduction),
+            contribution_kinds: contribution_kinds.clone(),
+            completion_requirement: *completion_requirement,
+        });
+    }
+    aggregate.runtime_filter_spec = AggregateRuntimeFilterSpec::Native {
+        topn_producers: producers,
+    };
+    Ok(())
+}
+
+fn find_hash_aggregate_mut(
+    node: &mut ExecNode,
+    node_id: i32,
+) -> Option<&mut crate::exec::node::aggregate::AggregateNode> {
+    match &mut node.kind {
+        ExecNodeKind::Aggregate(aggregate) if aggregate.node_id == node_id => Some(aggregate),
+        ExecNodeKind::Limit(limit) if limit.node_id == node_id => {
+            find_hash_aggregate_mut(&mut limit.input, node_id)
+        }
+        ExecNodeKind::Project(project) if project.is_subordinate && project.node_id == node_id => {
+            find_hash_aggregate_mut(&mut project.input, node_id)
+        }
+        _ => None,
+    }
+}
+
+fn find_hash_join_mut(
+    node: &mut ExecNode,
+    node_id: i32,
+) -> Option<&mut crate::exec::node::join::JoinNode> {
+    match &mut node.kind {
+        ExecNodeKind::Join(join) if join.node_id == node_id => Some(join),
+        ExecNodeKind::Limit(limit) if limit.node_id == node_id => {
+            find_hash_join_mut(&mut limit.input, node_id)
+        }
+        ExecNodeKind::Project(project) if project.is_subordinate && project.node_id == node_id => {
+            find_hash_join_mut(&mut project.input, node_id)
+        }
+        _ => None,
+    }
 }
 
 fn consumer_spec(
@@ -1900,10 +2140,115 @@ mod tests {
                     completion_requirement: i32::from(
                         plan::RuntimeFilterCompletionRequirement::ProducerClosed,
                     ),
-                    join_key_ordinal: Some(join_key_ordinal),
+                    target: Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                        plan::RuntimeFilterJoinBuildKey {
+                            ordinal: join_key_ordinal,
+                        },
+                    )),
                 },
             )),
         }
+    }
+
+    fn ordered_aggregate_topn_producer_wire(
+        binding_id: u32,
+        node_id: i32,
+        expression: expr::Expr,
+        data_type: DataType,
+        group_key_ordinal: u32,
+        limit: u32,
+    ) -> plan::RuntimeFilterBinding {
+        use crate::runtime_filter::model::contract::{
+            NullOrder, OrderContract, OrderKeyContract, SortDirection,
+        };
+        use crate::runtime_filter::port::ordered_bound::{
+            COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
+        };
+
+        let keys = vec![OrderKeyContract {
+            data_type: data_type.clone(),
+            direction: SortDirection::Descending,
+            null_order: NullOrder::First,
+        }];
+        let comparator_digest = comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION);
+        let order = RuntimeOrderContract::try_from_plan(&OrderContract {
+            keys,
+            inclusive: true,
+            comparator_digest,
+        })
+        .expect("canonical ordered contract");
+        plan::RuntimeFilterBinding {
+            binding_id,
+            channel_id: binding_id + 10,
+            node_id,
+            apply_point: i32::from(plan::RuntimeFilterApplyPoint::NodeOutput),
+            expression: Some(expression),
+            contract: Some(plan::RuntimeFilterContract {
+                kind: Some(plan::runtime_filter_contract::Kind::Ordered(
+                    plan::RuntimeFilterOrderedContract {
+                        keys: vec![plan::RuntimeFilterOrderKey {
+                            r#type: Some(type_desc(&data_type)),
+                            direction: i32::from(plan::RuntimeFilterSortDirection::Descending),
+                            null_order: i32::from(plan::RuntimeFilterNullOrder::First),
+                        }],
+                        comparator_digest: comparator_digest.get().to_vec(),
+                        order_contract_digest: order.digest().bytes().to_vec(),
+                    },
+                )),
+            }),
+            reduction: Some(plan::RuntimeFilterReductionContract {
+                kind: Some(
+                    plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(true),
+                ),
+            }),
+            role: Some(plan::runtime_filter_binding::Role::Producer(
+                plan::RuntimeFilterProducerRole {
+                    contribution_kinds: vec![
+                        i32::from(plan::RuntimeFilterContributionKind::OrderedBoundUpdate),
+                        i32::from(plan::RuntimeFilterContributionKind::ProducerClosed),
+                    ],
+                    completion_requirement: i32::from(
+                        plan::RuntimeFilterCompletionRequirement::ProducerClosed,
+                    ),
+                    target: Some(
+                        plan::runtime_filter_producer_role::Target::AggregateTopnKey(
+                            plan::RuntimeFilterAggregateTopNKey {
+                                group_key_ordinal,
+                                limit,
+                            },
+                        ),
+                    ),
+                },
+            )),
+        }
+    }
+
+    fn projected_grouped_aggregate_node(node_id: i32) -> plan::DistributedNode {
+        let group_column = output_column(1, "group_key", DataType::Int64);
+        let count_column = output_column(2, "count", DataType::Int64);
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![column_ref(1, DataType::Int64)],
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "count".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![group_column],
+                    aggregate_columns: vec![count_column.clone()],
+                }),
+                output_columns: vec![count_column.clone()],
+            }),
+            vec![count_column],
+            vec![one_col_values_node(10)],
+        )
     }
 
     fn membership_consumer_wire(
@@ -2225,6 +2570,447 @@ mod tests {
             ledger.finish().is_err(),
             "failed lowering must not consume binding"
         );
+    }
+
+    #[test]
+    fn producer_binding_target_rejects_aggregate_topn_attachment_to_hash_join() {
+        let left = one_col_values_node_with(10, 1, "lhs", 10);
+        let right = one_col_values_node_with(11, 2, "rhs", 20);
+        let mut wire = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: i32::from(plan::JoinKind::Inner),
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: i32::from(plan::JoinDistribution::Broadcast),
+                execution_mode: None,
+            }),
+            Vec::new(),
+            vec![left, right],
+        );
+        wire.runtime_filter_binding_ids = vec![1];
+        let mut producer =
+            membership_producer_wire(1, 30, column_ref(2, DataType::Int64), &DataType::Int64);
+        let Some(plan::runtime_filter_binding::Role::Producer(role)) = producer.role.as_mut()
+        else {
+            unreachable!("membership producer fixture")
+        };
+        role.target = Some(
+            plan::runtime_filter_producer_role::Target::AggregateTopnKey(
+                plan::RuntimeFilterAggregateTopNKey {
+                    group_key_ordinal: 0,
+                    limit: 5,
+                },
+            ),
+        );
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![producer],
+        };
+        let mut ledger = NativeRuntimeFilterDecodeLedger::decode(1, Some(&table))
+            .expect("aggregate producer target is valid on the wire");
+
+        let error = decode_node_with_runtime_filters(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect_err("AggregateTopNKey must not attach to HashJoin");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.runtime_filter_binding_ids"
+        );
+        assert!(
+            protocol
+                .to_string()
+                .contains("HashJoin must target a join build key"),
+            "{protocol}"
+        );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_attaches_after_projected_tree_is_complete() {
+        let mut wire = projected_grouped_aggregate_node(20);
+        wire.runtime_filter_binding_ids = vec![1];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![ordered_aggregate_topn_producer_wire(
+                1,
+                20,
+                column_ref(1, DataType::Int64),
+                DataType::Int64,
+                0,
+                5,
+            )],
+        };
+        let mut ledger =
+            NativeRuntimeFilterDecodeLedger::decode(1, Some(&table)).expect("decode binding table");
+        let mut arena = ExprArena::default();
+
+        let lowered = decode_node_with_runtime_filters(
+            &wire,
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect("valid AggregateTopNKey binding must attach through the projected node tree");
+        ledger.finish().expect("producer binding consumed");
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("visible output must keep its subordinate projection")
+        };
+        let ExecNodeKind::Aggregate(aggregate) = project.input.kind else {
+            panic!("producer must attach to the physical aggregate below the projection")
+        };
+        let AggregateRuntimeFilterSpec::Native { topn_producers } = aggregate.runtime_filter_spec
+        else {
+            panic!("native aggregate runtime-filter execution")
+        };
+        assert_eq!(topn_producers.len(), 1);
+        let spec = &topn_producers[0];
+        assert_eq!(spec.binding_id, 1);
+        assert_eq!(spec.channel_id, 11);
+        assert_eq!(spec.group_key_ordinal, 0);
+        assert_eq!(spec.group_key_expr_id, aggregate.group_by[0]);
+        assert_eq!(
+            arena.data_type(spec.group_key_expr_id),
+            Some(&DataType::Int64)
+        );
+        assert_eq!(spec.limit.get(), 5);
+        let NativeRuntimeFilterContract::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        } = &spec.contract
+        else {
+            panic!("aggregate TopN must keep the ordered contract")
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].data_type(), &DataType::Int64);
+        assert_eq!(
+            keys[0].direction(),
+            crate::runtime_filter::model::contract::SortDirection::Descending
+        );
+        assert_eq!(
+            keys[0].null_order(),
+            crate::runtime_filter::model::contract::NullOrder::First
+        );
+        assert_ne!(*comparator_digest, [0; 32]);
+        assert_ne!(*order_contract_digest, [0; 32]);
+        assert_eq!(
+            spec.reduction,
+            NativeRuntimeFilterReduction::TightenOrderedBound
+        );
+        assert_eq!(
+            spec.contribution_kinds,
+            BTreeSet::from([
+                crate::runtime_filter::model::contract::ContributionKind::OrderedBoundUpdate,
+                crate::runtime_filter::model::contract::ContributionKind::ProducerClosed,
+            ])
+        );
+        assert_eq!(
+            spec.completion_requirement,
+            crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
+        );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_attaches_after_distributed_limit_wrapper_is_complete() {
+        let mut wire = projected_grouped_aggregate_node(20);
+        wire.limit = 7;
+
+        let mut unbound = decode_node(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect("aggregate with a distributed limit");
+        assert!(
+            matches!(unbound.node.kind, ExecNodeKind::Limit(_)),
+            "DistributedNode.limit must be the completed outer wrapper"
+        );
+        assert!(
+            find_hash_aggregate_mut(&mut unbound.node, 20).is_some(),
+            "the controlled aggregate-owner traversal must cross only same-node wrappers"
+        );
+
+        wire.runtime_filter_binding_ids = vec![1];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![ordered_aggregate_topn_producer_wire(
+                1,
+                20,
+                column_ref(1, DataType::Int64),
+                DataType::Int64,
+                0,
+                5,
+            )],
+        };
+        let mut ledger =
+            NativeRuntimeFilterDecodeLedger::decode(1, Some(&table)).expect("decode binding table");
+        let lowered = decode_node_with_runtime_filters(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect("AggregateTopNKey binding must attach after the limit wrapper exists");
+        ledger.finish().expect("producer binding consumed");
+
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("distributed limit must remain the completed outer wrapper")
+        };
+        assert_eq!(limit.limit, Some(7));
+        let ExecNodeKind::Project(project) = limit.input.kind else {
+            panic!("visible-output projection must remain below the limit")
+        };
+        let ExecNodeKind::Aggregate(aggregate) = project.input.kind else {
+            panic!("binding must target the unique physical aggregate below controlled wrappers")
+        };
+        let AggregateRuntimeFilterSpec::Native { topn_producers } = aggregate.runtime_filter_spec
+        else {
+            panic!("native aggregate runtime-filter execution")
+        };
+        assert_eq!(topn_producers.len(), 1);
+        assert_eq!(topn_producers[0].binding_id, 1);
+    }
+
+    fn native_aggregate_topn_binding_error(
+        wire: plan::DistributedNode,
+        binding: plan::RuntimeFilterBinding,
+    ) -> String {
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![binding],
+        };
+        let mut ledger = match NativeRuntimeFilterDecodeLedger::decode(1, Some(&table)) {
+            Ok(ledger) => ledger,
+            Err(error) => return error.to_string(),
+        };
+        decode_node_with_runtime_filters(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect_err("invalid aggregate TopN binding must fail")
+        .to_string()
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_rejects_wrong_owner_targets() {
+        let mut aggregate = projected_grouped_aggregate_node(20);
+        aggregate.runtime_filter_binding_ids = vec![1];
+        let mut aggregate_binding = ordered_aggregate_topn_producer_wire(
+            1,
+            20,
+            column_ref(1, DataType::Int64),
+            DataType::Int64,
+            0,
+            5,
+        );
+        let Some(plan::runtime_filter_binding::Role::Producer(role)) =
+            aggregate_binding.role.as_mut()
+        else {
+            unreachable!("producer fixture")
+        };
+        role.target = Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+            plan::RuntimeFilterJoinBuildKey { ordinal: 0 },
+        ));
+        let error = native_aggregate_topn_binding_error(aggregate, aggregate_binding);
+        assert!(
+            error.contains("HashAggregate must target an aggregate TopN key"),
+            "{error}"
+        );
+
+        let mut values = one_col_values_node(20);
+        values.runtime_filter_binding_ids = vec![1];
+        let error = native_aggregate_topn_binding_error(
+            values,
+            ordered_aggregate_topn_producer_wire(
+                1,
+                20,
+                column_ref(1, DataType::Int64),
+                DataType::Int64,
+                0,
+                5,
+            ),
+        );
+        assert!(
+            error.contains("physical HashJoin or HashAggregate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_rejects_expression_ordinal_and_contract_drift() {
+        let mut aggregate = projected_grouped_aggregate_node(20);
+        aggregate.runtime_filter_binding_ids = vec![1];
+
+        let error = native_aggregate_topn_binding_error(
+            aggregate.clone(),
+            ordered_aggregate_topn_producer_wire(
+                1,
+                20,
+                column_ref(2, DataType::Int64),
+                DataType::Int64,
+                0,
+                5,
+            ),
+        );
+        assert!(
+            error.contains("does not match aggregate group key"),
+            "{error}"
+        );
+
+        let error = native_aggregate_topn_binding_error(
+            aggregate.clone(),
+            ordered_aggregate_topn_producer_wire(
+                1,
+                20,
+                column_ref(1, DataType::Int64),
+                DataType::Int64,
+                1,
+                5,
+            ),
+        );
+        assert!(error.contains("missing aggregate group key"), "{error}");
+
+        let error = native_aggregate_topn_binding_error(
+            aggregate,
+            ordered_aggregate_topn_producer_wire(
+                1,
+                20,
+                column_ref(1, DataType::Int64),
+                DataType::Utf8,
+                0,
+                5,
+            ),
+        );
+        assert!(
+            error.contains("matching group key")
+                || error.contains("ordered contract")
+                || error.contains("does not match expression type"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_rejects_multi_key_and_topk_contracts() {
+        use crate::runtime_filter::model::contract::{
+            NullOrder, OrderContract, OrderKeyContract, SortDirection, TopKSummaryRequirement,
+        };
+        use crate::runtime_filter::port::ordered_bound::{
+            COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
+        };
+        use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
+
+        let mut aggregate = projected_grouped_aggregate_node(20);
+        aggregate.runtime_filter_binding_ids = vec![1];
+        let mut multi_key = ordered_aggregate_topn_producer_wire(
+            1,
+            20,
+            column_ref(1, DataType::Int64),
+            DataType::Int64,
+            0,
+            5,
+        );
+        let keys = vec![
+            OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Descending,
+                null_order: NullOrder::First,
+            },
+            OrderKeyContract {
+                data_type: DataType::Utf8,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            },
+        ];
+        let comparator_digest = comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION);
+        let order_plan = OrderContract {
+            keys: keys.clone(),
+            inclusive: true,
+            comparator_digest,
+        };
+        let runtime_order =
+            RuntimeOrderContract::try_from_plan(&order_plan).expect("canonical multi-key order");
+        multi_key.contract = Some(plan::RuntimeFilterContract {
+            kind: Some(plan::runtime_filter_contract::Kind::Ordered(
+                plan::RuntimeFilterOrderedContract {
+                    keys: keys
+                        .iter()
+                        .map(|key| plan::RuntimeFilterOrderKey {
+                            r#type: Some(type_desc(&key.data_type)),
+                            direction: i32::from(match key.direction {
+                                SortDirection::Ascending => {
+                                    plan::RuntimeFilterSortDirection::Ascending
+                                }
+                                SortDirection::Descending => {
+                                    plan::RuntimeFilterSortDirection::Descending
+                                }
+                            }),
+                            null_order: i32::from(match key.null_order {
+                                NullOrder::First => plan::RuntimeFilterNullOrder::First,
+                                NullOrder::Last => plan::RuntimeFilterNullOrder::Last,
+                            }),
+                        })
+                        .collect(),
+                    comparator_digest: comparator_digest.get().to_vec(),
+                    order_contract_digest: runtime_order.digest().bytes().to_vec(),
+                },
+            )),
+        });
+        let error = native_aggregate_topn_binding_error(aggregate.clone(), multi_key);
+        assert!(error.contains("exactly one key"), "{error}");
+
+        let mut topk = ordered_aggregate_topn_producer_wire(
+            1,
+            20,
+            column_ref(1, DataType::Int64),
+            DataType::Int64,
+            0,
+            5,
+        );
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::First,
+        }];
+        let order_plan = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        let topk_contract = RuntimeTopKSummaryContract::try_from_plan(
+            &order_plan,
+            TopKSummaryRequirement::try_new(5).expect("nonzero TopK"),
+        )
+        .expect("canonical TopK contract");
+        topk.reduction = Some(plan::RuntimeFilterReductionContract {
+            kind: Some(
+                plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(
+                    plan::RuntimeFilterTopKReduction {
+                        k: 5,
+                        contract_digest: topk_contract.digest().bytes().to_vec(),
+                    },
+                ),
+            ),
+        });
+        let Some(plan::runtime_filter_binding::Role::Producer(role)) = topk.role.as_mut() else {
+            unreachable!("producer fixture")
+        };
+        role.contribution_kinds = vec![
+            i32::from(plan::RuntimeFilterContributionKind::TopkSummary),
+            i32::from(plan::RuntimeFilterContributionKind::ProducerClosed),
+        ];
+        let error = native_aggregate_topn_binding_error(aggregate, topk);
+        assert!(error.contains("requires TightenOrderedBound"), "{error}");
     }
 
     #[test]

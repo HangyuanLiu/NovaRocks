@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 
 use crate::sql::analysis::TypedExpr;
 
@@ -43,7 +44,18 @@ pub(crate) struct RuntimeFilterChannelSpec {
 pub(crate) struct ProducerRequirement {
     pub contribution_kinds: BTreeSet<ContributionKind>,
     pub completion_requirement: CompletionRequirement,
-    pub join_key_ordinal: usize,
+    pub target: ProducerBindingTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProducerBindingTarget {
+    JoinBuildKey {
+        ordinal: usize,
+    },
+    AggregateTopNKey {
+        group_key_ordinal: usize,
+        limit: NonZeroU32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +213,7 @@ impl RuntimeFilterGraph {
 #[cfg(test)]
 pub(super) mod tests {
     use std::collections::BTreeSet;
+    use std::num::NonZeroU32;
 
     use arrow::datatypes::DataType;
 
@@ -215,6 +228,57 @@ pub(super) mod tests {
     };
     use super::super::coverage::Coverage;
     use super::*;
+
+    #[test]
+    fn producer_binding_target_preserves_exact_owner_payloads() {
+        let join = ProducerBindingTarget::JoinBuildKey { ordinal: 7 };
+        let aggregate = ProducerBindingTarget::AggregateTopNKey {
+            group_key_ordinal: 11,
+            limit: NonZeroU32::new(19).unwrap(),
+        };
+
+        assert_eq!(join, ProducerBindingTarget::JoinBuildKey { ordinal: 7 });
+        assert_eq!(
+            aggregate,
+            ProducerBindingTarget::AggregateTopNKey {
+                group_key_ordinal: 11,
+                limit: NonZeroU32::new(19).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn producer_binding_target_variants_are_not_interchangeable() {
+        fn join_ordinal(target: ProducerBindingTarget) -> Option<usize> {
+            match target {
+                ProducerBindingTarget::JoinBuildKey { ordinal } => Some(ordinal),
+                ProducerBindingTarget::AggregateTopNKey { .. } => None,
+            }
+        }
+
+        fn aggregate_key(target: ProducerBindingTarget) -> Option<(usize, NonZeroU32)> {
+            match target {
+                ProducerBindingTarget::JoinBuildKey { .. } => None,
+                ProducerBindingTarget::AggregateTopNKey {
+                    group_key_ordinal,
+                    limit,
+                } => Some((group_key_ordinal, limit)),
+            }
+        }
+
+        let join = ProducerBindingTarget::JoinBuildKey { ordinal: 3 };
+        let aggregate = ProducerBindingTarget::AggregateTopNKey {
+            group_key_ordinal: 5,
+            limit: NonZeroU32::new(13).unwrap(),
+        };
+        assert_eq!(join_ordinal(join), Some(3));
+        assert_eq!(aggregate_key(join), None);
+        assert_eq!(join_ordinal(aggregate), None);
+        assert_eq!(
+            aggregate_key(aggregate),
+            Some((5, NonZeroU32::new(13).unwrap()))
+        );
+    }
 
     pub(crate) fn expression() -> TypedExpr {
         TypedExpr {
@@ -310,6 +374,7 @@ pub(super) mod tests {
         witness_id: CoverageWitnessId,
         contribution_kinds: BTreeSet<ContributionKind>,
         completion_requirement: CompletionRequirement,
+        target: ProducerBindingTarget,
     ) -> RuntimeFilterBindingSpec {
         RuntimeFilterBindingSpec {
             binding_id,
@@ -324,7 +389,7 @@ pub(super) mod tests {
             role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                 contribution_kinds,
                 completion_requirement,
-                join_key_ordinal: 0,
+                target,
             }),
         }
     }
@@ -367,6 +432,7 @@ pub(super) mod tests {
                 ContributionKind::ProducerClosed,
             ]),
             CompletionRequirement::ProducerClosed,
+            ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
         )
     }
 

@@ -30,16 +30,21 @@
 
 use super::dispatch::ScanDispatchState;
 use super::types::{
-    PushResult, ScanAsyncState, ScanRuntimeFilterProbe, SharedRuntimeFilterDecision,
+    NATIVE_ORDERED_LATE_PRUNED_UNITS, PushResult, ScanAsyncState, ScanRuntimeFilterProbe,
+    SharedRuntimeFilterDecision,
 };
 use crate::common::failpoint;
 use crate::connector::iceberg::equality_delete::{EqualityDeleteSet, equality_delete_keep_mask};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema, hydrate_dictionary_columns_except};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode, ScanOp};
+use crate::exec::node::scan::{
+    RuntimeFilterContext, ScanMorsel, ScanMorselPruneDecision, ScanNode, ScanOp,
+};
 use crate::exec::operators::FilterEncodingPolicy;
-use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
+use crate::exec::operators::runtime_filter::{
+    NativeOrderedLiveConsumerSet, NativeRuntimeFilterConsumerSet,
+};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::exec::row_position::LakeRowPositionSpec;
@@ -140,6 +145,7 @@ pub(super) struct ScanAsyncRunner {
     runtime_filter_ctx: Option<Arc<RuntimeFilterContext>>,
     runtime_filters_loaded: bool,
     native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
+    native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
     conjunct_predicate: Option<ExprId>,
     conjunct_encoding_policy: Option<FilterEncodingPolicy>,
     arena: Arc<ExprArena>,
@@ -153,6 +159,7 @@ pub(super) struct ScanAsyncRunner {
     iceberg_virtual_state: Option<IcebergVirtualState>,
     iceberg_delete_filter_state: Option<IcebergDeleteFilterState>,
     iceberg_include_position_filter_state: Option<IcebergIncludePositionFilterState>,
+    late_pruned_units: u64,
 }
 
 struct RowPositionState {
@@ -317,6 +324,7 @@ impl ScanAsyncRunner {
         runtime_filter_exprs: HashMap<i32, ExprId>,
         runtime_filters_expected: usize,
         native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
+        native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
         arena: Arc<ExprArena>,
         profiles: Option<crate::runtime::profile::OperatorProfiles>,
         driver_id: i32,
@@ -344,6 +352,7 @@ impl ScanAsyncRunner {
             runtime_filter_ctx: None,
             runtime_filters_loaded: false,
             native_runtime_filter_consumers,
+            native_ordered_live_consumers,
             arena,
             profiles,
             last_progress: Instant::now(),
@@ -355,6 +364,7 @@ impl ScanAsyncRunner {
             iceberg_virtual_state: None,
             iceberg_delete_filter_state: None,
             iceberg_include_position_filter_state: None,
+            late_pruned_units: 0,
         }
     }
 
@@ -363,6 +373,13 @@ impl ScanAsyncRunner {
         handles: HashMap<i32, RfLifecycleHandle>,
     ) {
         self.runtime_filter_lifecycle_handles = handles;
+    }
+
+    pub(super) fn set_native_ordered_live_consumers(
+        &mut self,
+        consumers: Option<NativeOrderedLiveConsumerSet>,
+    ) {
+        self.native_ordered_live_consumers = consumers;
     }
 
     fn record_runtime_filter_acquired(&self, outcome: &str, latency_ns: i64) {
@@ -579,6 +596,32 @@ impl ScanAsyncRunner {
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
+                let late_prune = match self.native_ordered_live_consumers.as_ref() {
+                    Some(consumers) => {
+                        let is_file_range = matches!(&morsel, ScanMorsel::FileRange { .. });
+                        consumers.poll_and_prune_morsel(|slot_id, predicate| {
+                            if !is_file_range {
+                                return Ok(ScanMorselPruneDecision::Keep);
+                            }
+                            self.op.late_prune_morsel_with_ordered_predicate(
+                                &morsel, slot_id, predicate,
+                            )
+                        })?
+                    }
+                    None => ScanMorselPruneDecision::Keep,
+                };
+                if late_prune == ScanMorselPruneDecision::Skip {
+                    self.late_pruned_units = self.late_pruned_units.saturating_add(1);
+                    if let Some(profiles) = self.profiles.as_ref() {
+                        profiles.common.counter_add(
+                            NATIVE_ORDERED_LATE_PRUNED_UNITS,
+                            ProfileUnit::Unit,
+                            1,
+                        );
+                    }
+                    self.last_progress = Instant::now();
+                    continue;
+                }
                 self.current_morsel = Some(morsel.clone());
                 self.row_position_state = self.build_row_position_state(&morsel)?;
                 self.lake_row_position_state = self.build_lake_row_position_state(&morsel);
@@ -613,6 +656,9 @@ impl ScanAsyncRunner {
             match next {
                 Some(Ok(chunk)) => {
                     self.last_progress = Instant::now();
+                    if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
+                        consumers.poll_updates()?;
+                    }
                     failpoint::sleep_if_triggered(
                         failpoint::SCAN_CHUNK_SLEEP_AFTER_READ,
                         Duration::from_millis(25),
@@ -631,6 +677,14 @@ impl ScanAsyncRunner {
                         self.append_iceberg_virtual_columns(chunk, kept_positions.as_deref())?;
                     let chunk = self.append_row_position_columns(chunk)?;
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
+                        continue;
+                    };
+                    let Some(chunk) = (match self.native_ordered_live_consumers.as_ref() {
+                        Some(consumers) => {
+                            consumers.apply_latest_chunk_profiled(chunk, self.profiles.as_ref())?
+                        }
+                        None => Some(chunk),
+                    }) else {
                         continue;
                     };
                     let Some(chunk) = (match self.native_runtime_filter_consumers.as_ref() {
@@ -692,6 +746,11 @@ impl ScanAsyncRunner {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn late_pruned_units_for_test(&self) -> u64 {
+        self.late_pruned_units
     }
 
     fn apply_conjunct_predicate(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
@@ -1723,10 +1782,16 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, ConsumerActivation, LateApplyGranularity,
+    };
+    use crate::runtime_filter::port::artifact::ArtifactBundle;
+    use crate::runtime_filter::port::identity::LogicalVersion;
+    use crate::runtime_filter::port::subscription::{LivePollOutcome, NonBlockingLiveSubscription};
     use arrow::array::{Array, DictionaryArray, Int8Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::thread;
 
     /// Helper: call the production synthesis helper from a RecordBatch fixture.
@@ -1966,6 +2031,205 @@ mod tests {
         observed_min_max_counts: Arc<Mutex<Vec<usize>>>,
     }
 
+    struct ControllableOrderedLiveSubscription {
+        latest: Mutex<Option<Arc<ArtifactBundle>>>,
+        polls: AtomicUsize,
+    }
+
+    struct PublishedBlockingSubscription(Arc<ArtifactBundle>);
+
+    impl crate::runtime_filter::port::subscription::BlockingSnapshotSubscription
+        for PublishedBlockingSubscription
+    {
+        fn acquire(
+            &self,
+            _timeout: Duration,
+        ) -> crate::runtime_filter::port::subscription::ArtifactAcquireOutcome {
+            crate::runtime_filter::port::subscription::ArtifactAcquireOutcome::Published(
+                Arc::clone(&self.0),
+            )
+        }
+
+        fn snapshot(&self) -> Option<Arc<ArtifactBundle>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    impl ControllableOrderedLiveSubscription {
+        fn new() -> Self {
+            Self {
+                latest: Mutex::new(None),
+                polls: AtomicUsize::new(0),
+            }
+        }
+
+        fn publish(&self, bundle: Arc<ArtifactBundle>) {
+            *self.latest.lock().expect("ordered live latest lock") = Some(bundle);
+        }
+
+        fn poll_count(&self) -> usize {
+            self.polls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl NonBlockingLiveSubscription for ControllableOrderedLiveSubscription {
+        fn snapshot(&self) -> Option<Arc<ArtifactBundle>> {
+            self.latest
+                .lock()
+                .expect("ordered live latest lock")
+                .clone()
+        }
+
+        fn poll_after(&self, observed: Option<LogicalVersion>) -> LivePollOutcome {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            let latest = self
+                .latest
+                .lock()
+                .expect("ordered live latest lock")
+                .clone();
+            match latest {
+                Some(bundle) if observed.is_none_or(|observed| bundle.version() > observed) => {
+                    LivePollOutcome::Updated {
+                        bundle,
+                        terminal: None,
+                    }
+                }
+                Some(bundle) => LivePollOutcome::Idle {
+                    latest_version: Some(bundle.version()),
+                    terminal: None,
+                },
+                None => LivePollOutcome::Idle {
+                    latest_version: None,
+                    terminal: None,
+                },
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct OrderedLatePruneScanOp {
+        morsels: Vec<ScanMorsel>,
+        rows: Arc<HashMap<String, Vec<i64>>>,
+        exact_bounds: Arc<HashMap<String, (i64, i64)>>,
+        executed_paths: Arc<Mutex<Vec<String>>>,
+        publish_after_skip: Option<(
+            Arc<ControllableOrderedLiveSubscription>,
+            Arc<ArtifactBundle>,
+        )>,
+    }
+
+    #[derive(Clone)]
+    struct NonFileSkipScanOp {
+        executed: Arc<Mutex<bool>>,
+    }
+
+    impl ScanOp for NonFileSkipScanOp {
+        fn execute_iter(
+            &self,
+            morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&RuntimeFilterContext>,
+        ) -> Result<BoxedExecIter, String> {
+            if !matches!(morsel, ScanMorsel::Schema { .. }) {
+                return Err("non-file skip fixture expected Schema morsel".to_string());
+            }
+            *self.executed.lock().expect("non-file executed lock") = true;
+            let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
+            let chunk_schema =
+                ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[SlotId::new(1)])?;
+            let chunk = Chunk::try_new_with_columns(
+                chunk_schema,
+                vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+            )?;
+            Ok(Box::new(std::iter::once(Ok(chunk))))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            Ok(ScanMorsels::new(
+                vec![ScanMorsel::Schema {
+                    table_name: "non-file".to_string(),
+                }],
+                false,
+            ))
+        }
+
+        fn late_prune_morsel_with_ordered_predicate(
+            &self,
+            _morsel: &ScanMorsel,
+            _slot_id: SlotId,
+            _predicate: &crate::runtime_filter::exec::ordered_range_predicate::
+                NativeOrderedRangePredicate,
+        ) -> Result<crate::exec::node::scan::ScanMorselPruneDecision, String> {
+            Ok(crate::exec::node::scan::ScanMorselPruneDecision::Skip)
+        }
+    }
+
+    impl ScanOp for OrderedLatePruneScanOp {
+        fn execute_iter(
+            &self,
+            morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&RuntimeFilterContext>,
+        ) -> Result<BoxedExecIter, String> {
+            let ScanMorsel::FileRange { path, .. } = morsel else {
+                return Err("ordered late-prune fixture expected FileRange".to_string());
+            };
+            self.executed_paths
+                .lock()
+                .expect("ordered late-prune executed lock")
+                .push(path.clone());
+            let values = self
+                .rows
+                .get(&path)
+                .cloned()
+                .ok_or_else(|| format!("missing ordered late-prune rows for {path}"))?;
+            let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
+            let chunk_schema =
+                ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[SlotId::new(1)])?;
+            let chunk = Chunk::try_new_with_columns(
+                chunk_schema,
+                vec![Arc::new(Int64Array::from(values)) as ArrayRef],
+            )?;
+            Ok(Box::new(std::iter::once(Ok(chunk))))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            Ok(ScanMorsels::new(self.morsels.clone(), false))
+        }
+
+        fn late_prune_morsel_with_ordered_predicate(
+            &self,
+            morsel: &ScanMorsel,
+            slot_id: SlotId,
+            predicate: &crate::runtime_filter::exec::ordered_range_predicate::
+                NativeOrderedRangePredicate,
+        ) -> Result<crate::exec::node::scan::ScanMorselPruneDecision, String> {
+            use crate::exec::node::scan::ScanMorselPruneDecision;
+
+            if slot_id != SlotId::new(1) {
+                return Ok(ScanMorselPruneDecision::Keep);
+            }
+            let ScanMorsel::FileRange { path, .. } = morsel else {
+                return Ok(ScanMorselPruneDecision::Keep);
+            };
+            let Some((lower, upper)) = self.exact_bounds.get(path) else {
+                return Ok(ScanMorselPruneDecision::Keep);
+            };
+            let candidates = Int64Array::from(vec![*lower, *upper]);
+            let mask = predicate
+                .evaluate(&candidates)
+                .map_err(|error| error.to_string())?;
+            if mask.iter().all(|value| value != Some(true)) {
+                if let Some((subscription, bundle)) = self.publish_after_skip.as_ref() {
+                    subscription.publish(bundle.clone());
+                }
+                Ok(ScanMorselPruneDecision::Skip)
+            } else {
+                Ok(ScanMorselPruneDecision::Keep)
+            }
+        }
+    }
+
     impl ScanOp for RuntimeFilterRecordingScanOp {
         fn execute_iter(
             &self,
@@ -2104,6 +2368,70 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
+    fn ordered_live_spec(
+        arena: &mut ExprArena,
+        order: &Arc<crate::runtime_filter::port::ordered_bound::RuntimeOrderContract>,
+        late_apply: LateApplyGranularity,
+    ) -> crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec {
+        use crate::exec::node::runtime_filter::{
+            NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
+            NativeRuntimeFilterReduction,
+        };
+
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        NativeRuntimeFilterConsumerSpec {
+            binding_id: 2,
+            channel_id: 7,
+            expr_id,
+            activation: ConsumerActivation::NonBlockingLive { late_apply },
+            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
+            contract: NativeRuntimeFilterContract::Ordered {
+                keys: order.keys().to_vec().into(),
+                comparator_digest: order.plan_comparator_digest().get(),
+                order_contract_digest: order.digest().bytes(),
+            },
+            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+        }
+    }
+
+    fn ordered_live_bundle(
+        order: Arc<crate::runtime_filter::port::ordered_bound::RuntimeOrderContract>,
+        version: u64,
+        bound: i64,
+    ) -> Arc<ArtifactBundle> {
+        crate::runtime_filter::exec::ordered_range_predicate::tests_support::bundle(
+            order,
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64(bound)),
+            LogicalVersion::new(version),
+        )
+    }
+
+    fn ordered_file_morsel(path: &str) -> ScanMorsel {
+        ScanMorsel::FileRange {
+            path: path.to_string(),
+            file_len: 1024,
+            offset: 0,
+            length: 1024,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        }
+    }
+
+    fn int64_values(chunk: &Chunk) -> Vec<i64> {
+        chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values")
+            .values()
+            .to_vec()
+    }
+
     fn dictionary_status_chunk(keys: Vec<Option<i32>>, values: Arc<StringArray>) -> Chunk {
         let dict = Arc::new(
             DictionaryArray::<Int32Type>::try_new(Int32Array::from(keys), values)
@@ -2230,6 +2558,348 @@ mod tests {
             .expect("min/max filter")
     }
 
+    #[test]
+    fn native_scan_ordered_live_skips_only_unopened_morsels_and_uses_latest_chunk_bound() {
+        use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
+
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        );
+        let subscription = Arc::new(ControllableOrderedLiveSubscription::new());
+        let mut arena = ExprArena::default();
+        let spec = ordered_live_spec(&mut arena, &order, LateApplyGranularity::Split);
+        let arena = Arc::new(arena);
+        let typed: Arc<dyn NonBlockingLiveSubscription> = subscription.clone();
+        let consumers =
+            crate::exec::operators::runtime_filter::NativeOrderedLiveConsumerSet::
+                from_bound_for_test(vec![spec], Arc::clone(&arena), vec![typed]);
+
+        let executed_paths = Arc::new(Mutex::new(Vec::new()));
+        let v2 = ordered_live_bundle(order.clone(), 2, 3);
+        let op: Arc<dyn ScanOp> = Arc::new(OrderedLatePruneScanOp {
+            morsels: vec![
+                ordered_file_morsel("first"),
+                ordered_file_morsel("second"),
+                ordered_file_morsel("third"),
+            ],
+            rows: Arc::new(HashMap::from([
+                ("first".to_string(), vec![1, 8]),
+                ("second".to_string(), vec![10, 20]),
+                ("third".to_string(), vec![2, 4, 9]),
+            ])),
+            exact_bounds: Arc::new(HashMap::from([
+                ("first".to_string(), (1, 8)),
+                ("second".to_string(), (10, 20)),
+                ("third".to_string(), (2, 9)),
+            ])),
+            executed_paths: Arc::clone(&executed_paths),
+            publish_after_skip: Some((Arc::clone(&subscription), v2)),
+        });
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_node_id(42)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let morsels = op.build_morsels().expect("build ordered live morsels");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "ordered-live-scan".to_string(),
+            scan,
+            op,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            None,
+            HashMap::new(),
+            0,
+            None,
+            Some(consumers),
+            arena,
+            None,
+            0,
+        );
+
+        let first = runner
+            .next_chunk()
+            .expect("first morsel scan")
+            .expect("first morsel output");
+        assert_eq!(int64_values(&first), vec![1, 8]);
+
+        subscription.publish(ordered_live_bundle(order.clone(), 1, 5));
+        let third = runner
+            .next_chunk()
+            .expect("post-v1 scan")
+            .expect("third morsel output");
+        assert_eq!(int64_values(&third), vec![2]);
+        assert_eq!(
+            *executed_paths.lock().expect("ordered live executed lock"),
+            vec!["first".to_string(), "third".to_string()]
+        );
+        assert_eq!(runner.late_pruned_units_for_test(), 1);
+        assert!(runner.next_chunk().expect("ordered live eof").is_none());
+
+        subscription.publish(ordered_live_bundle(order, 3, 1));
+        assert!(
+            runner
+                .next_chunk()
+                .expect("late artifact after eof")
+                .is_none()
+        );
+        assert_eq!(
+            *executed_paths.lock().expect("ordered live executed lock"),
+            vec!["first".to_string(), "third".to_string()],
+            "already returned data must never be replayed"
+        );
+    }
+
+    #[test]
+    fn native_scan_ordered_live_batch_filters_chunks_before_scan_limit_without_morsel_skip() {
+        use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
+
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        );
+        let subscription = Arc::new(ControllableOrderedLiveSubscription::new());
+        subscription.publish(ordered_live_bundle(order.clone(), 1, 5));
+        let mut arena = ExprArena::default();
+        let spec = ordered_live_spec(&mut arena, &order, LateApplyGranularity::Batch);
+        let arena = Arc::new(arena);
+        let typed: Arc<dyn NonBlockingLiveSubscription> = subscription;
+        let consumers =
+            crate::exec::operators::runtime_filter::NativeOrderedLiveConsumerSet::
+                from_bound_for_test(vec![spec], Arc::clone(&arena), vec![typed]);
+
+        let executed_paths = Arc::new(Mutex::new(Vec::new()));
+        let op: Arc<dyn ScanOp> = Arc::new(OrderedLatePruneScanOp {
+            morsels: vec![
+                ordered_file_morsel("filtered-before-limit"),
+                ordered_file_morsel("limit-output"),
+            ],
+            rows: Arc::new(HashMap::from([
+                ("filtered-before-limit".to_string(), vec![10, 20]),
+                ("limit-output".to_string(), vec![1, 2, 8]),
+            ])),
+            exact_bounds: Arc::new(HashMap::from([
+                ("filtered-before-limit".to_string(), (10, 20)),
+                ("limit-output".to_string(), (1, 8)),
+            ])),
+            executed_paths: Arc::clone(&executed_paths),
+            publish_after_skip: None,
+        });
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_node_id(43)
+            .with_limit(Some(2))
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let morsels = op.build_morsels().expect("build Batch live morsels");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "ordered-live-batch-scan".to_string(),
+            scan,
+            op,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            None,
+            HashMap::new(),
+            0,
+            None,
+            Some(consumers),
+            arena,
+            None,
+            0,
+        );
+
+        let output = runner
+            .next_chunk()
+            .expect("Batch ordered live scan")
+            .expect("post-filter limit output");
+        assert_eq!(int64_values(&output), vec![1, 2]);
+        assert_eq!(
+            *executed_paths.lock().expect("Batch executed lock"),
+            vec![
+                "filtered-before-limit".to_string(),
+                "limit-output".to_string()
+            ],
+            "Batch late apply must not prune unopened FileRange morsels"
+        );
+        assert_eq!(runner.late_pruned_units_for_test(), 0);
+    }
+
+    #[test]
+    fn native_scan_ordered_live_split_never_skips_non_file_morsels() {
+        use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
+
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        );
+        let subscription = Arc::new(ControllableOrderedLiveSubscription::new());
+        subscription.publish(ordered_live_bundle(order.clone(), 1, 5));
+        let mut arena = ExprArena::default();
+        let spec = ordered_live_spec(&mut arena, &order, LateApplyGranularity::Split);
+        let arena = Arc::new(arena);
+        let typed: Arc<dyn NonBlockingLiveSubscription> = subscription;
+        let consumers =
+            crate::exec::operators::runtime_filter::NativeOrderedLiveConsumerSet::
+                from_bound_for_test(vec![spec], Arc::clone(&arena), vec![typed]);
+        let executed = Arc::new(Mutex::new(false));
+        let op: Arc<dyn ScanOp> = Arc::new(NonFileSkipScanOp {
+            executed: Arc::clone(&executed),
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op));
+        let morsels = op.build_morsels().expect("build non-file morsel");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "ordered-live-non-file-scan".to_string(),
+            scan,
+            op,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            None,
+            HashMap::new(),
+            0,
+            None,
+            Some(consumers),
+            arena,
+            None,
+            0,
+        );
+
+        let output = runner
+            .next_chunk()
+            .expect("non-file ordered live scan")
+            .expect("non-file output");
+        assert_eq!(int64_values(&output), vec![1]);
+        assert!(*executed.lock().expect("non-file executed lock"));
+        assert_eq!(runner.late_pruned_units_for_test(), 0);
+    }
+
+    #[test]
+    fn native_scan_ordered_live_polls_every_chunk_before_blocking_native_filter() {
+        use crate::exec::node::runtime_filter::{
+            NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
+            NativeRuntimeFilterReduction,
+        };
+        use crate::runtime_filter::model::contract::{NullOrder, NullSemantics, SortDirection};
+        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+        use crate::runtime_filter::port::subscription::BlockingSnapshotSubscription;
+
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let membership_schema =
+            ArtifactMembershipSchema::new(&DataType::Int32, NullSemantics::NeverMatches)
+                .expect("membership schema");
+        let blocking_spec = NativeRuntimeFilterConsumerSpec {
+            binding_id: 11,
+            channel_id: 7,
+            expr_id,
+            activation: ConsumerActivation::BlockingSnapshot,
+            capabilities: BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            contract: NativeRuntimeFilterContract::Membership {
+                canonical_schema: Arc::from(membership_schema.canonical_bytes()),
+                schema_digest: membership_schema.digest().bytes(),
+            },
+            reduction: NativeRuntimeFilterReduction::SetUnion,
+        };
+        let blocking_subscription: Arc<dyn BlockingSnapshotSubscription> =
+            Arc::new(PublishedBlockingSubscription(
+                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[]),
+            ));
+        let arena = Arc::new(arena);
+        let blocking_consumers =
+            crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet::
+                from_bound_for_test(
+                    vec![blocking_spec],
+                    Arc::clone(&arena),
+                    vec![blocking_subscription],
+                );
+        blocking_consumers
+            .acquire_configured()
+            .expect("acquire empty-domain blocking filter");
+
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Int32,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        );
+        let ordered_spec = NativeRuntimeFilterConsumerSpec {
+            binding_id: 12,
+            channel_id: 7,
+            expr_id,
+            activation: ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
+            contract: NativeRuntimeFilterContract::Ordered {
+                keys: order.keys().to_vec().into(),
+                comparator_digest: order.plan_comparator_digest().get(),
+                order_contract_digest: order.digest().bytes(),
+            },
+            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+        };
+        let live = Arc::new(ControllableOrderedLiveSubscription::new());
+        let typed: Arc<dyn NonBlockingLiveSubscription> = live.clone();
+        let ordered_consumers =
+            crate::exec::operators::runtime_filter::NativeOrderedLiveConsumerSet::
+                from_bound_for_test(
+                    vec![ordered_spec],
+                    Arc::clone(&arena),
+                    vec![typed],
+                );
+        let op: Arc<dyn ScanOp> = Arc::new(ValuesScanOp {
+            values: vec![1, 2],
+            ivm_change_op: None,
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op));
+        let morsels = op.build_morsels().expect("build blocking-filter morsel");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "ordered-live-before-blocking".to_string(),
+            scan,
+            op,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            None,
+            HashMap::new(),
+            0,
+            Some(blocking_consumers),
+            Some(ordered_consumers),
+            arena,
+            None,
+            0,
+        );
+
+        assert!(
+            runner
+                .next_chunk()
+                .expect("blocking native RF scan")
+                .is_none(),
+            "empty-domain blocking filter must remove the chunk"
+        );
+        assert!(
+            live.poll_count() >= 2,
+            "ordered live must poll once for the morsel and again for the new chunk"
+        );
+    }
+
     fn scan_runtime_filter_runner(
         filter_id: i32,
         query_key: QueryKey,
@@ -2264,6 +2934,7 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
             1,
+            None,
             None,
             arena,
             None,
@@ -2315,6 +2986,7 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
             HashMap::from([(filter_id, expr)]),
             1,
+            None,
             None,
             arena,
             None,
@@ -2478,6 +3150,7 @@ mod tests {
             Some(ScanRuntimeFilterProbe::new(probe)),
             runtime_filter_exprs,
             1,
+            None,
             None,
             arena,
             Some(profiles.clone()),
@@ -2767,6 +3440,7 @@ mod tests {
             HashMap::from([(7, expr)]),
             1,
             None,
+            None,
             arena,
             None,
             0,
@@ -2847,6 +3521,7 @@ mod tests {
             None,
             HashMap::from([(7, expr)]),
             1,
+            None,
             None,
             arena,
             None,
@@ -2942,6 +3617,7 @@ mod tests {
             HashMap::new(),
             0,
             None,
+            None,
             Arc::clone(&arena),
             None,
             0,
@@ -2957,6 +3633,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             None,
             arena,
             None,
@@ -3022,6 +3699,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             None,
             arena,
             None,
@@ -3096,6 +3774,7 @@ mod tests {
             HashMap::new(),
             0,
             None,
+            None,
             arena,
             None,
             0,
@@ -3146,6 +3825,7 @@ mod tests {
             None,
             HashMap::new(),
             0,
+            None,
             None,
             arena,
             None,

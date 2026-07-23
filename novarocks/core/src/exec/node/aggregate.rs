@@ -14,10 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
+
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
+use crate::exec::node::runtime_filter::{
+    NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+};
 use crate::exec::runtime_filter::RuntimeFilterType;
+use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug)]
@@ -80,6 +87,30 @@ pub struct TopNRuntimeFilterSpec {
     pub is_nulls_first: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct NativeAggregateTopNProducerSpec {
+    pub(crate) binding_id: u32,
+    pub(crate) channel_id: u32,
+    pub(crate) group_key_expr_id: ExprId,
+    pub(crate) group_key_ordinal: usize,
+    pub(crate) limit: NonZeroU32,
+    pub(crate) contract: NativeRuntimeFilterContract,
+    pub(crate) reduction: NativeRuntimeFilterReduction,
+    pub(crate) contribution_kinds: BTreeSet<ContributionKind>,
+    pub(crate) completion_requirement: CompletionRequirement,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum AggregateRuntimeFilterSpec {
+    Native {
+        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    },
+    #[cfg(feature = "compat")]
+    Compat {
+        legacy_topn_specs: Vec<TopNRuntimeFilterSpec>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamingPreaggregationMode {
     Auto,
@@ -99,6 +130,6 @@ pub struct AggregateNode {
     /// Mixed merge/update aggregates are supported via per-function flags.
     pub input_is_intermediate: bool,
     pub output_chunk_schema: ChunkSchemaRef,
-    pub topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+    pub(crate) runtime_filter_spec: AggregateRuntimeFilterSpec,
     pub streaming_preaggregation_mode: Option<StreamingPreaggregationMode>,
 }

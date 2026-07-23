@@ -31,7 +31,10 @@
 use std::sync::Arc;
 
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::exec::node::aggregate::{AggregateNode, StreamingPreaggregationMode};
+use crate::exec::node::aggregate::{
+    AggregateNode, AggregateRuntimeFilterSpec, NativeAggregateTopNProducerSpec,
+    StreamingPreaggregationMode,
+};
 use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode};
 use crate::exec::node::filter::FilterNode;
@@ -730,6 +733,18 @@ fn native_runtime_filter_context(
     }
 }
 
+fn native_aggregate_topn_context(
+    specs: &[NativeAggregateTopNProducerSpec],
+    execution: &PipelineRuntimeFilterExecution,
+) -> Result<Option<NativeRuntimeFilterExecutionContext>, String> {
+    let Some(spec) = specs.first() else {
+        return Ok(None);
+    };
+    native_runtime_filter_context(execution, spec.binding_id)
+        .cloned()
+        .map(Some)
+}
+
 fn validate_native_producer_specs(
     specs: &[crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec],
     ctx: &PipelineBuildContext,
@@ -784,6 +799,172 @@ fn validate_native_producer_specs(
         }
     }
     Ok(())
+}
+
+fn validate_native_aggregate_topn_specs(
+    specs: &[NativeAggregateTopNProducerSpec],
+    group_by: &[ExprId],
+    ctx: &PipelineBuildContext,
+) -> Result<(), String> {
+    let expected_contributions = std::collections::BTreeSet::from([
+        crate::runtime_filter::model::contract::ContributionKind::OrderedBoundUpdate,
+        crate::runtime_filter::model::contract::ContributionKind::ProducerClosed,
+    ]);
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in specs {
+        if !seen.insert((spec.binding_id, spec.group_key_ordinal)) {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} duplicates group key ordinal={}",
+                spec.binding_id, spec.group_key_ordinal
+            ));
+        }
+    }
+    for spec in specs {
+        let expected_expr = group_by.get(spec.group_key_ordinal).ok_or_else(|| {
+            format!(
+                "native aggregate TopN producer binding_id={} targets missing group key ordinal={}, key_count={}",
+                spec.binding_id,
+                spec.group_key_ordinal,
+                group_by.len()
+            )
+        })?;
+        if *expected_expr != spec.group_key_expr_id {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} expression does not match group key ordinal={}",
+                spec.binding_id, spec.group_key_ordinal
+            ));
+        }
+        let group_key_type = ctx.arena.data_type(spec.group_key_expr_id).ok_or_else(|| {
+            format!(
+                "native aggregate TopN producer binding_id={} group key expression has no type",
+                spec.binding_id
+            )
+        })?;
+        let NativeRuntimeFilterContract::Ordered { keys, .. } = &spec.contract else {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} requires an ordered contract",
+                spec.binding_id
+            ));
+        };
+        if keys.len() != 1 || keys[0].data_type() != group_key_type {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} ordered contract must contain exactly one key matching group key type={group_key_type:?}",
+                spec.binding_id
+            ));
+        }
+        if spec.reduction != NativeRuntimeFilterReduction::TightenOrderedBound {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} requires TightenOrderedBound reduction",
+                spec.binding_id
+            ));
+        }
+        if spec.contribution_kinds != expected_contributions {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} contribution kinds must be exactly OrderedBoundUpdate and ProducerClosed",
+                spec.binding_id
+            ));
+        }
+        if spec.completion_requirement
+            != crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
+        {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} completion must be ProducerClosed",
+                spec.binding_id
+            ));
+        }
+        let context =
+            native_runtime_filter_context(&ctx.runtime_filter_execution, spec.binding_id)?;
+        let resolved = context
+            .resolve_producer(
+                crate::runtime_filter::model::contract::BindingId::new(spec.binding_id),
+                crate::runtime_filter::model::contract::ChannelId::new(spec.channel_id),
+                ProducerPortKind::OrderedBound,
+            )
+            .map_err(|error| {
+                format!(
+                    "native aggregate TopN producer binding_id={} resolution failed: {error}",
+                    spec.binding_id
+                )
+            })?;
+        validate_native_contract(spec.binding_id, &spec.contract, resolved.contract())?;
+        validate_native_reduction(
+            spec.binding_id,
+            &spec.reduction,
+            resolved.reduction_requirement(),
+            resolved.topk_contract_digest(),
+        )?;
+        if &spec.contribution_kinds != resolved.allowed_contribution_kinds() {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} contribution kinds do not match the installed descriptor",
+                spec.binding_id
+            ));
+        }
+        if spec.completion_requirement != resolved.completion_requirement() {
+            return Err(format!(
+                "native aggregate TopN producer binding_id={} completion requirement does not match the installed descriptor",
+                spec.binding_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateTopNProducerSite {
+    AggregateProcessor,
+    PartialAggregateProcessor,
+    FinalAggregateProcessor,
+    StreamingAggregateSink,
+    StreamingAggregateSource,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AggregateTopNProducerSiteCandidate {
+    site: AggregateTopNProducerSite,
+    owns_complete_group_identity: bool,
+}
+
+fn resolve_aggregate_topn_producer_site(
+    binding_id: u32,
+    candidates: &[AggregateTopNProducerSiteCandidate],
+) -> Result<AggregateTopNProducerSite, String> {
+    let mut owners = candidates
+        .iter()
+        .filter(|candidate| candidate.owns_complete_group_identity)
+        .map(|candidate| candidate.site);
+    let Some(owner) = owners.next() else {
+        return Err(format!(
+            "native aggregate TopN producer binding_id={binding_id} has no ownership-safe physical producer site after pipeline expansion"
+        ));
+    };
+    if owners.next().is_some() {
+        return Err(format!(
+            "native aggregate TopN producer binding_id={binding_id} has multiple ownership-safe physical producer sites after pipeline expansion"
+        ));
+    }
+    Ok(owner)
+}
+
+fn resolve_aggregate_topn_producer_site_if_present(
+    specs: &[NativeAggregateTopNProducerSpec],
+    candidates: &[AggregateTopNProducerSiteCandidate],
+) -> Result<Option<AggregateTopNProducerSite>, String> {
+    specs
+        .first()
+        .map(|spec| resolve_aggregate_topn_producer_site(spec.binding_id, candidates))
+        .transpose()
+}
+
+fn aggregate_topn_producers_for_site(
+    resolved_site: Option<AggregateTopNProducerSite>,
+    physical_site: AggregateTopNProducerSite,
+    specs: &[NativeAggregateTopNProducerSpec],
+) -> Vec<NativeAggregateTopNProducerSpec> {
+    if resolved_site == Some(physical_site) {
+        specs.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 fn native_join_producer_factory(
@@ -1223,17 +1404,51 @@ fn build_pipeline_for_node(
             need_finalize,
             input_is_intermediate: _input_is_intermediate,
             output_chunk_schema,
-            topn_rf_specs,
+            runtime_filter_spec,
             streaming_preaggregation_mode,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
             let output_slots = output_chunk_schema.slot_ids();
-            let legacy_topn_rf_specs: Vec<crate::exec::node::aggregate::TopNRuntimeFilterSpec> =
-                match &ctx.runtime_filter_execution {
-                    PipelineRuntimeFilterExecution::Native { .. } => Vec::new(),
-                    #[cfg(feature = "compat")]
-                    PipelineRuntimeFilterExecution::Compat { .. } => topn_rf_specs.clone(),
-                };
+            let (legacy_topn_rf_specs, native_topn_producers): (
+                Vec<crate::exec::node::aggregate::TopNRuntimeFilterSpec>,
+                &[NativeAggregateTopNProducerSpec],
+            ) = match (runtime_filter_spec, &ctx.runtime_filter_execution) {
+                (
+                    AggregateRuntimeFilterSpec::Native { topn_producers },
+                    PipelineRuntimeFilterExecution::Native { .. },
+                ) => {
+                    validate_native_aggregate_topn_specs(topn_producers, group_by, ctx)?;
+                    (Vec::new(), topn_producers)
+                }
+                #[cfg(feature = "compat")]
+                (
+                    AggregateRuntimeFilterSpec::Compat { legacy_topn_specs },
+                    PipelineRuntimeFilterExecution::Compat { .. },
+                ) => (legacy_topn_specs.clone(), &[]),
+                #[cfg(feature = "compat")]
+                (
+                    AggregateRuntimeFilterSpec::Native { topn_producers },
+                    PipelineRuntimeFilterExecution::Compat { .. },
+                ) => {
+                    let binding_id = topn_producers
+                        .first()
+                        .map(|spec| spec.binding_id)
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "native aggregate TopN producer binding_id={binding_id} cannot execute in compat mode"
+                    ));
+                }
+                #[cfg(feature = "compat")]
+                (
+                    AggregateRuntimeFilterSpec::Compat { .. },
+                    PipelineRuntimeFilterExecution::Native { .. },
+                ) => {
+                    return Err(
+                        "compat aggregate runtime-filter specs cannot execute in native mode"
+                            .to_string(),
+                    );
+                }
+            };
 
             let dop = build.pipeline.dop.max(1);
             let all_update = functions.iter().all(|f| !f.input_is_intermediate);
@@ -1256,6 +1471,19 @@ fn build_pipeline_for_node(
                 build = ensure_hash(build, ctx, *node_id, group_by.clone(), dop as usize);
             }
             if *need_finalize && !group_by.is_empty() && dop > 1 && all_update {
+                let producer_site = resolve_aggregate_topn_producer_site_if_present(
+                    native_topn_producers,
+                    &[
+                        AggregateTopNProducerSiteCandidate {
+                            site: AggregateTopNProducerSite::PartialAggregateProcessor,
+                            owns_complete_group_identity: false,
+                        },
+                        AggregateTopNProducerSiteCandidate {
+                            site: AggregateTopNProducerSite::FinalAggregateProcessor,
+                            owns_complete_group_identity: true,
+                        },
+                    ],
+                )?;
                 // StarRocks-aligned two-phase hash aggregation:
                 // - Partial aggregation per upstream driver
                 // - Hash shuffle by group keys
@@ -1268,6 +1496,15 @@ fn build_pipeline_for_node(
                 let partial_agg_factory: Box<dyn OperatorFactory> =
                     match &ctx.runtime_filter_execution {
                         PipelineRuntimeFilterExecution::Native { .. } => {
+                            let topn_producers = aggregate_topn_producers_for_site(
+                                producer_site,
+                                AggregateTopNProducerSite::PartialAggregateProcessor,
+                                native_topn_producers,
+                            );
+                            let runtime_filter_context = native_aggregate_topn_context(
+                                &topn_producers,
+                                &ctx.runtime_filter_execution,
+                            )?;
                             Box::new(AggregateProcessorFactory::new_native(
                                 *node_id,
                                 Arc::clone(&ctx.arena),
@@ -1276,8 +1513,11 @@ fn build_pipeline_for_node(
                                 true,
                                 false,
                                 output_chunk_schema.clone(),
+                                topn_producers,
+                                runtime_filter_context,
+                                dop,
                                 None,
-                            ))
+                            )?)
                         }
                         #[cfg(feature = "compat")]
                         PipelineRuntimeFilterExecution::Compat { hub } => {
@@ -1318,6 +1558,15 @@ fn build_pipeline_for_node(
                 for func in &mut merge_functions {
                     func.input_is_intermediate = true;
                 }
+                let final_topn_producers = aggregate_topn_producers_for_site(
+                    producer_site,
+                    AggregateTopNProducerSite::FinalAggregateProcessor,
+                    native_topn_producers,
+                );
+                let final_runtime_filter_context = native_aggregate_topn_context(
+                    &final_topn_producers,
+                    &ctx.runtime_filter_execution,
+                )?;
                 build
                     .pipeline
                     .factories
@@ -1329,8 +1578,11 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        final_topn_producers,
+                        final_runtime_filter_context,
+                        build.pipeline.dop,
                         None,
-                    )));
+                    )?));
                 return Ok(build);
             }
 
@@ -1349,8 +1601,11 @@ fn build_pipeline_for_node(
                             true,
                             false,
                             output_chunk_schema.clone(),
+                            Vec::new(),
                             None,
-                        ))
+                            dop,
+                            None,
+                        )?)
                     }
                     #[cfg(feature = "compat")]
                     PipelineRuntimeFilterExecution::Compat { hub } => {
@@ -1407,8 +1662,11 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        Vec::new(),
                         None,
-                    )));
+                        downstream_dop,
+                        None,
+                    )?));
 
                 let mut extra_pipelines = build.extra_pipelines;
                 extra_pipelines.push(build.pipeline);
@@ -1429,9 +1687,31 @@ fn build_pipeline_for_node(
                 streaming_preaggregation_mode,
                 Some(StreamingPreaggregationMode::ForcePreaggregation)
             ) {
+                let producer_site = resolve_aggregate_topn_producer_site_if_present(
+                    native_topn_producers,
+                    &[
+                        AggregateTopNProducerSiteCandidate {
+                            site: AggregateTopNProducerSite::StreamingAggregateSink,
+                            owns_complete_group_identity: true,
+                        },
+                        AggregateTopNProducerSiteCandidate {
+                            site: AggregateTopNProducerSite::StreamingAggregateSource,
+                            owns_complete_group_identity: false,
+                        },
+                    ],
+                )?;
                 let streaming_state = AggregateStreamingState::new(dop.max(1) as usize);
                 let sink_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
                     PipelineRuntimeFilterExecution::Native { .. } => {
+                        let topn_producers = aggregate_topn_producers_for_site(
+                            producer_site,
+                            AggregateTopNProducerSite::StreamingAggregateSink,
+                            native_topn_producers,
+                        );
+                        let runtime_filter_context = native_aggregate_topn_context(
+                            &topn_producers,
+                            &ctx.runtime_filter_execution,
+                        )?;
                         Box::new(AggregateStreamingSinkFactory::new_native(
                             *node_id,
                             Arc::clone(&ctx.arena),
@@ -1440,7 +1720,10 @@ fn build_pipeline_for_node(
                             !*need_finalize,
                             output_chunk_schema.clone(),
                             streaming_state.clone(),
-                        ))
+                            topn_producers,
+                            runtime_filter_context,
+                            dop,
+                        )?)
                     }
                     #[cfg(feature = "compat")]
                     PipelineRuntimeFilterExecution::Compat { hub } => {
@@ -1477,8 +1760,24 @@ fn build_pipeline_for_node(
                 });
             }
 
+            let producer_site = resolve_aggregate_topn_producer_site_if_present(
+                native_topn_producers,
+                &[AggregateTopNProducerSiteCandidate {
+                    site: AggregateTopNProducerSite::AggregateProcessor,
+                    owns_complete_group_identity: true,
+                }],
+            )?;
             let agg_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
                 PipelineRuntimeFilterExecution::Native { .. } => {
+                    let topn_producers = aggregate_topn_producers_for_site(
+                        producer_site,
+                        AggregateTopNProducerSite::AggregateProcessor,
+                        native_topn_producers,
+                    );
+                    let runtime_filter_context = native_aggregate_topn_context(
+                        &topn_producers,
+                        &ctx.runtime_filter_execution,
+                    )?;
                     Box::new(AggregateProcessorFactory::new_native(
                         *node_id,
                         Arc::clone(&ctx.arena),
@@ -1487,8 +1786,11 @@ fn build_pipeline_for_node(
                         !*need_finalize,
                         false,
                         output_chunk_schema.clone(),
+                        topn_producers,
+                        runtime_filter_context,
+                        dop,
                         None,
-                    ))
+                    )?)
                 }
                 #[cfg(feature = "compat")]
                 PipelineRuntimeFilterExecution::Compat { hub } => {
@@ -2037,13 +2339,11 @@ fn build_pipeline_for_node(
                 .get(node.node_id)
                 .ok_or_else(|| format!("missing exchange binding for node {}", node.node_id))?;
             let factory = match &ctx.runtime_filter_execution {
-                PipelineRuntimeFilterExecution::Native { .. } => {
-                    ExchangeSourceFactory::new_native(
-                        node.clone(),
-                        binding,
-                        Arc::clone(&ctx.arena),
-                    )?
-                }
+                PipelineRuntimeFilterExecution::Native { .. } => ExchangeSourceFactory::new_native(
+                    node.clone(),
+                    binding,
+                    Arc::clone(&ctx.arena),
+                )?,
                 #[cfg(feature = "compat")]
                 PipelineRuntimeFilterExecution::Compat { hub } => {
                     ExchangeSourceFactory::new_compat(
@@ -2158,7 +2458,9 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
+    use crate::exec::node::aggregate::{
+        AggFunction, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
+    };
     use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
     use crate::exec::node::iceberg_delta_scan::{
         ApplyKeySource, BaseTableIdent, IcebergDeltaScanNode, IcebergDeltaTablePayload,
@@ -2183,9 +2485,11 @@ mod tests {
     #[cfg(feature = "compat")]
     use super::build_compat_pipeline_graph_for_exec_plan_with_dop;
     use super::{
+        AggregateTopNProducerSite, AggregateTopNProducerSiteCandidate,
         build_native_pipeline_graph_for_exec_plan_with_dop,
         build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
         build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context,
+        resolve_aggregate_topn_producer_site,
     };
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
@@ -2587,6 +2891,476 @@ mod tests {
         }
     }
 
+    fn native_aggregate_topn_spec(
+        binding_id: u32,
+        group_key_expr_id: crate::exec::expr::ExprId,
+    ) -> crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+        native_aggregate_topn_spec_for_type(binding_id, group_key_expr_id, DataType::Int64)
+    }
+
+    fn native_aggregate_topn_spec_for_type(
+        binding_id: u32,
+        group_key_expr_id: crate::exec::expr::ExprId,
+        data_type: DataType,
+    ) -> crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+        use crate::runtime_filter::model::contract::{
+            CompletionRequirement, ContributionKind, NullOrder, OrderContract, OrderKeyContract,
+            SortDirection,
+        };
+        use crate::runtime_filter::port::ordered_bound::{
+            COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
+        };
+
+        let keys = vec![OrderKeyContract {
+            data_type,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let runtime = RuntimeOrderContract::try_from_plan(&OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        })
+        .expect("canonical aggregate TopN order");
+        crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+            binding_id,
+            channel_id: 1,
+            group_key_expr_id,
+            group_key_ordinal: 0,
+            limit: std::num::NonZeroU32::new(5).expect("nonzero limit"),
+            contract: NativeRuntimeFilterContract::Ordered {
+                keys: Arc::from(runtime.keys()),
+                comparator_digest: runtime.plan_comparator_digest().get(),
+                order_contract_digest: runtime.digest().bytes(),
+            },
+            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+            contribution_kinds: BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            completion_requirement: CompletionRequirement::ProducerClosed,
+        }
+    }
+
+    fn native_aggregate_topn_plan(
+        duplicate_spec: bool,
+        need_finalize: bool,
+        streaming_preaggregation_mode: Option<
+            crate::exec::node::aggregate::StreamingPreaggregationMode,
+        >,
+    ) -> ExecPlan {
+        native_aggregate_topn_plan_for_type(
+            DataType::Int64,
+            duplicate_spec,
+            need_finalize,
+            streaming_preaggregation_mode,
+        )
+    }
+
+    fn native_aggregate_topn_plan_for_type(
+        data_type: DataType,
+        duplicate_spec: bool,
+        need_finalize: bool,
+        streaming_preaggregation_mode: Option<
+            crate::exec::node::aggregate::StreamingPreaggregationMode,
+        >,
+    ) -> ExecPlan {
+        let chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![Field::new(
+                "group_key",
+                data_type.clone(),
+                false,
+            )])),
+            &[SlotId::new(1)],
+        );
+        let mut arena = ExprArena::default();
+        let group_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), data_type.clone());
+        let spec = native_aggregate_topn_spec_for_type(3, group_key, data_type);
+        let mut topn_producers = vec![spec.clone()];
+        if duplicate_spec {
+            topn_producers.push(spec);
+        }
+        ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::Aggregate(AggregateNode {
+                    input: Box::new(lookup_node(1, Arc::clone(&chunk_schema))),
+                    node_id: 2,
+                    group_by: vec![group_key],
+                    functions: Vec::new(),
+                    need_finalize,
+                    input_is_intermediate: false,
+                    output_chunk_schema: chunk_schema,
+                    runtime_filter_spec: AggregateRuntimeFilterSpec::Native { topn_producers },
+                    streaming_preaggregation_mode,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_rejects_duplicate_owner_spec_before_service_resolution() {
+        let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(true, false, None),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate aggregate TopN target must fail before Service resolution"),
+        };
+        assert!(error.contains("duplicates group key ordinal=0"), "{error}");
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_requires_one_ownership_safe_physical_site() {
+        let partial = AggregateTopNProducerSiteCandidate {
+            site: AggregateTopNProducerSite::PartialAggregateProcessor,
+            owns_complete_group_identity: false,
+        };
+        let final_owner = AggregateTopNProducerSiteCandidate {
+            site: AggregateTopNProducerSite::FinalAggregateProcessor,
+            owns_complete_group_identity: true,
+        };
+        assert_eq!(
+            resolve_aggregate_topn_producer_site(3, &[partial, final_owner])
+                .expect("final aggregate is the unique group owner"),
+            AggregateTopNProducerSite::FinalAggregateProcessor
+        );
+
+        let error = resolve_aggregate_topn_producer_site(3, &[partial])
+            .expect_err("partial aggregate cannot prove complete group ownership");
+        assert!(error.contains("no ownership-safe"), "{error}");
+
+        let error = resolve_aggregate_topn_producer_site(
+            3,
+            &[
+                final_owner,
+                AggregateTopNProducerSiteCandidate {
+                    site: AggregateTopNProducerSite::AggregateProcessor,
+                    owns_complete_group_identity: true,
+                },
+            ],
+        )
+        .expect_err("two complete group owners are ambiguous");
+        assert!(error.contains("multiple ownership-safe"), "{error}");
+    }
+
+    fn installed_native_aggregate_topn_context() -> (
+        Arc<crate::runtime::query_context::QueryContextManager>,
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    ) {
+        installed_native_aggregate_topn_context_for_type(DataType::Int64)
+    }
+
+    fn installed_native_aggregate_topn_context_for_type(
+        data_type: DataType,
+    ) -> (
+        Arc<crate::runtime::query_context::QueryContextManager>,
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    ) {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+        use crate::runtime::query_context::{QueryContextManager, QueryId};
+        use crate::runtime_filter::model::contract::{
+            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, OrderContract,
+            OrderKeyContract, ReductionRequirement, RuntimeFilterLifecycle,
+            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement, SortDirection,
+        };
+        use crate::runtime_filter::model::coverage::Coverage;
+        use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
+        use crate::runtime_filter::port::identity::{
+            DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
+        };
+        use crate::runtime_filter::port::install::{
+            ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
+            RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
+            local_participant_install_for_test,
+        };
+        use crate::runtime_filter::port::ordered_bound::{
+            COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
+        };
+
+        let manager = QueryContextManager::new_for_test();
+        let query_id = QueryId { hi: 70, lo: 9_301 };
+        let producer_instance = crate::common::types::UniqueId { hi: 70, lo: 30 };
+        let consumer_instance = crate::common::types::UniqueId { hi: 70, lo: 40 };
+        let lifecycle = RuntimeFilterQueryLifecycleOptions {
+            delivery_expire: Duration::from_secs(11),
+            query_expire: Duration::from_secs(29),
+            transport_retry_interval: Duration::from_millis(200),
+            transport_max_attempts: 3,
+            transport_deadline: Duration::from_secs(5),
+            transport_max_pending_entries: 128,
+            transport_max_pending_bytes: 1024 * 1024,
+        };
+        manager
+            .ensure_native_context(
+                query_id,
+                false,
+                lifecycle.delivery_expire,
+                lifecycle.query_expire,
+            )
+            .expect("native query context");
+
+        let keys = vec![OrderKeyContract {
+            data_type,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let order = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        let runtime_order =
+            RuntimeOrderContract::try_from_plan(&order).expect("canonical installed order");
+        let witness = CoverageWitnessId::new(2);
+        let channel = RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::OrderedBound(order),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 1,
+            },
+            RuntimeFilterCoreBudget::new(8192),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(3),
+                ProducerDeployment::new(witness, BTreeSet::from([producer_instance])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(4),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([ArtifactCapability::OrderedRange]),
+                    ConsumerArtifactProfile::new_ordered_range(runtime_order.digest())
+                        .expect("ordered range profile"),
+                    BTreeSet::from([RouteEdgeId::new(5)]),
+                    BTreeSet::from([consumer_instance]),
+                ),
+            )]),
+        );
+        manager
+            .install_runtime_filter_deployment(
+                query_id,
+                lifecycle,
+                local_participant_install_for_test(RuntimeFilterInstallView::new(
+                    DeploymentEpoch::new(6),
+                    RuntimeFilterParticipantId::new(7),
+                    BTreeMap::from([(ChannelId::new(1), channel)]),
+                )),
+            )
+            .expect("ordered runtime-filter deployment");
+        let context = manager
+            .runtime_filter_context_for_native_execution(query_id, producer_instance)
+            .expect("aggregate producer runtime-filter context");
+        (manager, context)
+    }
+
+    #[test]
+    fn native_aggregate_topn_boolean_target_fails_at_factory_build_before_first_input() {
+        let (_manager, context) =
+            installed_native_aggregate_topn_context_for_type(DataType::Boolean);
+        let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan_for_type(DataType::Boolean, false, false, None),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            Some(context),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "typed Boolean aggregate TopN target must fail at factory build before operator input"
+            ),
+        };
+        assert!(error.contains("Boolean"), "{error}");
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_resolves_ordered_bound_on_unique_final_owner() {
+        let (_manager, context) = installed_native_aggregate_topn_context();
+        let graph = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(false, true, None),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            Some(context),
+        )
+        .expect("installed ordered binding and unique final owner must build");
+        let aggregate_factories = graph
+            .pipelines
+            .iter()
+            .flat_map(|pipeline| pipeline.factories.iter())
+            .filter(|factory| factory.name().starts_with("AGGREGATE"))
+            .count();
+        assert_eq!(
+            aggregate_factories, 2,
+            "two-phase expansion must keep one partial helper and one final aggregate"
+        );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_factory_ownership_is_ordinary_final_or_streaming_sink_only() {
+        fn attachments(graph: &super::PipelineGraph) -> Vec<(i32, String, Vec<u32>)> {
+            graph
+                .pipelines
+                .iter()
+                .flat_map(|pipeline| {
+                    pipeline.factories.iter().map(move |factory| {
+                        (
+                            pipeline.id,
+                            factory.name().to_string(),
+                            factory
+                                .native_aggregate_topn_producers()
+                                .iter()
+                                .map(|spec| spec.binding_id)
+                                .collect(),
+                        )
+                    })
+                })
+                .filter(|(_, name, _)| name.contains("AGG"))
+                .collect()
+        }
+
+        let (_ordinary_manager, ordinary_context) = installed_native_aggregate_topn_context();
+        let ordinary = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(false, false, None),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            Some(ordinary_context),
+        )
+        .expect("ordinary aggregate owner");
+        assert_eq!(
+            attachments(&ordinary),
+            vec![(ordinary.root_id, "AGGREGATE (id=2)".to_string(), vec![3])]
+        );
+
+        let (_final_manager, final_context) = installed_native_aggregate_topn_context();
+        let two_phase = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(false, true, None),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            Some(final_context),
+        )
+        .expect("two-phase final aggregate owner");
+        let two_phase_attachments = attachments(&two_phase);
+        assert_eq!(
+            two_phase_attachments
+                .iter()
+                .filter(|(_, _, bindings)| !bindings.is_empty())
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(two_phase.root_id, "AGGREGATE (id=2)".to_string(), vec![3])],
+            "only the final aggregate in the root pipeline may own the binding"
+        );
+        assert_eq!(
+            two_phase_attachments
+                .iter()
+                .filter(|(pipeline_id, _, bindings)| {
+                    *pipeline_id != two_phase.root_id && bindings.is_empty()
+                })
+                .count(),
+            1,
+            "the partial helper must carry no binding"
+        );
+
+        let (_streaming_manager, streaming_context) = installed_native_aggregate_topn_context();
+        let streaming = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(
+                false,
+                false,
+                Some(
+                    crate::exec::node::aggregate::StreamingPreaggregationMode::ForcePreaggregation,
+                ),
+            ),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            Some(streaming_context),
+        )
+        .expect("streaming sink aggregate owner");
+        let streaming_attachments = attachments(&streaming);
+        assert_eq!(
+            streaming_attachments
+                .iter()
+                .filter(|(_, _, bindings)| !bindings.is_empty())
+                .map(|(_, name, bindings)| (name.as_str(), bindings.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![("AGGREGATE_STREAMING_SINK (id=2)", &[3][..])],
+            "only the streaming sink may own the binding"
+        );
+        assert!(
+            streaming_attachments
+                .iter()
+                .any(|(pipeline_id, name, bindings)| {
+                    *pipeline_id == streaming.root_id
+                        && name == "AGG_STREAMING_SOURCE (id=2)"
+                        && bindings.is_empty()
+                }),
+            "the streaming source must carry no binding"
+        );
+    }
+
+    #[test]
+    fn native_aggregate_topn_binding_never_falls_back_to_membership_producer() {
+        let (_manager, membership_context) = installed_native_producer_context();
+        let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan(false, false, None),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            Some(membership_context),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("aggregate TopN must resolve only an OrderedBound producer"),
+        };
+        assert!(
+            error.contains("resolution failed") || error.contains("contract"),
+            "{error}"
+        );
+    }
+
     fn assert_native_join_build_sinks_bind_exact_producer(
         distribution_mode: JoinDistributionMode,
         expected_build_dop: i32,
@@ -2925,7 +3699,9 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
-                topn_rf_specs: Vec::new(),
+                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                    topn_producers: Vec::new(),
+                },
                 streaming_preaggregation_mode: None,
             }),
         };
@@ -2949,7 +3725,9 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
-                topn_rf_specs: Vec::new(),
+                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                    topn_producers: Vec::new(),
+                },
                 streaming_preaggregation_mode: None,
             }),
         };
@@ -3197,7 +3975,9 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: true,
                 output_chunk_schema: agg_output_chunk_schema,
-                topn_rf_specs: Vec::new(),
+                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                    topn_producers: Vec::new(),
+                },
                 streaming_preaggregation_mode: None,
             }),
         };
@@ -3279,7 +4059,9 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: false,
                 output_chunk_schema: agg_output_chunk_schema,
-                topn_rf_specs: Vec::new(),
+                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                    topn_producers: Vec::new(),
+                },
                 streaming_preaggregation_mode: None,
             }),
         };
