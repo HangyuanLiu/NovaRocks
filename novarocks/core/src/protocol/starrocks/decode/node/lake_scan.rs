@@ -23,9 +23,10 @@ use crate::connector::starrocks::fe_v2_meta::{
 };
 use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+use crate::exec::fragment::program::ScanAssignmentKind;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::scan::LakeGlmScanInfo;
+use crate::exec::node::scan::ScanNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::{
     LakeRowPositionSpec, is_lake_row_id, is_lake_rss_id, is_lake_source_id, is_lake_tablet_id,
@@ -41,8 +42,9 @@ use crate::protocol::starrocks::decode::layout::{
     slot_display_name_from_desc,
 };
 use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_dicts;
-use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
-use crate::runtime::fragment::instance::ScanAssignments;
+use crate::protocol::starrocks::decode::node::{
+    Lowered, QueryGlobalDictMap, ScanRangeCarrier, local_rf_waiting_set,
+};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRange;
@@ -59,7 +61,7 @@ pub(crate) fn lower_lake_scan_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     program_facts: Option<&crate::protocol::starrocks::decode::LakeScanProgramFacts>,
     query_id: Option<QueryId>,
     query_opts: &QueryOptions,
@@ -261,17 +263,16 @@ pub(crate) fn lower_lake_scan_node(
         ));
     }
 
-    let Some(scan_assignments) = scan_assignments else {
+    let Some(scan_ranges) = scan_ranges else {
         return Err("LAKE_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
     };
-    let assignment = scan_assignments
-        .get(&FragmentNodeId::new(node.node_id))
+    let (assignment_kind, assignment_ranges) = scan_ranges
+        .get(node.node_id)
         .ok_or_else(|| format!("missing typed scan assignment for node_id={}", node.node_id))?;
-    if assignment.kind() != ScanAssignmentKind::StarRocksTablet {
+    if assignment_kind != ScanAssignmentKind::StarRocksTablet {
         return Err(format!(
-            "LAKE_SCAN_NODE node_id={} expected StarRocksTablet assignment, got {:?}",
+            "LAKE_SCAN_NODE node_id={} expected StarRocksTablet assignment, got {assignment_kind:?}",
             node.node_id,
-            assignment.kind()
         ));
     }
     let program_facts = program_facts.ok_or_else(|| {
@@ -286,7 +287,7 @@ pub(crate) fn lower_lake_scan_node(
     let internal_db_name = program_facts.db_name.clone();
     let internal_table_name = program_facts.table_name.clone();
     let mut has_more = false;
-    for p in assignment.ranges() {
+    for p in assignment_ranges {
         if p.empty.unwrap_or(false) {
             if p.has_more.unwrap_or(false) {
                 has_more = true;
@@ -559,8 +560,11 @@ pub(crate) fn lower_lake_scan_node(
         lake_schema_meta: cfg.lake_schema_meta.clone(),
     });
 
-    let scan = connectors
-        .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?
+    let (source, bound_ranges) =
+        connectors.create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?;
+    // Route the enriched ranges to the instance; bind at materialize time.
+    scan_ranges.capture(node.node_id, bound_ranges);
+    let scan = ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(scan_output_chunk_schema.clone())
         .with_limit(limit)

@@ -684,6 +684,7 @@ mod tests {
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+    use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
     use crate::runtime::runtime_state::RuntimeState;
 
@@ -833,6 +834,8 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             None,
             None,
             2,

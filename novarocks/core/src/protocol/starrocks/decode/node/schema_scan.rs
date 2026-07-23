@@ -20,12 +20,12 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::schema::{
-    BeSchemaTable, SchemaFrontend, SchemaScanContext, SchemaScanOp, SchemaTable,
+    BeSchemaTable, SchemaFrontend, SchemaScanContext, SchemaScanSource, SchemaTable,
     SchemaUserIdentity, SchemaUserRoles,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-use crate::exec::node::scan::ScanNode;
+use crate::exec::fragment::program::ScanAssignmentKind;
+use crate::exec::node::scan::{BoundScanRanges, ScanNode};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::warn;
@@ -33,12 +33,11 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, schema_for_layout,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
-use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::scan_range::ScanRange;
 use crate::thrift::descriptors;
 use crate::thrift::plan_nodes;
 
-use super::local_rf_waiting_set;
+use super::{ScanRangeCarrier, local_rf_waiting_set};
 
 /// Lower a SCHEMA_SCAN_NODE to an empty `ValuesNode`.
 ///
@@ -48,7 +47,7 @@ pub(crate) fn lower_schema_scan_node(
     node: &plan_nodes::TPlanNode,
     out_layout: &Layout,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     external_dependencies: Option<
         &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
     >,
@@ -69,7 +68,7 @@ pub(crate) fn lower_schema_scan_node(
                     node,
                     out_layout,
                     desc_tbl,
-                    scan_assignments,
+                    scan_ranges,
                     external_dependencies,
                     table,
                     require_scan_ranges,
@@ -136,7 +135,7 @@ fn lower_supported_schema_scan_node(
     node: &plan_nodes::TPlanNode,
     out_layout: &Layout,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     external_dependencies: Option<
         &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
     >,
@@ -156,19 +155,26 @@ fn lower_supported_schema_scan_node(
     };
     let context = decode_schema_scan_context(schema_scan);
     let _ = require_scan_ranges;
-    let should_scan = schema_scan_selected(node.node_id, scan_assignments)?;
-    let scan = ScanNode::new(Arc::new(SchemaScanOp::new(
+    let should_scan = schema_scan_selected(node.node_id, scan_ranges)?;
+    let source = SchemaScanSource::new(
         table,
         context,
         output_chunk_schema.clone(),
-        should_scan,
         external_dependencies
             .and_then(|draft| draft.frontend_endpoint())
             .cloned(),
-    )))
-    .with_node_id(node.node_id)
-    .with_output_chunk_schema(output_chunk_schema)
-    .with_local_rf_waiting_set(local_rf_waiting_set(node));
+    );
+    // Route the enriched selection to the instance; bind at materialize time.
+    if let Some(scan_ranges) = scan_ranges {
+        scan_ranges.capture(
+            node.node_id,
+            BoundScanRanges::SchemaSelection { should_scan },
+        );
+    }
+    let scan = ScanNode::new(Arc::new(source))
+        .with_node_id(node.node_id)
+        .with_output_chunk_schema(output_chunk_schema)
+        .with_local_rf_waiting_set(local_rf_waiting_set(node));
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),
@@ -243,20 +249,19 @@ fn normalize_optional_string(value: Option<&String>) -> Option<String> {
 
 fn schema_scan_selected(
     node_id: i32,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
 ) -> Result<bool, String> {
-    let assignments = scan_assignments
+    let scan_ranges = scan_ranges
         .ok_or_else(|| "SCHEMA_SCAN_NODE requires typed scan assignments".to_string())?;
-    let assignment = assignments
-        .get(&FragmentNodeId::new(node_id))
+    let (assignment_kind, assignment_ranges) = scan_ranges
+        .get(node_id)
         .ok_or_else(|| format!("SCHEMA_SCAN_NODE node_id={node_id} missing typed assignment"))?;
-    if assignment.kind() != ScanAssignmentKind::SchemaSelection {
+    if assignment_kind != ScanAssignmentKind::SchemaSelection {
         return Err(format!(
-            "SCHEMA_SCAN_NODE node_id={node_id} expected SchemaSelection assignment, got {:?}",
-            assignment.kind()
+            "SCHEMA_SCAN_NODE node_id={node_id} expected SchemaSelection assignment, got {assignment_kind:?}",
         ));
     }
-    let [range] = assignment.ranges() else {
+    let [range] = assignment_ranges else {
         return Err(format!(
             "SCHEMA_SCAN_NODE node_id={node_id} requires exactly one selection range"
         ));

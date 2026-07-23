@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
+use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource};
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, NullArray, RecordBatch,
     RecordBatchOptions, StringBuilder,
@@ -73,6 +73,24 @@ impl ScanOp for JdbcScanOp {
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
         Ok(ScanMorsels::new(vec![ScanMorsel::JdbcSingle], false))
+    }
+}
+
+/// Static [`ScanSource`] for JDBC/MySQL scans. JDBC has no scan ranges, so
+/// `bind` ignores them and materializes a single-morsel [`JdbcScanOp`].
+pub(crate) struct JdbcScanSource {
+    cfg: JdbcScanConfig,
+}
+
+impl JdbcScanSource {
+    pub(crate) fn new(cfg: JdbcScanConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl ScanSource for JdbcScanSource {
+    fn bind(&self, _ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        Ok(Arc::new(JdbcScanOp::new(self.cfg.clone())))
     }
 }
 
@@ -398,3 +416,34 @@ fn mysql_column_type_to_datatype(col_type: ColumnType) -> DataType {
 }
 
 // Integration tests are located under tests/ to avoid coupling to this module's internals.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::chunk::ChunkSchema;
+
+    fn sample_cfg() -> JdbcScanConfig {
+        JdbcScanConfig {
+            jdbc_url: "jdbc:sqlite::memory:".to_string(),
+            jdbc_user: None,
+            jdbc_passwd: None,
+            table: "t".to_string(),
+            columns: vec!["a".to_string()],
+            filters: Vec::new(),
+            limit: None,
+            chunk_schema: Arc::new(ChunkSchema::empty()),
+        }
+    }
+
+    #[test]
+    fn jdbc_scan_source_bind_none_yields_single_jdbc_morsel() {
+        let source = JdbcScanSource::new(sample_cfg());
+        let op = source
+            .bind(BoundScanRanges::None)
+            .expect("jdbc bind should succeed");
+        let morsels = op.build_morsels().expect("build morsels");
+        assert!(!morsels.has_more);
+        assert_eq!(morsels.morsels.len(), 1);
+        assert!(matches!(morsels.morsels[0], ScanMorsel::JdbcSingle));
+    }
+}

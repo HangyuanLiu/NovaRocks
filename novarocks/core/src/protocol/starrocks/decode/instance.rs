@@ -25,7 +25,6 @@ use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind, ScanSou
 use crate::exec::node::scan::{HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange};
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::fragment::instance::{BackendNum, FragmentInstanceId};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
@@ -431,7 +430,12 @@ pub(crate) fn decode_instance_parts(
     })
 }
 
-pub(crate) fn decode_scan_contracts_and_assignments(
+/// Decode the static scan contracts and the transient per-node enrichment
+/// carrier. This does NOT build the instance's `ScanAssignments`: it returns the
+/// raw `(ScanAssignmentKind, Vec<ScanRangeParams>)` per node that the scan
+/// decoders read (kind guard + range enrichment); the instance assignments are
+/// assembled afterwards from the enriched `BoundScanRanges` the decoders capture.
+pub(crate) fn decode_scan_contracts_and_raw_ranges(
     nodes: &[plan_nodes::TPlanNode],
     raw_ranges: &BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
     descriptors: Option<&descriptors::TDescriptorTable>,
@@ -440,7 +444,11 @@ pub(crate) fn decode_scan_contracts_and_assignments(
 ) -> Result<
     (
         BTreeMap<FragmentNodeId, ScanSourceContract>,
-        ScanAssignments,
+        // Transient enrichment INPUT per scan node: its assignment kind (for the
+        // decoders' kind guards) plus the decoded `ScanRangeParams`. The
+        // instance's `ScanAssignments` are assembled after node decode from the
+        // enriched `BoundScanRanges` captured by the decoders.
+        BTreeMap<FragmentNodeId, (ScanAssignmentKind, Vec<ScanRangeParams>)>,
     ),
     StarRocksFragmentDecodeError,
 > {
@@ -530,8 +538,6 @@ pub(crate) fn decode_scan_contracts_and_assignments(
         }
         assignments.insert(id, (kind, decoded));
     }
-    let assignments =
-        ScanAssignments::try_new(assignments).map_err(StarRocksFragmentDecodeError::Binding)?;
     Ok((contracts, assignments))
 }
 

@@ -31,7 +31,8 @@ use crate::exec::node::scan::IncrementalScanRange;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::scan::RowPositionScanConfig;
-use crate::exec::node::scan::ScanNode;
+#[cfg(feature = "compat")]
+use crate::exec::node::scan::ScanOp;
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
@@ -173,7 +174,6 @@ pub(crate) struct QueryContext {
     pub(crate) query_expire: Duration,
     #[allow(dead_code)]
     pub(crate) query_deadline: Instant,
-    pub(crate) exchange_senders: HashMap<i32, usize>,
     legacy_runtime_filter_execution: LegacyRuntimeFilterExecutionClaim,
     runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
     runtime_filter_params: Option<RuntimeFilterParams>,
@@ -395,7 +395,6 @@ impl QueryContext {
             delivery_deadline: now + delivery_expire,
             query_expire,
             query_deadline: now + query_expire,
-            exchange_senders: HashMap::new(),
             legacy_runtime_filter_execution: LegacyRuntimeFilterExecutionClaim::Unclaimed,
             runtime_filter_hub: None,
             runtime_filter_params: None,
@@ -527,19 +526,6 @@ impl QueryContext {
 
     pub(crate) fn extend_delivery_lifetime(&mut self) {
         self.delivery_deadline = Instant::now() + self.delivery_expire;
-    }
-
-    pub(crate) fn update_exchange_senders(&mut self, counts: HashMap<i32, usize>) {
-        for (node_id, count) in counts {
-            let entry = self.exchange_senders.entry(node_id).or_insert(0);
-            if *entry < count {
-                *entry = count;
-            }
-        }
-    }
-
-    pub(crate) fn exchange_sender_count(&self, node_id: i32) -> Option<usize> {
-        self.exchange_senders.get(&node_id).copied()
     }
 
     fn claim_legacy_runtime_filter_execution(
@@ -893,16 +879,16 @@ impl Drop for QueryContext {
 
 #[cfg(feature = "compat")]
 struct IncrementalScanNodeHandle {
-    scan: ScanNode,
+    op: Arc<dyn ScanOp>,
     dispatch: Arc<ScanDispatchState>,
     update_mu: Mutex<()>,
 }
 
 #[cfg(feature = "compat")]
 impl IncrementalScanNodeHandle {
-    fn new(scan: ScanNode, dispatch: Arc<ScanDispatchState>) -> Self {
+    fn new(op: Arc<dyn ScanOp>, dispatch: Arc<ScanDispatchState>) -> Self {
         Self {
-            scan,
+            op,
             dispatch,
             update_mu: Mutex::new(()),
         }
@@ -910,7 +896,7 @@ impl IncrementalScanNodeHandle {
 
     fn append_scan_ranges(&self, scan_ranges: &[IncrementalScanRange]) -> Result<(), String> {
         let _guard = self.update_mu.lock().expect("incremental scan handle lock");
-        let morsels = self.scan.build_incremental_morsels(scan_ranges)?;
+        let morsels = self.op.build_incremental_morsels(scan_ranges)?;
         self.dispatch
             .append_morsels(morsels.morsels, morsels.has_more)
     }
@@ -1068,7 +1054,6 @@ pub(crate) struct StarRocksQueryHandoff {
     pub(crate) query_expire: Duration,
     pub(crate) fragment_count: usize,
     pub(crate) cache_options: CacheOptions,
-    pub(crate) exchange_senders: HashMap<i32, usize>,
     pub(crate) descriptor_snapshot: Option<Arc<DescriptorSnapshot>>,
     pub(crate) total_fragments: Option<usize>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
@@ -2415,7 +2400,6 @@ impl QueryContextManager {
         if context.cache_options.is_none() {
             context.cache_options = Some(handoff.cache_options);
         }
-        context.update_exchange_senders(handoff.exchange_senders);
         if let Some(snapshot) = handoff.descriptor_snapshot {
             context.desc_snapshot = Some(snapshot);
         }
@@ -2586,17 +2570,6 @@ impl QueryContextManager {
             .and_then(|ctx| ctx.lake_tablet_paths(cache_key))
     }
 
-    pub(crate) fn update_exchange_sender_counts(
-        &self,
-        query_id: QueryId,
-        counts: HashMap<i32, usize>,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| {
-            ctx.update_exchange_senders(counts);
-            Ok(())
-        })
-    }
-
     pub(crate) fn register_row_pos_descs(
         &self,
         query_id: QueryId,
@@ -2724,15 +2697,6 @@ impl QueryContextManager {
             .or_else(|| guard.second_chance.get(&query_id))
             .and_then(|ctx| ctx.lake_glm_info(row_source_slot))
             .cloned()
-    }
-
-    pub(crate) fn exchange_sender_count(&self, query_id: QueryId, node_id: i32) -> Option<usize> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.exchange_sender_count(node_id))
     }
 
     pub(crate) fn query_mem_tracker(&self, query_id: QueryId) -> Option<Arc<MemTracker>> {
@@ -2909,7 +2873,7 @@ impl QueryContextManager {
         &self,
         finst_id: UniqueId,
         node_id: i32,
-        scan: ScanNode,
+        op: Arc<dyn ScanOp>,
         dispatch: Arc<ScanDispatchState>,
     ) -> Result<(), String> {
         let handle = {
@@ -2921,7 +2885,7 @@ impl QueryContextManager {
             if let Some(existing) = node_map.get(&node_id) {
                 Arc::clone(existing)
             } else {
-                let handle = Arc::new(IncrementalScanNodeHandle::new(scan, dispatch));
+                let handle = Arc::new(IncrementalScanNodeHandle::new(op, dispatch));
                 node_map.insert(node_id, Arc::clone(&handle));
                 handle
             }

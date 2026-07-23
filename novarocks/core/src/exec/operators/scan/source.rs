@@ -33,7 +33,7 @@ use crate::common::config::{
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::scan::ScanNode;
+use crate::exec::node::scan::{ScanNode, ScanOp, ScanRuntimeFilterDecision};
 use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -60,6 +60,10 @@ use super::types::{ScanAsyncState, ScanRuntimeFilterProbe};
 pub struct ScanSourceFactory {
     name: String,
     scan: ScanNode,
+    /// Instance-materialized bound op (from the pipeline's `ScanBindings`).
+    /// The static `scan.source()` produced this via `bind`; the operator and
+    /// its async runners execute against this op, not against the node.
+    op: Arc<dyn ScanOp>,
     state: SharedScanState,
     runtime_filter_execution: ScanSourceRuntimeFilterExecution,
     arena: Arc<ExprArena>,
@@ -80,13 +84,18 @@ enum ScanSourceRuntimeFilterExecution {
 }
 
 impl ScanSourceFactory {
-    pub(crate) fn new_native(scan: ScanNode, arena: Arc<ExprArena>) -> Result<Self, String> {
+    pub(crate) fn new_native(
+        scan: ScanNode,
+        op: Arc<dyn ScanOp>,
+        arena: Arc<ExprArena>,
+    ) -> Result<Self, String> {
         let consumers = NativeRuntimeFilterConsumerSet::from_plan(
             scan.native_runtime_filter_specs(),
             Arc::clone(&arena),
         )?;
         Ok(Self::new_in_mode(
             scan,
+            op,
             arena,
             ScanSourceRuntimeFilterExecution::Native { consumers },
         ))
@@ -95,11 +104,13 @@ impl ScanSourceFactory {
     #[cfg(test)]
     fn new_native_with_consumers_for_test(
         scan: ScanNode,
+        op: Arc<dyn ScanOp>,
         arena: Arc<ExprArena>,
         consumers: NativeRuntimeFilterConsumerSet,
     ) -> Self {
         Self::new_in_mode(
             scan,
+            op,
             arena,
             ScanSourceRuntimeFilterExecution::Native { consumers },
         )
@@ -108,6 +119,7 @@ impl ScanSourceFactory {
     #[cfg(feature = "compat")]
     pub(crate) fn new_compat(
         scan: ScanNode,
+        op: Arc<dyn ScanOp>,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
         arena: Arc<ExprArena>,
     ) -> Self {
@@ -125,6 +137,7 @@ impl ScanSourceFactory {
         let local_rf_waiting_set = scan.local_rf_waiting_set().to_vec();
         Self::new_in_mode(
             scan,
+            op,
             arena,
             ScanSourceRuntimeFilterExecution::Compat {
                 runtime_filter_specs,
@@ -138,10 +151,11 @@ impl ScanSourceFactory {
 
     fn new_in_mode(
         scan: ScanNode,
+        op: Arc<dyn ScanOp>,
         arena: Arc<ExprArena>,
         runtime_filter_execution: ScanSourceRuntimeFilterExecution,
     ) -> Self {
-        let mut name = scan
+        let mut name = op
             .profile_name()
             .unwrap_or_else(|| "ScanSource".to_string());
         if !name.contains("plan_node_id=") && !name.contains("(id=") {
@@ -161,6 +175,7 @@ impl ScanSourceFactory {
         Self {
             name,
             scan,
+            op,
             state: SharedScanState::new(),
             runtime_filter_execution,
             arena,
@@ -246,6 +261,7 @@ impl OperatorFactory for ScanSourceFactory {
         Box::new(ScanSourceOperator {
             name: self.name.clone(),
             scan: self.scan.clone(),
+            op: Arc::clone(&self.op),
             state: self.state.clone(),
             driver_id,
             dispatch: None,
@@ -283,6 +299,10 @@ impl OperatorFactory for ScanSourceFactory {
 struct ScanSourceOperator {
     name: String,
     scan: ScanNode,
+    /// Instance-materialized bound op (see `ScanSourceFactory::op`). All
+    /// morsel building / execution goes through this op; `scan` supplies only
+    /// static node config (accept-empty gate, RF specs, node id, limit, ...).
+    op: Arc<dyn ScanOp>,
     state: SharedScanState,
     driver_id: i32,
     dispatch: Option<Arc<ScanDispatchState>>,
@@ -393,7 +413,7 @@ impl ScanSourceOperator {
             if self.incremental_registered {
                 return Ok(());
             }
-            if !self.scan.supports_incremental_scan_ranges() {
+            if !self.op.supports_incremental_scan_ranges() {
                 self.incremental_registered = true;
                 return Ok(());
             }
@@ -411,7 +431,7 @@ impl ScanSourceOperator {
             crate::runtime::query_context::query_context_manager().register_incremental_scan_node(
                 finst_id,
                 node_id,
-                self.scan.clone(),
+                Arc::clone(&self.op),
                 dispatch,
             )?;
             self.incremental_registered = true;
@@ -447,8 +467,16 @@ impl ScanSourceOperator {
         }
     }
 
+    /// Whether morsels must be materialized only after runtime filters are
+    /// available. Mirrors the old `ScanNode::materialize_morsels_after_runtime_filters`:
+    /// gated by the node's RF specs AND the bound op's own decision.
+    fn materialize_morsels_after_runtime_filters(&self) -> bool {
+        !self.scan.runtime_filter_specs().is_empty()
+            && self.op.materialize_morsels_after_runtime_filters()
+    }
+
     fn runtime_filter_decision_ready_for_dispatch(&self) -> bool {
-        if !self.scan.materialize_morsels_after_runtime_filters() {
+        if !self.materialize_morsels_after_runtime_filters() {
             return true;
         }
         if self.runtime_filters_expected == 0 {
@@ -465,7 +493,10 @@ impl ScanSourceOperator {
 
     fn build_shared_dispatch(&self) -> Result<Arc<ScanDispatchState>, String> {
         let scan = self.scan.clone();
-        let materialize_after_runtime_filters = scan.materialize_morsels_after_runtime_filters();
+        let op = Arc::clone(&self.op);
+        // Static gate lifted off the node; the bound op no longer knows it.
+        let accept_empty = scan.accept_empty_scan_ranges();
+        let materialize_after_runtime_filters = self.materialize_morsels_after_runtime_filters();
         let async_state = Arc::clone(&self.async_state);
         let runtime_filter_probe = self.runtime_filter_probe.clone();
         let runtime_filters_expected = self.runtime_filters_expected;
@@ -488,15 +519,19 @@ impl ScanSourceOperator {
                     None
                 };
                 let morsels = if materialize_after_runtime_filters {
-                    let morsels = scan.build_morsels_with_runtime_filters(acquired.as_ref())?;
+                    let decision = ScanRuntimeFilterDecision::from_acquired(acquired.as_ref());
+                    let mut morsels = op.build_morsels_with_runtime_filters(decision)?;
+                    morsels.ensure_non_empty(accept_empty);
                     if let Some(profile) = materialization_profile.as_ref() {
-                        scan.flush_morsel_materialization_profile(profile);
+                        op.flush_morsel_materialization_profile(profile);
                     }
                     morsels
                 } else {
-                    scan.build_morsels()?
+                    let mut morsels = op.build_morsels()?;
+                    morsels.ensure_non_empty(accept_empty);
+                    morsels
                 };
-                if morsels.has_more && !scan.supports_incremental_scan_ranges() {
+                if morsels.has_more && !op.supports_incremental_scan_ranges() {
                     let node_id = scan.node_id().unwrap_or(-1);
                     return Err(format!(
                         "scan node_id={} has incremental morsels which are not supported",
@@ -541,6 +576,7 @@ impl ScanSourceOperator {
             let mut runner = ScanAsyncRunner::new(
                 self.name.clone(),
                 self.scan.clone(),
+                Arc::clone(&self.op),
                 Arc::clone(&dispatch),
                 self.state.runtime_filter_decision.clone(),
                 self.runtime_filter_probe.clone(),
@@ -794,7 +830,7 @@ impl Operator for ScanSourceOperator {
             return Ok(());
         }
 
-        if self.scan.materialize_morsels_after_runtime_filters() {
+        if self.materialize_morsels_after_runtime_filters() {
             self.max_io_tasks_for_scan()?;
             return Ok(());
         }
@@ -1232,11 +1268,11 @@ mod tests {
     #[test]
     fn non_runtime_materialized_scan_keeps_plain_build_morsels() {
         let op = Arc::new(PlainScanOp::new());
-        let scan = ScanNode::new(op.clone())
+        let scan = ScanNode::new_for_test(op.clone())
             .with_node_id(11)
             .with_connector_io_tasks_per_scan_operator(Some(1));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
+        let factory = ScanSourceFactory::new_native(scan, op.clone(), arena).unwrap();
 
         let mut source = factory.create(1, 0);
         source.prepare().expect("prepare source");
@@ -1247,12 +1283,13 @@ mod tests {
     #[test]
     fn scan_source_distributes_morsels_across_drivers() {
         let rt = RuntimeState::default();
-        let op = TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2], vec![3], vec![4, 5, 6], vec![7]],
-        };
-        let scan = ScanNode::new(Arc::new(op)).with_connector_io_tasks_per_scan_operator(Some(1));
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
+        let factory = ScanSourceFactory::new_native(scan, op, arena).unwrap();
 
         let dop = 4;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)
@@ -1307,11 +1344,13 @@ mod tests {
             crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
                 crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
             );
-        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2, 3, 4]],
-        }))
-        .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1340,11 +1379,13 @@ mod tests {
             crate::exec::operators::runtime_filter::tests_support::observed_published_consumer_set(
                 crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
             );
-        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2, 3, 4]],
-        }))
-        .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1378,9 +1419,11 @@ mod tests {
                     "two", "four",
                 ]),
             );
-        let scan = ScanNode::new(Arc::new(DictionaryScanOp))
+        let op: Arc<dyn ScanOp> = Arc::new(DictionaryScanOp);
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1414,12 +1457,14 @@ mod tests {
             crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
                 crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[3, 4]),
             );
-        let scan = ScanNode::new(Arc::new(TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2], vec![3, 4]],
-        }))
-        .with_limit(Some(2))
-        .with_connector_io_tasks_per_scan_operator(Some(1));
-        let factory = ScanSourceFactory::new_native_with_consumers_for_test(scan, arena, consumers);
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_limit(Some(2))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, op, arena, consumers);
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1480,12 +1525,13 @@ mod tests {
         }
 
         let rt = RuntimeState::default();
-        let op = TestMorselScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
             morsels: vec![vec![1, 2, 3]],
-        };
-        let scan = ScanNode::new(Arc::new(op)).with_connector_io_tasks_per_scan_operator(Some(1));
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
+        let factory = ScanSourceFactory::new_native(scan, op, arena).unwrap();
 
         let mut driver = factory.create(2, 0);
         driver.prepare().expect("prepare scan source");
@@ -1526,13 +1572,13 @@ mod tests {
         // due to in-flight morsels, but should stop picking up new morsels after limit.
         let morsels: Vec<Vec<i32>> = (0..20).map(|i| (i * 10..i * 10 + 10).collect()).collect();
 
-        let op = TestMorselScanOp { morsels };
-        let scan = ScanNode::new(Arc::new(op))
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp { morsels });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_connector_io_tasks_per_scan_operator(Some(1))
             .with_limit(Some(25));
 
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
+        let factory = ScanSourceFactory::new_native(scan, op, arena).unwrap();
 
         let dop = 4;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)
@@ -1591,13 +1637,13 @@ mod tests {
         // With DOP=2 and limit=25, we should read at most 3-4 morsels (30-40 rows).
         let morsels: Vec<Vec<i32>> = (0..10).map(|i| (i * 10..i * 10 + 10).collect()).collect();
 
-        let op = TestMorselScanOp { morsels };
-        let scan = ScanNode::new(Arc::new(op))
+        let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp { morsels });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_connector_io_tasks_per_scan_operator(Some(1))
             .with_limit(Some(25));
 
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new_native(scan, arena).unwrap();
+        let factory = ScanSourceFactory::new_native(scan, op, arena).unwrap();
 
         let dop = 2;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)

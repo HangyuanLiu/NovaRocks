@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use crate::exec::node::scan::ScanNode;
+use crate::exec::node::scan::{BoundScanRanges, ScanSource};
 
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
@@ -349,7 +349,14 @@ pub enum ScanConfig {
 
 pub trait ScanConnector: Send + Sync {
     fn name(&self) -> &'static str;
-    fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String>;
+    /// Split a decoder-built `ScanConfig` into a static `ScanSource` (for the
+    /// plan node) plus the enriched `BoundScanRanges` (for the instance's scan
+    /// assignment). Binding is deferred to execution time
+    /// (`materialize_scan_bindings`); this no longer eagerly builds a `ScanOp`.
+    fn create_scan_node(
+        &self,
+        cfg: ScanConfig,
+    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String>;
 }
 
 #[derive(Clone)]
@@ -442,11 +449,15 @@ impl ConnectorRegistry {
             .ok_or_else(|| format!("unknown scan planner: {name}"))
     }
 
+    /// Resolve the connector and split its `ScanConfig` into a static
+    /// `ScanSource` (stored on the plan node) plus the enriched
+    /// `BoundScanRanges` (routed into the instance's scan assignment). The
+    /// per-instance `ScanOp` is materialized later by `materialize_scan_bindings`.
     pub fn create_scan_node(
         &self,
         connector_name: &str,
         cfg: ScanConfig,
-    ) -> Result<ScanNode, String> {
+    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
         let Some(connector) = self.scan_connectors.get(connector_name) else {
             return Err(format!("unknown scan connector: {connector_name}"));
         };
@@ -535,9 +546,15 @@ impl ScanConnector for JdbcConnector {
         self.name
     }
 
-    fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
+    fn create_scan_node(
+        &self,
+        cfg: ScanConfig,
+    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
         match cfg {
-            ScanConfig::Jdbc(cfg) => Ok(ScanNode::new(Arc::new(jdbc::JdbcScanOp::new(cfg)))),
+            ScanConfig::Jdbc(cfg) => {
+                let source: Arc<dyn ScanSource> = Arc::new(jdbc::JdbcScanSource::new(cfg));
+                Ok((source, BoundScanRanges::None))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name
@@ -556,9 +573,40 @@ impl ScanConnector for HdfsConnector {
         self.name
     }
 
-    fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
+    fn create_scan_node(
+        &self,
+        cfg: ScanConfig,
+    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
         match cfg {
-            ScanConfig::Hdfs(cfg) => Ok(ScanNode::new(Arc::new(hdfs::HdfsScanOp::new(*cfg)))),
+            ScanConfig::Hdfs(cfg) => {
+                // Split the decoder-built config into a static source plus its
+                // file ranges. The ranges travel to the instance assignment;
+                // `bind` happens at materialize time.
+                let HdfsScanConfig {
+                    ranges,
+                    // `original_range_count` is recomputed from `ranges` in
+                    // `bind`; it equals `ranges.len()` at every decode site.
+                    original_range_count: _,
+                    has_more,
+                    limit,
+                    profile_label,
+                    format,
+                    object_store_config,
+                    iceberg_table_locations,
+                    query_global_dicts,
+                    iceberg_runtime_pruning,
+                } = *cfg;
+                let source: Arc<dyn ScanSource> = Arc::new(hdfs::HdfsScanSource::new(
+                    limit,
+                    profile_label,
+                    format,
+                    object_store_config,
+                    iceberg_table_locations,
+                    query_global_dicts,
+                    iceberg_runtime_pruning,
+                ));
+                Ok((source, BoundScanRanges::File { ranges, has_more }))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name
@@ -577,11 +625,36 @@ impl ScanConnector for IcebergConnector {
         self.name
     }
 
-    fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
+    fn create_scan_node(
+        &self,
+        cfg: ScanConfig,
+    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
         match cfg {
-            ScanConfig::IcebergMetadata(cfg) => Ok(ScanNode::new(Arc::new(
-                iceberg::IcebergMetadataScanOp::new(cfg)?,
-            ))),
+            ScanConfig::IcebergMetadata(cfg) => {
+                // Split the decoder-built config into a static source plus its
+                // metadata split ranges. `bind` happens at materialize time.
+                let IcebergMetadataScanConfig {
+                    metadata_table_type,
+                    serialized_table,
+                    serialized_predicate,
+                    load_column_stats,
+                    ranges,
+                    batch_size,
+                    output_columns,
+                    profile_label,
+                } = cfg;
+                let source: Arc<dyn ScanSource> =
+                    Arc::new(iceberg::metadata::IcebergMetadataScanSource::new(
+                        metadata_table_type,
+                        serialized_table,
+                        serialized_predicate,
+                        load_column_stats,
+                        batch_size,
+                        output_columns,
+                        profile_label,
+                    ));
+                Ok((source, BoundScanRanges::IcebergMetadata { ranges }))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name
@@ -602,11 +675,56 @@ impl ScanConnector for StarRocksConnector {
         self.name
     }
 
-    fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
+    fn create_scan_node(
+        &self,
+        cfg: ScanConfig,
+    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
         match cfg {
-            ScanConfig::StarRocks(cfg) => Ok(ScanNode::new(Arc::new(
-                starrocks::StarRocksScanOp::new(*cfg),
-            ))),
+            ScanConfig::StarRocks(cfg) => {
+                // Split the decoder-built config into a static source plus its
+                // tablet ranges. `deferred_lake_resolution` is carried through
+                // as-is; `bind` (at materialize time) never re-derives tablets.
+                let StarRocksScanConfig {
+                    db_name,
+                    table_name,
+                    properties,
+                    ranges,
+                    has_more,
+                    required_chunk_schema,
+                    output_chunk_schema,
+                    query_global_dicts,
+                    limit,
+                    batch_size,
+                    query_timeout,
+                    mem_limit,
+                    profile_label,
+                    min_max_predicates,
+                    lake_schema_meta,
+                    deferred_lake_resolution,
+                    topn_filter_column_map,
+                } = *cfg;
+                let source: Arc<dyn ScanSource> = Arc::new(starrocks::StarRocksScanSource {
+                    db_name,
+                    table_name,
+                    properties,
+                    required_chunk_schema,
+                    output_chunk_schema,
+                    query_global_dicts,
+                    limit,
+                    batch_size,
+                    query_timeout,
+                    mem_limit,
+                    profile_label,
+                    min_max_predicates,
+                    lake_schema_meta,
+                    deferred_lake_resolution,
+                    topn_filter_column_map,
+                });
+                Ok((
+                    source,
+                    BoundScanRanges::StarRocksTablet { ranges, has_more },
+                ))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name

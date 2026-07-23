@@ -32,7 +32,8 @@ use crate::connector::iceberg::{
     build_projected_output_schema_from_descriptor,
 };
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+use crate::exec::fragment::program::ScanAssignmentKind;
+use crate::exec::node::scan::ScanNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
@@ -47,11 +48,10 @@ use crate::protocol::starrocks::decode::layout::{Layout, layout_from_slot_ids};
 use crate::protocol::starrocks::decode::node::decode::{
     QueryGlobalDictMap, build_scan_query_global_dicts,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
 use crate::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
-use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
 use crate::thrift::{descriptors, exprs, plan_nodes, runtime_filter, types};
@@ -723,7 +723,7 @@ pub(crate) fn lower_hdfs_scan_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     query_opts: &QueryOptions,
     connectors: &ConnectorRegistry,
     query_global_dict_map: &QueryGlobalDictMap,
@@ -798,17 +798,16 @@ pub(crate) fn lower_hdfs_scan_node(
         })
         .unwrap_or_default();
 
-    let Some(scan_assignments) = scan_assignments else {
+    let Some(scan_ranges) = scan_ranges else {
         return Err("HDFS_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
     };
-    let assignment = scan_assignments
-        .get(&FragmentNodeId::new(node.node_id))
+    let (assignment_kind, assignment_ranges) = scan_ranges
+        .get(node.node_id)
         .ok_or_else(|| format!("missing typed scan assignment for node_id={}", node.node_id))?;
-    if assignment.kind() != ScanAssignmentKind::File {
+    if assignment_kind != ScanAssignmentKind::File {
         return Err(format!(
-            "HDFS_SCAN_NODE node_id={} expected File assignment, got {:?}",
+            "HDFS_SCAN_NODE node_id={} expected File assignment, got {assignment_kind:?}",
             node.node_id,
-            assignment.kind()
         ));
     }
 
@@ -1071,7 +1070,7 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut has_more = false;
     let mut scan_format: Option<descriptors::THdfsFileFormat> = None;
     let mut next_scan_range_id: i32 = 0;
-    for p in assignment.ranges() {
+    for p in assignment_ranges {
         if p.empty.unwrap_or(false) {
             if p.has_more.unwrap_or(false) {
                 has_more = true;
@@ -1359,11 +1358,13 @@ pub(crate) fn lower_hdfs_scan_node(
             output_columns,
             profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         };
-        let scan = connectors
-            .create_scan_node(
-                "iceberg",
-                crate::connector::ScanConfig::IcebergMetadata(cfg),
-            )?
+        let (source, bound_ranges) = connectors.create_scan_node(
+            "iceberg",
+            crate::connector::ScanConfig::IcebergMetadata(cfg),
+        )?;
+        // Route the enriched ranges to the instance; bind at materialize time.
+        scan_ranges.capture(node.node_id, bound_ranges);
+        let scan = ScanNode::new(source)
             .with_node_id(node.node_id)
             .with_output_chunk_schema(chunk_schema_for_snapshot_layout(
                 &out_layout,
@@ -1623,8 +1624,11 @@ pub(crate) fn lower_hdfs_scan_node(
         )
     });
 
-    let scan = connectors
-        .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))?
+    let (source, bound_ranges) =
+        connectors.create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))?;
+    // Route the enriched ranges to the instance; bind at materialize time.
+    scan_ranges.capture(node.node_id, bound_ranges);
+    let scan = ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)

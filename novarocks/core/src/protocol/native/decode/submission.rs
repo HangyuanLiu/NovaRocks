@@ -105,9 +105,13 @@ pub(crate) fn decode_fragment_submission(
     validate_runtime_filter_binding_expressions(fragment)?;
 
     let scan_sources = decode_scan_source_contracts(root, root_path.clone())?;
-    let scan_assignments = bind_scan_assignments(
+    // Preserve the old cross-check: every FE-provided scan-range node must map
+    // to a static scan contract. The enriched `BoundScanRanges` are captured
+    // during node decode (below) and assembled into the instance afterwards;
+    // the raw `ScanRangeParams` here are only the transient enrichment input.
+    validate_raw_scan_range_nodes(
         &scan_sources,
-        instance_parts.raw_scan_ranges,
+        &instance_parts.raw_scan_ranges,
         FieldPath::root("instance_params").field("per_node_scan_ranges"),
     )?;
     let sink_assignment = decode_fragment_sink_assignment(sink, instance_params)?;
@@ -116,7 +120,7 @@ pub(crate) fn decode_fragment_submission(
     arena.set_allow_throw_exception(instance_parts.query_options.allow_throw_exception);
     let context = NativePlanDecodeContext::from_parts(
         instance_parts.exchange_inputs.clone(),
-        scan_assignments.clone(),
+        instance_parts.raw_scan_ranges,
         instance_parts.query_options.clone(),
         Arc::new(crate::connector::ConnectorRegistry::default()),
         instance_parts.query_id,
@@ -129,6 +133,10 @@ pub(crate) fn decode_fragment_submission(
     let decoded_root =
         decode_node_with_runtime_filters(root, &mut arena, &context, &mut runtime_filter_ledger)?;
     runtime_filter_ledger.finish()?;
+    // Drain the per-node enriched `BoundScanRanges` captured during decode into
+    // the instance's scan assignments (`materialize_scan_bindings` binds these).
+    let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
+        .map_err(NativeFragmentDecodeError::Binding)?;
     let plan = ExecPlan {
         arena,
         root: decoded_root.node,
@@ -340,25 +348,28 @@ fn decode_instance_parts(
     })
 }
 
-fn bind_scan_assignments(
+/// Cross-check that every FE-provided per-node scan-range entry maps to a
+/// static scan contract (an "unknown scan node" is rejected here, as the old
+/// `bind_scan_assignments` did). The ranges themselves are the transient
+/// enrichment input; the instance's `ScanAssignments` are assembled from the
+/// enriched `BoundScanRanges` captured during node decode.
+fn validate_raw_scan_range_nodes(
     contracts: &BTreeMap<FragmentNodeId, ScanSourceContract>,
-    raw_ranges: BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    raw_ranges: &BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
     path: FieldPath,
-) -> Result<ScanAssignments, NativeFragmentDecodeError> {
-    let mut assignments = BTreeMap::new();
-    for (node_id, ranges) in raw_ranges {
-        let contract = contracts.get(&node_id).ok_or_else(|| {
-            NativeFragmentDecodeError::inconsistent(
+) -> Result<(), NativeFragmentDecodeError> {
+    for node_id in raw_ranges.keys() {
+        if !contracts.contains_key(node_id) {
+            return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().map_key(node_id.get().to_string()),
                 format!(
                     "scan ranges assigned to unknown scan node {}",
                     node_id.get()
                 ),
-            )
-        })?;
-        assignments.insert(node_id, (contract.assignment_kind(), ranges));
+            ));
+        }
     }
-    ScanAssignments::try_new(assignments).map_err(NativeFragmentDecodeError::Binding)
+    Ok(())
 }
 
 fn decode_scan_source_contracts(

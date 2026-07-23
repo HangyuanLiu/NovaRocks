@@ -57,18 +57,18 @@ use crate::exec::node::runtime_filter::{
     NativeRuntimeFilterConsumerNode, NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
     NativeRuntimeFilterReduction,
 };
+use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId, ScanAssignments,
+    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
-#[cfg(test)]
-use crate::runtime::scan_range::ScanRange;
 use crate::runtime::scan_range::ScanRangeParams;
+use std::cell::RefCell;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedNode {
@@ -80,7 +80,15 @@ pub(crate) struct DecodedNode {
 #[derive(Clone, Debug)]
 pub(crate) struct NativePlanDecodeContext {
     exchange_inputs: ExchangeInputAssignments,
-    scan_assignments: ScanAssignments,
+    /// Transient enrichment INPUT: FE-decoded `ScanRangeParams` per scan node.
+    /// The scan decoders read these to build connector ranges; the enriched
+    /// `BoundScanRanges` output is captured separately below and routed into
+    /// the instance's scan assignments (it no longer binds an op at decode).
+    raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+    /// Capture slot for the per-node enriched `BoundScanRanges` produced during
+    /// scan-node decode. Interior mutability lets `&self` decoders record their
+    /// output; the submission builder drains it into the instance assignments.
+    captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
     query_options: Option<QueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     query_id: Option<QueryId>,
@@ -91,7 +99,8 @@ impl Default for NativePlanDecodeContext {
     fn default() -> Self {
         Self {
             exchange_inputs: ExchangeInputAssignments::default(),
-            scan_assignments: ScanAssignments::default(),
+            raw_scan_ranges: BTreeMap::new(),
+            captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: None,
             connectors: None,
             query_id: None,
@@ -106,7 +115,7 @@ impl Default for NativePlanDecodeContext {
 impl NativePlanDecodeContext {
     pub(crate) fn from_parts(
         exchange_inputs: ExchangeInputAssignments,
-        scan_assignments: ScanAssignments,
+        raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
         query_options: QueryOptions,
         connectors: Arc<crate::connector::ConnectorRegistry>,
         query_id: QueryId,
@@ -114,7 +123,8 @@ impl NativePlanDecodeContext {
     ) -> Self {
         Self {
             exchange_inputs,
-            scan_assignments,
+            raw_scan_ranges,
+            captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: Some(query_options),
             connectors: Some(connectors),
             query_id: Some(query_id),
@@ -122,83 +132,28 @@ impl NativePlanDecodeContext {
         }
     }
 
-    pub(crate) fn from_native(
-        root: &plan::DistributedNode,
-        instance_params: &novarocks::InstanceParams,
-        query_options: Option<QueryOptions>,
-        connectors: Arc<crate::connector::ConnectorRegistry>,
-        query_id: QueryId,
-        fragment_instance_id: FragmentInstanceId,
-    ) -> Result<Self, super::NativeFragmentDecodeError> {
-        let scan_kinds =
-            collect_scan_assignment_kinds(root, FieldPath::root("plan_fragment").field("root"))?;
-        let scan_path = FieldPath::root("instance_params").field("per_node_scan_ranges");
-        let mut scan_assignments = BTreeMap::new();
-        let mut scan_keys = instance_params
-            .per_node_scan_ranges
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        scan_keys.sort_unstable();
-        for raw_node_id in scan_keys {
-            let wire_ranges = &instance_params.per_node_scan_ranges[&raw_node_id];
-            let node_path = scan_path.clone().map_key(raw_node_id.to_string());
-            let node_id = FragmentNodeId::new(raw_node_id);
-            let kind = scan_kinds.get(&node_id).copied().ok_or_else(|| {
-                super::NativeFragmentDecodeError::inconsistent(
-                    node_path.clone(),
-                    format!(
-                        "native InstanceParams assigns scan ranges to unknown scan node_id={raw_node_id}"
-                    ),
-                )
-            })?;
-            let mut ranges = Vec::with_capacity(wire_ranges.ranges.len());
-            for (index, wire_range) in wire_ranges.ranges.iter().enumerate() {
-                ranges.push(super::instance::decode_scan_range_params_at(
-                    wire_range,
-                    node_path.clone().field("ranges").index(index),
-                )?);
-            }
-            scan_assignments.insert(node_id, (kind, ranges));
-        }
-        let scan_assignments = ScanAssignments::try_new(scan_assignments)
-            .map_err(|error| super::NativeFragmentDecodeError::inconsistent(scan_path, error))?;
+    /// Record a scan node's enriched connector ranges (produced during node
+    /// decode). Drained later by `take_captured_scan_ranges` into the instance.
+    pub(crate) fn capture_scan_ranges(&self, node_id: i32, ranges: BoundScanRanges) {
+        self.captured_scan_ranges
+            .borrow_mut()
+            .insert(FragmentNodeId::new(node_id), ranges);
+    }
 
-        let exchange_path = FieldPath::root("instance_params").field("per_exch_num_senders");
-        let mut exchange_inputs = BTreeMap::new();
-        let mut exchange_keys = instance_params
-            .per_exch_num_senders
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        exchange_keys.sort_unstable();
-        for raw_node_id in exchange_keys {
-            let raw_sender_count = instance_params.per_exch_num_senders[&raw_node_id];
-            let sender_count = usize::try_from(raw_sender_count)
-                .ok()
-                .and_then(NonZeroUsize::new)
-                .ok_or_else(|| {
-                    super::NativeFragmentDecodeError::out_of_range(
-                        exchange_path.clone().map_key(raw_node_id.to_string()),
-                        format!(
-                            "native InstanceParams per_exch_num_senders node_id={raw_node_id} must be positive, got {raw_sender_count}"
-                        ),
-                    )
-                })?;
-            exchange_inputs.insert(
-                FragmentNodeId::new(raw_node_id),
-                ExchangeInputAssignment::new(sender_count),
-            );
-        }
+    /// Drain the captured per-node `BoundScanRanges` for instance assembly.
+    pub(crate) fn take_captured_scan_ranges(&self) -> BTreeMap<FragmentNodeId, BoundScanRanges> {
+        std::mem::take(&mut self.captured_scan_ranges.borrow_mut())
+    }
 
-        Ok(Self {
-            exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-            scan_assignments,
-            query_options,
-            connectors: Some(connectors),
-            query_id: Some(query_id),
-            fragment_instance_id,
-        })
+    /// Test-only: read (clone) the enriched ranges a scan decoder captured for
+    /// `node_id`, so tests can materialize the op via `scan.source().bind(..)`.
+    #[cfg(test)]
+    pub(crate) fn captured_ranges_for_test(&self, node_id: i32) -> BoundScanRanges {
+        self.captured_scan_ranges
+            .borrow()
+            .get(&FragmentNodeId::new(node_id))
+            .cloned()
+            .expect("captured scan ranges for node")
     }
 
     #[cfg(test)]
@@ -221,29 +176,15 @@ impl NativePlanDecodeContext {
         node_id: i32,
         ranges: Vec<novarocks::ScanRangeParams>,
     ) -> Self {
+        // Populates the transient enrichment INPUT (raw `ScanRangeParams`); the
+        // decoders enrich these and capture the `BoundScanRanges` output.
         let ranges = ranges
             .iter()
             .map(super::decode_scan_range_params)
             .collect::<Result<Vec<_>, _>>()
             .expect("decode test scan ranges");
-        let kind = match ranges.first().map(|params| &params.range) {
-            Some(ScanRange::File(_)) => ScanAssignmentKind::File,
-            #[cfg(feature = "compat")]
-            Some(ScanRange::BrokerFile(_)) => {
-                panic!("native test scan assignment cannot contain a StarRocks broker-file range")
-            }
-            #[cfg(feature = "compat")]
-            Some(ScanRange::SchemaSelection(_)) => {
-                panic!("native test scan assignment cannot contain a StarRocks schema selection")
-            }
-            Some(ScanRange::StarRocksTablet(_)) => ScanAssignmentKind::StarRocksTablet,
-            None => panic!("test scan assignment requires at least one range"),
-        };
-        self.scan_assignments = ScanAssignments::try_new(BTreeMap::from([(
-            FragmentNodeId::new(node_id),
-            (kind, ranges),
-        )]))
-        .expect("build test scan assignment");
+        self.raw_scan_ranges
+            .insert(FragmentNodeId::new(node_id), ranges);
         self
     }
 
@@ -272,9 +213,9 @@ impl NativePlanDecodeContext {
         &self,
         node_id: i32,
     ) -> Result<&[ScanRangeParams], super::error::NativeFragmentLeafDecodeError> {
-        self.scan_assignments
+        self.raw_scan_ranges
             .get(&FragmentNodeId::new(node_id))
-            .map(|assignment| assignment.ranges())
+            .map(Vec::as_slice)
             .ok_or_else(|| {
                 super::error::NativeFragmentLeafDecodeError::at_field(
                     crate::protocol::common::error::ProtocolErrorKind::MissingField,
@@ -2535,9 +2476,9 @@ mod tests {
         let baseline = lower(&one_col_values_node(10));
         let mut lowered = DecodedNode {
             node: ExecNode {
-                kind: ExecNodeKind::Scan(crate::exec::node::scan::ScanNode::new(Arc::new(
-                    DummyScanOp,
-                ))),
+                kind: ExecNodeKind::Scan(crate::exec::node::scan::ScanNode::new_for_test(
+                    Arc::new(DummyScanOp),
+                )),
             },
             layout: baseline.layout,
             output_schema: baseline.output_schema,
@@ -2573,12 +2514,7 @@ mod tests {
             node: ExecNode {
                 kind: ExecNodeKind::ExchangeSource(
                     crate::exec::node::exchange_source::ExchangeSourceNode::new(
-                        crate::runtime::exchange::ExchangeKey {
-                            finst_id_hi: 1,
-                            finst_id_lo: 2,
-                            node_id: 3,
-                        },
-                        1,
+                        3,
                         std::time::Duration::from_secs(1),
                         Arc::clone(&baseline.output_schema),
                     ),
@@ -2683,9 +2619,9 @@ mod tests {
         let baseline = lower(&one_col_values_node(10));
         let mut children = vec![DecodedNode {
             node: ExecNode {
-                kind: ExecNodeKind::Scan(crate::exec::node::scan::ScanNode::new(Arc::new(
-                    DummyScanOp,
-                ))),
+                kind: ExecNodeKind::Scan(crate::exec::node::scan::ScanNode::new_for_test(
+                    Arc::new(DummyScanOp),
+                )),
             },
             layout: baseline.layout,
             output_schema: baseline.output_schema,

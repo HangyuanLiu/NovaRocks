@@ -27,8 +27,10 @@ use serde_json::Value;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
-use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp};
+use crate::exec::fragment::program::ScanAssignmentKind;
+use crate::exec::node::scan::{
+    BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp, ScanSource,
+};
 use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind};
 use crate::fs::scan_context::FileScanRange;
 use crate::protocol::common::error::FieldPath;
@@ -37,9 +39,8 @@ use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids, slot_name_from_desc,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
-use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::scan_range::{BrokerFileFormat, ScanRange};
 use crate::thrift::{descriptors, plan_nodes, types};
 
@@ -448,12 +449,52 @@ impl ScanOp for FileLoadScanOp {
     }
 }
 
+/// Static [`ScanSource`] for broker/stream-load FILE_SCAN nodes.
+///
+/// Holds everything the decoder computed for a [`FileLoadScanConfig`] except the
+/// per-instance `ranges` / `has_more`, which arrive via
+/// [`BoundScanRanges::File`] at bind time (the same variant HDFS uses). The
+/// lowered [`ExprArena`] is captured here so `bind` can hand it to the op.
+#[derive(Clone, Debug)]
+struct FileLoadScanSource {
+    format_type: plan_nodes::TFileFormatType,
+    source_chunk_schema: ChunkSchemaRef,
+    output_chunk_schema: ChunkSchemaRef,
+    output_field_names: Vec<String>,
+    output_field_types: Vec<DataType>,
+    output_exprs: Vec<ExprId>,
+    csv: Option<CsvReadOptions>,
+    json: Option<JsonReadOptions>,
+    arena: Arc<ExprArena>,
+}
+
+impl ScanSource for FileLoadScanSource {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        let BoundScanRanges::File { ranges, has_more } = ranges else {
+            return Err("file load scan source requires File scan ranges".to_string());
+        };
+        let cfg = FileLoadScanConfig {
+            ranges,
+            has_more,
+            format_type: self.format_type,
+            source_chunk_schema: self.source_chunk_schema.clone(),
+            output_chunk_schema: self.output_chunk_schema.clone(),
+            output_field_names: self.output_field_names.clone(),
+            output_field_types: self.output_field_types.clone(),
+            output_exprs: self.output_exprs.clone(),
+            csv: self.csv.clone(),
+            json: self.json.clone(),
+        };
+        Ok(Arc::new(FileLoadScanOp::new(cfg, self.arena.clone())))
+    }
+}
+
 pub(crate) fn lower_file_scan_node(
     node: &plan_nodes::TPlanNode,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     program_facts: Option<&BrokerFileProgramFacts>,
     arena: &mut ExprArena,
     out_layout: Layout,
@@ -464,7 +505,7 @@ pub(crate) fn lower_file_scan_node(
         desc_tbl,
         _tuple_slots,
         layout_hints,
-        scan_assignments,
+        scan_ranges,
         program_facts,
         arena,
         out_layout,
@@ -478,7 +519,7 @@ fn lower_file_scan_node_inner(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     program_facts: Option<&BrokerFileProgramFacts>,
     arena: &mut ExprArena,
     mut out_layout: Layout,
@@ -514,17 +555,16 @@ fn lower_file_scan_node_inner(
         ));
     }
 
-    let Some(scan_assignments) = scan_assignments else {
+    let Some(scan_ranges) = scan_ranges else {
         return Err("FILE_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
     };
-    let assignment = scan_assignments
-        .get(&FragmentNodeId::new(node.node_id))
+    let (assignment_kind, assignment_ranges) = scan_ranges
+        .get(node.node_id)
         .ok_or_else(|| format!("missing typed scan assignment for node_id={}", node.node_id))?;
-    if assignment.kind() != ScanAssignmentKind::BrokerFile {
+    if assignment_kind != ScanAssignmentKind::BrokerFile {
         return Err(format!(
-            "FILE_SCAN_NODE node_id={} expected BrokerFile assignment, got {:?}",
+            "FILE_SCAN_NODE node_id={} expected BrokerFile assignment, got {assignment_kind:?}",
             node.node_id,
-            assignment.kind()
         ));
     }
     let program_facts = program_facts.ok_or_else(|| {
@@ -540,7 +580,7 @@ fn lower_file_scan_node_inner(
     let mut format_type: Option<plan_nodes::TFileFormatType> = None;
     let mut json_range_options: Option<(bool, Option<String>)> = None;
 
-    for scan_range_param in assignment.ranges() {
+    for scan_range_param in assignment_ranges {
         if scan_range_param.empty.unwrap_or(false) {
             if scan_range_param.has_more.unwrap_or(false) {
                 has_more = true;
@@ -778,9 +818,12 @@ fn lower_file_scan_node_inner(
     };
     let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
 
-    let config = FileLoadScanConfig {
-        ranges,
-        has_more,
+    // Split the decoded config into a static source (stored on the ScanNode)
+    // plus its file ranges (captured for the instance below). FILE_SCAN is
+    // constructed inline here rather than through `create_scan_node`, so the
+    // split happens at this decode site instead of in the connector registry.
+    // Binding is deferred to materialize time; nothing is bound here.
+    let source = FileLoadScanSource {
         format_type,
         source_chunk_schema,
         output_chunk_schema: output_chunk_schema.clone(),
@@ -789,18 +832,18 @@ fn lower_file_scan_node_inner(
         output_exprs,
         csv,
         json,
+        arena: Arc::new(arena.clone()),
     };
+    // Route the enriched ranges to the instance; bind at materialize time.
+    scan_ranges.capture(node.node_id, BoundScanRanges::File { ranges, has_more });
 
     let limit = node.limit;
     let limit = (limit >= 0).then_some(limit as usize);
-    let scan = ScanNode::new(Arc::new(FileLoadScanOp::new(
-        config,
-        Arc::new(arena.clone()),
-    )))
-    .with_node_id(node.node_id)
-    .with_output_chunk_schema(output_chunk_schema)
-    .with_limit(limit)
-    .with_local_rf_waiting_set(local_rf_waiting_set(node));
+    let scan = ScanNode::new(Arc::new(source))
+        .with_node_id(node.node_id)
+        .with_output_chunk_schema(output_chunk_schema)
+        .with_limit(limit)
+        .with_local_rf_waiting_set(local_rf_waiting_set(node));
 
     Ok(Lowered {
         node: ExecNode {
@@ -999,5 +1042,90 @@ fn json_value_to_field(value: Option<&Value>) -> Option<String> {
         Some(Value::Bool(v)) => Some(v.to_string()),
         Some(Value::Number(v)) => Some(v.to_string()),
         Some(other) => Some(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::FileLoadScanSource;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
+    use crate::fs::scan_context::FileScanRange;
+    use crate::thrift::plan_nodes;
+
+    fn source_for_test() -> FileLoadScanSource {
+        FileLoadScanSource {
+            format_type: plan_nodes::TFileFormatType::FORMAT_CSV_PLAIN,
+            source_chunk_schema: Arc::new(ChunkSchema::empty()),
+            output_chunk_schema: Arc::new(ChunkSchema::empty()),
+            output_field_names: Vec::new(),
+            output_field_types: Vec::new(),
+            output_exprs: Vec::new(),
+            csv: None,
+            json: None,
+            arena: Arc::new(ExprArena::default()),
+        }
+    }
+
+    fn plain_file_range(path: &str) -> FileScanRange {
+        FileScanRange {
+            path: path.to_string(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: 0,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        }
+    }
+
+    #[test]
+    fn file_load_scan_source_bind_file_ranges_yields_file_morsels() {
+        let source = source_for_test();
+        let op = source
+            .bind(BoundScanRanges::File {
+                ranges: vec![
+                    plain_file_range("/tmp/a.csv"),
+                    plain_file_range("/tmp/b.csv"),
+                ],
+                has_more: false,
+            })
+            .expect("file load scan source bind should succeed");
+
+        let morsels = op.build_morsels().expect("build morsels");
+        assert!(!morsels.has_more);
+        assert_eq!(morsels.morsels.len(), 2);
+        let paths: Vec<String> = morsels
+            .morsels
+            .iter()
+            .map(|morsel| match morsel {
+                ScanMorsel::FileRange { path, .. } => path.clone(),
+                other => panic!("expected FileRange morsel, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/tmp/a.csv".to_string(), "/tmp/b.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn file_load_scan_source_bind_rejects_wrong_variant() {
+        let source = source_for_test();
+        let Err(err) = source.bind(BoundScanRanges::None) else {
+            panic!("non-File scan ranges must be rejected");
+        };
+        assert!(
+            err.contains("file load scan source requires File scan ranges"),
+            "err={err}"
+        );
     }
 }

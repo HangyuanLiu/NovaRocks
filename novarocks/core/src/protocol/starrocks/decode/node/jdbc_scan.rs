@@ -16,13 +16,14 @@
 // under the License.
 use std::collections::HashMap;
 
+use crate::exec::node::scan::ScanNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig, ScanConfig};
 use crate::protocol::starrocks::decode::layout::{
     chunk_schema_for_layout, layout_for_row_tuples, layout_from_slot_ids, qualify_table_name,
     resolve_jdbc_table, resolve_jdbc_table_by_name, tuple_slot_col_names,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
 use crate::runtime::query_options::QueryOptions;
 use crate::thrift::{descriptors, plan_nodes, types};
 
@@ -36,6 +37,7 @@ pub(crate) fn lower_jdbc_scan_node(
     connectors: &ConnectorRegistry,
     db_name: Option<&str>,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+    scan_ranges: Option<ScanRangeCarrier>,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
@@ -141,8 +143,13 @@ pub(crate) fn lower_jdbc_scan_node(
         chunk_schema: output_chunk_schema.clone(),
     };
 
-    let scan = connectors
-        .create_scan_node("jdbc", ScanConfig::Jdbc(cfg))?
+    let (source, bound_ranges) = connectors.create_scan_node("jdbc", ScanConfig::Jdbc(cfg))?;
+    // Range-less scan: still route the (empty) ranges to the instance so the
+    // materializer binds one op per instance uniformly.
+    if let Some(scan_ranges) = scan_ranges {
+        scan_ranges.capture(node.node_id, bound_ranges);
+    }
+    let scan = ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)

@@ -121,7 +121,7 @@ pub(super) fn lower_starrocks_scan(
             deferred_lake_resolution: Some(prepared.deferred_lake_resolution),
             topn_filter_column_map: HashMap::new(),
         };
-        let scan_node = ctx
+        let (source, bound_ranges) = ctx
             .connectors()?
             .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))
             .map_err(|error| {
@@ -130,7 +130,10 @@ pub(super) fn lower_starrocks_scan(
                     "source",
                     error,
                 )
-            })?
+            })?;
+        // Route the enriched ranges to the instance; bind happens at materialize.
+        ctx.capture_scan_ranges(node.node_id, bound_ranges);
+        let scan_node = crate::exec::node::scan::ScanNode::new(source)
             .with_node_id(node.node_id)
             .with_output_chunk_schema(Arc::clone(&output_schema))
             .with_limit(limit)

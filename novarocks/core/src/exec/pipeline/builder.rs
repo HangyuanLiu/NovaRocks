@@ -55,6 +55,7 @@ use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinShared
 use crate::exec::operators::hashjoin::build_state::JoinBuildSinkState;
 use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory;
 use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSharedState;
+use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
 #[cfg(feature = "compat")]
@@ -115,6 +116,8 @@ struct PipelineBuildContext {
     arena: Arc<ExprArena>,
     dep_manager: DependencyManager,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     next_pipeline_id: i32,
     pipeline_dop: i32,
 }
@@ -154,6 +157,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan(
     _debug: bool,
     dep_manager: DependencyManager,
     exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
 ) -> Result<PipelineGraph, String> {
     let default_dop = crate::runtime::exec_env::calc_pipeline_dop(0);
     build_native_pipeline_graph_for_exec_plan_with_dop(
@@ -161,6 +166,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan(
         _debug,
         dep_manager,
         exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
         default_dop,
     )
 }
@@ -171,6 +178,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
     _debug: bool,
     dep_manager: DependencyManager,
     _exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     pipeline_dop: i32,
 ) -> Result<PipelineGraph, String> {
     build_pipeline_graph_in_mode(
@@ -178,6 +187,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         _debug,
         dep_manager,
         _exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
         pipeline_dop,
         None,
         PipelineRuntimeFilterExecution::Native { context: None },
@@ -189,6 +200,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
     debug: bool,
     dep_manager: DependencyManager,
     exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
 ) -> Result<PipelineGraph, String> {
@@ -197,6 +210,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
         debug,
         dep_manager,
         exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
         pipeline_dop,
         root_sink_dop,
         None,
@@ -208,6 +223,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
     debug: bool,
     dep_manager: DependencyManager,
     exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     context: Option<NativeRuntimeFilterExecutionContext>,
@@ -217,6 +234,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         debug,
         dep_manager,
         exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
         pipeline_dop,
         root_sink_dop,
         PipelineRuntimeFilterExecution::Native { context },
@@ -228,6 +247,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_cont
     debug: bool,
     dep_manager: DependencyManager,
     exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     pipeline_dop: i32,
     context: Option<NativeRuntimeFilterExecutionContext>,
 ) -> Result<PipelineGraph, String> {
@@ -236,6 +257,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_cont
         debug,
         dep_manager,
         exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
         pipeline_dop,
         None,
         PipelineRuntimeFilterExecution::Native { context },
@@ -248,6 +271,8 @@ pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_dop(
     debug: bool,
     dep_manager: DependencyManager,
     exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     pipeline_dop: i32,
     runtime_filter_hub: Arc<RuntimeFilterHub>,
 ) -> Result<PipelineGraph, String> {
@@ -256,6 +281,8 @@ pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_dop(
         debug,
         dep_manager,
         exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
         pipeline_dop,
         None,
         runtime_filter_hub,
@@ -268,6 +295,8 @@ pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
     debug: bool,
     dep_manager: DependencyManager,
     exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     runtime_filter_hub: Arc<RuntimeFilterHub>,
@@ -277,6 +306,8 @@ pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
         debug,
         dep_manager,
         exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
         pipeline_dop,
         root_sink_dop,
         PipelineRuntimeFilterExecution::Compat {
@@ -290,6 +321,8 @@ fn build_pipeline_graph_in_mode(
     _debug: bool,
     dep_manager: DependencyManager,
     _exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
@@ -299,6 +332,8 @@ fn build_pipeline_graph_in_mode(
         arena,
         dep_manager,
         runtime_filter_execution,
+        exchange_bindings,
+        scan_bindings,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
     };
@@ -1992,14 +2027,23 @@ fn build_pipeline_for_node(
         }
         ExecNodeKind::ExchangeSource(node) => {
             validate_native_consumer_specs(node.native_runtime_filter_specs(), ctx)?;
+            let binding = ctx
+                .exchange_bindings
+                .get(node.node_id)
+                .ok_or_else(|| format!("missing exchange binding for node {}", node.node_id))?;
             let factory = match &ctx.runtime_filter_execution {
                 PipelineRuntimeFilterExecution::Native { .. } => {
-                    ExchangeSourceFactory::new_native(node.clone(), Arc::clone(&ctx.arena))?
+                    ExchangeSourceFactory::new_native(
+                        node.clone(),
+                        binding,
+                        Arc::clone(&ctx.arena),
+                    )?
                 }
                 #[cfg(feature = "compat")]
                 PipelineRuntimeFilterExecution::Compat { hub } => {
                     ExchangeSourceFactory::new_compat(
                         node.clone(),
+                        binding,
                         Arc::clone(hub),
                         Arc::clone(&ctx.arena),
                     )?
@@ -2025,13 +2069,24 @@ fn build_pipeline_for_node(
         }
         ExecNodeKind::Scan(scan) => {
             validate_native_consumer_specs(scan.native_runtime_filter_specs(), ctx)?;
+            // The bound op is materialized per-instance in `ScanBindings`
+            // (see `runtime::fragment::scan::materialize_scan_bindings`); the
+            // node itself is static and only supplies its source + config.
+            let node_id = scan.node_id().ok_or_else(|| {
+                "scan node missing node_id; cannot resolve scan binding".to_string()
+            })?;
+            let op = ctx
+                .scan_bindings
+                .get(node_id)
+                .ok_or_else(|| format!("missing scan binding for node {node_id}"))?;
             let factory = match &ctx.runtime_filter_execution {
                 PipelineRuntimeFilterExecution::Native { .. } => {
-                    ScanSourceFactory::new_native(scan.clone(), Arc::clone(&ctx.arena))?
+                    ScanSourceFactory::new_native(scan.clone(), op, Arc::clone(&ctx.arena))?
                 }
                 #[cfg(feature = "compat")]
                 PipelineRuntimeFilterExecution::Compat { hub } => ScanSourceFactory::new_compat(
                     scan.clone(),
+                    op,
                     Arc::clone(hub),
                     Arc::clone(&ctx.arena),
                 ),
@@ -2115,6 +2170,7 @@ mod tests {
     };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::dependency::DependencyManager;
     #[cfg(feature = "compat")]
     use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
@@ -2163,6 +2219,8 @@ mod tests {
                 false,
                 DependencyManager::new(),
                 None,
+                ExchangeBindings::default(),
+                ScanBindings::default(),
                 2,
                 Some(runtime_filter_context.clone()),
             )
@@ -2347,6 +2405,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             Some(runtime_filter_context),
         )
@@ -2419,6 +2479,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             Some(runtime_filter_context),
         )
@@ -2536,6 +2598,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             3,
             Some(context),
         )
@@ -2623,6 +2687,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             1,
             None,
         ) {
@@ -2640,6 +2706,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             1,
             Some(context),
         ) {
@@ -2669,6 +2737,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             1,
             None,
         )
@@ -2779,6 +2849,8 @@ mod tests {
                 false,
                 DependencyManager::new(),
                 None,
+                ExchangeBindings::default(),
+                ScanBindings::default(),
                 2,
                 Some(runtime_filter_context.clone()),
             )
@@ -2883,6 +2955,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
         )
         .expect("build pipeline graph");
@@ -2935,6 +3009,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
         )
         .expect("build pipeline graph");
@@ -2994,6 +3070,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
         )
         .expect("build pipeline graph");
@@ -3029,6 +3107,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             4,
             Some(1),
         )
@@ -3123,6 +3203,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
         )
         .expect("build pipeline graph");
@@ -3203,6 +3285,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
         )
         .expect("build pipeline graph");

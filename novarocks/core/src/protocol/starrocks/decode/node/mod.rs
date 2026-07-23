@@ -49,11 +49,15 @@ mod union;
 
 use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::limit::LimitNode;
+use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind, RuntimeFilterProbeSpec};
 use crate::novarocks_connectors::ConnectorRegistry;
 use crate::novarocks_logging::warn;
+use crate::runtime::scan_range::ScanRangeParams;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::protocol::common::error::FieldPath;
@@ -62,10 +66,49 @@ use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_
 use crate::protocol::starrocks::decode::layout::{Layout, layout_for_row_tuples};
 use crate::thrift::{data, descriptors, exprs, plan_nodes, runtime_filter, types};
 
+/// Transient scan-range access handed to compat scan decoders.
+///
+/// It bundles the two roles that the instance's old `ScanAssignments` used to
+/// serve during decode: the pre-enrichment INPUT (`(ScanAssignmentKind,
+/// Vec<ScanRangeParams>)` per node, for the decoders' kind guards + range
+/// enrichment) and a capture slot for the enriched `BoundScanRanges` OUTPUT
+/// (routed into the instance's scan assignments; `bind` is deferred to
+/// materialize time). Range-less scans (jdbc/mysql) only use `capture`.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanRangeCarrier<'a> {
+    raw: &'a BTreeMap<FragmentNodeId, (ScanAssignmentKind, Vec<ScanRangeParams>)>,
+    captured: &'a RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
+}
+
+impl<'a> ScanRangeCarrier<'a> {
+    pub(crate) fn new(
+        raw: &'a BTreeMap<FragmentNodeId, (ScanAssignmentKind, Vec<ScanRangeParams>)>,
+        captured: &'a RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
+    ) -> Self {
+        Self { raw, captured }
+    }
+
+    /// Pre-enrichment input for a scan node: its assignment kind (for the
+    /// decoder's kind guard) plus the FE-decoded `ScanRangeParams`.
+    pub(crate) fn get(&self, node_id: i32) -> Option<(ScanAssignmentKind, &'a [ScanRangeParams])> {
+        self.raw
+            .get(&FragmentNodeId::new(node_id))
+            .map(|(kind, ranges)| (*kind, ranges.as_slice()))
+    }
+
+    /// Record a scan node's enriched connector ranges; drained after decode
+    /// into the instance's scan assignments.
+    pub(crate) fn capture(&self, node_id: i32, ranges: BoundScanRanges) {
+        self.captured
+            .borrow_mut()
+            .insert(FragmentNodeId::new(node_id), ranges);
+    }
+}
+
 pub(crate) struct StarRocksPlanDecodeContext<'a> {
     query_id: Option<crate::runtime::query_context::QueryId>,
     fragment_instance_id: Option<crate::common::types::UniqueId>,
-    scan_assignments: Option<&'a crate::runtime::fragment::instance::ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier<'a>>,
     broker_file_program_facts: Option<&'a BTreeMap<i32, BrokerFileProgramFacts>>,
     lake_scan_program_facts:
         Option<&'a BTreeMap<i32, crate::protocol::starrocks::decode::LakeScanProgramFacts>>,
@@ -82,7 +125,7 @@ impl<'a> StarRocksPlanDecodeContext<'a> {
     pub(crate) fn new(
         query_id: Option<crate::runtime::query_context::QueryId>,
         fragment_instance_id: Option<crate::common::types::UniqueId>,
-        scan_assignments: Option<&'a crate::runtime::fragment::instance::ScanAssignments>,
+        scan_ranges: Option<ScanRangeCarrier<'a>>,
         broker_file_program_facts: Option<&'a BTreeMap<i32, BrokerFileProgramFacts>>,
         lake_scan_program_facts: Option<
             &'a BTreeMap<i32, crate::protocol::starrocks::decode::LakeScanProgramFacts>,
@@ -98,7 +141,7 @@ impl<'a> StarRocksPlanDecodeContext<'a> {
         Self {
             query_id,
             fragment_instance_id,
-            scan_assignments,
+            scan_ranges,
             broker_file_program_facts,
             lake_scan_program_facts,
             lake_meta_scan_range_facts,
@@ -611,13 +654,7 @@ fn lower_node_with_children_typed(
                     )
                     .into());
                 }
-                lower_schema_scan_node(
-                    node,
-                    &out_layout,
-                    desc_tbl,
-                    context.scan_assignments,
-                    fe_addr,
-                )?
+                lower_schema_scan_node(node, &out_layout, desc_tbl, context.scan_ranges, fe_addr)?
             }
             t if t == plan_nodes::TPlanNodeType::FETCH_NODE => {
                 lower_fetch_node(children, node, out_layout, desc_tbl)?
@@ -628,13 +665,14 @@ fn lower_node_with_children_typed(
                 tuple_slots,
                 &context.query_options,
                 connectors,
+                context.scan_ranges,
             )?,
             t if t == plan_nodes::TPlanNodeType::FILE_SCAN_NODE => lower_file_scan_node(
                 node,
                 desc_tbl,
                 tuple_slots,
                 layout_hints,
-                context.scan_assignments,
+                context.scan_ranges,
                 context
                     .broker_file_program_facts
                     .and_then(|facts| facts.get(&node.node_id)),
@@ -651,13 +689,14 @@ fn lower_node_with_children_typed(
                 connectors,
                 db_name,
                 context.decode_facts,
+                context.scan_ranges,
             )?,
             t if t == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE => lower_hdfs_scan_node(
                 node,
                 desc_tbl,
                 tuple_slots,
                 layout_hints,
-                context.scan_assignments,
+                context.scan_ranges,
                 &context.query_options,
                 connectors,
                 query_global_dict_map,
@@ -682,7 +721,7 @@ fn lower_node_with_children_typed(
                         desc_tbl,
                         tuple_slots,
                         layout_hints,
-                        context.scan_assignments,
+                        context.scan_ranges,
                         context
                             .lake_scan_program_facts
                             .and_then(|facts| facts.get(&node.node_id)),

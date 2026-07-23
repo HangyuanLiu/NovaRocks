@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -266,15 +267,6 @@ pub(crate) fn submit_exec_plan_fragment_native_with_manager(
         &query_opts,
         submission.program().runtime_filters().has_bindings(),
     )?;
-
-    let sender_counts = instance
-        .exchange_inputs()
-        .iter()
-        .map(|(node_id, assignment)| (node_id.get(), assignment.sender_count().get()))
-        .collect::<HashMap<_, _>>();
-    if !sender_counts.is_empty() {
-        mgr.update_exchange_sender_counts(query_id, sender_counts)?;
-    }
 
     let query_mem_tracker = mgr
         .query_mem_tracker(query_id)

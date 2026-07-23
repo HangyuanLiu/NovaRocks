@@ -63,8 +63,10 @@ pub(super) fn lower_exchange_receiver(
         plan::exchange_flavor::Kind::CteMulticast(_) => {}
     }
 
-    let (key, expected_senders) =
-        NativeFragmentDecodeError::map_invalid(path.clone(), ctx.exchange_input(node.node_id))?;
+    // Validate that the instance provides a sender count for this exchange node.
+    // The instance-scoped ExchangeKey and sender count are materialized into the
+    // per-node ExchangeBinding at execution time, not baked into the static node.
+    NativeFragmentDecodeError::map_invalid(path.clone(), ctx.exchange_input(node.node_id))?;
     let layout = NativeFragmentDecodeError::map_invalid(
         path.clone().field("output_columns"),
         layout_from_output_columns(&exchange.output_columns),
@@ -76,8 +78,7 @@ pub(super) fn lower_exchange_receiver(
     let mut lowered = DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
-                key,
-                expected_senders,
+                node.node_id,
                 Duration::from_millis(exchange_wait_ms()),
                 output_schema.clone(),
             )),
@@ -355,7 +356,7 @@ mod tests {
         let ExecNodeKind::ExchangeSource(exchange) = lowered.node.kind else {
             panic!("expected ExchangeSource");
         };
-        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.node_id, 40);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
     }
 
@@ -386,7 +387,7 @@ mod tests {
         let ExecNodeKind::ExchangeSource(exchange) = sort.input.kind else {
             panic!("expected ExchangeSource under Sort");
         };
-        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.node_id, 41);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
         assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
     }
@@ -417,7 +418,7 @@ mod tests {
         let ExecNodeKind::ExchangeSource(exchange) = limit.input.kind else {
             panic!("expected ExchangeSource under Limit");
         };
-        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.node_id, 42);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
         assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
     }
@@ -442,7 +443,7 @@ mod tests {
         let ExecNodeKind::ExchangeSource(exchange) = lowered.node.kind else {
             panic!("expected ExchangeSource");
         };
-        assert_eq!(exchange.expected_senders, 2);
+        assert_eq!(exchange.node_id, 43);
         assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
         assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
     }

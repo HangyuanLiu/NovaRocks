@@ -19,12 +19,10 @@ use std::time::Duration;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::RuntimeFilterProbeSpec;
 use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec;
-use crate::runtime::exchange::ExchangeKey;
 
 #[derive(Clone, Debug)]
 pub struct ExchangeSourceNode {
-    pub key: ExchangeKey,
-    pub expected_senders: usize,
+    pub node_id: i32,
     pub timeout: Duration,
     pub runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     pub expected_chunk_schema: ChunkSchemaRef,
@@ -33,15 +31,9 @@ pub struct ExchangeSourceNode {
 }
 
 impl ExchangeSourceNode {
-    pub fn new(
-        key: ExchangeKey,
-        expected_senders: usize,
-        timeout: Duration,
-        expected_chunk_schema: ChunkSchemaRef,
-    ) -> Self {
+    pub fn new(node_id: i32, timeout: Duration, expected_chunk_schema: ChunkSchemaRef) -> Self {
         Self {
-            key,
-            expected_senders,
+            node_id,
             timeout,
             runtime_filter_specs: Vec::new(),
             expected_chunk_schema,
@@ -51,7 +43,7 @@ impl ExchangeSourceNode {
     }
 
     pub fn profile_name(&self) -> String {
-        format!("EXCHANGE_SOURCE (id={})", self.key.node_id)
+        format!("EXCHANGE_SOURCE (id={})", self.node_id)
     }
 
     pub fn runtime_filter_specs(&self) -> &[RuntimeFilterProbeSpec] {
