@@ -33,18 +33,427 @@ use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::exec::membership_predicate::{
     MembershipPredicateContract, NativeRuntimeFilterPredicate, PredicateEvaluationError,
 };
+use crate::runtime_filter::exec::ordered_range_predicate::{
+    NativeOrderedRangePredicate, OrderedPredicateCompileError, OrderedPredicateEvaluationError,
+    OrderedRangePredicateContract,
+};
 use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, ConsumerActivation, RuntimeFilterLifecycle,
+    ArtifactCapability, BindingId, ChannelId, ComparatorDigest, ConsumerActivation,
+    LateApplyGranularity, OrderContract, OrderKeyContract, ReductionRequirement,
+    RuntimeFilterLifecycle,
 };
 use crate::runtime_filter::port::artifact::{
     ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
 };
 use crate::runtime_filter::port::identity::LogicalVersion;
+use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::producer::RuntimeContractViolationKind;
 use crate::runtime_filter::port::subscription::{
-    ArtifactAcquireOutcome, BlockingSnapshotSubscription, SubscriptionKind,
+    ArtifactAcquireOutcome, BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal,
+    NonBlockingLiveSubscription, SubscriptionKind,
 };
 use arrow::compute::filter_record_batch;
+
+pub(crate) struct NativeOrderedLiveConsumerSet {
+    inner: Arc<NativeOrderedLiveConsumerInner>,
+}
+
+struct NativeOrderedLiveConsumerInner {
+    arena: Arc<ExprArena>,
+    bindings: Mutex<Vec<NativeOrderedLiveBinding>>,
+}
+
+#[derive(Clone)]
+struct NativeOrderedLiveBinding {
+    spec: NativeRuntimeFilterConsumerSpec,
+    state: NativeOrderedLiveBindingState,
+}
+
+#[derive(Clone)]
+enum NativeOrderedLiveBindingState {
+    Unbound,
+    Live {
+        subscription: Arc<dyn NonBlockingLiveSubscription>,
+        last_seen: Option<LogicalVersion>,
+        latest_predicate: Option<Arc<NativeOrderedRangePredicate>>,
+        terminal: Option<LiveTerminal>,
+    },
+    PassThrough,
+}
+
+impl Clone for NativeOrderedLiveConsumerSet {
+    fn clone(&self) -> Self {
+        let bindings = self
+            .inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock")
+            .clone();
+        Self {
+            inner: Arc::new(NativeOrderedLiveConsumerInner {
+                arena: self.inner.arena.clone(),
+                bindings: Mutex::new(bindings),
+            }),
+        }
+    }
+}
+
+impl NativeOrderedLiveConsumerSet {
+    pub(crate) fn from_plan(
+        specs: &[NativeRuntimeFilterConsumerSpec],
+        arena: Arc<ExprArena>,
+    ) -> Result<Self, String> {
+        validate_ordered_live_plan_specs(specs, &arena)?;
+        Ok(Self {
+            inner: Arc::new(NativeOrderedLiveConsumerInner {
+                arena,
+                bindings: Mutex::new(
+                    specs
+                        .iter()
+                        .cloned()
+                        .map(|spec| NativeOrderedLiveBinding {
+                            spec,
+                            state: NativeOrderedLiveBindingState::Unbound,
+                        })
+                        .collect(),
+                ),
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_bound_for_test(
+        specs: Vec<NativeRuntimeFilterConsumerSpec>,
+        arena: Arc<ExprArena>,
+        subscriptions: Vec<Arc<dyn NonBlockingLiveSubscription>>,
+    ) -> Self {
+        validate_ordered_live_plan_specs(&specs, &arena).unwrap();
+        assert_eq!(specs.len(), subscriptions.len());
+        let bindings = specs
+            .into_iter()
+            .zip(subscriptions)
+            .map(|(spec, subscription)| NativeOrderedLiveBinding {
+                spec,
+                state: NativeOrderedLiveBindingState::Live {
+                    subscription,
+                    last_seen: None,
+                    latest_predicate: None,
+                    terminal: None,
+                },
+            })
+            .collect();
+        Self {
+            inner: Arc::new(NativeOrderedLiveConsumerInner {
+                arena,
+                bindings: Mutex::new(bindings),
+            }),
+        }
+    }
+
+    pub(crate) fn bind(&self, state: &RuntimeState) -> Result<(), String> {
+        let mut bindings = self
+            .inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock");
+        if bindings
+            .iter()
+            .all(|binding| !matches!(binding.state, NativeOrderedLiveBindingState::Unbound))
+        {
+            return Ok(());
+        }
+        let Some(context) = state.native_runtime_filter_context() else {
+            if bindings.is_empty() {
+                return Ok(());
+            }
+            return Err(
+                "native ordered runtime-filter consumers require an installed execution context"
+                    .into(),
+            );
+        };
+        for binding in bindings.iter_mut() {
+            if !matches!(binding.state, NativeOrderedLiveBindingState::Unbound) {
+                continue;
+            }
+            let resolved = match context.resolve_consumer(
+                BindingId::new(binding.spec.binding_id),
+                ChannelId::new(binding.spec.channel_id),
+                SubscriptionKind::NonBlockingLive,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                    binding.state = NativeOrderedLiveBindingState::PassThrough;
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            validate_resolved_ordered_live_consumer(&binding.spec, &resolved)?;
+            match resolved.subscribe_live() {
+                Ok(subscription) => {
+                    binding.state = NativeOrderedLiveBindingState::Live {
+                        subscription,
+                        last_seen: None,
+                        latest_predicate: None,
+                        terminal: None,
+                    };
+                }
+                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                    binding.state = NativeOrderedLiveBindingState::PassThrough;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poll_and_apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+        self.poll_and_apply_chunk_profiled(chunk, None)
+    }
+
+    pub(crate) fn poll_and_apply_chunk_profiled(
+        &self,
+        chunk: Chunk,
+        profiles: Option<&OperatorProfiles>,
+    ) -> Result<Option<Chunk>, String> {
+        self.poll()?;
+        let configured = !self
+            .inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock")
+            .is_empty();
+        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+        let output = self.apply_chunk_inner(chunk)?;
+        if configured && let Some(profiles) = profiles {
+            profiles
+                .common
+                .counter_add(RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit, input_rows);
+            profiles.common.counter_add(
+                RUNTIME_FILTER_OUTPUT_ROWS,
+                ProfileUnit::Unit,
+                output
+                    .as_ref()
+                    .map_or(0, |chunk| i64::try_from(chunk.len()).unwrap_or(i64::MAX)),
+            );
+        }
+        Ok(output)
+    }
+
+    fn poll(&self) -> Result<(), String> {
+        let pending = {
+            let bindings = self
+                .inner
+                .bindings
+                .lock()
+                .expect("native ordered RF consumer lock");
+            if bindings
+                .iter()
+                .any(|binding| matches!(binding.state, NativeOrderedLiveBindingState::Unbound))
+            {
+                return Err("native ordered runtime-filter consumers must bind before poll".into());
+            }
+            bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(index, binding)| match &binding.state {
+                    NativeOrderedLiveBindingState::Live {
+                        subscription,
+                        last_seen,
+                        terminal: None,
+                        ..
+                    } => Some((
+                        index,
+                        binding.spec.clone(),
+                        subscription.clone(),
+                        *last_seen,
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for (index, spec, subscription, observed) in pending {
+            let outcome = subscription.poll_after(observed);
+            self.apply_poll_outcome(index, &spec, outcome)?;
+        }
+        Ok(())
+    }
+
+    fn apply_poll_outcome(
+        &self,
+        index: usize,
+        spec: &NativeRuntimeFilterConsumerSpec,
+        outcome: LivePollOutcome,
+    ) -> Result<(), String> {
+        let mut bindings = self
+            .inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock");
+        let Some(binding) = bindings.get_mut(index) else {
+            return Err("native ordered runtime-filter binding index drifted".into());
+        };
+        let NativeOrderedLiveBindingState::Live {
+            last_seen,
+            latest_predicate,
+            terminal,
+            ..
+        } = &mut binding.state
+        else {
+            return Ok(());
+        };
+        match outcome {
+            LivePollOutcome::Updated {
+                bundle,
+                terminal: update_terminal,
+            } => {
+                if last_seen.is_none_or(|seen| bundle.version() > seen) {
+                    let expected = ordered_predicate_contract_with_version(spec, bundle.version())?;
+                    match NativeOrderedRangePredicate::compile(&bundle, &expected) {
+                        Ok(predicate) => {
+                            *last_seen = Some(bundle.version());
+                            *latest_predicate = Some(Arc::new(predicate));
+                        }
+                        Err(OrderedPredicateCompileError::ResourceUnavailable) => {
+                            if latest_predicate.is_none() {
+                                binding.state = NativeOrderedLiveBindingState::PassThrough;
+                                return Ok(());
+                            }
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                if let Some(update_terminal) = update_terminal {
+                    if latest_predicate.is_none() {
+                        binding.state = NativeOrderedLiveBindingState::PassThrough;
+                    } else {
+                        *terminal = Some(update_terminal);
+                    }
+                }
+            }
+            LivePollOutcome::Idle {
+                latest_version,
+                terminal: idle_terminal,
+            } => {
+                if latest_version.is_some_and(|latest| last_seen.is_none_or(|seen| latest > seen)) {
+                    return Err(format!(
+                        "native ordered runtime-filter binding_id={} reported a newer live version without artifact",
+                        spec.binding_id
+                    ));
+                }
+                if latest_version.is_some_and(|latest| last_seen.is_some_and(|seen| latest < seen))
+                {
+                    return Err(format!(
+                        "native ordered runtime-filter binding_id={} live cursor regressed",
+                        spec.binding_id
+                    ));
+                }
+                if let Some(idle_terminal) = idle_terminal {
+                    if latest_predicate.is_none() {
+                        binding.state = NativeOrderedLiveBindingState::PassThrough;
+                    } else {
+                        *terminal = Some(idle_terminal);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_chunk_inner(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+        let active = {
+            let bindings = self
+                .inner
+                .bindings
+                .lock()
+                .expect("native ordered RF consumer lock");
+            bindings
+                .iter()
+                .filter_map(|binding| match &binding.state {
+                    NativeOrderedLiveBindingState::Live {
+                        latest_predicate: Some(predicate),
+                        ..
+                    } => Some((binding.spec.expr_id, predicate.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        if active.is_empty() {
+            return Ok(Some(chunk));
+        }
+        let chunk = crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)?;
+        let mut current = Some(chunk);
+        for (expr_id, predicate) in active {
+            let Some(input) = current else {
+                return Ok(None);
+            };
+            let array = self.inner.arena.eval(expr_id, &input)?;
+            let mask = match predicate.evaluate(array.as_ref()) {
+                Ok(mask) => mask,
+                Err(OrderedPredicateEvaluationError::ResourceUnavailable) => {
+                    current = Some(input);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if mask.iter().all(|value| value == Some(true)) {
+                current = Some(input);
+            } else if mask.iter().all(|value| value != Some(true)) {
+                current = None;
+            } else {
+                let filtered =
+                    filter_record_batch(&input.batch, &mask).map_err(|error| error.to_string())?;
+                current = Some(Chunk::try_new_like(filtered, &input)?);
+            }
+        }
+        Ok(current)
+    }
+
+    #[cfg(test)]
+    fn last_seen_for_test(&self) -> Option<LogicalVersion> {
+        self.inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock")
+            .first()
+            .and_then(|binding| match &binding.state {
+                NativeOrderedLiveBindingState::Live { last_seen, .. } => *last_seen,
+                _ => None,
+            })
+    }
+
+    #[cfg(test)]
+    fn terminal_for_test(&self) -> Option<LiveTerminal> {
+        self.inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock")
+            .first()
+            .and_then(|binding| match &binding.state {
+                NativeOrderedLiveBindingState::Live { terminal, .. } => *terminal,
+                _ => None,
+            })
+    }
+
+    #[cfg(test)]
+    fn is_live_for_test(&self) -> bool {
+        self.inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock")
+            .iter()
+            .all(|binding| matches!(binding.state, NativeOrderedLiveBindingState::Live { .. }))
+    }
+
+    #[cfg(test)]
+    fn is_pass_through_for_test(&self) -> bool {
+        self.inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock")
+            .iter()
+            .all(|binding| matches!(binding.state, NativeOrderedLiveBindingState::PassThrough))
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct NativeRuntimeFilterConsumerSet {
@@ -389,9 +798,8 @@ fn join_profile() -> Result<ConsumerArtifactProfile, String> {
     .map_err(|error| format!("invalid native Join runtime-filter profile: {error:?}"))
 }
 
-fn validate_plan_specs(
+fn validate_unique_consumer_bindings(
     specs: &[NativeRuntimeFilterConsumerSpec],
-    arena: &ExprArena,
 ) -> Result<(), String> {
     let mut bindings = BTreeSet::new();
     for spec in specs {
@@ -401,6 +809,16 @@ fn validate_plan_specs(
                 spec.binding_id
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_plan_specs(
+    specs: &[NativeRuntimeFilterConsumerSpec],
+    arena: &ExprArena,
+) -> Result<(), String> {
+    validate_unique_consumer_bindings(specs)?;
+    for spec in specs {
         if spec.activation != ConsumerActivation::BlockingSnapshot {
             return Err(format!(
                 "native Join runtime-filter binding_id={} requires BlockingSnapshot",
@@ -427,6 +845,129 @@ fn validate_plan_specs(
         membership_predicate_contract_with_arena(spec, arena)?;
     }
     Ok(())
+}
+
+fn validate_ordered_live_plan_specs(
+    specs: &[NativeRuntimeFilterConsumerSpec],
+    arena: &ExprArena,
+) -> Result<(), String> {
+    validate_unique_consumer_bindings(specs)?;
+    for spec in specs {
+        match spec.activation {
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch | LateApplyGranularity::Split,
+            } => {}
+            ConsumerActivation::NonBlockingLive { .. } => {
+                return Err(format!(
+                    "native ordered runtime-filter binding_id={} has unsupported late-apply granularity",
+                    spec.binding_id
+                ));
+            }
+            ConsumerActivation::BlockingSnapshot => {
+                return Err(format!(
+                    "native ordered runtime-filter binding_id={} requires NonBlockingLive",
+                    spec.binding_id
+                ));
+            }
+        }
+        if spec.capabilities != BTreeSet::from([ArtifactCapability::OrderedRange]) {
+            return Err(format!(
+                "native ordered runtime-filter binding_id={} requires exactly OrderedRange capability",
+                spec.binding_id
+            ));
+        }
+        if spec.reduction != NativeRuntimeFilterReduction::TightenOrderedBound {
+            return Err(format!(
+                "native ordered runtime-filter binding_id={} requires TightenOrderedBound",
+                spec.binding_id
+            ));
+        }
+        ordered_predicate_contract_with_arena(spec, arena, LogicalVersion::FIRST)?;
+    }
+    Ok(())
+}
+
+fn ordered_runtime_contract(
+    spec: &NativeRuntimeFilterConsumerSpec,
+) -> Result<Arc<RuntimeOrderContract>, String> {
+    let NativeRuntimeFilterContract::Ordered {
+        keys,
+        comparator_digest,
+        order_contract_digest,
+    } = &spec.contract
+    else {
+        return Err(format!(
+            "native ordered runtime-filter binding_id={} requires an Ordered contract",
+            spec.binding_id
+        ));
+    };
+    if keys.len() != 1 {
+        return Err(format!(
+            "native ordered runtime-filter binding_id={} requires exactly one order key",
+            spec.binding_id
+        ));
+    }
+    let plan = OrderContract {
+        keys: keys
+            .iter()
+            .map(|key| OrderKeyContract {
+                data_type: key.data_type().clone(),
+                direction: key.direction(),
+                null_order: key.null_order(),
+            })
+            .collect(),
+        inclusive: true,
+        comparator_digest: ComparatorDigest::new(*comparator_digest),
+    };
+    let rebuilt = Arc::new(
+        RuntimeOrderContract::try_from_plan(&plan).map_err(|error| {
+            format!(
+                "native ordered runtime-filter binding_id={} has invalid comparator contract: {error:?}",
+                spec.binding_id
+            )
+        })?,
+    );
+    if rebuilt.keys() != keys.as_ref()
+        || rebuilt.plan_comparator_digest().get() != *comparator_digest
+        || rebuilt.digest().bytes() != *order_contract_digest
+    {
+        return Err(format!(
+            "native ordered runtime-filter binding_id={} contract digest mismatch",
+            spec.binding_id
+        ));
+    }
+    Ok(rebuilt)
+}
+
+fn ordered_predicate_contract_with_arena(
+    spec: &NativeRuntimeFilterConsumerSpec,
+    arena: &ExprArena,
+    version: LogicalVersion,
+) -> Result<OrderedRangePredicateContract, String> {
+    let contract = ordered_runtime_contract(spec)?;
+    let expression_type = arena.data_type(spec.expr_id).ok_or_else(|| {
+        format!(
+            "native ordered runtime-filter expression {:?} is missing",
+            spec.expr_id
+        )
+    })?;
+    if expression_type != contract.keys()[0].data_type() {
+        return Err(format!(
+            "native ordered runtime-filter binding_id={} expression type does not match its order key",
+            spec.binding_id
+        ));
+    }
+    OrderedRangePredicateContract::new(ChannelId::new(spec.channel_id), contract, version)
+        .map_err(|error| format!("invalid native ordered predicate contract: {error:?}"))
+}
+
+fn ordered_predicate_contract_with_version(
+    spec: &NativeRuntimeFilterConsumerSpec,
+    version: LogicalVersion,
+) -> Result<OrderedRangePredicateContract, String> {
+    let contract = ordered_runtime_contract(spec)?;
+    OrderedRangePredicateContract::new(ChannelId::new(spec.channel_id), contract, version)
+        .map_err(|error| format!("invalid native ordered predicate contract: {error:?}"))
 }
 
 fn membership_predicate_contract_with_arena(
@@ -561,6 +1102,55 @@ fn validate_resolved_consumer(
         ) if canonical_schema == installed_schema && schema_digest == installed_digest => Ok(()),
         _ => Err(format!(
             "native runtime-filter binding_id={} installed membership contract mismatch",
+            spec.binding_id
+        )),
+    }
+}
+
+fn validate_resolved_ordered_live_consumer(
+    spec: &NativeRuntimeFilterConsumerSpec,
+    resolved: &crate::runtime_filter::service::ResolvedNativeConsumer,
+) -> Result<(), String> {
+    let contract = ordered_runtime_contract(spec)?;
+    let profile = ConsumerArtifactProfile::new_ordered_range(contract.digest())
+        .map_err(|error| format!("invalid native ordered profile: {error:?}"))?;
+    if resolved.activation() != spec.activation
+        || !matches!(
+            resolved.activation(),
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch | LateApplyGranularity::Split
+            }
+        )
+        || resolved.lifecycle() != RuntimeFilterLifecycle::MonotonicUpdates
+        || resolved.capabilities() != &spec.capabilities
+        || resolved.artifact_profile() != &profile
+        || resolved.reduction_requirement() != ReductionRequirement::TightenOrderedBound
+    {
+        return Err(format!(
+            "native ordered runtime-filter binding_id={} installed lifecycle/profile contract mismatch",
+            spec.binding_id
+        ));
+    }
+    match (&spec.contract, resolved.contract()) {
+        (
+            NativeRuntimeFilterContract::Ordered {
+                keys,
+                comparator_digest,
+                order_contract_digest,
+            },
+            crate::runtime_filter::service::InstalledNativeRuntimeFilterContract::Ordered {
+                keys: installed_keys,
+                comparator_digest: installed_comparator,
+                order_contract_digest: installed_order,
+            },
+        ) if keys == installed_keys
+            && comparator_digest == installed_comparator
+            && order_contract_digest == installed_order =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "native ordered runtime-filter binding_id={} installed order contract mismatch",
             spec.binding_id
         )),
     }
@@ -1296,6 +1886,433 @@ mod tests {
             consumers.acquire_blocking(Duration::ZERO).unwrap();
             assert_eq!(consumers.apply_chunk(input).unwrap().unwrap().len(), 4);
         }
+    }
+}
+
+#[cfg(test)]
+mod native_ordered_live_consumer_tests {
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::{NativeOrderedLiveConsumerSet, NativeRuntimeFilterConsumerSet};
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::node::runtime_filter::{
+        NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    };
+    use crate::runtime::runtime_state::RuntimeState;
+    use crate::runtime_filter::exec::ordered_range_predicate::tests_support::{bundle, contract};
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, ConsumerActivation, LateApplyGranularity, NullOrder, NullSemantics,
+        SortDirection,
+    };
+    use crate::runtime_filter::port::artifact::{ArtifactBundle, ArtifactMembershipSchema};
+    use crate::runtime_filter::port::identity::LogicalVersion;
+    use crate::runtime_filter::port::ordered_bound::{OrderedScalar, RuntimeOrderContract};
+    use crate::runtime_filter::port::subscription::{
+        LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription, UnavailableReason,
+    };
+
+    struct TestLiveSubscription {
+        outcomes: Mutex<VecDeque<LivePollOutcome>>,
+        observed: Mutex<Vec<Option<LogicalVersion>>>,
+    }
+
+    impl TestLiveSubscription {
+        fn new(outcomes: Vec<LivePollOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                observed: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observed(&self) -> Vec<Option<LogicalVersion>> {
+            self.observed.lock().unwrap().clone()
+        }
+    }
+
+    impl NonBlockingLiveSubscription for TestLiveSubscription {
+        fn snapshot(&self) -> Option<Arc<ArtifactBundle>> {
+            None
+        }
+
+        fn poll_after(&self, observed: Option<LogicalVersion>) -> LivePollOutcome {
+            self.observed.lock().unwrap().push(observed);
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(LivePollOutcome::Idle {
+                    latest_version: observed,
+                    terminal: None,
+                })
+        }
+    }
+
+    fn ordered_spec(
+        arena: &mut ExprArena,
+        order: &Arc<RuntimeOrderContract>,
+        activation: ConsumerActivation,
+    ) -> NativeRuntimeFilterConsumerSpec {
+        let expr_id = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            order.keys()[0].data_type().clone(),
+        );
+        NativeRuntimeFilterConsumerSpec {
+            binding_id: 2,
+            channel_id: 1,
+            expr_id,
+            activation,
+            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
+            contract: NativeRuntimeFilterContract::Ordered {
+                keys: order.keys().to_vec().into(),
+                comparator_digest: order.plan_comparator_digest().get(),
+                order_contract_digest: order.digest().bytes(),
+            },
+            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+        }
+    }
+
+    fn live_fixture(
+        outcomes: Vec<LivePollOutcome>,
+    ) -> (
+        NativeOrderedLiveConsumerSet,
+        Arc<TestLiveSubscription>,
+        Arc<RuntimeOrderContract>,
+    ) {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let mut arena = ExprArena::default();
+        let mut spec = ordered_spec(
+            &mut arena,
+            &order,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+        );
+        spec.channel_id = 7;
+        let subscription = Arc::new(TestLiveSubscription::new(outcomes));
+        let typed: Arc<dyn NonBlockingLiveSubscription> = subscription.clone();
+        (
+            NativeOrderedLiveConsumerSet::from_bound_for_test(
+                vec![spec],
+                Arc::new(arena),
+                vec![typed],
+            ),
+            subscription,
+            order,
+        )
+    }
+
+    fn chunk(values: &[i64]) -> Chunk {
+        let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[SlotId::new(1)]).unwrap();
+        Chunk::try_new_with_columns(
+            chunk_schema,
+            vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    fn values(output: Option<Chunk>) -> Vec<i64> {
+        output
+            .map(|chunk| {
+                chunk.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .unwrap_or_default()
+    }
+
+    fn update(
+        order: Arc<RuntimeOrderContract>,
+        version: u64,
+        bound: i64,
+        terminal: Option<LiveTerminal>,
+    ) -> LivePollOutcome {
+        LivePollOutcome::Updated {
+            bundle: bundle(
+                order,
+                Some(OrderedScalar::Int64(bound)),
+                LogicalVersion::new(version),
+            ),
+            terminal,
+        }
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_bind_requests_only_nonblocking_live() {
+        let (context, order) = crate::runtime_filter::service::NativeRuntimeFilterExecutionContext::
+            installed_ordered_consumer_context_for_exec_test();
+        let mut arena = ExprArena::default();
+        let spec = ordered_spec(
+            &mut arena,
+            &order,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+        );
+        let consumers = NativeOrderedLiveConsumerSet::from_plan(&[spec], Arc::new(arena)).unwrap();
+        let state = RuntimeState::default().with_native_runtime_filter_context(Some(context));
+
+        consumers.bind(&state).unwrap();
+
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[1, 2])).unwrap()),
+            vec![1, 2]
+        );
+        assert!(consumers.is_live_for_test());
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_idle_then_v1_then_v2_replaces_predicate_without_waiting() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let (consumers, subscription, _) = live_fixture(vec![
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: None,
+            },
+            update(order.clone(), 1, 7, None),
+            update(order, 2, 3, None),
+        ]);
+
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5, 9])).unwrap()),
+            vec![2, 5, 9]
+        );
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5, 9])).unwrap()),
+            vec![2, 5]
+        );
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5, 9])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            subscription.observed(),
+            vec![None, None, Some(LogicalVersion::FIRST)]
+        );
+        assert_eq!(consumers.last_seen_for_test(), Some(LogicalVersion::new(2)));
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_private_cursor_skips_versions_and_never_rolls_back() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let (consumers, subscription, _) = live_fixture(vec![
+            update(order.clone(), 1, 7, None),
+            update(order.clone(), 3, 3, None),
+            update(order, 2, 9, None),
+        ]);
+
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5, 8])).unwrap()),
+            vec![2, 5]
+        );
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5, 8])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5, 8])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            subscription.observed(),
+            vec![
+                None,
+                Some(LogicalVersion::FIRST),
+                Some(LogicalVersion::new(3))
+            ]
+        );
+        assert_eq!(consumers.last_seen_for_test(), Some(LogicalVersion::new(3)));
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_clones_keep_private_cursors() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let (consumers, subscription, _) = live_fixture(vec![
+            update(order.clone(), 1, 3, None),
+            update(order, 1, 3, None),
+        ]);
+        let sibling = consumers.clone();
+
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            values(sibling.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2]
+        );
+
+        assert_eq!(subscription.observed(), vec![None, None]);
+        assert_eq!(consumers.last_seen_for_test(), Some(LogicalVersion::FIRST));
+        assert_eq!(sibling.last_seen_for_test(), Some(LogicalVersion::FIRST));
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_rejects_idle_version_ahead_of_private_cursor() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let (consumers, _, _) = live_fixture(vec![
+            update(order, 1, 7, None),
+            LivePollOutcome::Idle {
+                latest_version: Some(LogicalVersion::new(2)),
+                terminal: None,
+            },
+        ]);
+        consumers
+            .poll_and_apply_chunk(chunk(&[2, 5]))
+            .expect("v1 must compile");
+
+        let error = consumers
+            .poll_and_apply_chunk(chunk(&[2, 5]))
+            .expect_err("Idle cannot hide a newer trusted artifact");
+
+        assert!(error.contains("without artifact"), "{error}");
+        assert_eq!(consumers.last_seen_for_test(), Some(LogicalVersion::FIRST));
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_terminal_update_retains_last_artifact() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let (consumers, subscription, _) =
+            live_fixture(vec![update(order, 1, 3, Some(LiveTerminal::Completed))]);
+
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(subscription.observed().len(), 1);
+        assert_eq!(consumers.terminal_for_test(), Some(LiveTerminal::Completed));
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_unavailable_before_first_artifact_is_pass_through() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let (consumers, subscription, _) = live_fixture(vec![
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: Some(LiveTerminal::Unavailable(
+                    UnavailableReason::RouteUnavailable,
+                )),
+            },
+            update(order, 1, 3, None),
+        ]);
+
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2, 5]
+        );
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2, 5]
+        );
+        assert_eq!(subscription.observed().len(), 1);
+        assert!(consumers.is_pass_through_for_test());
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_degradation_after_artifact_keeps_last_sound_predicate() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let (consumers, _, _) = live_fixture(vec![
+            update(order, 1, 3, None),
+            LivePollOutcome::Idle {
+                latest_version: Some(LogicalVersion::FIRST),
+                terminal: Some(LiveTerminal::DegradedDelivery(
+                    UnavailableReason::RouteUnavailable,
+                )),
+            },
+        ]);
+
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            values(consumers.poll_and_apply_chunk(chunk(&[2, 5])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            consumers.terminal_for_test(),
+            Some(LiveTerminal::DegradedDelivery(
+                UnavailableReason::RouteUnavailable
+            ))
+        );
+        assert_eq!(consumers.last_seen_for_test(), Some(LogicalVersion::FIRST));
+    }
+
+    #[test]
+    fn native_ordered_live_consumer_build_rejects_blocking_or_non_ordered_specs() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let mut blocking_arena = ExprArena::default();
+        let blocking = ordered_spec(
+            &mut blocking_arena,
+            &order,
+            ConsumerActivation::BlockingSnapshot,
+        );
+        assert!(
+            NativeOrderedLiveConsumerSet::from_plan(&[blocking], Arc::new(blocking_arena))
+                .err()
+                .expect("blocking ordered consumer must fail")
+                .contains("NonBlockingLive")
+        );
+
+        let mut membership_arena = ExprArena::default();
+        let expr_id =
+            membership_arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let schema =
+            ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches).unwrap();
+        let membership = NativeRuntimeFilterConsumerSpec {
+            binding_id: 2,
+            channel_id: 1,
+            expr_id,
+            activation: ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+            capabilities: BTreeSet::from([ArtifactCapability::Membership]),
+            contract: NativeRuntimeFilterContract::Membership {
+                canonical_schema: Arc::from(schema.canonical_bytes()),
+                schema_digest: schema.digest().bytes(),
+            },
+            reduction: NativeRuntimeFilterReduction::SetUnion,
+        };
+        assert!(
+            NativeOrderedLiveConsumerSet::from_plan(&[membership], Arc::new(membership_arena))
+                .err()
+                .expect("membership live consumer must fail")
+                .contains("Ordered")
+        );
+    }
+
+    #[test]
+    fn native_join_consumer_remains_blocking_membership_only() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let mut arena = ExprArena::default();
+        let ordered = ordered_spec(
+            &mut arena,
+            &order,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+        );
+
+        assert!(
+            NativeRuntimeFilterConsumerSet::from_plan(&[ordered], Arc::new(arena))
+                .err()
+                .expect("ordered live spec must not enter Join consumer")
+                .contains("BlockingSnapshot")
+        );
     }
 }
 
