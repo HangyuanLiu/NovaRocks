@@ -27,7 +27,9 @@ use super::common::build_slot_projection;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
+use crate::exec::node::aggregate::{
+    AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
@@ -233,7 +235,9 @@ pub(super) fn lower_hash_aggregate_node(
                 need_finalize,
                 input_is_intermediate,
                 output_chunk_schema: aggregate_output_schema.clone(),
-                topn_rf_specs: Vec::new(),
+                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                    topn_producers: Vec::new(),
+                },
                 streaming_preaggregation_mode: None,
             }),
         },

@@ -810,7 +810,10 @@ mod tests {
                         ])),
                         &[SlotId::new(1), SlotId::new(2)],
                     ),
-                    topn_rf_specs: Vec::new(),
+                    runtime_filter_spec:
+                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
+                            topn_producers: Vec::new(),
+                        },
                     streaming_preaggregation_mode: None,
                 }),
             },
@@ -1948,7 +1951,10 @@ mod tests {
                         ])),
                         &[SlotId::new(3), SlotId::new(4)],
                     ),
-                    topn_rf_specs: Vec::new(),
+                    runtime_filter_spec:
+                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
+                            topn_producers: Vec::new(),
+                        },
                     streaming_preaggregation_mode: None,
                 }),
             },

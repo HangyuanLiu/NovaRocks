@@ -112,5 +112,36 @@ mod tests {
         };
         assert_eq!(producer.contract, consumer.contract);
         assert_eq!(producer.reduction, consumer.reduction);
+
+        let aggregate_producer = crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+            binding_id: 5,
+            channel_id: 6,
+            group_key_expr_id: expr_id,
+            group_key_ordinal: 0,
+            limit: std::num::NonZeroU32::new(7).expect("nonzero limit"),
+            contribution_kinds: BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            completion_requirement: CompletionRequirement::ProducerClosed,
+            contract: NativeRuntimeFilterContract::Ordered {
+                keys: Arc::from([
+                    crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::from_codec(
+                        DataType::Int64,
+                        crate::runtime_filter::model::contract::SortDirection::Ascending,
+                        crate::runtime_filter::model::contract::NullOrder::Last,
+                    ),
+                ]),
+                comparator_digest: [3; 32],
+                order_contract_digest: [4; 32],
+            },
+            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+        };
+        assert_eq!(aggregate_producer.group_key_expr_id, expr_id);
+        assert_eq!(aggregate_producer.limit.get(), 7);
+        assert_eq!(
+            aggregate_producer.reduction,
+            NativeRuntimeFilterReduction::TightenOrderedBound
+        );
     }
 }

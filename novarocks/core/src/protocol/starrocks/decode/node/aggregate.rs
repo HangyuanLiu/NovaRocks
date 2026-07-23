@@ -16,8 +16,8 @@
 // under the License.
 use crate::exec::expr::ExprArena;
 use crate::exec::node::aggregate::{
-    AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, StreamingPreaggregationMode,
-    TopNRuntimeFilterSpec,
+    AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
+    StreamingPreaggregationMode, TopNRuntimeFilterSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::runtime_filter::RuntimeFilterType;
@@ -321,7 +321,9 @@ pub(crate) fn lower_aggregate_node(
                 need_finalize: agg.need_finalize,
                 input_is_intermediate,
                 output_chunk_schema,
-                topn_rf_specs,
+                runtime_filter_spec: AggregateRuntimeFilterSpec::Compat {
+                    legacy_topn_specs: topn_rf_specs,
+                },
                 streaming_preaggregation_mode,
             }),
         },
