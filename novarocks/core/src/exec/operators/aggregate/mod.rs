@@ -57,6 +57,8 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::port::identity::PartitionId;
 use crate::runtime_filter::port::producer::{ProducerFailureReason, RuntimeContractViolationKind};
+#[cfg(test)]
+use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 use crate::runtime_filter::service::{FinalDomainCompletionSession, FinalDomainPartitionCommitter};
 
 pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
@@ -69,6 +71,18 @@ pub(crate) struct AggregateFinalDomainSessionBuilder {
     session: FinalDomainCompletionSession,
     declared_dop: i32,
     max_domain_canonical_bytes: usize,
+    #[cfg(test)]
+    partition_observer: Option<AggregateFinalDomainPartitionObserver>,
+}
+
+#[cfg(test)]
+type AggregateFinalDomainPartitionObserver =
+    Arc<dyn Fn(PartitionId, &ValueDomainDelta) + Send + Sync>;
+
+struct AggregateFinalDomainPartitionCommitter {
+    #[cfg(test)]
+    partition_id: PartitionId,
+    committer: FinalDomainPartitionCommitter,
 }
 
 impl AggregateFinalDomainSessionBuilder {
@@ -94,14 +108,25 @@ impl AggregateFinalDomainSessionBuilder {
             session,
             declared_dop,
             max_domain_canonical_bytes,
+            #[cfg(test)]
+            partition_observer: None,
         })
+    }
+
+    #[cfg(test)]
+    fn observe_partitions_for_test(
+        mut self,
+        observer: AggregateFinalDomainPartitionObserver,
+    ) -> Self {
+        self.partition_observer = Some(observer);
+        self
     }
 
     fn partition(
         &self,
         actual_dop: i32,
         driver_id: i32,
-    ) -> Result<FinalDomainPartitionCommitter, String> {
+    ) -> Result<AggregateFinalDomainPartitionCommitter, String> {
         if actual_dop != self.declared_dop {
             let _ = self.session.fail(ProducerFailureReason::ExecutionFailed);
             return Err(format!(
@@ -115,13 +140,20 @@ impl AggregateFinalDomainSessionBuilder {
                 "aggregate final-domain driver id is outside the actual DOP: driver_id={driver_id} dop={actual_dop}"
             ));
         }
-        self.session
-            .partition(PartitionId::new(driver_id as u32))
+        let partition_id = PartitionId::new(driver_id as u32);
+        let committer = self
+            .session
+            .partition(partition_id)
             .map_err(|error| {
                 format!(
                     "aggregate final-domain partition acquisition failed for driver_id={driver_id}: {error}"
                 )
-            })
+            })?;
+        Ok(AggregateFinalDomainPartitionCommitter {
+            #[cfg(test)]
+            partition_id,
+            committer,
+        })
     }
 
     fn fail(&self) {
@@ -503,6 +535,11 @@ impl OperatorFactory for AggregateProcessorFactory {
                 .as_ref()
                 .map(|session| session.max_domain_canonical_bytes),
             #[cfg(test)]
+            final_domain_partition_observer: self
+                .final_domain_session
+                .as_ref()
+                .and_then(|session| session.partition_observer.clone()),
+            #[cfg(test)]
             fail_output_construction: self.fail_output_construction,
         })
     }
@@ -534,9 +571,11 @@ struct AggregateProcessorOperator {
     key_table_mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
-    final_domain_committer: Option<FinalDomainPartitionCommitter>,
+    final_domain_committer: Option<AggregateFinalDomainPartitionCommitter>,
     final_domain_bind_error: Option<String>,
     max_domain_canonical_bytes: Option<usize>,
+    #[cfg(test)]
+    final_domain_partition_observer: Option<AggregateFinalDomainPartitionObserver>,
     #[cfg(test)]
     fail_output_construction: bool,
 }
@@ -1018,11 +1057,11 @@ impl ProcessorOperator for AggregateProcessorOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.finished {
-            return Ok(());
-        }
         if self.finishing {
             return Err("aggregate received input after set_finishing".to_string());
+        }
+        if self.finished {
+            return Ok(());
         }
         if self.pending_output.is_some() {
             return Err("aggregate received input while output buffer is full".to_string());
@@ -1123,17 +1162,23 @@ impl AggregateProcessorOperator {
             }
             Err(error) => return Err(error.to_string()),
         };
-        let mut committer = self
+        let mut partition = self
             .final_domain_committer
             .take()
             .expect("checked aggregate final-domain committer");
-        if let Err(error) = committer.seal(domain) {
+        #[cfg(test)]
+        let observed_domain = domain.clone();
+        if let Err(error) = partition.committer.seal(domain) {
             if error.kind() == RuntimeContractViolationKind::ServiceUnavailable {
                 return Ok(());
             }
             return Err(error.to_string());
         }
-        if let Err(error) = committer.close() {
+        #[cfg(test)]
+        if let Some(observer) = self.final_domain_partition_observer.as_ref() {
+            observer(partition.partition_id, &observed_domain);
+        }
+        if let Err(error) = partition.committer.close() {
             if error.kind() == RuntimeContractViolationKind::ServiceUnavailable {
                 return Ok(());
             }
@@ -1615,9 +1660,11 @@ mod tests {
         MaterializationPolicy, ProducerDeployment, RuntimeFilterChannelDeployment,
         RuntimeFilterCoreBudget, RuntimeFilterInstallView, local_participant_install_for_test,
     };
+    use crate::runtime_filter::port::subscription::UnavailableReason;
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
+    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
     use crate::runtime_filter::service::RuntimeFilterService;
 
     const RF_BINDING: BindingId = BindingId::new(10);
@@ -1722,11 +1769,19 @@ mod tests {
         }
 
         fn session_builder(&self, dop: i32) -> AggregateFinalDomainSessionBuilder {
+            self.session_builder_with_budget(dop, 512)
+        }
+
+        fn session_builder_with_budget(
+            &self,
+            dop: i32,
+            max_domain_canonical_bytes: usize,
+        ) -> AggregateFinalDomainSessionBuilder {
             let session = self
                 .service
                 .open_final_aggregate_producer(RF_BINDING, RF_INSTANCE, dop as u32)
                 .expect("final-domain completion session");
-            AggregateFinalDomainSessionBuilder::new(session, dop, 512)
+            AggregateFinalDomainSessionBuilder::new(session, dop, max_domain_canonical_bytes)
                 .expect("aggregate final-domain session builder")
         }
 
@@ -1750,6 +1805,22 @@ mod tests {
                 .filter(|event| matches!(event, RuntimeFilterEvent::ProducerInstanceFailed { .. }))
                 .count()
         }
+
+        fn producer_failed_unavailable_count(&self) -> usize {
+            self.events
+                .snapshot()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        RuntimeFilterEvent::ChannelUnavailable {
+                            reason: UnavailableReason::ProducerFailed,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        }
     }
 
     fn aggregate_factory(
@@ -1761,6 +1832,15 @@ mod tests {
     fn aggregate_factory_with_output_type(
         session: Option<AggregateFinalDomainSessionBuilder>,
         output_type: DataType,
+    ) -> AggregateProcessorFactory {
+        aggregate_factory_with_shape(session, output_type, false, true)
+    }
+
+    fn aggregate_factory_with_shape(
+        session: Option<AggregateFinalDomainSessionBuilder>,
+        output_type: DataType,
+        output_intermediate: bool,
+        direct_input: bool,
     ) -> AggregateProcessorFactory {
         let mut arena = ExprArena::default();
         let group_expr = arena.push_typed(ExprNode::SlotId(GROUP_SLOT), DataType::Int64);
@@ -1777,8 +1857,8 @@ mod tests {
             Arc::new(arena),
             vec![group_expr],
             Vec::new(),
-            false,
-            true,
+            output_intermediate,
+            direct_input,
             output_schema,
             session,
         )
@@ -1845,6 +1925,16 @@ mod tests {
             .expect("aggregate output")
     }
 
+    fn sorted_int64_output(chunk: &Chunk) -> Vec<i64> {
+        let values = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 aggregate output");
+        let mut values = values.values().iter().copied().collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    }
+
     #[test]
     fn aggregate_freezes_domain_only_after_set_finishing() {
         let fixture = FinalDomainFixture::new();
@@ -1880,19 +1970,148 @@ mod tests {
 
         assert_eq!(error, "aggregate received input after set_finishing");
         assert_eq!(fixture.accepted_partitions(), vec![0]);
+
+        processor
+            .pull_chunk(&state)
+            .expect("pull aggregate output")
+            .expect("aggregate output");
+        assert!(processor.is_finished());
+        let error = processor
+            .push_chunk(&state, group_chunk([3]))
+            .expect_err("finished aggregate must reject post-freeze input");
+        assert_eq!(error, "aggregate received input after set_finishing");
+        assert_eq!(fixture.accepted_partitions(), vec![0]);
     }
 
     #[test]
     fn aggregate_factory_maps_driver_id_to_partition() {
         let fixture = FinalDomainFixture::new();
-        let factory = aggregate_factory(Some(fixture.session_builder(2)));
+        let observed = Arc::new(Mutex::new(BTreeMap::<u32, ValueDomainDelta>::new()));
+        let observer_state = Arc::clone(&observed);
+        let session = fixture
+            .session_builder(2)
+            .observe_partitions_for_test(Arc::new(move |partition_id, domain| {
+                observer_state
+                    .lock()
+                    .expect("partition observer lock")
+                    .insert(partition_id.get(), domain.clone());
+            }));
+        let factory = aggregate_factory(Some(session));
         let mut driver_1 = prepare_processor(&factory, 2, 1);
         let mut driver_0 = prepare_processor(&factory, 2, 0);
 
-        finish_operator(&mut driver_1, [20]);
-        finish_operator(&mut driver_0, [10]);
+        finish_operator(&mut driver_1, [20, 21]);
+        assert_eq!(
+            observed
+                .lock()
+                .expect("partition observer lock")
+                .get(&1)
+                .map(ValueDomainDelta::values),
+            Some(&MembershipValues::int64([20, 21]))
+        );
+        assert!(
+            observed
+                .lock()
+                .expect("partition observer lock")
+                .get(&0)
+                .is_none()
+        );
+        finish_operator(&mut driver_0, [10, 11]);
 
+        assert_eq!(
+            *observed.lock().expect("partition observer lock"),
+            BTreeMap::from([
+                (
+                    0,
+                    ValueDomainDelta::new(MembershipValues::int64([10, 11]), false)
+                ),
+                (
+                    1,
+                    ValueDomainDelta::new(MembershipValues::int64([20, 21]), false)
+                ),
+            ])
+        );
         assert_eq!(fixture.accepted_partitions(), vec![0, 1]);
+    }
+
+    #[test]
+    fn aggregate_rejects_partial_and_nonmerge_session_miswire() {
+        for (output_intermediate, direct_input, expected) in [
+            (
+                true,
+                false,
+                "aggregate final-domain session may bind only to a merge/final factory",
+            ),
+            (
+                false,
+                false,
+                "aggregate final-domain session may bind only to a merge/final factory",
+            ),
+        ] {
+            let fixture = FinalDomainFixture::new();
+            let factory = aggregate_factory_with_shape(
+                Some(fixture.session_builder(1)),
+                DataType::Int64,
+                output_intermediate,
+                direct_input,
+            );
+            let mut operator = factory.create(1, 0);
+
+            assert_eq!(
+                operator.prepare().expect_err("structural miswire"),
+                expected
+            );
+            assert_eq!(fixture.failure_count(), 1);
+            assert_eq!(fixture.producer_failed_unavailable_count(), 1);
+            assert!(fixture.accepted_partitions().is_empty());
+        }
+    }
+
+    #[test]
+    fn aggregate_rejects_declared_actual_dop_mismatch() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(2)));
+        let mut operator = factory.create(3, 0);
+
+        assert_eq!(
+            operator.prepare().expect_err("DOP mismatch"),
+            "aggregate final-domain DOP mismatch: declared=2 actual=3"
+        );
+        assert_eq!(fixture.failure_count(), 1);
+        assert_eq!(fixture.producer_failed_unavailable_count(), 1);
+        assert!(fixture.accepted_partitions().is_empty());
+    }
+
+    #[test]
+    fn aggregate_rejects_out_of_range_and_duplicate_driver_ids() {
+        {
+            let fixture = FinalDomainFixture::new();
+            let factory = aggregate_factory(Some(fixture.session_builder(2)));
+            let mut operator = factory.create(2, 2);
+
+            assert_eq!(
+                operator.prepare().expect_err("out-of-range driver"),
+                "aggregate final-domain driver id is outside the actual DOP: driver_id=2 dop=2"
+            );
+            assert_eq!(fixture.failure_count(), 1);
+            assert_eq!(fixture.producer_failed_unavailable_count(), 1);
+        }
+
+        {
+            let fixture = FinalDomainFixture::new();
+            let factory = aggregate_factory(Some(fixture.session_builder(2)));
+            let first = prepare_processor(&factory, 2, 0);
+            let mut duplicate = factory.create(2, 0);
+
+            let error = duplicate.prepare().expect_err("duplicate driver");
+            assert!(error.contains("partition acquisition failed for driver_id=0"));
+            assert!(error.contains("already created"));
+            assert_eq!(fixture.failure_count(), 1);
+            assert_eq!(fixture.producer_failed_unavailable_count(), 1);
+            drop(first);
+            drop(factory);
+            assert_eq!(fixture.failure_count(), 1);
+        }
     }
 
     #[test]
@@ -1982,20 +2201,65 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_without_session_is_behavior_identical() {
-        let first_factory = aggregate_factory(None);
-        let second_factory = aggregate_factory(None);
-        let mut first = prepare_processor(&first_factory, 1, 0);
-        let mut second = prepare_processor(&second_factory, 1, 0);
+    fn aggregate_resource_or_size_failure_is_rf_fail_open() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder_with_budget(1, 1)));
+        let mut operator = prepare_processor(&factory, 1, 0);
+        let output = finish_operator(&mut operator, [3, 1, 3, 2]);
 
-        let first_output = finish_operator(&mut first, [3, 1, 3, 2]);
-        let second_output = finish_operator(&mut second, [3, 1, 3, 2]);
+        assert_eq!(sorted_int64_output(&output), vec![1, 2, 3]);
+        assert!(operator.is_finished());
+        assert!(fixture.accepted_partitions().is_empty());
+        assert_eq!(fixture.failure_count(), 1);
+        assert_eq!(fixture.producer_failed_unavailable_count(), 1);
+    }
 
-        assert_eq!(
-            first_output.columns()[0].to_data(),
-            second_output.columns()[0].to_data()
+    #[test]
+    fn aggregate_service_unavailable_is_rf_fail_open() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory(Some(fixture.session_builder(2)));
+        let mut surviving = prepare_processor(&factory, 2, 0);
+        let failed = prepare_processor(&factory, 2, 1);
+        drop(failed);
+        assert_eq!(fixture.failure_count(), 1);
+        assert_eq!(fixture.producer_failed_unavailable_count(), 1);
+
+        let output = finish_operator(&mut surviving, [3, 1, 3, 2]);
+
+        assert_eq!(sorted_int64_output(&output), vec![1, 2, 3]);
+        assert!(surviving.is_finished());
+        assert!(fixture.accepted_partitions().is_empty());
+        assert_eq!(fixture.failure_count(), 1);
+        assert_eq!(fixture.producer_failed_unavailable_count(), 1);
+    }
+
+    #[test]
+    fn aggregate_without_session_has_fixed_output_and_lifecycle() {
+        let factory = aggregate_factory(None);
+        let mut operator = prepare_processor(&factory, 1, 0);
+        let state = RuntimeState::default();
+        assert!(!operator.is_finished());
+
+        let processor = operator.as_processor_mut().expect("aggregate processor");
+        processor
+            .push_chunk(&state, group_chunk([3, 1, 3, 2]))
+            .expect("push aggregate input");
+        processor.set_finishing(&state).expect("finish aggregate");
+        assert!(!processor.is_finished());
+
+        let output = processor
+            .pull_chunk(&state)
+            .expect("pull aggregate output")
+            .expect("aggregate output");
+        assert_eq!(sorted_int64_output(&output), vec![1, 2, 3]);
+        assert_eq!(output.chunk_schema().slot_ids(), &[GROUP_SLOT]);
+        assert!(processor.is_finished());
+        assert!(
+            processor
+                .pull_chunk(&state)
+                .expect("terminal pull")
+                .is_none()
         );
-        assert_eq!(first_output.chunk_schema(), second_output.chunk_schema());
     }
 
     #[test]
