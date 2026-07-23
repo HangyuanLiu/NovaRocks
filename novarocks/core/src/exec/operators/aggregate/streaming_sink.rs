@@ -295,6 +295,10 @@ impl Operator for AggregateStreamingSinkOperator {
         let _ = self.fail_native_topn_producers(ProducerFailureReason::Cancelled);
     }
 
+    fn on_driver_failure(&mut self) {
+        let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
+    }
+
     fn close(&mut self) -> Result<(), String> {
         self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed)
     }

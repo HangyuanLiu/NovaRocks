@@ -599,6 +599,9 @@ impl AggregateTopNProducerStream {
             return Ok(());
         }
         self.terminal = true;
+        let Some(adapter) = self.adapter.as_ref() else {
+            return Ok(());
+        };
         if self
             .binding
             .coordinator
@@ -608,9 +611,6 @@ impl AggregateTopNProducerStream {
         {
             return Ok(());
         }
-        let Some(adapter) = self.adapter.as_ref() else {
-            return Ok(());
-        };
         match adapter.fail(reason) {
             Ok(_) => Ok(()),
             Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
@@ -639,6 +639,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use arrow::array::RecordBatchOptions;
     use arrow::datatypes::DataType;
@@ -654,6 +655,7 @@ mod tests {
     use crate::exec::operators::aggregate::topn_boundary::{
         AggregateTopNBoundaryBinding, build_topn_boundary_bindings,
     };
+    use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::runtime::runtime_state::RuntimeState;
     use crate::runtime_filter::model::contract::{
         CompletionRequirement, ContributionKind, NullOrder, OrderContract, OrderKeyContract,
@@ -1181,6 +1183,60 @@ mod tests {
         assert_eq!(
             adapter.events(),
             vec![Event::Fail(ProducerFailureReason::Cancelled)]
+        );
+    }
+
+    #[test]
+    fn aggregate_topn_producer_runtime_state_failure_uses_execution_failed() {
+        let contract = runtime_contract();
+        let spec = spec(&contract, 1);
+        let adapter = Arc::new(FakeOrderedAdapter::default());
+        let factory = factory(&spec, &contract, Arc::clone(&adapter), 1);
+        let mut operator = super::super::aggregate_topn_test_operator(vec![spec], factory);
+        let runtime_state = Arc::new(RuntimeState::default());
+        operator
+            .bind_runtime_state(runtime_state.as_ref())
+            .expect("bind native producer");
+        runtime_state
+            .error_state()
+            .set_error("injected upstream failure".to_string());
+        let mut driver =
+            PipelineDriver::new(0, vec![operator], None, Vec::new(), runtime_state, None);
+
+        assert_eq!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::Failed("injected upstream failure".to_string())
+        );
+        assert_eq!(
+            adapter.events(),
+            vec![Event::Fail(ProducerFailureReason::ExecutionFailed)]
+        );
+    }
+
+    #[test]
+    fn aggregate_topn_producer_partial_bind_failure_reaches_bound_driver_once() {
+        let contract = runtime_contract();
+        let spec = spec(&contract, 1);
+        let adapter = Arc::new(FakeOrderedAdapter::default());
+        let factory = factory(&spec, &contract, Arc::clone(&adapter), 2);
+        let mut unbound = factory.create(0).expect("unbound partition session");
+        let mut bound = factory.create(1).expect("bound partition session");
+        bound.bind().expect("bind sibling partition");
+        unbound.streams[0].adapter = None;
+
+        unbound
+            .fail(ProducerFailureReason::ExecutionFailed)
+            .expect("record pending failure");
+        bound
+            .fail(ProducerFailureReason::ExecutionFailed)
+            .expect("deliver pending failure");
+        bound
+            .fail(ProducerFailureReason::Cancelled)
+            .expect("duplicate failure is idempotent");
+
+        assert_eq!(
+            adapter.events(),
+            vec![Event::Fail(ProducerFailureReason::ExecutionFailed)]
         );
     }
 
