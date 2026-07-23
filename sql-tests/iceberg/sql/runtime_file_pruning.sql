@@ -17,9 +17,9 @@
 
 -- @order_sensitive=true
 -- @tags=iceberg,runtime_filter
--- RFD-5B keeps native runtime-filter deployment deliberately dormant. Validate
--- that the Iceberg join still preserves results and reports the dormant seam
--- without claiming file-pruning side effects before RFD-6 installs artifacts.
+-- RFD-6 activates native runtime-filter deployment. Validate that the Iceberg
+-- join preserves results and reports active filter application instead of the
+-- retired RFD-5B dormancy seam.
 
 -- query 1
 -- @skip_result_check=true
@@ -92,7 +92,8 @@ ORDER BY p.k1;
 -- query 14
 -- @skip_result_check=true
 -- @result_contains=Profile: fragments=
--- @result_contains=RuntimeFilterDormancy: lookups_observed=true all_deployment_not_installed=true zero_side_effects=true same_backend_partial_completion=false
+-- @result_not_contains=RuntimeFilterDormancy:
+-- @result_contains=RuntimeFilterApply: input_rows=4 output_rows=2
 -- @result_contains=HASH JOIN
 EXPLAIN ANALYZE
 SELECT p.k1, p.payload
