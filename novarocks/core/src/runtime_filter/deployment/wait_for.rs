@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::novarocks_logging::debug;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::sql::planner::distributed::{
     FragmentEdge, FragmentId, JoinBuildProgressCatalog, JoinBuildProgressProof,
@@ -392,7 +393,14 @@ pub(crate) fn validate_wait_for(
     }
 
     match find_cycle(&succ) {
-        None => Ok(()),
+        None => {
+            for (fragment, join_node) in &accepted_build_ready {
+                debug!(
+                    "runtime-filter join progress proof accepted: fragment={fragment} join_node={join_node}"
+                );
+            }
+            Ok(())
+        }
         Some(cycle_edges) => {
             let (channel, binding) = cycle_edges
                 .iter()

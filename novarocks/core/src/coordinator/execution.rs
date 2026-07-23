@@ -52,7 +52,6 @@ use crate::coordinator::profile::{
 };
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
 use crate::coordinator::runtime_filter_deployment::InstalledRuntimeFilterDeployment;
-use crate::coordinator::scheduler::SchedulingPlan;
 use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
@@ -64,12 +63,12 @@ use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{
-    DistributedNode, DistributedNodeKind, FragmentEdge, FragmentEdgeKind, FragmentId,
-};
+use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
 
 #[cfg(test)]
 use crate::coordinator::profile::record_native_standalone_query_profile_report;
+#[cfg(test)]
+use crate::coordinator::scheduler::SchedulingPlan;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
