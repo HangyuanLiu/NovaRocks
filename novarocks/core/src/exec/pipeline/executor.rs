@@ -418,8 +418,8 @@ mod tests {
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
+    use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime::runtime_state::RuntimeState;

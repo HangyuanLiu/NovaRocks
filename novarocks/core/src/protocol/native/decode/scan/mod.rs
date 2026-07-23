@@ -228,11 +228,11 @@ mod tests {
     use crate::common::ids::SlotId;
     #[cfg(feature = "compat")]
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+    #[cfg(feature = "compat")]
+    use crate::connector::StarRocksScanConfig;
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
     use crate::connector::{ConnectorRegistry, HdfsScanConfig, ScanConfig, ScanConnector};
-    #[cfg(feature = "compat")]
-    use crate::connector::StarRocksScanConfig;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
@@ -1349,7 +1349,12 @@ mod tests {
         let ExecNodeKind::Scan(scan) = lowered.node.kind else {
             panic!("expected Scan");
         };
-        let morsels = scan.build_morsels().expect("build morsels");
+        let morsels = scan
+            .source()
+            .bind(ctx.captured_ranges_for_test(10))
+            .expect("bind scan source")
+            .build_morsels()
+            .expect("build morsels");
         let [
             ScanMorsel::FileRange {
                 iceberg_file_pruning,
@@ -1418,7 +1423,12 @@ mod tests {
         let ExecNodeKind::Scan(scan) = lowered.node.kind else {
             panic!("expected Scan");
         };
-        let morsels = scan.build_morsels().expect("build morsels");
+        let morsels = scan
+            .source()
+            .bind(ctx.captured_ranges_for_test(10))
+            .expect("bind scan source")
+            .build_morsels()
+            .expect("build morsels");
         let [
             ScanMorsel::FileRange {
                 iceberg_file_pruning,
@@ -1571,7 +1581,11 @@ mod tests {
         let ExecNodeKind::Scan(scan) = lowered.node.kind else {
             panic!("expected Scan");
         };
-        let morsel = scan
+        let op = scan
+            .source()
+            .bind(ctx.captured_ranges_for_test(10))
+            .expect("bind scan source");
+        let morsel = op
             .build_morsels()
             .expect("build native scan morsels")
             .morsels
@@ -1600,7 +1614,7 @@ mod tests {
             )
             .expect("ordered predicate");
         assert_eq!(
-            scan.late_prune_morsel_with_ordered_predicate(&morsel, SlotId::new(1), &predicate,)
+            op.late_prune_morsel_with_ordered_predicate(&morsel, SlotId::new(1), &predicate,)
                 .expect("native late prune"),
             crate::exec::node::scan::ScanMorselPruneDecision::Keep,
             "missing null_count must not be encoded as explicit NoNulls"

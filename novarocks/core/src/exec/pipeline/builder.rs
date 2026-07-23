@@ -2339,13 +2339,11 @@ fn build_pipeline_for_node(
                 .get(node.node_id)
                 .ok_or_else(|| format!("missing exchange binding for node {}", node.node_id))?;
             let factory = match &ctx.runtime_filter_execution {
-                PipelineRuntimeFilterExecution::Native { .. } => {
-                    ExchangeSourceFactory::new_native(
-                        node.clone(),
-                        binding,
-                        Arc::clone(&ctx.arena),
-                    )?
-                }
+                PipelineRuntimeFilterExecution::Native { .. } => ExchangeSourceFactory::new_native(
+                    node.clone(),
+                    binding,
+                    Arc::clone(&ctx.arena),
+                )?,
                 #[cfg(feature = "compat")]
                 PipelineRuntimeFilterExecution::Compat { hub } => {
                     ExchangeSourceFactory::new_compat(
