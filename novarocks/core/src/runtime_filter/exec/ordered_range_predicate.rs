@@ -204,6 +204,10 @@ impl NativeOrderedRangePredicate {
         self.logical_version
     }
 
+    pub(crate) fn data_type(&self) -> &DataType {
+        self.order_contract.keys()[0].data_type()
+    }
+
     pub(crate) fn evaluate(
         &self,
         array: &dyn Array,

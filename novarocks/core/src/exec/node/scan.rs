@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::common::ids::SlotId;
 use crate::connector::iceberg::IcebergMetadataScanRange;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
@@ -291,6 +292,12 @@ impl<'a> ScanRuntimeFilterDecision<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScanMorselPruneDecision {
+    Keep,
+    Skip,
+}
+
 pub trait ScanOp: Send + Sync {
     fn execute_iter(
         &self,
@@ -328,6 +335,17 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
+
+    #[allow(private_interfaces)]
+    fn late_prune_morsel_with_ordered_predicate(
+        &self,
+        _morsel: &ScanMorsel,
+        _slot_id: SlotId,
+        _predicate: &crate::runtime_filter::exec::ordered_range_predicate::
+            NativeOrderedRangePredicate,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        Ok(ScanMorselPruneDecision::Keep)
+    }
 
     /// Load Iceberg v2 position-delete files attached to `morsel` and collect
     /// the row positions they retire for the morsel's data file. Returns

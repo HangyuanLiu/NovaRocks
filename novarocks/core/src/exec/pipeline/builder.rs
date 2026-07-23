@@ -2983,6 +2983,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             None,
         ) {
@@ -3153,6 +3155,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             Some(context),
         )
@@ -3198,6 +3202,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             Some(ordinary_context),
         )
@@ -3213,6 +3219,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             Some(final_context),
         )
@@ -3250,6 +3258,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             Some(streaming_context),
         )
@@ -3284,6 +3294,8 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
             2,
             Some(membership_context),
         ) {

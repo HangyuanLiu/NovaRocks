@@ -19,11 +19,13 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::ExprArena;
+use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::runtime_filter::{
     NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
 };
+use crate::exec::node::scan::ScanMorselPruneDecision;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::profile::{
@@ -122,7 +124,7 @@ impl NativeOrderedLiveConsumerSet {
     }
 
     #[cfg(test)]
-    fn from_bound_for_test(
+    pub(crate) fn from_bound_for_test(
         specs: Vec<NativeRuntimeFilterConsumerSpec>,
         arena: Arc<ExprArena>,
         subscriptions: Vec<Arc<dyn NonBlockingLiveSubscription>>,
@@ -210,12 +212,71 @@ impl NativeOrderedLiveConsumerSet {
         self.poll_and_apply_chunk_profiled(chunk, None)
     }
 
+    pub(crate) fn poll_and_prune_morsel(
+        &self,
+        mut prune: impl FnMut(
+            SlotId,
+            &NativeOrderedRangePredicate,
+        ) -> Result<ScanMorselPruneDecision, String>,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        self.poll()?;
+        let active = {
+            let bindings = self
+                .inner
+                .bindings
+                .lock()
+                .expect("native ordered RF consumer lock");
+            bindings
+                .iter()
+                .filter_map(|binding| {
+                    let ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Split,
+                    } = binding.spec.activation
+                    else {
+                        return None;
+                    };
+                    let NativeOrderedLiveBindingState::Live {
+                        latest_predicate: Some(predicate),
+                        ..
+                    } = &binding.state
+                    else {
+                        return None;
+                    };
+                    let Some(ExprNode::SlotId(slot_id)) =
+                        self.inner.arena.node(binding.spec.expr_id)
+                    else {
+                        return None;
+                    };
+                    Some((*slot_id, predicate.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (slot_id, predicate) in active {
+            if prune(slot_id, predicate.as_ref())? == ScanMorselPruneDecision::Skip {
+                return Ok(ScanMorselPruneDecision::Skip);
+            }
+        }
+        Ok(ScanMorselPruneDecision::Keep)
+    }
+
     pub(crate) fn poll_and_apply_chunk_profiled(
         &self,
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
     ) -> Result<Option<Chunk>, String> {
-        self.poll()?;
+        self.poll_updates()?;
+        self.apply_latest_chunk_profiled(chunk, profiles)
+    }
+
+    pub(crate) fn poll_updates(&self) -> Result<(), String> {
+        self.poll()
+    }
+
+    pub(crate) fn apply_latest_chunk_profiled(
+        &self,
+        chunk: Chunk,
+        profiles: Option<&OperatorProfiles>,
+    ) -> Result<Option<Chunk>, String> {
         let configured = !self
             .inner
             .bindings
@@ -515,7 +576,7 @@ impl NativeRuntimeFilterConsumerSet {
     }
 
     #[cfg(test)]
-    fn from_bound_for_test(
+    pub(crate) fn from_bound_for_test(
         specs: Vec<NativeRuntimeFilterConsumerSpec>,
         arena: Arc<ExprArena>,
         subscriptions: Vec<Arc<dyn BlockingSnapshotSubscription>>,

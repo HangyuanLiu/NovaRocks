@@ -18,6 +18,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
+use arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array,
+    TimestampMicrosecondArray, new_null_array,
+};
+use arrow::datatypes::{DataType, TimeUnit};
+
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::{
     RuntimeScanPredicateBindings, RuntimeScanPredicateCounters, RuntimeScanPredicateOptions,
@@ -31,12 +37,13 @@ use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
     BoundScanRanges, HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
-    ScanMorsels, ScanOp, ScanRuntimeFilterDecision, ScanSource,
+    ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanRuntimeFilterDecision, ScanSource,
 };
 use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::runtime_filter_hub::AcquiredRuntimeFilters;
+use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
 
 fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
     delete_files
@@ -53,6 +60,110 @@ fn apply_parquet_pruning_gate_for_delete_files(
         parquet_cfg.min_max_predicates.clear();
         parquet_cfg.runtime_min_max_filter_columns.clear();
         parquet_cfg.variant_path_predicates.clear();
+    }
+}
+
+fn exact_ordered_file_candidates(
+    stats: &crate::connector::iceberg::scan_model::IcebergColumnStats,
+    data_type: &DataType,
+) -> Option<ArrayRef> {
+    let value_count = stats.value_count?;
+    let null_count = stats.null_count?;
+    if value_count < 0 || null_count < 0 || null_count > value_count {
+        return None;
+    }
+    if value_count == 0 {
+        return Some(new_null_array(data_type, 0));
+    }
+    if value_count == null_count {
+        return Some(new_null_array(data_type, 1));
+    }
+
+    let lower = stats.lower_bound.as_deref()?;
+    let upper = stats.upper_bound.as_deref()?;
+    let has_null = null_count > 0;
+    macro_rules! candidates {
+        ($lower:expr, $upper:expr, $array:ident $(, $finish:expr)?) => {{
+            let lower = $lower;
+            let upper = $upper;
+            if lower > upper {
+                return None;
+            }
+            let values = if has_null {
+                vec![Some(lower), Some(upper), None]
+            } else {
+                vec![Some(lower), Some(upper)]
+            };
+            let array = $array::from(values);
+            $(
+                let array = $finish(array)?;
+            )?
+            Some(Arc::new(array) as ArrayRef)
+        }};
+    }
+    match data_type {
+        DataType::Boolean => {
+            let decode = |bytes: &[u8]| match bytes {
+                [0] => Some(false),
+                [1] => Some(true),
+                _ => None,
+            };
+            candidates!(decode(lower)?, decode(upper)?, BooleanArray)
+        }
+        DataType::Int32 => {
+            candidates!(
+                i32::from_le_bytes(lower.try_into().ok()?),
+                i32::from_le_bytes(upper.try_into().ok()?),
+                Int32Array
+            )
+        }
+        DataType::Int64 => {
+            candidates!(
+                i64::from_le_bytes(lower.try_into().ok()?),
+                i64::from_le_bytes(upper.try_into().ok()?),
+                Int64Array
+            )
+        }
+        DataType::Date32 => {
+            candidates!(
+                i32::from_le_bytes(lower.try_into().ok()?),
+                i32::from_le_bytes(upper.try_into().ok()?),
+                Date32Array
+            )
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+            let lower = i64::from_le_bytes(lower.try_into().ok()?);
+            let upper = i64::from_le_bytes(upper.try_into().ok()?);
+            if lower > upper {
+                return None;
+            }
+            let values = if has_null {
+                vec![Some(lower), Some(upper), None]
+            } else {
+                vec![Some(lower), Some(upper)]
+            };
+            Some(Arc::new(
+                TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone()),
+            ) as ArrayRef)
+        }
+        DataType::Decimal128(precision, scale) => {
+            let decode = |bytes: &[u8]| {
+                if bytes.is_empty() || bytes.len() > 16 {
+                    return None;
+                }
+                let fill = if bytes[0] & 0x80 == 0 { 0 } else { u8::MAX };
+                let mut decoded = [fill; 16];
+                decoded[16 - bytes.len()..].copy_from_slice(bytes);
+                Some(i128::from_be_bytes(decoded))
+            };
+            candidates!(
+                decode(lower)?,
+                decode(upper)?,
+                Decimal128Array,
+                |array: Decimal128Array| array.with_precision_and_scale(*precision, *scale).ok()
+            )
+        }
+        _ => None,
     }
 }
 
@@ -505,6 +616,47 @@ impl ScanOp for HdfsScanOp {
         self.flush_iceberg_runtime_pruning_profile(profile);
     }
 
+    fn late_prune_morsel_with_ordered_predicate(
+        &self,
+        morsel: &ScanMorsel,
+        slot_id: SlotId,
+        predicate: &NativeOrderedRangePredicate,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        let ScanMorsel::FileRange {
+            iceberg_file_pruning: Some(metadata),
+            ..
+        } = morsel
+        else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let Some(pruning) = self.cfg.iceberg_runtime_pruning.as_ref() else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let Some(column) = pruning.slot_to_column.get(&slot_id) else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let Some(stats) = metadata.columns.get(column).or_else(|| {
+            metadata
+                .columns
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                .map(|(_, stats)| stats)
+        }) else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let Some(candidates) = exact_ordered_file_candidates(stats, predicate.data_type()) else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let Ok(mask) = predicate.evaluate(candidates.as_ref()) else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        if mask.iter().all(|value| value != Some(true)) {
+            Ok(ScanMorselPruneDecision::Skip)
+        } else {
+            Ok(ScanMorselPruneDecision::Keep)
+        }
+    }
+
     fn supports_incremental_scan_ranges(&self) -> bool {
         true
     }
@@ -886,7 +1038,8 @@ mod tests {
     use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::node::scan::{
         BoundScanRanges, HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange,
-        ScanMorsel, ScanNode, ScanOp, ScanRuntimeFilterDecision, ScanSource,
+        ScanMorsel, ScanMorselPruneDecision, ScanNode, ScanOp, ScanRuntimeFilterDecision,
+        ScanSource,
     };
     use crate::exec::operators::scan::ScanSourceFactory;
     use crate::exec::pipeline::dependency::DependencyManager;
@@ -904,6 +1057,12 @@ mod tests {
         AcquiredRuntimeFilters, RuntimeFilterHub, RuntimeFilterSnapshot,
         RuntimeFilterUnavailableReason,
     };
+    use crate::runtime_filter::exec::ordered_range_predicate::{
+        NativeOrderedRangePredicate, OrderedRangePredicateContract,
+    };
+    use crate::runtime_filter::model::contract::{ChannelId, NullOrder, SortDirection};
+    use crate::runtime_filter::port::identity::LogicalVersion;
+    use crate::runtime_filter::port::ordered_bound::OrderedScalar;
 
     use super::{
         HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp, HdfsScanSource,
@@ -1059,6 +1218,61 @@ mod tests {
         }
     }
 
+    fn exact_iceberg_file_pruning_metadata_for_i32_range(
+        column: &str,
+        lower: i32,
+        upper: i32,
+    ) -> IcebergFilePruningMetadata {
+        let mut metadata = iceberg_file_pruning_metadata_for_i32_range(column, lower, upper);
+        let stats = metadata
+            .columns
+            .get_mut(column)
+            .expect("exact Iceberg column stats");
+        stats.null_count = Some(0);
+        stats.value_count = Some(2);
+        metadata
+    }
+
+    fn ordered_i32_predicate(bound: i32) -> NativeOrderedRangePredicate {
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Int32,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        );
+        let version = LogicalVersion::FIRST;
+        let bundle = crate::runtime_filter::exec::ordered_range_predicate::tests_support::bundle(
+            order.clone(),
+            Some(OrderedScalar::Int32(bound)),
+            version,
+        );
+        NativeOrderedRangePredicate::compile(
+            &bundle,
+            &OrderedRangePredicateContract::new(ChannelId::new(7), order, version)
+                .expect("ordered predicate contract"),
+        )
+        .expect("ordered predicate")
+    }
+
+    fn ordered_utf8_predicate(bound: &str) -> NativeOrderedRangePredicate {
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Utf8,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        );
+        let version = LogicalVersion::FIRST;
+        let bundle = crate::runtime_filter::exec::ordered_range_predicate::tests_support::bundle(
+            order.clone(),
+            Some(OrderedScalar::Utf8(Arc::from(bound))),
+            version,
+        );
+        NativeOrderedRangePredicate::compile(
+            &bundle,
+            &OrderedRangePredicateContract::new(ChannelId::new(7), order, version)
+                .expect("ordered UTF8 predicate contract"),
+        )
+        .expect("ordered UTF8 predicate")
+    }
+
     fn iceberg_file_range_for_runtime_pruning_test(
         path: &str,
         stats: Option<IcebergFilePruningMetadata>,
@@ -1105,6 +1319,125 @@ mod tests {
                 discrete_set_max_values: 256,
             }),
         }
+    }
+
+    #[test]
+    fn native_scan_ordered_live_hdfs_skips_only_exact_file_range_evidence() {
+        let mut cfg = hdfs_cfg_with_two_iceberg_files_for_test();
+        cfg.ranges = Vec::new();
+        let op = HdfsScanOp::new(cfg);
+        let predicate = ordered_i32_predicate(50);
+
+        let exact_miss = iceberg_file_range_for_runtime_pruning_test(
+            "s3://bucket/path/exact-miss.parquet",
+            Some(exact_iceberg_file_pruning_metadata_for_i32_range(
+                "k1", 90, 110,
+            )),
+        );
+        let exact_miss = HdfsScanOp::new(HdfsScanConfig {
+            ranges: vec![exact_miss],
+            ..op.cfg.clone()
+        })
+        .build_morsels()
+        .expect("exact morsel")
+        .morsels
+        .pop()
+        .expect("exact file range");
+        assert_eq!(
+            op.late_prune_morsel_with_ordered_predicate(&exact_miss, SlotId::new(3), &predicate,)
+                .expect("exact late prune"),
+            ScanMorselPruneDecision::Skip
+        );
+
+        let missing_counts = iceberg_file_range_for_runtime_pruning_test(
+            "s3://bucket/path/missing-counts.parquet",
+            Some(iceberg_file_pruning_metadata_for_i32_range("k1", 90, 110)),
+        );
+        let missing_counts = HdfsScanOp::new(HdfsScanConfig {
+            ranges: vec![missing_counts],
+            ..op.cfg.clone()
+        })
+        .build_morsels()
+        .expect("missing-counts morsel")
+        .morsels
+        .pop()
+        .expect("missing-counts file range");
+        assert_eq!(
+            op.late_prune_morsel_with_ordered_predicate(
+                &missing_counts,
+                SlotId::new(3),
+                &predicate,
+            )
+            .expect("missing-counts late prune"),
+            ScanMorselPruneDecision::Keep
+        );
+
+        let missing_metadata = HdfsScanOp::new(HdfsScanConfig {
+            ranges: vec![iceberg_file_range_for_runtime_pruning_test(
+                "s3://bucket/path/missing-metadata.parquet",
+                None,
+            )],
+            ..op.cfg.clone()
+        })
+        .build_morsels()
+        .expect("missing-metadata morsel")
+        .morsels
+        .pop()
+        .expect("missing-metadata file range");
+        assert_eq!(
+            op.late_prune_morsel_with_ordered_predicate(
+                &missing_metadata,
+                SlotId::new(3),
+                &predicate,
+            )
+            .expect("missing-metadata late prune"),
+            ScanMorselPruneDecision::Keep
+        );
+
+        let unsupported_metadata = IcebergFilePruningMetadata {
+            columns: HashMap::from([(
+                "k1".to_string(),
+                IcebergColumnStats {
+                    null_count: Some(0),
+                    value_count: Some(2),
+                    column_size: None,
+                    lower_bound: Some(b"z".to_vec()),
+                    upper_bound: Some(b"zz".to_vec()),
+                },
+            )]),
+        };
+        let unsupported = HdfsScanOp::new(HdfsScanConfig {
+            ranges: vec![iceberg_file_range_for_runtime_pruning_test(
+                "s3://bucket/path/unsupported-string-bounds.parquet",
+                Some(unsupported_metadata),
+            )],
+            ..op.cfg.clone()
+        })
+        .build_morsels()
+        .expect("unsupported morsel")
+        .morsels
+        .pop()
+        .expect("unsupported file range");
+        assert_eq!(
+            op.late_prune_morsel_with_ordered_predicate(
+                &unsupported,
+                SlotId::new(3),
+                &ordered_utf8_predicate("m"),
+            )
+            .expect("unsupported late prune"),
+            ScanMorselPruneDecision::Keep
+        );
+        assert_eq!(
+            op.late_prune_morsel_with_ordered_predicate(
+                &ScanMorsel::Schema {
+                    table_name: "not-a-file-range".to_string(),
+                },
+                SlotId::new(3),
+                &predicate,
+            )
+            .expect("non-file late prune"),
+            ScanMorselPruneDecision::Keep
+        );
     }
 
     fn hdfs_cfg_with_all_pruned_iceberg_files_for_test() -> HdfsScanConfig {
