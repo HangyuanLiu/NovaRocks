@@ -212,7 +212,7 @@ pub(crate) fn compile_with_join_progress(
             }
         }
     }
-    validate_wait_for(&exec_deps, edges, &consumer_waits, join_progress)?;
+    validate_wait_for(&exec_deps, edges, &consumer_waits, join_progress, graph)?;
 
     // 5. Role graph per channel + the per-channel projection spec the shard
     // projector needs. The completion requirement is precomputed here from

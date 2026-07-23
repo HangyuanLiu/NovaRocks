@@ -50,8 +50,7 @@ pub(crate) struct FrontierEdge {
     pub(crate) target_exchange_node: i32,
 }
 
-pub(crate) type JoinBuildProgressCatalog =
-    BTreeMap<(ChannelId, BindingId, FragmentId), JoinBuildProgressProof>;
+type JoinBuildProgressKey = (ChannelId, BindingId, FragmentId);
 
 /// Why a join was skipped (no proof sealed). Diagnostic only; a skipped join
 /// keeps its coarse-grained wait edges and the final cycle guard still runs.
@@ -60,6 +59,69 @@ pub(crate) enum FrontierSkip {
     NoRfSides,
     MissingChild,
     UnauditedNode { node_id: i32 },
+}
+
+/// Planner provenance for one producer that could not seal a build-frontier
+/// proof. Deployment keeps the coarse edge and uses this only for diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JoinBuildProgressSkip {
+    pub(crate) join_node_id: i32,
+    pub(crate) rule: FrontierSkip,
+}
+
+/// Planner-sealed build-progress facts. Successful proofs and fail-closed skip
+/// provenance share the same expected producer tuple without conflating their
+/// semantics.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct JoinBuildProgressCatalog {
+    proofs: BTreeMap<JoinBuildProgressKey, JoinBuildProgressProof>,
+    skips: BTreeMap<JoinBuildProgressKey, JoinBuildProgressSkip>,
+}
+
+impl JoinBuildProgressCatalog {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.proofs.len() + self.skips.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &JoinBuildProgressProof> {
+        self.proofs.values()
+    }
+
+    pub(crate) fn get(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressProof> {
+        self.proofs.get(key)
+    }
+
+    pub(crate) fn skipped(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressSkip> {
+        self.skips.get(key)
+    }
+
+    fn insert_proof(&mut self, key: JoinBuildProgressKey, proof: JoinBuildProgressProof) {
+        self.skips.remove(&key);
+        self.proofs.insert(key, proof);
+    }
+
+    fn insert_skip(&mut self, key: JoinBuildProgressKey, skip: JoinBuildProgressSkip) {
+        self.proofs.remove(&key);
+        self.skips.insert(key, skip);
+    }
+}
+
+impl FromIterator<(JoinBuildProgressKey, JoinBuildProgressProof)> for JoinBuildProgressCatalog {
+    fn from_iter<T: IntoIterator<Item = (JoinBuildProgressKey, JoinBuildProgressProof)>>(
+        iter: T,
+    ) -> Self {
+        let mut catalog = Self::new();
+        for (key, proof) in iter {
+            catalog.insert_proof(key, proof);
+        }
+        catalog
+    }
 }
 
 /// Fragment-local input-closure audit.
@@ -172,8 +234,8 @@ pub(super) fn build_join_progress_proof_catalog(
     ) {
         if matches!(node.payload, DistributedNodeKind::HashJoin(_))
             && !node.runtime_filter_binding_ids.is_empty()
-            && let Ok(split) = split_join_inputs(fragment, node)
         {
+            let split = split_join_inputs(fragment, node);
             for binding_id in &node.runtime_filter_binding_ids {
                 let Some(binding) = graph.binding(*binding_id) else {
                     continue;
@@ -184,17 +246,27 @@ pub(super) fn build_join_progress_proof_catalog(
                 if requirement.completion_requirement != CompletionRequirement::ProducerClosed {
                     continue;
                 }
-                catalog.insert(
-                    (binding.channel_id, binding.binding_id, fragment.fragment_id),
-                    JoinBuildProgressProof {
-                        channel: binding.channel_id,
-                        producer_binding: binding.binding_id,
-                        producer_fragment: fragment.fragment_id,
-                        join_node_id: node.node_id,
-                        build_frontier: split.build_frontier.iter().copied().collect(),
-                        non_build_inputs: split.non_build_inputs.iter().copied().collect(),
-                    },
-                );
+                let key = (binding.channel_id, binding.binding_id, fragment.fragment_id);
+                match &split {
+                    Ok(split) => catalog.insert_proof(
+                        key,
+                        JoinBuildProgressProof {
+                            channel: binding.channel_id,
+                            producer_binding: binding.binding_id,
+                            producer_fragment: fragment.fragment_id,
+                            join_node_id: node.node_id,
+                            build_frontier: split.build_frontier.iter().copied().collect(),
+                            non_build_inputs: split.non_build_inputs.iter().copied().collect(),
+                        },
+                    ),
+                    Err(rule) => catalog.insert_skip(
+                        key,
+                        JoinBuildProgressSkip {
+                            join_node_id: node.node_id,
+                            rule: *rule,
+                        },
+                    ),
+                }
             }
         }
         for child in &node.children {
@@ -213,9 +285,22 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::sql::analysis::JoinKind;
+    use arrow::datatypes::DataType;
+
+    use crate::runtime_filter::deployment::DeploymentError;
+    use crate::runtime_filter::deployment::wait_for::{
+        ConsumerWaitInput, ExecutionDependencyGraph, ProducerWaitInput, validate_wait_for,
+    };
+    use crate::runtime_filter::model::contract::{
+        ConsumerActivation, ContributionKind, CoverageWitnessId, PlanFragmentId, PlanNodeId,
+    };
+    use crate::runtime_filter::model::graph::{
+        ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingSpec,
+    };
+    use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
-        DataPartition, DataSink, ExchangeFlavor, ExchangeReceiver, PartitionKind, PlanFragment,
+        DataPartition, DataSink, ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
+        FragmentStreamKind, PartitionKind, PlanFragment,
     };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::runtime_filter::JoinExecutionMode;
@@ -330,6 +415,55 @@ mod tests {
         FrontierEdge {
             source_fragment: source,
             target_exchange_node: exchange_node,
+        }
+    }
+
+    fn producer_graph(fragment_id: FragmentId, join_node_id: i32) -> RuntimeFilterGraph {
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(100),
+                channel_id: ChannelId::new(7),
+                coverage_witness_id: Some(CoverageWitnessId::new(1)),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(fragment_id),
+                    node_id: PlanNodeId::new(join_node_id),
+                },
+                expression: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    join_key_ordinal: 0,
+                }),
+            })
+            .unwrap();
+        graph
+    }
+
+    fn fragment_edge(
+        source_fragment_id: FragmentId,
+        target_fragment_id: FragmentId,
+        target_exchange_node_id: i32,
+    ) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id,
+            output_partition: DataPartition {
+                kind: PartitionKind::Hash,
+                exprs: vec![],
+            },
+            stream_kind: FragmentStreamKind::Partitioned,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: vec![],
         }
     }
 
@@ -450,6 +584,39 @@ mod tests {
             split_join_inputs(&frag, &join),
             Err(FrontierSkip::MissingChild)
         );
+    }
+
+    #[test]
+    fn planner_skip_provenance_is_rendered_when_coarse_fallback_cycles() {
+        let mut join = hash_join(
+            10,
+            1,
+            JoinKind::LeftOuter,
+            vec![exchange(20, 1, 2), exchange(30, 1, 3)],
+        );
+        join.runtime_filter_binding_ids = vec![BindingId::new(100)];
+        let fragments = vec![fragment(1, join)];
+        let graph = producer_graph(1, 10);
+        let catalog = build_join_progress_proof_catalog(&fragments, &graph);
+        let edges = vec![fragment_edge(2, 1, 20), fragment_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = ConsumerWaitInput {
+            channel: ChannelId::new(7),
+            binding: BindingId::new(10),
+            consumer_fragment: 2,
+            activation: ConsumerActivation::BlockingSnapshot,
+            producers: vec![ProducerWaitInput {
+                binding: BindingId::new(100),
+                fragment: 1,
+            }],
+        };
+
+        let err = validate_wait_for(&deps, &edges, &[consumer], &catalog, &graph).unwrap_err();
+        let DeploymentError::BlockingFeedbackCycle { cycle, .. } = err else {
+            panic!("expected coarse fallback cycle");
+        };
+        let rendered = cycle.join(", ");
+        assert!(rendered.contains("proof skipped: join-node=10 rule=NoRfSides"));
     }
 
     #[test]
