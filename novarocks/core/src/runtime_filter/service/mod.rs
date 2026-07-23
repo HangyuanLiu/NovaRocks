@@ -22,6 +22,8 @@ mod inbound;
 #[cfg(test)]
 mod live_deployment_conformance_tests;
 #[cfg(test)]
+mod live_aggregate_conformance_tests;
+#[cfg(test)]
 mod live_join_conformance_tests;
 #[cfg(test)]
 mod m3a_tests;
