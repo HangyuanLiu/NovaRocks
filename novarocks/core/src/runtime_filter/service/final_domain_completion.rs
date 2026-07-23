@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
+use arrow::datatypes::DataType;
 use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
@@ -47,6 +48,7 @@ pub(crate) struct FinalDomainServiceIssuancePermit {
 
 pub(crate) struct FinalDomainCompletionSession {
     inner: Arc<FinalDomainCompletionSessionInner>,
+    membership_key_type: DataType,
     _owner_lease: FinalDomainCompletionOwnerLease,
 }
 
@@ -287,6 +289,7 @@ impl FinalDomainCompletionSession {
                 "a final-domain completion session requires at least one partition",
             ));
         }
+        let membership_key_type = contract.membership_schema().data_type().clone();
         let authority = FinalDomainCompletionAuthority::new(
             contract,
             binding_id,
@@ -313,8 +316,13 @@ impl FinalDomainCompletionSession {
         });
         Ok(Self {
             inner: Arc::clone(&inner),
+            membership_key_type,
             _owner_lease: FinalDomainCompletionOwnerLease { inner },
         })
+    }
+
+    pub(crate) const fn membership_key_type(&self) -> &DataType {
+        &self.membership_key_type
     }
 
     pub(crate) fn partition(
@@ -786,28 +794,11 @@ mod tests {
         }
     }
 
-    struct RejectNthReservation {
-        call: AtomicUsize,
-        reject_at: usize,
-    }
+    struct AcceptingMemory;
 
-    impl RejectNthReservation {
-        fn new(reject_at: usize) -> Self {
-            Self {
-                call: AtomicUsize::new(0),
-                reject_at,
-            }
-        }
-    }
-
-    impl RuntimeFilterMemoryAccount for RejectNthReservation {
+    impl RuntimeFilterMemoryAccount for AcceptingMemory {
         fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
-            let call = self.call.fetch_add(1, Ordering::SeqCst) + 1;
-            if call == self.reject_at {
-                Err(MemoryAccountError::CapacityExceeded)
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
 
         fn release(&self, _bytes: usize) {}
@@ -1154,12 +1145,9 @@ mod tests {
     }
 
     #[test]
-    fn nth_partition_submit_failure_stops_and_fails_without_materializing_subset() {
+    fn selected_partition_submit_failure_stops_and_fails_without_materializing_subset() {
         let events = Arc::new(RecordingEvents::default());
-        // One accepted final shard consumes a temporary lease and then its retained
-        // reducer reservation. Reject call 3 to fail the second partition before
-        // any second-shard core mutation.
-        let memory = Arc::new(RejectNthReservation::new(3));
+        let memory = Arc::new(AcceptingMemory);
         let service = Arc::new(super::super::RuntimeFilterService::new_with_dependencies(
             UniqueId { hi: 0, lo: 0 },
             Arc::new(FixedClock(Instant::now())),
@@ -1181,6 +1169,12 @@ mod tests {
         let session = service
             .open_final_aggregate_producer(BindingId::new(10), UniqueId { hi: 70, lo: 10 }, 3)
             .unwrap();
+        service.inject_final_domain_submit_failure_for_test(
+            BindingId::new(10),
+            UniqueId { hi: 70, lo: 10 },
+            PartitionId::new(1),
+            ProducerSequence::new(0),
+        );
         let mut partitions = [
             session.partition(PartitionId::new(0)).unwrap(),
             session.partition(PartitionId::new(1)).unwrap(),
@@ -1203,7 +1197,7 @@ mod tests {
             live.poll_after(None),
             LivePollOutcome::Idle {
                 latest_version: None,
-                terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ResourceLimit)),
+                terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ProducerFailed)),
             }
         ));
         let events = events.0.lock().unwrap();

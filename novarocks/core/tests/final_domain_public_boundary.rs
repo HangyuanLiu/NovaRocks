@@ -18,31 +18,100 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
-fn novarocks_rlib() -> PathBuf {
-    let deps = std::env::current_exe()
+fn current_target_dir() -> PathBuf {
+    std::env::current_exe()
         .expect("test executable path")
         .parent()
         .expect("test executable lives in target/deps")
-        .to_path_buf();
-    fs::read_dir(&deps)
-        .expect("target dependency directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("libnovarocks-") && name.ends_with(".rlib"))
-        })
-        .expect("novarocks rlib for external-public-API check")
+        .parent()
+        .expect("target profile directory")
+        .parent()
+        .expect("Cargo target directory")
+        .to_path_buf()
+}
+
+fn current_novarocks_rlib() -> &'static PathBuf {
+    static RLIB: OnceLock<PathBuf> = OnceLock::new();
+    RLIB.get_or_init(|| {
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .arg("build")
+            .arg("--locked")
+            .arg("--offline")
+            .arg("--manifest-path")
+            .arg(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|path| path.parent())
+                    .expect("NovaRocks workspace root")
+                    .join("Cargo.toml"),
+            )
+            .arg("-p")
+            .arg("novarocks")
+            .arg("--lib")
+            .arg("--no-default-features")
+            .arg("--message-format=json-render-diagnostics")
+            .env("CARGO_TARGET_DIR", current_target_dir());
+        let mut features = Vec::new();
+        if cfg!(feature = "compat") {
+            features.push("compat");
+        }
+        if cfg!(feature = "foundationdb-provider") {
+            features.push("foundationdb-provider");
+        }
+        if cfg!(feature = "mysql-state-store-provider") {
+            features.push("mysql-state-store-provider");
+        }
+        if cfg!(feature = "state-store-test-hooks") {
+            features.push("state-store-test-hooks");
+        }
+        if cfg!(feature = "ssb") {
+            features.push("ssb");
+        }
+        if !features.is_empty() {
+            command.arg("--features").arg(features.join(","));
+        }
+        let output = command.output().expect("build current novarocks library");
+        assert!(
+            output.status.success(),
+            "current novarocks library build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let artifacts = String::from_utf8(output.stdout)
+            .expect("Cargo JSON output is UTF-8")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter(|message| message["target"]["name"] == "novarocks")
+            .filter(|message| {
+                message["target"]["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+            })
+            .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
+            .filter_map(|filename| filename.as_str().map(PathBuf::from))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "rlib")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "Cargo must report exactly one current novarocks rlib, got {artifacts:?}"
+        );
+        artifacts.into_iter().next().unwrap()
+    })
 }
 
 fn compile_external(source: &str) -> Output {
     let workspace = tempfile::tempdir().expect("temporary external caller workspace");
     let source_path = workspace.path().join("external.rs");
     fs::write(&source_path, source).expect("external caller source");
-    let rlib = novarocks_rlib();
-    let deps = rlib.parent().expect("rlib dependency directory");
+    let rlib = current_novarocks_rlib();
+    let deps = rlib.parent().expect("rlib profile directory").join("deps");
 
     Command::new("rustc")
         .arg("--edition=2024")

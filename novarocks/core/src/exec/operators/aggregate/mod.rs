@@ -57,6 +57,7 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::port::identity::PartitionId;
 use crate::runtime_filter::port::producer::{ProducerFailureReason, RuntimeContractViolationKind};
+use crate::runtime_filter::port::value_domain::MembershipValues;
 #[cfg(test)]
 use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 use crate::runtime_filter::service::{FinalDomainCompletionSession, FinalDomainPartitionCommitter};
@@ -70,6 +71,7 @@ pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 pub(crate) struct AggregateFinalDomainSessionBuilder {
     session: FinalDomainCompletionSession,
     declared_dop: i32,
+    installed_membership_key_type: DataType,
     max_domain_canonical_bytes: usize,
     #[cfg(test)]
     partition_observer: Option<AggregateFinalDomainPartitionObserver>,
@@ -104,9 +106,11 @@ impl AggregateFinalDomainSessionBuilder {
                     .to_string(),
             );
         }
+        let installed_membership_key_type = session.membership_key_type().clone();
         Ok(Self {
             session,
             declared_dop,
+            installed_membership_key_type,
             max_domain_canonical_bytes,
             #[cfg(test)]
             partition_observer: None,
@@ -423,7 +427,21 @@ impl AggregateProcessorFactory {
                         .to_string(),
                 )
             } else {
-                None
+                let key_type = arena
+                    .data_type(group_by[0])
+                    .expect("validated aggregate group expression id");
+                if MembershipValues::empty_for_data_type(key_type).is_none() {
+                    Some(format!(
+                        "unsupported aggregate final-domain membership key type: {key_type:?}"
+                    ))
+                } else if key_type != &session.installed_membership_key_type {
+                    Some(format!(
+                        "aggregate final-domain key type mismatch: installed={:?} aggregate={key_type:?}",
+                        session.installed_membership_key_type
+                    ))
+                } else {
+                    None
+                }
             };
             if error.is_some() {
                 session.fail();
@@ -1842,6 +1860,32 @@ mod tests {
         aggregate_factory_with_shape(session, output_type, false, true)
     }
 
+    fn aggregate_factory_with_group_key_type(
+        session: Option<AggregateFinalDomainSessionBuilder>,
+        group_key_type: DataType,
+    ) -> AggregateProcessorFactory {
+        let mut arena = ExprArena::default();
+        let group_expr = arena.push_typed(ExprNode::SlotId(GROUP_SLOT), group_key_type.clone());
+        let output_field = Field::new("group_key", group_key_type, true);
+        let output_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(GROUP_SLOT, &output_field, None)
+                    .expect("aggregate output slot"),
+            ])
+            .expect("aggregate output schema"),
+        );
+        AggregateProcessorFactory::new_native(
+            7,
+            Arc::new(arena),
+            vec![group_expr],
+            Vec::new(),
+            false,
+            true,
+            output_schema,
+            session,
+        )
+    }
+
     fn aggregate_factory_with_shape(
         session: Option<AggregateFinalDomainSessionBuilder>,
         output_type: DataType,
@@ -2113,6 +2157,56 @@ mod tests {
         assert_eq!(fixture.failure_count(), 1);
         assert_eq!(fixture.producer_failed_unavailable_count(), 1);
         assert!(fixture.accepted_partitions().is_empty());
+    }
+
+    #[test]
+    fn aggregate_prepare_rejects_unsupported_final_domain_key_before_mutation() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory_with_group_key_type(
+            Some(fixture.session_builder(1)),
+            DataType::Decimal256(10, 2),
+        );
+        let mut operator = factory.create(1, 0);
+
+        assert_eq!(
+            operator
+                .prepare()
+                .expect_err("unsupported final-domain key must fail prepare"),
+            "unsupported aggregate final-domain membership key type: Decimal256(10, 2)"
+        );
+        assert!(
+            !operator
+                .as_processor_ref()
+                .expect("aggregate processor")
+                .has_output()
+        );
+        assert!(fixture.accepted_partitions().is_empty());
+        assert_eq!(fixture.failure_count(), 1);
+    }
+
+    #[test]
+    fn aggregate_prepare_rejects_installed_schema_mismatch_before_mutation() {
+        let fixture = FinalDomainFixture::new();
+        let factory = aggregate_factory_with_group_key_type(
+            Some(fixture.session_builder(1)),
+            DataType::Int32,
+        );
+        let mut operator = factory.create(1, 0);
+
+        assert_eq!(
+            operator
+                .prepare()
+                .expect_err("installed schema mismatch must fail prepare"),
+            "aggregate final-domain key type mismatch: installed=Int64 aggregate=Int32"
+        );
+        assert!(
+            !operator
+                .as_processor_ref()
+                .expect("aggregate processor")
+                .has_output()
+        );
+        assert!(fixture.accepted_partitions().is_empty());
+        assert_eq!(fixture.failure_count(), 1);
     }
 
     #[test]

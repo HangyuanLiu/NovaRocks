@@ -2674,6 +2674,23 @@ impl RuntimeFilterService {
     }
 
     #[cfg(test)]
+    fn inject_final_domain_submit_failure_for_test(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: crate::runtime_filter::port::identity::PartitionId,
+        sequence: crate::runtime_filter::port::identity::ProducerSequence,
+    ) {
+        self.producer_test_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(binding_id, fragment_instance_id))
+            .and_then(Weak::upgrade)
+            .expect("selected final-domain producer handle must be live")
+            .inject_final_domain_submit_failure(partition_id, sequence);
+    }
+
+    #[cfg(test)]
     fn final_domain_test_issuer(
         &self,
         binding_id: BindingId,

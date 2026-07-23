@@ -826,6 +826,8 @@ pub(super) struct ServiceProducerAdapter {
     final_domain_authority: Mutex<Option<CompletionFenceAuthority>>,
     #[cfg(test)]
     before_dispatch: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    final_domain_submit_failure: Mutex<Option<(PartitionId, ProducerSequence)>>,
 }
 
 impl ServiceProducerAdapter {
@@ -851,12 +853,44 @@ impl ServiceProducerAdapter {
             final_domain_authority: Mutex::new(final_domain_authority),
             #[cfg(test)]
             before_dispatch: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            final_domain_submit_failure: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     pub(super) fn set_before_dispatch(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.before_dispatch.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_final_domain_submit_failure(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+    ) {
+        *self
+            .final_domain_submit_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((partition_id, sequence));
+    }
+
+    #[cfg(test)]
+    fn take_final_domain_submit_failure(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+    ) -> bool {
+        let mut failure = self
+            .final_domain_submit_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *failure == Some((partition_id, sequence)) {
+            *failure = None;
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(test)]
@@ -1045,6 +1079,13 @@ impl FinalDomainProducerAdapter for ServiceProducerAdapter {
         sequence: ProducerSequence,
         shard: FinalDomainShard,
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        #[cfg(test)]
+        if self.take_final_domain_submit_failure(partition_id, sequence) {
+            return Err(RuntimeContractViolation::new(
+                RuntimeContractViolationKind::ServiceUnavailable,
+                "injected selected final-domain submit failure",
+            ));
+        }
         let result = (|| {
             self.channel.authorize_final(
                 self.binding_id,
