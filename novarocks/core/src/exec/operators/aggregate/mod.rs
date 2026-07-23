@@ -31,6 +31,7 @@ pub(crate) mod final_domain;
 pub(crate) mod streaming_sink;
 pub(crate) mod streaming_source;
 pub(crate) mod streaming_state;
+pub(crate) mod topn_boundary;
 
 use std::sync::Arc;
 
@@ -63,6 +64,10 @@ use crate::runtime_filter::port::value_domain::MembershipValues;
 #[cfg(test)]
 use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 use crate::runtime_filter::service::{FinalDomainCompletionSession, FinalDomainPartitionCommitter};
+
+use self::topn_boundary::{
+    AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
+};
 
 pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 
@@ -552,6 +557,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             key_table_mem_tracker: None,
             runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
+            topn_boundary_bindings: Vec::new(),
             final_domain_committer,
             final_domain_session_bound: self.final_domain_session.is_some(),
             final_domain_bind_error,
@@ -605,6 +611,7 @@ struct AggregateProcessorOperator {
     key_table_mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
+    topn_boundary_bindings: Vec<AggregateTopNBoundaryBinding>,
     final_domain_committer: Option<AggregateFinalDomainPartitionCommitter>,
     final_domain_session_bound: bool,
     final_domain_bind_error: Option<String>,
@@ -862,7 +869,7 @@ impl AggregateProcessorOperator {
                         let lookup = key_table
                             .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -881,7 +888,7 @@ impl AggregateProcessorOperator {
                         let lookup = key_table
                             .find_or_insert_one_number(view, row, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -897,7 +904,7 @@ impl AggregateProcessorOperator {
                         let lookup = key_table
                             .find_or_insert_one_string_like(view, row, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -910,7 +917,7 @@ impl AggregateProcessorOperator {
                         let lookup = key_table
                             .find_or_insert_fixed_size(&key_views, row, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -948,7 +955,7 @@ impl AggregateProcessorOperator {
                                 .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                                 .map_err(|e| e.to_string())?
                         };
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -1373,6 +1380,14 @@ impl AggregateProcessorOperator {
             return Ok(());
         }
 
+        let native_topn_producers = match &self.runtime_filter_execution {
+            AggregateRuntimeFilterExecution::Native { topn_producers } => topn_producers.as_slice(),
+            #[cfg(feature = "compat")]
+            AggregateRuntimeFilterExecution::Compat { .. } => &[],
+        };
+        self.topn_boundary_bindings = build_topn_boundary_bindings(native_topn_producers)
+            .map_err(|error| error.to_string())?;
+
         let expected_group_types = self.expected_group_types()?;
         let expected_agg_types = self.expected_agg_input_types()?;
 
@@ -1615,9 +1630,16 @@ impl AggregateProcessorOperator {
         Ok(())
     }
 
-    fn ensure_group_state(&mut self, lookup: &KeyLookup) -> Result<(), String> {
+    fn ensure_group_state(
+        &mut self,
+        lookup: &KeyLookup,
+        group_arrays: &[ArrayRef],
+        row: usize,
+    ) -> Result<(), String> {
         if lookup.is_new {
             self.alloc_group_state(lookup.group_id)?;
+            observe_key_table_group(&mut self.topn_boundary_bindings, lookup, group_arrays, row)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }

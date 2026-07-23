@@ -59,6 +59,10 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 
+use super::topn_boundary::{
+    AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
+};
+
 /// Factory that constructs streaming aggregate sink operators for Phase 1 pre-aggregation.
 pub struct AggregateStreamingSinkFactory {
     name: String,
@@ -171,6 +175,7 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             key_table_mem_tracker: None,
             runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
+            topn_boundary_bindings: Vec::new(),
             streaming_state: self.streaming_state.clone(),
         })
     }
@@ -210,6 +215,7 @@ struct AggregateStreamingSinkOperator {
     key_table_mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter_execution: StreamingAggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
+    topn_boundary_bindings: Vec<AggregateTopNBoundaryBinding>,
     streaming_state: AggregateStreamingState,
 }
 
@@ -422,7 +428,7 @@ impl AggregateStreamingSinkOperator {
                         let lookup = key_table
                             .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -441,7 +447,7 @@ impl AggregateStreamingSinkOperator {
                         let lookup = key_table
                             .find_or_insert_one_number(view, row, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -457,7 +463,7 @@ impl AggregateStreamingSinkOperator {
                         let lookup = key_table
                             .find_or_insert_one_string_like(view, row, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -470,7 +476,7 @@ impl AggregateStreamingSinkOperator {
                         let lookup = key_table
                             .find_or_insert_fixed_size(&key_views, row, hash)
                             .map_err(|e| e.to_string())?;
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -508,7 +514,7 @@ impl AggregateStreamingSinkOperator {
                                 .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                                 .map_err(|e| e.to_string())?
                         };
-                        self.ensure_group_state(&lookup)
+                        self.ensure_group_state(&lookup, &group_arrays, row)
                             .map_err(|e| e.to_string())?;
                         group_ids.push(lookup.group_id);
                     }
@@ -646,6 +652,16 @@ impl AggregateStreamingSinkOperator {
         if self.initialized {
             return Ok(());
         }
+
+        let native_topn_producers = match &self.runtime_filter_execution {
+            StreamingAggregateRuntimeFilterExecution::Native { topn_producers } => {
+                topn_producers.as_slice()
+            }
+            #[cfg(feature = "compat")]
+            StreamingAggregateRuntimeFilterExecution::Compat { .. } => &[],
+        };
+        self.topn_boundary_bindings = build_topn_boundary_bindings(native_topn_producers)
+            .map_err(|error| error.to_string())?;
 
         let expected_group_types = self.expected_group_types()?;
         let expected_agg_types = self.expected_agg_input_types()?;
@@ -954,9 +970,16 @@ impl AggregateStreamingSinkOperator {
         Ok(())
     }
 
-    fn ensure_group_state(&mut self, lookup: &KeyLookup) -> Result<(), String> {
+    fn ensure_group_state(
+        &mut self,
+        lookup: &KeyLookup,
+        group_arrays: &[ArrayRef],
+        row: usize,
+    ) -> Result<(), String> {
         if lookup.is_new {
             self.alloc_group_state(lookup.group_id)?;
+            observe_key_table_group(&mut self.topn_boundary_bindings, lookup, group_arrays, row)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
