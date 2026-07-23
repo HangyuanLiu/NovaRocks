@@ -113,8 +113,7 @@ struct PreparedPlanProjection {
     topological_fragment_order: Vec<FragmentId>,
     execution_anchor_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
-    runtime_filter_join_progress:
-        crate::sql::planner::distributed::RuntimeFilterJoinProgressCatalog,
+    runtime_filter_join_progress: crate::sql::planner::distributed::JoinBuildProgressCatalog,
 }
 
 pub(crate) struct PreparedFragmentSet {
@@ -134,7 +133,7 @@ impl PreparedFragmentSet {
         execution_anchor_fragment_id: FragmentId,
         edges: Vec<FragmentEdge>,
         runtime_filter_graph: RuntimeFilterGraph,
-        runtime_filter_join_progress: crate::sql::planner::distributed::RuntimeFilterJoinProgressCatalog,
+        runtime_filter_join_progress: crate::sql::planner::distributed::JoinBuildProgressCatalog,
     ) -> Self {
         Self {
             by_fragment,
@@ -177,7 +176,7 @@ impl PreparedFragmentSet {
 
     pub(crate) fn runtime_filter_join_progress(
         &self,
-    ) -> &crate::sql::planner::distributed::RuntimeFilterJoinProgressCatalog {
+    ) -> &crate::sql::planner::distributed::JoinBuildProgressCatalog {
         &self.projection.runtime_filter_join_progress
     }
 }

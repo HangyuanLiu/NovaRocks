@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::sql::planner::distributed::{
-    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
-    RuntimeFilterJoinProgressCatalog, RuntimeFilterJoinProgressCertificate,
+    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, JoinBuildProgressCatalog,
+    JoinBuildProgressProof, PartitionKind,
 };
 
 use super::DeploymentError;
@@ -148,32 +148,42 @@ fn exact_partitioned_hash_edge(
     })
 }
 
+// Temporary RFD-6F bridge: Task 4 replaces this first-frontier projection
+// with exact whole-frontier validation before it can refine the wait graph.
 fn certifies_join_build_progress(
     deps: &ExecutionDependencyGraph,
     edges: &[FragmentEdge],
     consumer_fragment: FragmentId,
-    certificate: RuntimeFilterJoinProgressCertificate,
+    proof: JoinBuildProgressProof,
 ) -> bool {
-    let producer_fragment = certificate.producer_fragment;
-    let probe_input = certificate.probe_input_fragment;
-    let build_input = certificate.build_input_fragment;
+    if proof.build_frontier.len() != 1 || proof.non_build_inputs.len() != 1 {
+        return false;
+    }
+    let Some(probe_input) = proof.non_build_inputs.first() else {
+        return false;
+    };
+    let Some(build_input) = proof.build_frontier.first() else {
+        return false;
+    };
+    let producer_fragment = proof.producer_fragment;
 
     exact_partitioned_hash_edge(
         edges,
-        probe_input,
+        probe_input.source_fragment,
         producer_fragment,
-        certificate.probe_target_exchange_node,
+        probe_input.target_exchange_node,
     ) && exact_partitioned_hash_edge(
         edges,
-        build_input,
+        build_input.source_fragment,
         producer_fragment,
-        certificate.build_target_exchange_node,
-    ) && deps.reaches(producer_fragment, probe_input)
-        && deps.reaches(producer_fragment, build_input)
-        && (consumer_fragment == probe_input || deps.reaches(probe_input, consumer_fragment))
-        && build_input != consumer_fragment
-        && !deps.reaches(build_input, consumer_fragment)
-        && !deps.reaches(consumer_fragment, build_input)
+        build_input.target_exchange_node,
+    ) && deps.reaches(producer_fragment, probe_input.source_fragment)
+        && deps.reaches(producer_fragment, build_input.source_fragment)
+        && (consumer_fragment == probe_input.source_fragment
+            || deps.reaches(probe_input.source_fragment, consumer_fragment))
+        && build_input.source_fragment != consumer_fragment
+        && !deps.reaches(build_input.source_fragment, consumer_fragment)
+        && !deps.reaches(consumer_fragment, build_input.source_fragment)
 }
 
 /// Reject any `BlockingSnapshot` consumer whose wait edge closes an execution
@@ -183,7 +193,7 @@ pub(crate) fn validate_wait_for(
     deps: &ExecutionDependencyGraph,
     edges: &[FragmentEdge],
     consumers: &[ConsumerWaitInput],
-    join_progress: &RuntimeFilterJoinProgressCatalog,
+    join_progress: &JoinBuildProgressCatalog,
 ) -> Result<(), DeploymentError> {
     for c in consumers {
         if c.activation != ConsumerActivation::BlockingSnapshot {
@@ -197,17 +207,12 @@ pub(crate) fn validate_wait_for(
             if deps.reaches(producer.fragment, c.consumer_fragment) {
                 let certificate = join_progress
                     .get(&(c.channel, producer.binding, producer.fragment))
-                    .copied();
-                if !certificate.is_some_and(|certificate| {
-                    certificate.channel == c.channel
-                        && certificate.producer_binding == producer.binding
-                        && certificate.producer_fragment == producer.fragment
-                        && certifies_join_build_progress(
-                            deps,
-                            edges,
-                            c.consumer_fragment,
-                            certificate,
-                        )
+                    .cloned();
+                if !certificate.is_some_and(|proof| {
+                    proof.channel == c.channel
+                        && proof.producer_binding == producer.binding
+                        && proof.producer_fragment == producer.fragment
+                        && certifies_join_build_progress(deps, edges, c.consumer_fragment, proof)
                 }) {
                     return Err(DeploymentError::BlockingFeedbackCycle {
                         channel: c.channel,
@@ -226,7 +231,8 @@ mod tests {
     use super::*;
     use crate::runtime_filter::model::contract::{ConsumerActivation, LateApplyGranularity};
     use crate::sql::planner::distributed::{
-        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
+        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, FrontierEdge,
+        PartitionKind,
     };
 
     pub(super) fn edge(source: u32, target: u32) -> FragmentEdge {
@@ -259,15 +265,20 @@ mod tests {
         }
     }
 
-    fn join_certificate() -> RuntimeFilterJoinProgressCertificate {
-        RuntimeFilterJoinProgressCertificate {
+    fn join_certificate() -> JoinBuildProgressProof {
+        JoinBuildProgressProof {
             channel: ChannelId::new(7),
             producer_binding: BindingId::new(100),
             producer_fragment: 1,
-            probe_input_fragment: 2,
-            probe_target_exchange_node: 20,
-            build_input_fragment: 3,
-            build_target_exchange_node: 30,
+            join_node_id: 10,
+            build_frontier: vec![FrontierEdge {
+                source_fragment: 3,
+                target_exchange_node: 30,
+            }],
+            non_build_inputs: vec![FrontierEdge {
+                source_fragment: 2,
+                target_exchange_node: 20,
+            }],
         }
     }
 
@@ -400,12 +411,42 @@ mod tests {
     }
 
     #[test]
+    fn multi_build_frontier_proof_cannot_bypass_blocking_feedback_cycle() {
+        let edges = vec![
+            partitioned_edge(2, 1, 20),
+            partitioned_edge(3, 1, 30),
+            partitioned_edge(4, 1, 40),
+            edge(2, 4),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let mut proof = join_certificate();
+        proof.build_frontier.push(FrontierEdge {
+            source_fragment: 4,
+            target_exchange_node: 40,
+        });
+        let catalog = BTreeMap::from([(
+            (
+                proof.channel,
+                proof.producer_binding,
+                proof.producer_fragment,
+            ),
+            proof,
+        )]);
+
+        assert!(matches!(
+            validate_wait_for(&deps, &edges, &[consumer], &catalog),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
     fn forged_join_progress_certificate_is_rejected() {
         let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
         let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
         let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
         let mut certificate = join_certificate();
-        certificate.build_target_exchange_node = 31;
+        certificate.build_frontier[0].target_exchange_node = 31;
         let catalog = BTreeMap::from([(
             (
                 certificate.channel,

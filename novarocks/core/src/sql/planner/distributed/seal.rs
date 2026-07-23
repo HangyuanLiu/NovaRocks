@@ -29,9 +29,7 @@ use super::output::{
     WriteContractError, build_fragment_edge_output_catalog, build_node_output_catalog,
     build_write_contract_catalog,
 };
-use super::runtime_filter_progress::{
-    RuntimeFilterJoinProgressCatalog, build_runtime_filter_join_progress_catalog,
-};
+use super::runtime_filter_progress::{JoinBuildProgressCatalog, build_join_progress_proof_catalog};
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError, RuntimeFilterPlanValidationError};
 
@@ -41,9 +39,9 @@ struct DistributedPlanData {
     root_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
     runtime_filter_graph: RuntimeFilterGraph,
-    // Authoritative planner-sealed certificates for partitioned hash-join
+    // Authoritative planner-sealed proofs for hash-join
     // build-before-probe progress. The coordinator only projects this catalog.
-    runtime_filter_join_progress: RuntimeFilterJoinProgressCatalog,
+    runtime_filter_join_progress: JoinBuildProgressCatalog,
     // Authoritative boundary membership catalog derived at seal time.
     boundaries: BoundaryCatalog,
     // Final state of the single query-scoped occurrence allocator. Preserved so
@@ -85,7 +83,7 @@ impl DistributedPlan {
         &self.data.runtime_filter_graph
     }
 
-    pub(crate) fn runtime_filter_join_progress(&self) -> &RuntimeFilterJoinProgressCatalog {
+    pub(crate) fn runtime_filter_join_progress(&self) -> &JoinBuildProgressCatalog {
         &self.data.runtime_filter_join_progress
     }
 
@@ -214,7 +212,7 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     validation::validate_runtime_filter_graph_against_plan(&runtime_filter_graph, &fragments)
         .map_err(DistributedPlanSealError::RuntimeFilterPlan)?;
     let runtime_filter_join_progress =
-        build_runtime_filter_join_progress_catalog(&fragments, &edges, &runtime_filter_graph);
+        build_join_progress_proof_catalog(&fragments, &runtime_filter_graph);
     // Finalize logical boundary membership and occurrence identity. This only
     // derives from the now known-valid fragments/edges/sinks; it fails fast on
     // any unresolved column reference and never repairs or guesses. The final

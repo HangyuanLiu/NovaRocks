@@ -40,9 +40,7 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-use crate::sql::planner::distributed::{
-    FragmentEdge, FragmentId, RuntimeFilterJoinProgressCatalog,
-};
+use crate::sql::planner::distributed::{FragmentEdge, FragmentId, JoinBuildProgressCatalog};
 
 /// Compile a query-global [`RuntimeFilterGraph`] plus COOR-2 scheduling/placement
 /// into a coordinator-side [`RuntimeFilterDeploymentPlan`]: a full role graph
@@ -70,7 +68,7 @@ pub(crate) fn compile(
         graph,
         scheduling,
         edges,
-        &RuntimeFilterJoinProgressCatalog::default(),
+        &JoinBuildProgressCatalog::default(),
         backends,
         policy,
         epoch,
@@ -81,7 +79,7 @@ pub(crate) fn compile_with_join_progress(
     graph: &RuntimeFilterGraph,
     scheduling: &SchedulingPlan,
     edges: &[FragmentEdge],
-    join_progress: &RuntimeFilterJoinProgressCatalog,
+    join_progress: &JoinBuildProgressCatalog,
     backends: &LiveBackendSnapshot,
     policy: &RuntimeFilterDeploymentPolicy,
     epoch: DeploymentEpoch,
