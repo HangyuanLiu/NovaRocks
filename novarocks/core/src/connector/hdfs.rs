@@ -1046,7 +1046,13 @@ mod tests {
     use crate::connector::iceberg::file_pruning::{
         IcebergFileNullState, IcebergFilePruningMetadata,
     };
+    #[cfg(feature = "compat")]
+    use crate::connector::iceberg::file_pruning_wire::{
+        iceberg_file_pruning_metadata_from_thrift, iceberg_file_pruning_metadata_to_thrift,
+    };
     use crate::connector::iceberg::scan_model::IcebergColumnStats;
+    #[cfg(feature = "compat")]
+    use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::node::RuntimeFilterProbeSpec;
@@ -1269,6 +1275,27 @@ mod tests {
         .expect("ordered predicate")
     }
 
+    #[cfg(feature = "compat")]
+    fn ordered_i64_predicate(bound: i64) -> NativeOrderedRangePredicate {
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        );
+        let version = LogicalVersion::FIRST;
+        let bundle = crate::runtime_filter::exec::ordered_range_predicate::tests_support::bundle(
+            order.clone(),
+            Some(OrderedScalar::Int64(bound)),
+            version,
+        );
+        NativeOrderedRangePredicate::compile(
+            &bundle,
+            &OrderedRangePredicateContract::new(ChannelId::new(7), order, version)
+                .expect("ordered predicate contract"),
+        )
+        .expect("ordered predicate")
+    }
+
     fn ordered_utf8_predicate(bound: &str) -> NativeOrderedRangePredicate {
         let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
             DataType::Utf8,
@@ -1481,6 +1508,59 @@ mod tests {
             )
             .expect("non-file late prune"),
             ScanMorselPruneDecision::Keep
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn thrift_missing_null_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip() {
+        let mut file =
+            IcebergDataFileInfo::for_test("s3://bucket/path/missing-null-count.parquet", 1024, 2);
+        file.column_stats = Some(HashMap::from([(
+            "k1".to_string(),
+            IcebergColumnStats {
+                null_count: None,
+                value_count: Some(2),
+                column_size: None,
+                lower_bound: Some(90_i64.to_le_bytes().to_vec()),
+                upper_bound: Some(110_i64.to_le_bytes().to_vec()),
+            },
+        )]));
+        let columns = vec![novarocks_catalog::schema::ColumnDef {
+            name: "k1".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }];
+        let encoded = iceberg_file_pruning_metadata_to_thrift(&file, &columns);
+        let wire = crate::thrift::plan_nodes::THdfsScanRange {
+            min_max_values: encoded,
+            ..Default::default()
+        };
+        let decoded = iceberg_file_pruning_metadata_from_thrift(&wire, &["k1".to_string()]);
+        let range = iceberg_file_range_for_runtime_pruning_test(
+            "s3://bucket/path/missing-null-count.parquet",
+            decoded,
+        );
+        let mut cfg = hdfs_cfg_with_two_iceberg_files_for_test();
+        cfg.ranges = vec![range];
+        let op = HdfsScanOp::new(cfg);
+        let morsel = op
+            .build_morsels()
+            .expect("thrift roundtrip morsel")
+            .morsels
+            .pop()
+            .expect("thrift file morsel");
+        assert_eq!(
+            op.late_prune_morsel_with_ordered_predicate(
+                &morsel,
+                SlotId::new(3),
+                &ordered_i64_predicate(50),
+            )
+            .expect("thrift late prune"),
+            ScanMorselPruneDecision::Keep,
+            "missing null_count must not be encoded as explicit NoNulls"
         );
     }
 

@@ -95,9 +95,33 @@ controller review 的 3 条 P1 与 2 条 P2 均以聚焦 RED/GREEN 闭环：
 
 因果顺序 RED 进一步暴露出 production observability 缺口：direct ordered / TopK 路径的 `refresh_ordered_instance_progress` 会把实例标记为 Satisfied，却没有生成 membership 路径已有的 `ProducerInstanceClosed`。修复后四个 ordered progress 入口都在 transition 时生成该事件，`refresh_after_ordered_progress` 再追加 completion。
 
+### Remaining P1：未知 null count 的 wire 语义
+
+re-review 指出的两条编码路径都曾用 `null_count.unwrap_or(0)` 生成 `has_null = false`，把 Iceberg manifest 中缺失的 null count 错误编码成显式 `NoNulls`。修复后：
+
+- native protobuf encoder 与 Thrift encoder 都要求真实 `null_count`；缺失时省略该列的可选 file-pruning 元数据；
+- 不再从缺失值推导 `NoNulls`，HDFS late pruning 因证据不足保守返回 `Keep`；
+- native 回归经过真实 scan-range planner、instance protobuf encode、native decode、morsel 构造和 HDFS ordered late prune；
+- Thrift 回归经过真实 Iceberg metadata encoder、`THdfsScanRange` decoder、morsel 构造和 HDFS ordered late prune。
+
+两条回归在修复前均稳定得到：
+
+```text
+left: Skip
+right: Keep
+```
+
+修复后均通过。
+
 ## 最终验证
 
 ```text
+cargo test -p novarocks native_missing_null_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip --lib
+PASS: 1 passed, 0 failed
+
+cargo test -p novarocks --features compat thrift_missing_null_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip --lib
+PASS: 1 passed, 0 failed
+
 cargo test -p novarocks lowers_iceberg_data_file_scan --lib
 PASS: 4 passed, 0 failed
 

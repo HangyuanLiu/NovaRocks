@@ -214,7 +214,7 @@ pub(crate) fn scan_read_binding_for_test(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
     use arrow::datatypes::DataType;
@@ -1431,6 +1431,179 @@ mod tests {
         assert!(
             iceberg_file_pruning.is_none(),
             "one-byte negative Int8 bounds must not reach the untyped shared pruning decoder"
+        );
+    }
+
+    #[test]
+    fn native_missing_null_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip() {
+        let mut file = crate::connector::iceberg::scan_model::IcebergDataFileInfo::for_test(
+            "s3://bucket/missing-null-count.parquet",
+            1024,
+            2,
+        );
+        file.column_stats = Some(HashMap::from([(
+            "id".to_string(),
+            crate::connector::iceberg::scan_model::IcebergColumnStats {
+                null_count: None,
+                value_count: Some(2),
+                column_size: None,
+                lower_bound: Some(90_i32.to_le_bytes().to_vec()),
+                upper_bound: Some(110_i32.to_le_bytes().to_vec()),
+            },
+        )]));
+        let connector_table = crate::connector::iceberg::scan_planner::IcebergTableHandle {
+            catalog: "rest".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            snapshot_id: Some(1),
+            table_info: crate::connector::iceberg::scan_model::IcebergTableInfo {
+                catalog: "rest".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                table_uuid: None,
+                current_snapshot_id: Some(1),
+                schema_id: 7,
+                location: "s3://bucket/warehouse/db/t".to_string(),
+                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                    fields: vec![
+                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                            field_id: 10,
+                            name: "id".to_string(),
+                            initial_default: None,
+                            write_default: None,
+                            initial_default_json: None,
+                            write_default_json: None,
+                            children: Vec::new(),
+                        },
+                    ],
+                },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            },
+            split_source:
+                crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(vec![
+                    file.clone(),
+                ]),
+            column_names: vec!["id".to_string()],
+        };
+        let scan_handle = crate::connector::scan_planning::ScanHandle::new(
+            "iceberg",
+            crate::connector::iceberg::scan_planner::IcebergScanHandle {
+                table: connector_table,
+            },
+        );
+        let split = crate::connector::scan_planning::Split::new(
+            "iceberg",
+            crate::connector::iceberg::scan_planner::IcebergSplit { data_file: file },
+        );
+        let planned = crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(
+            &scan_handle,
+            &[split],
+            crate::connector::iceberg::scan_range::IcebergScanRangeContext {
+                min_max_predicates: Vec::new(),
+                columns: vec![novarocks_catalog::schema::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                }],
+            },
+        )
+        .expect("plan native Iceberg scan range");
+        let placement = crate::coordinator::scheduler::FragmentInstancePlacement {
+            fragment_id: 0,
+            instance_index: 0,
+            finst_id: crate::common::types::UniqueId { hi: 11, lo: 12 },
+            backend_idx: 0,
+            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 8060)
+                .expect("native test endpoint"),
+            scan_ranges: BTreeMap::from([(10, planned.scan_ranges)]),
+            destinations: Vec::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        };
+        let encoded = crate::protocol::native::encode::instance::encode_instance_params(
+            &crate::common::types::UniqueId { hi: 9, lo: 10 },
+            &placement,
+            &QueryOptions::default(),
+            0,
+            None,
+            false,
+        )
+        .expect("encode native instance params");
+        let wire_ranges = encoded
+            .per_node_scan_ranges
+            .get(&10)
+            .expect("encoded scan node ranges")
+            .ranges
+            .clone();
+
+        let mut node = scan_node_with(
+            vec![output_column(1, "id", DataType::Int32)],
+            Vec::new(),
+            Vec::new(),
+            plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            }),
+        );
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+        else {
+            panic!("expected physical scan");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut() else {
+            panic!("expected scan node");
+        };
+        scan.table
+            .as_mut()
+            .expect("scan table")
+            .columns
+            .get_mut(0)
+            .expect("id column")
+            .data_type = Some(type_desc(&DataType::Int32));
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, wire_ranges);
+        let mut arena = ExprArena::default();
+        let lowered = decode_node(&node, &mut arena, &ctx).expect("lower native scan");
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected Scan");
+        };
+        let morsel = scan
+            .build_morsels()
+            .expect("build native scan morsels")
+            .morsels
+            .pop()
+            .expect("native file morsel");
+        let order = crate::runtime_filter::exec::ordered_range_predicate::tests_support::contract(
+            DataType::Int32,
+            crate::runtime_filter::model::contract::SortDirection::Ascending,
+            crate::runtime_filter::model::contract::NullOrder::Last,
+        );
+        let version = crate::runtime_filter::port::identity::LogicalVersion::FIRST;
+        let bundle = crate::runtime_filter::exec::ordered_range_predicate::tests_support::bundle(
+            order.clone(),
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32(50)),
+            version,
+        );
+        let predicate =
+            crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate::compile(
+                &bundle,
+                &crate::runtime_filter::exec::ordered_range_predicate::OrderedRangePredicateContract::new(
+                    crate::runtime_filter::model::contract::ChannelId::new(7),
+                    order,
+                    version,
+                )
+                .expect("ordered predicate contract"),
+            )
+            .expect("ordered predicate");
+        assert_eq!(
+            scan.late_prune_morsel_with_ordered_predicate(&morsel, SlotId::new(1), &predicate,)
+                .expect("native late prune"),
+            crate::exec::node::scan::ScanMorselPruneDecision::Keep,
+            "missing null_count must not be encoded as explicit NoNulls"
         );
     }
 

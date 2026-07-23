@@ -91,11 +91,11 @@ fn thrift_min_max_value_from_stats(
     stats: &IcebergColumnStats,
     data_type: &DataType,
 ) -> Option<exprs::TExprMinMaxValue> {
-    let has_null = stats.null_count.unwrap_or(0) > 0;
+    let null_count = stats.null_count?;
+    let has_null = null_count > 0;
     let all_null = stats
         .value_count
-        .zip(stats.null_count)
-        .is_some_and(|(value_count, null_count)| value_count > 0 && value_count == null_count);
+        .is_some_and(|value_count| value_count > 0 && value_count == null_count);
 
     match data_type {
         DataType::Boolean => {
