@@ -819,6 +819,8 @@ pub(super) struct ServiceProducerAdapter {
     fragment_instance_id: UniqueId,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     dispatcher: Arc<ActionDispatcher>,
+    final_domain_authorized: bool,
+    #[cfg(test)]
     final_domain_authority: Option<CompletionFenceAuthority>,
     #[cfg(test)]
     before_dispatch: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -841,6 +843,8 @@ impl ServiceProducerAdapter {
             fragment_instance_id,
             memory_account,
             dispatcher,
+            final_domain_authorized: final_domain_authority.is_some(),
+            #[cfg(test)]
             final_domain_authority,
             #[cfg(test)]
             before_dispatch: std::sync::Mutex::new(None),
@@ -1040,7 +1044,7 @@ impl FinalDomainProducerAdapter for ServiceProducerAdapter {
                 self.fragment_instance_id,
                 partition_id,
                 sequence,
-                self.final_domain_authority.is_some(),
+                self.final_domain_authorized,
                 &shard,
             )?;
             let Some(bytes) = shard.canonical_contribution_bytes() else {

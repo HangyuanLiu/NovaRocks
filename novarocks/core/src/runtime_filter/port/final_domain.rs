@@ -150,6 +150,24 @@ pub(crate) struct CompletionFenceAuthority {
     scope_digest: [u8; 32],
 }
 
+#[derive(Debug)]
+pub(crate) struct FinalDomainFreezeCapability {
+    stream: ProducerStreamId,
+    authority_scope_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+pub(crate) struct FrozenFinalDomainPayload {
+    stream: ProducerStreamId,
+    authority_scope_digest: [u8; 32],
+    domain: ValueDomainDelta,
+}
+
+pub(crate) struct FrozenFinalDomainIssuer {
+    authority: CompletionFenceAuthority,
+    proof: CommittedDomainFrozenProof,
+}
+
 impl CompletionFenceAuthority {
     pub(crate) fn try_new(
         contract: Arc<RuntimeCompletionFenceContract>,
@@ -188,11 +206,73 @@ impl CompletionFenceAuthority {
         ))
     }
 
+    pub(crate) fn freeze_capability(
+        &self,
+        partition_id: super::identity::PartitionId,
+    ) -> FinalDomainFreezeCapability {
+        FinalDomainFreezeCapability {
+            stream: ProducerStreamId::new(self.binding_id, self.fragment_instance_id, partition_id),
+            authority_scope_digest: self.scope_digest,
+        }
+    }
+
+    pub(crate) fn freeze(
+        self,
+        payloads: &[FrozenFinalDomainPayload],
+    ) -> Result<FrozenFinalDomainIssuer, FinalDomainError> {
+        if payloads.iter().any(|payload| {
+            payload.authority_scope_digest != self.scope_digest
+                || payload.stream.binding_id() != self.binding_id
+                || payload.stream.fragment_instance_id() != self.fragment_instance_id
+        }) {
+            return Err(FinalDomainError::FrozenProofMismatch);
+        }
+        let proof = CommittedDomainFrozenProof {
+            authority_scope_digest: self.scope_digest,
+        };
+        Ok(FrozenFinalDomainIssuer {
+            authority: self,
+            proof,
+        })
+    }
+
     #[cfg(test)]
     fn frozen_proof_for_test(&self) -> CommittedDomainFrozenProof {
         CommittedDomainFrozenProof {
             authority_scope_digest: self.scope_digest,
         }
+    }
+}
+
+impl FinalDomainFreezeCapability {
+    pub(crate) fn seal(self, domain: ValueDomainDelta) -> FrozenFinalDomainPayload {
+        FrozenFinalDomainPayload {
+            stream: self.stream,
+            authority_scope_digest: self.authority_scope_digest,
+            domain,
+        }
+    }
+}
+
+impl FrozenFinalDomainPayload {
+    pub(crate) const fn partition_id(&self) -> super::identity::PartitionId {
+        self.stream.partition_id()
+    }
+}
+
+impl FrozenFinalDomainIssuer {
+    pub(crate) fn issue(
+        &self,
+        payload: FrozenFinalDomainPayload,
+        sequence: ProducerSequence,
+    ) -> Result<FinalDomainShard, FinalDomainError> {
+        if payload.authority_scope_digest != self.authority.scope_digest {
+            return Err(FinalDomainError::FrozenProofMismatch);
+        }
+        let fence = self
+            .authority
+            .issue(&self.proof, payload.stream, sequence)?;
+        FinalDomainShard::try_new(&self.authority.contract, fence, payload.domain)
     }
 }
 
