@@ -177,6 +177,8 @@ impl ProcessGuard {
                 }
             }
             if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
                 panic!(
                     "timed out waiting for marker `{marker}`; stdout={stdout:?}; stderr={}",
                     self.read_stderr()
@@ -510,9 +512,10 @@ backends = [{backends_list}]
         self.fe = Some(fe);
     }
 
-    fn wait_for_be_submit_cancel_match(
+    fn wait_for_be_submit_cancel_coverage(
         &mut self,
-        expected_instance_count: usize,
+        expected_submit_count: usize,
+        expected_cancel_count: usize,
         cancel_detail: &str,
         timeout: Duration,
     ) {
@@ -546,15 +549,18 @@ backends = [{backends_list}]
             }
             let submitted_total = submitted.iter().sum::<usize>();
             let canceled_total = canceled.iter().sum::<usize>();
-            if submitted_total == expected_instance_count
-                && canceled_total == expected_instance_count
-                && submitted == canceled
+            if submitted_total == expected_submit_count
+                && canceled_total == expected_cancel_count
+                && submitted
+                    .iter()
+                    .zip(&canceled)
+                    .all(|(submitted, canceled)| canceled >= submitted)
             {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "expected submit/cancel identity for {expected_instance_count} instances; submitted={submitted:?} canceled={canceled:?} stdout={stdout:?}"
+                "expected {expected_submit_count} submitted instances covered by {expected_cancel_count} canceled instances; submitted={submitted:?} canceled={canceled:?} stdout={stdout:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -989,7 +995,7 @@ heartbeat_timeout_retries = 2
 }
 
 #[test]
-fn submit_half_failure_cancels_submitted() {
+fn submit_half_failure_cancels_attempted_submissions() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
@@ -1021,7 +1027,7 @@ fault_inject_submit_fail_after = 1
         "expected injected submit failure, got: {err_str}"
     );
     cluster.be.wait_for_output_contains(
-        "NOVAROCKS_CANCEL count=1 finsts=1 reason=coordinator cancel",
+        "NOVAROCKS_CANCEL count=1 finsts=2 reason=coordinator cancel",
         Duration::from_secs(3),
     );
 }
@@ -1113,11 +1119,16 @@ emit_grpc_fragment_marker = true
         "expected timeout error, got: {err_str}"
     );
 
-    cluster.wait_for_be_submit_cancel_match(2, "reason=coordinator cancel", Duration::from_secs(5));
+    cluster.wait_for_be_submit_cancel_coverage(
+        2,
+        2,
+        "reason=coordinator cancel",
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
-fn three_be_partial_submit_failure_cancels_accepted_fragments() {
+fn three_be_partial_submit_failure_cancels_attempted_fragments() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
@@ -1152,7 +1163,12 @@ fault_inject_submit_fail_after = 2
         "expected injected submit failure, got: {err_str}"
     );
 
-    cluster.wait_for_be_submit_cancel_match(2, "reason=coordinator cancel", Duration::from_secs(5));
+    cluster.wait_for_be_submit_cancel_coverage(
+        2,
+        3,
+        "reason=coordinator cancel",
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
