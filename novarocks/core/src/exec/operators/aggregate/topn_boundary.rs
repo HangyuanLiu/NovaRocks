@@ -369,7 +369,9 @@ fn tuple_from_group_array(
         .first()
         .expect("aggregate TopN state validates one order key")
         .data_type();
-    let value = if array.is_null(row) {
+    let value = if expected == &DataType::Utf8 {
+        utf8_value(array, row)?.map(|value| OrderedScalar::Utf8(Arc::from(value)))
+    } else if array.is_null(row) {
         None
     } else {
         Some(scalar_from_group_array(expected, array, row)?)
@@ -414,7 +416,6 @@ fn scalar_from_group_array(
             primitive!(TimestampNanosecondArray, Timestamp)
         }
         DataType::Decimal128(_, _) => primitive!(Decimal128Array, Decimal128),
-        DataType::Utf8 => OrderedScalar::Utf8(Arc::from(utf8_value(array, row)?)),
         DataType::FixedSizeBinary(width)
             if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
@@ -451,13 +452,16 @@ fn require_exact_array_type(
     }
 }
 
-fn utf8_value<'a>(array: &'a ArrayRef, row: usize) -> Result<&'a str, AggregateTopNBoundaryError> {
+fn utf8_value<'a>(
+    array: &'a ArrayRef,
+    row: usize,
+) -> Result<Option<&'a str>, AggregateTopNBoundaryError> {
     if array.data_type() == &DataType::Utf8 {
-        return Ok(array
+        let strings = array
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("matching Arrow Utf8 type")
-            .value(row));
+            .expect("matching Arrow Utf8 type");
+        return Ok((!strings.is_null(row)).then(|| strings.value(row)));
     }
     if matches!(
         array.data_type(),
@@ -468,6 +472,9 @@ fn utf8_value<'a>(array: &'a ArrayRef, row: usize) -> Result<&'a str, AggregateT
             .as_any()
             .downcast_ref::<DictionaryArray<Int32Type>>()
             .expect("matching Arrow Int32 dictionary type");
+        if dictionary.is_null(row) {
+            return Ok(None);
+        }
         let key = usize::try_from(dictionary.keys().value(row)).map_err(|_| {
             AggregateTopNBoundaryError::InvalidCandidateValue(
                 "negative UTF-8 dictionary key".to_string(),
@@ -478,7 +485,12 @@ fn utf8_value<'a>(array: &'a ArrayRef, row: usize) -> Result<&'a str, AggregateT
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("matching Arrow UTF-8 dictionary values");
-        return Ok(values.value(key));
+        if key >= values.len() {
+            return Err(AggregateTopNBoundaryError::InvalidCandidateValue(
+                "UTF-8 dictionary key is out of bounds".to_string(),
+            ));
+        }
+        return Ok((!values.is_null(key)).then(|| values.value(key)));
     }
     Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
         expected: DataType::Utf8,
@@ -495,7 +507,8 @@ mod tests {
 
     use arrow::array::{
         ArrayRef, Date32Array, Decimal128Array, DictionaryArray, Int8Array, Int16Array, Int32Array,
-        Int64Array, StringArray, TimestampMicrosecondArray,
+        Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow::datatypes::{DataType, Int32Type, TimeUnit};
     use rand::SeedableRng;
@@ -506,7 +519,8 @@ mod tests {
         AggregateTopNBoundaryBinding, AggregateTopNBoundaryError, AggregateTopNBoundarySnapshot,
         AggregateTopNBoundaryState, build_topn_boundary_bindings, observe_key_table_group,
     };
-    use crate::exec::hash_table::key_table::KeyLookup;
+    use crate::exec::hash_table::key_builder::build_group_key_views;
+    use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
     use crate::exec::node::aggregate::NativeAggregateTopNProducerSpec;
     use crate::exec::node::runtime_filter::{
         NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
@@ -897,9 +911,15 @@ mod tests {
     }
 
     #[test]
-    fn topn_boundary_aggregate_hook_counts_only_real_new_key_table_groups() {
+    fn topn_boundary_aggregate_hook_uses_real_complete_key_table_group_identity() {
         let contract = runtime_contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
         let mut bindings = vec![
+            AggregateTopNBoundaryBinding::try_new(
+                0,
+                NonZeroU32::new(2).unwrap(),
+                Arc::clone(&contract),
+            )
+            .unwrap(),
             AggregateTopNBoundaryBinding::try_new(
                 0,
                 NonZeroU32::new(3).unwrap(),
@@ -908,41 +928,76 @@ mod tests {
             .unwrap(),
         ];
         let group_arrays: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(vec![7, 7, 9])),
-            Arc::new(StringArray::from(vec!["group-a", "group-b", "group-c"])),
+            Arc::new(Int64Array::from(vec![7, 7, 7])),
+            Arc::new(StringArray::from(vec!["group-a", "group-b", "group-a"])),
         ];
-
-        for group_id in 0..3 {
-            observe_key_table_group(
-                &mut bindings,
-                &KeyLookup {
-                    group_id,
-                    is_new: true,
-                },
-                &group_arrays,
-                group_id,
-            )
+        let mut key_table = KeyTable::new(vec![DataType::Int64, DataType::Utf8], false).unwrap();
+        let key_views = build_group_key_views(&group_arrays).unwrap();
+        let rows = key_table.build_rows(&group_arrays).unwrap();
+        let hashes = key_table
+            .build_group_hashes(&key_views, group_arrays[0].len())
             .unwrap();
-        }
-        observe_key_table_group(
-            &mut bindings,
-            &KeyLookup {
-                group_id: 0,
-                is_new: false,
-            },
-            &group_arrays,
-            0,
-        )
-        .unwrap();
+        let mut lookups = Vec::new();
 
+        for (row, hash) in hashes.into_iter().enumerate() {
+            let lookup = key_table
+                .find_or_insert_from_row(&key_views, row, rows.row(row).data(), hash)
+                .unwrap();
+            lookups.push((lookup.group_id, lookup.is_new));
+            observe_key_table_group(&mut bindings, &lookup, &group_arrays, row).unwrap();
+        }
+
+        assert_eq!(lookups, vec![(0, true), (1, true), (0, false)]);
         assert_eq!(
             ready_bound(bindings[0].state().snapshot()),
-            int64_tuple(&contract, Some(9))
+            int64_tuple(&contract, Some(7))
         );
         assert_eq!(
             bindings[0].state_mut().take_pending_tightening().unwrap(),
-            Some(int64_tuple(&contract, Some(9)))
+            Some(int64_tuple(&contract, Some(7)))
         );
+        assert_eq!(
+            bindings[1].state().snapshot(),
+            AggregateTopNBoundarySnapshot::NotReady,
+            "the duplicate complete key must not be counted as a third group"
+        );
+    }
+
+    #[test]
+    fn topn_boundary_dictionary_utf8_value_null_projects_logical_null() {
+        let keys = Int32Array::from(vec![Some(0)]);
+        let values: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
+        let dictionary: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+
+        for null_order in [NullOrder::First, NullOrder::Last] {
+            let contract = runtime_contract(DataType::Utf8, SortDirection::Ascending, null_order);
+            let mut bindings = vec![
+                AggregateTopNBoundaryBinding::try_new(
+                    0,
+                    NonZeroU32::new(1).unwrap(),
+                    Arc::clone(&contract),
+                )
+                .unwrap(),
+            ];
+
+            observe_key_table_group(
+                &mut bindings,
+                &KeyLookup {
+                    group_id: 0,
+                    is_new: true,
+                },
+                &[Arc::clone(&dictionary)],
+                0,
+            )
+            .unwrap();
+
+            assert_eq!(
+                ready_bound(bindings[0].state().snapshot()),
+                tuple(&contract, None),
+                "null_order={null_order:?}"
+            );
+        }
     }
 
     #[test]
@@ -997,8 +1052,23 @@ mod tests {
                 OrderedScalar::Date32(-2),
             ),
             (
+                DataType::Timestamp(TimeUnit::Second, None),
+                Arc::new(TimestampSecondArray::from(vec![-2])),
+                OrderedScalar::Timestamp(-2),
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                Arc::new(TimestampMillisecondArray::from(vec![-2])),
+                OrderedScalar::Timestamp(-2),
+            ),
+            (
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 Arc::new(TimestampMicrosecondArray::from(vec![-2])),
+                OrderedScalar::Timestamp(-2),
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                Arc::new(TimestampNanosecondArray::from(vec![-2])),
                 OrderedScalar::Timestamp(-2),
             ),
             (
