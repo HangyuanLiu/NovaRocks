@@ -53,14 +53,18 @@ use crate::runtime_filter::model::graph::{
     RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
     RuntimeFilterGraph,
 };
+use crate::runtime_filter::port::artifact::{ArtifactBundle, ResidentMembershipIndexView};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, TransportEventKind};
 use crate::runtime_filter::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{ProducerPortKind, SubmitOutcome};
+use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
 use crate::runtime_filter::port::subscription::{ArtifactAcquireOutcome, SubscriptionKind};
-use crate::runtime_filter::port::transport::RuntimeFilterAcceptStatus;
+use crate::runtime_filter::port::transport::{
+    RuntimeFilterAcceptStatus, RuntimeFilterEnvelopeKind,
+};
 use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
 use crate::service::grpc_fragment_dispatcher::GrpcRuntimeFilterDeploymentControl;
 use crate::service::grpc_server::IndependentGrpcRuntimeFilterNode;
@@ -487,6 +491,92 @@ fn wait_for_transport_ack(
     }
 }
 
+fn producer_route_edges(
+    install: &RuntimeFilterParticipantInstall,
+) -> BTreeSet<crate::runtime_filter::port::identity::RouteEdgeId> {
+    install.routing_shard().channels()[&CHANNEL]
+        .outbound_edges()
+        .iter()
+        .filter(|edge| {
+            edge.source().role() == RuntimeFilterRouteRole::Producer(PRODUCER_BINDING)
+                && edge
+                    .allowed_kinds()
+                    .contains(&RuntimeFilterEnvelopeKind::Contribution)
+        })
+        .map(|edge| edge.route_edge_id())
+        .collect()
+}
+
+fn assert_remote_producer_envelopes(
+    service: &RuntimeFilterService,
+    install: &RuntimeFilterParticipantInstall,
+    fragment_instance_id: UniqueId,
+) {
+    let expected_edges = producer_route_edges(install);
+    assert_eq!(
+        expected_edges.len(),
+        1,
+        "remote producer has one installed route"
+    );
+    let observed = service
+        .admitted_transport_envelopes_for_test()
+        .into_iter()
+        .filter_map(|(route, envelope)| {
+            let identity = envelope.route_identity().as_contribution()?;
+            (identity.producer_binding_id() == PRODUCER_BINDING
+                && identity.fragment_instance_id() == fragment_instance_id)
+                .then_some((
+                    envelope.kind(),
+                    route.route_edge_id(),
+                    identity.partition_id(),
+                    identity.sequence(),
+                ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![
+            (
+                RuntimeFilterEnvelopeKind::Contribution,
+                *expected_edges.first().unwrap(),
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+            ),
+            (
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                *expected_edges.first().unwrap(),
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+            ),
+        ],
+        "Contribution(seq=0) and ProducerClosed(terminal_seq=1) use the same installed route"
+    );
+}
+
+fn membership_i32_values(bundle: &ArtifactBundle) -> BTreeSet<i32> {
+    let artifact = bundle
+        .artifacts()
+        .iter()
+        .find_map(|(_, artifact)| artifact.membership_index().map(|index| (artifact, index)))
+        .expect("published membership artifact carries a resident index");
+    match artifact.1.view() {
+        ResidentMembershipIndexView::Fixed {
+            values,
+            count,
+            width,
+            ..
+        } => {
+            assert_eq!(width, std::mem::size_of::<i32>());
+            assert_eq!(count, 3);
+            artifact.0.canonical_bytes()[values.clone()]
+                .chunks_exact(width)
+                .map(|bytes| i32::from_be_bytes(bytes.try_into().expect("i32 bytes")))
+                .collect()
+        }
+        other => panic!("expected fixed-width membership index, got {other:?}"),
+    }
+}
+
 fn assert_zero_fragment_submits(dispatcher: &RecordingFragmentDispatcher) {
     assert_eq!(
         dispatcher.submit_count(),
@@ -684,6 +774,24 @@ fn run_live_conformance(topology: ConformanceTopology) {
         .map(|placement| (placement.backend_idx, placement.finst_id))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(producer_finsts.len(), 3);
+    let aggregator_idx = (0..3).find(|backend_idx| {
+        let participant = participant_id_for_backend(*backend_idx).unwrap();
+        expected_installs[&participant].routing_shard().channels()[&CHANNEL]
+            .local_roles()
+            .contains(&RuntimeFilterRouteRole::Aggregator)
+    });
+    let aggregator_idx = match topology {
+        ConformanceTopology::AllOfAggregate => {
+            aggregator_idx.expect("exactly one participant owns the aggregator role")
+        }
+        ConformanceTopology::AnyOfDirect => {
+            assert!(
+                aggregator_idx.is_none(),
+                "AnyOf direct has no aggregator role"
+            );
+            0
+        }
+    };
     let consumer_finst = producer_finsts[&2];
     let mut producers = Vec::new();
     for backend_idx in 0..3 {
@@ -709,6 +817,29 @@ fn run_live_conformance(topology: ConformanceTopology) {
         .into_blocking()
         .expect("blocking snapshot consumer");
 
+    if matches!(topology, ConformanceTopology::AllOfAggregate) {
+        for remote_idx in (0..3).filter(|idx| *idx != aggregator_idx) {
+            let remote_finst = producer_finsts[&remote_idx];
+            let error = services[aggregator_idx]
+                .open_producer(
+                    PRODUCER_BINDING,
+                    remote_finst,
+                    1,
+                    ProducerPortKind::Membership,
+                )
+                .expect_err("aggregator public API cannot open a remote-owned finst");
+            assert_eq!(
+                error.kind(),
+                crate::runtime_filter::port::producer::RuntimeContractViolationKind::UnauthorizedFragmentInstance,
+            );
+            assert!(
+                !services[aggregator_idx]
+                    .core_producer_handle_exists_for_test(PRODUCER_BINDING, remote_finst,),
+                "rejected public open must not mutate aggregator Core"
+            );
+        }
+    }
+
     let submit_and_close =
         |producer: &Arc<dyn crate::runtime_filter::port::producer::ProducerAdapter>, value: i32| {
             let submit = producer
@@ -731,24 +862,47 @@ fn run_live_conformance(topology: ConformanceTopology) {
     match topology {
         ConformanceTopology::AnyOfDirect => submit_and_close(&producers[0], 11),
         ConformanceTopology::AllOfAggregate => {
-            // RFD-6A validates the query-global aggregator Core and the aggregate
-            // final artifact's cross-BE delivery. Remote producer-contribution
-            // transport is explicitly deferred to RFD-6B, so all authorized
-            // streams enter through the actual BE0 aggregator Service here.
-            submit_and_close(&producers[0], 11);
-            for (backend_idx, value) in [(1, 22), (2, 33)] {
-                let aggregate_remote_producer = services[0]
-                    .open_producer(
-                        PRODUCER_BINDING,
-                        producer_finsts[&backend_idx],
-                        1,
-                        ProducerPortKind::Membership,
-                    )
-                    .expect("aggregator Core owns every remote producer stream")
-                    .into_membership()
-                    .expect("membership producer port");
-                submit_and_close(&aggregate_remote_producer, value);
-            }
+            let mut remote_indices = (0..3)
+                .filter(|idx| *idx != aggregator_idx)
+                .collect::<Vec<_>>();
+            remote_indices.sort_unstable();
+            let first = remote_indices[0];
+            submit_and_close(&producers[first], [11, 22, 33][first]);
+            let participant = participant_id_for_backend(first).unwrap();
+            wait_for_transport_ack(
+                query_id,
+                &services[first],
+                participant,
+                &producer_route_edges(&expected_installs[&participant]),
+            );
+            assert_remote_producer_envelopes(
+                &services[first],
+                &expected_installs[&participant],
+                producer_finsts[&first],
+            );
+            assert!(
+                subscription.snapshot().is_none(),
+                "AllOf must not publish after one shard"
+            );
+            let second = remote_indices[1];
+            submit_and_close(&producers[second], [11, 22, 33][second]);
+            let participant = participant_id_for_backend(second).unwrap();
+            wait_for_transport_ack(
+                query_id,
+                &services[second],
+                participant,
+                &producer_route_edges(&expected_installs[&participant]),
+            );
+            assert_remote_producer_envelopes(
+                &services[second],
+                &expected_installs[&participant],
+                producer_finsts[&second],
+            );
+            assert!(
+                subscription.snapshot().is_none(),
+                "AllOf must not publish before the last shard"
+            );
+            submit_and_close(&producers[aggregator_idx], [11, 22, 33][aggregator_idx]);
         }
     }
 
@@ -759,6 +913,9 @@ fn run_live_conformance(topology: ConformanceTopology) {
         !bundle.artifacts().is_empty(),
         "the remotely delivered artifact bundle is nonempty"
     );
+    if matches!(topology, ConformanceTopology::AllOfAggregate) {
+        assert_eq!(membership_i32_values(&bundle), BTreeSet::from([11, 22, 33]));
+    }
     let sender_participant = participant_id_for_backend(0).expect("valid sender backend id");
     let sender_routes = expected_installs[&sender_participant]
         .core_view()
@@ -802,5 +959,15 @@ fn live_three_be_anyof_direct_install_ack_and_delivery() {
 
 #[test]
 fn live_three_be_allof_aggregate_install_ack_and_delivery() {
+    run_live_conformance(ConformanceTopology::AllOfAggregate);
+}
+
+#[test]
+fn remote_membership_contribution_uses_installed_route() {
+    run_live_conformance(ConformanceTopology::AllOfAggregate);
+}
+
+#[test]
+fn remote_producer_closed_uses_same_route_and_terminal_sequence() {
     run_live_conformance(ConformanceTopology::AllOfAggregate);
 }

@@ -29,6 +29,7 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::sink_commit;
+use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
@@ -47,6 +48,7 @@ pub struct RuntimeState {
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
     spill_config: Option<SpillConfig>,
     spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
+    native_runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +83,7 @@ impl Default for RuntimeState {
             mem_tracker: None,
             spill_config: None,
             spill_manager: None,
+            native_runtime_filter_context: None,
         }
     }
 }
@@ -101,6 +104,7 @@ impl Clone for RuntimeState {
             mem_tracker: self.mem_tracker.clone(),
             spill_config: self.spill_config.clone(),
             spill_manager: self.spill_manager.clone(),
+            native_runtime_filter_context: self.native_runtime_filter_context.clone(),
         }
     }
 }
@@ -143,11 +147,26 @@ impl RuntimeState {
             mem_tracker,
             spill_config,
             spill_manager,
+            native_runtime_filter_context: None,
         };
         if let Some(finst_id) = fragment_instance_id {
             sink_commit::register(finst_id);
         }
         state
+    }
+
+    pub(crate) fn with_native_runtime_filter_context(
+        mut self,
+        context: Option<NativeRuntimeFilterExecutionContext>,
+    ) -> Self {
+        self.native_runtime_filter_context = context;
+        self
+    }
+
+    pub(crate) fn native_runtime_filter_context(
+        &self,
+    ) -> Option<&NativeRuntimeFilterExecutionContext> {
+        self.native_runtime_filter_context.as_ref()
     }
 
     #[allow(dead_code)]

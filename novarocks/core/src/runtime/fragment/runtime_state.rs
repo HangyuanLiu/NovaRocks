@@ -29,6 +29,7 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 pub(crate) struct RuntimeStateInputs {
     pub(crate) query_options: Option<QueryOptions>,
@@ -37,6 +38,7 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) fragment_instance_id: Option<UniqueId>,
     pub(crate) backend_num: Option<i32>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
+    pub(crate) native_runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
 }
 
 pub(crate) fn apply_query_option_overrides(
@@ -65,15 +67,18 @@ pub(crate) fn build_runtime_state(
     let spill_manager = spill_config
         .as_ref()
         .map(|config| Arc::new(QuerySpillManager::new(config.clone(), profiler)));
-    Ok(Arc::new(RuntimeState::new(
-        inputs.query_options,
-        Some(cache_options),
-        inputs.query_id,
-        inputs.runtime_filter_params,
-        inputs.fragment_instance_id,
-        inputs.backend_num,
-        inputs.mem_tracker,
-        spill_config,
-        spill_manager,
-    )))
+    Ok(Arc::new(
+        RuntimeState::new(
+            inputs.query_options,
+            Some(cache_options),
+            inputs.query_id,
+            inputs.runtime_filter_params,
+            inputs.fragment_instance_id,
+            inputs.backend_num,
+            inputs.mem_tracker,
+            spill_config,
+            spill_manager,
+        )
+        .with_native_runtime_filter_context(inputs.native_runtime_filter_context),
+    ))
 }

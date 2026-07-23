@@ -146,12 +146,12 @@ fn stats_compute_size_for_columns(stats: &PhysicalPlanStats, columns: &[ColumnId
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct JoinRfSides {
-    probe_child: usize,
-    build_child: usize,
+pub(crate) struct JoinRfSides {
+    pub(crate) probe_child: usize,
+    pub(crate) build_child: usize,
 }
 
-fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
+pub(crate) fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
     match kind {
         JoinKind::Inner | JoinKind::RightOuter | JoinKind::LeftSemi => Some(JoinRfSides {
             probe_child: 0,

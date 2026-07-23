@@ -21,15 +21,8 @@ use std::sync::Arc;
 
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::runtime_filter::model::contract::{
-    ArtifactCapability, CompletionRequirement, ConsumerActivation, ContributionKind,
-};
+use crate::runtime_filter::model::contract::{ArtifactCapability, ConsumerActivation};
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderKey;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NativeRuntimeFilterAvailability {
-    DeploymentNotInstalled,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NativeRuntimeFilterContract {
@@ -63,7 +56,6 @@ pub(crate) struct NativeRuntimeFilterConsumerSpec {
     pub(crate) capabilities: BTreeSet<ArtifactCapability>,
     pub(crate) contract: NativeRuntimeFilterContract,
     pub(crate) reduction: NativeRuntimeFilterReduction,
-    pub(crate) availability: NativeRuntimeFilterAvailability,
 }
 
 #[derive(Clone, Debug)]
@@ -83,9 +75,10 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 
     #[test]
-    fn dormant_execution_seams_are_explicitly_unavailable() {
+    fn execution_specs_carry_only_binding_contract_data() {
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let consumer = NativeRuntimeFilterConsumerSpec {
@@ -102,12 +95,7 @@ mod tests {
                 schema_digest: [2; 32],
             },
             reduction: NativeRuntimeFilterReduction::SetUnion,
-            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
         };
-        assert_eq!(
-            consumer.availability,
-            NativeRuntimeFilterAvailability::DeploymentNotInstalled
-        );
 
         let producer = crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec {
             binding_id: 3,
@@ -121,11 +109,8 @@ mod tests {
             completion_requirement: CompletionRequirement::ProducerClosed,
             contract: consumer.contract.clone(),
             reduction: consumer.reduction.clone(),
-            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
         };
-        assert_eq!(
-            producer.availability,
-            NativeRuntimeFilterAvailability::DeploymentNotInstalled
-        );
+        assert_eq!(producer.contract, consumer.contract);
+        assert_eq!(producer.reduction, consumer.reduction);
     }
 }

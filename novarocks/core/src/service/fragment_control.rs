@@ -17,7 +17,7 @@
 
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::info;
-use crate::runtime::query_context::query_context_manager;
+use crate::runtime::query_context::{QueryContextManager, query_context_manager};
 use crate::runtime::{exchange, result_buffer};
 
 pub fn cancel(finst_id: UniqueId) {
@@ -40,7 +40,10 @@ pub fn cancel(finst_id: UniqueId) {
 }
 
 fn cancel_runtime(finst_id: UniqueId) {
-    let mgr = query_context_manager();
+    cancel_with_manager(finst_id, query_context_manager());
+}
+
+pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryContextManager>) {
     let cancel_reason = format!("query canceled by FE: finst={}", finst_id);
     let cancel_result = mgr.cancel_finst(finst_id, cancel_reason);
     let query_id = cancel_result.query_id;

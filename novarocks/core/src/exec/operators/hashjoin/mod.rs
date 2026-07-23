@@ -34,6 +34,7 @@ mod hash_join_probe_core;
 mod join_hash_map;
 mod join_hash_table;
 pub(crate) mod join_probe_utils;
+pub(crate) mod native_runtime_filter;
 mod partitioned_join_probe_processor;
 pub(crate) mod partitioned_join_shared;
 

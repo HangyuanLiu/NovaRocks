@@ -38,7 +38,7 @@ use crate::runtime::runtime_state::RuntimeState;
 
 #[cfg(feature = "compat")]
 use super::builder::build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop;
-use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop;
+use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context;
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
 use super::global_driver_executor::{DriverTask, FragmentCompletion, global_driver_executor};
@@ -105,7 +105,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
         fe_addr,
         backend_num,
         root_sink_dop,
-        PipelineExecutionMode::NativeDisabled,
+        PipelineExecutionMode::Native,
     )
 }
 
@@ -172,7 +172,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
 }
 
 enum PipelineExecutionMode {
-    NativeDisabled,
+    Native,
     #[cfg(feature = "compat")]
     Compat,
 }
@@ -197,7 +197,7 @@ fn execute_plan_with_pipeline_in_mode(
     let dep_manager = DependencyManager::new();
     #[cfg(feature = "compat")]
     let runtime_filter_hub = match (&mode, query_id) {
-        (PipelineExecutionMode::NativeDisabled, _) => None,
+        (PipelineExecutionMode::Native, _) => None,
         (PipelineExecutionMode::Compat, Some(qid)) => {
             if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid)? {
                 Some(hub)
@@ -233,14 +233,15 @@ fn execute_plan_with_pipeline_in_mode(
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
     let graph = match mode {
-        PipelineExecutionMode::NativeDisabled => {
-            build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
+        PipelineExecutionMode::Native => {
+            build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
                 &plan,
                 debug,
                 dep_manager.clone(),
                 exchange_finst_id,
                 pipeline_dop,
                 root_sink_dop,
+                runtime_state.native_runtime_filter_context().cloned(),
             )?
         }
         #[cfg(feature = "compat")]
@@ -374,6 +375,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
+    use crate::common::types::UniqueId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
@@ -387,18 +389,20 @@ mod tests {
     };
     use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
     use crate::exec::node::runtime_filter::{
-        NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
-        NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+        NativeRuntimeFilterConsumerNode, NativeRuntimeFilterConsumerSpec,
+        NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
     };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+    use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime::runtime_state::RuntimeState;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, CompletionRequirement, ConsumerActivation, ContributionKind,
     };
+    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
     use super::execute_native_plan_with_pipeline;
 
@@ -414,6 +418,30 @@ mod tests {
         let lifecycle = RuntimeFilterLifecycleRegistry::global();
         lifecycle.remove_query(query_key);
         let context_manager = query_context_manager();
+        let deployment_lifecycle = RuntimeFilterQueryLifecycleOptions {
+            delivery_expire: Duration::from_secs(1),
+            query_expire: Duration::from_secs(5),
+            transport_retry_interval: Duration::from_millis(200),
+            transport_max_attempts: 3,
+            transport_deadline: Duration::from_secs(5),
+            transport_max_pending_entries: 128,
+            transport_max_pending_bytes: 1024 * 1024,
+        };
+        context_manager
+            .ensure_native_context(
+                query_id,
+                false,
+                deployment_lifecycle.delivery_expire,
+                deployment_lifecycle.query_expire,
+            )
+            .expect("create native query context");
+        context_manager
+            .install_runtime_filter_deployment(
+                query_id,
+                deployment_lifecycle,
+                crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install(),
+            )
+            .expect("install query-owned runtime-filter Service");
         for _ in 0..2 {
             context_manager
                 .get_or_register_native(
@@ -422,23 +450,23 @@ mod tests {
                     Duration::from_secs(1),
                     Duration::from_secs(5),
                 )
-                .expect("register shared NativeDisabled query context");
+                .expect("register shared NativeService query context");
         }
         let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
             Err(error) => error,
-            Ok(_) => panic!("NativeDisabled context must reject legacy hub access"),
+            Ok(_) => panic!("NativeService context must reject legacy hub access"),
         };
-        assert!(hub_error.contains("NativeDisabled"), "{hub_error}");
+        assert!(hub_error.contains("NativeService"), "{hub_error}");
         let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
             Err(error) => error,
-            Ok(_) => panic!("NativeDisabled context must reject legacy worker access"),
+            Ok(_) => panic!("NativeService context must reject legacy worker access"),
         };
-        assert!(worker_error.contains("NativeDisabled"), "{worker_error}");
+        assert!(worker_error.contains("NativeService"), "{worker_error}");
         let initial_lifecycle = lifecycle
             .snapshot(query_key)
-            .expect("query context installs an empty lifecycle event sink");
-        assert!(initial_lifecycle.filters.is_empty());
-        assert!(initial_lifecycle.channel_events.is_empty());
+            .expect("query context installs a lifecycle event sink");
+        let installed_filter_count = initial_lifecycle.filters.len();
+        let installed_channel_event_count = initial_lifecycle.channel_events.len();
 
         let full_build_domain = BTreeSet::from([11_i64, 29]);
         let local_producer_domain = BTreeSet::from([11_i64]);
@@ -484,9 +512,14 @@ mod tests {
             producer_arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let build_expr =
             producer_arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let membership_schema = ArtifactMembershipSchema::new(
+            &DataType::Int64,
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
         let contract = NativeRuntimeFilterContract::Membership {
-            canonical_schema: Arc::from([]),
-            schema_digest: [0; 32],
+            canonical_schema: Arc::from(membership_schema.canonical_bytes()),
+            schema_digest: membership_schema.digest().bytes(),
         };
         let producer_plan = ExecPlan {
             arena: producer_arena,
@@ -527,8 +560,8 @@ mod tests {
                     residual_predicate: None,
                     runtime_filter_execution: JoinRuntimeFilterExecution::Native {
                         producers: vec![NativeJoinRuntimeFilterProducerSpec {
-                            binding_id: 7,
-                            channel_id: 9,
+                            binding_id: 3,
+                            channel_id: 1,
                             build_expr_id: build_expr,
                             build_key_index: 0,
                             contribution_kinds: BTreeSet::from([
@@ -538,7 +571,6 @@ mod tests {
                             completion_requirement: CompletionRequirement::ProducerClosed,
                             contract: contract.clone(),
                             reduction: NativeRuntimeFilterReduction::SetUnion,
-                            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
                         }],
                     },
                 }),
@@ -553,7 +585,16 @@ mod tests {
             None,
             None,
             1,
-            Arc::new(RuntimeState::default()),
+            Arc::new(
+                RuntimeState::default().with_native_runtime_filter_context(Some(
+                    context_manager
+                        .runtime_filter_context_for_native_execution(
+                            query_id,
+                            UniqueId { hi: 70, lo: 30 },
+                        )
+                        .expect("producer runtime-filter context"),
+                )),
+            ),
             Some(query_id),
             None,
             None,
@@ -570,8 +611,11 @@ mod tests {
         let producer_lifecycle = lifecycle
             .snapshot(query_key)
             .expect("producer shares the query lifecycle event sink");
-        assert!(producer_lifecycle.filters.is_empty());
-        assert!(producer_lifecycle.channel_events.is_empty());
+        assert_eq!(producer_lifecycle.filters.len(), installed_filter_count);
+        assert_eq!(
+            producer_lifecycle.channel_events.len(),
+            installed_channel_event_count
+        );
 
         let consumer_schema = Arc::new(Schema::new(vec![Field::new(
             "consumer_key",
@@ -602,8 +646,8 @@ mod tests {
                     }),
                     owner_node_id: 4,
                     bindings: vec![NativeRuntimeFilterConsumerSpec {
-                        binding_id: 7,
-                        channel_id: 9,
+                        binding_id: 4,
+                        channel_id: 1,
                         expr_id: consumer_expr,
                         activation: ConsumerActivation::BlockingSnapshot,
                         capabilities: BTreeSet::from([
@@ -612,7 +656,6 @@ mod tests {
                         ]),
                         contract,
                         reduction: NativeRuntimeFilterReduction::SetUnion,
-                        availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
                     }],
                 }),
             },
@@ -626,7 +669,16 @@ mod tests {
             None,
             None,
             1,
-            Arc::new(RuntimeState::default()),
+            Arc::new(
+                RuntimeState::default().with_native_runtime_filter_context(Some(
+                    context_manager
+                        .runtime_filter_context_for_native_execution(
+                            query_id,
+                            UniqueId { hi: 70, lo: 40 },
+                        )
+                        .expect("consumer runtime-filter context"),
+                )),
+            ),
             Some(query_id),
             None,
             None,
@@ -651,18 +703,21 @@ mod tests {
         let consumer_lifecycle = lifecycle
             .snapshot(query_key)
             .expect("consumer shares the query lifecycle event sink");
-        assert!(consumer_lifecycle.filters.is_empty());
-        assert!(consumer_lifecycle.channel_events.is_empty());
+        assert_eq!(consumer_lifecycle.filters.len(), installed_filter_count);
+        assert_eq!(
+            consumer_lifecycle.channel_events.len(),
+            installed_channel_event_count
+        );
         let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
             Err(error) => error,
-            Ok(_) => panic!("NativeDisabled context must remain hub-free"),
+            Ok(_) => panic!("NativeService context must remain hub-free"),
         };
-        assert!(hub_error.contains("NativeDisabled"), "{hub_error}");
+        assert!(hub_error.contains("NativeService"), "{hub_error}");
         let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
             Err(error) => error,
-            Ok(_) => panic!("NativeDisabled context must remain worker-free"),
+            Ok(_) => panic!("NativeService context must remain worker-free"),
         };
-        assert!(worker_error.contains("NativeDisabled"), "{worker_error}");
+        assert!(worker_error.contains("NativeService"), "{worker_error}");
         context_manager.cancel_query(query_id, "test cleanup".to_string());
         context_manager.finish_fragment(query_id);
         context_manager.finish_fragment(query_id);

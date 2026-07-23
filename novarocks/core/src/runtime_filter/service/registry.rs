@@ -162,6 +162,28 @@ impl InboundProducerContract {
             Self::FinalDomain { .. } => ProducerPortKind::FinalDomain,
         }
     }
+
+    pub(super) fn codec_expectation(
+        &self,
+        stream: crate::runtime_filter::port::identity::ProducerStreamId,
+        sequence: crate::runtime_filter::port::identity::ProducerSequence,
+    ) -> crate::runtime_filter::codec::contribution::ContributionCodecExpectation<'_> {
+        use crate::runtime_filter::codec::contribution::ContributionCodecExpectation;
+        match self {
+            Self::Membership { schema, .. } => ContributionCodecExpectation::Membership(schema),
+            Self::OrderedBound { contract, .. } => {
+                ContributionCodecExpectation::OrderedBound(contract)
+            }
+            Self::TopKSummary { contract, .. } => {
+                ContributionCodecExpectation::TopKSummary(contract)
+            }
+            Self::FinalDomain { contract, .. } => ContributionCodecExpectation::FinalDomain {
+                contract,
+                stream,
+                sequence,
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -308,6 +330,25 @@ impl InstalledDeployment {
         self.producers.get(&binding_id)
     }
 
+    pub(super) fn channel_deployment(
+        &self,
+        channel_id: ChannelId,
+    ) -> Option<&crate::runtime_filter::port::install::RuntimeFilterChannelDeployment> {
+        self.install.core_view().channels().get(&channel_id)
+    }
+
+    pub(super) fn producer_participant(
+        &self,
+        channel_id: ChannelId,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Option<RuntimeFilterParticipantId> {
+        self.install
+            .routing_shard()
+            .channel(channel_id)
+            .and_then(|channel| channel.producer_participant(binding_id, fragment_instance_id))
+    }
+
     pub(super) fn subscription(
         &self,
         binding_id: BindingId,
@@ -363,6 +404,20 @@ impl InstalledDeployment {
     /// emitting participant for sender-side transport lifecycle events.
     pub(super) fn participant_id(&self) -> RuntimeFilterParticipantId {
         self.install.core_view().local_participant_id()
+    }
+
+    pub(super) fn local_producer_instances(
+        &self,
+        channel_id: ChannelId,
+    ) -> Vec<(BindingId, UniqueId)> {
+        let participant = self.participant_id();
+        self.install
+            .routing_shard()
+            .channel(channel_id)
+            .into_iter()
+            .flat_map(|channel| channel.producer_instances())
+            .filter_map(|(identity, owner)| (*owner == participant).then_some(*identity))
+            .collect()
     }
 
     #[cfg(test)]
@@ -2323,7 +2378,7 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
-                RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
             ]),
         )
     }
@@ -2845,7 +2900,7 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Contribution,
                         RuntimeFilterEnvelopeKind::ProducerClosed,
-                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::ProducerUnavailable,
                     ]),
                 ),
                 inbound_to_aggregator_with(
@@ -2857,7 +2912,7 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Contribution,
                         RuntimeFilterEnvelopeKind::ProducerClosed,
-                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::ProducerUnavailable,
                     ]),
                 ),
             ],

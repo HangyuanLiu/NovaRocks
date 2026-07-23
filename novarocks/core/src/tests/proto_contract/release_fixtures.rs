@@ -21,8 +21,7 @@ use prost::Message;
 
 use crate::proto::{common, expr, filter, novarocks, plan};
 use crate::protocol::native::decode::{
-    decode_destinations, decode_fragment_submission, decode_query_options,
-    decode_runtime_filter_params, decode_scan_range_params,
+    decode_destinations, decode_query_options, decode_scan_range_params,
 };
 
 const SUBMIT_FRAGMENT_REQUEST_FIXTURE_HEX: &str = "0a96040801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a02080512a0030a0408011002120408031004180922c801080b12c3010ac0010ab7010ab4010a0750415251554554121873333a2f2f6275636b65742f646174612e706172717565741a0c646174612e7061727175657420632808301038800142390a1a73333a2f2f6275636b65742f64656c6574652e706172717565741207504152515545541a10504f534954494f4e5f44454c45544553204050e807582c60c0c4076a040801100372030305087a0b7b2273706c6974223a317d8001018801ffffffffffffffffff0192010c0801120808021001200a2814100d180020002a04080c100332150a0408031004120d31302e302e302e383a383036303a270a1b084d12170a150a0408051006120d31302e302e302e393a393036301204084d100218808040426d08802010ac0218012008288080808002300438dc0b40b817480150808004580162240802119a9999999999e93f1880804020808080202801300138808080044080808008480368017001780180010188010190014b980102a001901ca8010ab0011eb80107c00101c8018080404a0e31302e302e302e31303a393037305001";
@@ -159,22 +158,6 @@ fn release_query_options() -> novarocks::QueryOptions {
         runtime_profile_report_interval: 7,
         enable_join_runtime_bitset_filter: Some(true),
         global_runtime_filter_build_max_size: 1 << 20,
-    }
-}
-
-fn release_runtime_filter_params() -> novarocks::RuntimeFilterParams {
-    novarocks::RuntimeFilterParams {
-        id_to_prober_params: HashMap::from([(
-            77,
-            novarocks::ProberParamsList {
-                params: vec![novarocks::ProberParams {
-                    fragment_instance_id: Some(id(5, 6)),
-                    endpoint: "10.0.0.9:9060".to_string(),
-                }],
-            },
-        )]),
-        runtime_filter_builder_number: HashMap::from([(77, 2)]),
-        runtime_filter_max_size: 1 << 20,
     }
 }
 
@@ -359,7 +342,6 @@ fn release_submit_fragment_request() -> novarocks::SubmitFragmentRequest {
             )]),
             per_exch_num_senders: HashMap::from([(12, 3)]),
             destinations: vec![release_destination()],
-            runtime_filter_params: Some(release_runtime_filter_params()),
             query_options: Some(release_query_options()),
             report_endpoint: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,
@@ -564,9 +546,20 @@ fn print_release_fixture_hex() {
 }
 
 #[test]
-fn release_submit_fragment_request_fixture_decodes_through_native_boundaries() {
-    let request: novarocks::SubmitFragmentRequest =
-        decode_fixture("SubmitFragmentRequest", SUBMIT_FRAGMENT_REQUEST_FIXTURE_HEX);
+fn legacy_release_submit_fragment_request_fixture_is_rejected_at_native_wire_boundary() {
+    let bytes = decode_hex(
+        "legacy SubmitFragmentRequest",
+        SUBMIT_FRAGMENT_REQUEST_FIXTURE_HEX,
+    );
+    let error = crate::protocol::native::codec::validate_submit_fragment_request_wire(&bytes)
+        .expect_err("legacy InstanceParams tag 7 must fail before Prost drops it");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("tag 7"), "{error}");
+
+    // This proves why the raw-wire guard is required: plain Prost still silently
+    // drops the reserved field and decodes the remaining legacy fixture.
+    let request = novarocks::SubmitFragmentRequest::decode(bytes.as_slice())
+        .expect("plain Prost preserves its unknown-field behavior");
     let plan = request
         .plan
         .as_ref()
@@ -690,26 +683,6 @@ fn release_submit_fragment_request_fixture_decodes_through_native_boundaries() {
     assert_eq!(query_options.runtime_filter_scan_wait_time_ms, Some(1500));
     assert_eq!(query_options.runtime_filter_wait_timeout_ms, Some(3000));
 
-    let rf_params = decode_runtime_filter_params(
-        params
-            .runtime_filter_params
-            .as_ref()
-            .expect("SubmitFragmentRequest fixture runtime_filter_params"),
-    )
-    .expect("SubmitFragmentRequest fixture runtime_filter_params boundary");
-    assert_eq!(rf_params.runtime_filter_max_size(), Some(1 << 20));
-    assert_eq!(
-        rf_params.runtime_filter_builder_number().get(&77),
-        Some(&2),
-        "SubmitFragmentRequest fixture runtime filter builder count"
-    );
-    let prober = rf_params
-        .id_to_prober_params()
-        .get(&77)
-        .and_then(|items| items.first())
-        .expect("SubmitFragmentRequest fixture runtime filter prober");
-    assert_eq!(prober.endpoint().as_host_port(), "10.0.0.9:9060");
-
     let destinations = decode_destinations(&params.destinations)
         .expect("SubmitFragmentRequest fixture destinations boundary");
     assert_eq!(destinations.len(), 1);
@@ -726,18 +699,6 @@ fn release_submit_fragment_request_fixture_decodes_through_native_boundaries() {
         decoded_scan_range.range,
         crate::runtime::scan_range::ScanRange::File(_)
     ));
-
-    let submission_error = decode_fragment_submission(plan, params)
-        .expect_err("release fixture carries unsupported legacy runtime-filter params");
-    let protocol = submission_error.protocol().expect("typed protocol error");
-    assert_eq!(
-        protocol.path().to_string(),
-        "instance_params.runtime_filter_params"
-    );
-    assert_eq!(
-        protocol.kind(),
-        crate::protocol::common::error::ProtocolErrorKind::Unsupported
-    );
 }
 
 #[test]

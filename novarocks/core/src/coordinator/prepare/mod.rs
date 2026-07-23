@@ -243,6 +243,7 @@ pub(crate) fn prepare_fragments(
         execution_anchor_fragment_id,
         plan.edges().to_vec(),
         plan.runtime_filter_graph().clone(),
+        plan.runtime_filter_join_progress().clone(),
     ))
 }
 
@@ -294,6 +295,7 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
         plan.topology().execution_anchor_fragment_id(),
         plan.edges().to_vec(),
         plan.runtime_filter_graph().clone(),
+        plan.runtime_filter_join_progress().clone(),
     ))
 }
 

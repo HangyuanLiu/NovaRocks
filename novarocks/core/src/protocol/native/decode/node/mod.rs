@@ -54,8 +54,8 @@ use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::join::{JoinRuntimeFilterExecution, NativeJoinRuntimeFilterProducerSpec};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
-    NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    NativeRuntimeFilterConsumerNode, NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
+    NativeRuntimeFilterReduction,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
@@ -820,7 +820,7 @@ fn attach_hash_join_producers(
     bindings: &[DecodedRuntimeFilterBinding],
     direct_inputs: &[(Layout, ChunkSchemaRef)],
     lowered: &mut DecodedNode,
-    arena: &mut ExprArena,
+    _arena: &mut ExprArena,
     path: FieldPath,
 ) -> Result<(), super::NativeFragmentDecodeError> {
     let binding_path = path.clone().field("runtime_filter_binding_ids");
@@ -955,7 +955,15 @@ fn attach_hash_join_producers(
             build_schema,
             raw_build_path,
         )?;
-        let build_expr_id = lower_binding_expression(binding, build_layout, build_schema, arena)?;
+        let build_expr_id = *join.build_keys.get(build_key_index).ok_or_else(|| {
+            super::NativeFragmentDecodeError::inconsistent(
+                join_key_path.clone(),
+                format!(
+                    "native runtime-filter producer binding_id={} lowered join key ordinal={build_key_index} is missing",
+                    binding.binding_id
+                ),
+            )
+        })?;
         producers.push(NativeJoinRuntimeFilterProducerSpec {
             binding_id: binding.binding_id,
             channel_id: binding.channel_id,
@@ -965,7 +973,6 @@ fn attach_hash_join_producers(
             completion_requirement: *completion_requirement,
             contract: native_contract(&binding.contract),
             reduction: native_reduction(&binding.reduction),
-            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
         });
     }
     join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
@@ -995,7 +1002,6 @@ fn consumer_spec(
         capabilities: capabilities.clone(),
         contract: native_contract(&binding.contract),
         reduction: native_reduction(&binding.reduction),
-        availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
     })
 }
 
@@ -2324,14 +2330,19 @@ mod tests {
         let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("producer seam")
         };
+        let lowered_build_key = join.build_keys[0];
         let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
             panic!("native producer execution")
         };
         let build_expr_id = producers[0].build_expr_id;
-        assert_eq!(arena.data_type(build_expr_id), Some(&DataType::Int32));
+        assert_eq!(
+            build_expr_id, lowered_build_key,
+            "producer must reuse the exact lowered HashJoin key expression"
+        );
+        assert_eq!(arena.data_type(build_expr_id), Some(&DataType::Int64));
         assert!(matches!(
             arena.node(build_expr_id),
-            Some(crate::exec::expr::ExprNode::SlotId(_))
+            Some(crate::exec::expr::ExprNode::Cast(_))
         ));
     }
 

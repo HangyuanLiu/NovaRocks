@@ -25,7 +25,6 @@ use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::proto::{common, novarocks};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range;
 
 pub(crate) fn encode_instance_params(
@@ -65,7 +64,6 @@ pub(crate) fn encode_instance_params(
             .iter()
             .map(encode_destination)
             .collect::<Result<Vec<_>, _>>()?,
-        runtime_filter_params: None,
         query_options: Some(encode_query_options(query_options)),
         report_endpoint: report_endpoint.map(RuntimeEndpoint::as_host_port),
         typed_result_sink,
@@ -251,31 +249,6 @@ pub(crate) fn encode_query_options(src: &QueryOptions) -> novarocks::QueryOption
     }
 }
 
-pub(crate) fn encode_runtime_filter_params(
-    src: &RuntimeFilterParams,
-) -> novarocks::RuntimeFilterParams {
-    novarocks::RuntimeFilterParams {
-        id_to_prober_params: src
-            .id_to_prober_params()
-            .iter()
-            .map(|(filter_id, params)| {
-                (
-                    *filter_id,
-                    novarocks::ProberParamsList {
-                        params: params.iter().map(encode_runtime_filter_prober).collect(),
-                    },
-                )
-            })
-            .collect(),
-        runtime_filter_builder_number: src
-            .runtime_filter_builder_number()
-            .iter()
-            .map(|(filter_id, count)| (*filter_id, *count))
-            .collect(),
-        runtime_filter_max_size: src.runtime_filter_max_size().unwrap_or_default(),
-    }
-}
-
 fn encode_spill_config(src: &SpillConfig) -> novarocks::SpillOptions {
     novarocks::SpillOptions {
         spill_mode: match src.spill_mode {
@@ -294,18 +267,5 @@ fn encode_spill_config(src: &SpillConfig) -> novarocks::SpillOptions {
             .unwrap_or_default(),
         spill_mem_table_size: src.spill_mem_table_size.unwrap_or_default(),
         spill_mem_table_num: src.spill_mem_table_num.unwrap_or_default(),
-    }
-}
-
-fn encode_runtime_filter_prober(
-    src: &crate::runtime::endpoint::RuntimeFilterProberDestination,
-) -> novarocks::ProberParams {
-    let fragment_instance_id = src.fragment_instance_id();
-    novarocks::ProberParams {
-        fragment_instance_id: Some(common::UniqueId {
-            hi: fragment_instance_id.hi,
-            lo: fragment_instance_id.lo,
-        }),
-        endpoint: src.endpoint().as_host_port(),
     }
 }

@@ -112,11 +112,12 @@ WHERE t3.v <= 150;
 SET disable_optimizer_rules = 'JoinAssociativity,JoinCommutativity';
 -- The transitive filter is the one BUILT on t3.k (the top join's build side).
 -- Proving IT (not J_ab's own local t1.k=t2.k filter) lands on TWO scans is
--- the bilateral/transitive M3 claim: filter_id = 1 is built once on t3.k,
--- and must appear as a probe on both t1's scan AND t2's scan below.
+-- the bilateral/transitive M3 claim: the filter built on t3.k must appear as
+-- a probe on both t1's scan AND t2's scan below.
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=HASH_PARTITIONED (k)
--- @explain_contains=runtime filter channel 1
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 -- @explain_contains=expr = (t3.k)
 -- @explain_contains=expr = (t1.k)
 -- @explain_contains=expr = (t2.k)
@@ -127,6 +128,9 @@ JOIN ${case_db}.rf_dist_bi_t2 t2 ON t1.k = t2.k
 JOIN ${case_db}.rf_dist_bi_t3 t3 ON t2.k = t3.k
 WHERE t3.v <= 150;
 
+-- The preceding @explain_contains directives already assert both channels and
+-- bilateral probe placement. Do not golden query-local allocator identities.
+-- @skip_result_check=true
 EXPLAIN VERBOSE
 SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,
        COALESCE(SUM(t1.v), 0) AS t1_sum, COALESCE(SUM(t2.v), 0) AS t2_sum

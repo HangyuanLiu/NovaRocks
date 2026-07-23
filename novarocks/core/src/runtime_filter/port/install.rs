@@ -118,6 +118,21 @@ impl MaterializationPolicy {
         self.max_concurrent_jobs
     }
 
+    pub(crate) fn with_max_concurrent_jobs(
+        self,
+        max_concurrent_jobs: usize,
+    ) -> Result<Self, MaterializationPolicyError> {
+        Self::new(
+            self.bloom_bits_per_key,
+            self.bloom_hash_count,
+            self.bloom_seed,
+            self.bloom_algorithm_version,
+            self.max_total_retained_bytes,
+            self.max_scratch_bytes_per_job,
+            max_concurrent_jobs,
+        )
+    }
+
     pub(crate) fn aggregate_scratch_bytes(self) -> Result<usize, MaterializationPolicyError> {
         let total = self
             .max_scratch_bytes_per_job

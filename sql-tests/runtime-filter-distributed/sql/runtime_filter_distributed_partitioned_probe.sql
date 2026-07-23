@@ -70,6 +70,15 @@ FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
 
+-- @skip_result_check=true
+-- @normalize_explain_timing=true
+-- @result_not_contains=RuntimeFilterApply:
+EXPLAIN ANALYZE
+SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+FROM ${case_db}.rf_dist_part_probe p
+JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
+WHERE b.flag = 'Y';
+
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=HASH_PARTITIONED (k)
@@ -80,6 +89,20 @@ FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
 
+-- @skip_result_check=true
+-- @normalize_explain_timing=true
+-- @result_contains=RuntimeFilterApply: input_rows=2000 output_rows=1000
+-- @result_contains=Profile: fragments=
+-- @result_contains=HASH JOIN (PARTITIONED
+EXPLAIN ANALYZE
+SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+FROM ${case_db}.rf_dist_part_probe p
+JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
+WHERE b.flag = 'Y';
+
+-- The preceding @explain_contains directives already assert this plan shape.
+-- Do not golden unstable query-local runtime-filter channel/binding ids.
+-- @skip_result_check=true
 EXPLAIN VERBOSE
 SELECT 'partitioned_probe' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p

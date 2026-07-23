@@ -50,6 +50,7 @@ mod project_processor;
 mod repeat_processor;
 mod result_buffer_sink;
 mod result_sink;
+pub(crate) mod runtime_filter;
 pub(crate) mod scan;
 mod setop;
 mod sort;

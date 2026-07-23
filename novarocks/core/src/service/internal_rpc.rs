@@ -540,7 +540,7 @@ pub(crate) fn handle_lookup_close_compat(
 mod native_runtime_filter_mode_tests {
     use super::*;
 
-    fn submit_native_fragment_with_legacy_runtime_filter(query_id: QueryId) -> Result<(), String> {
+    fn submit_native_fragment(query_id: QueryId) -> Result<(), String> {
         let fragment_id = 8;
         crate::service::native_fragment_service::submit_exec_plan_fragment_native(
             crate::proto::plan::PlanFragment {
@@ -580,10 +580,6 @@ mod native_runtime_filter_mode_tests {
                 fragment_instance_id: Some(proto::common::UniqueId {
                     hi: query_id.hi + 1,
                     lo: query_id.lo + 1,
-                }),
-                runtime_filter_params: Some(crate::proto::novarocks::RuntimeFilterParams {
-                    runtime_filter_builder_number: HashMap::from([(9, 1)]),
-                    ..Default::default()
                 }),
                 query_options: Some(crate::proto::novarocks::QueryOptions {
                     pipeline_dop: 1,
@@ -676,13 +672,7 @@ mod native_runtime_filter_mode_tests {
             hi: 71_003,
             lo: 71_004,
         };
-        let fragment_error = submit_native_fragment_with_legacy_runtime_filter(query_id)
-            .expect_err("native fragment must reject legacy runtime-filter params");
-        assert!(
-            fragment_error.contains("instance_params.runtime_filter_params")
-                && fragment_error.contains("unsupported"),
-            "{fragment_error}"
-        );
+        submit_native_fragment(query_id).expect("native fragment submission");
 
         let response =
             handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {

@@ -583,6 +583,7 @@ static C++ runtime is required.",
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
+        .codec_path("crate::protocol::native::codec::NativeProstCodec")
         .compile_protos(&novarocks_protos, &[NOVAROCKS_IDL_DIR])
         .expect("compile novarocks common + expr + filter + plan + service protos");
 

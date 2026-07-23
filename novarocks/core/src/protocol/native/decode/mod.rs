@@ -30,16 +30,13 @@ pub(crate) use error::NativeFragmentDecodeError;
 #[allow(unused_imports)]
 pub(crate) use instance::{
     NativeSubmissionMetadata, decode_destinations, decode_endpoint, decode_query_options,
-    decode_runtime_filter_params, decode_scan_range_params,
+    decode_scan_range_params,
 };
 #[allow(unused_imports)]
 pub(crate) use node::{
     DecodedNode, NativePlanDecodeContext, decode_node, decode_node_with_runtime_filters,
 };
-pub(crate) use runtime_filter::{
-    DecodedApplyPoint, NativeRuntimeFilterDecodeLedger, NativeRuntimeFilterDormancyFact,
-    NativeRuntimeFilterDormancyRole,
-};
+pub(crate) use runtime_filter::{DecodedApplyPoint, NativeRuntimeFilterDecodeLedger};
 pub(in crate::protocol::native) use runtime_filter::{
     decode_runtime_filter_activation, decode_runtime_filter_capability,
     decode_runtime_filter_completion, decode_runtime_filter_contribution_kind,

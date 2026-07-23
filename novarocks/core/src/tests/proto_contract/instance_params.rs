@@ -132,22 +132,6 @@ fn destination() -> novarocks::Destination {
     }
 }
 
-fn runtime_filter_params() -> novarocks::RuntimeFilterParams {
-    novarocks::RuntimeFilterParams {
-        id_to_prober_params: HashMap::from([(
-            77,
-            novarocks::ProberParamsList {
-                params: vec![novarocks::ProberParams {
-                    fragment_instance_id: Some(id(5, 6)),
-                    endpoint: "10.0.0.9:9060".to_string(),
-                }],
-            },
-        )]),
-        runtime_filter_builder_number: HashMap::from([(77, 2)]),
-        runtime_filter_max_size: 1 << 20,
-    }
-}
-
 fn query_options() -> novarocks::QueryOptions {
     novarocks::QueryOptions {
         batch_size: 4096,
@@ -242,12 +226,15 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
         per_node_scan_ranges: HashMap::new(),
         per_exch_num_senders: HashMap::new(),
         destinations: vec![destination()],
-        runtime_filter_params: Some(runtime_filter_params()),
         query_options: Some(query_options()),
         report_endpoint: Some("10.0.0.10:9070".to_string()),
         typed_result_sink: true,
     };
     let params_fields = encoded_field_numbers(&params);
+    assert!(
+        !params_fields.contains(&7),
+        "InstanceParams tag 7 is a permanent runtime_filter_params tombstone"
+    );
     assert!(
         params_fields.contains(&9),
         "InstanceParams endpoint reporting field must keep tag 9 stable"
@@ -276,7 +263,6 @@ fn instance_params_survives_proto_roundtrip() {
         )]),
         per_exch_num_senders: HashMap::from([(20, 3)]),
         destinations: vec![destination()],
-        runtime_filter_params: Some(runtime_filter_params()),
         query_options: Some(query_options()),
         report_endpoint: Some("10.0.0.10:9070".to_string()),
         typed_result_sink: true,
@@ -297,7 +283,6 @@ fn submit_fragment_request_carries_native_fields_only() {
             per_node_scan_ranges: HashMap::new(),
             per_exch_num_senders: HashMap::new(),
             destinations: vec![destination()],
-            runtime_filter_params: Some(runtime_filter_params()),
             query_options: Some(query_options()),
             report_endpoint: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,

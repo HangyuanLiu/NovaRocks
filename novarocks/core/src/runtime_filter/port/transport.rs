@@ -18,6 +18,7 @@
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::types::UniqueId;
@@ -31,6 +32,7 @@ pub(crate) enum RuntimeFilterEnvelopeKind {
     Contribution,
     Artifact,
     ProducerClosed,
+    ProducerUnavailable,
     Unavailable,
     CompletedWithoutArtifact,
     DegradedLogical,
@@ -247,6 +249,42 @@ pub(crate) struct DeliveryRouteIdentity {
     sequence: ProducerSequence,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProducerInstanceRouteIdentity {
+    producer_binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+}
+
+impl ProducerInstanceRouteIdentity {
+    pub(crate) fn try_new(
+        producer_binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Result<Self, RuntimeFilterTransportError> {
+        if producer_binding_id.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity(
+                "producer binding id",
+            ));
+        }
+        if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity(
+                "fragment instance id",
+            ));
+        }
+        Ok(Self {
+            producer_binding_id,
+            fragment_instance_id,
+        })
+    }
+
+    pub(crate) const fn producer_binding_id(&self) -> BindingId {
+        self.producer_binding_id
+    }
+
+    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
+    }
+}
+
 impl DeliveryRouteIdentity {
     pub(crate) fn try_new(
         route_edge_id: RouteEdgeId,
@@ -284,6 +322,7 @@ pub(crate) struct RuntimeFilterRouteIdentity {
 enum RuntimeFilterRouteIdentityKind {
     Contribution(ContributionRouteIdentity),
     Delivery(DeliveryRouteIdentity),
+    ProducerInstance(ProducerInstanceRouteIdentity),
 }
 
 impl RuntimeFilterRouteIdentity {
@@ -299,17 +338,33 @@ impl RuntimeFilterRouteIdentity {
         }
     }
 
+    pub(crate) const fn producer_instance(identity: ProducerInstanceRouteIdentity) -> Self {
+        Self {
+            kind: RuntimeFilterRouteIdentityKind::ProducerInstance(identity),
+        }
+    }
+
     pub(crate) const fn as_contribution(&self) -> Option<&ContributionRouteIdentity> {
         match &self.kind {
             RuntimeFilterRouteIdentityKind::Contribution(identity) => Some(identity),
-            RuntimeFilterRouteIdentityKind::Delivery(_) => None,
+            RuntimeFilterRouteIdentityKind::Delivery(_)
+            | RuntimeFilterRouteIdentityKind::ProducerInstance(_) => None,
         }
     }
 
     pub(crate) const fn as_delivery(&self) -> Option<&DeliveryRouteIdentity> {
         match &self.kind {
             RuntimeFilterRouteIdentityKind::Delivery(identity) => Some(identity),
-            RuntimeFilterRouteIdentityKind::Contribution(_) => None,
+            RuntimeFilterRouteIdentityKind::Contribution(_)
+            | RuntimeFilterRouteIdentityKind::ProducerInstance(_) => None,
+        }
+    }
+
+    pub(crate) const fn as_producer_instance(&self) -> Option<&ProducerInstanceRouteIdentity> {
+        match &self.kind {
+            RuntimeFilterRouteIdentityKind::ProducerInstance(identity) => Some(identity),
+            RuntimeFilterRouteIdentityKind::Contribution(_)
+            | RuntimeFilterRouteIdentityKind::Delivery(_) => None,
         }
     }
 }
@@ -416,6 +471,9 @@ impl RuntimeFilterEnvelope {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
                 route_identity.as_contribution().is_some()
             }
+            RuntimeFilterEnvelopeKind::ProducerUnavailable => {
+                route_identity.as_producer_instance().is_some()
+            }
             RuntimeFilterEnvelopeKind::Artifact
             | RuntimeFilterEnvelopeKind::FinalArtifact
             | RuntimeFilterEnvelopeKind::Unavailable
@@ -431,6 +489,7 @@ impl RuntimeFilterEnvelope {
             RuntimeFilterEnvelopeKind::Contribution
                 | RuntimeFilterEnvelopeKind::Artifact
                 | RuntimeFilterEnvelopeKind::FinalArtifact
+                | RuntimeFilterEnvelopeKind::ProducerUnavailable
                 | RuntimeFilterEnvelopeKind::Unavailable
                 | RuntimeFilterEnvelopeKind::DegradedLogical
         );
@@ -494,6 +553,14 @@ impl RuntimeFilterEnvelope {
     pub(crate) fn payload(&self) -> &[u8] {
         &self.payload
     }
+
+    /// Deterministic retained-memory charge owned directly by this envelope. The
+    /// variable heap component uses `Vec::capacity`, not its logical wire length.
+    /// Arc/control-block and transport-entry fixed overhead are bounded separately by
+    /// the reliable transport's pending-entry ceiling.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.payload.capacity())
+    }
 }
 
 /// A complete domain envelope plus the unary deadline installed for this query.
@@ -502,12 +569,12 @@ impl RuntimeFilterEnvelope {
 /// receives this immutable value and is responsible only for wire transmission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterTransportEnvelope {
-    envelope: RuntimeFilterEnvelope,
+    envelope: Arc<RuntimeFilterEnvelope>,
     rpc_deadline: Duration,
 }
 
 impl RuntimeFilterTransportEnvelope {
-    pub(crate) fn new(envelope: RuntimeFilterEnvelope, rpc_deadline: Duration) -> Self {
+    pub(crate) fn new(envelope: Arc<RuntimeFilterEnvelope>, rpc_deadline: Duration) -> Self {
         assert!(
             !rpc_deadline.is_zero(),
             "runtime filter envelope RPC deadline must be nonzero"
@@ -518,11 +585,15 @@ impl RuntimeFilterTransportEnvelope {
         }
     }
 
-    pub(crate) const fn envelope(&self) -> &RuntimeFilterEnvelope {
+    pub(crate) fn envelope(&self) -> &RuntimeFilterEnvelope {
+        self.envelope.as_ref()
+    }
+
+    pub(crate) const fn envelope_arc(&self) -> &Arc<RuntimeFilterEnvelope> {
         &self.envelope
     }
 
-    pub(crate) fn into_parts(self) -> (RuntimeFilterEnvelope, Duration) {
+    pub(crate) fn into_parts(self) -> (Arc<RuntimeFilterEnvelope>, Duration) {
         (self.envelope, self.rpc_deadline)
     }
 }
@@ -1338,6 +1409,45 @@ mod tests {
                 RuntimeFilterEnvelopeKind::DegradedLogical,
                 RuntimeFilterEnvelopeKind::Ack,
             ]
+        );
+    }
+
+    #[test]
+    fn producer_unavailable_uses_producer_instance_identity() {
+        let identity =
+            ProducerInstanceRouteIdentity::try_new(BindingId::new(7), UniqueId { hi: 8, lo: 9 })
+                .unwrap();
+        let envelope = RuntimeFilterEnvelope::try_new(
+            RuntimeFilterEnvelopeKind::ProducerUnavailable,
+            UniqueId { hi: 1, lo: 2 },
+            ChannelId::new(3),
+            DeploymentEpoch::new(4),
+            RuntimeFilterRouteIdentity::producer_instance(identity.clone()),
+            None,
+            None,
+            &[5; 32],
+            vec![1, 2],
+        )
+        .unwrap();
+
+        assert_eq!(
+            envelope.route_identity().as_producer_instance(),
+            Some(&identity)
+        );
+        assert!(envelope.route_identity().as_delivery().is_none());
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                delivery_route(),
+                None,
+                None,
+                &[5; 32],
+                vec![1, 2],
+            )
+            .is_err()
         );
     }
 }

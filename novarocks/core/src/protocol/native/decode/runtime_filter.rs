@@ -74,21 +74,6 @@ pub(crate) enum DecodedConsumerBindingTarget {
     SourceBoundary,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeRuntimeFilterDormancyRole {
-    Producer,
-    Consumer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NativeRuntimeFilterDormancyFact {
-    pub(crate) binding_id: u32,
-    pub(crate) channel_id: u32,
-    pub(crate) node_id: i32,
-    pub(crate) apply_point: DecodedApplyPoint,
-    pub(crate) role: NativeRuntimeFilterDormancyRole,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecodedRuntimeFilterContract {
     Membership {
@@ -267,17 +252,13 @@ impl NativeRuntimeFilterDecodeLedger {
         Ok(())
     }
 
-    pub(crate) fn finish(
-        self,
-    ) -> Result<Vec<NativeRuntimeFilterDormancyFact>, super::NativeFragmentDecodeError> {
+    pub(crate) fn finish(self) -> Result<(), super::NativeFragmentDecodeError> {
         self.finish_impl().map_err(|error| {
             error.into_native(FieldPath::root("plan_fragment").field("runtime_filter_bindings"))
         })
     }
 
-    fn finish_impl(
-        self,
-    ) -> Result<Vec<NativeRuntimeFilterDormancyFact>, NativeFragmentLeafDecodeError> {
+    fn finish_impl(self) -> Result<(), NativeFragmentLeafDecodeError> {
         if let Some(binding_id) = self
             .records
             .keys()
@@ -292,24 +273,7 @@ impl NativeRuntimeFilterDecodeLedger {
                 ),
             ));
         }
-        Ok(self
-            .records
-            .into_values()
-            .map(|binding| NativeRuntimeFilterDormancyFact {
-                binding_id: binding.binding_id,
-                channel_id: binding.channel_id,
-                node_id: binding.node_id,
-                apply_point: binding.apply_point,
-                role: match binding.role {
-                    DecodedBindingRole::Producer { .. } => {
-                        NativeRuntimeFilterDormancyRole::Producer
-                    }
-                    DecodedBindingRole::Consumer { .. } => {
-                        NativeRuntimeFilterDormancyRole::Consumer
-                    }
-                },
-            })
-            .collect())
+        Ok(())
     }
 }
 
@@ -1838,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_returns_sorted_dormancy_facts_only_after_complete_consumption() {
+    fn finish_succeeds_only_after_complete_consumption() {
         let consumer = membership_binding(1, 11);
         let mut producer = membership_binding(2, 12);
         producer.apply_point = i32::from(plan::RuntimeFilterApplyPoint::NodeOutput);
@@ -1863,34 +1827,6 @@ mod tests {
         ledger.lookup_for_node(1, 11, 7).expect("consumer lookup");
         ledger.commit_consumed(1).expect("consumer consumed");
 
-        let facts = ledger.finish().expect("all bindings consumed");
-        assert_eq!(
-            facts
-                .iter()
-                .map(|fact| (
-                    fact.binding_id,
-                    fact.channel_id,
-                    fact.node_id,
-                    fact.apply_point,
-                    fact.role
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    1,
-                    9,
-                    11,
-                    DecodedApplyPoint::NodeInput,
-                    NativeRuntimeFilterDormancyRole::Consumer
-                ),
-                (
-                    2,
-                    9,
-                    12,
-                    DecodedApplyPoint::NodeOutput,
-                    NativeRuntimeFilterDormancyRole::Producer
-                ),
-            ]
-        );
+        ledger.finish().expect("all bindings consumed");
     }
 }

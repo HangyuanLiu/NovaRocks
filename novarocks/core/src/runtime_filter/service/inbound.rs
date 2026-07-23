@@ -24,6 +24,7 @@ use crate::runtime_filter::codec::contribution::{
     ContributionCodecExpectation, RuntimeFilterContribution, decode_contribution,
     semantic_contribution_bytes,
 };
+use crate::runtime_filter::codec::producer::decode_producer_failure;
 use crate::runtime_filter::port::identity::ProducerStreamId;
 use crate::runtime_filter::port::producer::{
     ProducerHandle, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
@@ -105,12 +106,34 @@ impl RuntimeFilterService {
         &self,
         envelope: RuntimeFilterEnvelope,
     ) -> Result<InboundProducerDispatchOutcome, InboundProducerDispatchError> {
-        let route = envelope.route_identity().as_contribution().ok_or_else(|| {
-            ingress_error(
-                InboundProducerDispatchErrorKind::RouteContract,
-                "producer envelope requires contribution identity",
-            )
-        })?;
+        let contribution_route = envelope.route_identity().as_contribution();
+        let producer_instance_route = envelope.route_identity().as_producer_instance();
+        let (producer_binding_id, fragment_instance_id) = match envelope.kind() {
+            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
+                let route = contribution_route.ok_or_else(|| {
+                    ingress_error(
+                        InboundProducerDispatchErrorKind::RouteContract,
+                        "contribution or close envelope requires contribution identity",
+                    )
+                })?;
+                (route.producer_binding_id(), route.fragment_instance_id())
+            }
+            RuntimeFilterEnvelopeKind::ProducerUnavailable => {
+                let route = producer_instance_route.ok_or_else(|| {
+                    ingress_error(
+                        InboundProducerDispatchErrorKind::RouteContract,
+                        "producer-unavailable envelope requires producer-instance identity",
+                    )
+                })?;
+                (route.producer_binding_id(), route.fragment_instance_id())
+            }
+            _ => {
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::RouteContract,
+                    "envelope kind is not valid for producer ingress",
+                ));
+            }
+        };
 
         // (query, epoch) tombstone: a late contribution for a retired/stale epoch is
         // rejected without rebuilding context (M2B3 lookup-only). Consulted before
@@ -156,25 +179,77 @@ impl RuntimeFilterService {
             .authorize_contribution(
                 envelope.deployment_epoch(),
                 envelope.channel_id(),
-                route.producer_binding_id(),
-                route.fragment_instance_id(),
+                producer_binding_id,
+                fragment_instance_id,
                 envelope.kind(),
             )
             .map_err(map_route_error)?;
-        let producer = installed
-            .producer(route.producer_binding_id())
-            .ok_or_else(|| {
-                ingress_error(
-                    InboundProducerDispatchErrorKind::RouteContract,
-                    "producer binding is not installed",
-                )
-            })?;
+        let producer = installed.producer(producer_binding_id).ok_or_else(|| {
+            ingress_error(
+                InboundProducerDispatchErrorKind::RouteContract,
+                "producer binding is not installed",
+            )
+        })?;
         if producer.channel_id() != envelope.channel_id() {
             return Err(ingress_error(
                 InboundProducerDispatchErrorKind::RouteContract,
                 "producer binding belongs to another channel",
             ));
         }
+
+        let contract = producer.inbound_contract();
+        if envelope.kind() == RuntimeFilterEnvelopeKind::ProducerUnavailable {
+            if envelope.schema_digest() != &contract.schema_digest() {
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::CodecContract,
+                    "producer-unavailable digest does not match the installed producer contract",
+                ));
+            }
+            let reason = decode_producer_failure(envelope.payload()).map_err(|error| {
+                ingress_error(
+                    InboundProducerDispatchErrorKind::CodecContract,
+                    error.to_string(),
+                )
+            })?;
+            let route = producer_instance_route.expect("kind and identity were validated together");
+            match self.dedupe.admit_producer_instance(
+                envelope.channel_id(),
+                route,
+                envelope_fingerprint(&envelope),
+            ) {
+                ContributionAdmission::DuplicateRetry => {
+                    drop(operation);
+                    return Ok(InboundProducerDispatchOutcome::Duplicate);
+                }
+                ContributionAdmission::Conflict => {
+                    drop(operation);
+                    return Err(ingress_error(
+                        InboundProducerDispatchErrorKind::ProducerContract,
+                        "producer-unavailable identity was replayed with different content",
+                    ));
+                }
+                ContributionAdmission::ResourceLimit => {
+                    drop(operation);
+                    return Err(ingress_error(
+                        InboundProducerDispatchErrorKind::ResourceLimit,
+                        "runtime filter producer-instance dedupe set is at its per-channel resource ceiling",
+                    ));
+                }
+                ContributionAdmission::Fresh => {}
+            }
+            let action = producer
+                .channel
+                .fail_instance(producer_binding_id, fragment_instance_id, reason)
+                .map_err(map_producer_error)?;
+            let outcome = action.outcome();
+            drop(operation);
+            self.dispatcher
+                .dispatch(envelope.channel_id(), action)
+                .map_err(map_producer_error)?;
+            return Ok(dispatch_outcome(outcome));
+        }
+
+        let route = contribution_route.expect("contribution kinds require contribution identity");
 
         let local_partition_count = envelope
             .producer_open()
@@ -186,7 +261,6 @@ impl RuntimeFilterService {
             })?
             .local_partition_count()
             .get();
-        let contract = producer.inbound_contract();
         let contribution = match envelope.kind() {
             RuntimeFilterEnvelopeKind::Contribution => {
                 let expectation = contribution_expectation(
@@ -253,12 +327,19 @@ impl RuntimeFilterService {
         // conflicting replay. The content witness is the encoded contribution payload;
         // for a `ProducerClosed` (empty payload) it collapses to the empty-payload digest,
         // so its retries are absorbed too.
-        let content_digest: [u8; 32] = Sha256::digest(envelope.payload()).into();
+        let content_digest = envelope_fingerprint(&envelope);
         match self
             .dedupe
             .admit_contribution(envelope.channel_id(), route, content_digest)
         {
-            ContributionAdmission::Fresh | ContributionAdmission::Conflict => {}
+            ContributionAdmission::Fresh => {}
+            ContributionAdmission::Conflict => {
+                drop(operation);
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::ProducerContract,
+                    "producer contribution identity was replayed with different content",
+                ));
+            }
             ContributionAdmission::DuplicateRetry => {
                 drop(operation);
                 return Ok(InboundProducerDispatchOutcome::Duplicate);
@@ -276,7 +357,7 @@ impl RuntimeFilterService {
         }
 
         let OpenedProducer { handle, outcome } = self
-            .open_producer_locked(
+            .open_inbound_core_locked(
                 &installed,
                 route.producer_binding_id(),
                 route.fragment_instance_id(),
@@ -337,6 +418,32 @@ impl RuntimeFilterService {
         .map_err(map_producer_error)?;
         Ok(dispatch_outcome(outcome))
     }
+}
+
+fn envelope_fingerprint(envelope: &RuntimeFilterEnvelope) -> [u8; 32] {
+    let kind_tag = match envelope.kind() {
+        RuntimeFilterEnvelopeKind::Contribution => 1,
+        RuntimeFilterEnvelopeKind::Artifact => 2,
+        RuntimeFilterEnvelopeKind::ProducerClosed => 3,
+        RuntimeFilterEnvelopeKind::ProducerUnavailable => 4,
+        RuntimeFilterEnvelopeKind::Unavailable => 5,
+        RuntimeFilterEnvelopeKind::Ack => 6,
+        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => 7,
+        RuntimeFilterEnvelopeKind::DegradedLogical => 8,
+        RuntimeFilterEnvelopeKind::FinalArtifact => 9,
+    };
+    let mut digest = Sha256::new();
+    digest.update([kind_tag]);
+    match envelope.producer_open() {
+        Some(open) => {
+            digest.update([1]);
+            digest.update(open.local_partition_count().get().to_le_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update(envelope.schema_digest());
+    digest.update(envelope.payload());
+    digest.finalize().into()
 }
 
 fn contribution_expectation<'a>(
@@ -423,6 +530,7 @@ mod tests {
         ContributionCodecExpectation, RuntimeFilterContribution, encode_contribution,
         semantic_contribution_bytes,
     };
+    use crate::runtime_filter::codec::producer::encode_producer_failure;
     use crate::runtime_filter::core::channel::{ProducerIngressCoreSnapshot, RuntimeFilterChannel};
     use crate::runtime_filter::core::coverage::CoverageProgress;
     use crate::runtime_filter::core::state::TerminalProgress;
@@ -456,7 +564,8 @@ mod tests {
         comparator_digest_for_test,
     };
     use crate::runtime_filter::port::producer::{
-        InstallOutcome, RuntimeContractViolation, RuntimeContractViolationKind,
+        InstallOutcome, ProducerFailureReason, RuntimeContractViolation,
+        RuntimeContractViolationKind,
     };
     use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
     use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
@@ -465,8 +574,8 @@ mod tests {
     };
     use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
     use crate::runtime_filter::port::transport::{
-        ContributionRouteIdentity, ProducerOpenMetadata, RuntimeFilterEnvelope,
-        RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
+        ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
+        RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
     };
     use crate::runtime_filter::port::transport::{
         RuntimeFilterAcceptStatus, RuntimeFilterEnvelopeIngress,
@@ -2279,6 +2388,27 @@ mod tests {
             self.envelope(RuntimeFilterEnvelopeKind::ProducerClosed, 1, Vec::new())
         }
 
+        fn producer_unavailable(&self, reason: ProducerFailureReason) -> RuntimeFilterEnvelope {
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
+                self.transport_query_id,
+                self.channel_id,
+                self.deployment_epoch,
+                RuntimeFilterRouteIdentity::producer_instance(
+                    ProducerInstanceRouteIdentity::try_new(
+                        self.binding_id,
+                        self.fragment_instance_id,
+                    )
+                    .unwrap(),
+                ),
+                None,
+                None,
+                &self.schema_digest,
+                encode_producer_failure(reason),
+            )
+            .unwrap()
+        }
+
         fn ingress_snapshot(&self) -> ProducerIngressCoreSnapshot {
             self.channel
                 .producer_ingress_core_snapshot(self.binding_id, self.fragment_instance_id)
@@ -2288,7 +2418,7 @@ mod tests {
     // Part A: the whole chain (remote finst union -> RoleRouter authority -> installed expectation
     // -> open -> dispatch) forms one path through the production query-scoped ingress.
     #[test]
-    fn remote_producer_ingress_compiler_fixture_reaches_aggregator_core() {
+    fn authorized_inbound_can_open_remote_fragment_instance_core() {
         let fixture = ThreeBackendIngressFixture::compile_and_install();
         assert_ne!(fixture.source_participant, fixture.aggregator_participant);
 
@@ -2319,6 +2449,45 @@ mod tests {
             fixture.ingress_snapshot().terminal_progress,
             TerminalProgress::Satisfied,
             "the producer-close must advance the producer instance to Satisfied"
+        );
+    }
+
+    #[test]
+    fn remote_producer_unavailable_is_authorized_and_fails_instance() {
+        let fixture = ThreeBackendIngressFixture::compile_and_install();
+        assert_eq!(fixture.ingress_snapshot().local_partition_count, None);
+
+        let first = fixture
+            .ingress
+            .accept(fixture.producer_unavailable(ProducerFailureReason::ExecutionFailed));
+        assert_eq!(first.accept_status(), RuntimeFilterAcceptStatus::Accepted);
+        let failed = fixture.ingress_snapshot();
+        assert_eq!(
+            failed.local_partition_count, None,
+            "unavailable must never open a stream"
+        );
+        assert_eq!(failed.terminal_progress, TerminalProgress::Impossible);
+
+        let duplicate = fixture
+            .ingress
+            .accept(fixture.producer_unavailable(ProducerFailureReason::ExecutionFailed));
+        assert_eq!(
+            duplicate.accept_status(),
+            RuntimeFilterAcceptStatus::Duplicate
+        );
+
+        let conflict = fixture
+            .ingress
+            .accept(fixture.producer_unavailable(ProducerFailureReason::UpstreamUnavailable));
+        assert_eq!(
+            conflict.accept_status(),
+            RuntimeFilterAcceptStatus::Rejected
+        );
+        assert!(
+            conflict
+                .rejection_reason()
+                .is_some_and(|reason| reason.contains("different content")),
+            "same producer-instance identity with another reason must be rejected"
         );
     }
 
@@ -2814,7 +2983,7 @@ mod tests {
                     PRODUCER_B_BINDING,
                     PRODUCER_B_FINST,
                     0,
-                    0,
+                    1,
                     1,
                     digest_b,
                 ))

@@ -1248,7 +1248,6 @@ fn merge_all_write_commits(
         write_commit: merged_commit,
         write_abort,
         fragment_profiles: Vec::new(),
-        runtime_filter_dormancy_proof: None,
     })
 }
 
@@ -1388,7 +1387,6 @@ fn no_mutation_write_result() -> CoordinatedQueryResult {
         write_commit: None,
         write_abort: None,
         fragment_profiles: Vec::new(),
-        runtime_filter_dormancy_proof: None,
     }
 }
 
@@ -1801,7 +1799,6 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             write_commit: Some(write_commit),
             write_abort: None,
             fragment_profiles: Vec::new(),
-            runtime_filter_dormancy_proof: None,
         })
     }
 
@@ -3521,7 +3518,6 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
                     write_commit: Some(rewrite.write_commit),
                     write_abort: None,
                     fragment_profiles: Vec::new(),
-                    runtime_filter_dormancy_proof: None,
                 });
                 *self
                     .cow_update_rewrite

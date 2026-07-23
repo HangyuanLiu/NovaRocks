@@ -33,7 +33,7 @@ use crate::runtime_filter::port::support::{
     ArtifactRetainedBudget, ArtifactRetention, ArtifactScratchBudget, ArtifactScratchReservation,
     RuntimeFilterMemoryAccount,
 };
-use crate::runtime_filter::port::value_domain::LogicalSnapshot;
+use crate::runtime_filter::port::value_domain::{LogicalSnapshot, MembershipValues};
 
 use self::bitset::BitsetPlan;
 use self::bloom::BloomHashContract;
@@ -126,6 +126,7 @@ pub(crate) struct MaterializationPlan<'a> {
     leaf_encoded_bytes: usize,
     payload_bytes: usize,
     max_scalar_frame_bytes: usize,
+    resident_index_bytes: usize,
 }
 
 pub(crate) enum MaterializationAdmission<'a> {
@@ -272,6 +273,14 @@ impl Materializer {
             }
         };
 
+        let resident_index_bytes = match (&selected, values) {
+            (SelectedRepresentation::ValueSet, MembershipValues::Utf8(values)) => values
+                .len()
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or(MaterializationError::SizeOverflow)?,
+            _ => 0,
+        };
+
         Ok(MaterializationPlan {
             snapshot,
             schema,
@@ -282,6 +291,7 @@ impl Materializer {
             leaf_encoded_bytes,
             payload_bytes,
             max_scalar_frame_bytes,
+            resident_index_bytes,
         })
     }
 
@@ -366,9 +376,18 @@ impl Materializer {
         )
         .map_err(|_| PreparationFailure::ResourceLimit)?;
 
-        let artifact_footprint =
+        let artifact_footprint = if matches!(
+            plan.selected,
+            SelectedRepresentation::ValueSet | SelectedRepresentation::EmptyDomain
+        ) {
+            PhysicalArtifact::accounted_indexed_resident_component_bytes(
+                plan.leaf_encoded_bytes,
+                plan.resident_index_bytes,
+            )
+        } else {
             PhysicalArtifact::accounted_resident_component_bytes(plan.leaf_encoded_bytes)
-                .map_err(|_| PreparationFailure::Internal)?;
+        }
+        .map_err(|_| PreparationFailure::Internal)?;
         let bundle_footprint = ArtifactBundle::accounted_resident_overhead(&plan.profile, 1)
             .map_err(|_| PreparationFailure::Internal)?;
         let total_footprint = artifact_footprint
@@ -465,18 +484,42 @@ impl Materializer {
         if encoded.len() != plan.leaf_encoded_bytes {
             return Err(());
         }
+        let membership_index = if matches!(kind, ArtifactKind::ValueSet | ArtifactKind::EmptyDomain)
+        {
+            let index_plan = codec::inspect_membership_index(&encoded).map_err(|_| ())?;
+            if index_plan.heap_bytes().map_err(|_| ())? != plan.resident_index_bytes {
+                return Err(());
+            }
+            Some(codec::build_membership_index(&encoded, &index_plan).map_err(|_| ())?)
+        } else {
+            None
+        };
         let encoded: Arc<[u8]> = encoded.into();
         let artifact = Arc::new(
-            PhysicalArtifact::from_shared_retained_bytes(
-                kind,
-                plan.schema.digest(),
-                plan.snapshot.version(),
-                contains_null,
-                encoded,
-                artifact_footprint,
-                total_footprint,
-                retained.clone(),
-            )
+            if let Some(index) = membership_index {
+                PhysicalArtifact::from_shared_indexed_retained_bytes(
+                    kind,
+                    plan.schema.digest(),
+                    plan.snapshot.version(),
+                    contains_null,
+                    encoded,
+                    index,
+                    artifact_footprint,
+                    total_footprint,
+                    retained.clone(),
+                )
+            } else {
+                PhysicalArtifact::from_shared_retained_bytes(
+                    kind,
+                    plan.schema.digest(),
+                    plan.snapshot.version(),
+                    contains_null,
+                    encoded,
+                    artifact_footprint,
+                    total_footprint,
+                    retained.clone(),
+                )
+            }
             .map_err(|_| ())?,
         );
         let bundle = ArtifactBundle::new_retained(
@@ -519,7 +562,7 @@ mod tests {
     use super::bloom::BloomHashContract;
     use super::{
         MaterializationError, MaterializationOutcome, Materializer, SelectedRepresentation,
-        validate_membership_kind,
+        UnavailableReason, validate_membership_kind,
     };
 
     struct UnlimitedMemory;
@@ -915,6 +958,72 @@ mod tests {
         assert_eq!(budget.retained_bytes(), total_footprint);
         drop(artifact);
         assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn utf8_membership_index_is_included_in_local_exact_admission() {
+        let values = MembershipValues::utf8(["a", "bb", "ccc"]);
+        let schema =
+            ArtifactMembershipSchema::new(&DataType::Utf8, NullSemantics::NeverMatches).unwrap();
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let make_plan = || {
+            Materializer::plan(
+                Arc::new(LogicalSnapshot::first(
+                    ChannelId::new(12),
+                    ReducedMembershipDomain::new(values.clone(), false),
+                    Default::default(),
+                )),
+                &schema,
+                &profile,
+                MaterializationPolicy::for_test(),
+                4096,
+            )
+            .unwrap()
+        };
+        let plan = make_plan();
+        assert_eq!(plan.resident_index_bytes, 3 * std::mem::size_of::<usize>());
+        let total = PhysicalArtifact::accounted_indexed_resident_component_bytes(
+            plan.leaf_encoded_bytes,
+            plan.resident_index_bytes,
+        )
+        .unwrap()
+        .checked_add(ArtifactBundle::accounted_resident_overhead(&profile, 1).unwrap())
+        .unwrap();
+        assert!(matches!(
+            Materializer::materialize(
+                plan,
+                Arc::new(ArtifactRetainedBudget::new(total - 1)),
+                Arc::new(ArtifactScratchBudget::new(1 << 16, 1 << 16).unwrap()),
+                Arc::new(UnlimitedMemory),
+            ),
+            MaterializationOutcome::Unavailable(UnavailableReason::ResourceLimit)
+        ));
+
+        let budget = Arc::new(ArtifactRetainedBudget::new(total));
+        let MaterializationOutcome::Published(bundle) = Materializer::materialize(
+            make_plan(),
+            budget.clone(),
+            Arc::new(ArtifactScratchBudget::new(1 << 16, 1 << 16).unwrap()),
+            Arc::new(UnlimitedMemory),
+        ) else {
+            panic!("exact local indexed footprint must publish");
+        };
+        assert_eq!(budget.retained_bytes(), total);
+        assert_eq!(
+            bundle.artifacts()[0]
+                .1
+                .membership_index()
+                .unwrap()
+                .heap_bytes()
+                .unwrap(),
+            3 * std::mem::size_of::<usize>()
+        );
+        drop(bundle);
         assert_eq!(budget.retained_bytes(), 0);
     }
 

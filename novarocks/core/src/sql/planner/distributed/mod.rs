@@ -20,6 +20,7 @@ pub(crate) mod build;
 mod fragment;
 mod node;
 pub(crate) mod output;
+mod runtime_filter_progress;
 mod seal;
 pub(crate) mod topology;
 mod validation;
@@ -39,6 +40,9 @@ pub(crate) use node::{
 };
 pub(crate) use output::{
     FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeOutputCatalog, WriteContractCatalog,
+};
+pub(crate) use runtime_filter_progress::{
+    RuntimeFilterJoinProgressCatalog, RuntimeFilterJoinProgressCertificate,
 };
 pub(crate) use seal::DistributedPlan;
 

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -65,6 +67,23 @@ pub(crate) struct StandaloneExecStateReporter {
     normal: ReportQueue,
     priority: ReportQueue,
     started: OnceLock<()>,
+    #[cfg(test)]
+    priority_pending: Mutex<HashMap<(QueryId, UniqueId), usize>>,
+}
+
+#[cfg(test)]
+struct FinalReportPendingGuard<'a> {
+    reporter: &'a StandaloneExecStateReporter,
+    query_id: QueryId,
+    finst_id: UniqueId,
+}
+
+#[cfg(test)]
+impl Drop for FinalReportPendingGuard<'_> {
+    fn drop(&mut self) {
+        self.reporter
+            .decrement_final_report_pending(self.query_id, self.finst_id);
+    }
 }
 
 impl StandaloneExecStateReporter {
@@ -74,6 +93,8 @@ impl StandaloneExecStateReporter {
             normal: ReportQueue::default(),
             priority: ReportQueue::default(),
             started: OnceLock::new(),
+            #[cfg(test)]
+            priority_pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +142,8 @@ impl StandaloneExecStateReporter {
             .state
             .lock()
             .expect("standalone priority report queue lock");
+        #[cfg(test)]
+        self.increment_final_report_pending(task.query_id, task.finst_id);
         guard.push_back(task);
         self.priority.cv.notify_one();
     }
@@ -131,6 +154,57 @@ impl StandaloneExecStateReporter {
 
     fn take_final_task(&self) -> StandaloneExecStateReportTask {
         take_task(&self.priority, "standalone priority report queue wait")
+    }
+
+    #[cfg(test)]
+    fn increment_final_report_pending(&self, query_id: QueryId, finst_id: UniqueId) {
+        let mut pending = self
+            .priority_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending.entry((query_id, finst_id)).or_default() += 1;
+    }
+
+    #[cfg(test)]
+    fn decrement_final_report_pending(&self, query_id: QueryId, finst_id: UniqueId) {
+        let mut pending = self
+            .priority_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let scope = (query_id, finst_id);
+        let remove = match pending.get_mut(&scope) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            pending.remove(&scope);
+        }
+    }
+
+    #[cfg(test)]
+    fn final_report_pending_guard(
+        &self,
+        task: &StandaloneExecStateReportTask,
+    ) -> FinalReportPendingGuard<'_> {
+        FinalReportPendingGuard {
+            reporter: self,
+            query_id: task.query_id,
+            finst_id: task.finst_id,
+        }
+    }
+
+    #[cfg(test)]
+    fn final_reports_pending_for_test(&self, query_id: QueryId, finst_id: UniqueId) -> usize {
+        self.priority_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(query_id, finst_id))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -148,6 +222,11 @@ pub(crate) fn enqueue_final(task: StandaloneExecStateReportTask) {
     let reporter = StandaloneExecStateReporter::shared();
     reporter.ensure_started();
     reporter.enqueue_final(task);
+}
+
+#[cfg(test)]
+pub(crate) fn final_reports_pending_for_test(query_id: QueryId, finst_id: UniqueId) -> usize {
+    StandaloneExecStateReporter::shared().final_reports_pending_for_test(query_id, finst_id)
 }
 
 fn take_task(queue: &ReportQueue, wait_msg: &'static str) -> StandaloneExecStateReportTask {
@@ -178,12 +257,15 @@ fn run_normal_worker(reporter: &'static StandaloneExecStateReporter) {
 fn run_priority_worker(reporter: &'static StandaloneExecStateReporter) {
     loop {
         let task = reporter.take_final_task();
-        if let Err(err) = send_final_report_with(
+        #[cfg(test)]
+        let _pending = reporter.final_report_pending_guard(&task);
+        let result = send_final_report_with(
             task.clone(),
             reporter.settings.final_retry_limit,
             send_once,
             std::thread::sleep,
-        ) {
+        );
+        if let Err(err) = result {
             handle_final_report_exhaustion_with(
                 task,
                 err,
@@ -449,6 +531,64 @@ mod tests {
     }
 
     #[test]
+    fn final_report_pending_counts_are_scoped_by_query_and_fragment_instance() {
+        let reporter = StandaloneExecStateReporter::new();
+        let first = test_task_with_ids(QueryId { hi: 1, lo: 2 }, UniqueId { hi: 3, lo: 4 });
+        let same_query_other_finst = test_task_with_ids(first.query_id, UniqueId { hi: 5, lo: 6 });
+        let other_query_same_finst = test_task_with_ids(QueryId { hi: 7, lo: 8 }, first.finst_id);
+
+        reporter.enqueue_final(first.clone());
+        reporter.enqueue_final(first.clone());
+        reporter.enqueue_final(same_query_other_finst.clone());
+        reporter.enqueue_final(other_query_same_finst.clone());
+
+        assert_eq!(
+            reporter.final_reports_pending_for_test(first.query_id, first.finst_id),
+            2
+        );
+        assert_eq!(
+            reporter.final_reports_pending_for_test(
+                same_query_other_finst.query_id,
+                same_query_other_finst.finst_id,
+            ),
+            1
+        );
+        assert_eq!(
+            reporter.final_reports_pending_for_test(
+                other_query_same_finst.query_id,
+                other_query_same_finst.finst_id,
+            ),
+            1
+        );
+        assert_eq!(
+            reporter.final_reports_pending_for_test(
+                QueryId { hi: 99, lo: 100 },
+                UniqueId { hi: 101, lo: 102 },
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn final_report_pending_guard_decrements_its_scope_during_unwind() {
+        let reporter = StandaloneExecStateReporter::new();
+        let task = test_task();
+        reporter.enqueue_final(task.clone());
+        let task = reporter.take_final_task();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pending = reporter.final_report_pending_guard(&task);
+            panic!("simulated final report worker panic");
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(
+            reporter.final_reports_pending_for_test(task.query_id, task.finst_id),
+            0
+        );
+    }
+
+    #[test]
     fn report_socket_addr_accepts_ipv4_literal() {
         let addr = standalone_report_socket_addr(&runtime_endpoint("127.0.0.1", 18040))
             .expect("ipv4 literal");
@@ -508,13 +648,23 @@ mod tests {
     }
 
     fn test_task() -> StandaloneExecStateReportTask {
+        test_task_with_ids(QueryId { hi: 501, lo: 601 }, UniqueId { hi: 301, lo: 401 })
+    }
+
+    fn test_task_with_ids(query_id: QueryId, finst_id: UniqueId) -> StandaloneExecStateReportTask {
         StandaloneExecStateReportTask {
-            finst_id: UniqueId { hi: 301, lo: 401 },
-            query_id: QueryId { hi: 501, lo: 601 },
+            finst_id,
+            query_id,
             coord: runtime_endpoint("127.0.0.1", 18040),
             report: proto::novarocks::ExecStatusReport {
-                query_id: Some(proto::common::UniqueId { hi: 501, lo: 601 }),
-                fragment_instance_id: Some(proto::common::UniqueId { hi: 301, lo: 401 }),
+                query_id: Some(proto::common::UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                }),
+                fragment_instance_id: Some(proto::common::UniqueId {
+                    hi: finst_id.hi,
+                    lo: finst_id.lo,
+                }),
                 backend_num: 0,
                 status: Some(proto::common::Status {
                     code: 0,

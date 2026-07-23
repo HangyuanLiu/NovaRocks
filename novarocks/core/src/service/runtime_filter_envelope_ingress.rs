@@ -97,7 +97,9 @@ impl RuntimeFilterEnvelopeIngress for QueryScopedRuntimeFilterEnvelopeIngress {
         // Dispatch by direction: producer-contribution kinds to the producer path,
         // artifact-delivery kinds to the consumer path, `Ack` (M3) rejected here.
         match envelope.kind() {
-            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
+            RuntimeFilterEnvelopeKind::Contribution
+            | RuntimeFilterEnvelopeKind::ProducerClosed
+            | RuntimeFilterEnvelopeKind::ProducerUnavailable => {
                 ingress_result_for_producer_dispatch(service.dispatch_inbound_producer(envelope))
             }
             RuntimeFilterEnvelopeKind::Artifact

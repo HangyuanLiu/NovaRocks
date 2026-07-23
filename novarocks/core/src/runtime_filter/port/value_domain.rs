@@ -199,7 +199,7 @@ impl CanonicalOutput for VecOutput<'_> {
 pub(crate) struct CanonicalF32(u32);
 
 impl CanonicalF32 {
-    fn new(value: f32) -> Self {
+    pub(crate) fn new(value: f32) -> Self {
         let bits = if value == 0.0 {
             0
         } else if value.is_nan() {
@@ -227,7 +227,7 @@ impl PartialOrd for CanonicalF32 {
 pub(crate) struct CanonicalF64(u64);
 
 impl CanonicalF64 {
-    fn new(value: f64) -> Self {
+    pub(crate) fn new(value: f64) -> Self {
         let bits = if value == 0.0 {
             0
         } else if value.is_nan() {
@@ -287,6 +287,104 @@ impl MembershipValues {
     membership_constructor!(int64, Int64, i64);
     membership_constructor!(large_int, LargeInt, i128);
     membership_constructor!(date32, Date32, i32);
+
+    pub(crate) fn boolean_set(values: BTreeSet<bool>) -> Self {
+        Self::Boolean(values)
+    }
+    pub(crate) fn int8_set(values: BTreeSet<i8>) -> Self {
+        Self::Int8(values)
+    }
+    pub(crate) fn int16_set(values: BTreeSet<i16>) -> Self {
+        Self::Int16(values)
+    }
+    pub(crate) fn int32_set(values: BTreeSet<i32>) -> Self {
+        Self::Int32(values)
+    }
+    pub(crate) fn int64_set(values: BTreeSet<i64>) -> Self {
+        Self::Int64(values)
+    }
+    pub(crate) fn large_int_set(values: BTreeSet<i128>) -> Self {
+        Self::LargeInt(values)
+    }
+    pub(crate) fn date32_set(values: BTreeSet<i32>) -> Self {
+        Self::Date32(values)
+    }
+    pub(crate) fn float32_set(values: BTreeSet<CanonicalF32>) -> Self {
+        Self::Float32(values)
+    }
+    pub(crate) fn float64_set(values: BTreeSet<CanonicalF64>) -> Self {
+        Self::Float64(values)
+    }
+    pub(crate) fn utf8_set(values: BTreeSet<String>) -> Self {
+        Self::Utf8(values)
+    }
+
+    pub(crate) fn timestamp_set(
+        unit: TimeUnit,
+        timezone: Option<Arc<str>>,
+        values: BTreeSet<i64>,
+    ) -> Self {
+        Self::Timestamp {
+            unit,
+            timezone,
+            values,
+        }
+    }
+
+    pub(crate) fn decimal128_set(
+        precision: u8,
+        scale: i8,
+        values: BTreeSet<i128>,
+    ) -> Result<Self, Decimal128ValidationError> {
+        Self::validate_decimal128_values(precision, scale, &values)?;
+        Ok(Self::Decimal128(Decimal128Values::new_validated(
+            precision, scale, values,
+        )))
+    }
+
+    pub(crate) fn validate_decimal128_values(
+        precision: u8,
+        scale: i8,
+        values: &BTreeSet<i128>,
+    ) -> Result<(), Decimal128ValidationError> {
+        if precision == 0 || precision > DECIMAL128_MAX_PRECISION {
+            return Err(Decimal128ValidationError::InvalidPrecision { precision });
+        }
+        if !decimal_scale_is_valid(precision, scale) {
+            return Err(Decimal128ValidationError::InvalidScale { precision, scale });
+        }
+        let exclusive_bound = 10_i128
+            .checked_pow(u32::from(precision))
+            .expect("Decimal128 maximum precision fits i128");
+        if let Some(value) = values
+            .iter()
+            .copied()
+            .find(|value| *value <= -exclusive_bound || *value >= exclusive_bound)
+        {
+            return Err(Decimal128ValidationError::ValueOutOfRange { precision, value });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_decimal128_scalar(
+        precision: u8,
+        scale: i8,
+        value: i128,
+    ) -> Result<(), Decimal128ValidationError> {
+        if precision == 0 || precision > DECIMAL128_MAX_PRECISION {
+            return Err(Decimal128ValidationError::InvalidPrecision { precision });
+        }
+        if !decimal_scale_is_valid(precision, scale) {
+            return Err(Decimal128ValidationError::InvalidScale { precision, scale });
+        }
+        let exclusive_bound = 10_i128
+            .checked_pow(u32::from(precision))
+            .expect("Decimal128 maximum precision fits i128");
+        if value <= -exclusive_bound || value >= exclusive_bound {
+            return Err(Decimal128ValidationError::ValueOutOfRange { precision, value });
+        }
+        Ok(())
+    }
 
     pub(crate) fn float32(values: impl IntoIterator<Item = f32>) -> Self {
         Self::Float32(values.into_iter().map(CanonicalF32::new).collect())

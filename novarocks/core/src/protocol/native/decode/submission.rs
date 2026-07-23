@@ -23,8 +23,8 @@ use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-    FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterApplyPoint, RuntimeFilterContract,
-    RuntimeFilterDormancyFact, RuntimeFilterDormancyRole, RuntimeFilterId, ScanSourceContract,
+    FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract, RuntimeFilterId,
+    ScanSourceContract,
 };
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
@@ -35,7 +35,6 @@ use crate::runtime::fragment::instance::{
 };
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
 use super::instance::{NativeSubmissionMetadata, decode_scan_range_params_at};
 use super::{
@@ -71,7 +70,6 @@ struct DecodedNativeInstanceParts {
     pipeline_dop: NonZeroUsize,
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
     exchange_inputs: ExchangeInputAssignments,
-    runtime_filter_params: RuntimeFilterParams,
     report_endpoint: Option<crate::runtime::endpoint::RuntimeEndpoint>,
     typed_result_sink: bool,
 }
@@ -130,7 +128,7 @@ pub(crate) fn decode_fragment_submission(
     )?;
     let decoded_root =
         decode_node_with_runtime_filters(root, &mut arena, &context, &mut runtime_filter_ledger)?;
-    let dormancy_facts = runtime_filter_ledger.finish()?;
+    runtime_filter_ledger.finish()?;
     let plan = ExecPlan {
         arena,
         root: decoded_root.node,
@@ -139,7 +137,7 @@ pub(crate) fn decode_fragment_submission(
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let exchange_inputs = decode_exchange_contracts(root, root_path)?;
-    let runtime_filters = decode_runtime_filter_contract(fragment, &dormancy_facts)?;
+    let runtime_filters = decode_runtime_filter_contract(fragment)?;
     let program = FragmentProgram::new(
         plan,
         sink_spec,
@@ -153,14 +151,13 @@ pub(crate) fn decode_fragment_submission(
         instance_parts.report_endpoint.clone(),
         instance_parts.typed_result_sink,
     );
-    let instance = FragmentInstanceSpec::new(
+    let instance = FragmentInstanceSpec::new_native(
         FragmentContractVersion::CURRENT,
         instance_parts.query_id,
         instance_parts.fragment_instance_id,
         scan_assignments,
         instance_parts.exchange_inputs,
         sink_assignment,
-        instance_parts.runtime_filter_params,
         FragmentRuntimeOptions::new(
             instance_parts.query_options,
             None,
@@ -284,13 +281,6 @@ fn decode_instance_parts(
                 ),
             )
         })?;
-    if src.runtime_filter_params.is_some() {
-        return Err(NativeFragmentDecodeError::unsupported(
-            path.clone().field("runtime_filter_params"),
-            "legacy runtime_filter_params are unsupported with native runtime-filter bindings",
-        ));
-    }
-
     let mut scan_keys = src.per_node_scan_ranges.keys().copied().collect::<Vec<_>>();
     scan_keys.sort_unstable();
     let mut raw_scan_ranges = BTreeMap::new();
@@ -345,7 +335,6 @@ fn decode_instance_parts(
         pipeline_dop,
         raw_scan_ranges,
         exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-        runtime_filter_params: RuntimeFilterParams::default(),
         report_endpoint,
         typed_result_sink: src.typed_result_sink,
     })
@@ -433,7 +422,6 @@ fn decode_exchange_contracts(
 
 fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
-    dormancy_facts: &[super::NativeRuntimeFilterDormancyFact],
 ) -> Result<RuntimeFilterContract, NativeFragmentDecodeError> {
     let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
     let table = fragment.runtime_filter_bindings.as_ref().ok_or_else(|| {
@@ -466,30 +454,7 @@ fn decode_runtime_filter_contract(
             }
         }
     }
-    let dormancy_facts = dormancy_facts
-        .iter()
-        .map(|fact| RuntimeFilterDormancyFact {
-            binding_id: fact.binding_id,
-            channel_id: fact.channel_id,
-            node_id: fact.node_id,
-            apply_point: match fact.apply_point {
-                super::DecodedApplyPoint::NodeInput => RuntimeFilterApplyPoint::NodeInput,
-                super::DecodedApplyPoint::NodeOutput => RuntimeFilterApplyPoint::NodeOutput,
-            },
-            role: match fact.role {
-                super::NativeRuntimeFilterDormancyRole::Producer => {
-                    RuntimeFilterDormancyRole::Producer
-                }
-                super::NativeRuntimeFilterDormancyRole::Consumer => {
-                    RuntimeFilterDormancyRole::Consumer
-                }
-            },
-        })
-        .collect();
-    Ok(
-        RuntimeFilterContract::new(build_filters, probe_filters)
-            .with_dormancy_facts(dormancy_facts),
-    )
+    Ok(RuntimeFilterContract::new(build_filters, probe_filters))
 }
 
 fn unique_id_from_native(src: &crate::proto::common::UniqueId) -> UniqueId {
@@ -681,21 +646,6 @@ mod tests {
             "instance_params.per_node_scan_ranges[\"11\"].ranges[0].range"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
-    }
-
-    #[test]
-    fn legacy_runtime_filter_params_are_rejected_at_typed_path() {
-        let mut params = instance_params(UniqueId { hi: 71, lo: 72 }, UniqueId { hi: 81, lo: 82 });
-        params.runtime_filter_params = Some(novarocks::RuntimeFilterParams::default());
-
-        let error = decode_fragment_submission(&values_noop_fragment(), &params)
-            .expect_err("legacy runtime-filter params must fail");
-        let protocol = error.protocol().expect("protocol error");
-        assert_eq!(
-            protocol.path().to_string(),
-            "instance_params.runtime_filter_params"
-        );
-        assert_eq!(protocol.kind(), ProtocolErrorKind::Unsupported);
     }
 
     #[test]

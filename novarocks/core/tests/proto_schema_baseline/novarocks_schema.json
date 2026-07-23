@@ -2132,6 +2132,26 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterProducerInstanceRouteIdentity": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "producer_binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "fragment_instance_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterProducerOpenMetadata": {
           "fields": {
             "1": {
@@ -2253,6 +2273,13 @@
               "number": 2,
               "name": "delivery",
               "type_name": "RuntimeFilterDeliveryRouteIdentity",
+              "label": "singular",
+              "oneof": "value"
+            },
+            "3": {
+              "number": 3,
+              "name": "producer_instance",
+              "type_name": "RuntimeFilterProducerInstanceRouteIdentity",
               "label": "singular",
               "oneof": "value"
             }
@@ -2570,6 +2597,10 @@
             {
               "number": 8,
               "name": "RUNTIME_FILTER_ENVELOPE_KIND_FINAL_ARTIFACT"
+            },
+            {
+              "number": 9,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_PRODUCER_UNAVAILABLE"
             }
           ],
           "reserved_numbers": [],

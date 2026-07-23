@@ -163,7 +163,9 @@ impl RoleRouter {
         }
         if !matches!(
             kind,
-            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
+            RuntimeFilterEnvelopeKind::Contribution
+                | RuntimeFilterEnvelopeKind::ProducerClosed
+                | RuntimeFilterEnvelopeKind::ProducerUnavailable
         ) || !edge.allowed_kinds().contains(&kind)
         {
             return Err(RuntimeFilterRouteContractError::ForbiddenInboundKind {
@@ -588,14 +590,15 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_delivery_can_authorize_a_to_aggregator_edge() {
+    fn producer_unavailable_can_authorize_a_to_aggregator_edge() {
         let router = router(2);
         let edge = router
-            .authorize_delivery(
+            .authorize_contribution(
                 DeploymentEpoch::new(9),
                 ChannelId::new(1),
-                RouteEdgeId::new(2),
-                RuntimeFilterEnvelopeKind::Unavailable,
+                BindingId::new(10),
+                finst(7),
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
             )
             .unwrap();
 

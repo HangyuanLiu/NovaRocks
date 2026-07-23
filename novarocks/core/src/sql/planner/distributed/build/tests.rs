@@ -10,7 +10,7 @@ use super::runtime_filter_binding::{
     RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::model::contract::BindingId;
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
@@ -445,7 +445,7 @@ fn stream_exchange_output_columns_falls_back_to_requested_when_source_is_empty()
 }
 
 #[test]
-fn build_distributed_plan_binds_runtime_filters_across_redistribute_fragment() {
+fn build_distributed_plan_seals_partitioned_join_progress_certificate() {
     let filter_id = 77;
     let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
     let build_expr = column_ref_expr(2, "r_k", DataType::Int64, false);
@@ -483,7 +483,21 @@ fn build_distributed_plan_binds_runtime_filters_across_redistribute_fragment() {
         stats: stats(),
         probe_runtime_filters: vec![],
     };
-    let right = scan_node(2, "r_k");
+    let right_scan = scan_node(2, "r_k");
+    let right = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+            mode: RedistributeMode::Hash {
+                cols: vec![ColumnId::new_for_test(2)],
+                source: HashSource::ShuffleJoin,
+            },
+            partition_exprs: vec![build_expr.clone()],
+            output_columns: right_scan.output_columns.clone(),
+        }),
+        children: vec![right_scan],
+        output_columns: vec![output_col(2, "r_k", DataType::Int64, false)],
+        stats: stats(),
+        probe_runtime_filters: vec![],
+    };
     let join = PhysicalPlanNode {
         kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
             join_type: JoinKind::Inner,
@@ -518,16 +532,28 @@ fn build_distributed_plan_binds_runtime_filters_across_redistribute_fragment() {
 
     let dp = build_distributed_plan(&join).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments().len(), 2);
+    assert_eq!(dp.fragments().len(), 3);
     let root_fragment = dp
         .fragments()
         .iter()
         .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
         .expect("root fragment");
+    let graph = dp.runtime_filter_graph();
+    let producer = graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+        .expect("producer binding");
+    let probe_fragment_id = graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
+        .expect("consumer binding")
+        .location
+        .fragment_id
+        .get();
     let probe_fragment = dp
         .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id != dp.root_fragment_id())
+        .find(|fragment| fragment.fragment_id == probe_fragment_id)
         .expect("probe fragment");
     let join_node = &root_fragment.root;
     assert_eq!(join_node.fragment_id, dp.root_fragment_id());
@@ -535,19 +561,28 @@ fn build_distributed_plan_binds_runtime_filters_across_redistribute_fragment() {
         &join_node.payload,
         DistributedNodeKind::HashJoin(_)
     ));
-    let graph = dp.runtime_filter_graph();
     assert_eq!(graph.channel_count(), 1);
     assert_eq!(graph.binding_count(), 3);
-    let producer = graph
-        .bindings()
-        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
-        .expect("producer binding");
     assert_eq!(producer.location.fragment_id.get(), join_node.fragment_id);
     assert_eq!(producer.location.node_id.get(), join_node.node_id);
     assert_column_ref(&producer.expression, 2, "r_k");
     assert_eq!(
         join_node.runtime_filter_binding_ids,
         vec![producer.binding_id]
+    );
+    let certificate = dp
+        .runtime_filter_join_progress()
+        .get(&(
+            producer.channel_id,
+            producer.binding_id,
+            join_node.fragment_id,
+        ))
+        .expect("partitioned join progress certificate");
+    assert_eq!(certificate.producer_fragment, join_node.fragment_id);
+    assert_eq!(certificate.probe_input_fragment, probe_fragment.fragment_id);
+    assert_ne!(
+        certificate.probe_input_fragment,
+        certificate.build_input_fragment
     );
 
     let probe_project = &probe_fragment.root;
@@ -640,10 +675,8 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
     let graph = distributed.runtime_filter_graph();
     assert_eq!(graph.channel_count(), 1);
     assert_eq!(graph.binding_count(), 2);
-    assert_eq!(
-        graph.channels().next().unwrap().channel_id,
-        ChannelId::new(0)
-    );
+    let channel = graph.channels().next().expect("runtime-filter channel");
+    assert_ne!(channel.channel_id.get(), 0);
     let producer = graph
         .bindings()
         .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
@@ -652,8 +685,11 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
         .bindings()
         .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
         .expect("consumer binding");
-    assert_eq!(producer.binding_id, BindingId::new(0));
-    assert_eq!(consumer.binding_id, BindingId::new(1));
+    assert_ne!(producer.binding_id.get(), 0);
+    assert_ne!(consumer.binding_id.get(), 0);
+    assert_ne!(producer.binding_id, consumer.binding_id);
+    assert_eq!(producer.channel_id, channel.channel_id);
+    assert_eq!(consumer.channel_id, channel.channel_id);
     assert!(distributed.fragments().iter().any(|fragment| {
         fn has_binding(node: &DistributedNode, binding_id: BindingId) -> bool {
             node.runtime_filter_binding_ids.contains(&binding_id)

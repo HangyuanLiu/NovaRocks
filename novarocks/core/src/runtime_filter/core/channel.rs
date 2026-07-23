@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -2459,14 +2459,47 @@ impl RuntimeFilterChannel {
     }
 
     pub(crate) fn cancel(&self) -> ChannelAction {
+        self.cancel_with_pending_producer_failures(&BTreeSet::new())
+    }
+
+    /// Cancels the channel and, under the same core-state linearization point,
+    /// records failures for the still-pending producer instances owned by this
+    /// service participant. Keeping these events in the returned action makes
+    /// them obey the channel dispatch FIFO together with `ChannelCancelled`.
+    pub(crate) fn cancel_with_pending_producer_failures(
+        &self,
+        locally_owned: &BTreeSet<(BindingId, UniqueId)>,
+    ) -> ChannelAction {
         let mut state = self.state.lock().unwrap();
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
             return ChannelAction::None;
         }
+        let mut events = state
+            .producers
+            .iter()
+            .flat_map(|(binding_id, producer)| {
+                producer
+                    .instances
+                    .iter()
+                    .filter_map(move |(finst_id, instance)| {
+                        let identity = (*binding_id, *finst_id);
+                        (instance.progress == TerminalProgress::Pending
+                            && locally_owned.contains(&identity))
+                        .then(|| RuntimeFilterEvent::ProducerInstanceFailed {
+                            identity: ProducerEventIdentity::new(
+                                self.event_identity,
+                                *binding_id,
+                                *finst_id,
+                            ),
+                            reason: ProducerFailureReason::Cancelled,
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
         let release_after_unlock = self.detach_collecting_state(&mut state);
-        let events = vec![RuntimeFilterEvent::ChannelCancelled {
+        events.push(RuntimeFilterEvent::ChannelCancelled {
             identity: self.event_identity,
-        }];
+        });
         let order = next_dispatch_order(&mut state);
         state.terminal = ChannelTerminal::Cancelled {
             order,
