@@ -14,9 +14,9 @@ PLAN FRAGMENT 0
 Explain String
 TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 0, node = 5, expr = (rk)
-    consumer binding 1, fragment = 0, node = 1, expr = (CAST(cost_model_explain_t.k AS Int64)), activation = BlockingSnapshot
+  runtime filter channel 1
+    producer binding 1, fragment = 0, node = 5, expr = (rk)
+    consumer binding 2, fragment = 0, node = 1, expr = (CAST(cost_model_explain_t.k AS Int64)), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED

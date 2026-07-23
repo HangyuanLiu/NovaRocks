@@ -1,11 +1,11 @@
 Explain String
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 1, node = 4, expr = (b.k)
-    consumer binding 1, fragment = 1, node = 1, expr = (a.k), activation = BlockingSnapshot
   runtime filter channel 1
-    producer binding 2, fragment = 1, node = 7, expr = (s.s)
-    consumer binding 3, fragment = 1, node = 1, expr = (a.k), activation = BlockingSnapshot
+    producer binding 1, fragment = 1, node = 4, expr = (b.k)
+    consumer binding 2, fragment = 1, node = 1, expr = (a.k), activation = BlockingSnapshot
+  runtime filter channel 2
+    producer binding 3, fragment = 1, node = 7, expr = (s.s)
+    consumer binding 4, fragment = 1, node = 1, expr = (a.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED

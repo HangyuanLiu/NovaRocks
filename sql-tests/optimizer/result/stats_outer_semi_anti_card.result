@@ -24,9 +24,9 @@ PLAN FRAGMENT 1
 -- query 10
 Explain String
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 0, node = 4, expr = (r.k)
-    consumer binding 1, fragment = 0, node = 1, expr = (l.k), activation = BlockingSnapshot
+  runtime filter channel 1
+    producer binding 1, fragment = 0, node = 4, expr = (r.k)
+    consumer binding 2, fragment = 0, node = 1, expr = (l.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED

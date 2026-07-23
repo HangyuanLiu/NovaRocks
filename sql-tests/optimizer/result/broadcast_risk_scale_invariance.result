@@ -5,9 +5,9 @@ cnt
 -- query 18
 Explain String
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 1, node = 4, expr = (b.k)
-    consumer binding 1, fragment = 1, node = 1, expr = (p.k), activation = BlockingSnapshot
+  runtime filter channel 1
+    producer binding 1, fragment = 1, node = 4, expr = (b.k)
+    consumer binding 2, fragment = 1, node = 1, expr = (p.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -49,9 +49,9 @@ cnt
 -- query 20
 Explain String
 RUNTIME FILTER GRAPH
-  runtime filter channel 0
-    producer binding 0, fragment = 1, node = 4, expr = (b.k)
-    consumer binding 1, fragment = 1, node = 1, expr = (p.k), activation = BlockingSnapshot
+  runtime filter channel 1
+    producer binding 1, fragment = 1, node = 4, expr = (b.k)
+    consumer binding 2, fragment = 1, node = 1, expr = (p.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
