@@ -63,7 +63,6 @@ pub enum ScanMorsel {
         tablet_id: i64,
     },
     JdbcSingle,
-    Exchange,
     IcebergMetadata {
         index: usize,
     },
@@ -109,7 +108,6 @@ impl ScanMorsel {
                 format!("starrocks_range_index={index} tablet_id={tablet_id}")
             }
             ScanMorsel::JdbcSingle => "jdbc_single".to_string(),
-            ScanMorsel::Exchange => "exchange".to_string(),
             ScanMorsel::IcebergMetadata { index } => {
                 format!("iceberg_metadata_index={index}")
             }
