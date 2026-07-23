@@ -19,17 +19,31 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
+use sha2::{Digest, Sha256};
+
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::BindingId;
-use crate::runtime_filter::port::final_domain::{
-    CompletionFenceAuthority, FinalDomainFreezeCapability, FrozenFinalDomainPayload,
-};
-use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
+use crate::runtime_filter::port::final_domain::{FinalDomainShard, RuntimeCompletionFenceContract};
+use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence, ProducerStreamId};
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
     RuntimeContractViolationKind, SubmitOutcome,
 };
 use crate::runtime_filter::port::value_domain::ValueDomainDelta;
+
+const COMPLETION_SET_DOMAIN: &[u8] = b"novarocks.runtime-filter.final-domain-completion-set";
+const COMPLETION_SET_VERSION: u16 = 1;
+const FROZEN_SET_DOMAIN: &[u8] = b"novarocks.runtime-filter.final-domain-frozen-set";
+const FROZEN_SET_VERSION: u16 = 1;
+const ISSUANCE_PERMIT_DOMAIN: &[u8] = b"novarocks.runtime-filter.final-domain-issuance-permit";
+const ISSUANCE_PERMIT_VERSION: u16 = 1;
+
+pub(crate) struct FinalDomainServiceIssuancePermit {
+    frozen_set_digest: [u8; 32],
+    stream: ProducerStreamId,
+    domain_fingerprint: [u8; 32],
+    binding_digest: [u8; 32],
+}
 
 pub(crate) struct FinalDomainCompletionSession {
     inner: Arc<FinalDomainCompletionSessionInner>,
@@ -79,7 +93,7 @@ struct FinalDomainCompletionSessionInner {
 
 struct FinalDomainCompletionState {
     lifecycle: FinalDomainCompletionLifecycle,
-    authority: Option<CompletionFenceAuthority>,
+    authority: Option<FinalDomainCompletionAuthority>,
     partitions: Vec<FinalDomainPartitionState>,
     fail_sent: bool,
 }
@@ -99,9 +113,171 @@ struct FinalDomainPartitionState {
     closed: bool,
 }
 
+struct FinalDomainCompletionAuthority {
+    contract: Arc<RuntimeCompletionFenceContract>,
+    binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+    partition_count: u32,
+    completion_set_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+struct FinalDomainFreezeCapability {
+    stream: ProducerStreamId,
+    completion_set_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+struct FrozenFinalDomainPayload {
+    stream: ProducerStreamId,
+    completion_set_digest: [u8; 32],
+    domain: ValueDomainDelta,
+}
+
+struct FrozenFinalDomainSet {
+    _proof_digest: [u8; 32],
+    shards: Vec<(PartitionId, FinalDomainShard)>,
+}
+
+impl FinalDomainCompletionAuthority {
+    fn new(
+        contract: Arc<RuntimeCompletionFenceContract>,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_count: u32,
+    ) -> Self {
+        let completion_set_digest = completion_set_digest(
+            contract.digest().bytes(),
+            binding_id,
+            fragment_instance_id,
+            partition_count,
+        );
+        Self {
+            contract,
+            binding_id,
+            fragment_instance_id,
+            partition_count,
+            completion_set_digest,
+        }
+    }
+
+    fn partition_capability(&self, partition_id: PartitionId) -> FinalDomainFreezeCapability {
+        FinalDomainFreezeCapability {
+            stream: ProducerStreamId::new(self.binding_id, self.fragment_instance_id, partition_id),
+            completion_set_digest: self.completion_set_digest,
+        }
+    }
+
+    fn freeze(
+        self,
+        payloads: Vec<FrozenFinalDomainPayload>,
+    ) -> Result<FrozenFinalDomainSet, RuntimeContractViolation> {
+        if payloads.len() != self.partition_count as usize {
+            return Err(violation(
+                RuntimeContractViolationKind::FinalDomainMissing,
+                "frozen final-domain payload set does not cover every declared partition",
+            ));
+        }
+        for (expected, payload) in payloads.iter().enumerate() {
+            if payload.completion_set_digest != self.completion_set_digest {
+                return Err(violation(
+                    RuntimeContractViolationKind::UnauthorizedFragmentInstance,
+                    "frozen final-domain payload belongs to a different completion set",
+                ));
+            }
+            if payload.stream.binding_id() != self.binding_id
+                || payload.stream.fragment_instance_id() != self.fragment_instance_id
+            {
+                return Err(violation(
+                    RuntimeContractViolationKind::UnauthorizedFragmentInstance,
+                    "frozen final-domain payload scope does not match the completion session",
+                ));
+            }
+            if payload.stream.partition_id().get() as usize != expected {
+                return Err(violation(
+                    RuntimeContractViolationKind::InvalidPartition,
+                    "frozen final-domain payload set is reordered, duplicated, or incomplete",
+                ));
+            }
+        }
+
+        let proof_digest = frozen_set_digest(self.completion_set_digest, &payloads);
+        let mut shards = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let partition_id = payload.stream.partition_id();
+            let permit = FinalDomainServiceIssuancePermit::new(
+                proof_digest,
+                payload.stream,
+                &payload.domain,
+            );
+            let shard = FinalDomainShard::issue_for_service(
+                permit,
+                &self.contract,
+                payload.stream,
+                ProducerSequence::new(0),
+                payload.domain,
+            )
+            .map_err(|error| {
+                violation(
+                    RuntimeContractViolationKind::TypeMismatch,
+                    error.to_string(),
+                )
+            })?;
+            shards.push((partition_id, shard));
+        }
+        Ok(FrozenFinalDomainSet {
+            _proof_digest: proof_digest,
+            shards,
+        })
+    }
+}
+
+impl FinalDomainServiceIssuancePermit {
+    fn new(
+        frozen_set_digest: [u8; 32],
+        stream: ProducerStreamId,
+        domain: &ValueDomainDelta,
+    ) -> Self {
+        let domain_fingerprint = domain.fingerprint().bytes();
+        let binding_digest = issuance_permit_digest(frozen_set_digest, stream, domain_fingerprint);
+        Self {
+            frozen_set_digest,
+            stream,
+            domain_fingerprint,
+            binding_digest,
+        }
+    }
+
+    pub(crate) fn authorizes(&self, stream: ProducerStreamId, domain: &ValueDomainDelta) -> bool {
+        let domain_fingerprint = domain.fingerprint().bytes();
+        self.stream == stream
+            && self.domain_fingerprint == domain_fingerprint
+            && self.binding_digest
+                == issuance_permit_digest(self.frozen_set_digest, stream, domain_fingerprint)
+    }
+}
+
+impl FinalDomainFreezeCapability {
+    fn seal(self, domain: ValueDomainDelta) -> FrozenFinalDomainPayload {
+        FrozenFinalDomainPayload {
+            stream: self.stream,
+            completion_set_digest: self.completion_set_digest,
+            domain,
+        }
+    }
+}
+
+impl FrozenFinalDomainSet {
+    fn into_shards(self) -> Vec<(PartitionId, FinalDomainShard)> {
+        self.shards
+    }
+}
+
 impl FinalDomainCompletionSession {
     pub(super) fn new(
-        authority: CompletionFenceAuthority,
+        contract: Arc<RuntimeCompletionFenceContract>,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
         producer: Arc<dyn FinalDomainProducerAdapter>,
         partition_count: u32,
     ) -> Result<Self, RuntimeContractViolation> {
@@ -111,10 +287,16 @@ impl FinalDomainCompletionSession {
                 "a final-domain completion session requires at least one partition",
             ));
         }
+        let authority = FinalDomainCompletionAuthority::new(
+            contract,
+            binding_id,
+            fragment_instance_id,
+            partition_count,
+        );
         let partitions = (0..partition_count)
             .map(|partition| FinalDomainPartitionState {
                 claimed: false,
-                capability: Some(authority.freeze_capability(PartitionId::new(partition))),
+                capability: Some(authority.partition_capability(PartitionId::new(partition))),
                 payload: None,
                 closed: false,
             })
@@ -388,42 +570,25 @@ impl FinalDomainCompletionSessionInner {
                 .collect::<Vec<_>>();
             (authority, payloads)
         };
-        let issuer = match authority.freeze(&payloads) {
-            Ok(issuer) => issuer,
+        let frozen = match authority.freeze(payloads) {
+            Ok(frozen) => frozen,
             Err(error) => {
-                let violation = violation(
-                    RuntimeContractViolationKind::TypeMismatch,
-                    error.to_string(),
-                );
-                let _ = self.fail_while_holding_operation(ProducerFailureReason::ExecutionFailed);
-                return Err(violation);
-            }
-        };
-        for payload in payloads {
-            let partition_id = payload.partition_id();
-            let shard = match issuer.issue(payload, ProducerSequence::new(0)) {
-                Ok(shard) => shard,
-                Err(error) => {
-                    let violation = violation(
-                        RuntimeContractViolationKind::TypeMismatch,
-                        error.to_string(),
-                    );
-                    let _ =
-                        self.fail_while_holding_operation(ProducerFailureReason::ExecutionFailed);
-                    return Err(violation);
-                }
-            };
-            if let Err(error) =
-                self.producer
-                    .complete(partition_id, ProducerSequence::new(0), shard)
-            {
                 let _ = self.fail_while_holding_operation(ProducerFailureReason::ExecutionFailed);
                 return Err(error);
             }
-            if let Err(error) = self
+        };
+        for (partition_id, shard) in frozen.into_shards() {
+            let complete = self
                 .producer
-                .close_partition(partition_id, ProducerSequence::new(1))
-            {
+                .complete(partition_id, ProducerSequence::new(0), shard);
+            if let Err(error) = require_non_terminal_submit(complete) {
+                let _ = self.fail_while_holding_operation(ProducerFailureReason::ExecutionFailed);
+                return Err(error);
+            }
+            let close = self
+                .producer
+                .close_partition(partition_id, ProducerSequence::new(1));
+            if let Err(error) = require_non_terminal_submit(close) {
                 let _ = self.fail_while_holding_operation(ProducerFailureReason::ExecutionFailed);
                 return Err(error);
             }
@@ -462,6 +627,68 @@ impl Drop for FinalDomainPartitionCommitter {
     }
 }
 
+fn completion_set_digest(
+    contract_digest: [u8; 32],
+    binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+    partition_count: u32,
+) -> [u8; 32] {
+    let mut canonical = Sha256::new();
+    canonical.update(COMPLETION_SET_DOMAIN);
+    canonical.update(COMPLETION_SET_VERSION.to_be_bytes());
+    canonical.update(contract_digest);
+    canonical.update(binding_id.get().to_be_bytes());
+    canonical.update(fragment_instance_id.hi.to_be_bytes());
+    canonical.update(fragment_instance_id.lo.to_be_bytes());
+    canonical.update(partition_count.to_be_bytes());
+    canonical.finalize().into()
+}
+
+fn frozen_set_digest(
+    completion_set_digest: [u8; 32],
+    payloads: &[FrozenFinalDomainPayload],
+) -> [u8; 32] {
+    let mut canonical = Sha256::new();
+    canonical.update(FROZEN_SET_DOMAIN);
+    canonical.update(FROZEN_SET_VERSION.to_be_bytes());
+    canonical.update(completion_set_digest);
+    canonical.update((payloads.len() as u64).to_be_bytes());
+    for payload in payloads {
+        canonical.update(payload.stream.partition_id().get().to_be_bytes());
+        canonical.update(payload.domain.fingerprint().bytes());
+    }
+    canonical.finalize().into()
+}
+
+fn issuance_permit_digest(
+    frozen_set_digest: [u8; 32],
+    stream: ProducerStreamId,
+    domain_fingerprint: [u8; 32],
+) -> [u8; 32] {
+    let mut canonical = Sha256::new();
+    canonical.update(ISSUANCE_PERMIT_DOMAIN);
+    canonical.update(ISSUANCE_PERMIT_VERSION.to_be_bytes());
+    canonical.update(frozen_set_digest);
+    canonical.update(stream.binding_id().get().to_be_bytes());
+    canonical.update(stream.fragment_instance_id().hi.to_be_bytes());
+    canonical.update(stream.fragment_instance_id().lo.to_be_bytes());
+    canonical.update(stream.partition_id().get().to_be_bytes());
+    canonical.update(domain_fingerprint);
+    canonical.finalize().into()
+}
+
+fn require_non_terminal_submit(
+    result: Result<SubmitOutcome, RuntimeContractViolation>,
+) -> Result<SubmitOutcome, RuntimeContractViolation> {
+    match result? {
+        SubmitOutcome::TerminalNoop => Err(violation(
+            RuntimeContractViolationKind::ServiceUnavailable,
+            "final-domain producer became terminal during completion issuance",
+        )),
+        outcome => Ok(outcome),
+    }
+}
+
 fn violation(
     kind: RuntimeContractViolationKind,
     detail: impl Into<String>,
@@ -487,6 +714,7 @@ fn session_already_open() -> RuntimeContractViolation {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use arrow::datatypes::DataType;
 
@@ -495,13 +723,20 @@ mod tests {
         BindingId, ChannelId, CompletionFenceKind, NullSemantics,
     };
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
     use crate::runtime_filter::port::final_domain::{
-        CompletionFenceAuthority, FinalDomainShard, RuntimeCompletionFenceContract,
+        FinalDomainError, FinalDomainShard, RuntimeCompletionFenceContract,
     };
     use crate::runtime_filter::port::identity::{DeploymentEpoch, PartitionId, ProducerSequence};
     use crate::runtime_filter::port::producer::{
         FinalDomainProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
         RuntimeContractViolationKind, SubmitOutcome,
+    };
+    use crate::runtime_filter::port::subscription::{
+        LivePollOutcome, LiveTerminal, SubscriptionKind, UnavailableReason,
+    };
+    use crate::runtime_filter::port::support::{
+        MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
     use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
 
@@ -521,6 +756,50 @@ mod tests {
         calls: Mutex<Vec<AdapterCall>>,
         complete_calls: AtomicUsize,
         fail_complete_call: Option<usize>,
+    }
+
+    #[derive(Default)]
+    struct RecordingEvents(Mutex<Vec<RuntimeFilterEvent>>);
+
+    impl RuntimeFilterEventSink for RecordingEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    struct FixedClock(Instant);
+
+    impl RuntimeFilterClock for FixedClock {
+        fn now(&self) -> Instant {
+            self.0
+        }
+    }
+
+    struct RejectNthReservation {
+        call: AtomicUsize,
+        reject_at: usize,
+    }
+
+    impl RejectNthReservation {
+        fn new(reject_at: usize) -> Self {
+            Self {
+                call: AtomicUsize::new(0),
+                reject_at,
+            }
+        }
+    }
+
+    impl RuntimeFilterMemoryAccount for RejectNthReservation {
+        fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
+            let call = self.call.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.reject_at {
+                Err(MemoryAccountError::CapacityExceeded)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn release(&self, _bytes: usize) {}
     }
 
     impl RecordingAdapter {
@@ -579,10 +858,10 @@ mod tests {
         }
     }
 
-    fn authority() -> CompletionFenceAuthority {
+    fn contract() -> Arc<RuntimeCompletionFenceContract> {
         let schema =
             ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NullSafeEqual).unwrap();
-        let contract = Arc::new(
+        Arc::new(
             RuntimeCompletionFenceContract::try_from_install(
                 UniqueId { hi: 1, lo: 2 },
                 DeploymentEpoch::new(3),
@@ -591,8 +870,7 @@ mod tests {
                 &schema,
             )
             .unwrap(),
-        );
-        CompletionFenceAuthority::try_new(contract, BINDING, INSTANCE).unwrap()
+        )
     }
 
     fn domain(value: i64) -> ValueDomainDelta {
@@ -606,7 +884,14 @@ mod tests {
         let adapter = Arc::new(RecordingAdapter::new(fail_complete_call));
         let typed: Arc<dyn FinalDomainProducerAdapter> = adapter.clone();
         (
-            FinalDomainCompletionSession::new(authority(), typed, partition_count).unwrap(),
+            FinalDomainCompletionSession::new(
+                contract(),
+                BINDING,
+                INSTANCE,
+                typed,
+                partition_count,
+            )
+            .unwrap(),
             adapter,
         )
     }
@@ -660,6 +945,129 @@ mod tests {
                 AdapterCall::Complete(PartitionId::new(1), ProducerSequence::new(0)),
                 AdapterCall::Close(PartitionId::new(1), ProducerSequence::new(1)),
             ]
+        );
+    }
+
+    #[test]
+    fn production_signing_api_is_service_exclusive() {
+        let port_source = include_str!("../port/final_domain.rs");
+        let service_source = include_str!("mod.rs");
+        let completion_source = include_str!("final_domain_completion.rs");
+
+        assert!(port_source.contains(
+            "#[cfg(test)]\n#[derive(Debug)]\npub(crate) struct CompletionFenceAuthority"
+        ));
+        assert!(
+            !port_source
+                .contains("#[derive(Clone, Debug)]\npub(crate) struct CompletionFenceAuthority")
+        );
+        assert!(!port_source.contains("pub(crate) struct FinalDomainFreezeCapability"));
+        assert!(!port_source.contains("pub(crate) struct FrozenFinalDomainPayload"));
+        assert!(!port_source.contains("pub(crate) struct FrozenFinalDomainIssuer"));
+        assert!(!port_source.contains("pub(crate) fn freeze_capability"));
+        assert!(service_source.contains("mod final_domain_completion;"));
+        assert!(!service_source.contains("pub mod final_domain_completion;"));
+        assert!(completion_source.contains("pub(crate) struct FinalDomainServiceIssuancePermit"));
+        let public_key_field = ["pub(crate) frozen_", "set_digest: [u8; 32]"].concat();
+        assert!(!completion_source.contains(&public_key_field));
+    }
+
+    #[test]
+    fn completion_proof_rejects_empty_and_duplicate_partition_sets() {
+        assert!(
+            FinalDomainCompletionAuthority::new(contract(), BINDING, INSTANCE, 2)
+                .freeze(Vec::new())
+                .is_err()
+        );
+
+        let authority = FinalDomainCompletionAuthority::new(contract(), BINDING, INSTANCE, 2);
+        let subset = authority
+            .partition_capability(PartitionId::new(0))
+            .seal(domain(10));
+        assert!(
+            FinalDomainCompletionAuthority::new(contract(), BINDING, INSTANCE, 2)
+                .freeze(vec![subset])
+                .is_err()
+        );
+
+        let authority = FinalDomainCompletionAuthority::new(contract(), BINDING, INSTANCE, 2);
+        let duplicate_0 = authority
+            .partition_capability(PartitionId::new(0))
+            .seal(domain(10));
+        let replayed_0 = authority
+            .partition_capability(PartitionId::new(0))
+            .seal(domain(11));
+        assert!(authority.freeze(vec![duplicate_0, replayed_0]).is_err());
+
+        let first_authority = FinalDomainCompletionAuthority::new(contract(), BINDING, INSTANCE, 2);
+        let first_payloads = vec![
+            first_authority
+                .partition_capability(PartitionId::new(0))
+                .seal(domain(10)),
+            first_authority
+                .partition_capability(PartitionId::new(1))
+                .seal(domain(11)),
+        ];
+        let first = first_authority.freeze(first_payloads).unwrap();
+        let second_authority =
+            FinalDomainCompletionAuthority::new(contract(), BINDING, INSTANCE, 2);
+        let second_payloads = vec![
+            second_authority
+                .partition_capability(PartitionId::new(0))
+                .seal(domain(10)),
+            second_authority
+                .partition_capability(PartitionId::new(1))
+                .seal(domain(12)),
+        ];
+        let second = second_authority.freeze(second_payloads).unwrap();
+        assert_ne!(first._proof_digest, second._proof_digest);
+
+        let stream = ProducerStreamId::new(BINDING, INSTANCE, PartitionId::new(0));
+        let permitted_domain = domain(10);
+        let permit =
+            FinalDomainServiceIssuancePermit::new(first._proof_digest, stream, &permitted_domain);
+        assert!(permit.authorizes(stream, &permitted_domain));
+        assert!(!permit.authorizes(stream, &domain(99)));
+        assert!(!permit.authorizes(
+            ProducerStreamId::new(BINDING, INSTANCE, PartitionId::new(1)),
+            &permitted_domain,
+        ));
+
+        let mut forged =
+            FinalDomainServiceIssuancePermit::new(first._proof_digest, stream, &permitted_domain);
+        forged.binding_digest[0] ^= 1;
+        assert_eq!(
+            FinalDomainShard::issue_for_service(
+                forged,
+                &contract(),
+                stream,
+                ProducerSequence::new(0),
+                permitted_domain,
+            ),
+            Err(FinalDomainError::FrozenProofMismatch)
+        );
+    }
+
+    #[test]
+    fn all_shards_are_prevalidated_before_first_adapter_mutation() {
+        let (session, adapter) = session(2, None);
+        let mut partition_0 = session.partition(PartitionId::new(0)).unwrap();
+        let mut partition_1 = session.partition(PartitionId::new(1)).unwrap();
+
+        partition_0.seal(domain(10)).unwrap();
+        partition_1
+            .seal(ValueDomainDelta::new(
+                MembershipValues::utf8(["wrong-schema"]),
+                false,
+            ))
+            .unwrap();
+        partition_0.close().unwrap();
+        let error = partition_1.close().unwrap_err();
+
+        assert_eq!(error.kind(), RuntimeContractViolationKind::TypeMismatch);
+        assert_eq!(
+            adapter.calls(),
+            vec![AdapterCall::Fail(ProducerFailureReason::ExecutionFailed)]
         );
     }
 
@@ -754,7 +1162,32 @@ mod tests {
 
     #[test]
     fn nth_partition_submit_failure_stops_and_fails_without_materializing_subset() {
-        let (session, adapter) = session(3, Some(2));
+        let events = Arc::new(RecordingEvents::default());
+        // One accepted final shard consumes a temporary lease and then its retained
+        // reducer reservation. Reject call 3 to fail the second partition before
+        // any second-shard core mutation.
+        let memory = Arc::new(RejectNthReservation::new(3));
+        let service = Arc::new(super::super::RuntimeFilterService::new_with_dependencies(
+            UniqueId { hi: 0, lo: 0 },
+            Arc::new(FixedClock(Instant::now())),
+            events.clone(),
+            memory,
+        ));
+        service
+            .install(super::super::tests::compiled_fenced_final_install())
+            .unwrap();
+        let live = service
+            .subscribe(
+                BindingId::new(30),
+                UniqueId { hi: 70, lo: 10 },
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+            .into_live()
+            .unwrap();
+        let session = service
+            .open_final_aggregate_producer(BindingId::new(10), UniqueId { hi: 70, lo: 10 }, 3)
+            .unwrap();
         let mut partitions = [
             session.partition(PartitionId::new(0)).unwrap(),
             session.partition(PartitionId::new(1)).unwrap(),
@@ -772,14 +1205,31 @@ mod tests {
             error.kind(),
             RuntimeContractViolationKind::ServiceUnavailable
         );
+        assert!(live.snapshot().is_none());
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ResourceLimit)),
+            }
+        ));
+        let events = events.0.lock().unwrap();
         assert_eq!(
-            adapter.calls(),
-            vec![
-                AdapterCall::Complete(PartitionId::new(0), ProducerSequence::new(0)),
-                AdapterCall::Close(PartitionId::new(0), ProducerSequence::new(1)),
-                AdapterCall::Complete(PartitionId::new(1), ProducerSequence::new(0)),
-                AdapterCall::Fail(ProducerFailureReason::ExecutionFailed),
-            ]
+            events
+                .iter()
+                .filter(|event| matches!(event, RuntimeFilterEvent::ArtifactPublished { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeFilterEvent::FinalDomainShardAccepted { .. }
+                ))
+                .count(),
+            1
         );
     }
 }

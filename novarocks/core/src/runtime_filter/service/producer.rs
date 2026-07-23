@@ -30,7 +30,9 @@ use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::events::{
     RuntimeFilterEventIdentity, TransportRouteEventIdentity,
 };
-use crate::runtime_filter::port::final_domain::{CompletionFenceAuthority, FinalDomainShard};
+#[cfg(test)]
+use crate::runtime_filter::port::final_domain::CompletionFenceAuthority;
+use crate::runtime_filter::port::final_domain::FinalDomainShard;
 use crate::runtime_filter::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, ProducerStreamId, RuntimeFilterParticipantId,
 };
@@ -821,7 +823,7 @@ pub(super) struct ServiceProducerAdapter {
     dispatcher: Arc<ActionDispatcher>,
     final_domain_authorized: bool,
     #[cfg(test)]
-    final_domain_authority: Option<CompletionFenceAuthority>,
+    final_domain_authority: Mutex<Option<CompletionFenceAuthority>>,
     #[cfg(test)]
     before_dispatch: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -834,7 +836,8 @@ impl ServiceProducerAdapter {
         fragment_instance_id: UniqueId,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
         dispatcher: Arc<ActionDispatcher>,
-        final_domain_authority: Option<CompletionFenceAuthority>,
+        final_domain_authorized: bool,
+        #[cfg(test)] final_domain_authority: Option<CompletionFenceAuthority>,
     ) -> Self {
         Self {
             channel_id,
@@ -843,9 +846,9 @@ impl ServiceProducerAdapter {
             fragment_instance_id,
             memory_account,
             dispatcher,
-            final_domain_authorized: final_domain_authority.is_some(),
+            final_domain_authorized,
             #[cfg(test)]
-            final_domain_authority,
+            final_domain_authority: Mutex::new(final_domain_authority),
             #[cfg(test)]
             before_dispatch: std::sync::Mutex::new(None),
         }
@@ -861,12 +864,16 @@ impl ServiceProducerAdapter {
         &self,
         open_drivers: u32,
     ) -> Option<crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer> {
-        self.final_domain_authority.clone().map(|authority| {
-            crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer::new(
-                authority,
-                open_drivers,
-            )
-        })
+        self.final_domain_authority
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .map(|authority| {
+                crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer::new(
+                    authority,
+                    open_drivers,
+                )
+            })
     }
 
     fn finish(

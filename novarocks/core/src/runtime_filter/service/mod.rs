@@ -87,7 +87,7 @@ pub(crate) use self::consumer_ingress::{
 use self::dedupe::IngressDedupe;
 use self::final_domain_completion::FinalDomainCompletionSessionRegistry;
 pub(crate) use self::final_domain_completion::{
-    FinalDomainCompletionSession, FinalDomainPartitionCommitter,
+    FinalDomainCompletionSession, FinalDomainPartitionCommitter, FinalDomainServiceIssuancePermit,
 };
 pub(crate) use self::inbound::{
     InboundProducerDispatchError, InboundProducerDispatchErrorKind, InboundProducerDispatchOutcome,
@@ -1809,7 +1809,7 @@ impl RuntimeFilterService {
                 "producer binding is not installed on this participant",
             )
         })?;
-        let authority = route
+        let contract = route
             .final_domain_seed
             .as_ref()
             .ok_or_else(|| {
@@ -1818,7 +1818,7 @@ impl RuntimeFilterService {
                     "installed producer route has no final-domain completion authority",
                 )
             })?
-            .derive(binding_id, fragment_instance_id)?;
+            .contract();
         let producer = self
             .open_producer_with_install_locked(
                 &installed,
@@ -1828,8 +1828,13 @@ impl RuntimeFilterService {
                 ProducerPortKind::FinalDomain,
             )?
             .into_final_domain()?;
-        let session =
-            FinalDomainCompletionSession::new(authority, producer, local_partition_count)?;
+        let session = FinalDomainCompletionSession::new(
+            contract,
+            binding_id,
+            fragment_instance_id,
+            producer,
+            local_partition_count,
+        )?;
         self.final_domain_completion_sessions.register(
             binding_id,
             fragment_instance_id,
@@ -2062,6 +2067,9 @@ impl RuntimeFilterService {
                 return Ok(OpenedProducer { handle, outcome });
             }
         }
+        let final_domain_authorized =
+            requested == ProducerPortKind::FinalDomain && route.final_domain_seed.is_some();
+        #[cfg(test)]
         let final_domain_authority = if requested == ProducerPortKind::FinalDomain {
             Some(
                 route
@@ -2073,7 +2081,7 @@ impl RuntimeFilterService {
                             "installed final-domain producer route is missing its private seed",
                         )
                     })?
-                    .derive(binding_id, fragment_instance_id)?,
+                    .derive_test_authority(binding_id, fragment_instance_id)?,
             )
         } else {
             None
@@ -2085,6 +2093,8 @@ impl RuntimeFilterService {
             fragment_instance_id,
             self.memory_account.clone(),
             self.dispatcher.clone(),
+            final_domain_authorized,
+            #[cfg(test)]
             final_domain_authority,
         ));
         #[cfg(test)]
