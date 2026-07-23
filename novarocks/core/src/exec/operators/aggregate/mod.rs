@@ -1797,6 +1797,9 @@ fn aggregate_topn_test_operator(
         output_chunk_schema: Arc::new(ChunkSchema::empty()),
         runtime_filter_execution: AggregateRuntimeFilterExecution::Native { topn_producers },
         native_topn_session_factory: Some(Arc::new(session_factory)),
+        final_domain_session: None,
+        final_domain_shape_error: None,
+        fail_output_construction: false,
     }
     .create(1, 0)
 }
