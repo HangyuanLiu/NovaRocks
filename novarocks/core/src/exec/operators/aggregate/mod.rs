@@ -28,6 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 pub(crate) mod final_domain;
+pub(crate) mod native_runtime_filter;
 pub(crate) mod streaming_sink;
 pub(crate) mod streaming_source;
 pub(crate) mod streaming_state;
@@ -45,13 +46,16 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-use crate::exec::node::aggregate::{
-    AggFunction, NativeAggregateTopNProducerSpec, TopNRuntimeFilterSpec,
-};
+#[cfg(feature = "compat")]
+use crate::exec::node::aggregate::TopNRuntimeFilterSpec;
+use crate::exec::node::aggregate::{AggFunction, NativeAggregateTopNProducerSpec};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+#[cfg(feature = "compat")]
 use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
+#[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
@@ -65,6 +69,9 @@ use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 use crate::runtime_filter::service::{FinalDomainCompletionSession, FinalDomainPartitionCommitter};
 
+use self::native_runtime_filter::{
+    AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
+};
 use self::topn_boundary::{
     AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
 };
@@ -382,6 +389,7 @@ pub struct AggregateProcessorFactory {
     direct_input: bool,
     output_chunk_schema: ChunkSchemaRef,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
+    native_topn_session_factory: Option<Arc<AggregateTopNProducerSessionFactory>>,
     final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
     final_domain_shape_error: Option<String>,
     #[cfg(test)]
@@ -410,8 +418,10 @@ impl AggregateProcessorFactory {
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
         topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+        runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
+        local_partition_count: i32,
         final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let name = if node_id >= 0 {
             format!("AGGREGATE (id={node_id})")
         } else {
@@ -458,7 +468,22 @@ impl AggregateProcessorFactory {
             }
             error
         });
-        Self {
+        let native_topn_session_factory = if topn_producers.is_empty() {
+            None
+        } else {
+            let context = runtime_filter_context.ok_or_else(|| {
+                format!(
+                    "native aggregate TopN producer binding_id={} requires an installed runtime-filter context",
+                    topn_producers[0].binding_id
+                )
+            })?;
+            Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(
+                &topn_producers,
+                &context,
+                local_partition_count,
+            )?))
+        };
+        Ok(Self {
             name,
             arena,
             group_by,
@@ -467,11 +492,12 @@ impl AggregateProcessorFactory {
             direct_input,
             output_chunk_schema,
             runtime_filter_execution: AggregateRuntimeFilterExecution::Native { topn_producers },
+            native_topn_session_factory,
             final_domain_session,
             final_domain_shape_error,
             #[cfg(test)]
             fail_output_construction: false,
-        }
+        })
     }
 
     #[cfg(feature = "compat")]
@@ -487,22 +513,29 @@ impl AggregateProcessorFactory {
         topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
     ) -> Self {
-        let mut factory = Self::new_native(
-            node_id,
+        let name = if node_id >= 0 {
+            format!("AGGREGATE (id={node_id})")
+        } else {
+            "AGGREGATE".to_string()
+        };
+        Self {
+            name,
             arena,
             group_by,
             functions,
             output_intermediate,
             direct_input,
             output_chunk_schema,
-            Vec::new(),
-            None,
-        );
-        factory.runtime_filter_execution = AggregateRuntimeFilterExecution::Compat {
-            topn_specs: topn_rf_specs,
-            hub: runtime_filter_hub,
-        };
-        factory
+            runtime_filter_execution: AggregateRuntimeFilterExecution::Compat {
+                topn_specs: topn_rf_specs,
+                hub: runtime_filter_hub,
+            },
+            native_topn_session_factory: None,
+            final_domain_session: None,
+            final_domain_shape_error: None,
+            #[cfg(test)]
+            fail_output_construction: false,
+        }
     }
 
     #[cfg(test)]
@@ -531,6 +564,14 @@ impl OperatorFactory for AggregateProcessorFactory {
         } else {
             None
         };
+        let (native_topn_session, native_topn_bind_error) =
+            match self.native_topn_session_factory.as_ref() {
+                Some(factory) => match factory.create_for_driver(dop, driver_id) {
+                    Ok(session) => (Some(session), None),
+                    Err(error) => (None, Some(error)),
+                },
+                None => (None, None),
+            };
         Box::new(AggregateProcessorOperator {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
@@ -558,6 +599,8 @@ impl OperatorFactory for AggregateProcessorFactory {
             runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
             topn_boundary_bindings: Vec::new(),
+            native_topn_session,
+            native_topn_bind_error,
             final_domain_committer,
             final_domain_session_bound: self.final_domain_session.is_some(),
             final_domain_bind_error,
@@ -612,6 +655,8 @@ struct AggregateProcessorOperator {
     runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
     topn_boundary_bindings: Vec<AggregateTopNBoundaryBinding>,
+    native_topn_session: Option<AggregateTopNProducerSession>,
+    native_topn_bind_error: Option<String>,
     final_domain_committer: Option<AggregateFinalDomainPartitionCommitter>,
     final_domain_session_bound: bool,
     final_domain_bind_error: Option<String>,
@@ -652,6 +697,24 @@ impl Operator for AggregateProcessorOperator {
             self.fail_final_domain();
         }
         result
+    }
+
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        if let Some(error) = self.native_topn_bind_error.take() {
+            return Err(error);
+        }
+        if let Some(session) = self.native_topn_session.as_mut() {
+            session.bind()?;
+        }
+        Ok(())
+    }
+
+    fn cancel(&mut self) {
+        let _ = self.fail_native_topn_producers(ProducerFailureReason::Cancelled);
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed)
     }
 
     fn is_finished(&self) -> bool {
@@ -709,7 +772,7 @@ impl AggregateProcessorOperator {
     }
 
     #[cfg(feature = "compat")]
-    fn try_publish_topn_runtime_filter(&mut self) {
+    fn try_publish_legacy_topn_runtime_filter(&mut self) {
         const PUBLISH_THRESHOLD: usize = 4096;
 
         let AggregateRuntimeFilterExecution::Compat { topn_specs, hub } =
@@ -751,6 +814,34 @@ impl AggregateProcessorOperator {
             hub.publish_min_max_filter(spec.filter_id, filter);
         }
         self.topn_rf_rows_since_publish = 0;
+    }
+
+    fn try_submit_native_topn_bound(&mut self) -> Result<(), String> {
+        const PUBLISH_THRESHOLD: usize = 4096;
+
+        let Some(session) = self.native_topn_session.as_mut() else {
+            return Ok(());
+        };
+        if self.topn_rf_rows_since_publish < PUBLISH_THRESHOLD {
+            return Ok(());
+        }
+        session.submit_pending(&mut self.topn_boundary_bindings)?;
+        self.topn_rf_rows_since_publish = 0;
+        Ok(())
+    }
+
+    fn finish_native_topn_producers(&mut self) -> Result<(), String> {
+        let Some(session) = self.native_topn_session.as_mut() else {
+            return Ok(());
+        };
+        session.finish(&mut self.topn_boundary_bindings)
+    }
+
+    fn fail_native_topn_producers(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+        let Some(session) = self.native_topn_session.as_mut() else {
+            return Ok(());
+        };
+        session.fail(reason)
     }
 
     fn process(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
@@ -1099,34 +1190,36 @@ impl ProcessorOperator for AggregateProcessorOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.finished {
-            return if self.final_domain_session_bound {
-                Err("aggregate received input after set_finishing".to_string())
-            } else {
-                Ok(())
-            };
-        }
-        if self.finishing {
-            return Err("aggregate received input after set_finishing".to_string());
-        }
-        if self.pending_output.is_some() {
-            return Err("aggregate received input while output buffer is full".to_string());
-        }
-        let num_rows = chunk.len();
-        let out = match self.process(chunk) {
-            Ok(out) => out,
-            Err(error) => {
-                self.fail_final_domain();
-                return Err(error);
+        let result = (|| {
+            if self.finished {
+                return if self.final_domain_session_bound {
+                    Err("aggregate received input after set_finishing".to_string())
+                } else {
+                    Ok(())
+                };
             }
-        };
-        if out.is_some() {
+            if self.finishing {
+                return Err("aggregate received input after set_finishing".to_string());
+            }
+            if self.pending_output.is_some() {
+                return Err("aggregate received input while output buffer is full".to_string());
+            }
+            let num_rows = chunk.len();
+            let out = self.process(chunk)?;
+            if out.is_some() {
+                return Err("aggregate produced output before finishing".to_string());
+            }
+            self.topn_rf_rows_since_publish += num_rows;
+            #[cfg(feature = "compat")]
+            self.try_publish_legacy_topn_runtime_filter();
+            self.try_submit_native_topn_bound()?;
+            Ok(())
+        })();
+        if result.is_err() {
             self.fail_final_domain();
-            return Err("aggregate produced output before finishing".to_string());
+            let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
         }
-        self.topn_rf_rows_since_publish += num_rows;
-        self.try_publish_topn_runtime_filter();
-        Ok(())
+        result
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
@@ -1138,40 +1231,40 @@ impl ProcessorOperator for AggregateProcessorOperator {
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finishing = true;
-        if self.finalized {
-            return Ok(());
-        }
-        if self.pending_output.is_some() {
-            return Ok(());
-        }
-        let out = match self.finish() {
-            Ok(out) => out,
-            Err(error) => {
-                self.fail_final_domain();
-                return Err(error);
+        let result = (|| {
+            if self.finished {
+                return Ok(());
             }
-        };
-        if self.final_domain_committer.is_some()
-            && let Err(error) = self.seal_final_domain()
-        {
+            self.finishing = true;
+            if self.finalized {
+                return Ok(());
+            }
+            if self.pending_output.is_some() {
+                return Ok(());
+            }
+            let out = self.finish()?;
+            self.finish_native_topn_producers()?;
+            if self.final_domain_committer.is_some() {
+                self.seal_final_domain()?;
+            }
+            self.release_finalized_state();
+            if failpoint::should_trigger(
+                failpoint::FORCE_RESET_AGGREGATOR_AFTER_STREAMING_SINK_FINISH,
+            ) {
+                self.reset_after_streaming_finish();
+            }
+            self.pending_output = out;
+            self.finalized = true;
+            if self.pending_output.is_none() {
+                self.finished = true;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
             self.fail_final_domain();
-            return Err(error);
+            let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
         }
-        self.release_finalized_state();
-        if failpoint::should_trigger(failpoint::FORCE_RESET_AGGREGATOR_AFTER_STREAMING_SINK_FINISH)
-        {
-            self.reset_after_streaming_finish();
-        }
-        self.pending_output = out;
-        self.finalized = true;
-        if self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+        result
     }
 
     fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
@@ -1476,9 +1569,6 @@ impl AggregateProcessorOperator {
         }
     }
 
-    #[cfg(not(feature = "compat"))]
-    fn try_publish_topn_runtime_filter(&mut self) {}
-
     fn expected_group_types(&self) -> Result<Vec<DataType>, String> {
         let mut types = Vec::with_capacity(self.group_by.len());
         for expr in &self.group_by {
@@ -1684,6 +1774,25 @@ impl Drop for AggregateProcessorOperator {
     fn drop(&mut self) {
         self.drop_group_states();
     }
+}
+
+#[cfg(test)]
+fn aggregate_topn_test_operator(
+    topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    session_factory: AggregateTopNProducerSessionFactory,
+) -> Box<dyn Operator> {
+    AggregateProcessorFactory {
+        name: "AGGREGATE_TOPN_TEST".to_string(),
+        arena: Arc::new(ExprArena::default()),
+        group_by: Vec::new(),
+        functions: Vec::new(),
+        output_intermediate: false,
+        direct_input: false,
+        output_chunk_schema: Arc::new(ChunkSchema::empty()),
+        runtime_filter_execution: AggregateRuntimeFilterExecution::Native { topn_producers },
+        native_topn_session_factory: Some(Arc::new(session_factory)),
+    }
+    .create(1, 0)
 }
 
 #[cfg(test)]
@@ -1920,8 +2029,11 @@ mod tests {
             true,
             output_schema,
             Vec::new(),
+            None,
+            1,
             session,
         )
+        .expect("build aggregate factory")
     }
 
     fn aggregate_factory_with_shape(
@@ -1949,8 +2061,11 @@ mod tests {
             direct_input,
             output_schema,
             Vec::new(),
+            None,
+            1,
             session,
         )
+        .expect("build aggregate factory")
     }
 
     #[cfg(feature = "compat")]

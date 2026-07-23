@@ -733,6 +733,18 @@ fn native_runtime_filter_context(
     }
 }
 
+fn native_aggregate_topn_context(
+    specs: &[NativeAggregateTopNProducerSpec],
+    execution: &PipelineRuntimeFilterExecution,
+) -> Result<Option<NativeRuntimeFilterExecutionContext>, String> {
+    let Some(spec) = specs.first() else {
+        return Ok(None);
+    };
+    native_runtime_filter_context(execution, spec.binding_id)
+        .cloned()
+        .map(Some)
+}
+
 fn validate_native_producer_specs(
     specs: &[crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec],
     ctx: &PipelineBuildContext,
@@ -1484,6 +1496,15 @@ fn build_pipeline_for_node(
                 let partial_agg_factory: Box<dyn OperatorFactory> =
                     match &ctx.runtime_filter_execution {
                         PipelineRuntimeFilterExecution::Native { .. } => {
+                            let topn_producers = aggregate_topn_producers_for_site(
+                                producer_site,
+                                AggregateTopNProducerSite::PartialAggregateProcessor,
+                                native_topn_producers,
+                            );
+                            let runtime_filter_context = native_aggregate_topn_context(
+                                &topn_producers,
+                                &ctx.runtime_filter_execution,
+                            )?;
                             Box::new(AggregateProcessorFactory::new_native(
                                 *node_id,
                                 Arc::clone(&ctx.arena),
@@ -1492,13 +1513,11 @@ fn build_pipeline_for_node(
                                 true,
                                 false,
                                 output_chunk_schema.clone(),
-                                aggregate_topn_producers_for_site(
-                                    producer_site,
-                                    AggregateTopNProducerSite::PartialAggregateProcessor,
-                                    native_topn_producers,
-                                ),
+                                topn_producers,
+                                runtime_filter_context,
+                                dop,
                                 None,
-                            ))
+                            )?)
                         }
                         #[cfg(feature = "compat")]
                         PipelineRuntimeFilterExecution::Compat { hub } => {
@@ -1539,6 +1558,15 @@ fn build_pipeline_for_node(
                 for func in &mut merge_functions {
                     func.input_is_intermediate = true;
                 }
+                let final_topn_producers = aggregate_topn_producers_for_site(
+                    producer_site,
+                    AggregateTopNProducerSite::FinalAggregateProcessor,
+                    native_topn_producers,
+                );
+                let final_runtime_filter_context = native_aggregate_topn_context(
+                    &final_topn_producers,
+                    &ctx.runtime_filter_execution,
+                )?;
                 build
                     .pipeline
                     .factories
@@ -1550,13 +1578,11 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
-                        aggregate_topn_producers_for_site(
-                            producer_site,
-                            AggregateTopNProducerSite::FinalAggregateProcessor,
-                            native_topn_producers,
-                        ),
+                        final_topn_producers,
+                        final_runtime_filter_context,
+                        build.pipeline.dop,
                         None,
-                    )));
+                    )?));
                 return Ok(build);
             }
 
@@ -1577,7 +1603,9 @@ fn build_pipeline_for_node(
                             output_chunk_schema.clone(),
                             Vec::new(),
                             None,
-                        ))
+                            dop,
+                            None,
+                        )?)
                     }
                     #[cfg(feature = "compat")]
                     PipelineRuntimeFilterExecution::Compat { hub } => {
@@ -1636,7 +1664,9 @@ fn build_pipeline_for_node(
                         output_chunk_schema.clone(),
                         Vec::new(),
                         None,
-                    )));
+                        downstream_dop,
+                        None,
+                    )?));
 
                 let mut extra_pipelines = build.extra_pipelines;
                 extra_pipelines.push(build.pipeline);
@@ -1673,6 +1703,15 @@ fn build_pipeline_for_node(
                 let streaming_state = AggregateStreamingState::new(dop.max(1) as usize);
                 let sink_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
                     PipelineRuntimeFilterExecution::Native { .. } => {
+                        let topn_producers = aggregate_topn_producers_for_site(
+                            producer_site,
+                            AggregateTopNProducerSite::StreamingAggregateSink,
+                            native_topn_producers,
+                        );
+                        let runtime_filter_context = native_aggregate_topn_context(
+                            &topn_producers,
+                            &ctx.runtime_filter_execution,
+                        )?;
                         Box::new(AggregateStreamingSinkFactory::new_native(
                             *node_id,
                             Arc::clone(&ctx.arena),
@@ -1681,12 +1720,10 @@ fn build_pipeline_for_node(
                             !*need_finalize,
                             output_chunk_schema.clone(),
                             streaming_state.clone(),
-                            aggregate_topn_producers_for_site(
-                                producer_site,
-                                AggregateTopNProducerSite::StreamingAggregateSink,
-                                native_topn_producers,
-                            ),
-                        ))
+                            topn_producers,
+                            runtime_filter_context,
+                            dop,
+                        )?)
                     }
                     #[cfg(feature = "compat")]
                     PipelineRuntimeFilterExecution::Compat { hub } => {
@@ -1732,6 +1769,15 @@ fn build_pipeline_for_node(
             )?;
             let agg_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
                 PipelineRuntimeFilterExecution::Native { .. } => {
+                    let topn_producers = aggregate_topn_producers_for_site(
+                        producer_site,
+                        AggregateTopNProducerSite::AggregateProcessor,
+                        native_topn_producers,
+                    );
+                    let runtime_filter_context = native_aggregate_topn_context(
+                        &topn_producers,
+                        &ctx.runtime_filter_execution,
+                    )?;
                     Box::new(AggregateProcessorFactory::new_native(
                         *node_id,
                         Arc::clone(&ctx.arena),
@@ -1740,13 +1786,11 @@ fn build_pipeline_for_node(
                         !*need_finalize,
                         false,
                         output_chunk_schema.clone(),
-                        aggregate_topn_producers_for_site(
-                            producer_site,
-                            AggregateTopNProducerSite::AggregateProcessor,
-                            native_topn_producers,
-                        ),
+                        topn_producers,
+                        runtime_filter_context,
+                        dop,
                         None,
-                    ))
+                    )?)
                 }
                 #[cfg(feature = "compat")]
                 PipelineRuntimeFilterExecution::Compat { hub } => {

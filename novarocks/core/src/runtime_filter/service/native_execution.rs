@@ -27,7 +27,8 @@ use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ConsumerAr
 use crate::runtime_filter::port::identity::DeploymentEpoch;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::producer::{
-    ProducerAdapter, ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
+    OrderedBoundProducerAdapter, ProducerAdapter, ProducerHandle, ProducerPortKind,
+    RuntimeContractViolation, RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{SubscriptionHandle, SubscriptionKind};
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
@@ -281,6 +282,10 @@ impl std::fmt::Debug for ResolvedNativeProducer {
 }
 
 impl ResolvedNativeProducer {
+    pub(crate) const fn kind(&self) -> ProducerPortKind {
+        self.kind
+    }
+
     pub(crate) const fn contract(&self) -> &InstalledNativeRuntimeFilterContract {
         &self.contract
     }
@@ -323,6 +328,32 @@ impl ResolvedNativeProducer {
                 self.kind,
             )?
             .into_membership()
+    }
+
+    pub(crate) fn open_ordered_bound(
+        &self,
+        local_partition_count: u32,
+    ) -> Result<Arc<dyn OrderedBoundProducerAdapter>, RuntimeContractViolation> {
+        if self.kind != ProducerPortKind::OrderedBound {
+            return Err(resolution_violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "resolved producer is not an ordered-bound producer",
+            ));
+        }
+        match self.service.open_producer(
+            self.binding_id,
+            self.fragment_instance_id,
+            local_partition_count,
+            self.kind,
+        )? {
+            ProducerHandle::OrderedBound(adapter) => Ok(adapter),
+            ProducerHandle::Membership(_)
+            | ProducerHandle::TopKSummary(_)
+            | ProducerHandle::FinalDomain(_) => Err(resolution_violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "resolved ordered-bound producer opened a different typed port",
+            )),
+        }
     }
 }
 

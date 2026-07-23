@@ -458,8 +458,11 @@ fn aggregate_factory(session: AggregateFinalDomainSessionBuilder) -> AggregatePr
         true,
         output_schema,
         Vec::new(),
+        None,
+        AGGREGATE_DOP,
         Some(session),
     )
+    .expect("build aggregate factory")
 }
 
 fn group_chunk(values: &[i64]) -> Chunk {
