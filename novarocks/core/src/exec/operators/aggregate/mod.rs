@@ -74,6 +74,7 @@ use self::native_runtime_filter::{
 };
 use self::topn_boundary::{
     AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
+    validate_topn_boundary_specs,
 };
 
 pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
@@ -427,6 +428,7 @@ impl AggregateProcessorFactory {
         } else {
             "AGGREGATE".to_string()
         };
+        validate_topn_boundary_specs(&topn_producers).map_err(|error| error.to_string())?;
         let final_domain_shape_error = final_domain_session.as_ref().and_then(|session| {
             let error = if output_intermediate || !direct_input {
                 Some(

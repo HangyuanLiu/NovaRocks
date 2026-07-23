@@ -68,6 +68,7 @@ use super::native_runtime_filter::{
 };
 use super::topn_boundary::{
     AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
+    validate_topn_boundary_specs,
 };
 
 /// Factory that constructs streaming aggregate sink operators for Phase 1 pre-aggregation.
@@ -113,6 +114,7 @@ impl AggregateStreamingSinkFactory {
         } else {
             "AGGREGATE_STREAMING_SINK".to_string()
         };
+        validate_topn_boundary_specs(&topn_producers).map_err(|error| error.to_string())?;
         let native_topn_session_factory = if topn_producers.is_empty() {
             None
         } else {

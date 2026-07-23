@@ -311,11 +311,12 @@ fn native_min_max_value_from_stats(
     stats: &crate::connector::iceberg::scan_model::IcebergColumnStats,
     data_type: &DataType,
 ) -> Option<scan_range::FilePruningMinMaxValue> {
-    let null_count = stats.null_count?;
+    let (value_count, null_count) = stats.value_count.zip(stats.null_count)?;
+    if value_count < 0 || null_count < 0 || null_count > value_count {
+        return None;
+    }
     let has_null = null_count > 0;
-    let all_null = stats
-        .value_count
-        .is_some_and(|value_count| value_count > 0 && value_count == null_count);
+    let all_null = value_count > 0 && value_count == null_count;
 
     match data_type {
         DataType::Boolean => {

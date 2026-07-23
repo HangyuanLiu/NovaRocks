@@ -1444,18 +1444,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn native_missing_null_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip() {
-        let mut file = crate::connector::iceberg::scan_model::IcebergDataFileInfo::for_test(
-            "s3://bucket/missing-null-count.parquet",
-            1024,
-            2,
-        );
+    fn assert_native_file_counts_keep_ordered_late_pruning_after_wire_roundtrip(
+        path: &str,
+        null_count: Option<i64>,
+        value_count: Option<i64>,
+    ) {
+        let mut file =
+            crate::connector::iceberg::scan_model::IcebergDataFileInfo::for_test(path, 1024, 2);
         file.column_stats = Some(HashMap::from([(
             "id".to_string(),
             crate::connector::iceberg::scan_model::IcebergColumnStats {
-                null_count: None,
-                value_count: Some(2),
+                null_count,
+                value_count,
                 column_size: None,
                 lower_bound: Some(90_i32.to_le_bytes().to_vec()),
                 upper_bound: Some(110_i32.to_le_bytes().to_vec()),
@@ -1617,7 +1617,36 @@ mod tests {
             op.late_prune_morsel_with_ordered_predicate(&morsel, SlotId::new(1), &predicate,)
                 .expect("native late prune"),
             crate::exec::node::scan::ScanMorselPruneDecision::Keep,
-            "missing null_count must not be encoded as explicit NoNulls"
+            "invalid or missing counts must not be encoded as explicit null-state evidence: \
+             null_count={null_count:?} value_count={value_count:?}"
+        );
+    }
+
+    #[test]
+    fn native_missing_null_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip() {
+        assert_native_file_counts_keep_ordered_late_pruning_after_wire_roundtrip(
+            "s3://bucket/missing-null-count.parquet",
+            None,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn native_negative_null_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip() {
+        assert_native_file_counts_keep_ordered_late_pruning_after_wire_roundtrip(
+            "s3://bucket/negative-null-count.parquet",
+            Some(-1),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn native_null_count_exceeding_value_count_keeps_ordered_late_pruning_conservative_after_wire_roundtrip()
+     {
+        assert_native_file_counts_keep_ordered_late_pruning_after_wire_roundtrip(
+            "s3://bucket/null-count-exceeds-value-count.parquet",
+            Some(3),
+            Some(2),
         );
     }
 

@@ -2895,6 +2895,14 @@ mod tests {
         binding_id: u32,
         group_key_expr_id: crate::exec::expr::ExprId,
     ) -> crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+        native_aggregate_topn_spec_for_type(binding_id, group_key_expr_id, DataType::Int64)
+    }
+
+    fn native_aggregate_topn_spec_for_type(
+        binding_id: u32,
+        group_key_expr_id: crate::exec::expr::ExprId,
+        data_type: DataType,
+    ) -> crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
         use crate::runtime_filter::model::contract::{
             CompletionRequirement, ContributionKind, NullOrder, OrderContract, OrderKeyContract,
             SortDirection,
@@ -2904,7 +2912,7 @@ mod tests {
         };
 
         let keys = vec![OrderKeyContract {
-            data_type: DataType::Int64,
+            data_type,
             direction: SortDirection::Ascending,
             null_order: NullOrder::Last,
         }];
@@ -2941,17 +2949,33 @@ mod tests {
             crate::exec::node::aggregate::StreamingPreaggregationMode,
         >,
     ) -> ExecPlan {
+        native_aggregate_topn_plan_for_type(
+            DataType::Int64,
+            duplicate_spec,
+            need_finalize,
+            streaming_preaggregation_mode,
+        )
+    }
+
+    fn native_aggregate_topn_plan_for_type(
+        data_type: DataType,
+        duplicate_spec: bool,
+        need_finalize: bool,
+        streaming_preaggregation_mode: Option<
+            crate::exec::node::aggregate::StreamingPreaggregationMode,
+        >,
+    ) -> ExecPlan {
         let chunk_schema = chunk_schema_of(
             &Arc::new(Schema::new(vec![Field::new(
                 "group_key",
-                DataType::Int64,
+                data_type.clone(),
                 false,
             )])),
             &[SlotId::new(1)],
         );
         let mut arena = ExprArena::default();
-        let group_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        let spec = native_aggregate_topn_spec(3, group_key);
+        let group_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), data_type.clone());
+        let spec = native_aggregate_topn_spec_for_type(3, group_key, data_type);
         let mut topn_producers = vec![spec.clone()];
         if duplicate_spec {
             topn_producers.push(spec);
@@ -3030,6 +3054,15 @@ mod tests {
         Arc<crate::runtime::query_context::QueryContextManager>,
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     ) {
+        installed_native_aggregate_topn_context_for_type(DataType::Int64)
+    }
+
+    fn installed_native_aggregate_topn_context_for_type(
+        data_type: DataType,
+    ) -> (
+        Arc<crate::runtime::query_context::QueryContextManager>,
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    ) {
         use std::collections::BTreeMap;
         use std::time::Duration;
 
@@ -3078,7 +3111,7 @@ mod tests {
             .expect("native query context");
 
         let keys = vec![OrderKeyContract {
-            data_type: DataType::Int64,
+            data_type,
             direction: SortDirection::Ascending,
             null_order: NullOrder::Last,
         }];
@@ -3143,6 +3176,28 @@ mod tests {
             .runtime_filter_context_for_native_execution(query_id, producer_instance)
             .expect("aggregate producer runtime-filter context");
         (manager, context)
+    }
+
+    #[test]
+    fn native_aggregate_topn_boolean_target_fails_at_factory_build_before_first_input() {
+        let (_manager, context) =
+            installed_native_aggregate_topn_context_for_type(DataType::Boolean);
+        let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_aggregate_topn_plan_for_type(DataType::Boolean, false, false, None),
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+            Some(context),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "typed Boolean aggregate TopN target must fail at factory build before operator input"
+            ),
+        };
+        assert!(error.contains("Boolean"), "{error}");
     }
 
     #[test]

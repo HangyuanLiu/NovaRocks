@@ -62,6 +62,9 @@ pub(crate) enum AggregateTopNBoundaryError {
     },
     InvalidOrderContract(OrderContractError),
     NonOrderedContract,
+    UnsupportedOrderKeyType {
+        actual: DataType,
+    },
     GroupIdentityOutOfSequence {
         expected: usize,
         actual: usize,
@@ -105,6 +108,10 @@ impl fmt::Display for AggregateTopNBoundaryError {
                     "aggregate TopN boundary requires an ordered contract"
                 )
             }
+            Self::UnsupportedOrderKeyType { actual } => write!(
+                formatter,
+                "aggregate TopN boundary does not support order key type {actual:?}"
+            ),
             Self::GroupIdentityOutOfSequence { expected, actual } => write!(
                 formatter,
                 "aggregate TopN group identity is out of sequence: expected={expected} actual={actual}"
@@ -171,11 +178,7 @@ impl AggregateTopNBoundaryState {
         limit: NonZeroU32,
         contract: Arc<RuntimeOrderContract>,
     ) -> Result<Self, AggregateTopNBoundaryError> {
-        if contract.keys().len() != 1 {
-            return Err(AggregateTopNBoundaryError::UnsupportedKeyArity {
-                actual: contract.keys().len(),
-            });
-        }
+        validate_topn_boundary_contract(&contract)?;
         Ok(Self {
             limit: limit.get() as usize,
             contract,
@@ -329,6 +332,59 @@ pub(crate) fn build_topn_boundary_bindings(
         .iter()
         .map(AggregateTopNBoundaryBinding::try_from_spec)
         .collect()
+}
+
+pub(crate) fn validate_topn_boundary_specs(
+    specs: &[NativeAggregateTopNProducerSpec],
+) -> Result<(), AggregateTopNBoundaryError> {
+    for spec in specs {
+        let NativeRuntimeFilterContract::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        } = &spec.contract
+        else {
+            return Err(AggregateTopNBoundaryError::NonOrderedContract);
+        };
+        let contract = RuntimeOrderContract::from_codec(
+            keys.to_vec(),
+            ComparatorDigest::new(*comparator_digest),
+            OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
+        )?;
+        validate_topn_boundary_contract(&contract)?;
+    }
+    Ok(())
+}
+
+fn validate_topn_boundary_contract(
+    contract: &RuntimeOrderContract,
+) -> Result<(), AggregateTopNBoundaryError> {
+    if contract.keys().len() != 1 {
+        return Err(AggregateTopNBoundaryError::UnsupportedKeyArity {
+            actual: contract.keys().len(),
+        });
+    }
+    let data_type = contract.keys()[0].data_type();
+    if !matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+    ) && !matches!(
+        data_type,
+        DataType::FixedSizeBinary(width)
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
+    ) {
+        return Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
+            actual: data_type.clone(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn observe_key_table_group(
@@ -797,6 +853,17 @@ mod tests {
                 "data_type={data_type:?}"
             );
         }
+    }
+
+    #[test]
+    fn topn_boundary_constructor_rejects_ordered_boolean_before_observation() {
+        let contract =
+            runtime_contract(DataType::Boolean, SortDirection::Ascending, NullOrder::Last);
+
+        let error = AggregateTopNBoundaryState::try_new(NonZeroU32::new(1).unwrap(), contract)
+            .expect_err("Boolean has no aggregate TopN boundary extractor");
+
+        assert!(error.to_string().contains("Boolean"), "{error}");
     }
 
     #[test]
