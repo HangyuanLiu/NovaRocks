@@ -529,6 +529,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
             final_domain_committer,
+            final_domain_session_bound: self.final_domain_session.is_some(),
             final_domain_bind_error,
             max_domain_canonical_bytes: self
                 .final_domain_session
@@ -572,6 +573,7 @@ struct AggregateProcessorOperator {
     runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
     final_domain_committer: Option<AggregateFinalDomainPartitionCommitter>,
+    final_domain_session_bound: bool,
     final_domain_bind_error: Option<String>,
     max_domain_canonical_bytes: Option<usize>,
     #[cfg(test)]
@@ -1057,11 +1059,15 @@ impl ProcessorOperator for AggregateProcessorOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        if self.finished {
+            return if self.final_domain_session_bound {
+                Err("aggregate received input after set_finishing".to_string())
+            } else {
+                Ok(())
+            };
+        }
         if self.finishing {
             return Err("aggregate received input after set_finishing".to_string());
-        }
-        if self.finished {
-            return Ok(());
         }
         if self.pending_output.is_some() {
             return Err("aggregate received input while output buffer is full".to_string());
@@ -1864,6 +1870,33 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "compat")]
+    fn compat_aggregate_factory() -> AggregateProcessorFactory {
+        let mut arena = ExprArena::default();
+        let group_expr = arena.push_typed(ExprNode::SlotId(GROUP_SLOT), DataType::Int64);
+        let output_field = Field::new("group_key", DataType::Int64, true);
+        let output_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(GROUP_SLOT, &output_field, None)
+                    .expect("aggregate output slot"),
+            ])
+            .expect("aggregate output schema"),
+        );
+        AggregateProcessorFactory::new_compat(
+            7,
+            Arc::new(arena),
+            vec![group_expr],
+            Vec::new(),
+            false,
+            true,
+            output_schema,
+            Vec::new(),
+            Arc::new(crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(
+                crate::exec::pipeline::dependency::DependencyManager::new(),
+            )),
+        )
+    }
+
     fn group_chunk(values: impl IntoIterator<Item = i64>) -> Chunk {
         let field = Field::new("group_key", DataType::Int64, false);
         let values = values.into_iter().collect::<Vec<_>>();
@@ -2260,6 +2293,29 @@ mod tests {
                 .expect("terminal pull")
                 .is_none()
         );
+        processor
+            .push_chunk(&state, group_chunk([4]))
+            .expect("sessionless completed aggregate preserves terminal no-op input");
+        assert!(processor.is_finished());
+        assert!(!processor.has_output());
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_aggregate_without_session_preserves_completed_push_noop() {
+        let factory = compat_aggregate_factory();
+        let mut operator = prepare_processor(&factory, 1, 0);
+        let output = finish_operator(&mut operator, [3, 1, 3, 2]);
+        assert_eq!(sorted_int64_output(&output), vec![1, 2, 3]);
+        assert!(operator.is_finished());
+
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().expect("aggregate processor");
+        processor
+            .push_chunk(&state, group_chunk([4]))
+            .expect("compat completed aggregate preserves terminal no-op input");
+        assert!(processor.is_finished());
+        assert!(!processor.has_output());
     }
 
     #[test]
