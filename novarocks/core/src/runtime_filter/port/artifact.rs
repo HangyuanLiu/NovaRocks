@@ -984,6 +984,21 @@ impl PhysicalArtifact {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn clone_with_test_codec_version(&self, codec_version: u16) -> Self {
+        Self {
+            kind: self.kind,
+            codec_version,
+            schema_digest: self.schema_digest,
+            version: self.version,
+            contains_null: self.contains_null,
+            canonical_bytes: self.canonical_bytes.clone(),
+            canonical_digest: self.canonical_digest,
+            payload: self.payload.clone(),
+            retained_memory: self.retained_memory.clone(),
+        }
+    }
+
     pub(crate) fn from_indexed_retained_bytes(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,

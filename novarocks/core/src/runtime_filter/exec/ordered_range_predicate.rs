@@ -434,7 +434,8 @@ mod tests {
 
     use arrow::array::{
         ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int8Array, Int16Array, Int32Array,
-        Int64Array, StringArray, TimestampMicrosecondArray,
+        Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow::datatypes::{DataType, TimeUnit};
 
@@ -487,22 +488,175 @@ mod tests {
         mask.iter().map(|value| value.unwrap()).collect()
     }
 
-    fn assert_mask(
+    #[derive(Clone, Copy, Debug)]
+    enum NaturalRelation {
+        Null,
+        Less,
+        Equal,
+        Greater,
+    }
+
+    struct OrderedScalarFixture {
+        name: &'static str,
         data_type: DataType,
         bound: OrderedScalar,
         values: ArrayRef,
-        expected: Vec<bool>,
-    ) {
-        let predicate = predicate(
-            data_type,
-            SortDirection::Ascending,
-            NullOrder::Last,
-            Some(bound),
-        );
-        assert_eq!(
-            mask_values(&predicate.evaluate(values.as_ref()).unwrap()),
-            expected
-        );
+        relations: Vec<NaturalRelation>,
+    }
+
+    fn supported_ordered_scalar_fixtures() -> Vec<OrderedScalarFixture> {
+        let timezone: Arc<str> = Arc::from("UTC");
+        vec![
+            OrderedScalarFixture {
+                name: "Boolean",
+                data_type: DataType::Boolean,
+                bound: OrderedScalar::Boolean(false),
+                values: Arc::new(BooleanArray::from(vec![None, Some(false), Some(true)])),
+                relations: vec![
+                    NaturalRelation::Null,
+                    NaturalRelation::Equal,
+                    NaturalRelation::Greater,
+                ],
+            },
+            OrderedScalarFixture {
+                name: "Int8",
+                data_type: DataType::Int8,
+                bound: OrderedScalar::Int8(1),
+                values: Arc::new(Int8Array::from(vec![None, Some(0), Some(1), Some(2)])),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "Int16",
+                data_type: DataType::Int16,
+                bound: OrderedScalar::Int16(2),
+                values: Arc::new(Int16Array::from(vec![None, Some(1), Some(2), Some(3)])),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "Int32",
+                data_type: DataType::Int32,
+                bound: OrderedScalar::Int32(3),
+                values: Arc::new(Int32Array::from(vec![None, Some(2), Some(3), Some(4)])),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "Int64",
+                data_type: DataType::Int64,
+                bound: OrderedScalar::Int64(4),
+                values: Arc::new(Int64Array::from(vec![None, Some(3), Some(4), Some(5)])),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "LargeInt",
+                data_type: DataType::FixedSizeBinary(
+                    novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
+                ),
+                bound: OrderedScalar::LargeInt(5),
+                values: novarocks_types::largeint::array_from_i128(&[
+                    None,
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                ])
+                .unwrap(),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "Utf8",
+                data_type: DataType::Utf8,
+                bound: OrderedScalar::Utf8("m".into()),
+                values: Arc::new(StringArray::from(vec![
+                    None,
+                    Some("a"),
+                    Some("m"),
+                    Some("z"),
+                ])),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "Date32",
+                data_type: DataType::Date32,
+                bound: OrderedScalar::Date32(10),
+                values: Arc::new(Date32Array::from(vec![None, Some(9), Some(10), Some(11)])),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "TimestampSecond",
+                data_type: DataType::Timestamp(TimeUnit::Second, Some(timezone.clone())),
+                bound: OrderedScalar::Timestamp(20),
+                values: Arc::new(
+                    TimestampSecondArray::from(vec![None, Some(19), Some(20), Some(21)])
+                        .with_timezone(timezone.clone()),
+                ),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "TimestampMillisecond",
+                data_type: DataType::Timestamp(TimeUnit::Millisecond, Some(timezone.clone())),
+                bound: OrderedScalar::Timestamp(30),
+                values: Arc::new(
+                    TimestampMillisecondArray::from(vec![None, Some(29), Some(30), Some(31)])
+                        .with_timezone(timezone.clone()),
+                ),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "TimestampMicrosecond",
+                data_type: DataType::Timestamp(TimeUnit::Microsecond, Some(timezone.clone())),
+                bound: OrderedScalar::Timestamp(40),
+                values: Arc::new(
+                    TimestampMicrosecondArray::from(vec![None, Some(39), Some(40), Some(41)])
+                        .with_timezone(timezone.clone()),
+                ),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "TimestampNanosecond",
+                data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone.clone())),
+                bound: OrderedScalar::Timestamp(50),
+                values: Arc::new(
+                    TimestampNanosecondArray::from(vec![None, Some(49), Some(50), Some(51)])
+                        .with_timezone(timezone),
+                ),
+                relations: ordered_numeric_relations(),
+            },
+            OrderedScalarFixture {
+                name: "Decimal128",
+                data_type: DataType::Decimal128(18, 2),
+                bound: OrderedScalar::Decimal128(300),
+                values: Arc::new(
+                    Decimal128Array::from(vec![None, Some(299), Some(300), Some(301)])
+                        .with_precision_and_scale(18, 2)
+                        .unwrap(),
+                ),
+                relations: ordered_numeric_relations(),
+            },
+        ]
+    }
+
+    fn ordered_numeric_relations() -> Vec<NaturalRelation> {
+        vec![
+            NaturalRelation::Null,
+            NaturalRelation::Less,
+            NaturalRelation::Equal,
+            NaturalRelation::Greater,
+        ]
+    }
+
+    fn expected_matrix_mask(
+        relations: &[NaturalRelation],
+        direction: SortDirection,
+        null_order: NullOrder,
+    ) -> Vec<bool> {
+        relations
+            .iter()
+            .map(|relation| match relation {
+                NaturalRelation::Null => null_order == NullOrder::First,
+                NaturalRelation::Less => direction == SortDirection::Ascending,
+                NaturalRelation::Equal => true,
+                NaturalRelation::Greater => direction == SortDirection::Descending,
+            })
+            .collect()
     }
 
     #[test]
@@ -558,37 +712,34 @@ mod tests {
     }
 
     #[test]
-    fn ordered_range_predicate_obeys_nulls_first_and_last_without_direction_inference() {
-        let nulls_first = predicate(
-            DataType::Int64,
-            SortDirection::Ascending,
-            NullOrder::First,
-            Some(OrderedScalar::Int64(3)),
-        );
-        assert_eq!(
-            mask_values(
-                &nulls_first
-                    .evaluate(&Int64Array::from(vec![None, Some(3), Some(4)]))
-                    .unwrap()
-            ),
-            vec![true, true, false]
-        );
+    fn ordered_range_predicate_applies_direction_and_null_order_matrix_to_every_supported_type() {
+        let directions = [SortDirection::Ascending, SortDirection::Descending];
+        let null_orders = [NullOrder::First, NullOrder::Last];
+        let fixtures = supported_ordered_scalar_fixtures();
+        assert_eq!(fixtures.len(), 13, "the supported scalar matrix drifted");
 
-        let nulls_last = predicate(
-            DataType::Int64,
-            SortDirection::Ascending,
-            NullOrder::Last,
-            Some(OrderedScalar::Int64(3)),
-        );
-        assert_eq!(
-            mask_values(
-                &nulls_last
-                    .evaluate(&Int64Array::from(vec![None, Some(2), Some(3)]))
-                    .unwrap()
-            ),
-            vec![false, true, true]
-        );
+        for fixture in fixtures {
+            for direction in directions {
+                for null_order in null_orders {
+                    let predicate = predicate(
+                        fixture.data_type.clone(),
+                        direction,
+                        null_order,
+                        Some(fixture.bound.clone()),
+                    );
+                    assert_eq!(
+                        mask_values(&predicate.evaluate(fixture.values.as_ref()).unwrap()),
+                        expected_matrix_mask(&fixture.relations, direction, null_order),
+                        "{} {direction:?} {null_order:?}",
+                        fixture.name
+                    );
+                }
+            }
+        }
+    }
 
+    #[test]
+    fn ordered_range_predicate_applies_null_bound_through_frozen_comparator() {
         let null_bound = predicate(
             DataType::Int64,
             SortDirection::Descending,
@@ -606,71 +757,37 @@ mod tests {
     }
 
     #[test]
-    fn ordered_range_predicate_applies_every_supported_ordered_scalar_type() {
-        assert_mask(
-            DataType::Boolean,
-            OrderedScalar::Boolean(false),
-            Arc::new(BooleanArray::from(vec![false, true])),
-            vec![true, false],
+    fn ordered_range_predicate_rejects_wrong_codec_version_before_payload_validation() {
+        let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
+        let valid = bundle(
+            order.clone(),
+            Some(OrderedScalar::Int64(3)),
+            LogicalVersion::FIRST,
         );
-        assert_mask(
-            DataType::Int8,
-            OrderedScalar::Int8(1),
-            Arc::new(Int8Array::from(vec![1, 2])),
-            vec![true, false],
+        let (kind, artifact) = valid.artifacts()[0].clone();
+        let wrong_codec = Arc::new(
+            artifact.clone_with_test_codec_version(super::LEAF_CODEC_VERSION.wrapping_add(1)),
         );
-        assert_mask(
-            DataType::Int16,
-            OrderedScalar::Int16(2),
-            Arc::new(Int16Array::from(vec![2, 3])),
-            vec![true, false],
-        );
-        assert_mask(
-            DataType::Int32,
-            OrderedScalar::Int32(3),
-            Arc::new(Int32Array::from(vec![3, 4])),
-            vec![true, false],
-        );
-        assert_mask(
-            DataType::Int64,
-            OrderedScalar::Int64(4),
-            Arc::new(Int64Array::from(vec![4, 5])),
-            vec![true, false],
-        );
-        assert_mask(
-            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
-            OrderedScalar::LargeInt(5),
-            novarocks_types::largeint::array_from_i128(&[Some(5), Some(6)]).unwrap(),
-            vec![true, false],
-        );
-        assert_mask(
-            DataType::Utf8,
-            OrderedScalar::Utf8("m".into()),
-            Arc::new(StringArray::from(vec!["m", "z"])),
-            vec![true, false],
-        );
-        assert_mask(
-            DataType::Date32,
-            OrderedScalar::Date32(10),
-            Arc::new(Date32Array::from(vec![10, 11])),
-            vec![true, false],
-        );
-        assert_mask(
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            OrderedScalar::Timestamp(20),
-            Arc::new(TimestampMicrosecondArray::from(vec![20, 21])),
-            vec![true, false],
-        );
-        assert_mask(
-            DataType::Decimal128(18, 2),
-            OrderedScalar::Decimal128(300),
-            Arc::new(
-                Decimal128Array::from(vec![300, 301])
-                    .with_precision_and_scale(18, 2)
-                    .unwrap(),
-            ),
-            vec![true, false],
-        );
+        let profile = ConsumerArtifactProfile::new_ordered_range(order.digest()).unwrap();
+        let bundle = ArtifactBundle::new(
+            ChannelId::new(7),
+            LogicalVersion::FIRST,
+            &profile,
+            vec![(kind, wrong_codec)],
+            usize::MAX,
+        )
+        .unwrap();
+        let expected =
+            OrderedRangePredicateContract::new(ChannelId::new(7), order, LogicalVersion::FIRST)
+                .unwrap();
+
+        assert!(matches!(
+            NativeOrderedRangePredicate::compile(&bundle, &expected),
+            Err(OrderedPredicateCompileError::CodecVersionMismatch {
+                expected: super::LEAF_CODEC_VERSION,
+                actual
+            }) if actual == super::LEAF_CODEC_VERSION.wrapping_add(1)
+        ));
     }
 
     #[test]
