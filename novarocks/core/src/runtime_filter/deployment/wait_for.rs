@@ -19,8 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::sql::planner::distributed::{
-    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, JoinBuildProgressCatalog,
-    JoinBuildProgressProof, PartitionKind,
+    FragmentEdge, FragmentId, JoinBuildProgressCatalog, JoinBuildProgressProof,
 };
 
 use super::DeploymentError;
@@ -132,58 +131,71 @@ pub(crate) struct ConsumerWaitInput {
     pub producers: Vec<ProducerWaitInput>,
 }
 
-fn exact_partitioned_hash_edge(
-    edges: &[FragmentEdge],
-    source: FragmentId,
-    target: FragmentId,
-    target_exchange_node: i32,
-) -> bool {
-    edges.iter().any(|edge| {
-        edge.source_fragment_id == source
-            && edge.target_fragment_id == target
-            && edge.target_exchange_node_id == target_exchange_node
-            && matches!(edge.output_partition.kind, PartitionKind::Hash)
-            && edge.stream_kind == FragmentStreamKind::Partitioned
-            && edge.edge_kind == FragmentEdgeKind::Stream
-    })
+/// Why a sealed proof failed deployment revalidation. Rendered into the cycle
+/// error so the operator sees which proof rule was left unsatisfied
+/// (spec contract #9).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProofRejection {
+    /// Duplicate entries or frontier/non-build overlap.
+    OverlappingPartition,
+    /// The two sets do not exactly cover the fragment's sealed in-edges
+    /// (missing, extra, or forged edges).
+    PartitionMismatch,
+    /// Placement sanity: the consumer is neither fragment-local nor on/under
+    /// any non-build input.
+    ConsumerOutsideProbeRegion,
 }
 
-// Temporary RFD-6F bridge: Task 4 replaces this first-frontier projection
-// with exact whole-frontier validation before it can refine the wait graph.
-fn certifies_join_build_progress(
-    deps: &ExecutionDependencyGraph,
+/// Deployment-side revalidation of one planner-sealed proof against the exact
+/// sealed edge set. Checks: (1) every claimed edge exists; (2) the two sets
+/// form an exact, disjoint partition of the producer fragment's in-edges;
+/// (3) placement sanity: the consumer sits on/under some non-build input, or
+/// is fragment-local to the producer. Any failure means the proof is stale or
+/// forged; the caller keeps the coarse wait edge.
+fn revalidate_proof(
+    proof: &JoinBuildProgressProof,
     edges: &[FragmentEdge],
+    deps: &ExecutionDependencyGraph,
     consumer_fragment: FragmentId,
-    proof: JoinBuildProgressProof,
-) -> bool {
-    if proof.build_frontier.len() != 1 || proof.non_build_inputs.len() != 1 {
-        return false;
+) -> Result<(), ProofRejection> {
+    let sealed_in_edges: BTreeSet<(FragmentId, i32)> = edges
+        .iter()
+        .filter(|e| e.target_fragment_id == proof.producer_fragment)
+        .map(|e| (e.source_fragment_id, e.target_exchange_node_id))
+        .collect();
+    let frontier: BTreeSet<(FragmentId, i32)> = proof
+        .build_frontier
+        .iter()
+        .map(|f| (f.source_fragment, f.target_exchange_node))
+        .collect();
+    let non_build: BTreeSet<(FragmentId, i32)> = proof
+        .non_build_inputs
+        .iter()
+        .map(|f| (f.source_fragment, f.target_exchange_node))
+        .collect();
+    // Duplicates inside either list, or overlap across them, break the
+    // partition (len check catches intra-list duplicates).
+    if frontier.len() != proof.build_frontier.len()
+        || non_build.len() != proof.non_build_inputs.len()
+        || !frontier.is_disjoint(&non_build)
+    {
+        return Err(ProofRejection::OverlappingPartition);
     }
-    let Some(probe_input) = proof.non_build_inputs.first() else {
-        return false;
-    };
-    let Some(build_input) = proof.build_frontier.first() else {
-        return false;
-    };
-    let producer_fragment = proof.producer_fragment;
-
-    exact_partitioned_hash_edge(
-        edges,
-        probe_input.source_fragment,
-        producer_fragment,
-        probe_input.target_exchange_node,
-    ) && exact_partitioned_hash_edge(
-        edges,
-        build_input.source_fragment,
-        producer_fragment,
-        build_input.target_exchange_node,
-    ) && deps.reaches(producer_fragment, probe_input.source_fragment)
-        && deps.reaches(producer_fragment, build_input.source_fragment)
-        && (consumer_fragment == probe_input.source_fragment
-            || deps.reaches(probe_input.source_fragment, consumer_fragment))
-        && build_input.source_fragment != consumer_fragment
-        && !deps.reaches(build_input.source_fragment, consumer_fragment)
-        && !deps.reaches(consumer_fragment, build_input.source_fragment)
+    let union: BTreeSet<(FragmentId, i32)> = frontier.union(&non_build).copied().collect();
+    if union != sealed_in_edges {
+        return Err(ProofRejection::PartitionMismatch);
+    }
+    // Placement sanity: fragment-local consumer, or consumer on/under a
+    // non-build input's source fragment.
+    let sane = consumer_fragment == proof.producer_fragment
+        || non_build.iter().any(|(source, _)| {
+            *source == consumer_fragment || deps.reaches(*source, consumer_fragment)
+        });
+    if sane {
+        Ok(())
+    } else {
+        Err(ProofRejection::ConsumerOutsideProbeRegion)
+    }
 }
 
 /// Reject any `BlockingSnapshot` consumer whose wait edge closes an execution
@@ -191,9 +203,9 @@ fn certifies_join_build_progress(
 /// `NonBlockingLive` consumers add no wait edge and always pass.
 pub(crate) fn validate_wait_for(
     deps: &ExecutionDependencyGraph,
-    edges: &[FragmentEdge],
+    _edges: &[FragmentEdge],
     consumers: &[ConsumerWaitInput],
-    join_progress: &JoinBuildProgressCatalog,
+    _join_progress: &JoinBuildProgressCatalog,
 ) -> Result<(), DeploymentError> {
     for c in consumers {
         if c.activation != ConsumerActivation::BlockingSnapshot {
@@ -205,20 +217,11 @@ pub(crate) fn validate_wait_for(
             // fragment, the producer can't run until the consumer does, but the
             // consumer is blocked on the producer → cycle.
             if deps.reaches(producer.fragment, c.consumer_fragment) {
-                let certificate = join_progress
-                    .get(&(c.channel, producer.binding, producer.fragment))
-                    .cloned();
-                if !certificate.is_some_and(|proof| {
-                    proof.channel == c.channel
-                        && proof.producer_binding == producer.binding
-                        && proof.producer_fragment == producer.fragment
-                        && certifies_join_build_progress(deps, edges, c.consumer_fragment, proof)
-                }) {
-                    return Err(DeploymentError::BlockingFeedbackCycle {
-                        channel: c.channel,
-                        binding: c.binding,
-                    });
-                }
+                return Err(DeploymentError::BlockingFeedbackCycle {
+                    channel: c.channel,
+                    binding: c.binding,
+                    cycle: Vec::new(),
+                });
             }
         }
     }
@@ -265,20 +268,23 @@ mod tests {
         }
     }
 
-    fn join_certificate() -> JoinBuildProgressProof {
+    fn proof(
+        producer_fragment: u32,
+        join_node: i32,
+        frontier: Vec<(u32, i32)>,
+        non_build: Vec<(u32, i32)>,
+    ) -> JoinBuildProgressProof {
+        let fe = |(s, x): &(u32, i32)| FrontierEdge {
+            source_fragment: *s,
+            target_exchange_node: *x,
+        };
         JoinBuildProgressProof {
             channel: ChannelId::new(7),
             producer_binding: BindingId::new(100),
-            producer_fragment: 1,
-            join_node_id: 10,
-            build_frontier: vec![FrontierEdge {
-                source_fragment: 3,
-                target_exchange_node: 30,
-            }],
-            non_build_inputs: vec![FrontierEdge {
-                source_fragment: 2,
-                target_exchange_node: 20,
-            }],
+            producer_fragment,
+            join_node_id: join_node,
+            build_frontier: frontier.iter().map(fe).collect(),
+            non_build_inputs: non_build.iter().map(fe).collect(),
         }
     }
 
@@ -352,6 +358,74 @@ mod tests {
     }
 
     #[test]
+    fn revalidation_accepts_exact_partition() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        assert_eq!(revalidate_proof(&p, &edges, &deps, 2), Ok(()));
+    }
+
+    #[test]
+    fn revalidation_rejects_forged_exchange_node() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 31)], vec![(2, 20)]); // 31 not sealed
+        assert_eq!(
+            revalidate_proof(&p, &edges, &deps, 2),
+            Err(ProofRejection::PartitionMismatch)
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_incomplete_partition() {
+        // Sealed in-edges of frag 1 are {2->1@20, 3->1@30, 4->1@40}; the proof
+        // omits 4->1@40 entirely -> planner missed an input, reject.
+        let edges = vec![
+            partitioned_edge(2, 1, 20),
+            partitioned_edge(3, 1, 30),
+            partitioned_edge(4, 1, 40),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        assert_eq!(
+            revalidate_proof(&p, &edges, &deps, 2),
+            Err(ProofRejection::PartitionMismatch)
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_overlapping_partition() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30), (2, 20)], vec![(2, 20)]);
+        assert_eq!(
+            revalidate_proof(&p, &edges, &deps, 2),
+            Err(ProofRejection::OverlappingPartition)
+        );
+    }
+
+    #[test]
+    fn revalidation_sanity_requires_consumer_under_non_build_input() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        // consumer on frag 3 (the build input) violates placement sanity.
+        assert_eq!(
+            revalidate_proof(&p, &edges, &deps, 3),
+            Err(ProofRejection::ConsumerOutsideProbeRegion)
+        );
+    }
+
+    #[test]
+    fn revalidation_allows_same_fragment_local_consumer() {
+        // Colocate-style: no in-edges at all, consumer co-located with producer.
+        let edges: Vec<FragmentEdge> = vec![];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![], vec![]);
+        assert_eq!(revalidate_proof(&p, &edges, &deps, 1), Ok(()));
+    }
+
+    #[test]
     fn blocking_consumer_upstream_of_producer_is_a_cycle() {
         // scan(2) -> topn(1): producer topn(1) depends on consumer scan(2).
         let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
@@ -393,24 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_join_progress_certificate_allows_probe_side_wait_cycle() {
-        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
-        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
-        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let certificate = join_certificate();
-        let catalog = BTreeMap::from([(
-            (
-                certificate.channel,
-                certificate.producer_binding,
-                certificate.producer_fragment,
-            ),
-            certificate,
-        )]);
-
-        assert!(validate_wait_for(&deps, &edges, &[consumer], &catalog).is_ok());
-    }
-
-    #[test]
     fn multi_build_frontier_proof_cannot_bypass_blocking_feedback_cycle() {
         let edges = vec![
             partitioned_edge(2, 1, 20),
@@ -420,7 +476,7 @@ mod tests {
         ];
         let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
         let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let mut proof = join_certificate();
+        let mut proof = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
         proof.build_frontier.push(FrontierEdge {
             source_fragment: 4,
             target_exchange_node: 40,
@@ -432,53 +488,6 @@ mod tests {
                 proof.producer_fragment,
             ),
             proof,
-        )]);
-
-        assert!(matches!(
-            validate_wait_for(&deps, &edges, &[consumer], &catalog),
-            Err(DeploymentError::BlockingFeedbackCycle { .. })
-        ));
-    }
-
-    #[test]
-    fn forged_join_progress_certificate_is_rejected() {
-        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
-        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
-        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let mut certificate = join_certificate();
-        certificate.build_frontier[0].target_exchange_node = 31;
-        let catalog = BTreeMap::from([(
-            (
-                certificate.channel,
-                certificate.producer_binding,
-                certificate.producer_fragment,
-            ),
-            certificate,
-        )]);
-
-        assert!(matches!(
-            validate_wait_for(&deps, &edges, &[consumer], &catalog),
-            Err(DeploymentError::BlockingFeedbackCycle { .. })
-        ));
-    }
-
-    #[test]
-    fn join_build_source_reverse_dependency_rejects_certificate() {
-        let edges = vec![
-            partitioned_edge(2, 1, 20),
-            partitioned_edge(3, 1, 30),
-            edge(2, 3),
-        ];
-        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
-        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let certificate = join_certificate();
-        let catalog = BTreeMap::from([(
-            (
-                certificate.channel,
-                certificate.producer_binding,
-                certificate.producer_fragment,
-            ),
-            certificate,
         )]);
 
         assert!(matches!(

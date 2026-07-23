@@ -110,11 +110,13 @@ pub(crate) enum DeploymentError {
     /// The fragment edges supplied to the compiler formed a cycle; the
     /// execution dependency graph could not be built.
     FragmentCycle,
-    /// A `BlockingSnapshot` consumer would wait on a producer that (transitively)
-    /// depends on the consumer's own fragment — an execution cycle.
+    /// A `BlockingSnapshot` consumer's wait edge closes a cycle in the refined
+    /// wait graph (data-flow + frontier + wait + backpressure edges).
     BlockingFeedbackCycle {
         channel: ChannelId,
         binding: BindingId,
+        /// Deterministic cycle path through the refined graph, for diagnosis.
+        cycle: Vec<String>,
     },
     /// A channel's coverage carries no witnesses / producers.
     EmptyCoverage { channel: ChannelId },
@@ -176,11 +178,16 @@ impl fmt::Display for DeploymentError {
             Self::FragmentCycle => {
                 write!(f, "fragment execution dependency graph contains a cycle")
             }
-            Self::BlockingFeedbackCycle { channel, binding } => write!(
+            Self::BlockingFeedbackCycle {
+                channel,
+                binding,
+                cycle,
+            } => write!(
                 f,
-                "blocking-snapshot consumer binding {} on channel {} forms an execution cycle",
+                "blocking-snapshot consumer binding {} on channel {} forms an execution cycle: {}",
                 binding.get(),
-                channel.get()
+                channel.get(),
+                cycle.join(", ")
             ),
             Self::EmptyCoverage { channel } => {
                 write!(f, "channel {} has empty coverage", channel.get())
@@ -242,11 +249,18 @@ mod tests {
         let err = DeploymentError::BlockingFeedbackCycle {
             channel: ChannelId::new(1),
             binding: BindingId::new(2),
+            cycle: vec![
+                "frag 3 --dataflow--> frag 2".to_string(),
+                "build-ready(frag 2, join 10) --wait ch1/b2--> frag 1".to_string(),
+            ],
         };
         let rendered = format!("{err}");
         assert!(rendered.contains("blocking"));
         assert!(rendered.contains("binding 2"));
         assert!(rendered.contains("channel 1"));
+        assert!(rendered.contains(
+            "frag 3 --dataflow--> frag 2, build-ready(frag 2, join 10) --wait ch1/b2--> frag 1"
+        ));
     }
 
     #[test]
