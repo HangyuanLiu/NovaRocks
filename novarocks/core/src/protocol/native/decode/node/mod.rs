@@ -2244,6 +2244,68 @@ mod tests {
     }
 
     #[test]
+    fn producer_binding_target_rejects_aggregate_topn_attachment_to_hash_join() {
+        let left = one_col_values_node_with(10, 1, "lhs", 10);
+        let right = one_col_values_node_with(11, 2, "rhs", 20);
+        let mut wire = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: i32::from(plan::JoinKind::Inner),
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: i32::from(plan::JoinDistribution::Broadcast),
+                execution_mode: None,
+            }),
+            Vec::new(),
+            vec![left, right],
+        );
+        wire.runtime_filter_binding_ids = vec![1];
+        let mut producer =
+            membership_producer_wire(1, 30, column_ref(2, DataType::Int64), &DataType::Int64);
+        let Some(plan::runtime_filter_binding::Role::Producer(role)) = producer.role.as_mut()
+        else {
+            unreachable!("membership producer fixture")
+        };
+        role.target = Some(
+            plan::runtime_filter_producer_role::Target::AggregateTopnKey(
+                plan::RuntimeFilterAggregateTopNKey {
+                    group_key_ordinal: 0,
+                    limit: 5,
+                },
+            ),
+        );
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![producer],
+        };
+        let mut ledger = NativeRuntimeFilterDecodeLedger::decode(1, Some(&table))
+            .expect("aggregate producer target is valid on the wire");
+
+        let error = decode_node_with_runtime_filters(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect_err("AggregateTopNKey must not attach to HashJoin");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.runtime_filter_binding_ids"
+        );
+        assert!(
+            protocol
+                .to_string()
+                .contains("HashJoin must target a join build key"),
+            "{protocol}"
+        );
+    }
+
+    #[test]
     fn producer_matches_and_references_once_lowered_raw_build_expression() {
         let left = one_col_values_node_typed(10, 1, "lhs", 10, DataType::Int64);
         let right = one_col_values_node_typed(11, 2, "rhs", 20, DataType::Int32);

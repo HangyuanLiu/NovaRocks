@@ -129,7 +129,7 @@ fn encode_runtime_filter_binding(
     })
 }
 
-pub(super) fn encode_runtime_filter_producer_target(
+pub(in crate::protocol::native) fn encode_runtime_filter_producer_target(
     binding_id: u32,
     target: ProducerBindingTarget,
 ) -> Result<plan::runtime_filter_producer_role::Target, String> {

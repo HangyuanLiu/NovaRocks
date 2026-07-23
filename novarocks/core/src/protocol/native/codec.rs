@@ -24,16 +24,24 @@ use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_f
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
+const PLAN_FIELD: u32 = 1;
 const INSTANCE_PARAMS_FIELD: u32 = 2;
 const LEGACY_RUNTIME_FILTER_PARAMS_FIELD: u32 = 7;
+const PLAN_RUNTIME_FILTER_BINDINGS_FIELD: u32 = 10;
+const RUNTIME_FILTER_TABLE_BINDING_FIELD: u32 = 2;
+const RUNTIME_FILTER_BINDING_PRODUCER_FIELD: u32 = 8;
+const PRODUCER_JOIN_BUILD_KEY_FIELD: u32 = 3;
+const PRODUCER_AGGREGATE_TOPN_KEY_FIELD: u32 = 4;
 
 /// Native protobuf codec used by generated NovaRocks clients and servers.
 ///
 /// Prost intentionally discards unknown fields. That behavior is correct for
-/// every native message except the retired `InstanceParams` tag 7: accepting
-/// that tag would make a legacy sender appear to have submitted the current
-/// contract. The decoder therefore inspects only raw `SubmitFragmentRequest`
-/// bytes before delegating to Prost. No legacy payload is decoded or carried.
+/// every native message except the retired `InstanceParams` tag 7 and ambiguous
+/// producer target oneofs: accepting either would make invalid raw wire appear
+/// to satisfy the current contract after unknown-field or oneof information is
+/// discarded. The decoder therefore inspects only the affected paths in raw
+/// `SubmitFragmentRequest` bytes before delegating to Prost. No legacy payload
+/// is decoded or carried.
 #[derive(Debug, Clone)]
 pub(crate) struct NativeProstCodec<T, U> {
     marker: PhantomData<(T, U)>,
@@ -135,6 +143,9 @@ where
                 Err(WireScanError::LegacyRuntimeFilterParams) => {
                     return Err(legacy_runtime_filter_params_status());
                 }
+                Err(WireScanError::AmbiguousProducerBindingTarget) => {
+                    return Err(ambiguous_producer_binding_target_status());
+                }
             }
         }
 
@@ -152,6 +163,9 @@ pub(crate) fn validate_submit_fragment_request_wire(bytes: &[u8]) -> Result<(), 
     match scan_submit_fragment_request(bytes) {
         Ok(()) => Ok(()),
         Err(WireScanError::LegacyRuntimeFilterParams) => Err(legacy_runtime_filter_params_status()),
+        Err(WireScanError::AmbiguousProducerBindingTarget) => {
+            Err(ambiguous_producer_binding_target_status())
+        }
         Err(WireScanError::Decode(error)) => Err(Status::internal(error.to_string())),
     }
 }
@@ -162,23 +176,116 @@ fn legacy_runtime_filter_params_status() -> Status {
     )
 }
 
+fn ambiguous_producer_binding_target_status() -> Status {
+    Status::invalid_argument(
+        "native runtime-filter producer target carries both join_build_key and aggregate_topn_key",
+    )
+}
+
 fn scan_submit_fragment_request(bytes: &[u8]) -> Result<(), WireScanError> {
     let mut cursor = bytes;
     let context = DecodeContext::default();
     while cursor.has_remaining() {
         let (field, wire_type) = decode_key(&mut cursor)?;
-        if field == INSTANCE_PARAMS_FIELD && wire_type == WireType::LengthDelimited {
-            let length = decode_varint(&mut cursor)?;
-            if length > cursor.remaining() as u64 {
-                return Err(prost::DecodeError::new("buffer underflow").into());
+        if wire_type == WireType::LengthDelimited {
+            match field {
+                PLAN_FIELD => {
+                    let plan = take_length_delimited(&mut cursor)?;
+                    scan_plan_fragment(plan)?;
+                    continue;
+                }
+                INSTANCE_PARAMS_FIELD => {
+                    let instance_params = take_length_delimited(&mut cursor)?;
+                    scan_instance_params(instance_params)?;
+                    continue;
+                }
+                _ => {}
             }
-            let instance_params = cursor.copy_to_bytes(length as usize);
-            scan_instance_params(instance_params.as_ref())?;
+        }
+        skip_field(wire_type, field, &mut cursor, context.clone())?;
+    }
+    Ok(())
+}
+
+fn scan_plan_fragment(bytes: &[u8]) -> Result<(), WireScanError> {
+    let mut cursor = bytes;
+    let context = DecodeContext::default();
+    while cursor.has_remaining() {
+        let (field, wire_type) = decode_key(&mut cursor)?;
+        if field == PLAN_RUNTIME_FILTER_BINDINGS_FIELD && wire_type == WireType::LengthDelimited {
+            let table = take_length_delimited(&mut cursor)?;
+            scan_runtime_filter_binding_table(table)?;
         } else {
             skip_field(wire_type, field, &mut cursor, context.clone())?;
         }
     }
     Ok(())
+}
+
+fn scan_runtime_filter_binding_table(bytes: &[u8]) -> Result<(), WireScanError> {
+    let mut cursor = bytes;
+    let context = DecodeContext::default();
+    while cursor.has_remaining() {
+        let (field, wire_type) = decode_key(&mut cursor)?;
+        if field == RUNTIME_FILTER_TABLE_BINDING_FIELD && wire_type == WireType::LengthDelimited {
+            let binding = take_length_delimited(&mut cursor)?;
+            scan_runtime_filter_binding(binding)?;
+        } else {
+            skip_field(wire_type, field, &mut cursor, context.clone())?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_runtime_filter_binding(bytes: &[u8]) -> Result<(), WireScanError> {
+    let mut cursor = bytes;
+    let context = DecodeContext::default();
+    let mut target_field = None;
+    while cursor.has_remaining() {
+        let (field, wire_type) = decode_key(&mut cursor)?;
+        if field == RUNTIME_FILTER_BINDING_PRODUCER_FIELD && wire_type == WireType::LengthDelimited
+        {
+            let producer = take_length_delimited(&mut cursor)?;
+            scan_runtime_filter_producer_role(producer, &mut target_field)?;
+        } else {
+            skip_field(wire_type, field, &mut cursor, context.clone())?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_runtime_filter_producer_role(
+    bytes: &[u8],
+    target_field: &mut Option<u32>,
+) -> Result<(), WireScanError> {
+    let mut cursor = bytes;
+    let context = DecodeContext::default();
+    while cursor.has_remaining() {
+        let (field, wire_type) = decode_key(&mut cursor)?;
+        if matches!(
+            field,
+            PRODUCER_JOIN_BUILD_KEY_FIELD | PRODUCER_AGGREGATE_TOPN_KEY_FIELD
+        ) && wire_type == WireType::LengthDelimited
+        {
+            if target_field.is_some_and(|seen| seen != field) {
+                return Err(WireScanError::AmbiguousProducerBindingTarget);
+            }
+            *target_field = Some(field);
+        }
+        skip_field(wire_type, field, &mut cursor, context.clone())?;
+    }
+    Ok(())
+}
+
+fn take_length_delimited<'a>(cursor: &mut &'a [u8]) -> Result<&'a [u8], WireScanError> {
+    let length = decode_varint(cursor)?;
+    if length > cursor.remaining() as u64 {
+        return Err(prost::DecodeError::new("buffer underflow").into());
+    }
+    let length = length as usize;
+    let (payload, remaining) = cursor.split_at(length);
+    *cursor = remaining;
+    Ok(payload)
 }
 
 fn scan_instance_params(bytes: &[u8]) -> Result<(), WireScanError> {
@@ -198,6 +305,7 @@ fn scan_instance_params(bytes: &[u8]) -> Result<(), WireScanError> {
 enum WireScanError {
     Decode(prost::DecodeError),
     LegacyRuntimeFilterParams,
+    AmbiguousProducerBindingTarget,
 }
 
 impl From<prost::DecodeError> for WireScanError {
@@ -213,6 +321,9 @@ impl std::fmt::Display for WireScanError {
             Self::LegacyRuntimeFilterParams => formatter.write_str(
                 "legacy InstanceParams tag 7 runtime_filter_params is not accepted by native submission",
             ),
+            Self::AmbiguousProducerBindingTarget => formatter.write_str(
+                "native runtime-filter producer target carries both join_build_key and aggregate_topn_key",
+            ),
         }
     }
 }
@@ -227,6 +338,14 @@ mod tests {
         let mut request = vec![0x12, instance.len() as u8];
         request.extend_from_slice(instance);
         request
+    }
+
+    fn length_delimited(field: u32, payload: &[u8]) -> Vec<u8> {
+        assert!(field <= 15);
+        assert!(payload.len() < 128);
+        let mut wire = vec![((field << 3) | 2) as u8, payload.len() as u8];
+        wire.extend_from_slice(payload);
+        wire
     }
 
     #[test]
@@ -279,6 +398,38 @@ mod tests {
         request.extend_from_slice(&submit_with_instance(&[0x08, 1]));
         validate_submit_fragment_request_wire(&request)
             .expect("only direct InstanceParams tag 7 is retired");
+    }
+
+    #[test]
+    fn producer_binding_target_rejects_ambiguous_raw_oneof_before_prost_collapse() {
+        let mut producer = length_delimited(3, &[]);
+        producer.extend_from_slice(&length_delimited(4, &[]));
+        let binding = length_delimited(8, &producer);
+        let table = length_delimited(2, &binding);
+        let plan = length_delimited(10, &table);
+        let request = length_delimited(1, &plan);
+
+        let decoded = crate::proto::novarocks::SubmitFragmentRequest::decode(request.as_slice())
+            .expect("Prost accepts both oneof target tags");
+        let target = decoded
+            .plan
+            .and_then(|plan| plan.runtime_filter_bindings)
+            .and_then(|table| table.bindings.into_iter().next())
+            .and_then(|binding| binding.role)
+            .and_then(|role| match role {
+                crate::proto::plan::runtime_filter_binding::Role::Producer(role) => role.target,
+                crate::proto::plan::runtime_filter_binding::Role::Consumer(_) => None,
+            });
+        assert!(matches!(
+            target,
+            Some(crate::proto::plan::runtime_filter_producer_role::Target::AggregateTopnKey(_))
+        ));
+
+        let error = validate_submit_fragment_request_wire(&request)
+            .expect_err("raw wire carrying both producer target arms must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("join_build_key"), "{error}");
+        assert!(error.message().contains("aggregate_topn_key"), "{error}");
     }
 
     #[test]

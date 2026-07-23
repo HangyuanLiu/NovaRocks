@@ -1278,27 +1278,19 @@ mod tests {
     #[test]
     fn producer_binding_target_proto_round_trips_both_variants_exactly() {
         let cases = [
-            (
-                plan::runtime_filter_producer_role::Target::JoinBuildKey(
-                    plan::RuntimeFilterJoinBuildKey { ordinal: 7 },
-                ),
-                ProducerBindingTarget::JoinBuildKey { ordinal: 7 },
-            ),
-            (
-                plan::runtime_filter_producer_role::Target::AggregateTopnKey(
-                    plan::RuntimeFilterAggregateTopNKey {
-                        group_key_ordinal: 11,
-                        limit: 19,
-                    },
-                ),
-                ProducerBindingTarget::AggregateTopNKey {
-                    group_key_ordinal: 11,
-                    limit: NonZeroU32::new(19).unwrap(),
-                },
-            ),
+            ProducerBindingTarget::JoinBuildKey { ordinal: 7 },
+            ProducerBindingTarget::AggregateTopNKey {
+                group_key_ordinal: 11,
+                limit: NonZeroU32::new(19).unwrap(),
+            },
         ];
 
-        for (wire_target, expected) in cases {
+        for expected in cases {
+            let wire_target =
+                crate::protocol::native::encode::plan::encode_runtime_filter_producer_target(
+                    17, expected,
+                )
+                .expect("encode typed producer target");
             let wire = match producer_role_with_target(Some(wire_target)) {
                 plan::runtime_filter_binding::Role::Producer(wire) => wire,
                 _ => unreachable!("helper always returns producer"),
