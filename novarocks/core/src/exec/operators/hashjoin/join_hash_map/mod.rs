@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Hash join map module exports for M1.
-//!
-//! Provides the initial three-layer primitives used by the hash join map refactor.
+//! Purpose-built hash join map: method dispatch / build store / search / gather layers.
+
+// Design: ADR-0004 (docs/adr/ADR-0004-purpose-built-join-hash-map.md)
 
 pub(crate) mod build_store;
 pub(crate) mod finalize;
