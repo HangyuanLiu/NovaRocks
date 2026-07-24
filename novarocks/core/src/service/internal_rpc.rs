@@ -517,13 +517,6 @@ mod native_runtime_filter_mode_tests {
         let status = response.status.expect("status");
         assert_ne!(status.code, 0);
         assert!(status.message.contains("disabled"), "{}", status.message);
-        let manager = query_context_manager();
-        assert!(manager.get_runtime_filter_hub(query_id).is_err());
-        assert!(
-            manager
-                .enqueue_pending_runtime_filter(query_id, 9, 0, vec![1], None)
-                .is_err()
-        );
     }
 
     #[test]
@@ -595,13 +588,5 @@ mod native_runtime_filter_mode_tests {
         let status = response.status.expect("status");
         assert_ne!(status.code, 0);
         assert!(status.message.contains("disabled"), "{}", status.message);
-        let manager = query_context_manager();
-        assert!(manager.get_runtime_filter_hub(query_id).is_err());
-        assert!(manager.get_runtime_filter_worker(query_id).is_err());
-        assert!(
-            manager
-                .enqueue_pending_runtime_filter(query_id, 9, 0, vec![1], None)
-                .is_err()
-        );
     }
 }

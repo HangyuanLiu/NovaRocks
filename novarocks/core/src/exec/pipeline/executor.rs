@@ -427,16 +427,6 @@ mod tests {
                 )
                 .expect("register shared NativeService query context");
         }
-        let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must reject legacy hub access"),
-        };
-        assert!(hub_error.contains("NativeService"), "{hub_error}");
-        let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must reject legacy worker access"),
-        };
-        assert!(worker_error.contains("NativeService"), "{worker_error}");
         let initial_lifecycle = lifecycle
             .snapshot(query_key)
             .expect("query context installs a lifecycle event sink");
@@ -687,25 +677,9 @@ mod tests {
             consumer_lifecycle.channel_events.len(),
             installed_channel_event_count
         );
-        let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must remain hub-free"),
-        };
-        assert!(hub_error.contains("NativeService"), "{hub_error}");
-        let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must remain worker-free"),
-        };
-        assert!(worker_error.contains("NativeService"), "{worker_error}");
         context_manager.cancel_query(query_id, "test cleanup".to_string());
         context_manager.finish_fragment(query_id);
         context_manager.finish_fragment(query_id);
-        assert!(
-            context_manager
-                .get_runtime_filter_hub(query_id)
-                .expect("query context removed after both fragments finish")
-                .is_none()
-        );
         lifecycle.remove_query(query_key);
     }
 

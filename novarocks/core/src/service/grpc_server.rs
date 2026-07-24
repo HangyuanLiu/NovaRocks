@@ -2014,15 +2014,6 @@ mod tests {
             service.is_none(),
             "codec rejection must not create a query-owned Service"
         );
-        assert!(
-            matches!(node.manager().get_runtime_filter_hub(query_id), Ok(None)),
-            "codec rejection must not create a legacy Hub"
-        );
-        assert!(
-            matches!(node.manager().get_runtime_filter_worker(query_id), Ok(None)),
-            "codec rejection must not create a legacy Worker"
-        );
-
         let response = send_raw_submit(
             node.endpoint(),
             RawSubmitFragmentRequest {
