@@ -26,7 +26,7 @@ use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder
 
 const PLAN_FIELD: u32 = 1;
 const INSTANCE_PARAMS_FIELD: u32 = 2;
-const LEGACY_RUNTIME_FILTER_PARAMS_FIELD: u32 = 7;
+const RETIRED_RUNTIME_FILTER_PARAMS_FIELD: u32 = 7;
 const PLAN_RUNTIME_FILTER_BINDINGS_FIELD: u32 = 10;
 const RUNTIME_FILTER_TABLE_BINDING_FIELD: u32 = 2;
 const RUNTIME_FILTER_BINDING_PRODUCER_FIELD: u32 = 8;
@@ -295,7 +295,7 @@ fn scan_instance_params(bytes: &[u8]) -> Result<(), WireScanError> {
     let context = DecodeContext::default();
     while cursor.has_remaining() {
         let (field, wire_type) = decode_key(&mut cursor)?;
-        if field == LEGACY_RUNTIME_FILTER_PARAMS_FIELD {
+        if field == RETIRED_RUNTIME_FILTER_PARAMS_FIELD {
             return Err(WireScanError::RetiredInstanceParamsField);
         }
         skip_field(wire_type, field, &mut cursor, context.clone())?;

@@ -2263,6 +2263,20 @@ impl QueryContextManager {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn query_ids_for_test(&self) -> Vec<QueryId> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        let mut query_ids = guard
+            .active
+            .keys()
+            .chain(guard.second_chance.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        query_ids.sort_by_key(|query_id| (query_id.hi, query_id.lo));
+        query_ids.dedup();
+        query_ids
+    }
+
     pub(crate) fn runtime_filter_context_for_native_execution(
         &self,
         query_id: QueryId,

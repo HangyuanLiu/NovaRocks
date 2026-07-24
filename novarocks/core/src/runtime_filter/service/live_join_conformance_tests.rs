@@ -850,6 +850,43 @@ fn loopback_join_plan(files: &LocalJoinFiles) -> PhysicalPlanNode {
     plan
 }
 
+fn drain_final_reports_before_node_shutdown(query_id: crate::runtime::query_context::QueryId) {
+    assert!(
+        crate::service::standalone_exec_state_reporter::wait_for_final_reports_for_query_for_test(
+            query_id, MAX_WAIT,
+        ),
+        "final profile reports drain before temporary live BE endpoints shut down"
+    );
+}
+
+fn drain_final_reports_for_submitted_finsts_before_node_shutdown(
+    query_id: crate::runtime::query_context::QueryId,
+    finst_ids: &[UniqueId],
+) {
+    assert!(
+        crate::service::standalone_exec_state_reporter::wait_for_final_reports_for_finsts_for_test(
+            query_id, finst_ids, MAX_WAIT,
+        ),
+        "every submitted fragment enqueues and drains its final profile report before temporary live BE endpoints shut down"
+    );
+}
+
+fn query_id_from_live_nodes(
+    nodes: &[IndependentGrpcRuntimeFilterNode],
+) -> crate::runtime::query_context::QueryId {
+    let query_ids = nodes
+        .first()
+        .expect("live Join owns at least one BE")
+        .manager()
+        .query_ids_for_test();
+    assert_eq!(
+        query_ids.len(),
+        1,
+        "temporary live Join BEs retain exactly one query before shutdown"
+    );
+    query_ids[0]
+}
+
 fn run_live_join(
     topology: JoinTopology,
     runtime_filter: bool,
@@ -1038,6 +1075,7 @@ fn run_live_join(
         started.elapsed() <= MAX_WAIT,
         "live Join execution exceeded {MAX_WAIT:?}"
     );
+    let query_id_from_execution = query_id_from_live_nodes(&nodes);
     let observations = observations.lock().unwrap().clone();
     if let Some(controller) = broadcast_loser_gates.as_ref() {
         controller.join();
@@ -1119,6 +1157,7 @@ fn run_live_join(
             });
         }
     }
+    drain_final_reports_before_node_shutdown(query_id_from_execution);
     for node in &mut nodes {
         node.shutdown().expect("shutdown live Join BE");
     }
@@ -1305,24 +1344,8 @@ fn run_live_join_cancel() -> CancelRun {
         std::thread::sleep(Duration::from_millis(5));
     };
     let lifecycle_events = participant_events.values().flatten().cloned().collect();
-    let report_finsts = submitted.values().flatten().copied().collect::<Vec<_>>();
-    let report_deadline = Instant::now() + MAX_WAIT;
-    while report_finsts.iter().any(|finst_id| {
-        crate::service::standalone_exec_state_reporter::final_reports_pending_for_test(
-            query_id, *finst_id,
-        ) != 0
-    }) && Instant::now() < report_deadline
-    {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        report_finsts.iter().all(|finst_id| {
-            crate::service::standalone_exec_state_reporter::final_reports_pending_for_test(
-                query_id, *finst_id,
-            ) == 0
-        }),
-        "cancel drains this query's final profile reports before shutting down node endpoints"
-    );
+    let submitted_finsts = submitted.values().flatten().copied().collect::<Vec<_>>();
+    drain_final_reports_for_submitted_finsts_before_node_shutdown(query_id, &submitted_finsts);
     for node in &mut nodes {
         node.shutdown().expect("shutdown cancelled live Join BE");
     }

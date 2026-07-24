@@ -14,18 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Local runtime-filter registry.
+//! Runtime-filter key helpers.
 //!
 //! Responsibilities:
-//! - Maintains runtime filters available inside one fragment/executor boundary.
-//! - Tracks filter availability and probe eligibility metadata per expression.
+//! - Detects null composite keys while building runtime-filter values.
 //!
-//! Key exported interfaces:
-//! - Types: `LocalRuntimeFilterSet`.
-//!
-//! Current limitations:
-//! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
-//! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
+//! The native runtime-filter data plane is owned by `runtime_filter::service`.
 
 use crate::exec::hash_table::key_builder::GroupKeyArrayView;
 
