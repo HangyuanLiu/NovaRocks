@@ -383,6 +383,8 @@ pub(super) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
 
@@ -390,8 +392,14 @@ mod tests {
     use crate::coordinator::cluster::LiveBackendSnapshot;
     use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
     use crate::exec::expr::ExprArena;
+    use crate::exec::fragment::program::FragmentNodeId;
     use crate::exec::node::ExecNodeKind;
     use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime::fragment::instance::{
+        ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
+    };
+    use crate::runtime::query_context::QueryId;
+    use crate::runtime::query_options::QueryOptions;
     use crate::runtime_filter::deployment::compiler::compile_with_join_progress;
     use crate::runtime_filter::deployment::{DeploymentError, RuntimeFilterDeploymentPolicy};
     use crate::runtime_filter::model::contract::{
@@ -772,7 +780,14 @@ mod tests {
                         endpoint: endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
                         destinations: Vec::new(),
-                        per_exch_num_senders: BTreeMap::new(),
+                        per_exch_num_senders: plan
+                            .edges()
+                            .iter()
+                            .filter(|edge| edge.target_fragment_id == fragment.fragment_id)
+                            .fold(BTreeMap::new(), |mut counts, edge| {
+                                *counts.entry(edge.target_exchange_node_id).or_insert(0) += 1;
+                                counts
+                            }),
                     }],
                 )
             })
@@ -794,6 +809,37 @@ mod tests {
             replica_redundancy: 1,
             materialization: MaterializationPolicy::for_test(),
         }
+    }
+
+    fn cycle_decode_context(
+        scheduling: &SchedulingPlan,
+    ) -> crate::protocol::native::decode::NativePlanDecodeContext {
+        let placement = scheduling
+            .placements_for_fragment_for_test(5)
+            .and_then(|placements| placements.first())
+            .expect("scheduled consumer fragment instance");
+        let exchange_inputs = placement
+            .per_exch_num_senders
+            .iter()
+            .map(|(&node_id, &sender_count)| {
+                let sender_count = usize::try_from(sender_count)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .expect("scheduled exchange sender count is positive");
+                (
+                    FragmentNodeId::new(node_id),
+                    ExchangeInputAssignment::new(sender_count),
+                )
+            })
+            .collect();
+        crate::protocol::native::decode::NativePlanDecodeContext::from_parts(
+            ExchangeInputAssignments::new(exchange_inputs),
+            BTreeMap::new(),
+            QueryOptions::default(),
+            Arc::new(crate::connector::ConnectorRegistry::new()),
+            QueryId { hi: 1, lo: 5 },
+            FragmentInstanceId::new(placement.finst_id),
+        )
     }
 
     /// A non-empty but structurally invalid graph: a producer binding points at a
@@ -946,10 +992,11 @@ mod tests {
             Some(table),
         )
         .expect("decode actual binding table");
+        let scheduling = cycle_scheduling_plan(&plan);
         let decoded = crate::protocol::native::decode::decode_node_with_runtime_filters(
             root,
             &mut ExprArena::default(),
-            &crate::protocol::native::decode::NativePlanDecodeContext::default(),
+            &cycle_decode_context(&scheduling),
             &mut ledger,
         )
         .expect("decode actual sealed consumer node");
@@ -968,7 +1015,6 @@ mod tests {
             }
         ));
 
-        let scheduling = cycle_scheduling_plan(&plan);
         let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
         let policy = cycle_deployment_policy();
         compile_with_join_progress(
