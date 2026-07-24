@@ -17,6 +17,9 @@
 
 use std::fmt;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::runtime_filter::model::validation::GraphValidationError;
 
@@ -36,6 +39,21 @@ use super::output::{
 use super::runtime_filter_progress::{JoinBuildProgressCatalog, build_join_progress_proof_catalog};
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError, RuntimeFilterPlanValidationError};
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_FINAL_PLAN_FAILURE_AFTER_CYCLE_FORCED_MUTATION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_final_plan_failure_after_cycle_forced_mutation_for_test() {
+    FORCE_FINAL_PLAN_FAILURE_AFTER_CYCLE_FORCED_MUTATION.with(|enabled| enabled.set(true));
+}
+
+#[cfg(test)]
+fn take_forced_final_plan_failure_after_cycle_forced_mutation_for_test() -> bool {
+    FORCE_FINAL_PLAN_FAILURE_AFTER_CYCLE_FORCED_MUTATION.with(|enabled| enabled.replace(false))
+}
 
 #[derive(Clone, Debug)]
 struct DistributedPlanData {
@@ -187,6 +205,16 @@ fn apply_cycle_forced_activations_and_revalidate(
 ) -> Result<(), DistributedPlanSealError> {
     apply_cycle_forced_activations(runtime_filter_graph, decisions)
         .map_err(DistributedPlanSealError::CycleForcedActivation)?;
+    #[cfg(test)]
+    if !decisions.is_empty()
+        && take_forced_final_plan_failure_after_cycle_forced_mutation_for_test()
+    {
+        runtime_filter_graph
+            .binding_mut_for_test(decisions[0].consumer_binding)
+            .expect("cycle-forced decision owns an existing consumer")
+            .location
+            .node_id = crate::runtime_filter::model::contract::PlanNodeId::new(999);
+    }
     runtime_filter_graph
         .validate()
         .map_err(DistributedPlanSealError::RuntimeFilterGraph)?;
@@ -354,10 +382,18 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use arrow::datatypes::DataType;
 
+    use crate::common::types::UniqueId;
+    use crate::coordinator::cluster::LiveBackendSnapshot;
+    use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::ExecNodeKind;
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime_filter::deployment::compiler::compile_with_join_progress;
+    use crate::runtime_filter::deployment::{DeploymentError, RuntimeFilterDeploymentPolicy};
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
         ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
@@ -371,6 +407,8 @@ mod tests {
         RuntimeFilterGraph,
     };
     use crate::runtime_filter::model::validation::GraphValidationErrorKind;
+    use crate::runtime_filter::port::identity::DeploymentEpoch;
+    use crate::runtime_filter::port::install::{MaterializationPolicy, RuntimeFilterCoreBudget};
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::fragment::{
@@ -690,6 +728,49 @@ mod tests {
         requirement.activation
     }
 
+    fn cycle_scheduling_plan(plan: &super::DistributedPlan) -> SchedulingPlan {
+        let endpoint = RuntimeEndpoint::from_socket_addr("127.0.0.1:9060".parse().unwrap());
+        let by_fragment = plan
+            .fragments()
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.fragment_id,
+                    vec![FragmentInstancePlacement {
+                        fragment_id: fragment.fragment_id,
+                        instance_index: 0,
+                        finst_id: UniqueId {
+                            hi: 1,
+                            lo: i64::from(fragment.fragment_id),
+                        },
+                        backend_idx: 0,
+                        endpoint: endpoint.clone(),
+                        scan_ranges: BTreeMap::new(),
+                        destinations: Vec::new(),
+                        per_exch_num_senders: BTreeMap::new(),
+                    }],
+                )
+            })
+            .collect();
+        SchedulingPlan {
+            root_fragment_id: plan.root_fragment_id(),
+            by_fragment,
+            root_finst_id: UniqueId {
+                hi: 1,
+                lo: i64::from(plan.root_fragment_id()),
+            },
+            root_backend_idx: 0,
+        }
+    }
+
+    fn cycle_deployment_policy() -> RuntimeFilterDeploymentPolicy {
+        RuntimeFilterDeploymentPolicy {
+            core_budget: RuntimeFilterCoreBudget::new(1024),
+            replica_redundancy: 1,
+            materialization: MaterializationPolicy::for_test(),
+        }
+    }
+
     /// A non-empty but structurally invalid graph: a producer binding points at a
     /// channel that was never inserted. `validate` rejects it with `UnknownChannel`.
     fn graph_with_binding_to_unknown_channel() -> RuntimeFilterGraph {
@@ -817,28 +898,91 @@ mod tests {
     }
 
     #[test]
-    fn seal_keeps_impure_cycle_blocking_for_deployment_validator() {
-        let plan =
-            seal_draft(cycle_draft(JoinKind::LeftOuter)).expect("impure cycle draft must seal");
+    fn sealed_pure_cycle_round_trips_batch_activation_and_rejects_forged_blocking() {
+        let plan = seal_draft(cycle_draft(JoinKind::Inner)).expect("pure cycle draft seals");
+        let prepared = crate::coordinator::prepare::prepare_fragments(
+            &plan,
+            &crate::connector::ConnectorRegistry::new(),
+            None,
+        )
+        .expect("prepare actual sealed cycle plan");
+        let bundle =
+            crate::protocol::native::encode::encode_native_fragment_bundle(&plan, &prepared)
+                .expect("encode actual sealed cycle plan");
+        let encoded = bundle.get(5).expect("consumer fragment");
+        let root = encoded.root.as_ref().expect("consumer root");
+        assert_eq!(root.runtime_filter_binding_ids, vec![2]);
+        let table = encoded
+            .runtime_filter_bindings
+            .as_ref()
+            .expect("actual binding table");
+        let mut ledger = crate::protocol::native::decode::NativeRuntimeFilterDecodeLedger::decode(
+            5,
+            Some(table),
+        )
+        .expect("decode actual binding table");
+        let decoded = crate::protocol::native::decode::decode_node_with_runtime_filters(
+            root,
+            &mut ExprArena::default(),
+            &crate::protocol::native::decode::NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect("decode actual sealed consumer node");
+        let ExecNodeKind::ExchangeSource(exchange) = decoded.node.kind else {
+            panic!("cycle consumer remains an exchange boundary");
+        };
+        let decoded_activation = exchange
+            .native_runtime_filter_specs()
+            .first()
+            .expect("one decoded consumer spec")
+            .activation;
+        assert!(matches!(
+            decoded_activation,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            }
+        ));
 
-        assert_eq!(
-            sealed_consumer_activation(&plan),
-            ConsumerActivation::BlockingSnapshot
-        );
+        let scheduling = cycle_scheduling_plan(&plan);
+        let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
+        let policy = cycle_deployment_policy();
+        compile_with_join_progress(
+            plan.runtime_filter_graph(),
+            &scheduling,
+            plan.edges(),
+            plan.runtime_filter_join_progress(),
+            &backends,
+            &policy,
+            DeploymentEpoch::new(1),
+        )
+        .expect("actual sealed Batch Live graph is deployment-valid");
+
+        let mut forged_graph = plan.runtime_filter_graph().clone();
+        let RuntimeFilterBindingRole::Consumer(requirement) = &mut forged_graph
+            .binding_mut_for_test(BindingId::new(2))
+            .expect("actual graph consumer")
+            .role
+        else {
+            panic!("binding remains a consumer");
+        };
+        requirement.activation = ConsumerActivation::BlockingSnapshot;
+        assert!(matches!(
+            compile_with_join_progress(
+                &forged_graph,
+                &scheduling,
+                plan.edges(),
+                plan.runtime_filter_join_progress(),
+                &backends,
+                &policy,
+                DeploymentEpoch::new(1),
+            ),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
     }
 
     #[test]
     fn seal_activation_stage_rejects_stale_checked_mutation() {
         let mut draft = cycle_draft(JoinKind::Inner);
-        draft
-            .runtime_filter_graph
-            .validate()
-            .expect("initial graph validation must precede activation mutation");
-        super::validation::validate_runtime_filter_graph_against_plan(
-            &draft.runtime_filter_graph,
-            &draft.fragments,
-        )
-        .expect("initial graph/plan ownership must be valid");
         let RuntimeFilterBindingRole::Consumer(requirement) = &mut draft
             .runtime_filter_graph
             .binding_mut_for_test(BindingId::new(2))
@@ -879,35 +1023,20 @@ mod tests {
     }
 
     #[test]
-    fn seal_activation_stage_rejects_final_plan_mismatch_after_initial_validation() {
-        let mut draft = cycle_draft(JoinKind::Inner);
+    fn seal_draft_revalidates_after_policy_mutation() {
+        let draft = cycle_draft(JoinKind::Inner);
         draft
             .runtime_filter_graph
             .validate()
-            .expect("initial graph validation must pass");
+            .expect("initial graph validation passes before production seal");
         super::validation::validate_runtime_filter_graph_against_plan(
             &draft.runtime_filter_graph,
             &draft.fragments,
         )
-        .expect("initial graph/plan ownership must pass");
-
-        let consumer = draft
-            .runtime_filter_graph
-            .binding_mut_for_test(BindingId::new(2))
-            .expect("consumer binding");
-        consumer.location.node_id = PlanNodeId::new(999);
-        draft
-            .runtime_filter_graph
-            .validate()
-            .expect("location mutation stays graph-valid so final plan validation is exercised");
-
-        let error = super::apply_cycle_forced_activations_and_revalidate(
-            &mut draft.runtime_filter_graph,
-            &draft.fragments,
-            &[],
-        )
-        .expect_err("final graph/plan validation must reject a post-mutation location mismatch");
-
+        .expect("initial graph/plan validation passes before production seal");
+        super::force_final_plan_failure_after_cycle_forced_mutation_for_test();
+        let error = seal_draft(draft)
+            .expect_err("post-policy mutation must be rejected by production final validation");
         assert!(matches!(
             error,
             DistributedPlanSealError::RuntimeFilterPlan(
@@ -930,6 +1059,17 @@ mod tests {
             DistributedPlanSealError::RuntimeFilterGraph(graph_error)
                 if graph_error.kind == GraphValidationErrorKind::UnknownChannel
         ));
+    }
+
+    #[test]
+    fn seal_keeps_impure_cycle_blocking_for_deployment_validator() {
+        let plan =
+            seal_draft(cycle_draft(JoinKind::LeftOuter)).expect("impure cycle draft must seal");
+
+        assert_eq!(
+            sealed_consumer_activation(&plan),
+            ConsumerActivation::BlockingSnapshot
+        );
     }
 
     #[test]

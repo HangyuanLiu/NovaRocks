@@ -167,54 +167,6 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
     let distributed = crate::sql::planner::distributed::build::build_distributed_plan(&physical)
         .expect("build Graph-owned RF plan");
     assert_eq!(distributed.runtime_filter_graph().channel_count(), 1);
-    let consumer = distributed
-        .runtime_filter_graph()
-        .bindings()
-        .find_map(|binding| {
-            matches!(
-                binding.role,
-                crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Consumer(_)
-            )
-            .then_some((
-                binding.binding_id,
-                binding.channel_id,
-                binding.location.fragment_id.get(),
-            ))
-        })
-        .expect("fixture has one graph consumer");
-    let distributed =
-        crate::sql::planner::distributed::test_support::rebuild_test_plan(distributed, |builder| {
-            builder
-                .runtime_filter_graph_mut()
-                .replace_consumer_activation_checked(
-                    consumer.0,
-                    consumer.1,
-                    consumer.2,
-                    crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
-                    crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
-                        late_apply:
-                            crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
-                    },
-                )
-                .expect("test fixture only changes graph-owned consumer activation");
-        });
-    assert!(matches!(
-        distributed
-            .runtime_filter_graph()
-            .binding(consumer.0)
-            .expect("consumer binding")
-            .role,
-        crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Consumer(
-            crate::runtime_filter::model::graph::ConsumerRequirement {
-                activation:
-                    crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
-                        late_apply:
-                            crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
-                    },
-                ..
-            }
-        )
-    ));
     let prepared = crate::coordinator::prepare::prepare_fragments(
         &distributed,
         &crate::connector::ConnectorRegistry::new(),

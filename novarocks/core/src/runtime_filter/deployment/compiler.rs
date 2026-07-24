@@ -971,28 +971,6 @@ mod tests {
             materialization: MaterializationPolicy::for_test(),
         };
 
-        let mut batch_live_graph = graph.clone();
-        batch_live_graph
-            .replace_consumer_activation_checked(
-                BindingId::new(11),
-                ChannelId::new(5),
-                2,
-                ConsumerActivation::BlockingSnapshot,
-                ConsumerActivation::NonBlockingLive {
-                    late_apply: LateApplyGranularity::Batch,
-                },
-            )
-            .expect("Batch Live graph mutation is valid");
-        compile(
-            &batch_live_graph,
-            &scheduling,
-            &edges,
-            &backends,
-            &policy,
-            DeploymentEpoch::new(7),
-        )
-        .expect("nonblocking graph must be accepted before strict cycle validation");
-
         let err = compile(
             &graph,
             &scheduling,

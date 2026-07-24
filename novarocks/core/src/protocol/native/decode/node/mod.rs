@@ -3270,47 +3270,6 @@ mod tests {
     }
 
     #[test]
-    fn binding_table_batch_live_activation_drives_decoded_consumer_spec() {
-        let mut wire = one_col_values_node(10);
-        wire.runtime_filter_binding_ids = vec![7];
-        let mut binding =
-            membership_consumer_wire(7, 10, column_ref(1, DataType::Int64), &DataType::Int64);
-        let Some(plan::runtime_filter_binding::Role::Consumer(role)) = binding.role.as_mut() else {
-            panic!("membership fixture must be a consumer");
-        };
-        role.activation = Some(plan::RuntimeFilterConsumerActivation {
-            kind: Some(
-                plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(i32::from(
-                    plan::RuntimeFilterLateApplyGranularity::Batch,
-                )),
-            ),
-        });
-        let table = plan::RuntimeFilterBindingTable {
-            fragment_id: 1,
-            bindings: vec![binding],
-        };
-        let mut ledger = NativeRuntimeFilterDecodeLedger::decode(1, Some(&table))
-            .expect("decode Batch Live consumer table");
-
-        let lowered = decode_node_with_runtime_filters(
-            &wire,
-            &mut ExprArena::default(),
-            &NativePlanDecodeContext::default(),
-            &mut ledger,
-        )
-        .expect("decode Batch Live consumer");
-        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
-            panic!("leaf consumer must remain graph-owned wrapper");
-        };
-        assert_eq!(
-            consumer.bindings[0].activation,
-            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
-                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
-            }
-        );
-    }
-
-    #[test]
     fn exchange_binding_uses_leaf_local_native_consumer_spec() {
         let baseline = lower(&one_col_values_node(10));
         let mut wire = physical_node(
