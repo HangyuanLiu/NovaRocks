@@ -30,8 +30,6 @@ use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
-use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
-use crate::service::grpc_runtime_filter_adapter::encode_runtime_filter_transmission;
 
 pub use crate::proto;
 
@@ -865,51 +863,6 @@ pub fn send_chunks(
         }
         Ok(())
     })?
-}
-
-pub(crate) fn transmit_runtime_filter(
-    dest_host: &str,
-    dest_port: u16,
-    params: RuntimeFilterTransmission,
-) -> Result<(), String> {
-    let dest_host = dest_host.to_string();
-    let port = dest_port;
-    let runtime_handle = data_runtime_handle()?;
-    let params = encode_runtime_filter_transmission(params);
-    runtime_handle.spawn(async move {
-        let ch = match get_or_create_channel(&dest_host, port).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "runtime filter connect failed: dest={}:{} error={}",
-                    dest_host, port, e
-                );
-                return;
-            }
-        };
-        let mut cli = proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
-            .max_encoding_message_size(64 * 1024 * 1024)
-            .max_decoding_message_size(64 * 1024 * 1024);
-        match cli.transmit_runtime_filter(params).await {
-            Ok(resp) => {
-                if let Some(status) = resp.get_ref().status.as_ref()
-                    && status.code != 0
-                {
-                    error!(
-                        "runtime filter send failed: dest={}:{} code={} message={}",
-                        dest_host, port, status.code, status.message
-                    );
-                }
-            }
-            Err(e) => {
-                error!(
-                    "runtime filter send failed: dest={}:{} error={}",
-                    dest_host, port, e
-                );
-            }
-        }
-    });
-    Ok(())
 }
 
 pub fn lookup(

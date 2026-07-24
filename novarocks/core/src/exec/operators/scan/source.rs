@@ -32,31 +32,26 @@ use crate::common::config::{
     scan_submit_fail_timeout_ms,
 };
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::scan::{ScanNode, ScanOp, ScanRuntimeFilterDecision};
+use crate::exec::expr::ExprArena;
+use crate::exec::node::scan::{ScanNode, ScanOp};
 use crate::exec::operators::runtime_filter::{
     NativeOrderedLiveConsumerSet, NativeRuntimeFilterConsumerSet,
 };
-use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, warn};
-use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-use crate::runtime::runtime_filter_observability::{
-    QueryKey, RfLifecycleHandle, RuntimeFilterLifecycleRegistry,
-};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::scan_executor::scan_executor;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::dispatch::{ScanDispatchState, SharedScanState};
 use super::runner::{ScanAsyncRunner, run_scan_worker};
-use super::types::{ScanAsyncState, ScanRuntimeFilterProbe};
+use super::types::ScanAsyncState;
 
 /// Factory for scan source operators that consume async scan output.
 pub struct ScanSourceFactory {
@@ -71,19 +66,9 @@ pub struct ScanSourceFactory {
     arena: Arc<ExprArena>,
 }
 
-enum ScanSourceRuntimeFilterExecution {
-    Native {
-        blocking_consumers: NativeRuntimeFilterConsumerSet,
-        ordered_live_consumers: NativeOrderedLiveConsumerSet,
-    },
-    #[cfg(feature = "compat")]
-    Compat {
-        runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
-        runtime_filter_exprs: HashMap<i32, ExprId>,
-        runtime_filters_expected: usize,
-        local_rf_waiting_set: Vec<i32>,
-        runtime_filter_hub: Arc<RuntimeFilterHub>,
-    },
+struct ScanSourceRuntimeFilterExecution {
+    blocking_consumers: NativeRuntimeFilterConsumerSet,
+    ordered_live_consumers: NativeOrderedLiveConsumerSet,
 }
 
 impl ScanSourceFactory {
@@ -119,7 +104,7 @@ impl ScanSourceFactory {
             scan,
             op,
             arena,
-            ScanSourceRuntimeFilterExecution::Native {
+            ScanSourceRuntimeFilterExecution {
                 blocking_consumers,
                 ordered_live_consumers,
             },
@@ -157,42 +142,9 @@ impl ScanSourceFactory {
             scan,
             op,
             arena,
-            ScanSourceRuntimeFilterExecution::Native {
+            ScanSourceRuntimeFilterExecution {
                 blocking_consumers,
                 ordered_live_consumers,
-            },
-        )
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn new_compat(
-        scan: ScanNode,
-        op: Arc<dyn ScanOp>,
-        runtime_filter_hub: Arc<RuntimeFilterHub>,
-        arena: Arc<ExprArena>,
-    ) -> Self {
-        let runtime_filter_specs = scan.runtime_filter_specs().to_vec();
-        let runtime_filter_exprs = runtime_filter_specs
-            .iter()
-            .map(|spec| (spec.filter_id, spec.expr_id))
-            .collect();
-        let runtime_filters_expected = runtime_filter_specs.len();
-        if runtime_filters_expected > 0
-            && let Some(node_id) = scan.node_id()
-        {
-            runtime_filter_hub.register_probe_specs(node_id, &runtime_filter_specs);
-        }
-        let local_rf_waiting_set = scan.local_rf_waiting_set().to_vec();
-        Self::new_in_mode(
-            scan,
-            op,
-            arena,
-            ScanSourceRuntimeFilterExecution::Compat {
-                runtime_filter_specs,
-                runtime_filter_exprs,
-                runtime_filters_expected,
-                local_rf_waiting_set,
-                runtime_filter_hub,
             },
         )
     }
@@ -229,37 +181,6 @@ impl ScanSourceFactory {
             arena,
         }
     }
-
-    #[cfg(feature = "compat")]
-    fn local_rf_deps(&self) -> Vec<DependencyHandle> {
-        let ScanSourceRuntimeFilterExecution::Compat {
-            local_rf_waiting_set,
-            runtime_filter_hub,
-            ..
-        } = &self.runtime_filter_execution
-        else {
-            return Vec::new();
-        };
-        if local_rf_waiting_set.is_empty() {
-            return Vec::new();
-        }
-        let mut deps = Vec::new();
-        let mut seen = HashSet::new();
-        for node_id in local_rf_waiting_set {
-            if seen.insert(*node_id) {
-                if let Some(dep) = runtime_filter_hub.local_dependency_if_exists(*node_id) {
-                    deps.push(dep);
-                } else {
-                    debug!(
-                        "scan skip unknown local RF dependency: node_id={:?} waiting_build_node_id={}",
-                        self.scan.node_id(),
-                        node_id
-                    );
-                }
-            }
-        }
-        deps
-    }
 }
 
 impl OperatorFactory for ScanSourceFactory {
@@ -268,42 +189,6 @@ impl OperatorFactory for ScanSourceFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        let (runtime_filter_probe, local_rf_deps, runtime_filter_exprs, runtime_filters_expected) =
-            match &self.runtime_filter_execution {
-                ScanSourceRuntimeFilterExecution::Native { .. } => {
-                    (None, Vec::new(), HashMap::new(), 0)
-                }
-                #[cfg(feature = "compat")]
-                ScanSourceRuntimeFilterExecution::Compat {
-                    runtime_filter_exprs,
-                    runtime_filters_expected,
-                    local_rf_waiting_set,
-                    runtime_filter_hub,
-                    ..
-                } => {
-                    let probe = if *runtime_filters_expected > 0 {
-                        self.scan.node_id().map(|node_id| {
-                            ScanRuntimeFilterProbe::new(runtime_filter_hub.register_probe(node_id))
-                        })
-                    } else {
-                        None
-                    };
-                    if !local_rf_waiting_set.is_empty() {
-                        debug!(
-                            "ScanSource local RF wait: node_id={:?} driver_id={} waiting_set={:?}",
-                            self.scan.node_id(),
-                            driver_id,
-                            local_rf_waiting_set
-                        );
-                    }
-                    (
-                        probe,
-                        self.local_rf_deps(),
-                        runtime_filter_exprs.clone(),
-                        *runtime_filters_expected,
-                    )
-                }
-            };
         let node_id = self.scan.node_id().unwrap_or(-1);
         let label = format!("scan_async_queue node={} driver={}", node_id, driver_id);
         Box::new(ScanSourceOperator {
@@ -313,27 +198,13 @@ impl OperatorFactory for ScanSourceFactory {
             state: self.state.clone(),
             driver_id,
             dispatch: None,
-            runtime_filter_probe,
-            local_rf_deps,
-            runtime_filter_exprs,
-            runtime_filters_expected,
-            runtime_filter_lifecycle_handles: HashMap::new(),
             arena: Arc::clone(&self.arena),
-            native_runtime_filter_consumers: match &self.runtime_filter_execution {
-                ScanSourceRuntimeFilterExecution::Native {
-                    blocking_consumers, ..
-                } => Some(blocking_consumers.clone()),
-                #[cfg(feature = "compat")]
-                ScanSourceRuntimeFilterExecution::Compat { .. } => None,
-            },
-            native_ordered_live_consumers: match &self.runtime_filter_execution {
-                ScanSourceRuntimeFilterExecution::Native {
-                    ordered_live_consumers,
-                    ..
-                } => Some(ordered_live_consumers.clone()),
-                #[cfg(feature = "compat")]
-                ScanSourceRuntimeFilterExecution::Compat { .. } => None,
-            },
+            native_runtime_filter_consumers: Some(
+                self.runtime_filter_execution.blocking_consumers.clone(),
+            ),
+            native_ordered_live_consumers: Some(
+                self.runtime_filter_execution.ordered_live_consumers.clone(),
+            ),
             profiles: None,
             async_state: ScanAsyncState::new(operator_buffer_chunks().max(1), label),
             async_runners: Arc::new(Mutex::new(Vec::new())),
@@ -364,11 +235,6 @@ struct ScanSourceOperator {
     state: SharedScanState,
     driver_id: i32,
     dispatch: Option<Arc<ScanDispatchState>>,
-    runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
-    local_rf_deps: Vec<DependencyHandle>,
-    runtime_filter_exprs: HashMap<i32, ExprId>,
-    runtime_filters_expected: usize,
-    runtime_filter_lifecycle_handles: HashMap<i32, RfLifecycleHandle>,
     arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
     native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
@@ -388,15 +254,6 @@ struct ScanSourceOperator {
 }
 
 impl ScanSourceOperator {
-    fn local_rf_dependency(&self) -> Option<DependencyHandle> {
-        for dep in &self.local_rf_deps {
-            if !dep.is_ready() {
-                return Some(dep.clone());
-            }
-        }
-        None
-    }
-
     fn register_row_position(&mut self, state: &RuntimeState) -> Result<(), String> {
         if self.row_position_registered {
             return Ok(());
@@ -526,70 +383,17 @@ impl ScanSourceOperator {
         }
     }
 
-    /// Whether morsels must be materialized only after runtime filters are
-    /// available. Mirrors the old `ScanNode::materialize_morsels_after_runtime_filters`:
-    /// gated by the node's RF specs AND the bound op's own decision.
-    fn materialize_morsels_after_runtime_filters(&self) -> bool {
-        !self.scan.runtime_filter_specs().is_empty()
-            && self.op.materialize_morsels_after_runtime_filters()
-    }
-
-    fn runtime_filter_decision_ready_for_dispatch(&self) -> bool {
-        if !self.materialize_morsels_after_runtime_filters() {
-            return true;
-        }
-        if self.runtime_filters_expected == 0 {
-            return true;
-        }
-        let Some(rf) = self.runtime_filter_probe.as_ref() else {
-            return true;
-        };
-        match rf.dependency_or_timeout() {
-            Some(dep) => dep.is_ready(),
-            None => true,
-        }
-    }
-
     fn build_shared_dispatch(&self) -> Result<Arc<ScanDispatchState>, String> {
         let scan = self.scan.clone();
         let op = Arc::clone(&self.op);
         // Static gate lifted off the node; the bound op no longer knows it.
         let accept_empty = scan.accept_empty_scan_ranges();
-        let materialize_after_runtime_filters = self.materialize_morsels_after_runtime_filters();
-        let async_state = Arc::clone(&self.async_state);
-        let runtime_filter_probe = self.runtime_filter_probe.clone();
-        let runtime_filters_expected = self.runtime_filters_expected;
-        let runtime_filter_decision = self.state.runtime_filter_decision.clone();
-        let materialization_profile = self
-            .profiles
-            .as_ref()
-            .map(|profiles| profiles.common.clone());
         let dispatch_result = self
             .state
             .dispatch
             .get_or_init(move || {
-                let acquired = if materialize_after_runtime_filters {
-                    runtime_filter_decision.get_or_acquire(
-                        async_state.as_ref(),
-                        runtime_filter_probe.as_ref(),
-                        runtime_filters_expected,
-                    )?
-                } else {
-                    None
-                };
-                let morsels = if materialize_after_runtime_filters {
-                    let decision = ScanRuntimeFilterDecision::from_acquired(acquired.as_ref());
-                    let mut morsels = op.build_morsels_with_runtime_filters(decision)?;
-                    morsels.ensure_non_empty(accept_empty);
-                    if let Some(profile) = materialization_profile.as_ref() {
-                        op.flush_morsel_materialization_profile(profile);
-                    }
-                    morsels
-                } else {
-                    let mut morsels = op.build_morsels()?;
-                    morsels.ensure_non_empty(accept_empty);
-                    morsels
-                };
+                let mut morsels = op.build_morsels()?;
+                morsels.ensure_non_empty(accept_empty);
                 if morsels.has_more && !op.supports_incremental_scan_ranges() {
                     let node_id = scan.node_id().unwrap_or(-1);
                     return Err(format!(
@@ -608,9 +412,6 @@ impl ScanSourceOperator {
         if let Some(dispatch) = self.current_dispatch()? {
             self.configure_dispatch(Arc::clone(&dispatch))?;
             return Ok(Some(dispatch));
-        }
-        if !self.runtime_filter_decision_ready_for_dispatch() {
-            return Ok(None);
         }
         let dispatch = self.build_shared_dispatch()?;
         self.configure_dispatch(Arc::clone(&dispatch))?;
@@ -632,23 +433,16 @@ impl ScanSourceOperator {
             return;
         }
         for _ in 0..max_io_tasks {
-            let mut runner = ScanAsyncRunner::new(
+            let runner = ScanAsyncRunner::new(
                 self.name.clone(),
                 self.scan.clone(),
                 Arc::clone(&self.op),
                 Arc::clone(&dispatch),
-                self.state.runtime_filter_decision.clone(),
-                self.runtime_filter_probe.clone(),
-                self.runtime_filter_exprs.clone(),
-                self.runtime_filters_expected,
                 self.native_runtime_filter_consumers.clone(),
                 self.native_ordered_live_consumers.clone(),
                 Arc::clone(&self.arena),
                 self.profiles.clone(),
                 self.driver_id,
-            );
-            runner.set_runtime_filter_lifecycle_handles(
-                self.runtime_filter_lifecycle_handles.clone(),
             );
             guard.push(runner);
         }
@@ -676,31 +470,6 @@ impl ScanSourceOperator {
         }));
     }
 
-    fn bind_runtime_filter_lifecycle(&mut self, state: &RuntimeState) {
-        let Some(query_id) = state.query_id() else {
-            self.runtime_filter_lifecycle_handles.clear();
-            self.propagate_runtime_filter_lifecycle_handles();
-            return;
-        };
-        let recorder = RuntimeFilterLifecycleRegistry::global()
-            .recorder(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
-        self.runtime_filter_lifecycle_handles = self
-            .runtime_filter_exprs
-            .keys()
-            .map(|filter_id| (*filter_id, recorder.filter(*filter_id)))
-            .collect();
-        self.propagate_runtime_filter_lifecycle_handles();
-    }
-
-    fn propagate_runtime_filter_lifecycle_handles(&mut self) {
-        let mut runners = self.async_runners.lock().expect("scan runner lock");
-        for runner in runners.iter_mut() {
-            runner.set_runtime_filter_lifecycle_handles(
-                self.runtime_filter_lifecycle_handles.clone(),
-            );
-        }
-    }
-
     fn propagate_native_ordered_live_consumers(&mut self) {
         let mut runners = self.async_runners.lock().expect("scan runner lock");
         for runner in runners.iter_mut() {
@@ -715,9 +484,6 @@ impl ScanSourceOperator {
     fn maybe_start_async_scan(&self) {
         // Scan tasks are short-lived: stop when the buffer is full and resume on demand.
         if self.async_state.is_canceled() || self.async_state.is_finished() {
-            return;
-        }
-        if self.local_rf_dependency().is_some() {
             return;
         }
         let dispatch = match self.ensure_dispatch_initialized() {
@@ -746,12 +512,6 @@ impl ScanSourceOperator {
                 self.async_state.mark_finished();
                 return;
             }
-        }
-        if let Some(rf) = self.runtime_filter_probe.as_ref()
-            && let Some(dep) = rf.dependency_or_timeout()
-            && !dep.is_ready()
-        {
-            return;
         }
         if !self.async_state.has_capacity() {
             return;
@@ -836,38 +596,6 @@ impl ScanSourceOperator {
         }
     }
 
-    fn should_wait_runtime_filters(&self) -> bool {
-        // Avoid blocking on runtime filters when this driver already has output
-        // or has no remaining morsels to process.
-        if self.async_state.is_finished() || self.async_state.has_output() {
-            return false;
-        }
-        let dispatch = match self.current_dispatch() {
-            Ok(Some(dispatch)) => dispatch,
-            Ok(None) => return true,
-            Err(err) => {
-                self.async_state.set_error(err);
-                return false;
-            }
-        };
-        let queue_empty = dispatch.queue_empty();
-        if !queue_empty {
-            return true;
-        }
-        if dispatch.has_more() {
-            return true;
-        }
-        if self.inflight_tasks.load(Ordering::Acquire) != 0 {
-            return true;
-        }
-        {
-            let guard = self.async_runners.lock().expect("scan runner lock");
-            guard
-                .iter()
-                .any(|runner| runner.pending_chunk.is_some() || runner.morsel_iter.is_some())
-        }
-    }
-
     fn try_acquire_inflight(&self, max_io_tasks: usize) -> bool {
         let mut current = self.inflight_tasks.load(Ordering::Acquire);
         loop {
@@ -901,11 +629,6 @@ impl Operator for ScanSourceOperator {
             return Ok(());
         }
 
-        if self.materialize_morsels_after_runtime_filters() {
-            self.max_io_tasks_for_scan()?;
-            return Ok(());
-        }
-
         let Some(state) = self.ensure_dispatch_initialized()? else {
             return Ok(());
         };
@@ -927,7 +650,6 @@ impl Operator for ScanSourceOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
-        self.bind_runtime_filter_lifecycle(state);
         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
             consumers.set_wait_timeout(
                 state
@@ -1041,26 +763,6 @@ impl ProcessorOperator for ScanSourceOperator {
     fn precondition_dependency(
         &self,
     ) -> Option<crate::exec::pipeline::dependency::DependencyHandle> {
-        // If the scan has already exhausted all morsels, do not block on
-        // runtime filters or local RF. This avoids empty-range drivers
-        // getting stuck behind dependencies and never sending EOS.
-        if self.is_finished() {
-            return None;
-        }
-        // 先等本地 RF（local build 端）
-        if let Some(dep) = self.local_rf_dependency() {
-            return Some(dep);
-        }
-        // 再等 RuntimeFilterHub 的依赖
-        if let Some(rf) = self.runtime_filter_probe.as_ref()
-            && let Some(dep) = rf.dependency_or_timeout()
-            && !dep.is_ready()
-        {
-            if !self.should_wait_runtime_filters() {
-                return None;
-            }
-            return Some(dep);
-        }
         None
     }
 }
@@ -1079,17 +781,10 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprId};
-    use crate::exec::node::scan::{
-        ScanMorsel, ScanMorsels, ScanNode, ScanOp, ScanRuntimeFilterDecision,
-    };
+    use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanNode, ScanOp};
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::exec::runtime_filter::{
-        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType,
-        RuntimeMembershipFilter, RuntimeMinMaxFilter,
-    };
     use crate::runtime::io::io_executor;
-    use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterHub};
 
     use super::ScanSourceFactory;
     use std::thread;
@@ -1140,73 +835,6 @@ mod tests {
         }
     }
 
-    struct RecordingScanOp {
-        plain_calls: AtomicUsize,
-        runtime_filter_calls: AtomicUsize,
-        decisions: Mutex<Vec<String>>,
-    }
-
-    impl RecordingScanOp {
-        fn new() -> Self {
-            Self {
-                plain_calls: AtomicUsize::new(0),
-                runtime_filter_calls: AtomicUsize::new(0),
-                decisions: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn build_plain_calls(&self) -> usize {
-            self.plain_calls.load(Ordering::Acquire)
-        }
-
-        fn build_with_runtime_filter_calls(&self) -> usize {
-            self.runtime_filter_calls.load(Ordering::Acquire)
-        }
-
-        fn decisions(&self) -> Vec<String> {
-            self.decisions.lock().expect("decision lock").clone()
-        }
-    }
-
-    impl ScanOp for RecordingScanOp {
-        fn execute_iter(
-            &self,
-            _morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
-            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
-        ) -> Result<crate::exec::node::BoxedExecIter, String> {
-            Ok(Box::new(std::iter::empty()))
-        }
-
-        fn build_morsels(&self) -> Result<ScanMorsels, String> {
-            self.plain_calls.fetch_add(1, Ordering::AcqRel);
-            Ok(ScanMorsels::new(vec![test_file_morsel("plain")], false))
-        }
-
-        fn materialize_morsels_after_runtime_filters(&self) -> bool {
-            true
-        }
-
-        fn build_morsels_with_runtime_filters(
-            &self,
-            decision: ScanRuntimeFilterDecision<'_>,
-        ) -> Result<ScanMorsels, String> {
-            self.runtime_filter_calls.fetch_add(1, Ordering::AcqRel);
-            let decision = match decision.acquired() {
-                Some(AcquiredRuntimeFilters::Complete(_)) => "complete".to_string(),
-                Some(AcquiredRuntimeFilters::Unavailable(reason)) => {
-                    format!("unavailable:{reason:?}")
-                }
-                None => "none".to_string(),
-            };
-            self.decisions.lock().expect("decision lock").push(decision);
-            Ok(ScanMorsels::new(
-                vec![test_file_morsel("runtime-filter")],
-                false,
-            ))
-        }
-    }
-
     struct PlainScanOp {
         plain_calls: AtomicUsize,
     }
@@ -1237,29 +865,6 @@ mod tests {
             self.plain_calls.fetch_add(1, Ordering::AcqRel);
             Ok(ScanMorsels::new(vec![test_file_morsel("plain")], false))
         }
-    }
-
-    fn runtime_filter_probe_spec(filter_id: i32) -> crate::exec::node::RuntimeFilterProbeSpec {
-        crate::exec::node::RuntimeFilterProbeSpec {
-            filter_id,
-            expr_id: ExprId(0),
-            slot_id: SlotId::new(3),
-            data_type: DataType::Int32,
-        }
-    }
-
-    fn passthrough_membership_filter(filter_id: i32) -> RuntimeMembershipFilter {
-        let min_max =
-            RuntimeMinMaxFilter::full_range(RuntimeFilterType::Int32).expect("min/max range");
-        RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
-            filter_id,
-            SlotId::new(3),
-            RuntimeFilterType::Int32,
-            false,
-            RUNTIME_FILTER_JOIN_MODE_BROADCAST,
-            0,
-            min_max,
-        ))
     }
 
     impl ScanOp for TestMorselScanOp {

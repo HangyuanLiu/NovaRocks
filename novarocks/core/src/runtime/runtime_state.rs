@@ -27,7 +27,6 @@ use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::sink_commit;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
@@ -42,7 +41,6 @@ pub struct RuntimeState {
     error_state: std::sync::Arc<RuntimeErrorState>,
     last_report_exec_state_ns: AtomicI64,
     query_id: Option<QueryId>,
-    runtime_filter_params: Option<RuntimeFilterParams>,
     fragment_instance_id: Option<UniqueId>,
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
@@ -77,7 +75,6 @@ impl Default for RuntimeState {
             error_state: std::sync::Arc::new(RuntimeErrorState::default()),
             last_report_exec_state_ns: AtomicI64::new(0),
             query_id: None,
-            runtime_filter_params: None,
             fragment_instance_id: None,
             backend_num: None,
             mem_tracker: None,
@@ -98,7 +95,6 @@ impl Clone for RuntimeState {
                 self.last_report_exec_state_ns.load(Ordering::Acquire),
             ),
             query_id: self.query_id,
-            runtime_filter_params: self.runtime_filter_params.clone(),
             fragment_instance_id: self.fragment_instance_id,
             backend_num: self.backend_num,
             mem_tracker: self.mem_tracker.clone(),
@@ -114,7 +110,6 @@ impl RuntimeState {
         query_options: Option<QueryOptions>,
         cache_options: Option<crate::cache::CacheOptions>,
         query_id: Option<QueryId>,
-        runtime_filter_params: Option<RuntimeFilterParams>,
         fragment_instance_id: Option<UniqueId>,
         backend_num: Option<i32>,
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
@@ -141,7 +136,6 @@ impl RuntimeState {
             error_state: std::sync::Arc::new(RuntimeErrorState::default()),
             last_report_exec_state_ns: AtomicI64::new(0),
             query_id,
-            runtime_filter_params,
             fragment_instance_id,
             backend_num,
             mem_tracker,
@@ -339,10 +333,6 @@ impl RuntimeState {
 
     pub(crate) fn spill_manager(&self) -> Option<std::sync::Arc<QuerySpillManager>> {
         self.spill_manager.clone()
-    }
-
-    pub(crate) fn runtime_filter_params(&self) -> Option<&RuntimeFilterParams> {
-        self.runtime_filter_params.as_ref()
     }
 
     pub(crate) fn runtime_filter_scan_wait_timeout(&self) -> Option<Duration> {

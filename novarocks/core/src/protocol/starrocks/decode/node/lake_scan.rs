@@ -34,7 +34,7 @@ use crate::exec::row_position::{
 use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
 };
-use crate::novarocks_logging::{debug, warn};
+use crate::novarocks_logging::debug;
 use crate::protocol::starrocks::decode::expr::parse_min_max_conjuncts;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
@@ -42,13 +42,11 @@ use crate::protocol::starrocks::decode::layout::{
     slot_display_name_from_desc,
 };
 use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_dicts;
-use crate::protocol::starrocks::decode::node::{
-    Lowered, QueryGlobalDictMap, ScanRangeCarrier, local_rf_waiting_set,
-};
+use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, ScanRangeCarrier};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRange;
-use crate::thrift::{descriptors, plan_nodes, runtime_filter, types};
+use crate::thrift::{descriptors, plan_nodes, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 ///
@@ -461,62 +459,7 @@ pub(crate) fn lower_lake_scan_node(
         node.node_id, tuple_id, compat_output_slots, compat_row_position_slots
     );
 
-    // Parse TOPN_FILTER probe descriptors to build filter_id -> column_name map.
-    let mut topn_filter_column_map = HashMap::new();
-    if let Some(descs) = node
-        .probe_runtime_filters
-        .as_ref()
-        .filter(|v| !v.is_empty())
-    {
-        for desc in descs {
-            if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
-                continue;
-            }
-            let Some(filter_id) = desc.filter_id else {
-                warn!(
-                    "TOPN_FILTER probe descriptor missing filter_id: node_id={}",
-                    node.node_id
-                );
-                continue;
-            };
-            // Look up the probe expression targeted at this scan node.
-            let probe_column_name = desc
-                .plan_node_id_to_target_expr
-                .as_ref()
-                .and_then(|m| m.get(&node.node_id))
-                .and_then(|probe_expr| probe_expr.nodes.first())
-                .and_then(|probe_node| probe_node.slot_ref.as_ref())
-                .and_then(|slot_ref| {
-                    let slot_id = slot_ref.slot_id;
-                    // Resolve slot_id to column name via the descriptor table.
-                    desc_tbl
-                        .slot_descriptors
-                        .as_ref()
-                        .and_then(|slots| {
-                            slots
-                                .iter()
-                                .find(|sd| sd.id == Some(slot_id))
-                                .and_then(|sd| sd.col_name.clone())
-                        })
-                        .or_else(|| Some(format!("__slot_{}", slot_id)))
-                });
-            match probe_column_name {
-                Some(name) if !name.is_empty() => {
-                    debug!(
-                        "LAKE_SCAN_NODE node_id={} topn_filter_id={} -> column={}",
-                        node.node_id, filter_id, name
-                    );
-                    topn_filter_column_map.insert(filter_id, name);
-                }
-                _ => {
-                    warn!(
-                        "TOPN_FILTER probe filter_id={} could not resolve column name for node_id={}",
-                        filter_id, node.node_id
-                    );
-                }
-            }
-        }
-    }
+    let topn_filter_column_map = HashMap::new();
 
     let cfg = StarRocksScanConfig {
         db_name: normalize_optional_table_name(&db_name, "__unknown_db__"),
@@ -570,7 +513,6 @@ pub(crate) fn lower_lake_scan_node(
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_accept_empty_scan_ranges(true)
-        .with_local_rf_waiting_set(local_rf_waiting_set(node))
         .with_lake_row_position(lake_row_position_spec)
         .with_lake_glm_info(lake_glm_info);
     let scan_lowered = Lowered {

@@ -41,7 +41,6 @@ include "Types.thrift"
 include "Opcodes.thrift"
 include "Descriptors.thrift"
 include "Partitions.thrift"
-include "RuntimeFilter.thrift"
 include "CloudConfiguration.thrift"
 include "DataCache.thrift"
 
@@ -831,10 +830,6 @@ struct THashJoinNode {
   21: optional string sql_join_predicates
   22: optional string sql_predicates
 
-  // runtime filters built by this node.
-  50: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
-  51: optional bool build_runtime_filters_from_planner;
-
   52: optional TJoinDistributionMode distribution_mode;
   53: optional list<Exprs.TExpr> partition_exprs
   54: optional list<Types.TSlotId> output_columns
@@ -872,10 +867,6 @@ struct TMergeJoinNode {
   21: optional string sql_join_predicates
   22: optional string sql_predicates
 
-  // runtime filters built by this node.
-  50: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
-  51: optional bool build_runtime_filters_from_planner;
-
   52: optional TJoinDistributionMode distribution_mode;
   53: optional list<Exprs.TExpr> partition_exprs
   54: optional list<Types.TSlotId> output_columns
@@ -883,7 +874,6 @@ struct TMergeJoinNode {
 
 struct TNestLoopJoinNode {
     1: optional TJoinOp join_op
-    2: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
     3: optional list<Exprs.TExpr> join_conjuncts
     4: optional string sql_join_conjuncts
     5: optional bool interpolate_passthrough = false
@@ -959,8 +949,6 @@ struct TAggregationNode {
   // enable runtime limit, pipelines share one limit
   29: optional bool enable_pipeline_share_limit = false
 
-  30: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters
-
   31: optional list<Exprs.TExpr> group_by_min_max
 
 }
@@ -1031,7 +1019,6 @@ struct TSortNode {
   23: optional list<Exprs.TExpr> partition_exprs
   24: optional i64 partition_limit
   25: optional TTopNType topn_type;
-  26: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
   27: optional i64 max_buffered_rows;
   28: optional i64 max_buffered_bytes;
   29: optional bool late_materialization;
@@ -1386,7 +1373,6 @@ struct TDecodeNode {
 }
 
 struct TCrossJoinNode {
-    1: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
 }
 
 struct TTableFunctionNode {
@@ -1780,11 +1766,7 @@ struct TPlanNode {
   52: optional THdfsScanNode hdfs_scan_node
   53: optional TProjectNode project_node
   54: optional TTableFunctionNode table_function_node
-  // runtime filters be probed by this node.
-  55: optional list<RuntimeFilter.TRuntimeFilterDescription> probe_runtime_filters
   56: optional TDecodeNode decode_node
-  // a set of TPlanNodeIds of whom generate local runtime filters that take effects on this node
-  57: optional set<Types.TPlanNodeId> local_rf_waiting_set
   // Columns that null values can be filtered out
   58: optional list<Types.TSlotId> filter_null_value_columns;
   // for outer join and cross join

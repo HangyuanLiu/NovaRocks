@@ -35,7 +35,6 @@ use super::build_requirements::{
 use super::join_hash_map::build_store::BuildStore;
 use super::join_hash_map::method::JoinHashMap;
 use crate::exec::chunk::Chunk;
-use crate::exec::runtime_filter::LocalRuntimeFilterSet;
 
 #[derive(Clone)]
 /// Materialized build-side artifact consumed by join probe operators.
@@ -46,26 +45,10 @@ pub(crate) struct JoinBuildArtifact {
     pub(crate) build_row_count: usize,
     pub(crate) build_has_null_key: bool,
     pub(crate) build_null_key_rows: Option<Arc<Vec<u32>>>,
-    runtime_filter_execution: JoinBuildArtifactRuntimeFilterExecution,
 }
 
 #[derive(Clone)]
-enum JoinBuildArtifactRuntimeFilterExecution {
-    Native,
-    #[cfg(feature = "compat")]
-    Compat {
-        local_filters: Option<Arc<LocalRuntimeFilterSet>>,
-    },
-}
-
-#[derive(Clone)]
-pub(crate) enum JoinBuildRuntimeFilterView {
-    Native,
-    #[cfg(feature = "compat")]
-    Compat {
-        local_filters: Option<Arc<LocalRuntimeFilterSet>>,
-    },
-}
+pub(crate) struct JoinBuildRuntimeFilterView;
 
 impl JoinBuildArtifact {
     pub(crate) fn new_native(
@@ -83,32 +66,7 @@ impl JoinBuildArtifact {
             build_row_count,
             build_has_null_key,
             build_null_key_rows,
-            runtime_filter_execution: JoinBuildArtifactRuntimeFilterExecution::Native,
         }
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn new_compat(
-        provided: BuildComponentRequirements,
-        build_store: Option<BuildStore>,
-        build_table: Option<JoinHashMap>,
-        build_row_count: usize,
-        build_has_null_key: bool,
-        build_null_key_rows: Option<Arc<Vec<u32>>>,
-        runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
-    ) -> Self {
-        let mut artifact = Self::new_native(
-            provided,
-            build_store,
-            build_table,
-            build_row_count,
-            build_has_null_key,
-            build_null_key_rows,
-        );
-        artifact.runtime_filter_execution = JoinBuildArtifactRuntimeFilterExecution::Compat {
-            local_filters: runtime_filters,
-        };
-        artifact
     }
 
     pub(crate) fn validate_components(
@@ -201,15 +159,7 @@ impl BuildView {
     }
 
     pub(crate) fn runtime_filter_view(&self) -> JoinBuildRuntimeFilterView {
-        match &self.artifact.runtime_filter_execution {
-            JoinBuildArtifactRuntimeFilterExecution::Native => JoinBuildRuntimeFilterView::Native,
-            #[cfg(feature = "compat")]
-            JoinBuildArtifactRuntimeFilterExecution::Compat { local_filters } => {
-                JoinBuildRuntimeFilterView::Compat {
-                    local_filters: local_filters.clone(),
-                }
-            }
-        }
+        JoinBuildRuntimeFilterView
     }
 }
 

@@ -23,7 +23,6 @@ use crate::exec::node::ExecNode;
 use crate::exec::node::runtime_filter::{
     NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
 };
-use crate::exec::runtime_filter::RuntimeFilterType;
 use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 use arrow::datatypes::DataType;
 
@@ -67,26 +66,6 @@ pub struct AggFunction {
     pub order: AggOrderSpec,
 }
 
-/// Spec for a TopN runtime filter built by the AGG operator.
-/// `expr_order` indexes into the group-by columns to select which column
-/// to compute min/max from. The FE bug hardcodes this to 0.
-#[derive(Clone, Debug)]
-pub struct TopNRuntimeFilterSpec {
-    pub filter_id: i32,
-    pub expr_order: usize,
-    /// The internal runtime filter type of the build expression.
-    pub(crate) build_type: RuntimeFilterType,
-    /// The column name on the probe (scan) side that this filter targets.
-    pub probe_column_name: String,
-    /// TopN limit — filter is only published when group count >= limit.
-    pub limit: usize,
-    /// Sort direction of the TopN (from FE). true = ASC ⇒ upper-bound-only filter.
-    pub is_asc: bool,
-    /// Null ordering of the TopN (from FE); reserved for future null handling.
-    #[allow(dead_code)]
-    pub is_nulls_first: bool,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct NativeAggregateTopNProducerSpec {
     pub(crate) binding_id: u32,
@@ -101,14 +80,8 @@ pub(crate) struct NativeAggregateTopNProducerSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum AggregateRuntimeFilterSpec {
-    Native {
-        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
-    },
-    #[cfg(feature = "compat")]
-    Compat {
-        legacy_topn_specs: Vec<TopNRuntimeFilterSpec>,
-    },
+pub(crate) struct AggregateRuntimeFilterSpec {
+    pub(crate) topn_producers: Vec<NativeAggregateTopNProducerSpec>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

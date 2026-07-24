@@ -17,12 +17,10 @@
 use crate::exec::expr::ExprArena;
 use crate::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
-    StreamingPreaggregationMode, TopNRuntimeFilterSpec,
+    StreamingPreaggregationMode,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::exec::runtime_filter::RuntimeFilterType;
 
-use crate::novarocks_logging::warn;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::{lower_expr_node_at, lower_t_expr_at};
@@ -32,7 +30,7 @@ use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
 use crate::runtime::query_options::QueryOptions;
 use crate::thrift::descriptors;
 
-use crate::thrift::{exprs, plan_nodes, runtime_filter};
+use crate::thrift::{exprs, plan_nodes};
 use arrow::datatypes::{DataType, Field, Fields};
 
 /// Lower an AGGREGATION_NODE plan node to a `Lowered` ExecNode.
@@ -177,125 +175,6 @@ pub(crate) fn lower_aggregate_node(
         StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
     })?;
 
-    // Parse TopN runtime filter specs from the aggregation node.
-    let mut topn_rf_specs = Vec::new();
-    if let Some(filters) = agg.build_runtime_filters.as_ref().filter(|v| !v.is_empty()) {
-        for (filter_index, desc) in filters.iter().enumerate() {
-            let filter_path = payload_path
-                .clone()
-                .field("build_runtime_filters")
-                .index(filter_index);
-            if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
-                continue;
-            }
-            let filter_id = desc.filter_id.ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("filter_id"),
-                    "topn runtime filter missing filter_id",
-                )
-            })?;
-            let expr_order = desc.expr_order.ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("expr_order"),
-                    format!("topn runtime filter {} missing expr_order", filter_id),
-                )
-            })? as usize;
-
-            // Convert the build expression type at the lowering boundary.
-            let build_type_desc = desc
-                .build_expr
-                .as_ref()
-                .and_then(|expr| expr.nodes.first())
-                .map(|node| &node.type_)
-                .ok_or_else(|| {
-                    StarRocksFragmentDecodeError::missing(
-                        filter_path.clone().field("build_expr"),
-                        format!("topn runtime filter {} missing build_expr type", filter_id),
-                    )
-                })?;
-            let build_data_type = arrow_type_from_desc(build_type_desc).ok_or_else(|| {
-                StarRocksFragmentDecodeError::unsupported(
-                    filter_path.clone().field("build_expr"),
-                    format!(
-                        "topn runtime filter {} unsupported build_expr type descriptor: {:?}",
-                        filter_id, build_type_desc
-                    ),
-                )
-            })?;
-            let build_type =
-                RuntimeFilterType::from_arrow_data_type(&build_data_type).map_err(|e| {
-                    StarRocksFragmentDecodeError::unsupported(
-                        filter_path.clone().field("build_expr"),
-                        format!(
-                            "topn runtime filter {} unsupported build_expr type: data_type={:?} err={}",
-                            filter_id, build_data_type, e
-                        ),
-                    )
-                })?;
-
-            // Resolve probe column name from plan_node_id_to_target_expr.
-            // Each entry maps a scan node ID to the probe TExpr. The probe
-            // expression is typically a SlotRef; we resolve the slot to a column
-            // name via the descriptor table. If resolution fails, store the
-            // slot_id as a string placeholder (will be fixed in Task 9).
-            let probe_column_name = desc
-                .plan_node_id_to_target_expr
-                .as_ref()
-                .and_then(|m| m.values().next())
-                .and_then(|probe_expr| probe_expr.nodes.first())
-                .and_then(|probe_node| probe_node.slot_ref.as_ref())
-                .and_then(|slot_ref| {
-                    let slot_id = slot_ref.slot_id;
-                    desc_tbl
-                        .slot_descriptors
-                        .as_ref()
-                        .and_then(|slots| {
-                            slots
-                                .iter()
-                                .find(|sd| sd.id == Some(slot_id))
-                                .and_then(|sd| sd.col_name.clone())
-                        })
-                        .or_else(|| Some(format!("__slot_{}", slot_id)))
-                })
-                .unwrap_or_default();
-
-            // The TopN limit comes from the runtime filter description's topn field,
-            // NOT from the plan node's limit (which is the AGG node's own limit, often -1).
-            let limit = desc.limit.unwrap_or(0);
-            if limit <= 0 {
-                warn!(
-                    "topn runtime filter {} has non-positive topn limit {}, skipping",
-                    filter_id, limit
-                );
-                continue;
-            }
-
-            // StarRocks always sets is_asc/is_nulls_first alongside limit for a
-            // TOPN_FILTER (RuntimeFilterDescription.toThrift). A missing value
-            // means a malformed descriptor; skip the filter rather than guessing
-            // a direction — a wrong is_asc flips the active side and would prune
-            // the wrong boundary group. Skipping only forgoes pruning; results
-            // stay correct.
-            let (Some(is_asc), Some(is_nulls_first)) = (desc.is_asc, desc.is_nulls_first) else {
-                warn!(
-                    "topn runtime filter {} missing is_asc/is_nulls_first, skipping",
-                    filter_id
-                );
-                continue;
-            };
-
-            topn_rf_specs.push(TopNRuntimeFilterSpec {
-                filter_id,
-                expr_order,
-                build_type,
-                probe_column_name,
-                limit: limit as usize,
-                is_asc,
-                is_nulls_first,
-            });
-        }
-    }
-
     let streaming_preaggregation_mode = agg.streaming_preaggregation_mode.map(|mode| {
         use crate::thrift::plan_nodes::TStreamingPreaggregationMode;
         match mode {
@@ -321,8 +200,8 @@ pub(crate) fn lower_aggregate_node(
                 need_finalize: agg.need_finalize,
                 input_is_intermediate,
                 output_chunk_schema,
-                runtime_filter_spec: AggregateRuntimeFilterSpec::Compat {
-                    legacy_topn_specs: topn_rf_specs,
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
+                    topn_producers: Vec::new(),
                 },
                 streaming_preaggregation_mode,
             }),
@@ -640,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn compat_aggregate_lowering_builds_only_legacy_runtime_filter_variant() {
+    fn compat_aggregate_lowering_ignores_runtime_filters() {
         let mut node = empty_plan_node();
         node.agg_node = Some(plan_nodes::TAggregationNode::new(
             None,
@@ -696,11 +575,9 @@ mod tests {
         let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
             panic!("compat aggregate node")
         };
-        let AggregateRuntimeFilterSpec::Compat { legacy_topn_specs } =
-            aggregate.runtime_filter_spec
-        else {
-            panic!("compat lowering must never construct native aggregate producer specs")
+        let AggregateRuntimeFilterSpec { topn_producers } = aggregate.runtime_filter_spec else {
+            panic!("compat lowering must construct empty native aggregate producer specs")
         };
-        assert!(legacy_topn_specs.is_empty());
+        assert!(topn_producers.is_empty());
     }
 }

@@ -23,7 +23,7 @@ use crate::protocol::starrocks::decode::layout::{
     chunk_schema_for_layout, layout_for_row_tuples, layout_from_slot_ids, qualify_table_name,
     resolve_jdbc_table, resolve_jdbc_table_by_name, tuple_slot_col_names,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
 use crate::runtime::query_options::QueryOptions;
 use crate::thrift::{descriptors, plan_nodes, types};
 
@@ -153,8 +153,7 @@ pub(crate) fn lower_jdbc_scan_node(
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)
-        .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
-        .with_local_rf_waiting_set(local_rf_waiting_set(node));
+        .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator);
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),

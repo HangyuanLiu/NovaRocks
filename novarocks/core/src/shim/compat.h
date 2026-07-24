@@ -96,12 +96,6 @@ int32_t novarocks_rs_transmit_chunk(const uint8_t* ptr,
                                     NovaRocksRustBuf* out_resp,
                                     NovaRocksRustBuf* out_err);
 
-// internal_service.proto PTransmitRuntimeFilterParams -> PTransmitRuntimeFilterResult (protobuf bytes).
-int32_t novarocks_rs_transmit_runtime_filter(const uint8_t* ptr,
-                                             size_t len,
-                                             NovaRocksRustBuf* out_resp,
-                                             NovaRocksRustBuf* out_err);
-
 // internal_service.proto PLookUpRequest -> PLookUpResponse (protobuf bytes).
 int32_t novarocks_rs_lookup(const uint8_t* ptr,
                             size_t len,
@@ -274,13 +268,6 @@ int32_t novarocks_compat_transmit_chunk(const char* host,
                                         size_t len,
                                         NovaRocksRustBuf* out_resp,
                                         NovaRocksRustBuf* out_err);
-
-int32_t novarocks_compat_transmit_runtime_filter(const char* host,
-                                                 uint16_t port,
-                                                 const uint8_t* ptr,
-                                                 size_t len,
-                                                 NovaRocksRustBuf* out_resp,
-                                                 NovaRocksRustBuf* out_err);
 
 int32_t novarocks_compat_lookup(const char* host,
                                 uint16_t port,

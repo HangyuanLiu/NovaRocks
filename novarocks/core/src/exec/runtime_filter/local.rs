@@ -14,45 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Local runtime-filter registry.
+//! Runtime-filter key helpers.
 //!
 //! Responsibilities:
-//! - Maintains runtime filters available inside one fragment/executor boundary.
-//! - Tracks filter availability and probe eligibility metadata per expression.
+//! - Detects null composite keys while building runtime-filter values.
 //!
-//! Key exported interfaces:
-//! - Types: `LocalRuntimeFilterSet`.
-//!
-//! Current limitations:
-//! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
-//! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
+//! The native runtime-filter data plane is owned by `runtime_filter::service`.
 
-use std::sync::Arc;
-
-use arrow::array::{Array, ArrayRef, BooleanArray};
-use arrow::compute::filter_record_batch;
-use hashbrown::HashSet;
-
-use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::hash_table::key_builder::{
-    GroupKeyArrayView, build_group_key_hashes, build_group_key_views,
-};
-use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
-
-#[derive(Clone, Debug)]
-/// Local registry containing runtime membership filters keyed by expression id.
-pub(crate) struct LocalRuntimeFilterSet {
-    hash_seed: u64,
-    filters: Vec<LocalRuntimeFilter>,
-}
-
-#[derive(Clone, Debug)]
-struct LocalRuntimeFilter {
-    filter_id: i32,
-    expr_order: usize,
-    hashes: HashSet<u64>,
-}
+use crate::exec::hash_table::key_builder::GroupKeyArrayView;
 
 pub(in crate::exec::runtime_filter) fn row_has_null(
     views: &[GroupKeyArrayView<'_>],
@@ -82,98 +51,4 @@ pub(in crate::exec::runtime_filter) fn row_has_null(
         }
     }
     false
-}
-
-impl LocalRuntimeFilterSet {
-    pub(crate) fn new(specs: &[CompatJoinRuntimeFilterSpec], hash_seed: u64) -> Self {
-        let mut filters = Vec::with_capacity(specs.len());
-        for spec in specs {
-            filters.push(LocalRuntimeFilter {
-                filter_id: spec.filter_id,
-                expr_order: spec.expr_order,
-                hashes: HashSet::new(),
-            });
-        }
-        Self { hash_seed, filters }
-    }
-
-    pub(crate) fn add_build_arrays(&mut self, key_arrays: &[ArrayRef]) -> Result<(), String> {
-        if self.filters.is_empty() {
-            return Ok(());
-        }
-        for filter in &mut self.filters {
-            let Some(array) = key_arrays.get(filter.expr_order) else {
-                return Err(format!(
-                    "runtime filter {} expects build key index {} but only {} keys are available",
-                    filter.filter_id,
-                    filter.expr_order,
-                    key_arrays.len()
-                ));
-            };
-            let arrays = [Arc::clone(array)];
-            let views = build_group_key_views(&arrays)?;
-            let hashes = build_group_key_hashes(&views, array.len(), self.hash_seed)?;
-            for (row, hash) in hashes.iter().copied().enumerate().take(array.len()) {
-                if row_has_null(&views, row) {
-                    continue;
-                }
-                filter.hashes.insert(hash);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn filter_probe_chunk(
-        &self,
-        arena: &ExprArena,
-        probe_keys: &[ExprId],
-        chunk: Chunk,
-    ) -> Result<Option<Chunk>, String> {
-        if self.filters.is_empty() || chunk.is_empty() {
-            return Ok(Some(chunk));
-        }
-        if probe_keys.is_empty() {
-            return Ok(Some(chunk));
-        }
-        let mut key_arrays = Vec::with_capacity(probe_keys.len());
-        for expr in probe_keys {
-            let array = arena.eval(*expr, &chunk).map_err(|e| e.to_string())?;
-            key_arrays.push(array);
-        }
-
-        let len = chunk.len();
-        let mut keep = vec![true; len];
-        for filter in &self.filters {
-            let Some(array) = key_arrays.get(filter.expr_order) else {
-                return Err(format!(
-                    "runtime filter {} expects probe key index {} but only {} keys are available",
-                    filter.filter_id,
-                    filter.expr_order,
-                    key_arrays.len()
-                ));
-            };
-            let arrays = [Arc::clone(array)];
-            let views = build_group_key_views(&arrays)?;
-            let hashes = build_group_key_hashes(&views, len, self.hash_seed)?;
-            for row in 0..len {
-                if !keep[row] {
-                    continue;
-                }
-                if row_has_null(&views, row) || !filter.hashes.contains(&hashes[row]) {
-                    keep[row] = false;
-                }
-            }
-        }
-
-        if keep.iter().all(|v| *v) {
-            return Ok(Some(chunk));
-        }
-        if keep.iter().all(|v| !*v) {
-            return Ok(None);
-        }
-
-        let mask = BooleanArray::from(keep);
-        let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
-        Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
-    }
 }

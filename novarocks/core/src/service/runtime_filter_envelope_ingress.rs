@@ -345,7 +345,7 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Contribution,
                     RuntimeFilterEnvelopeKind::ProducerClosed,
-                    RuntimeFilterEnvelopeKind::Unavailable,
+                    RuntimeFilterEnvelopeKind::ProducerUnavailable,
                 ]),
             )
             .unwrap();

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-    FragmentProgramOptions, RuntimeFilterContract, RuntimeFilterId,
+    FragmentProgramOptions, RuntimeFilterContract,
 };
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
@@ -585,12 +585,11 @@ fn decode_draft_parts(
         sink_path,
         FieldPath::root("exec_plan_fragment").field("fragment"),
     )?;
-    let runtime_filters = decode_runtime_filter_contract(&plan.nodes);
-    let mut plan = ExecPlan {
+    let runtime_filters = RuntimeFilterContract::default();
+    let plan = ExecPlan {
         arena,
         root: lowered.node,
     };
-    super::runtime_filter_pushdown::push_down_local_runtime_filters(&mut plan.root, &plan.arena);
     let exchange_contracts = collect_exchange_contracts(&plan.root)?;
     let exchange_assignments = decode_exchange_assignments(
         &exchange_contracts,
@@ -643,14 +642,13 @@ fn decode_draft_parts(
     let scan_assignments =
         ScanAssignments::try_new(std::mem::take(&mut captured_scan_ranges.borrow_mut()))
             .map_err(StarRocksFragmentDecodeError::Binding)?;
-    let instance_spec = FragmentInstanceSpec::new_compat(
+    let instance_spec = FragmentInstanceSpec::new_native(
         FragmentContractVersion::CURRENT,
         instance.query_id,
         instance.fragment_instance_id,
         scan_assignments,
         exchange_assignments,
         assignment,
-        instance.runtime_filter_params,
         FragmentRuntimeOptions::new(
             instance.query_options,
             instance.report_endpoint,
@@ -775,41 +773,6 @@ fn decode_lookup_close_targets(
         }
     }
     Ok(targets.into_iter().collect())
-}
-
-fn decode_runtime_filter_contract(
-    nodes: &[crate::thrift::plan_nodes::TPlanNode],
-) -> RuntimeFilterContract {
-    let mut build = BTreeSet::new();
-    let mut probe = BTreeSet::new();
-    for node in nodes {
-        if let Some(filters) = node.probe_runtime_filters.as_ref() {
-            for filter in filters {
-                if let Some(id) = filter.filter_id {
-                    probe.insert(RuntimeFilterId::new(id));
-                }
-            }
-        }
-        let builds = node
-            .hash_join_node
-            .as_ref()
-            .and_then(|join| join.build_runtime_filters.as_ref())
-            .into_iter()
-            .flatten()
-            .chain(
-                node.agg_node
-                    .as_ref()
-                    .and_then(|aggregate| aggregate.build_runtime_filters.as_ref())
-                    .into_iter()
-                    .flatten(),
-            );
-        for filter in builds {
-            if let Some(id) = filter.filter_id {
-                build.insert(RuntimeFilterId::new(id));
-            }
-        }
-    }
-    RuntimeFilterContract::new(build, probe)
 }
 
 fn collect_exchange_contracts(
@@ -1103,7 +1066,6 @@ mod tests {
             vec![],
             None,
             false,
-            None,
             None,
             None,
             None,

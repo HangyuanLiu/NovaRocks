@@ -227,7 +227,6 @@ pub(crate) fn execute_native_submission(
         RuntimeStateInputs {
             query_options,
             query_id: Some(query_id),
-            runtime_filter_params: None,
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker.clone(),

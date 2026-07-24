@@ -19,8 +19,7 @@ use anyhow::{Context, Result, bail};
 use novarocks::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PLookUpRequest, PLookUpResponse,
-    PTransmitChunkParams, PTransmitChunkResult, PTransmitRuntimeFilterParams,
-    PTransmitRuntimeFilterResult, PUniqueId, StatusPb,
+    PTransmitChunkParams, PTransmitChunkResult, PUniqueId, StatusPb,
 };
 use prost::Message;
 use std::ffi::{CString, c_char};
@@ -30,7 +29,6 @@ const PROBES: &[&str] = &[
     "malformed-plan",
     "malformed-batch-plan",
     "malformed-chunk",
-    "malformed-runtime-filter",
     "malformed-lookup",
     "terminal-fetch",
 ];
@@ -84,14 +82,6 @@ unsafe extern "C" {
         out_err: *mut NovaRocksRustBuf,
     ) -> i32;
     fn novarocks_compat_transmit_chunk(
-        host: *const c_char,
-        port: u16,
-        request_ptr: *const u8,
-        request_len: usize,
-        out_resp: *mut NovaRocksRustBuf,
-        out_err: *mut NovaRocksRustBuf,
-    ) -> i32;
-    fn novarocks_compat_transmit_runtime_filter(
         host: *const c_char,
         port: u16,
         request_ptr: *const u8,
@@ -336,38 +326,6 @@ fn run_probe(args: &Args) -> Result<()> {
                 novarocks_compat_transmit_chunk,
             )?;
             let response = PTransmitChunkResult::decode(bytes.as_slice())?;
-            require_error_status(
-                response
-                    .status
-                    .as_ref()
-                    .context("response status is missing")?,
-            )
-        }
-        "malformed-runtime-filter" => {
-            let request = PTransmitRuntimeFilterParams {
-                is_partial: Some(false),
-                query_id: Some(unique_id()),
-                filter_id: Some(-1),
-                finst_id: Some(unique_id()),
-                data: Some(vec![0xff, 0x00, 0x03]),
-                probe_finst_ids: Vec::new(),
-                build_be_number: Some(-1),
-                forward_targets: Vec::new(),
-                broadcast_timestamp: None,
-                is_pipeline: Some(true),
-                is_skew_broadcast_join: None,
-                column_type: None,
-                skew_shuffle_filter_id: None,
-                transmit_timeout_ms: Some(10_000),
-                transmit_via_http_min_size: None,
-            };
-            let bytes = call_without_attachment(
-                &host,
-                args.brpc_port,
-                &request,
-                novarocks_compat_transmit_runtime_filter,
-            )?;
-            let response = PTransmitRuntimeFilterResult::decode(bytes.as_slice())?;
             require_error_status(
                 response
                     .status

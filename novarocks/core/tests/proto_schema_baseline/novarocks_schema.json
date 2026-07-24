@@ -2381,74 +2381,6 @@
           },
           "reserved_numbers": [],
           "reserved_names": []
-        },
-        "TransmitRuntimeFilterRequest": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "is_partial",
-              "type_name": "bool",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "query_id",
-              "type_name": "novarocks.common.UniqueId",
-              "label": "singular",
-              "oneof": null
-            },
-            "3": {
-              "number": 3,
-              "name": "filter_id",
-              "type_name": "int32",
-              "label": "singular",
-              "oneof": null
-            },
-            "4": {
-              "number": 4,
-              "name": "data",
-              "type_name": "bytes",
-              "label": "singular",
-              "oneof": null
-            },
-            "5": {
-              "number": 5,
-              "name": "build_be_number",
-              "type_name": "int32",
-              "label": "singular",
-              "oneof": null
-            },
-            "6": {
-              "number": 6,
-              "name": "column_type",
-              "type_name": "novarocks.common.TypeDesc",
-              "label": "singular",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
-        "TransmitRuntimeFilterResponse": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "status",
-              "type_name": "novarocks.common.Status",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "filter_id",
-              "type_name": "int32",
-              "label": "singular",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
         }
       },
       "enums": {
@@ -8904,39 +8836,6 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
-        "ProberParams": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "fragment_instance_id",
-              "type_name": "novarocks.common.UniqueId",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "endpoint",
-              "type_name": "string",
-              "label": "singular",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
-        "ProberParamsList": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "params",
-              "type_name": "ProberParams",
-              "label": "repeated",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
         "ProfileNode": {
           "fields": {
             "1": {
@@ -9192,33 +9091,6 @@
               "number": 3,
               "name": "error_code",
               "type_name": "string",
-              "label": "singular",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
-        "RuntimeFilterParams": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "id_to_prober_params",
-              "type_name": "map<int32, ProberParamsList>",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "runtime_filter_builder_number",
-              "type_name": "map<int32, int32>",
-              "label": "singular",
-              "oneof": null
-            },
-            "3": {
-              "number": 3,
-              "name": "runtime_filter_max_size",
-              "type_name": "int64",
               "label": "singular",
               "oneof": null
             }
@@ -9619,12 +9491,6 @@
             "SubmitFragment": {
               "request": "SubmitFragmentRequest",
               "response": "SubmitFragmentResponse",
-              "client_streaming": false,
-              "server_streaming": false
-            },
-            "TransmitRuntimeFilter": {
-              "request": "novarocks.filter.TransmitRuntimeFilterRequest",
-              "response": "novarocks.filter.TransmitRuntimeFilterResponse",
               "client_streaming": false,
               "server_streaming": false
             },

@@ -28,7 +28,7 @@ use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
-use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::Lowered;
 use crate::thrift::{descriptors, plan_nodes};
 
 /// Lower an EXCHANGE_NODE plan node to a `Lowered` ExecNode.
@@ -80,14 +80,11 @@ pub(crate) fn lower_exchange_node(
                 StarRocksFragmentDecodeError::invalid_value(node_path.clone(), error)
             })?;
         let mut out = ExecNode {
-            kind: ExecNodeKind::ExchangeSource(
-                ExchangeSourceNode::new(
-                    node.node_id,
-                    Duration::from_millis(exchange_timeout_ms),
-                    expected_chunk_schema,
-                )
-                .with_local_rf_waiting_set(local_rf_waiting_set(node)),
-            ),
+            kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
+                node.node_id,
+                Duration::from_millis(exchange_timeout_ms),
+                expected_chunk_schema,
+            )),
         };
 
         // Some plans (e.g. global ORDER BY) use a merging exchange without an explicit SORT_NODE.

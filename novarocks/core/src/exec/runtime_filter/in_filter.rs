@@ -21,7 +21,7 @@
 //! - Provides local filter sets keyed by expr id for fast probe-time lookup.
 //!
 //! Key exported interfaces:
-//! - Types: `RuntimeInFilter`, `LocalRuntimeInFilterSet`.
+//! - Types: `RuntimeInFilter`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -40,7 +40,6 @@ use hashbrown::HashSet;
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicateValue;
 use crate::exec::chunk::Chunk;
-use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 use novarocks_types::largeint;
 
 #[derive(Clone, Debug)]
@@ -72,20 +71,6 @@ pub(in crate::exec::runtime_filter) enum RuntimeInFilterValues {
         precision: u8,
         scale: i8,
     },
-}
-
-#[derive(Clone, Debug)]
-/// Expression-indexed container of locally available runtime IN filters.
-pub(crate) struct LocalRuntimeInFilterSet {
-    filters: Vec<LocalRuntimeInFilter>,
-}
-
-#[derive(Clone, Debug)]
-struct LocalRuntimeInFilter {
-    filter_id: i32,
-    expr_order: usize,
-    slot_id: SlotId,
-    values: RuntimeInFilterValues,
 }
 
 impl RuntimeInFilterValues {
@@ -1097,62 +1082,6 @@ impl RuntimeInFilter {
         array: &arrow::array::ArrayRef,
     ) -> Result<(), String> {
         self.values.insert_array(array)
-    }
-}
-
-impl LocalRuntimeInFilterSet {
-    pub(crate) fn new(
-        specs: &[CompatJoinRuntimeFilterSpec],
-        key_arrays: &[ArrayRef],
-    ) -> Result<Self, String> {
-        let mut filters = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let Some(array) = key_arrays.get(spec.expr_order) else {
-                return Err(format!(
-                    "runtime filter {} expects build key index {} but only {} keys are available",
-                    spec.filter_id,
-                    spec.expr_order,
-                    key_arrays.len()
-                ));
-            };
-            let values = RuntimeInFilterValues::new(array.data_type())?;
-            filters.push(LocalRuntimeInFilter {
-                filter_id: spec.filter_id,
-                expr_order: spec.expr_order,
-                slot_id: spec.probe_slot_id,
-                values,
-            });
-        }
-        Ok(Self { filters })
-    }
-
-    pub(crate) fn add_build_arrays(&mut self, key_arrays: &[ArrayRef]) -> Result<(), String> {
-        if self.filters.is_empty() {
-            return Ok(());
-        }
-        for filter in &mut self.filters {
-            let Some(array) = key_arrays.get(filter.expr_order) else {
-                return Err(format!(
-                    "runtime filter {} expects build key index {} but only {} keys are available",
-                    filter.filter_id,
-                    filter.expr_order,
-                    key_arrays.len()
-                ));
-            };
-            filter.values.insert_array(array)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn into_filters(self) -> Vec<RuntimeInFilter> {
-        self.filters
-            .into_iter()
-            .map(|filter| RuntimeInFilter {
-                filter_id: filter.filter_id,
-                slot_id: filter.slot_id,
-                values: filter.values,
-            })
-            .collect()
     }
 }
 

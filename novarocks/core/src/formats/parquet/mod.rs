@@ -3294,25 +3294,9 @@ mod tests {
         });
         cfg.variant_path_predicates
             .push(variant_path_predicate(Some(10)));
-        let specs = [crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-            filter_id: 1,
-            expr_order: 0,
-            probe_expr_id: crate::exec::expr::ExprId(0),
-            build_expr_id: crate::exec::expr::ExprId(0),
-            probe_slot_id: SlotId::new(1),
-            build_data_type: DataType::Int32,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        }];
-        let key_arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![10, 20]))];
-        let mut local_filters =
-            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
-                .expect("local runtime filters");
-        local_filters
-            .add_build_arrays(&key_arrays)
-            .expect("runtime filter values");
+        let key_values = Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef;
         let runtime_filters = crate::exec::node::scan::RuntimeFilterContext::new(
-            local_filters.into_filters(),
+            vec![runtime_in_filter(1, SlotId::new(1), key_values)],
             Vec::new(),
         );
         let iter = test_scan_iter_for_predicates_with_runtime_filters(cfg, Some(runtime_filters));
@@ -3355,40 +3339,15 @@ mod tests {
             variant_path_columns: vec![variant_path_spec(Some(10))],
             query_global_dicts: Default::default(),
         };
-        let specs = [
-            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-                filter_id: 1,
-                expr_order: 0,
-                probe_expr_id: crate::exec::expr::ExprId(0),
-                build_expr_id: crate::exec::expr::ExprId(0),
-                probe_slot_id: SlotId::new(1),
-                build_data_type: DataType::Int32,
-                merge_nodes: Vec::new(),
-                has_remote_targets: false,
-            },
-            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-                filter_id: 2,
-                expr_order: 1,
-                probe_expr_id: crate::exec::expr::ExprId(1),
-                build_expr_id: crate::exec::expr::ExprId(1),
-                probe_slot_id: SlotId::new(2),
-                build_data_type: DataType::Int64,
-                merge_nodes: Vec::new(),
-                has_remote_targets: false,
-            },
+        let key_arrays: [ArrayRef; 2] = [
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![100, 200])) as ArrayRef,
         ];
-        let key_arrays: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from(vec![10, 20])),
-            Arc::new(Int64Array::from(vec![100, 200])),
-        ];
-        let mut local_filters =
-            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
-                .expect("local runtime filters");
-        local_filters
-            .add_build_arrays(&key_arrays)
-            .expect("runtime filter values");
         let runtime_filters = crate::exec::node::scan::RuntimeFilterContext::new(
-            local_filters.into_filters(),
+            vec![
+                runtime_in_filter(1, SlotId::new(1), Arc::clone(&key_arrays[0])),
+                runtime_in_filter(2, SlotId::new(2), Arc::clone(&key_arrays[1])),
+            ],
             Vec::new(),
         );
         let iter = test_scan_iter_for_predicates_with_runtime_filters(cfg, Some(runtime_filters));
@@ -3482,40 +3441,15 @@ mod tests {
             query_global_dicts: Default::default(),
         };
 
-        let specs = [
-            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-                filter_id: 1,
-                expr_order: 0,
-                probe_expr_id: crate::exec::expr::ExprId(0),
-                build_expr_id: crate::exec::expr::ExprId(0),
-                probe_slot_id: SlotId::new(1),
-                build_data_type: DataType::Int32,
-                merge_nodes: Vec::new(),
-                has_remote_targets: false,
-            },
-            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-                filter_id: 2,
-                expr_order: 1,
-                probe_expr_id: crate::exec::expr::ExprId(1),
-                build_expr_id: crate::exec::expr::ExprId(1),
-                probe_slot_id: SlotId::new(2),
-                build_data_type: DataType::Int64,
-                merge_nodes: Vec::new(),
-                has_remote_targets: false,
-            },
+        let key_arrays: [ArrayRef; 2] = [
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![100, 200])) as ArrayRef,
         ];
-        let key_arrays: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from(vec![10, 20])),
-            Arc::new(Int64Array::from(vec![100, 200])),
-        ];
-        let mut local_filters =
-            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
-                .expect("local runtime filters");
-        local_filters
-            .add_build_arrays(&key_arrays)
-            .expect("runtime filter values");
         let runtime_filters = crate::exec::node::scan::RuntimeFilterContext::new(
-            local_filters.into_filters(),
+            vec![
+                runtime_in_filter(1, SlotId::new(1), Arc::clone(&key_arrays[0])),
+                runtime_in_filter(2, SlotId::new(2), Arc::clone(&key_arrays[1])),
+            ],
             Vec::new(),
         );
 
@@ -4628,36 +4562,33 @@ mod tests {
         }
     }
 
-    /// Builds an in-filter `RuntimeFilterContext` (round-tripped through
-    /// `RuntimeFilterSnapshot`/`RuntimeFilterContext::from_snapshot`, matching
-    /// how the scan-runner path reconstructs a context from a hub snapshot)
-    /// whose min/max range is derived from `key_values` and bound to slot 1
-    /// (the `id` column).
+    /// Builds an in-filter `RuntimeFilterContext` whose min/max range is derived
+    /// from `key_values` and bound to slot 1 (the `id` column).
     fn runtime_filter_ctx_for_keys(
         key_values: Vec<i32>,
     ) -> crate::exec::node::scan::RuntimeFilterContext {
-        let specs = [crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-            filter_id: 1,
-            expr_order: 0,
-            probe_expr_id: crate::exec::expr::ExprId(0),
-            build_expr_id: crate::exec::expr::ExprId(0),
-            probe_slot_id: SlotId::new(1),
-            build_data_type: DataType::Int32,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        }];
-        let key_arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(key_values))];
-        let mut local_filters =
-            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
-                .expect("local runtime in-filter");
-        local_filters
-            .add_build_arrays(&key_arrays)
-            .expect("runtime in-filter build values");
-        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
-            local_filters.into_filters(),
+        let key_values = Arc::new(Int32Array::from(key_values)) as ArrayRef;
+        crate::exec::node::scan::RuntimeFilterContext::new(
+            vec![runtime_in_filter(1, SlotId::new(1), key_values)],
             Vec::new(),
-        );
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+        )
+    }
+
+    fn runtime_in_filter(
+        filter_id: i32,
+        slot_id: SlotId,
+        values: ArrayRef,
+    ) -> crate::exec::runtime_filter::RuntimeInFilter {
+        let mut filter = crate::exec::runtime_filter::RuntimeInFilter::new_for_test(
+            filter_id,
+            slot_id,
+            values.data_type(),
+        )
+        .expect("create runtime in filter");
+        filter
+            .insert_array_for_test(&values)
+            .expect("runtime in-filter build values");
+        filter
     }
 
     fn runtime_min_max_filter_ctx_for_i32(
@@ -4669,20 +4600,19 @@ mod tests {
             RuntimeFilterType, RuntimeMinMaxFilter, min_max::MinMaxValue,
         };
 
-        let mut snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+        crate::exec::node::scan::RuntimeFilterContext::with_min_max_filters(
             Vec::new(),
             Vec::new(),
-        );
-        snapshot.min_max_filters.push((
-            filter_id,
-            Arc::new(RuntimeMinMaxFilter::new(
-                RuntimeFilterType::Int32,
-                true,
-                MinMaxValue::Int32(min),
-                MinMaxValue::Int32(max),
-            )),
-        ));
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+            vec![(
+                filter_id,
+                Arc::new(RuntimeMinMaxFilter::new(
+                    RuntimeFilterType::Int32,
+                    true,
+                    MinMaxValue::Int32(min),
+                    MinMaxValue::Int32(max),
+                )),
+            )],
+        )
     }
 
     fn runtime_membership_filter_ctx_for_i32(
@@ -4709,11 +4639,7 @@ mod tests {
             2,
             min_max,
         ));
-        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
-            Vec::new(),
-            vec![membership],
-        );
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+        crate::exec::node::scan::RuntimeFilterContext::new(Vec::new(), vec![membership])
     }
 
     fn runtime_bloom_membership_filter_ctx_for_i32(
@@ -4736,11 +4662,7 @@ mod tests {
             )
             .expect("build runtime bloom filter"),
         );
-        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
-            Vec::new(),
-            vec![membership],
-        );
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+        crate::exec::node::scan::RuntimeFilterContext::new(Vec::new(), vec![membership])
     }
 
     #[test]

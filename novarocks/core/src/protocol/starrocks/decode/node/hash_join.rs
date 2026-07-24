@@ -19,14 +19,12 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::join::{
-    CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
-    JoinType, RuntimeFilterMergeNode,
+    JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
-use crate::novarocks_logging::warn;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
@@ -36,7 +34,7 @@ use crate::protocol::starrocks::decode::layout::{
 use crate::protocol::starrocks::decode::node::Lowered;
 use novarocks_types::wider_type;
 
-use crate::thrift::{descriptors, plan_nodes, runtime_filter, types};
+use crate::thrift::{descriptors, plan_nodes};
 
 fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<DataType>, String> {
     if left == right {
@@ -63,235 +61,6 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
         }
         _ => Ok(Some(wider_type(left, right))),
     }
-}
-
-fn lower_runtime_filter_merge_nodes(
-    nodes: Option<&[types::TNetworkAddress]>,
-) -> Vec<RuntimeFilterMergeNode> {
-    nodes
-        .unwrap_or_default()
-        .iter()
-        .map(|addr| RuntimeFilterMergeNode {
-            host: addr.hostname.clone(),
-            port: addr.port,
-        })
-        .collect()
-}
-
-fn validate_runtime_filter_intent(
-    desc: &runtime_filter::TRuntimeFilterDescription,
-    filter_id: i32,
-    expr_order: usize,
-    probe_layout: &Layout,
-    build_layout: &Layout,
-    expected_probe_key: ExprId,
-    expected_build_key: ExprId,
-    arena: &mut ExprArena,
-    last_query_id: Option<&str>,
-    fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-    filter_path: FieldPath,
-) -> Result<(), StarRocksFragmentDecodeError> {
-    let build_expr = desc.build_expr.as_ref().ok_or_else(|| {
-        StarRocksFragmentDecodeError::missing(
-            filter_path.clone().field("build_expr"),
-            format!("runtime filter {} missing build_expr", filter_id),
-        )
-    })?;
-    let build_expr_id = lower_t_expr_at(
-        build_expr,
-        arena,
-        build_layout,
-        last_query_id,
-        fe_addr,
-        filter_path.clone().field("build_expr"),
-    )?;
-    if !exprs_equivalent(arena, build_expr_id, expected_build_key) {
-        return Err(StarRocksFragmentDecodeError::inconsistent(
-            filter_path.clone().field("build_expr"),
-            format!(
-                "runtime filter {} build_expr does not match join key at expr_order {}",
-                filter_id, expr_order
-            ),
-        ));
-    }
-
-    let target_exprs = desc
-        .plan_node_id_to_target_expr
-        .as_ref()
-        .filter(|targets| !targets.is_empty())
-        .ok_or_else(|| {
-            StarRocksFragmentDecodeError::missing(
-                filter_path.clone().field("plan_node_id_to_target_expr"),
-                format!(
-                    "runtime filter {} missing plan_node_id_to_target_expr",
-                    filter_id
-                ),
-            )
-        })?;
-    for (target_node_id, probe_expr) in target_exprs {
-        let target_path = filter_path
-            .clone()
-            .field("plan_node_id_to_target_expr")
-            .map_key(target_node_id.to_string());
-        let probe_expr_id = lower_t_expr_at(
-            probe_expr,
-            arena,
-            probe_layout,
-            last_query_id,
-            fe_addr,
-            target_path.clone(),
-        )?;
-        if !exprs_equivalent(arena, probe_expr_id, expected_probe_key) {
-            return Err(StarRocksFragmentDecodeError::inconsistent(
-                target_path,
-                format!(
-                    "runtime filter {} probe target_expr does not match join key at expr_order {}",
-                    filter_id, expr_order
-                ),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
-    if arena.data_type(left) != arena.data_type(right) {
-        return false;
-    }
-    let Some(left_node) = arena.node(left) else {
-        return false;
-    };
-    let Some(right_node) = arena.node(right) else {
-        return false;
-    };
-    match (left_node, right_node) {
-        (ExprNode::Literal(left), ExprNode::Literal(right)) => {
-            format!("{left:?}") == format!("{right:?}")
-        }
-        (ExprNode::SlotId(left), ExprNode::SlotId(right)) => left == right,
-        (ExprNode::ArrayExpr { elements: left }, ExprNode::ArrayExpr { elements: right })
-        | (ExprNode::StructExpr { fields: left }, ExprNode::StructExpr { fields: right }) => {
-            expr_id_slices_equivalent(arena, left, right)
-        }
-        (
-            ExprNode::LambdaFunction {
-                body: left_body,
-                arg_slots: left_args,
-                common_sub_exprs: left_common,
-                is_nondeterministic: left_nondeterministic,
-            },
-            ExprNode::LambdaFunction {
-                body: right_body,
-                arg_slots: right_args,
-                common_sub_exprs: right_common,
-                is_nondeterministic: right_nondeterministic,
-            },
-        ) => {
-            left_args == right_args
-                && left_nondeterministic == right_nondeterministic
-                && exprs_equivalent(arena, *left_body, *right_body)
-                && common_sub_exprs_equivalent(arena, left_common, right_common)
-        }
-        (
-            ExprNode::DictDecode {
-                child: left,
-                dict: left_dict,
-            },
-            ExprNode::DictDecode {
-                child: right,
-                dict: right_dict,
-            },
-        ) => Arc::ptr_eq(left_dict, right_dict) && exprs_equivalent(arena, *left, *right),
-        (ExprNode::Cast(left), ExprNode::Cast(right))
-        | (ExprNode::CastTime(left), ExprNode::CastTime(right))
-        | (ExprNode::CastTimeFromDatetime(left), ExprNode::CastTimeFromDatetime(right))
-        | (ExprNode::Not(left), ExprNode::Not(right))
-        | (ExprNode::IsNull(left), ExprNode::IsNull(right))
-        | (ExprNode::IsNotNull(left), ExprNode::IsNotNull(right))
-        | (ExprNode::Clone(left), ExprNode::Clone(right)) => exprs_equivalent(arena, *left, *right),
-        (ExprNode::Add(ll, lr), ExprNode::Add(rl, rr))
-        | (ExprNode::Sub(ll, lr), ExprNode::Sub(rl, rr))
-        | (ExprNode::Mul(ll, lr), ExprNode::Mul(rl, rr))
-        | (ExprNode::Div(ll, lr), ExprNode::Div(rl, rr))
-        | (ExprNode::Mod(ll, lr), ExprNode::Mod(rl, rr))
-        | (ExprNode::Eq(ll, lr), ExprNode::Eq(rl, rr))
-        | (ExprNode::EqForNull(ll, lr), ExprNode::EqForNull(rl, rr))
-        | (ExprNode::Ne(ll, lr), ExprNode::Ne(rl, rr))
-        | (ExprNode::Lt(ll, lr), ExprNode::Lt(rl, rr))
-        | (ExprNode::Le(ll, lr), ExprNode::Le(rl, rr))
-        | (ExprNode::Gt(ll, lr), ExprNode::Gt(rl, rr))
-        | (ExprNode::Ge(ll, lr), ExprNode::Ge(rl, rr))
-        | (ExprNode::And(ll, lr), ExprNode::And(rl, rr))
-        | (ExprNode::Or(ll, lr), ExprNode::Or(rl, rr)) => {
-            exprs_equivalent(arena, *ll, *rl) && exprs_equivalent(arena, *lr, *rr)
-        }
-        (
-            ExprNode::In {
-                child: left_child,
-                values: left_values,
-                is_not_in: left_not,
-            },
-            ExprNode::In {
-                child: right_child,
-                values: right_values,
-                is_not_in: right_not,
-            },
-        ) => {
-            left_not == right_not
-                && exprs_equivalent(arena, *left_child, *right_child)
-                && expr_id_slices_equivalent(arena, left_values, right_values)
-        }
-        (
-            ExprNode::Case {
-                has_case_expr: left_has_case,
-                has_else_expr: left_has_else,
-                children: left_children,
-            },
-            ExprNode::Case {
-                has_case_expr: right_has_case,
-                has_else_expr: right_has_else,
-                children: right_children,
-            },
-        ) => {
-            left_has_case == right_has_case
-                && left_has_else == right_has_else
-                && expr_id_slices_equivalent(arena, left_children, right_children)
-        }
-        (
-            ExprNode::FunctionCall {
-                kind: left_kind,
-                args: left_args,
-            },
-            ExprNode::FunctionCall {
-                kind: right_kind,
-                args: right_args,
-            },
-        ) => left_kind == right_kind && expr_id_slices_equivalent(arena, left_args, right_args),
-        _ => false,
-    }
-}
-
-fn expr_id_slices_equivalent(arena: &ExprArena, left: &[ExprId], right: &[ExprId]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| exprs_equivalent(arena, *left, *right))
-}
-
-fn common_sub_exprs_equivalent(
-    arena: &ExprArena,
-    left: &[(crate::common::ids::SlotId, ExprId)],
-    right: &[(crate::common::ids::SlotId, ExprId)],
-) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|((left_slot, left_expr), (right_slot, right_expr))| {
-                left_slot == right_slot && exprs_equivalent(arena, *left_expr, *right_expr)
-            })
 }
 
 /// Lower a HASH_JOIN_NODE plan node to a `Lowered` ExecNode.
@@ -341,8 +110,6 @@ pub(crate) fn lower_hash_join_node(
             ));
         }
     };
-    let is_skew_join = join.is_skew_join.unwrap_or(false);
-
     if join.eq_join_conjuncts.is_empty() {
         return Err(StarRocksFragmentDecodeError::missing(
             payload_path.clone().field("eq_join_conjuncts"),
@@ -406,8 +173,6 @@ pub(crate) fn lower_hash_join_node(
             build_keys.push(right_key);
         }
     }
-    let raw_probe_keys = probe_keys.clone();
-    let raw_build_keys = build_keys.clone();
     for idx in 0..probe_keys.len() {
         let probe_expr = *probe_keys.get(idx).ok_or_else(|| {
             StarRocksFragmentDecodeError::missing(
@@ -514,160 +279,6 @@ pub(crate) fn lower_hash_join_node(
         residual_predicate = Some(acc);
     }
 
-    let mut runtime_filters = Vec::new();
-    if is_skew_join {
-        if join
-            .build_runtime_filters
-            .as_ref()
-            .is_some_and(|filters| !filters.is_empty())
-        {
-            warn!(
-                "skip runtime filters for skew hash join: node_id={}",
-                node.node_id
-            );
-        }
-    } else if let Some(filters) = join
-        .build_runtime_filters
-        .as_ref()
-        .filter(|v| !v.is_empty())
-        && matches!(
-            join_type,
-            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
-        )
-    {
-        if join.eq_join_conjuncts.is_empty() {
-            return Err(StarRocksFragmentDecodeError::missing(
-                payload_path.clone().field("eq_join_conjuncts"),
-                "HASH_JOIN_NODE runtime filters require eq_join_conjuncts",
-            ));
-        }
-        for (filter_index, desc) in filters.iter().enumerate() {
-            let filter_path = payload_path
-                .clone()
-                .field("build_runtime_filters")
-                .index(filter_index);
-            let filter_id = desc.filter_id.ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("filter_id"),
-                    "runtime filter missing filter_id",
-                )
-            })?;
-            let expr_order = desc.expr_order.ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("expr_order"),
-                    format!("runtime filter {} missing expr_order", filter_id),
-                )
-            })? as usize;
-            if expr_order >= join.eq_join_conjuncts.len() {
-                return Err(StarRocksFragmentDecodeError::out_of_range(
-                    filter_path.clone().field("expr_order"),
-                    format!(
-                        "runtime filter {} expr_order {} out of range (eq_join_conjuncts={})",
-                        filter_id,
-                        expr_order,
-                        join.eq_join_conjuncts.len()
-                    ),
-                ));
-            }
-            if eq_null_safe.get(expr_order).copied().unwrap_or(false) {
-                // Null-safe equality (`<=>`) must preserve NULL-key matches.
-                // Runtime filters currently prune NULL probe rows, so skip building
-                // runtime filters on null-safe join keys.
-                continue;
-            }
-            if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER) {
-                return Err(StarRocksFragmentDecodeError::unsupported(
-                    filter_path.clone().field("filter_type"),
-                    format!(
-                        "runtime filter {} has unsupported filter_type {:?}",
-                        filter_id, desc.filter_type
-                    ),
-                ));
-            }
-            let build_key = build_keys.get(expr_order).ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("expr_order"),
-                    "runtime filter build key missing",
-                )
-            })?;
-            let probe_key = probe_keys.get(expr_order).ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("expr_order"),
-                    "runtime filter probe key missing",
-                )
-            })?;
-            let (probe_layout, build_layout) = if right_semi_physical_right_probe {
-                (&right.layout, &left.layout)
-            } else {
-                (&left.layout, &right.layout)
-            };
-            validate_runtime_filter_intent(
-                desc,
-                filter_id,
-                expr_order,
-                probe_layout,
-                build_layout,
-                raw_probe_keys[expr_order],
-                raw_build_keys[expr_order],
-                arena,
-                last_query_id,
-                fe_addr,
-                filter_path.clone(),
-            )?;
-            let build_type = arena.data_type(*build_key).ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("expr_order"),
-                    "runtime filter build key type missing",
-                )
-            })?;
-            let probe_type = arena.data_type(*probe_key).ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    filter_path.clone().field("expr_order"),
-                    "runtime filter probe key type missing",
-                )
-            })?;
-            let supported = |t: &DataType| {
-                matches!(
-                    t,
-                    DataType::Int8
-                        | DataType::Int16
-                        | DataType::Int32
-                        | DataType::Int64
-                        | DataType::Float32
-                        | DataType::Float64
-                        | DataType::Boolean
-                        | DataType::Utf8
-                        | DataType::Date32
-                        | DataType::Timestamp(_, _)
-                        | DataType::Decimal128(_, _)
-                )
-            };
-            if !supported(build_type) || !supported(probe_type) {
-                warn!(
-                    "skip runtime filter {} due to unsupported key types build={:?} probe={:?}",
-                    filter_id, build_type, probe_type
-                );
-                continue;
-            }
-            let Some(ExprNode::SlotId(probe_slot_id)) = arena.node(*probe_key) else {
-                continue;
-            };
-            let merge_nodes =
-                lower_runtime_filter_merge_nodes(desc.runtime_filter_merge_nodes.as_deref());
-            let has_remote_targets = desc.has_remote_targets.unwrap_or(false);
-            runtime_filters.push(CompatJoinRuntimeFilterSpec {
-                filter_id,
-                expr_order,
-                probe_expr_id: *probe_key,
-                build_expr_id: *build_key,
-                probe_slot_id: *probe_slot_id,
-                build_data_type: build_type.clone(),
-                merge_nodes,
-                has_remote_targets,
-            });
-        }
-    }
-
     // Use the full join-scope layout for all join types.  For SEMI/ANTI joins
     // the FE's sort_tuple_slot_exprs / analytic output columns may reference
     // slots from the pruned (build or probe) side.  StarRocks BE handles this
@@ -754,8 +365,8 @@ pub(crate) fn lower_hash_join_node(
                 build_keys,
                 eq_null_safe,
                 residual_predicate,
-                runtime_filter_execution: JoinRuntimeFilterExecution::Compat {
-                    legacy_specs: runtime_filters,
+                runtime_filter_execution: JoinRuntimeFilterExecution {
+                    producers: Vec::new(),
                 },
             }),
         },

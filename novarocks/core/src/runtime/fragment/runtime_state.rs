@@ -27,14 +27,12 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 pub(crate) struct RuntimeStateInputs {
     pub(crate) query_options: Option<QueryOptions>,
     pub(crate) query_id: Option<QueryId>,
-    pub(crate) runtime_filter_params: Option<RuntimeFilterParams>,
     pub(crate) fragment_instance_id: Option<UniqueId>,
     pub(crate) backend_num: Option<i32>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
@@ -72,7 +70,6 @@ pub(crate) fn build_runtime_state(
             inputs.query_options,
             Some(cache_options),
             inputs.query_id,
-            inputs.runtime_filter_params,
             inputs.fragment_instance_id,
             inputs.backend_num,
             inputs.mem_tracker,

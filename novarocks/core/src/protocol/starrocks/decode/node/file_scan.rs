@@ -39,7 +39,7 @@ use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids, slot_name_from_desc,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
 use crate::runtime::scan_range::{BrokerFileFormat, ScanRange};
 use crate::thrift::{descriptors, plan_nodes, types};
@@ -842,8 +842,7 @@ fn lower_file_scan_node_inner(
     let scan = ScanNode::new(Arc::new(source))
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
-        .with_limit(limit)
-        .with_local_rf_waiting_set(local_rf_waiting_set(node));
+        .with_limit(limit);
 
     Ok(Lowered {
         node: ExecNode {

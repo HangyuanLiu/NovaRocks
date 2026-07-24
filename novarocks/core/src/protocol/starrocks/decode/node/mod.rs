@@ -48,23 +48,22 @@ mod table_function;
 mod union;
 
 use crate::common::ids::SlotId;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::scan::BoundScanRanges;
-use crate::exec::node::{ExecNode, ExecNodeKind, RuntimeFilterProbeSpec};
+use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_connectors::ConnectorRegistry;
-use crate::novarocks_logging::warn;
 use crate::runtime::scan_range::ScanRangeParams;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
 use crate::protocol::starrocks::decode::layout::{Layout, layout_for_row_tuples};
-use crate::thrift::{data, descriptors, exprs, plan_nodes, runtime_filter, types};
+use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
 
 /// Transient scan-range access handed to compat scan decoders.
 ///
@@ -884,31 +883,6 @@ fn lower_node_with_children_typed(
     })()
     .map_err(|error| error.into_fragment(node_path.clone()))?;
 
-    // Attach probe runtime filter specs to scan nodes only.
-    // Exchange source nodes are cross-fragment data channels; attaching RF
-    // specs creates a RuntimeFilterProbe dependency that may never be
-    // satisfied in multi-fragment coordinated execution, causing pipeline
-    // hangs.  Runtime filters should be applied at the scan level in the
-    // producing fragment instead.
-    if is_scan_node_type(node.node_type)
-        && node
-            .probe_runtime_filters
-            .as_ref()
-            .is_some_and(|descs| !descs.is_empty())
-    {
-        let specs = lower_probe_runtime_filter_specs(
-            node,
-            arena,
-            &lowered.layout,
-            last_query_id,
-            fe_addr,
-            &node_path,
-        )?;
-        if !specs.is_empty() {
-            attach_probe_runtime_filter_specs_to_scan(&mut lowered.node, &specs);
-        }
-    }
-
     // Apply conjuncts (predicates/filters) if present
     if let Some(conjuncts) = node.conjuncts.as_ref()
         && !conjuncts.is_empty()
@@ -1005,215 +979,4 @@ fn lower_node_with_children_typed(
         }
     }
     Ok(lowered)
-}
-
-fn is_scan_node_type(t: plan_nodes::TPlanNodeType) -> bool {
-    matches!(
-        t,
-        plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE
-            | plan_nodes::TPlanNodeType::OLAP_SCAN_NODE
-            | plan_nodes::TPlanNodeType::FILE_SCAN_NODE
-            | plan_nodes::TPlanNodeType::JDBC_SCAN_NODE
-            | plan_nodes::TPlanNodeType::HDFS_SCAN_NODE
-            | plan_nodes::TPlanNodeType::LAKE_SCAN_NODE
-            | plan_nodes::TPlanNodeType::SCHEMA_SCAN_NODE
-    )
-}
-
-fn common_slot_map_for_node(
-    node: &plan_nodes::TPlanNode,
-) -> Option<&BTreeMap<types::TSlotId, crate::thrift::exprs::TExpr>> {
-    node.select_node
-        .as_ref()
-        .and_then(|n| n.common_slot_map.as_ref())
-        .or_else(|| {
-            node.hash_join_node
-                .as_ref()
-                .and_then(|n| n.common_slot_map.as_ref())
-        })
-        .or_else(|| {
-            node.nestloop_join_node
-                .as_ref()
-                .and_then(|n| n.common_slot_map.as_ref())
-        })
-        .or_else(|| {
-            node.project_node
-                .as_ref()
-                .and_then(|n| n.common_slot_map.as_ref())
-        })
-        .or_else(|| node.common.as_ref().and_then(|n| n.heavy_exprs.as_ref()))
-}
-
-pub(crate) fn local_rf_waiting_set(node: &plan_nodes::TPlanNode) -> Vec<i32> {
-    let Some(set) = node.local_rf_waiting_set.as_ref() else {
-        return Vec::new();
-    };
-    let mut ids: Vec<i32> = set.iter().copied().collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-fn lower_probe_runtime_filter_specs(
-    node: &plan_nodes::TPlanNode,
-    arena: &mut ExprArena,
-    layout: &Layout,
-    last_query_id: Option<&str>,
-    fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-    node_path: &FieldPath,
-) -> Result<Vec<RuntimeFilterProbeSpec>, StarRocksFragmentDecodeError> {
-    let Some(descs) = node
-        .probe_runtime_filters
-        .as_ref()
-        .filter(|v| !v.is_empty())
-    else {
-        return Ok(Vec::new());
-    };
-    let common_slot_map = common_slot_map_for_node(node);
-    let mut specs = Vec::new();
-    let mut seen = HashSet::new();
-    for (desc_index, desc) in descs.iter().enumerate() {
-        let Some(filter_id) = desc.filter_id else {
-            warn!(
-                "probe runtime filter missing filter_id: node_id={}",
-                node.node_id
-            );
-            continue;
-        };
-        if let Some(filter_type) = desc.filter_type
-            && filter_type != runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER
-            && filter_type != runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER
-        {
-            continue;
-        }
-        let Some(targets) = desc.plan_node_id_to_target_expr.as_ref() else {
-            continue;
-        };
-        let Some(expr) = targets.get(&node.node_id) else {
-            continue;
-        };
-        let expr_id = lower_t_expr_with_common_slot_map_at(
-            expr,
-            arena,
-            layout,
-            last_query_id,
-            fe_addr,
-            common_slot_map,
-            node_path
-                .clone()
-                .field("probe_runtime_filters")
-                .index(desc_index)
-                .field("plan_node_id_to_target_expr")
-                .map_key(node.node_id.to_string()),
-            Some(node_path.clone()),
-        )?;
-        let slot_id = match arena.node(expr_id) {
-            Some(ExprNode::SlotId(slot_id)) => *slot_id,
-            _ => {
-                let slot_id = find_first_slot_id(arena, expr_id).unwrap_or_else(|| SlotId::new(0));
-                warn!(
-                    "probe runtime filter expr is not a slot ref; will eval expression: node_id={} filter_id={}",
-                    node.node_id, filter_id
-                );
-                slot_id
-            }
-        };
-        if seen.insert(filter_id) {
-            let Some(data_type) = arena.data_type(expr_id).cloned() else {
-                // probe expression type unknown: skip this RF probe spec rather than register an incomplete one.
-                continue;
-            };
-            specs.push(RuntimeFilterProbeSpec {
-                filter_id,
-                expr_id,
-                slot_id,
-                data_type,
-            });
-        }
-    }
-    Ok(specs)
-}
-
-fn find_first_slot_id(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {
-    let mut stack = vec![expr_id];
-    while let Some(id) = stack.pop() {
-        let Some(node) = arena.node(id) else {
-            continue;
-        };
-        match node {
-            ExprNode::SlotId(slot_id) => return Some(*slot_id),
-            ExprNode::ArrayExpr { elements } => {
-                for child in elements {
-                    stack.push(*child);
-                }
-            }
-            ExprNode::StructExpr { fields } => {
-                for child in fields {
-                    stack.push(*child);
-                }
-            }
-            ExprNode::LambdaFunction { .. } => {
-                // Do not descend into nested lambdas.
-            }
-            ExprNode::DictDecode { child, .. } => {
-                stack.push(*child);
-            }
-            ExprNode::Cast(child)
-            | ExprNode::CastTime(child)
-            | ExprNode::CastTimeFromDatetime(child)
-            | ExprNode::Not(child)
-            | ExprNode::IsNull(child)
-            | ExprNode::IsNotNull(child)
-            | ExprNode::Clone(child) => {
-                stack.push(*child);
-            }
-            ExprNode::Add(a, b)
-            | ExprNode::Sub(a, b)
-            | ExprNode::Mul(a, b)
-            | ExprNode::Div(a, b)
-            | ExprNode::Mod(a, b)
-            | ExprNode::Eq(a, b)
-            | ExprNode::EqForNull(a, b)
-            | ExprNode::Ne(a, b)
-            | ExprNode::Lt(a, b)
-            | ExprNode::Le(a, b)
-            | ExprNode::Gt(a, b)
-            | ExprNode::Ge(a, b)
-            | ExprNode::And(a, b)
-            | ExprNode::Or(a, b) => {
-                stack.push(*a);
-                stack.push(*b);
-            }
-            ExprNode::In { child, values, .. } => {
-                stack.push(*child);
-                for value in values {
-                    stack.push(*value);
-                }
-            }
-            ExprNode::Case { children, .. } => {
-                for child in children {
-                    stack.push(*child);
-                }
-            }
-            ExprNode::FunctionCall { args, .. } => {
-                for arg in args {
-                    stack.push(*arg);
-                }
-            }
-            ExprNode::Literal(_) => {}
-        }
-    }
-    None
-}
-
-fn attach_probe_runtime_filter_specs_to_scan(
-    node: &mut ExecNode,
-    specs: &[RuntimeFilterProbeSpec],
-) {
-    if specs.is_empty() {
-        return;
-    }
-    if let ExecNodeKind::Scan(scan) = &mut node.kind {
-        scan.add_runtime_filter_specs(specs);
-    }
 }

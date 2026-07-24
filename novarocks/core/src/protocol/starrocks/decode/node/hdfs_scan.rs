@@ -48,13 +48,13 @@ use crate::protocol::starrocks::decode::layout::{Layout, layout_from_slot_ids};
 use crate::protocol::starrocks::decode::node::decode::{
     QueryGlobalDictMap, build_scan_query_global_dicts,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
 use crate::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
-use crate::thrift::{descriptors, exprs, plan_nodes, runtime_filter, types};
+use crate::thrift::{descriptors, exprs, plan_nodes, types};
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
     let max_slot = visible_slot_ids
@@ -86,57 +86,6 @@ fn hdfs_scan_file_format_from_thrift(
         descriptors::THdfsFileFormat::ORC => crate::exec::node::scan::HdfsScanFileFormat::Orc,
         _ => crate::exec::node::scan::HdfsScanFileFormat::Other,
     }
-}
-
-fn build_topn_filter_column_map(
-    node: &plan_nodes::TPlanNode,
-    desc_tbl: &descriptors::TDescriptorTable,
-) -> HashMap<i32, String> {
-    let mut map = HashMap::new();
-    let Some(descs) = node
-        .probe_runtime_filters
-        .as_ref()
-        .filter(|v| !v.is_empty())
-    else {
-        return map;
-    };
-    for desc in descs {
-        if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
-            continue;
-        }
-        let Some(filter_id) = desc.filter_id else {
-            continue;
-        };
-        let probe_column_name = desc
-            .plan_node_id_to_target_expr
-            .as_ref()
-            .and_then(|m| m.get(&node.node_id))
-            .and_then(simple_topn_probe_slot_ref)
-            .and_then(|slot_ref| {
-                let slot_id = slot_ref.slot_id;
-                desc_tbl.slot_descriptors.as_ref().and_then(|slots| {
-                    slots
-                        .iter()
-                        .find(|sd| sd.id == Some(slot_id))
-                        .and_then(|sd| sd.col_name.clone())
-                })
-            });
-        if let Some(name) = probe_column_name.filter(|name| !name.is_empty()) {
-            map.insert(filter_id, name);
-        }
-    }
-    map
-}
-
-fn simple_topn_probe_slot_ref(probe_expr: &exprs::TExpr) -> Option<&exprs::TSlotRef> {
-    if probe_expr.nodes.len() != 1 {
-        return None;
-    }
-    let node = probe_expr.nodes.first()?;
-    if node.node_type != exprs::TExprNodeType::SLOT_REF || node.num_children != 0 {
-        return None;
-    }
-    node.slot_ref.as_ref()
 }
 
 fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
@@ -1372,8 +1321,7 @@ pub(crate) fn lower_hdfs_scan_node(
             )?)
             .with_limit(limit)
             .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
-            .with_accept_empty_scan_ranges(true)
-            .with_local_rf_waiting_set(local_rf_waiting_set(node));
+            .with_accept_empty_scan_ranges(true);
         return Ok(Lowered {
             node: ExecNode {
                 kind: ExecNodeKind::Scan(scan),
@@ -1409,7 +1357,7 @@ pub(crate) fn lower_hdfs_scan_node(
         }
     }
     let has_position_delete_files = scan_ranges_have_position_delete_files(&ranges);
-    let mut runtime_min_max_filter_columns = build_topn_filter_column_map(node, desc_tbl);
+    let mut runtime_min_max_filter_columns = HashMap::new();
     apply_row_position_pruning_gate(
         row_position_spec.is_some() || has_position_delete_files,
         &mut enable_page_index,
@@ -1648,8 +1596,7 @@ pub(crate) fn lower_hdfs_scan_node(
             row_id_field: iceberg_virtual_row_id_field,
             last_updated_seq_field: iceberg_virtual_last_updated_seq_field,
             change_op_field: iceberg_virtual_change_op_field,
-        }))
-        .with_local_rf_waiting_set(local_rf_waiting_set(node));
+        }));
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),

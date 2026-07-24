@@ -622,16 +622,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(result))
     }
 
-    async fn transmit_runtime_filter(
-        &self,
-        request: tonic::Request<proto::filter::TransmitRuntimeFilterRequest>,
-    ) -> Result<tonic::Response<proto::filter::TransmitRuntimeFilterResponse>, tonic::Status> {
-        self.require_local_execution("TransmitRuntimeFilter")?;
-        Ok(tonic::Response::new(
-            internal_rpc::handle_transmit_runtime_filter(request.into_inner()),
-        ))
-    }
-
     async fn transmit_runtime_filter_envelope(
         &self,
         request: tonic::Request<proto::filter::RuntimeFilterEnvelope>,
@@ -2014,15 +2004,6 @@ mod tests {
             service.is_none(),
             "codec rejection must not create a query-owned Service"
         );
-        assert!(
-            matches!(node.manager().get_runtime_filter_hub(query_id), Ok(None)),
-            "codec rejection must not create a legacy Hub"
-        );
-        assert!(
-            matches!(node.manager().get_runtime_filter_worker(query_id), Ok(None)),
-            "codec rejection must not create a legacy Worker"
-        );
-
         let response = send_raw_submit(
             node.endpoint(),
             RawSubmitFragmentRequest {

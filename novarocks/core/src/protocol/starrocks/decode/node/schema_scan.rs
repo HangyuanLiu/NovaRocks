@@ -37,7 +37,7 @@ use crate::runtime::scan_range::ScanRange;
 use crate::thrift::descriptors;
 use crate::thrift::plan_nodes;
 
-use super::{ScanRangeCarrier, local_rf_waiting_set};
+use super::ScanRangeCarrier;
 
 /// Lower a SCHEMA_SCAN_NODE to an empty `ValuesNode`.
 ///
@@ -173,8 +173,7 @@ fn lower_supported_schema_scan_node(
     }
     let scan = ScanNode::new(Arc::new(source))
         .with_node_id(node.node_id)
-        .with_output_chunk_schema(output_chunk_schema)
-        .with_local_rf_waiting_set(local_rf_waiting_set(node));
+        .with_output_chunk_schema(output_chunk_schema);
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),

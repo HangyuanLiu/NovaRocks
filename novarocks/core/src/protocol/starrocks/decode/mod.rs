@@ -24,8 +24,6 @@ mod instance;
 pub(crate) mod layout;
 pub(crate) mod node;
 mod options;
-mod runtime_filter;
-pub(crate) mod runtime_filter_pushdown;
 pub(crate) mod schema;
 pub(crate) mod sink;
 mod submission;
@@ -49,7 +47,6 @@ pub(crate) use instance::{
     decode_scan_contracts_and_raw_ranges,
 };
 pub(crate) use options::decode_query_options;
-pub(crate) use runtime_filter::decode_runtime_filter_params;
 pub(crate) use submission::{
     DecodedStarRocksFragment, StarRocksDecodeInput, StarRocksFragmentDraft,
     StarRocksLookupCloseTarget, StarRocksReportDestination, StarRocksSubmissionMetadata,

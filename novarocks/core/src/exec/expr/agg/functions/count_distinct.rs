@@ -821,10 +821,9 @@ mod tests {
                     need_finalize: true,
                     input_is_intermediate: false,
                     output_chunk_schema,
-                    runtime_filter_spec:
-                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
-                            topn_producers: Vec::new(),
-                        },
+                    runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
+                        topn_producers: Vec::new(),
+                    },
                     streaming_preaggregation_mode: None,
                 }),
             },

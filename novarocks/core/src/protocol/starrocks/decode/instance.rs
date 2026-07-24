@@ -28,17 +28,13 @@ use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::fragment::instance::{BackendNum, FragmentInstanceId};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range::{
     BrokerFileFormat, BrokerFileScanRange, DatacacheOptions, DeletionVectorDescriptor, FileFormat,
     FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat, ScanRangeParams,
 };
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
-use super::{
-    StarRocksFragmentDecodeError, decode_query_options, decode_runtime_endpoint,
-    decode_runtime_filter_params,
-};
+use super::{StarRocksFragmentDecodeError, decode_query_options, decode_runtime_endpoint};
 
 pub(crate) struct DecodedStarRocksInstanceParts {
     pub(crate) query_id: QueryId,
@@ -49,7 +45,6 @@ pub(crate) struct DecodedStarRocksInstanceParts {
     pub(crate) scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
     pub(crate) per_exchange_sender_counts: BTreeMap<i32, i32>,
     pub(crate) batch_exchange_sender_counts: HashMap<i32, usize>,
-    pub(crate) runtime_filter_params: RuntimeFilterParams,
     pub(crate) report_endpoint: Option<RuntimeEndpoint>,
     pub(crate) destinations: Vec<FragmentDestination>,
     pub(crate) sender_id: Option<i32>,
@@ -384,14 +379,6 @@ pub(crate) fn decode_instance_parts(
     let backend_num =
         BackendNum::try_new(backend_num).map_err(StarRocksFragmentDecodeError::Binding)?;
     let query_options = decode_query_options(query_options)?;
-    let runtime_filter_params = params
-        .runtime_filter_params
-        .as_ref()
-        .map(|value| {
-            decode_runtime_filter_params(value, params_path.clone().field("runtime_filter_params"))
-        })
-        .transpose()?
-        .unwrap_or_default();
     let report_endpoint = coord
         .map(|value| decode_runtime_endpoint(value, root_path.clone().field("coord")))
         .transpose()?;
@@ -410,7 +397,6 @@ pub(crate) fn decode_instance_parts(
         scan_ranges: params.per_node_scan_ranges.clone(),
         per_exchange_sender_counts: params.per_exch_num_senders.clone(),
         batch_exchange_sender_counts: batch_exchange_sender_counts.clone(),
-        runtime_filter_params,
         report_endpoint,
         destinations: params
             .destinations

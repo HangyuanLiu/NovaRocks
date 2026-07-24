@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use std::collections::HashMap;
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
@@ -69,6 +69,8 @@ pub(crate) struct StandaloneExecStateReporter {
     started: OnceLock<()>,
     #[cfg(test)]
     priority_pending: Mutex<HashMap<(QueryId, UniqueId), usize>>,
+    #[cfg(test)]
+    priority_final_report_enqueued: Mutex<HashSet<(QueryId, UniqueId)>>,
 }
 
 #[cfg(test)]
@@ -95,6 +97,8 @@ impl StandaloneExecStateReporter {
             started: OnceLock::new(),
             #[cfg(test)]
             priority_pending: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            priority_final_report_enqueued: Mutex::new(HashSet::new()),
         }
     }
 
@@ -143,7 +147,13 @@ impl StandaloneExecStateReporter {
             .lock()
             .expect("standalone priority report queue lock");
         #[cfg(test)]
-        self.increment_final_report_pending(task.query_id, task.finst_id);
+        {
+            self.increment_final_report_pending(task.query_id, task.finst_id);
+            self.priority_final_report_enqueued
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((task.query_id, task.finst_id));
+        }
         guard.push_back(task);
         self.priority.cv.notify_one();
     }
@@ -206,6 +216,26 @@ impl StandaloneExecStateReporter {
             .copied()
             .unwrap_or(0)
     }
+
+    #[cfg(test)]
+    fn final_reports_pending_for_query_for_test(&self, query_id: QueryId) -> usize {
+        self.priority_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|((pending_query_id, _), count)| {
+                (*pending_query_id == query_id).then_some(*count)
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn final_report_was_enqueued_for_test(&self, query_id: QueryId, finst_id: UniqueId) -> bool {
+        self.priority_final_report_enqueued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&(query_id, finst_id))
+    }
 }
 
 pub(crate) fn ensure_started() {
@@ -227,6 +257,46 @@ pub(crate) fn enqueue_final(task: StandaloneExecStateReportTask) {
 #[cfg(test)]
 pub(crate) fn final_reports_pending_for_test(query_id: QueryId, finst_id: UniqueId) -> usize {
     StandaloneExecStateReporter::shared().final_reports_pending_for_test(query_id, finst_id)
+}
+
+#[cfg(test)]
+pub(crate) fn final_reports_pending_for_query_for_test(query_id: QueryId) -> usize {
+    StandaloneExecStateReporter::shared().final_reports_pending_for_query_for_test(query_id)
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_final_reports_for_query_for_test(
+    query_id: QueryId,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while final_reports_pending_for_query_for_test(query_id) != 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    final_reports_pending_for_query_for_test(query_id) == 0
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_final_reports_for_finsts_for_test(
+    query_id: QueryId,
+    finst_ids: &[UniqueId],
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while (!finst_ids.iter().all(|finst_id| {
+        StandaloneExecStateReporter::shared()
+            .final_report_was_enqueued_for_test(query_id, *finst_id)
+    }) || final_reports_pending_for_query_for_test(query_id) != 0)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    finst_ids.iter().all(|finst_id| {
+        StandaloneExecStateReporter::shared()
+            .final_report_was_enqueued_for_test(query_id, *finst_id)
+    }) && final_reports_pending_for_query_for_test(query_id) == 0
 }
 
 fn take_task(queue: &ReportQueue, wait_msg: &'static str) -> StandaloneExecStateReportTask {
@@ -559,6 +629,25 @@ mod tests {
                 other_query_same_finst.finst_id,
             ),
             1
+        );
+        assert_eq!(
+            reporter.final_reports_pending_for_query_for_test(first.query_id),
+            3,
+            "query-scoped cleanup sees every pending final report for that query"
+        );
+        assert_eq!(
+            reporter.final_reports_pending_for_query_for_test(other_query_same_finst.query_id),
+            1,
+            "query-scoped cleanup excludes final reports owned by another query"
+        );
+        assert!(reporter.final_report_was_enqueued_for_test(first.query_id, first.finst_id));
+        assert!(reporter.final_report_was_enqueued_for_test(
+            same_query_other_finst.query_id,
+            same_query_other_finst.finst_id,
+        ));
+        assert!(
+            !reporter
+                .final_report_was_enqueued_for_test(first.query_id, UniqueId { hi: 9, lo: 10 },)
         );
         assert_eq!(
             reporter.final_reports_pending_for_test(

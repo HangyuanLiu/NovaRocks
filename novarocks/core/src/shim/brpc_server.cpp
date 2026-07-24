@@ -1336,31 +1336,18 @@ private:
 
     static void run_transmit_runtime_filter(
             brpc::Controller* cntl,
-            const starrocks::PTransmitRuntimeFilterParams* request,
+            const starrocks::PTransmitRuntimeFilterParams* /*request*/,
             starrocks::PTransmitRuntimeFilterResult* response) {
-        if (request == nullptr || response == nullptr) {
-            if (response != nullptr) {
-                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
-                           "missing transmit_runtime_filter request/response");
-            }
+        if (response == nullptr) {
             if (cntl != nullptr) {
-                cntl->SetFailed("missing transmit_runtime_filter request/response");
+                cntl->SetFailed("missing legacy runtime-filter response");
             }
             return;
         }
-
-        std::string err;
-        if (!invoke_transmit_runtime_filter(*request, response, &err)) {
-            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
-            if (cntl != nullptr) {
-                cntl->SetFailed(err);
-            }
-            return;
-        }
-        if (!response->has_status()) {
-            status_ok(response->mutable_status());
-        }
-        std::cerr << "[INFO] compat_rpc method=transmit_runtime_filter" << std::endl;
+        // PInternalService retains this generated virtual method for the StarRocks
+        // protocol surface. Runtime-filter transport is native-envelope-only, so
+        // stray legacy retries are acknowledged without crossing the Rust FFI.
+        status_ok(response->mutable_status());
     }
 
     static void run_lookup(brpc::Controller* cntl,
@@ -1439,17 +1426,6 @@ private:
                                       std::string* err) {
         return invoke_rust_unary_rpc(
                 request, response, novarocks_rs_transmit_chunk, "transmit_chunk", err);
-    }
-
-    static bool invoke_transmit_runtime_filter(
-            const starrocks::PTransmitRuntimeFilterParams& request,
-            starrocks::PTransmitRuntimeFilterResult* response,
-            std::string* err) {
-        return invoke_rust_unary_rpc(request,
-                                     response,
-                                     novarocks_rs_transmit_runtime_filter,
-                                     "transmit_runtime_filter",
-                                     err);
     }
 
     static bool invoke_lookup(const starrocks::PLookUpRequest& request,
@@ -2689,29 +2665,6 @@ int32_t novarocks_compat_transmit_chunk(const char* host,
             out_err,
             "transmit_chunk",
             &starrocks::PInternalService_Stub::transmit_chunk);
-}
-
-int32_t novarocks_compat_transmit_runtime_filter(const char* host,
-                                                 uint16_t port,
-                                                 const uint8_t* ptr,
-                                                 size_t len,
-                                                 NovaRocksRustBuf* out_resp,
-                                                 NovaRocksRustBuf* out_err) {
-    return invoke_internal_brpc_client<starrocks::PTransmitRuntimeFilterParams,
-                                       starrocks::PTransmitRuntimeFilterResult>(
-            host,
-            port,
-            ptr,
-            len,
-            out_resp,
-            out_err,
-            "transmit_runtime_filter",
-            &starrocks::PInternalService_Stub::transmit_runtime_filter,
-            [](brpc::Controller* cntl, const starrocks::PTransmitRuntimeFilterParams& request) {
-                if (request.has_transmit_timeout_ms()) {
-                    cntl->set_timeout_ms(request.transmit_timeout_ms());
-                }
-            });
 }
 
 int32_t novarocks_compat_lookup(const char* host,

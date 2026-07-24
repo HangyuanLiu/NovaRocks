@@ -49,16 +49,10 @@ use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-#[cfg(feature = "compat")]
-use crate::exec::node::aggregate::TopNRuntimeFilterSpec;
 use crate::exec::node::aggregate::{AggFunction, NativeAggregateTopNProducerSpec};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-#[cfg(feature = "compat")]
-use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
 use crate::runtime::mem_tracker::MemTracker;
-#[cfg(feature = "compat")]
-use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::port::producer::ProducerFailureReason;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
@@ -85,15 +79,8 @@ pub struct AggregateStreamingSinkFactory {
 }
 
 #[derive(Clone)]
-enum StreamingAggregateRuntimeFilterExecution {
-    Native {
-        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
-    },
-    #[cfg(feature = "compat")]
-    Compat {
-        topn_specs: Vec<TopNRuntimeFilterSpec>,
-        hub: Arc<RuntimeFilterHub>,
-    },
+struct StreamingAggregateRuntimeFilterExecution {
+    topn_producers: Vec<NativeAggregateTopNProducerSpec>,
 }
 
 impl AggregateStreamingSinkFactory {
@@ -137,46 +124,10 @@ impl AggregateStreamingSinkFactory {
             functions,
             output_intermediate,
             output_chunk_schema,
-            runtime_filter_execution: StreamingAggregateRuntimeFilterExecution::Native {
-                topn_producers,
-            },
+            runtime_filter_execution: StreamingAggregateRuntimeFilterExecution { topn_producers },
             native_topn_session_factory,
             streaming_state: state,
         })
-    }
-
-    #[cfg(feature = "compat")]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_compat(
-        node_id: i32,
-        arena: Arc<ExprArena>,
-        group_by: Vec<ExprId>,
-        functions: Vec<AggFunction>,
-        output_intermediate: bool,
-        output_chunk_schema: ChunkSchemaRef,
-        topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-        runtime_filter_hub: Arc<RuntimeFilterHub>,
-        state: AggregateStreamingState,
-    ) -> Self {
-        let name = if node_id >= 0 {
-            format!("AGGREGATE_STREAMING_SINK (id={node_id})")
-        } else {
-            "AGGREGATE_STREAMING_SINK".to_string()
-        };
-        Self {
-            name,
-            arena,
-            group_by,
-            functions,
-            output_intermediate,
-            output_chunk_schema,
-            runtime_filter_execution: StreamingAggregateRuntimeFilterExecution::Compat {
-                topn_specs: topn_rf_specs,
-                hub: runtime_filter_hub,
-            },
-            native_topn_session_factory: None,
-            streaming_state: state,
-        }
     }
 }
 
@@ -224,11 +175,7 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
 
     #[cfg(test)]
     fn native_aggregate_topn_producers(&self) -> &[NativeAggregateTopNProducerSpec] {
-        match &self.runtime_filter_execution {
-            StreamingAggregateRuntimeFilterExecution::Native { topn_producers } => topn_producers,
-            #[cfg(feature = "compat")]
-            StreamingAggregateRuntimeFilterExecution::Compat { .. } => &[],
-        }
+        &self.runtime_filter_execution.topn_producers
     }
 
     fn is_sink(&self) -> bool {
@@ -337,51 +284,6 @@ impl AggregateStreamingSinkOperator {
             group_key_nullable,
         )?);
         Ok(())
-    }
-
-    #[cfg(feature = "compat")]
-    fn try_publish_legacy_topn_runtime_filter(&mut self) {
-        const PUBLISH_THRESHOLD: usize = 4096;
-
-        let StreamingAggregateRuntimeFilterExecution::Compat { topn_specs, hub } =
-            &self.runtime_filter_execution
-        else {
-            return;
-        };
-        if topn_specs.is_empty() {
-            return;
-        }
-        let Some(key_table) = &self.key_table else {
-            return;
-        };
-        if self.topn_rf_rows_since_publish < PUBLISH_THRESHOLD {
-            return;
-        }
-
-        for spec in topn_specs {
-            if key_table.group_count() < spec.limit {
-                continue;
-            }
-            // Get the group-by key column at expr_order.
-            let key_columns = key_table.key_columns();
-            let Some(key_col) = key_columns.get(spec.expr_order) else {
-                continue;
-            };
-            let column_array = match key_col.to_array() {
-                Ok(arr) => arr,
-                Err(_) => continue,
-            };
-            let filter = match RuntimeMinMaxFilter::from_array_one_sided(
-                spec.build_type,
-                &column_array,
-                spec.is_asc,
-            ) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            hub.publish_min_max_filter(spec.filter_id, filter);
-        }
-        self.topn_rf_rows_since_publish = 0;
     }
 
     fn try_submit_native_topn_bound(&mut self) -> Result<(), String> {
@@ -747,13 +649,7 @@ impl AggregateStreamingSinkOperator {
             return Ok(());
         }
 
-        let native_topn_producers = match &self.runtime_filter_execution {
-            StreamingAggregateRuntimeFilterExecution::Native { topn_producers } => {
-                topn_producers.as_slice()
-            }
-            #[cfg(feature = "compat")]
-            StreamingAggregateRuntimeFilterExecution::Compat { .. } => &[],
-        };
+        let native_topn_producers = self.runtime_filter_execution.topn_producers.as_slice();
         self.topn_boundary_bindings = build_topn_boundary_bindings(native_topn_producers)
             .map_err(|error| error.to_string())?;
 
@@ -1133,8 +1029,6 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
             let num_rows = chunk.len();
             self.process(chunk)?;
             self.topn_rf_rows_since_publish += num_rows;
-            #[cfg(feature = "compat")]
-            self.try_publish_legacy_topn_runtime_filter();
             self.try_submit_native_topn_bound()?;
             Ok(())
         })();
@@ -1198,9 +1092,7 @@ pub(super) fn aggregate_streaming_topn_test_operator(
         functions: Vec::new(),
         output_intermediate: false,
         output_chunk_schema: Arc::new(ChunkSchema::empty()),
-        runtime_filter_execution: StreamingAggregateRuntimeFilterExecution::Native {
-            topn_producers,
-        },
+        runtime_filter_execution: StreamingAggregateRuntimeFilterExecution { topn_producers },
         native_topn_session_factory: Some(Arc::new(session_factory)),
         streaming_state: AggregateStreamingState::new(1),
     }

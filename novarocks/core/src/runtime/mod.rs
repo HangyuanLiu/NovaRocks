@@ -37,11 +37,7 @@ pub(crate) mod query_state;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
 #[allow(dead_code)]
 pub mod result_buffer;
-pub mod runtime_filter_hub;
 pub mod runtime_filter_observability;
-pub(crate) mod runtime_filter_params;
-pub(crate) mod runtime_filter_transmission;
-pub mod runtime_filter_worker;
 pub mod runtime_state;
 pub mod scan_executor;
 pub(crate) mod scan_range;

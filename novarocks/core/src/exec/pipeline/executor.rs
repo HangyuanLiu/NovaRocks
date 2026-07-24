@@ -37,8 +37,6 @@ use crate::novarocks_logging::info;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
 
-#[cfg(feature = "compat")]
-use super::builder::build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop;
 use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context;
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
@@ -99,7 +97,8 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
-    execute_plan_with_pipeline_in_mode(
+    let runtime_filter_context = runtime_state.native_runtime_filter_context().cloned();
+    execute_plan_with_pipeline(
         plan,
         debug,
         time_slice,
@@ -114,7 +113,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
         fe_addr,
         backend_num,
         root_sink_dop,
-        PipelineExecutionMode::Native,
+        runtime_filter_context,
     )
 }
 
@@ -169,7 +168,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
-    execute_plan_with_pipeline_in_mode(
+    execute_plan_with_pipeline(
         plan,
         debug,
         time_slice,
@@ -184,18 +183,12 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
         fe_addr,
         backend_num,
         root_sink_dop,
-        PipelineExecutionMode::Compat,
+        None,
     )
 }
 
-enum PipelineExecutionMode {
-    Native,
-    #[cfg(feature = "compat")]
-    Compat,
-}
-
 #[allow(clippy::too_many_arguments)]
-fn execute_plan_with_pipeline_in_mode(
+fn execute_plan_with_pipeline(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,
@@ -210,76 +203,26 @@ fn execute_plan_with_pipeline_in_mode(
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
-    mode: PipelineExecutionMode,
+    runtime_filter_context: Option<
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    >,
 ) -> Result<(), String> {
     let fragment_profiler = profiler.clone();
     let dep_manager = DependencyManager::new();
-    #[cfg(feature = "compat")]
-    let runtime_filter_hub = match (&mode, query_id) {
-        (PipelineExecutionMode::Native, _) => None,
-        (PipelineExecutionMode::Compat, Some(qid)) => {
-            if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid)? {
-                Some(hub)
-            } else {
-                let hub = Arc::new(
-                    crate::runtime::runtime_filter_hub::RuntimeFilterHub::new_for_query(
-                        DependencyManager::new(),
-                        qid,
-                    ),
-                );
-                query_context_manager().set_runtime_filter_hub(qid, Arc::clone(&hub))?;
-                Some(hub)
-            }
-        }
-        (PipelineExecutionMode::Compat, None) => Some(Arc::new(
-            crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(DependencyManager::new()),
-        )),
-    };
-    #[cfg(feature = "compat")]
-    if let Some(runtime_filter_hub) = runtime_filter_hub.as_ref() {
-        runtime_filter_hub.set_wait_timeouts(
-            runtime_state.runtime_filter_scan_wait_timeout(),
-            runtime_state.runtime_filter_wait_timeout(),
-        );
-        if let Some(qid) = query_id {
-            if let Some(params) = runtime_state.runtime_filter_params().cloned() {
-                query_context_manager().set_runtime_filter_params(qid, params)?;
-            }
-            query_context_manager().get_or_create_runtime_filter_worker(qid)?;
-        }
-    }
-
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
-    let graph = match mode {
-        PipelineExecutionMode::Native => {
-            build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
-                &plan,
-                debug,
-                dep_manager.clone(),
-                exchange_finst_id,
-                exchange_bindings,
-                scan_bindings,
-                pipeline_dop,
-                root_sink_dop,
-                runtime_state.native_runtime_filter_context().cloned(),
-            )?
-        }
-        #[cfg(feature = "compat")]
-        PipelineExecutionMode::Compat => {
-            build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
-                &plan,
-                debug,
-                dep_manager.clone(),
-                exchange_finst_id,
-                exchange_bindings,
-                scan_bindings,
-                pipeline_dop,
-                root_sink_dop,
-                runtime_filter_hub.expect("compat runtime-filter hub"),
-            )?
-        }
-    };
+    let graph =
+        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
+            &plan,
+            debug,
+            dep_manager.clone(),
+            exchange_finst_id,
+            exchange_bindings,
+            scan_bindings,
+            pipeline_dop,
+            root_sink_dop,
+            runtime_filter_context,
+        )?;
 
     let finst_id = runtime_state.fragment_instance_id();
     let ctx = Arc::new(FragmentContext::new(
@@ -476,16 +419,6 @@ mod tests {
                 )
                 .expect("register shared NativeService query context");
         }
-        let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must reject legacy hub access"),
-        };
-        assert!(hub_error.contains("NativeService"), "{hub_error}");
-        let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must reject legacy worker access"),
-        };
-        assert!(worker_error.contains("NativeService"), "{worker_error}");
         let initial_lifecycle = lifecycle
             .snapshot(query_key)
             .expect("query context installs a lifecycle event sink");
@@ -582,7 +515,7 @@ mod tests {
                     build_keys: vec![build_expr],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                    runtime_filter_execution: JoinRuntimeFilterExecution {
                         producers: vec![NativeJoinRuntimeFilterProducerSpec {
                             binding_id: 3,
                             channel_id: 1,
@@ -736,25 +669,9 @@ mod tests {
             consumer_lifecycle.channel_events.len(),
             installed_channel_event_count
         );
-        let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must remain hub-free"),
-        };
-        assert!(hub_error.contains("NativeService"), "{hub_error}");
-        let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
-            Err(error) => error,
-            Ok(_) => panic!("NativeService context must remain worker-free"),
-        };
-        assert!(worker_error.contains("NativeService"), "{worker_error}");
         context_manager.cancel_query(query_id, "test cleanup".to_string());
         context_manager.finish_fragment(query_id);
         context_manager.finish_fragment(query_id);
-        assert!(
-            context_manager
-                .get_runtime_filter_hub(query_id)
-                .expect("query context removed after both fragments finish")
-                .is_none()
-        );
         lifecycle.remove_query(query_key);
     }
 
@@ -810,10 +727,9 @@ mod tests {
                         ])),
                         &[SlotId::new(1), SlotId::new(2)],
                     ),
-                    runtime_filter_spec:
-                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
-                            topn_producers: Vec::new(),
-                        },
+                    runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
+                        topn_producers: Vec::new(),
+                    },
                     streaming_preaggregation_mode: None,
                 }),
             },
@@ -1329,10 +1245,9 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: Some(residual),
-                    runtime_filter_execution:
-                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
-                            producers: Vec::new(),
-                        },
+                    runtime_filter_execution: crate::exec::node::join::JoinRuntimeFilterExecution {
+                        producers: Vec::new(),
+                    },
                 }),
             },
         };
@@ -1507,10 +1422,9 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filter_execution:
-                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
-                            producers: Vec::new(),
-                        },
+                    runtime_filter_execution: crate::exec::node::join::JoinRuntimeFilterExecution {
+                        producers: Vec::new(),
+                    },
                 }),
             },
         };
@@ -1669,10 +1583,9 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filter_execution:
-                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
-                            producers: Vec::new(),
-                        },
+                    runtime_filter_execution: crate::exec::node::join::JoinRuntimeFilterExecution {
+                        producers: Vec::new(),
+                    },
                 }),
             },
         };
@@ -1951,10 +1864,9 @@ mod tests {
                         ])),
                         &[SlotId::new(3), SlotId::new(4)],
                     ),
-                    runtime_filter_spec:
-                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
-                            topn_producers: Vec::new(),
-                        },
+                    runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
+                        topn_producers: Vec::new(),
+                    },
                     streaming_preaggregation_mode: None,
                 }),
             },

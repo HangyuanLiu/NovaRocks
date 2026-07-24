@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(feature = "compat")]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
+#[cfg(feature = "compat")]
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchemaRef};
 use crate::exec::fragment::error::{
@@ -61,9 +64,6 @@ impl FragmentSubmission {
         validate_scan_assignments(&inventory, &instance)?;
         validate_exchange_assignments(&program, &instance)?;
         validate_sink_assignment(&program, &instance)?;
-        #[cfg(feature = "compat")]
-        validate_runtime_filter_params(&instance)?;
-
         Ok(Self { program, instance })
     }
 
@@ -563,33 +563,6 @@ fn sink_assignment_summary(assignment: &FragmentSinkAssignment) -> String {
     }
 }
 
-#[cfg(feature = "compat")]
-fn validate_runtime_filter_params(
-    instance: &FragmentInstanceSpec,
-) -> Result<(), FragmentBindingError> {
-    let params = instance.runtime_filter_params();
-    for (raw_id, count) in params.runtime_filter_builder_number() {
-        if *count <= 0 {
-            return Err(FragmentBindingError::new(
-                FragmentBindingTarget::RuntimeFilter(*raw_id),
-                FragmentBindingErrorKind::InvalidAssignment,
-                format!("runtime filter {raw_id} builder count must be positive, got {count}"),
-            ));
-        }
-    }
-    // Do NOT require `id_to_prober_params` keys to be a subset of this fragment's local
-    // build filters. `id_to_prober_params` is the query-global runtime-filter route table
-    // that the coordinator installs on the top (RF-coordinator) fragment for filters built
-    // anywhere in the query (StarRocks FE does this in
-    // DefaultCoordinator#setGlobalRuntimeFilterParams, targeting the top fragment). The top
-    // fragment is typically a result sink that builds no filter at all yet carries the whole
-    // route table, so its keys are intentionally not local build filters. Prober endpoint/ID
-    // validity is enforced at decode time (RuntimeFilterParams::from_thrift / native decode)
-    // and in the internal-service address checks; the per-fragment invariant here is limited
-    // to the builder-count sanity check above.
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -637,7 +610,6 @@ mod tests {
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::DataStreamPartitionType;
     use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime::endpoint::RuntimeFilterProberDestination;
     use crate::runtime::exchange::ExchangeKey;
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
@@ -647,7 +619,6 @@ mod tests {
     use crate::runtime::profile::RuntimeProfile;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
@@ -747,13 +718,6 @@ mod tests {
                 }),
             },
         }
-    }
-
-    fn prober_destination() -> RuntimeFilterProberDestination {
-        RuntimeFilterProberDestination::new(
-            uid(3, 4),
-            RuntimeEndpoint::new("be-1", 9060).expect("runtime endpoint"),
-        )
     }
 
     fn native_delta_scan_plan(node_id: i32) -> ExecPlan {
@@ -891,7 +855,7 @@ mod tests {
         scans: BTreeMap<FragmentNodeId, ScanAssignmentKind>,
         exchanges: BTreeMap<FragmentNodeId, usize>,
         sink: FragmentSinkAssignment,
-        prober_params: BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
+        prober_params: BTreeMap<i32, Vec<crate::runtime::endpoint::RuntimeFilterProberDestination>>,
         builder_counts: BTreeMap<i32, i32>,
     ) -> FragmentInstanceSpec {
         // Kind is no longer stored on the assignment; presence is what the
@@ -916,36 +880,18 @@ mod tests {
                 })
                 .collect(),
         );
-        #[cfg(feature = "compat")]
-        {
-            return FragmentInstanceSpec::new_compat(
-                version,
-                query,
-                FragmentInstanceId::new(finst),
-                scans,
-                exchanges,
-                sink,
-                RuntimeFilterParams::new(prober_params, builder_counts, None),
-                FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
-                NonZeroUsize::new(1).expect("pipeline DOP"),
-                BackendNum::try_new(0).expect("backend number"),
-            );
-        }
-        #[cfg(not(feature = "compat"))]
-        {
-            let _ = (prober_params, builder_counts);
-            FragmentInstanceSpec::new_native(
-                version,
-                query,
-                FragmentInstanceId::new(finst),
-                scans,
-                exchanges,
-                sink,
-                FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
-                NonZeroUsize::new(1).expect("pipeline DOP"),
-                BackendNum::try_new(0).expect("backend number"),
-            )
-        }
+        let _ = (prober_params, builder_counts);
+        FragmentInstanceSpec::new_native(
+            version,
+            query,
+            FragmentInstanceId::new(finst),
+            scans,
+            exchanges,
+            sink,
+            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            NonZeroUsize::new(1).expect("pipeline DOP"),
+            BackendNum::try_new(0).expect("backend number"),
+        )
     }
 
     fn empty_instance(finst_lo: i64) -> FragmentInstanceSpec {
@@ -1909,146 +1855,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn accepts_query_global_prober_route_without_local_build_filter() {
-        // The top fragment acts as the runtime-filter coordinator: it carries the
-        // query-global id_to_prober_params route table (plus builder counts) for filters
-        // that are built in *other* fragments, without building any of them locally. This
-        // mirrors StarRocks FE `setGlobalRuntimeFilterParams`, which installs the whole
-        // route table on the top fragment (DefaultCoordinator#setId_to_prober_params), not
-        // on each build-side fragment. Requiring every prober-routed filter to have a local
-        // builder is therefore wrong and rejects valid FE plans (e.g. sc07 skew split join).
-        let program = program_with(
-            values_plan(7),
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 50),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            FragmentSinkAssignment::None,
-            BTreeMap::from([
-                (13, vec![prober_destination()]),
-                (17, vec![prober_destination()]),
-            ]),
-            BTreeMap::from([(13, 2), (17, 3)]),
-        );
-        FragmentSubmission::try_new(program, instance)
-            .expect("query-global prober route on coordinator fragment");
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn accepts_query_global_builder_count_for_unrelated_filter() {
-        let program = program_with(
-            values_plan(7),
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::from([RuntimeFilterId::new(11)]),
-        );
-        FragmentSubmission::try_new(
-            program,
-            instance_with(
-                FragmentContractVersion::CURRENT,
-                query_id(1, 2),
-                uid(1, 51),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                FragmentSinkAssignment::None,
-                BTreeMap::new(),
-                BTreeMap::from([(13, 2)]),
-            ),
-        )
-        .expect("query-global builder count");
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn rejects_zero_and_negative_builder_counts() {
-        for (finst_lo, count) in [(52, 0), (53, -1)] {
-            let program = program_with(
-                values_plan(7),
-                result_sink(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeSet::from([RuntimeFilterId::new(11)]),
-            );
-            let instance = instance_with(
-                FragmentContractVersion::CURRENT,
-                query_id(1, 2),
-                uid(1, finst_lo),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                FragmentSinkAssignment::None,
-                BTreeMap::new(),
-                BTreeMap::from([(11, count)]),
-            );
-            assert_error(
-                FragmentSubmission::try_new(program, instance),
-                FragmentBindingTarget::RuntimeFilter(11),
-                FragmentBindingErrorKind::InvalidAssignment,
-            );
-        }
-    }
-
-    #[test]
-    fn accepts_empty_prober_list_for_local_build_filter() {
-        let program = program_with(
-            values_plan(7),
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::from([RuntimeFilterId::new(11)]),
-        );
-        FragmentSubmission::try_new(
-            program,
-            instance_with(
-                FragmentContractVersion::CURRENT,
-                query_id(1, 2),
-                uid(1, 54),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                FragmentSinkAssignment::None,
-                BTreeMap::from([(11, Vec::new())]),
-                BTreeMap::new(),
-            ),
-        )
-        .expect("empty prober list");
-    }
-
-    #[test]
-    fn reports_smallest_builder_count_error_first() {
-        let program = program_with(
-            values_plan(7),
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 55),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            FragmentSinkAssignment::None,
-            BTreeMap::new(),
-            BTreeMap::from([(20, 0), (10, 0)]),
-        );
-        assert_error(
-            FragmentSubmission::try_new(program, instance),
-            FragmentBindingTarget::RuntimeFilter(10),
-            FragmentBindingErrorKind::InvalidAssignment,
-        );
-    }
-
     #[test]
     fn static_exchange_validation_precedes_dynamic_scan_validation() {
         let scan_id = FragmentNodeId::new(10);
@@ -2194,7 +2000,7 @@ mod tests {
                         build_keys: Vec::new(),
                         eq_null_safe: Vec::new(),
                         residual_predicate: None,
-                        runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                        runtime_filter_execution: JoinRuntimeFilterExecution {
                             producers: Vec::new(),
                         },
                     }),

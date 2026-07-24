@@ -22,7 +22,7 @@ use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig, ScanConfig}
 use crate::protocol::starrocks::decode::layout::{
     chunk_schema_for_layout, layout_for_row_tuples, layout_for_tuple_columns, resolve_mysql_table,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
 use crate::runtime::query_options::QueryOptions;
 use crate::thrift::{descriptors, plan_nodes, types};
 
@@ -86,8 +86,7 @@ pub(crate) fn lower_mysql_scan_node(
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)
-        .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
-        .with_local_rf_waiting_set(local_rf_waiting_set(node));
+        .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator);
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),

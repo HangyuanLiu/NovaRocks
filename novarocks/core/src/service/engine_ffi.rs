@@ -32,9 +32,8 @@ use crate::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
     DeleteTabletRequest, DropTableRequest, PLookUpCloseRequest, PLookUpCloseResponse,
     PLookUpRequest, PLookUpResponse, PTransmitChunkParams, PTransmitChunkResult,
-    PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult, PUpdateFailPointStatusRequest,
-    PUpdateFailPointStatusResponse, PublishLogVersionBatchRequest, PublishLogVersionRequest,
-    PublishVersionRequest, TabletStatRequest, VacuumRequest,
+    PUpdateFailPointStatusRequest, PUpdateFailPointStatusResponse, PublishLogVersionBatchRequest,
+    PublishLogVersionRequest, PublishVersionRequest, TabletStatRequest, VacuumRequest,
 };
 use crate::service::internal_rpc;
 use crate::{FetchResult, UniqueId};
@@ -352,23 +351,6 @@ pub extern "C" fn novarocks_rs_transmit_chunk(
         out_err,
         "transmit_chunk",
         internal_rpc::handle_transmit_chunk_compat,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn novarocks_rs_transmit_runtime_filter(
-    ptr: *const u8,
-    len: usize,
-    out_resp: *mut NovaRocksRustBuf,
-    out_err: *mut NovaRocksRustBuf,
-) -> i32 {
-    handle_unary_proto_rpc::<PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult, _>(
-        ptr,
-        len,
-        out_resp,
-        out_err,
-        "transmit_runtime_filter",
-        internal_rpc::handle_transmit_runtime_filter_compat,
     )
 }
 

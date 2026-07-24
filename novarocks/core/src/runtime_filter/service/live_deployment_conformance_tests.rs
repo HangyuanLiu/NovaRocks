@@ -109,8 +109,8 @@ const CONSUMER_BINDING: BindingId = BindingId::new(82);
 const WITNESS: CoverageWitnessId = CoverageWitnessId::new(83);
 const PRODUCER_FRAGMENT: u32 = 0;
 const PRODUCER_NODE: i32 = 810;
-const CONSUMER_FRAGMENT: u32 = 0;
-const CONSUMER_NODE: i32 = PRODUCER_NODE;
+const CONSUMER_FRAGMENT: u32 = 1;
+const CONSUMER_NODE: i32 = 811;
 const MAX_WAIT: Duration = Duration::from_secs(5);
 static LIVE_CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -432,7 +432,7 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
             binding: IcebergDataFileBinding::ExplicitFiles,
         },
     };
-    let fragment = PlanFragment {
+    let mut producer_fragment = PlanFragment {
         fragment_id: PRODUCER_FRAGMENT,
         root: DistributedNode {
             node_id: PRODUCER_NODE,
@@ -440,7 +440,7 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
             tuple_ids: vec![PRODUCER_NODE],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            runtime_filter_binding_ids: vec![PRODUCER_BINDING, CONSUMER_BINDING],
+            runtime_filter_binding_ids: vec![PRODUCER_BINDING],
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Scan(PlanScanNode {
@@ -466,8 +466,15 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
         cte_id: None,
         cte_exchange_nodes: Vec::new(),
     };
+    let mut consumer_fragment = producer_fragment.clone();
+    consumer_fragment.fragment_id = CONSUMER_FRAGMENT;
+    consumer_fragment.root.node_id = CONSUMER_NODE;
+    consumer_fragment.root.fragment_id = CONSUMER_FRAGMENT;
+    consumer_fragment.root.tuple_ids = vec![CONSUMER_NODE];
+    consumer_fragment.root.runtime_filter_binding_ids = vec![CONSUMER_BINDING];
+    producer_fragment.root.runtime_filter_binding_ids = vec![PRODUCER_BINDING];
     DistributedPlanDraftBuilder::new(
-        vec![fragment],
+        vec![producer_fragment, consumer_fragment],
         Some(CONSUMER_FRAGMENT),
         Vec::new(),
         runtime_filter_graph(topology),
@@ -604,6 +611,29 @@ fn assert_zero_fragment_submits(dispatcher: &RecordingFragmentDispatcher) {
         0,
         "the coordinator submitted a fragment before the install barrier ACKed"
     );
+}
+
+fn drain_final_reports_before_node_shutdown(query_id: QueryId) {
+    assert!(
+        crate::service::standalone_exec_state_reporter::wait_for_final_reports_for_query_for_test(
+            query_id, MAX_WAIT,
+        ),
+        "final profile reports drain before temporary live BE endpoints shut down"
+    );
+}
+
+fn query_id_from_live_nodes(nodes: &[IndependentGrpcRuntimeFilterNode]) -> QueryId {
+    let query_ids = nodes
+        .first()
+        .expect("live deployment owns at least one BE")
+        .manager()
+        .query_ids_for_test();
+    assert_eq!(
+        query_ids.len(),
+        1,
+        "temporary live deployment BEs retain exactly one query before shutdown"
+    );
+    query_ids[0]
 }
 
 fn run_live_conformance(topology: ConformanceTopology) {
@@ -751,10 +781,10 @@ fn run_live_conformance(topology: ConformanceTopology) {
     );
     assert_eq!(
         actual_submissions.len(),
-        3,
-        "exactly three fragments submit"
+        6,
+        "both producer and consumer fragments submit on every live BE"
     );
-    assert_eq!(observer.scheduled_count(), 3);
+    assert_eq!(observer.scheduled_count(), 6);
     assert_eq!(
         actual_submissions
             .iter()
@@ -795,6 +825,11 @@ fn run_live_conformance(topology: ConformanceTopology) {
         .map(|placement| (placement.backend_idx, placement.finst_id))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(producer_finsts.len(), 3);
+    let consumer_finsts = scheduling.by_fragment[&CONSUMER_FRAGMENT]
+        .iter()
+        .map(|placement| (placement.backend_idx, placement.finst_id))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(consumer_finsts.len(), 3);
     let aggregator_idx = (0..3).find(|backend_idx| {
         let participant = participant_id_for_backend(*backend_idx).unwrap();
         expected_installs[&participant].routing_shard().channels()[&CHANNEL]
@@ -813,7 +848,7 @@ fn run_live_conformance(topology: ConformanceTopology) {
             0
         }
     };
-    let consumer_finst = producer_finsts[&2];
+    let consumer_finst = consumer_finsts[&2];
     let mut producers = Vec::new();
     for backend_idx in 0..3 {
         let producer = services[backend_idx]
@@ -967,6 +1002,10 @@ fn run_live_conformance(topology: ConformanceTopology) {
         !rejected,
         "the sender route must not complete with Rejected"
     );
+    drain_final_reports_before_node_shutdown(QueryId {
+        hi: query_id.hi,
+        lo: query_id.lo,
+    });
     for node in &mut nodes {
         node.shutdown().expect("shutdown independent gRPC BE");
     }
@@ -1136,12 +1175,12 @@ impl LocalTopNFiles {
             .expect("create live TopN tempdir");
         let leading = if remote {
             vec![
-                vec![20, 30],
-                vec![40, 50],
-                vec![60, 70],
-                vec![5],
-                vec![1],
-                vec![2],
+                vec![1, 2],
+                vec![1, 2],
+                vec![1, 2],
+                vec![1, 2],
+                vec![1, 2],
+                vec![1, 2],
             ]
         } else {
             vec![vec![20, 30], vec![5]]
@@ -1729,6 +1768,7 @@ fn run_live_topn(
         started.elapsed() <= Duration::from_secs(10),
         "live TopN execution exceeded ten seconds"
     );
+    let query_id = query_id_from_live_nodes(&nodes);
     let observations = observations.lock().unwrap().clone();
     let mut node_evidence = Vec::new();
     let mut hub_snapshot_empty = true;
@@ -1752,6 +1792,73 @@ fn run_live_topn(
             && Instant::now() < drain_deadline
         {
             std::thread::sleep(Duration::from_millis(5));
+        }
+        if runtime_filter && !fail_remote_transport {
+            let remote_producer_routes = observations
+                .iter()
+                .flat_map(|observation| {
+                    observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+                        .outbound_edges()
+                        .iter()
+                        .filter_map(|edge| {
+                            (matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
+                                && matches!(
+                                    edge.source().role(),
+                                    RuntimeFilterRouteRole::Producer(TOPN_PRODUCER_BINDING)
+                                )
+                                && edge.target().role() == RuntimeFilterRouteRole::Aggregator)
+                                .then_some(edge.route_edge_id())
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            let evidence_deadline = Instant::now() + MAX_WAIT;
+            let evidence_ready = loop {
+                let ready = if remote {
+                    services.iter().any(|service| {
+                        let envelopes = service.admitted_transport_envelopes_for_test();
+                        let events = service.lifecycle_events_for_test();
+                        remote_producer_routes.iter().any(|route_edge_id| {
+                            envelopes.iter().any(|(route, envelope)| {
+                                route.route_edge_id() == *route_edge_id
+                                    && envelope.kind() == RuntimeFilterEnvelopeKind::Contribution
+                                    && !envelope.payload().is_empty()
+                            }) && events.iter().any(|event| matches!(
+                                event,
+                                RuntimeFilterEvent::TransportEnvelope {
+                                    identity,
+                                    kind: TransportEventKind::Sent,
+                                    bytes,
+                                } if identity.route_edge_id() == *route_edge_id && *bytes > 0
+                            )) && events.iter().any(|event| matches!(
+                                event,
+                                RuntimeFilterEvent::TransportEnvelope {
+                                    identity,
+                                    kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
+                                    bytes,
+                                } if identity.route_edge_id() == *route_edge_id && *bytes > 0
+                            ))
+                        })
+                    })
+                } else {
+                    services.iter().any(|service| {
+                        service.lifecycle_events_for_test().iter().any(|event| {
+                            matches!(
+                                event,
+                                RuntimeFilterEvent::LiveSubscriptionUpdated { version, .. }
+                                    if version.get() == 2
+                            )
+                        })
+                    })
+                };
+                if ready || Instant::now() >= evidence_deadline {
+                    break ready;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(
+                evidence_ready,
+                "the live TopN snapshot waits for its asserted nonterminal Contribution Sent/Accepted evidence"
+            );
         }
         for service in services {
             let events = service.lifecycle_events_for_test();
@@ -1802,6 +1909,7 @@ fn run_live_topn(
         }
         RuntimeFilterLifecycleRegistry::global().remove_query(query);
     }
+    drain_final_reports_before_node_shutdown(query_id);
     for node in &mut nodes {
         node.shutdown().expect("shutdown live TopN BE");
     }
@@ -1946,7 +2054,7 @@ fn live_topn_loopback_executes_aggregate_service_and_live_scan_chain() {
 fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
     let on = run_live_topn(3, true, 5_000, false);
     let off = run_live_topn(3, false, 5_000, false);
-    assert_live_topn_common(&on, &off, &[1, 2]);
+    assert_live_topn_common(&on, &off, &[1, 1]);
     assert_eq!(on.node_evidence.len(), 3);
     let aggregator_install = on
         .observations

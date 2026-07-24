@@ -32,8 +32,7 @@ use crate::protocol::starrocks::decode::node::lower_row_pos_descs;
 use crate::protocol::starrocks::decode::{
     StarRocksDecodeInput, StarRocksFragmentDraft, StarRocksReportDestination,
     StarRocksSubmissionMetadata, decode_incremental_scan_ranges, decode_query_options,
-    decode_runtime_endpoint, decode_runtime_filter_params, finish_fragment_submission,
-    prepare_fragment_submission,
+    decode_runtime_endpoint, finish_fragment_submission, prepare_fragment_submission,
 };
 use crate::runtime::exchange;
 use crate::runtime::fragment::starrocks_execution::{
@@ -141,21 +140,6 @@ fn validate_internal_addresses(
     if let Some(dests) = exec_params.destinations.as_ref() {
         validate_destinations(dests, "destinations")?;
     }
-    if let Some(params) = exec_params.runtime_filter_params.as_ref()
-        && let Some(id_to_probers) = params.id_to_prober_params.as_ref()
-    {
-        for (filter_id, probers) in id_to_probers {
-            for (idx, prober) in probers.iter().enumerate() {
-                validate_network_address(
-                    prober.fragment_instance_address.as_ref(),
-                    "missing runtime filter prober address",
-                    &format!(
-                        "runtime_filter_params.id_to_prober_params[{filter_id}][{idx}].fragment_instance_address"
-                    ),
-                )?;
-            }
-        }
-    }
     if let Some(fragment) = fragment {
         if let Some(plan) = fragment.plan.as_ref() {
             for node in &plan.nodes {
@@ -163,23 +147,6 @@ fn validate_internal_addresses(
                     && let Some(nodes_info) = fetch.nodes_info.as_ref()
                 {
                     validate_nodes_info(nodes_info, "fetch.nodes_info")?;
-                }
-                if let Some(join) = node.hash_join_node.as_ref()
-                    && let Some(filters) = join.build_runtime_filters.as_ref()
-                {
-                    for (filter_idx, desc) in filters.iter().enumerate() {
-                        if let Some(merge_nodes) = desc.runtime_filter_merge_nodes.as_ref() {
-                            for (node_idx, addr) in merge_nodes.iter().enumerate() {
-                                validate_network_address(
-                                    Some(addr),
-                                    "missing runtime filter merge address",
-                                    &format!(
-                                        "hash_join.build_runtime_filters[{filter_idx}].runtime_filter_merge_nodes[{node_idx}]"
-                                    ),
-                                )?;
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -792,7 +759,6 @@ fn prepare_query_handoff(
         total_fragments,
         row_pos_descs,
         lookup_fetchers,
-        runtime_filter_params: first.submission.instance().runtime_filter_params().clone(),
         instances,
     })
 }
@@ -1517,7 +1483,6 @@ mod tests {
             vec![],
             None,
             false,
-            None,
             None,
             None,
             None,

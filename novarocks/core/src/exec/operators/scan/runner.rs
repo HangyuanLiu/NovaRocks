@@ -29,18 +29,13 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use super::dispatch::ScanDispatchState;
-use super::types::{
-    NATIVE_ORDERED_LATE_PRUNED_UNITS, PushResult, ScanAsyncState, ScanRuntimeFilterProbe,
-    SharedRuntimeFilterDecision,
-};
+use super::types::{NATIVE_ORDERED_LATE_PRUNED_UNITS, PushResult, ScanAsyncState};
 use crate::common::failpoint;
 use crate::connector::iceberg::equality_delete::{EqualityDeleteSet, equality_delete_keep_mask};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema, hydrate_dictionary_columns_except};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{
-    RuntimeFilterContext, ScanMorsel, ScanMorselPruneDecision, ScanNode, ScanOp,
-};
+use crate::exec::node::scan::{ScanMorsel, ScanMorselPruneDecision, ScanNode, ScanOp};
 use crate::exec::operators::FilterEncodingPolicy;
 use crate::exec::operators::runtime_filter::{
     NativeOrderedLiveConsumerSet, NativeRuntimeFilterConsumerSet,
@@ -49,16 +44,8 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::exec::row_position::LakeRowPositionSpec;
 use crate::exec::row_position::RowPositionSpec;
-use crate::exec::runtime_filter::{
-    RuntimeFilterDictionaryFoldCache, RuntimeInFilter, RuntimeMembershipFilter,
-    filter_chunk_by_in_filters_with_exprs_and_dict_cache,
-    filter_chunk_by_membership_filters_with_exprs_and_dict_cache,
-    filter_chunk_by_min_max_filters_with_exprs_and_dict_cache,
-};
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
-use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterSnapshot};
-use crate::runtime::runtime_filter_observability::RfLifecycleHandle;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use roaring::RoaringTreemap;
@@ -69,16 +56,6 @@ use std::time::{Duration, Instant};
 
 const SLOW_SCAN_PROGRESS_THRESHOLD: Duration = Duration::from_secs(5);
 const SLOW_SCAN_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const JOIN_RUNTIME_FILTER_TIME: &str = "JoinRuntimeFilterTime";
-const JOIN_RUNTIME_FILTER_HASH_TIME: &str = "JoinRuntimeFilterHashTime";
-const JOIN_RUNTIME_FILTER_INPUT_ROWS: &str = "JoinRuntimeFilterInputRows";
-const JOIN_RUNTIME_FILTER_OUTPUT_ROWS: &str = "JoinRuntimeFilterOutputRows";
-const JOIN_RUNTIME_FILTER_EVALUATE: &str = "JoinRuntimeFilterEvaluate";
-const RUNTIME_FILTER_NUM: &str = "RuntimeFilterNum";
-const RUNTIME_IN_FILTER_NUM: &str = "RuntimeInFilterNum";
-const RUNTIME_FILTER_PLANNED: &str = "RuntimeFilterPlanned";
-const RUNTIME_FILTER_COMPLETE: &str = "RuntimeFilterComplete";
-const RUNTIME_FILTER_UNAVAILABLE: &str = "RuntimeFilterUnavailable";
 const IO_TASK_EXEC_TIME: &str = "IOTaskExecTime";
 const SCAN_TIME: &str = "ScanTime";
 
@@ -135,15 +112,6 @@ pub(super) struct ScanAsyncRunner {
     pub(super) morsel_iter: Option<BoxedExecIter>,
     pub(super) pending_chunk: Option<Chunk>,
     finished: bool,
-    shared_runtime_filter_decision: SharedRuntimeFilterDecision,
-    runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
-    runtime_filter_exprs: HashMap<i32, ExprId>,
-    runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache,
-    runtime_filters_expected: usize,
-    runtime_filter_lifecycle_handles: HashMap<i32, RfLifecycleHandle>,
-    acquired: Option<AcquiredRuntimeFilters>,
-    runtime_filter_ctx: Option<Arc<RuntimeFilterContext>>,
-    runtime_filters_loaded: bool,
     native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
     native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
     conjunct_predicate: Option<ExprId>,
@@ -319,10 +287,6 @@ impl ScanAsyncRunner {
         scan: ScanNode,
         op: Arc<dyn ScanOp>,
         dispatch: Arc<ScanDispatchState>,
-        shared_runtime_filter_decision: SharedRuntimeFilterDecision,
-        runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
-        runtime_filter_exprs: HashMap<i32, ExprId>,
-        runtime_filters_expected: usize,
         native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
         native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
         arena: Arc<ExprArena>,
@@ -342,15 +306,6 @@ impl ScanAsyncRunner {
             morsel_iter: None,
             pending_chunk: None,
             finished: false,
-            shared_runtime_filter_decision,
-            runtime_filter_probe,
-            runtime_filter_exprs,
-            runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache::default(),
-            runtime_filters_expected,
-            runtime_filter_lifecycle_handles: HashMap::new(),
-            acquired: None,
-            runtime_filter_ctx: None,
-            runtime_filters_loaded: false,
             native_runtime_filter_consumers,
             native_ordered_live_consumers,
             arena,
@@ -368,208 +323,11 @@ impl ScanAsyncRunner {
         }
     }
 
-    pub(super) fn set_runtime_filter_lifecycle_handles(
-        &mut self,
-        handles: HashMap<i32, RfLifecycleHandle>,
-    ) {
-        self.runtime_filter_lifecycle_handles = handles;
-    }
-
     pub(super) fn set_native_ordered_live_consumers(
         &mut self,
         consumers: Option<NativeOrderedLiveConsumerSet>,
     ) {
         self.native_ordered_live_consumers = consumers;
-    }
-
-    fn record_runtime_filter_acquired(&self, outcome: &str, latency_ns: i64) {
-        for handle in self.runtime_filter_lifecycle_handles.values() {
-            handle.acquired(outcome, latency_ns);
-        }
-    }
-
-    fn record_runtime_filter_applied(&self, filter_id: i32, input_rows: usize, output_rows: usize) {
-        if let Some(handle) = self.runtime_filter_lifecycle_handles.get(&filter_id) {
-            handle.applied(input_rows as i64, output_rows as i64, 1);
-        }
-    }
-
-    fn apply_complete_runtime_filters(
-        &mut self,
-        snapshot: &RuntimeFilterSnapshot,
-        chunk: Chunk,
-    ) -> Result<Option<Chunk>, String> {
-        let mut current = Some(chunk);
-        for filter in snapshot.membership_filters() {
-            let Some(chunk) = current else {
-                return Ok(None);
-            };
-            let input_rows = chunk.len();
-            let filter_id = filter.filter_id();
-            current = filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
-                &self.arena,
-                &self.runtime_filter_exprs,
-                std::slice::from_ref(filter),
-                chunk,
-                &mut self.runtime_filter_dict_fold_cache,
-            )?;
-            let output_rows = current.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
-            self.record_runtime_filter_applied(filter_id, input_rows, output_rows);
-        }
-        for filter in snapshot.in_filters() {
-            let Some(chunk) = current else {
-                return Ok(None);
-            };
-            let input_rows = chunk.len();
-            let filter_id = filter.filter_id();
-            current = filter_chunk_by_in_filters_with_exprs_and_dict_cache(
-                &self.arena,
-                &self.runtime_filter_exprs,
-                std::slice::from_ref(filter),
-                chunk,
-                &mut self.runtime_filter_dict_fold_cache,
-            )?;
-            let output_rows = current.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
-            self.record_runtime_filter_applied(filter_id, input_rows, output_rows);
-        }
-        for (filter_id, filter) in snapshot.min_max_filters() {
-            let Some(chunk) = current else {
-                return Ok(None);
-            };
-            let input_rows = chunk.len();
-            let filter_slice = [(*filter_id, Arc::clone(filter))];
-            current = filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
-                &self.arena,
-                &self.runtime_filter_exprs,
-                &filter_slice,
-                chunk,
-                &mut self.runtime_filter_dict_fold_cache,
-            )?;
-            let output_rows = current.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
-            self.record_runtime_filter_applied(*filter_id, input_rows, output_rows);
-        }
-        Ok(current)
-    }
-
-    pub(super) fn prepare_runtime_filters(&mut self, state: &ScanAsyncState) -> Result<(), String> {
-        if self.runtime_filters_loaded {
-            return Ok(());
-        }
-        let acquired = self.shared_runtime_filter_decision.get_or_acquire(
-            state,
-            self.runtime_filter_probe.as_ref(),
-            self.runtime_filters_expected,
-        )?;
-        if state.is_canceled() {
-            return Err("scan canceled while waiting for runtime filters".to_string());
-        }
-        self.install_acquired_runtime_filters(acquired)
-    }
-
-    fn install_acquired_runtime_filters(
-        &mut self,
-        acquired: Option<AcquiredRuntimeFilters>,
-    ) -> Result<(), String> {
-        let Some(acquired) = acquired else {
-            self.acquired = None;
-            self.runtime_filter_ctx = None;
-            self.runtime_filters_loaded = true;
-            return Ok(());
-        };
-        if let Some(profile) = self.profiles.as_ref() {
-            profile.common.add_timer(JOIN_RUNTIME_FILTER_TIME);
-            profile.common.add_timer(JOIN_RUNTIME_FILTER_HASH_TIME);
-            profile
-                .common
-                .add_counter(JOIN_RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit);
-            profile
-                .common
-                .add_counter(JOIN_RUNTIME_FILTER_OUTPUT_ROWS, ProfileUnit::Unit);
-            profile
-                .common
-                .add_counter(JOIN_RUNTIME_FILTER_EVALUATE, ProfileUnit::Unit);
-            profile
-                .common
-                .add_counter(RUNTIME_FILTER_NUM, ProfileUnit::Unit);
-            profile
-                .common
-                .add_counter(RUNTIME_IN_FILTER_NUM, ProfileUnit::Unit);
-        }
-        if let AcquiredRuntimeFilters::Complete(snapshot) = &acquired {
-            self.runtime_filter_dict_fold_cache.clear();
-            self.runtime_filter_ctx = Some(Arc::new(RuntimeFilterContext::from_snapshot(
-                snapshot.clone(),
-            )));
-            let ready_latency_ns = self
-                .runtime_filter_probe
-                .as_ref()
-                .and_then(|rf| rf.mark_ready())
-                .map(|elapsed| clamp_u128_to_i64(elapsed.as_nanos()));
-            self.record_runtime_filter_acquired("complete", ready_latency_ns.unwrap_or(0));
-            if let Some(latency_ns) = ready_latency_ns
-                && let Some(profile) = self.profiles.as_ref()
-            {
-                for filter in snapshot.in_filters() {
-                    let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                    profile
-                        .common
-                        .counter_set(&name, ProfileUnit::TimeNs, latency_ns);
-                }
-                for filter in snapshot.membership_filters() {
-                    let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                    profile
-                        .common
-                        .counter_set(&name, ProfileUnit::TimeNs, latency_ns);
-                }
-            }
-            self.log_runtime_filters_loaded(snapshot.in_filters(), snapshot.membership_filters());
-            if let Some(profile) = self.profiles.as_ref() {
-                profile.common.counter_set(
-                    RUNTIME_FILTER_NUM,
-                    ProfileUnit::Unit,
-                    snapshot.membership_filters().len() as i64,
-                );
-                profile.common.counter_set(
-                    RUNTIME_IN_FILTER_NUM,
-                    ProfileUnit::Unit,
-                    snapshot.in_filters().len() as i64,
-                );
-            }
-        } else {
-            if let AcquiredRuntimeFilters::Unavailable(reason) = &acquired {
-                let outcome = format!("unavailable:{reason:?}");
-                self.record_runtime_filter_acquired(&outcome, 0);
-            }
-            self.runtime_filter_ctx = None;
-        }
-        if let Some(profile) = self.profiles.as_ref() {
-            profile
-                .common
-                .counter_set_unit(RUNTIME_FILTER_PLANNED, self.runtime_filters_expected as i64);
-            match &acquired {
-                AcquiredRuntimeFilters::Complete(snapshot) => {
-                    let complete = snapshot.in_filters().len()
-                        + snapshot.membership_filters().len()
-                        + snapshot.min_max_filters().len();
-                    profile
-                        .common
-                        .counter_set_unit(RUNTIME_FILTER_COMPLETE, complete as i64);
-                    profile
-                        .common
-                        .counter_set_unit(RUNTIME_FILTER_UNAVAILABLE, 0);
-                }
-                AcquiredRuntimeFilters::Unavailable(_) => {
-                    profile.common.counter_set_unit(RUNTIME_FILTER_COMPLETE, 0);
-                    profile.common.counter_set_unit(
-                        RUNTIME_FILTER_UNAVAILABLE,
-                        self.runtime_filters_expected as i64,
-                    );
-                }
-            }
-        }
-        self.acquired = Some(acquired);
-        self.runtime_filters_loaded = true;
-        Ok(())
     }
 
     pub(super) fn next_chunk(&mut self) -> Result<Option<Chunk>, String> {
@@ -640,7 +398,7 @@ impl ScanAsyncRunner {
                         .execute_iter(
                             morsel,
                             self.profiles.as_ref().map(|p| p.unique.clone()),
-                            self.runtime_filter_ctx.as_deref(),
+                            None,
                         )
                         .map_err(|e| e.to_string())?
                 };
@@ -695,12 +453,10 @@ impl ScanAsyncRunner {
                     }) else {
                         continue;
                     };
-                    if let Some(filtered) = self.apply_runtime_filters(chunk)?
-                        && !filtered.is_empty()
-                    {
+                    if !chunk.is_empty() {
                         // Check scan-level limit before returning chunk
                         if let Some(limit) = self.scan.limit() {
-                            let rows = filtered.len();
+                            let rows = chunk.len();
                             let prev_rows = dispatch.fetch_add_output_rows(rows);
                             let total_rows = prev_rows + rows;
 
@@ -719,12 +475,12 @@ impl ScanAsyncRunner {
                             }
                         }
                         if let Some(profile) = self.profiles.as_ref() {
-                            let rows = i64::try_from(filtered.len()).unwrap_or(i64::MAX);
+                            let rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
                             profile
                                 .unique
                                 .counter_add("RowsRead", ProfileUnit::Unit, rows);
                         }
-                        return Ok(Some(filtered));
+                        return Ok(Some(chunk));
                     }
                     continue;
                 }
@@ -1488,119 +1244,6 @@ impl ScanAsyncRunner {
     pub(super) fn format_morsel(morsel: &ScanMorsel) -> String {
         morsel.describe()
     }
-
-    fn log_runtime_filters_loaded(
-        &self,
-        in_filters: &[Arc<RuntimeInFilter>],
-        membership_filters: &[Arc<RuntimeMembershipFilter>],
-    ) {
-        let node_id = self.scan.node_id().unwrap_or(-1);
-        debug!(
-            "scan runtime filters loaded: node_id={} expected={} in_filters={} membership_filters={}",
-            node_id,
-            self.runtime_filters_expected,
-            in_filters.len(),
-            membership_filters.len()
-        );
-        for filter in in_filters {
-            let filter = filter.as_ref();
-            debug!(
-                "scan runtime in filter: node_id={} filter_id={} slot_id={:?} empty={}",
-                node_id,
-                filter.filter_id(),
-                filter.slot_id(),
-                filter.is_empty()
-            );
-        }
-        for filter in membership_filters {
-            let filter = filter.as_ref();
-            let kind = match filter {
-                RuntimeMembershipFilter::Bloom(_) => "bloom",
-                RuntimeMembershipFilter::Bitset(_) => "bitset",
-                RuntimeMembershipFilter::Empty(_) => "empty",
-            };
-            debug!(
-                "scan runtime membership filter: node_id={} filter_id={} kind={} slot_id={:?} ltype={:?} size={} has_null={} join_mode={} empty={}",
-                node_id,
-                filter.filter_id(),
-                kind,
-                filter.slot_id(),
-                filter.ltype(),
-                filter.size(),
-                filter.has_null(),
-                filter.join_mode(),
-                filter.is_empty()
-            );
-        }
-    }
-
-    fn apply_runtime_filters(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
-        let input_rows = chunk.len();
-        let snapshot = match self.acquired.as_ref() {
-            None => return Ok(Some(chunk)),
-            Some(AcquiredRuntimeFilters::Unavailable(_)) => {
-                if let Some(profile) = self.profiles.as_ref() {
-                    profile.common.counter_add(
-                        JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                        ProfileUnit::Unit,
-                        input_rows as i64,
-                    );
-                    profile.common.counter_add(
-                        JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                        ProfileUnit::Unit,
-                        input_rows as i64,
-                    );
-                }
-                return Ok(Some(chunk));
-            }
-            Some(AcquiredRuntimeFilters::Complete(snapshot)) => snapshot.clone(),
-        };
-        if snapshot.is_empty() {
-            if let Some(profile) = self.profiles.as_ref() {
-                profile.common.counter_add(
-                    JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                    ProfileUnit::Unit,
-                    input_rows as i64,
-                );
-                profile.common.counter_add(
-                    JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                    ProfileUnit::Unit,
-                    input_rows as i64,
-                );
-            }
-            return Ok(Some(chunk));
-        }
-        let filters_len = (snapshot.in_filters().len()
-            + snapshot.membership_filters().len()
-            + snapshot.min_max_filters().len()) as i64;
-        let result = if let Some(profile) = self.profiles.as_ref() {
-            let _timer = profile.common.scoped_timer(JOIN_RUNTIME_FILTER_TIME);
-            self.apply_complete_runtime_filters(&snapshot, chunk)
-        } else {
-            self.apply_complete_runtime_filters(&snapshot, chunk)
-        }?;
-        if let Some(profile) = self.profiles.as_ref() {
-            let output_rows = result.as_ref().map(|c| c.len()).unwrap_or(0) as i64;
-            profile.common.counter_add(
-                JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                ProfileUnit::Unit,
-                input_rows as i64,
-            );
-            profile.common.counter_add(
-                JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                ProfileUnit::Unit,
-                output_rows,
-            );
-            if filters_len > 0 {
-                profile.common.counter_add(
-                    JOIN_RUNTIME_FILTER_EVALUATE,
-                    ProfileUnit::Unit,
-                    filters_len,
-                );
-            }
-        }
-        Ok(result)
-    }
 }
 
 fn apply_iceberg_include_position_filter(
@@ -1686,18 +1329,6 @@ pub(super) fn run_scan_worker(
         return;
     }
 
-    if let Err(err) = runner.prepare_runtime_filters(state.as_ref()) {
-        if state.is_canceled() {
-            state.mark_finished();
-        } else {
-            state.set_error(err);
-        }
-        inflight.fetch_sub(1, Ordering::AcqRel);
-        let notify = inflight_observable.defer_notify();
-        notify.arm();
-        return;
-    }
-
     let _io_exec_scope = IoExecScope::new(Arc::clone(&state), runner.profiles.clone());
 
     let mut keep_runner = false;
@@ -1770,18 +1401,12 @@ mod tests {
         RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
     };
     use crate::exec::operators::scan::dispatch::ScanDispatchState;
-    use crate::exec::operators::scan::types::SharedRuntimeFilterDecision;
-    use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
     use crate::exec::row_position::IcebergVirtualSpec;
     use crate::exec::runtime_filter::{
-        LocalRuntimeInFilterSet, RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter,
-        RuntimeEmptyFilter, RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter,
-        RuntimeMinMaxFilter,
+        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeEmptyFilter,
+        RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
-    use crate::runtime::query_context::QueryId;
-    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, LateApplyGranularity,
     };
@@ -1792,7 +1417,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::{BTreeSet, HashMap};
-    use std::thread;
 
     /// Helper: call the production synthesis helper from a RecordBatch fixture.
     fn synthesize(
@@ -2242,7 +1866,7 @@ mod tests {
             self.observed_min_max_counts
                 .lock()
                 .expect("observed min/max lock")
-                .push(runtime_filters.snapshot().min_max_filters().len());
+                .push(runtime_filters.min_max_filters().len());
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -2468,43 +2092,25 @@ mod tests {
     }
 
     fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
-        let spec = crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-            filter_id,
-            expr_order: 0,
-            probe_expr_id: crate::exec::expr::ExprId(0),
-            build_expr_id: crate::exec::expr::ExprId(0),
-            probe_slot_id: SlotId::new(1),
-            build_data_type: DataType::Int32,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        };
         let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
-        let mut set =
-            LocalRuntimeInFilterSet::new(std::slice::from_ref(&spec), std::slice::from_ref(&array))
-                .expect("in filter set");
-        set.add_build_arrays(std::slice::from_ref(&array))
+        let mut filter =
+            RuntimeInFilter::new_for_test(filter_id, SlotId::new(1), array.data_type())
+                .expect("in filter");
+        filter
+            .insert_array_for_test(&array)
             .expect("add build values");
-        set.into_filters()
+        vec![filter]
     }
 
     fn string_in_filter(filter_id: i32, values: Vec<&str>) -> Vec<RuntimeInFilter> {
-        let spec = crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-            filter_id,
-            expr_order: 0,
-            probe_expr_id: crate::exec::expr::ExprId(0),
-            build_expr_id: crate::exec::expr::ExprId(0),
-            probe_slot_id: SlotId::new(1),
-            build_data_type: DataType::Utf8,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        };
         let array = Arc::new(StringArray::from(values)) as arrow::array::ArrayRef;
-        let mut set =
-            LocalRuntimeInFilterSet::new(std::slice::from_ref(&spec), std::slice::from_ref(&array))
-                .expect("string in filter set");
-        set.add_build_arrays(std::slice::from_ref(&array))
+        let mut filter =
+            RuntimeInFilter::new_for_test(filter_id, SlotId::new(1), array.data_type())
+                .expect("string in filter");
+        filter
+            .insert_array_for_test(&array)
             .expect("add string build values");
-        set.into_filters()
+        vec![filter]
     }
 
     fn pruning_membership_filter(filter_id: i32, values: Vec<i32>) -> RuntimeMembershipFilter {
@@ -2611,10 +2217,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             Some(consumers),
             arena,
@@ -2706,10 +2308,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             Some(consumers),
             arena,
@@ -2766,10 +2364,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             Some(consumers),
             arena,
@@ -2876,10 +2470,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             Some(blocking_consumers),
             Some(ordered_consumers),
             arena,
@@ -2897,650 +2487,6 @@ mod tests {
         assert!(
             live.poll_count() >= 2,
             "ordered live must poll once for the morsel and again for the new chunk"
-        );
-    }
-
-    fn scan_runtime_filter_runner(
-        filter_id: i32,
-        query_key: QueryKey,
-        hub: &RuntimeFilterHub,
-    ) -> (ScanAsyncRunner, crate::exec::expr::ExprId) {
-        let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let arena = Arc::new(arena);
-        hub.register_probe_specs(
-            42,
-            &[crate::exec::node::RuntimeFilterProbeSpec {
-                filter_id,
-                expr_id: expr,
-                slot_id: SlotId::new(1),
-                data_type: DataType::Int32,
-            }],
-        );
-        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let scan = ScanNode::new_for_test(Arc::new(EmptyScanOp))
-            .with_node_id(42)
-            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
-        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
-            Vec::new(),
-            false,
-        )));
-        let mut runner = ScanAsyncRunner::new(
-            "scan".to_string(),
-            scan,
-            Arc::new(EmptyScanOp),
-            dispatch,
-            SharedRuntimeFilterDecision::new(),
-            Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
-            HashMap::from([(filter_id, expr)]),
-            1,
-            None,
-            None,
-            arena,
-            None,
-            0,
-        );
-        let recorder = RuntimeFilterLifecycleRegistry::global().recorder(query_key);
-        runner.set_runtime_filter_lifecycle_handles(HashMap::from([(
-            filter_id,
-            recorder.filter(filter_id),
-        )]));
-        (runner, expr)
-    }
-
-    fn scan_runtime_filter_string_runner(
-        filter_id: i32,
-        query_key: QueryKey,
-        hub: &RuntimeFilterHub,
-    ) -> (ScanAsyncRunner, crate::exec::expr::ExprId) {
-        let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
-        let arena = Arc::new(arena);
-        hub.register_probe_specs(
-            42,
-            &[crate::exec::node::RuntimeFilterProbeSpec {
-                filter_id,
-                expr_id: expr,
-                slot_id: SlotId::new(1),
-                data_type: DataType::Utf8,
-            }],
-        );
-        let scan_schema = Arc::new(Schema::new(vec![Field::new(
-            "status",
-            DataType::Utf8,
-            true,
-        )]));
-        let scan = ScanNode::new_for_test(Arc::new(EmptyScanOp))
-            .with_node_id(42)
-            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
-        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
-            Vec::new(),
-            false,
-        )));
-        let mut runner = ScanAsyncRunner::new(
-            "scan".to_string(),
-            scan,
-            Arc::new(EmptyScanOp),
-            dispatch,
-            SharedRuntimeFilterDecision::new(),
-            Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
-            HashMap::from([(filter_id, expr)]),
-            1,
-            None,
-            None,
-            arena,
-            None,
-            0,
-        );
-        let recorder = RuntimeFilterLifecycleRegistry::global().recorder(query_key);
-        runner.set_runtime_filter_lifecycle_handles(HashMap::from([(
-            filter_id,
-            recorder.filter(filter_id),
-        )]));
-        (runner, expr)
-    }
-
-    #[test]
-    fn scan_runtime_filter_in_reuses_dictionary_fold_for_shared_values() {
-        let query_key = QueryKey::from_hi_lo(20_050, 7);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        );
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-        let (mut runner, _) = scan_runtime_filter_string_runner(7, query_key, &hub);
-
-        let in_filters = string_in_filter(7, vec!["PAID"]);
-        runner.acquired = Some(AcquiredRuntimeFilters::Complete(
-            RuntimeFilterSnapshot::from_filters(in_filters, Vec::new()),
-        ));
-
-        let values = Arc::new(StringArray::from(vec!["PAID", "NEW"]));
-        let base = dictionary_status_chunk(
-            vec![Some(0), Some(1), Some(1), Some(0)],
-            Arc::clone(&values),
-        );
-        let out1 = runner
-            .apply_runtime_filters(base.slice(0, 2))
-            .expect("apply runtime filters")
-            .expect("in filter should keep rows");
-        let out2 = runner
-            .apply_runtime_filters(base.slice(2, 2))
-            .expect("apply runtime filters")
-            .expect("in filter should keep rows");
-
-        assert_eq!(output_strings(&out1), vec![Some("PAID".to_string())]);
-        assert_eq!(output_strings(&out2), vec![Some("PAID".to_string())]);
-        assert_eq!(
-            runner.runtime_filter_dict_fold_cache.build_count_for_test(),
-            1
-        );
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn scan_runtime_filter_membership_reuses_dictionary_fold_for_shared_values() {
-        let query_key = QueryKey::from_hi_lo(20_051, 7);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        );
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-        let (mut runner, _) = scan_runtime_filter_string_runner(7, query_key, &hub);
-
-        runner.acquired = Some(AcquiredRuntimeFilters::Complete(
-            RuntimeFilterSnapshot::from_filters(
-                Vec::new(),
-                vec![pruning_string_membership_filter(7, vec!["PAID"])],
-            ),
-        ));
-
-        let values = Arc::new(StringArray::from(vec!["PAID", "NEW"]));
-        let base = dictionary_status_chunk(
-            vec![Some(0), Some(1), Some(1), Some(0)],
-            Arc::clone(&values),
-        );
-        let out1 = runner
-            .apply_runtime_filters(base.slice(0, 2))
-            .expect("apply runtime filters")
-            .expect("membership filter should keep rows");
-        let out2 = runner
-            .apply_runtime_filters(base.slice(2, 2))
-            .expect("apply runtime filters")
-            .expect("membership filter should keep rows");
-
-        assert_eq!(output_strings(&out1), vec![Some("PAID".to_string())]);
-        assert_eq!(output_strings(&out2), vec![Some("PAID".to_string())]);
-        assert_eq!(
-            runner.runtime_filter_dict_fold_cache.build_count_for_test(),
-            1
-        );
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn runtime_filters_use_acquired_snapshot_after_prepare() {
-        let query_key = QueryKey::from_hi_lo(20_004, 7);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            crate::runtime::query_context::QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        );
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-
-        let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let arena = Arc::new(arena);
-        hub.register_probe_specs(
-            42,
-            &[crate::exec::node::RuntimeFilterProbeSpec {
-                filter_id: 7,
-                expr_id: expr,
-                slot_id: SlotId::new(1),
-                data_type: DataType::Int32,
-            }],
-        );
-        let probe = hub.register_probe(42);
-        let build_values = Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef;
-        let membership = RuntimeMembershipFilter::Bloom(
-            RuntimeBloomFilter::build_from_array(
-                7,
-                SlotId::new(1),
-                RuntimeFilterType::Int32,
-                &build_values,
-                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
-            )
-            .expect("build bloom filter"),
-        );
-        hub.publish_filters(&[], &[membership]);
-
-        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let scan = ScanNode::new_for_test(Arc::new(EmptyScanOp))
-            .with_node_id(42)
-            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
-        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
-            Vec::new(),
-            false,
-        )));
-        let mut runtime_filter_exprs = HashMap::new();
-        runtime_filter_exprs.insert(7, expr);
-        let profiles = crate::runtime::profile::OperatorProfiles::new(
-            crate::runtime::profile::RuntimeProfile::new("scan"),
-        );
-        let mut runner = ScanAsyncRunner::new(
-            "scan".to_string(),
-            scan,
-            Arc::new(EmptyScanOp),
-            dispatch,
-            SharedRuntimeFilterDecision::new(),
-            Some(ScanRuntimeFilterProbe::new(probe)),
-            runtime_filter_exprs,
-            1,
-            None,
-            None,
-            arena,
-            Some(profiles.clone()),
-            0,
-        );
-        let recorder = registry.recorder(query_key);
-        runner.set_runtime_filter_lifecycle_handles(HashMap::from([(7, recorder.filter(7))]));
-        let state = ScanAsyncState::new(1, "runtime-filter-snapshot-test".to_string());
-        runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare runtime filters");
-        assert_eq!(
-            profiles.common.counter_value(RUNTIME_FILTER_PLANNED),
-            Some(1)
-        );
-        assert_eq!(
-            profiles.common.counter_value(RUNTIME_FILTER_COMPLETE),
-            Some(1)
-        );
-        assert_eq!(
-            profiles.common.counter_value(RUNTIME_FILTER_UNAVAILABLE),
-            Some(0)
-        );
-
-        hub.publish_min_max_filter(
-            7,
-            RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
-                .expect("empty min/max filter"),
-        );
-
-        let filtered = runner
-            .apply_runtime_filters(int32_chunk(vec![1, 2, 3, 4]))
-            .expect("apply runtime filters")
-            .expect("frozen snapshot should not include late filter");
-        assert_eq!(filtered.len(), 3);
-
-        let snapshot = registry.snapshot(query_key).expect("lifecycle snapshot");
-        let filter = snapshot.filters.get(&7).expect("filter lifecycle");
-        assert_eq!(
-            filter.acquired.as_ref().map(|info| info.outcome.as_str()),
-            Some("complete")
-        );
-        assert_eq!(filter.applied_input_rows(), 4);
-        assert_eq!(filter.applied_output_rows(), 3);
-        assert_eq!(filter.applied_evals(), 1);
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn runtime_filter_lifecycle_records_scan_membership_apply() {
-        let query_key = QueryKey::from_hi_lo(20_005, 7);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        );
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-        let (mut runner, _) = scan_runtime_filter_runner(7, query_key, &hub);
-        hub.publish_filters(&[], &[pruning_membership_filter(7, vec![1, 2, 3])]);
-
-        let state = ScanAsyncState::new(1, "scan-membership-lifecycle-test".to_string());
-        runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare runtime filters");
-        let filtered = runner
-            .apply_runtime_filters(int32_chunk(vec![1, 2, 3, 4]))
-            .expect("apply runtime filters")
-            .expect("membership filter should keep rows");
-        assert_eq!(filtered.len(), 3);
-
-        let snapshot = registry.snapshot(query_key).expect("lifecycle snapshot");
-        let filter = snapshot.filters.get(&7).expect("filter lifecycle");
-        assert_eq!(filter.applied_input_rows(), 4);
-        assert_eq!(filter.applied_output_rows(), 3);
-        assert_eq!(filter.applied_evals(), 1);
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn runtime_filter_lifecycle_records_scan_in_apply() {
-        let query_key = QueryKey::from_hi_lo(20_006, 8);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        );
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-        let (mut runner, _) = scan_runtime_filter_runner(8, query_key, &hub);
-        let in_filters = in_filter(8, vec![1, 3]);
-        hub.publish_filters(&in_filters, &[passthrough_membership_filter(8)]);
-
-        let state = ScanAsyncState::new(1, "scan-in-lifecycle-test".to_string());
-        runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare runtime filters");
-        let filtered = runner
-            .apply_runtime_filters(int32_chunk(vec![1, 2, 3, 4]))
-            .expect("apply runtime filters")
-            .expect("in filter should keep rows");
-        assert_eq!(filtered.len(), 2);
-
-        let snapshot = registry.snapshot(query_key).expect("lifecycle snapshot");
-        let filter = snapshot.filters.get(&8).expect("filter lifecycle");
-        assert_eq!(filter.applied_input_rows(), 8);
-        assert_eq!(filter.applied_output_rows(), 6);
-        assert_eq!(filter.applied_evals(), 2);
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn runtime_filter_lifecycle_records_scan_min_max_apply() {
-        let query_key = QueryKey::from_hi_lo(20_007, 9);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        );
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-        let (mut runner, _) = scan_runtime_filter_runner(9, query_key, &hub);
-        hub.publish_min_max_filter(9, pruning_min_max_filter(vec![1, 3]));
-        hub.publish_filters(&[], &[passthrough_membership_filter(9)]);
-
-        let state = ScanAsyncState::new(1, "scan-min-max-lifecycle-test".to_string());
-        runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare runtime filters");
-        let filtered = runner
-            .apply_runtime_filters(int32_chunk(vec![1, 2, 3, 4]))
-            .expect("apply runtime filters")
-            .expect("min/max filter should keep rows");
-        assert_eq!(filtered.len(), 3);
-
-        let snapshot = registry.snapshot(query_key).expect("lifecycle snapshot");
-        let filter = snapshot.filters.get(&9).expect("filter lifecycle");
-        assert_eq!(filter.applied_input_rows(), 8);
-        assert_eq!(filter.applied_output_rows(), 7);
-        assert_eq!(filter.applied_evals(), 2);
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn runtime_filter_lifecycle_records_scan_unavailable_acquired() {
-        let query_key = QueryKey::from_hi_lo(20_008, 10);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        );
-        hub.set_wait_timeouts(None, None);
-        let (mut runner, _) = scan_runtime_filter_runner(10, query_key, &hub);
-
-        let state = ScanAsyncState::new(1, "scan-unavailable-lifecycle-test".to_string());
-        runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare runtime filters");
-
-        let snapshot = registry.snapshot(query_key).expect("lifecycle snapshot");
-        let filter = snapshot.filters.get(&10).expect("filter lifecycle");
-        assert_eq!(
-            filter.acquired.as_ref().map(|info| info.outcome.as_str()),
-            Some("unavailable:NoWaitConfigured")
-        );
-        assert_eq!(
-            filter.acquired.as_ref().map(|info| info.latency_ns),
-            Some(0)
-        );
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn runtime_filter_lifecycle_preserves_first_scan_acquire_latency() {
-        let query_key = QueryKey::from_hi_lo(20_009, 11);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-        let hub = Arc::new(RuntimeFilterHub::new_for_query(
-            DependencyManager::new(),
-            QueryId {
-                hi: query_key.hi,
-                lo: query_key.lo,
-            },
-        ));
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-        let (mut first_runner, _) = scan_runtime_filter_runner(11, query_key, &hub);
-        let (mut later_runner, _) = scan_runtime_filter_runner(11, query_key, &hub);
-        let publisher = {
-            let hub = Arc::clone(&hub);
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(20));
-                hub.publish_filters(&[], &[pruning_membership_filter(11, vec![1, 2, 3])]);
-            })
-        };
-
-        let state = ScanAsyncState::new(1, "scan-first-acquire-lifecycle-test".to_string());
-        first_runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare first runtime filters");
-        publisher.join().expect("publisher");
-        let first_latency = registry
-            .snapshot(query_key)
-            .expect("lifecycle snapshot")
-            .filters
-            .get(&11)
-            .and_then(|filter| filter.acquired.as_ref())
-            .map(|info| info.latency_ns)
-            .expect("first acquire latency");
-        assert!(first_latency > 0, "first acquire should have waited");
-
-        later_runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare later runtime filters");
-        let snapshot = registry.snapshot(query_key).expect("lifecycle snapshot");
-        let filter = snapshot.filters.get(&11).expect("filter lifecycle");
-        assert_eq!(
-            filter.acquired.as_ref().map(|info| info.latency_ns),
-            Some(first_latency)
-        );
-        registry.remove_query(query_key);
-    }
-
-    #[test]
-    fn connector_scan_receives_frozen_runtime_filter_context() {
-        let hub = RuntimeFilterHub::new(DependencyManager::new());
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-
-        let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let arena = Arc::new(arena);
-        hub.register_probe_specs(
-            42,
-            &[crate::exec::node::RuntimeFilterProbeSpec {
-                filter_id: 7,
-                expr_id: expr,
-                slot_id: SlotId::new(1),
-                data_type: DataType::Int32,
-            }],
-        );
-        let probe = hub.register_probe(42);
-        let build_values = Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef;
-        let membership = RuntimeMembershipFilter::Bloom(
-            RuntimeBloomFilter::build_from_array(
-                7,
-                SlotId::new(1),
-                RuntimeFilterType::Int32,
-                &build_values,
-                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
-            )
-            .expect("build bloom filter"),
-        );
-        hub.publish_filters(&[], &[membership]);
-
-        let observed_min_max_counts = Arc::new(Mutex::new(Vec::new()));
-        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let op: Arc<dyn ScanOp> = Arc::new(RuntimeFilterRecordingScanOp {
-            observed_min_max_counts: Arc::clone(&observed_min_max_counts),
-        });
-        let scan = ScanNode::new_for_test(Arc::clone(&op))
-            .with_node_id(42)
-            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
-        let morsels = op.build_morsels().expect("build morsels");
-        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
-            morsels.morsels,
-            morsels.has_more,
-        )));
-        let mut runner = ScanAsyncRunner::new(
-            "scan".to_string(),
-            scan,
-            op,
-            dispatch,
-            SharedRuntimeFilterDecision::new(),
-            Some(ScanRuntimeFilterProbe::new(probe)),
-            HashMap::from([(7, expr)]),
-            1,
-            None,
-            None,
-            arena,
-            None,
-            0,
-        );
-        let state = ScanAsyncState::new(1, "runtime-filter-context-test".to_string());
-        runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare runtime filters");
-
-        hub.publish_min_max_filter(
-            7,
-            RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
-                .expect("empty min/max filter"),
-        );
-
-        assert!(
-            runner.next_chunk().expect("scan next chunk").is_none(),
-            "recording scan has no rows"
-        );
-        assert_eq!(
-            *observed_min_max_counts
-                .lock()
-                .expect("observed min/max lock"),
-            vec![0],
-            "connector must see the frozen prepare-time snapshot, not late handle updates"
-        );
-    }
-
-    #[test]
-    fn runner_uses_cached_runtime_filter_decision_for_connector_context() {
-        let hub = RuntimeFilterHub::new(DependencyManager::new());
-        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
-
-        let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let arena = Arc::new(arena);
-        hub.register_probe_specs(
-            42,
-            &[crate::exec::node::RuntimeFilterProbeSpec {
-                filter_id: 7,
-                expr_id: expr,
-                slot_id: SlotId::new(1),
-                data_type: DataType::Int32,
-            }],
-        );
-        let source_probe = ScanRuntimeFilterProbe::new(hub.register_probe(42));
-        hub.publish_filters(&[], &[pruning_membership_filter(7, vec![1, 2, 3])]);
-
-        let shared_decision = SharedRuntimeFilterDecision::new();
-        let state = ScanAsyncState::new(1, "shared-runtime-filter-decision-test".to_string());
-        let cached = shared_decision
-            .get_or_acquire(&state, Some(&source_probe), 1)
-            .expect("warm shared runtime filter decision");
-        assert!(
-            matches!(cached, Some(AcquiredRuntimeFilters::Complete(_))),
-            "shared decision should cache complete runtime filters"
-        );
-
-        let observed_min_max_counts = Arc::new(Mutex::new(Vec::new()));
-        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let op: Arc<dyn ScanOp> = Arc::new(RuntimeFilterRecordingScanOp {
-            observed_min_max_counts: Arc::clone(&observed_min_max_counts),
-        });
-        let scan = ScanNode::new_for_test(Arc::clone(&op))
-            .with_node_id(42)
-            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
-        let morsels = op.build_morsels().expect("build morsels");
-        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
-            morsels.morsels,
-            morsels.has_more,
-        )));
-        let mut runner = ScanAsyncRunner::new(
-            "scan".to_string(),
-            scan,
-            op,
-            dispatch,
-            shared_decision,
-            None,
-            HashMap::from([(7, expr)]),
-            1,
-            None,
-            None,
-            arena,
-            None,
-            0,
-        );
-        runner
-            .prepare_runtime_filters(&state)
-            .expect("prepare runtime filters from cached decision");
-
-        assert!(
-            runner.next_chunk().expect("scan next chunk").is_none(),
-            "recording scan has no rows"
-        );
-        assert_eq!(
-            *observed_min_max_counts
-                .lock()
-                .expect("observed min/max lock"),
-            vec![0],
-            "connector scan should receive runtime filter context from the shared decision"
         );
     }
 
@@ -3612,10 +2558,6 @@ mod tests {
             scan.clone(),
             Arc::new(EmptyScanOp),
             Arc::clone(&dispatch),
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             Arc::clone(&arena),
@@ -3629,10 +2571,6 @@ mod tests {
             scan,
             Arc::new(EmptyScanOp),
             Arc::clone(&dispatch),
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
@@ -3695,10 +2633,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
@@ -3769,10 +2703,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
@@ -3821,10 +2751,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
