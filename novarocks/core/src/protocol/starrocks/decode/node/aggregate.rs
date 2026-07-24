@@ -26,6 +26,7 @@ use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::{lower_expr_node_at, lower_t_expr_at};
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
 use crate::runtime::query_options::QueryOptions;
 use crate::thrift::descriptors;
 

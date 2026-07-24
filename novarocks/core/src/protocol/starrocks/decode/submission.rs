@@ -586,7 +586,7 @@ fn decode_draft_parts(
         FieldPath::root("exec_plan_fragment").field("fragment"),
     )?;
     let runtime_filters = decode_runtime_filter_contract(&plan.nodes);
-    let mut plan = ExecPlan {
+    let plan = ExecPlan {
         arena,
         root: lowered.node,
     };
