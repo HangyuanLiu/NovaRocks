@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+use crate::runtime_filter::model::refined_wait_graph::RefinedFragmentEdge;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
@@ -133,6 +134,16 @@ pub(crate) struct FragmentEdge {
     pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
     pub output_slot_ids: Vec<i32>,
+}
+
+impl FragmentEdge {
+    pub(crate) fn as_refined_runtime_filter_edge(&self) -> RefinedFragmentEdge {
+        RefinedFragmentEdge {
+            source_fragment: self.source_fragment_id,
+            target_fragment: self.target_fragment_id,
+            target_exchange_node: self.target_exchange_node_id,
+        }
+    }
 }
 
 #[derive(Debug)]

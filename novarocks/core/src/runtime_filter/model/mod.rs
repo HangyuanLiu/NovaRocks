@@ -20,4 +20,5 @@ pub(crate) mod coverage;
 pub(crate) mod graph;
 pub(crate) mod join_progress;
 pub(crate) mod policy;
+pub(crate) mod refined_wait_graph;
 pub(crate) mod validation;

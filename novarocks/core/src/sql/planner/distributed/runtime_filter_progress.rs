@@ -191,9 +191,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::runtime_filter::deployment::DeploymentError;
-    use crate::runtime_filter::deployment::wait_for::{
-        ConsumerWaitInput, ExecutionDependencyGraph, ProducerWaitInput, validate_wait_for,
-    };
+    use crate::runtime_filter::deployment::wait_for::validate_wait_for;
     use crate::runtime_filter::model::contract::{
         BindingId, ChannelId, ConsumerActivation, ContributionKind, CoverageWitnessId,
         PlanFragmentId, PlanNodeId,
@@ -201,6 +199,7 @@ mod tests {
     use crate::runtime_filter::model::graph::{
         ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingSpec,
     };
+    use crate::runtime_filter::model::refined_wait_graph::{ConsumerWaitInput, ProducerWaitInput};
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
@@ -506,7 +505,10 @@ mod tests {
         let graph = producer_graph(1, 10);
         let catalog = build_join_progress_proof_catalog(&fragments, &graph);
         let edges = vec![fragment_edge(2, 1, 20), fragment_edge(3, 1, 30)];
-        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let refined_edges = edges
+            .iter()
+            .map(FragmentEdge::as_refined_runtime_filter_edge)
+            .collect::<Vec<_>>();
         let consumer = ConsumerWaitInput {
             channel: ChannelId::new(7),
             binding: BindingId::new(10),
@@ -518,7 +520,7 @@ mod tests {
             }],
         };
 
-        let err = validate_wait_for(&deps, &edges, &[consumer], &catalog, &graph).unwrap_err();
+        let err = validate_wait_for(&refined_edges, &[consumer], &catalog, &graph).unwrap_err();
         let DeploymentError::BlockingFeedbackCycle { cycle, .. } = err else {
             panic!("expected coarse fallback cycle");
         };
