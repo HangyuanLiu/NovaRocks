@@ -77,7 +77,7 @@ impl ScanSourceFactory {
         op: Arc<dyn ScanOp>,
         arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
-        let mut blocking_specs = Vec::new();
+        let mut membership_specs = Vec::new();
         let mut ordered_live_specs = Vec::new();
         let mut seen_bindings = HashSet::new();
         for spec in scan.native_runtime_filter_specs() {
@@ -87,17 +87,17 @@ impl ScanSourceFactory {
                     spec.binding_id
                 ));
             }
-            match spec.activation {
-                crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
-                    blocking_specs.push(spec.clone());
-                }
-                crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+            match &spec.contract {
+                crate::exec::node::runtime_filter::NativeRuntimeFilterContract::Membership {
+                    ..
+                } => membership_specs.push(spec.clone()),
+                crate::exec::node::runtime_filter::NativeRuntimeFilterContract::Ordered {
                     ..
                 } => ordered_live_specs.push(spec.clone()),
             }
         }
         let blocking_consumers =
-            NativeRuntimeFilterConsumerSet::from_plan(&blocking_specs, Arc::clone(&arena))?;
+            NativeRuntimeFilterConsumerSet::from_plan(&membership_specs, Arc::clone(&arena))?;
         let ordered_live_consumers =
             NativeOrderedLiveConsumerSet::from_plan(&ordered_live_specs, Arc::clone(&arena))?;
         Ok(Self::new_in_mode(
@@ -1255,6 +1255,50 @@ mod tests {
 
         ScanSourceFactory::new_native(scan, op, Arc::new(arena))
             .expect("native scan factory must group blocking and ordered live specs separately");
+    }
+
+    #[test]
+    fn native_scan_cycle_forced_membership_stays_in_join_consumer_group() {
+        use std::collections::BTreeSet;
+
+        use crate::exec::expr::ExprNode;
+        use crate::exec::node::runtime_filter::{
+            NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
+            NativeRuntimeFilterReduction,
+        };
+        use crate::runtime_filter::model::contract::{
+            ArtifactCapability, ConsumerActivation, LateApplyGranularity, NullSemantics,
+        };
+        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let membership_schema =
+            ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
+                .expect("membership schema");
+        let op: Arc<dyn ScanOp> = Arc::new(PlainScanOp::new());
+        let mut scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        scan.set_native_runtime_filter_specs(vec![NativeRuntimeFilterConsumerSpec {
+            binding_id: 4,
+            channel_id: 2,
+            expr_id,
+            activation: ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+            capabilities: BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            contract: NativeRuntimeFilterContract::Membership {
+                canonical_schema: Arc::from(membership_schema.canonical_bytes()),
+                schema_digest: membership_schema.digest().bytes(),
+            },
+            reduction: NativeRuntimeFilterReduction::SetUnion,
+        }]);
+
+        ScanSourceFactory::new_native(scan, op, Arc::new(arena))
+            .expect("cycle-forced membership must remain a Join consumer");
     }
 
     #[test]
