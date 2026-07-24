@@ -21,26 +21,6 @@ package novarocks.filter;
 import "common.proto";  // novarocks.common.{Status, UniqueId, TypeDesc}
 import "plan.proto";
 
-// Runtime-filter transmission. Producer: src/exec/operators/hashjoin/
-// hash_join_build_sink.rs + src/runtime/runtime_filter_worker.rs. Consumer:
-// src/service/internal_rpc.rs. Replaces starrocks.PTransmitRuntimeFilterParams
-// (16 fields; NovaRocks consumed 6).
-message TransmitRuntimeFilterRequest {
-  bool is_partial = 1;                          // route: partial->merge, full->probe
-  novarocks.common.UniqueId query_id = 2;       // query that owns the runtime filter
-  int32 filter_id = 3;                          // runtime-filter id within the query
-  bytes data = 4;                               // RF codec payload (opaque; RF_VERSION_V3)
-  int32 build_be_number = 5;                    // meaningful only when is_partial
-  novarocks.common.TypeDesc column_type = 6;    // optional; infers build data type
-}
-
-// Runtime-filter transmission acknowledgement. Producer: src/service/internal_rpc.rs.
-// Consumer: src/runtime/runtime_filter_worker.rs and hash-join sender path.
-message TransmitRuntimeFilterResponse {
-  novarocks.common.Status status = 1;           // transmission result
-  int32 filter_id = 2;                          // runtime-filter id acknowledged
-}
-
 // Point lookup (row-position fetch; used by Iceberg v3 pure mode). Producer:
 // src/exec/operators/fetch_processor.rs. Consumer: src/service/internal_rpc.rs
 // -> src/runtime/lookup.rs. Replaces starrocks.PLookUpRequest/Response.

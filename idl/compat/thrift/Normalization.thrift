@@ -24,7 +24,6 @@ include "Types.thrift"
 include "Opcodes.thrift"
 include "Descriptors.thrift"
 include "Partitions.thrift"
-include "RuntimeFilter.thrift"
 include "PlanNodes.thrift"
 
 struct TNormalOlapScanNode {

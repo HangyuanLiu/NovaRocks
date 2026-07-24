@@ -30,14 +30,11 @@ mod tests {
         TPlanFragmentExecParams, TQueryOptions, TScanRangeParams, TSpillMode, TSpillOptions,
     };
     use crate::thrift::plan_nodes::TScanRange;
-    use crate::thrift::runtime_filter::{TRuntimeFilterParams, TRuntimeFilterProberParams};
     use crate::thrift::types::{TNetworkAddress, TUniqueId};
 
     use super::compat::request::backfill_per_node_scan_ranges;
     use super::compat::sink::select_partition_boundary_key;
-    use super::decode::{
-        decode_fragment_destination, decode_query_options, decode_runtime_filter_params,
-    };
+    use super::decode::{decode_fragment_destination, decode_query_options};
 
     fn scan_range(empty: bool, volume_id: i32) -> TScanRangeParams {
         TScanRangeParams::new(
@@ -62,7 +59,6 @@ mod tests {
             None::<i32>,
             None::<bool>,
             None::<bool>,
-            None::<TRuntimeFilterParams>,
             None::<i32>,
             None::<bool>,
             Some(per_driver),
@@ -243,36 +239,5 @@ mod tests {
             Some(std::slice::from_ref(&legacy))
         );
         assert_eq!(select_partition_boundary_key::<i32>(None, None), None);
-    }
-
-    #[test]
-    fn runtime_filter_params_decode_to_protocol_neutral_destinations() {
-        let wire = TRuntimeFilterParams {
-            id_to_prober_params: Some(BTreeMap::from([(
-                9,
-                vec![TRuntimeFilterProberParams::new(
-                    Some(TUniqueId::new(7, 8)),
-                    Some(TNetworkAddress::new("rf-be".to_string(), 8060)),
-                )],
-            )])),
-            runtime_filter_builder_number: Some(BTreeMap::from([(9, 2)])),
-            runtime_filter_max_size: Some(4096),
-            ..Default::default()
-        };
-
-        let decoded = decode_runtime_filter_params(
-            &wire,
-            FieldPath::root("exec_plan_fragment")
-                .field("params")
-                .field("runtime_filter_params"),
-        )
-        .expect("decode runtime filter params");
-
-        assert_eq!(decoded.runtime_filter_builder_number().get(&9), Some(&2));
-        assert_eq!(decoded.runtime_filter_max_size(), Some(4096));
-        let destination = &decoded.id_to_prober_params()[&9][0];
-        assert_eq!(destination.fragment_instance_id().hi, 7);
-        assert_eq!(destination.fragment_instance_id().lo, 8);
-        assert_eq!(destination.endpoint().host(), "rf-be");
     }
 }

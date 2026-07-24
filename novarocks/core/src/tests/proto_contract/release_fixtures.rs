@@ -29,9 +29,6 @@ const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
 const REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX: &str = "0a8d020a040801100212040803100418092200280132b7010ab0010a2273333a2f2f77617265686f7573652f64622f742f646174612d312e706172717565741207706172717565741809205a2a09726567696f6e3d757332040a0204083a220a04080110641204080110091a020801220208012a050801120101320508011201094201304801522073333a2f2f77617265686f7573652f64622f742f626173652e70617271756574584d62040a0201026a02aabb70057a080a060800120275738001800188018002900104100118003809405a480152390a370a0c467261676d656e74526f6f74100a1a120a08526f777352656164180120092804300c22110a057461626c6512086c696e656974656d";
 const BATCH_REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX: &str = "0a8d020a040801100212040803100418092200280132b7010ab0010a2273333a2f2f77617265686f7573652f64622f742f646174612d312e706172717565741207706172717565741809205a2a09726567696f6e3d757332040a0204083a220a04080110641204080110091a020801220208012a050801120101320508011201094201304801522073333a2f2f77617265686f7573652f64622f742f626173652e70617271756574584d62040a0201026a02aabb70057a080a060800120275738001800188018002900104100118003809405a480152390a370a0c467261676d656e74526f6f74100a1a120a08526f777352656164180120092804300c22110a057461626c6512086c696e656974656d";
-const TRANSMIT_RUNTIME_FILTER_REQUEST_FIXTURE_HEX: &str =
-    "0801120408011002184d22050300ff7f2a280932040a02080b";
-const TRANSMIT_RUNTIME_FILTER_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b104d";
 const LOOKUP_REQUEST_FIXTURE_HEX: &str = "0a04080110021021182c220a083710041a0400010203";
 const LOOKUP_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b120a083710041a0403020100";
 const PLAN_FRAGMENT_FIXTURE_HEX: &str = "0801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a020805";
@@ -439,27 +436,6 @@ fn release_batch_report_exec_status_request() -> novarocks::BatchReportExecStatu
     }
 }
 
-fn release_transmit_runtime_filter_request() -> filter::TransmitRuntimeFilterRequest {
-    filter::TransmitRuntimeFilterRequest {
-        is_partial: true,
-        query_id: Some(id(1, 2)),
-        filter_id: 77,
-        data: vec![0x03, 0x00, 0xff, 0x7f, 0x2a],
-        build_be_number: 9,
-        column_type: Some(scalar_type(common::PrimitiveType::Decimal128)),
-    }
-}
-
-fn release_transmit_runtime_filter_response() -> filter::TransmitRuntimeFilterResponse {
-    filter::TransmitRuntimeFilterResponse {
-        status: Some(common::Status {
-            code: 0,
-            message: "OK".to_string(),
-        }),
-        filter_id: 77,
-    }
-}
-
 fn release_lookup_request() -> filter::LookupRequest {
     filter::LookupRequest {
         query_id: Some(id(1, 2)),
@@ -530,14 +506,6 @@ fn print_release_fixture_hex() {
     print_fixture(
         "BATCH_REPORT_EXEC_STATUS_REQUEST",
         &release_batch_report_exec_status_request(),
-    );
-    print_fixture(
-        "TRANSMIT_RUNTIME_FILTER_REQUEST",
-        &release_transmit_runtime_filter_request(),
-    );
-    print_fixture(
-        "TRANSMIT_RUNTIME_FILTER_RESPONSE",
-        &release_transmit_runtime_filter_response(),
     );
     print_fixture("LOOKUP_REQUEST", &release_lookup_request());
     print_fixture("LOOKUP_RESPONSE", &release_lookup_response());
@@ -837,27 +805,6 @@ fn release_exec_status_report_fixtures_decode() {
     );
     assert_eq!(batch.reports.len(), 1);
     assert_eq!(batch.reports[0].filtered_rows, 1);
-}
-
-#[test]
-fn release_runtime_filter_fixtures_decode() {
-    let request: filter::TransmitRuntimeFilterRequest = decode_fixture(
-        "TransmitRuntimeFilterRequest",
-        TRANSMIT_RUNTIME_FILTER_REQUEST_FIXTURE_HEX,
-    );
-    assert!(request.is_partial);
-    assert_eq!(request.query_id.as_ref().expect("rf query_id").lo, 2);
-    assert_eq!(request.filter_id, 77);
-    assert_eq!(request.data, vec![0x03, 0x00, 0xff, 0x7f, 0x2a]);
-    assert_eq!(request.build_be_number, 9);
-    assert!(request.column_type.is_some(), "rf column_type");
-
-    let response: filter::TransmitRuntimeFilterResponse = decode_fixture(
-        "TransmitRuntimeFilterResponse",
-        TRANSMIT_RUNTIME_FILTER_RESPONSE_FIXTURE_HEX,
-    );
-    assert_eq!(response.status.as_ref().expect("rf status").code, 0);
-    assert_eq!(response.filter_id, 77);
 }
 
 #[test]

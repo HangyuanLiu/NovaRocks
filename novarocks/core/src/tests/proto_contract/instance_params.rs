@@ -207,18 +207,6 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
         "Destination must keep finst_id=1 and endpoint=2"
     );
 
-    let prober = novarocks::ProberParams {
-        fragment_instance_id: Some(id(5, 6)),
-        endpoint: "10.0.0.9:9060".to_string(),
-    };
-    let mut prober_fields = encoded_field_numbers(&prober);
-    prober_fields.sort_unstable();
-    assert_eq!(
-        prober_fields,
-        vec![1, 2],
-        "ProberParams must keep fragment_instance_id=1 and endpoint=2"
-    );
-
     let params = novarocks::InstanceParams {
         query_id: Some(id(1, 2)),
         fragment_instance_id: Some(id(3, 4)),

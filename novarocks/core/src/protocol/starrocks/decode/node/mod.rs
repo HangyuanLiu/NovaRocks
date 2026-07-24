@@ -63,7 +63,7 @@ use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
 use crate::protocol::starrocks::decode::layout::{Layout, layout_for_row_tuples};
-use crate::thrift::{data, descriptors, exprs, plan_nodes, runtime_filter, types};
+use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
 
 /// Transient scan-range access handed to compat scan decoders.
 ///
@@ -883,9 +883,6 @@ fn lower_node_with_children_typed(
     })()
     .map_err(|error| error.into_fragment(node_path.clone()))?;
 
-    // Compat accepts legacy probe descriptors but runtime filters are native-only.
-    discard_probe_runtime_filter_descriptors(node.probe_runtime_filters.as_deref());
-
     // Apply conjuncts (predicates/filters) if present
     if let Some(conjuncts) = node.conjuncts.as_ref()
         && !conjuncts.is_empty()
@@ -982,51 +979,4 @@ fn lower_node_with_children_typed(
         }
     }
     Ok(lowered)
-}
-
-pub(crate) fn local_rf_waiting_set(_node: &plan_nodes::TPlanNode) -> Vec<i32> {
-    Vec::new()
-}
-
-fn discard_probe_runtime_filter_descriptors(
-    descriptors: Option<&[runtime_filter::TRuntimeFilterDescription]>,
-) {
-    let _ = descriptors;
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-
-    #[test]
-    fn compat_probe_runtime_filter_descriptor_is_accepted_and_discarded() {
-        let descriptors = [runtime_filter::TRuntimeFilterDescription {
-            filter_id: Some(42),
-            build_expr: None,
-            expr_order: None,
-            filter_type: Some(runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER),
-            plan_node_id_to_target_expr: Some(BTreeMap::from([(7, exprs::TExpr::new(Vec::new()))])),
-            has_remote_targets: None,
-            bloom_filter_size: None,
-            runtime_filter_merge_nodes: None,
-            build_join_mode: None,
-            sender_finst_id: None,
-            build_plan_node_id: None,
-            broadcast_grf_senders: None,
-            broadcast_grf_destinations: None,
-            bucketseq_to_instance: None,
-            plan_node_id_to_partition_by_exprs: None,
-            layout: None,
-            build_from_group_execution: None,
-            is_broad_cast_join_in_skew: None,
-            skew_shuffle_filter_id: None,
-            is_asc: None,
-            is_nulls_first: None,
-            limit: None,
-        }];
-
-        discard_probe_runtime_filter_descriptors(Some(&descriptors));
-    }
 }

@@ -622,16 +622,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(result))
     }
 
-    async fn transmit_runtime_filter(
-        &self,
-        _request: tonic::Request<proto::filter::TransmitRuntimeFilterRequest>,
-    ) -> Result<tonic::Response<proto::filter::TransmitRuntimeFilterResponse>, tonic::Status> {
-        self.require_local_execution("TransmitRuntimeFilter")?;
-        Err(tonic::Status::unimplemented(
-            "legacy runtime-filter RPC is removed",
-        ))
-    }
-
     async fn transmit_runtime_filter_envelope(
         &self,
         request: tonic::Request<proto::filter::RuntimeFilterEnvelope>,

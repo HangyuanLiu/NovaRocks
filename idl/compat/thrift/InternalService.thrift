@@ -46,7 +46,6 @@ include "DataSinks.thrift"
 include "Data.thrift"
 include "RuntimeProfile.thrift"
 include "WorkGroup.thrift"
-include "RuntimeFilter.thrift"
 include "CloudConfiguration.thrift"
 
 // constants for function version
@@ -401,8 +400,6 @@ struct TPlanFragmentExecParams {
   11: optional bool send_query_statistics_with_every_batch
   12: optional bool use_vectorized // whether to use vectorized query engine
 
-  // Global runtime filters
-  50: optional RuntimeFilter.TRuntimeFilterParams runtime_filter_params
   51: optional i32 instances_number
   // To enable pass through chunks between sink/exchange if they are in the same process.
   52: optional bool enable_exchange_pass_through

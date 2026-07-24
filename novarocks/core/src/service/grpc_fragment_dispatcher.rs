@@ -522,7 +522,6 @@ mod tests {
     use crate::proto;
     use arrow::array::Int32Array;
     use proto::filter::{LookupRequest, LookupResponse};
-    use proto::filter::{TransmitRuntimeFilterRequest, TransmitRuntimeFilterResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
     use proto::novarocks::{
@@ -626,13 +625,6 @@ mod tests {
             &self,
             _request: Request<ExchangeRequest>,
         ) -> Result<Response<ExchangeResponse>, Status> {
-            Err(Status::unimplemented("mock"))
-        }
-
-        async fn transmit_runtime_filter(
-            &self,
-            _request: Request<TransmitRuntimeFilterRequest>,
-        ) -> Result<Response<TransmitRuntimeFilterResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
