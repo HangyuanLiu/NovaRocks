@@ -2695,8 +2695,8 @@ mod tests {
             keys[0].null_order(),
             crate::runtime_filter::model::contract::NullOrder::First
         );
-        assert_ne!(comparator_digest, [0; 32]);
-        assert_ne!(order_contract_digest, [0; 32]);
+        assert_ne!(*comparator_digest, [0; 32]);
+        assert_ne!(*order_contract_digest, [0; 32]);
         assert_eq!(
             spec.reduction,
             NativeRuntimeFilterReduction::TightenOrderedBound

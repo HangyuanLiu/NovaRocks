@@ -2000,7 +2000,7 @@ mod tests {
                         build_keys: Vec::new(),
                         eq_null_safe: Vec::new(),
                         residual_predicate: None,
-                        runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                        runtime_filter_execution: JoinRuntimeFilterExecution {
                             producers: Vec::new(),
                         },
                     }),

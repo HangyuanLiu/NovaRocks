@@ -46,10 +46,9 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 #[cfg(feature = "compat")]
 use crate::exec::runtime_filter::{
-    LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
-    PartialRuntimeInFilterMerger, RUNTIME_FILTER_JOIN_MODE_BROADCAST,
-    RUNTIME_FILTER_JOIN_MODE_PARTITIONED, RuntimeBloomFilter, RuntimeEmptyFilter,
-    RuntimeFilterMergeDropCounters, RuntimeFilterType, RuntimeInFilter,
+    MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger,
+    RUNTIME_FILTER_JOIN_MODE_BROADCAST, RUNTIME_FILTER_JOIN_MODE_PARTITIONED, RuntimeBloomFilter,
+    RuntimeEmptyFilter, RuntimeFilterMergeDropCounters, RuntimeFilterType, RuntimeInFilter,
     RuntimeMembershipBuildOptions, RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam,
     RuntimeMinMaxFilter, encode_starrocks_bitset_filter, encode_starrocks_bloom_filter,
     encode_starrocks_empty_filter, maybe_build_runtime_bitset_filter,
@@ -959,7 +958,7 @@ mod tests {
             distribution_mode: JoinDistributionMode::Broadcast,
             state,
             partition: 0,
-            runtime_filter_execution: HashJoinBuildOperatorRuntimeFilterExecution::Native {
+            runtime_filter_execution: HashJoinBuildOperatorRuntimeFilterExecution {
                 producers: None,
                 bind_error: None,
                 local_partition_count: Some(1),
@@ -1031,7 +1030,7 @@ mod tests {
         let state = Arc::new(TestBuildState::default());
         let mut operator = direct_int_build_operator(state);
         operator.eq_null_safe.clear();
-        operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution::Native {
+        operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution {
             producers: Some(producer_factory.create(0).expect("producer stream")),
             bind_error: None,
             local_partition_count: Some(1),
@@ -1061,7 +1060,7 @@ mod tests {
         let state = Arc::new(TestBuildState::default());
         let mut operator = direct_int_build_operator(state);
         operator.state = Arc::new(FailingBuildState);
-        operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution::Native {
+        operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution {
             producers: Some(producer_factory.create(0).expect("producer stream")),
             bind_error: None,
             local_partition_count: Some(1),
@@ -1502,7 +1501,7 @@ mod tests {
             distribution_mode: JoinDistributionMode::Broadcast,
             state,
             partition: 0,
-            runtime_filter_execution: HashJoinBuildOperatorRuntimeFilterExecution::Native {
+            runtime_filter_execution: HashJoinBuildOperatorRuntimeFilterExecution {
                 producers: None,
                 bind_error: None,
                 local_partition_count: Some(1),
@@ -1611,7 +1610,7 @@ mod tests {
             distribution_mode: JoinDistributionMode::Broadcast,
             state,
             partition: 0,
-            runtime_filter_execution: HashJoinBuildOperatorRuntimeFilterExecution::Native {
+            runtime_filter_execution: HashJoinBuildOperatorRuntimeFilterExecution {
                 producers: None,
                 bind_error: None,
                 local_partition_count: Some(1),

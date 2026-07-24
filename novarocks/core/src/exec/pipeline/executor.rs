@@ -523,7 +523,7 @@ mod tests {
                     build_keys: vec![build_expr],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                    runtime_filter_execution: JoinRuntimeFilterExecution {
                         producers: vec![NativeJoinRuntimeFilterProducerSpec {
                             binding_id: 3,
                             channel_id: 1,
@@ -735,10 +735,9 @@ mod tests {
                         ])),
                         &[SlotId::new(1), SlotId::new(2)],
                     ),
-                    runtime_filter_spec:
-                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
-                            topn_producers: Vec::new(),
-                        },
+                    runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
+                        topn_producers: Vec::new(),
+                    },
                     streaming_preaggregation_mode: None,
                 }),
             },
@@ -1254,10 +1253,9 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: Some(residual),
-                    runtime_filter_execution:
-                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
-                            producers: Vec::new(),
-                        },
+                    runtime_filter_execution: crate::exec::node::join::JoinRuntimeFilterExecution {
+                        producers: Vec::new(),
+                    },
                 }),
             },
         };
@@ -1432,10 +1430,9 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filter_execution:
-                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
-                            producers: Vec::new(),
-                        },
+                    runtime_filter_execution: crate::exec::node::join::JoinRuntimeFilterExecution {
+                        producers: Vec::new(),
+                    },
                 }),
             },
         };
@@ -1594,10 +1591,9 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filter_execution:
-                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
-                            producers: Vec::new(),
-                        },
+                    runtime_filter_execution: crate::exec::node::join::JoinRuntimeFilterExecution {
+                        producers: Vec::new(),
+                    },
                 }),
             },
         };
@@ -1876,10 +1872,9 @@ mod tests {
                         ])),
                         &[SlotId::new(3), SlotId::new(4)],
                     ),
-                    runtime_filter_spec:
-                        crate::exec::node::aggregate::AggregateRuntimeFilterSpec::Native {
-                            topn_producers: Vec::new(),
-                        },
+                    runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
+                        topn_producers: Vec::new(),
+                    },
                     streaming_preaggregation_mode: None,
                 }),
             },

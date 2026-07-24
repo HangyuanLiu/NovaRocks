@@ -109,8 +109,8 @@ const CONSUMER_BINDING: BindingId = BindingId::new(82);
 const WITNESS: CoverageWitnessId = CoverageWitnessId::new(83);
 const PRODUCER_FRAGMENT: u32 = 0;
 const PRODUCER_NODE: i32 = 810;
-const CONSUMER_FRAGMENT: u32 = 0;
-const CONSUMER_NODE: i32 = PRODUCER_NODE;
+const CONSUMER_FRAGMENT: u32 = 1;
+const CONSUMER_NODE: i32 = 811;
 const MAX_WAIT: Duration = Duration::from_secs(5);
 static LIVE_CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -432,7 +432,7 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
             binding: IcebergDataFileBinding::ExplicitFiles,
         },
     };
-    let fragment = PlanFragment {
+    let mut producer_fragment = PlanFragment {
         fragment_id: PRODUCER_FRAGMENT,
         root: DistributedNode {
             node_id: PRODUCER_NODE,
@@ -440,7 +440,7 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
             tuple_ids: vec![PRODUCER_NODE],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            runtime_filter_binding_ids: vec![PRODUCER_BINDING, CONSUMER_BINDING],
+            runtime_filter_binding_ids: vec![PRODUCER_BINDING],
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Scan(PlanScanNode {
@@ -466,8 +466,15 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
         cte_id: None,
         cte_exchange_nodes: Vec::new(),
     };
+    let mut consumer_fragment = producer_fragment.clone();
+    consumer_fragment.fragment_id = CONSUMER_FRAGMENT;
+    consumer_fragment.root.node_id = CONSUMER_NODE;
+    consumer_fragment.root.fragment_id = CONSUMER_FRAGMENT;
+    consumer_fragment.root.tuple_ids = vec![CONSUMER_NODE];
+    consumer_fragment.root.runtime_filter_binding_ids = vec![CONSUMER_BINDING];
+    producer_fragment.root.runtime_filter_binding_ids = vec![PRODUCER_BINDING];
     DistributedPlanDraftBuilder::new(
-        vec![fragment],
+        vec![producer_fragment, consumer_fragment],
         Some(CONSUMER_FRAGMENT),
         Vec::new(),
         runtime_filter_graph(topology),
@@ -751,10 +758,10 @@ fn run_live_conformance(topology: ConformanceTopology) {
     );
     assert_eq!(
         actual_submissions.len(),
-        3,
-        "exactly three fragments submit"
+        6,
+        "both producer and consumer fragments submit on every live BE"
     );
-    assert_eq!(observer.scheduled_count(), 3);
+    assert_eq!(observer.scheduled_count(), 6);
     assert_eq!(
         actual_submissions
             .iter()
@@ -795,6 +802,11 @@ fn run_live_conformance(topology: ConformanceTopology) {
         .map(|placement| (placement.backend_idx, placement.finst_id))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(producer_finsts.len(), 3);
+    let consumer_finsts = scheduling.by_fragment[&CONSUMER_FRAGMENT]
+        .iter()
+        .map(|placement| (placement.backend_idx, placement.finst_id))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(consumer_finsts.len(), 3);
     let aggregator_idx = (0..3).find(|backend_idx| {
         let participant = participant_id_for_backend(*backend_idx).unwrap();
         expected_installs[&participant].routing_shard().channels()[&CHANNEL]
@@ -813,7 +825,7 @@ fn run_live_conformance(topology: ConformanceTopology) {
             0
         }
     };
-    let consumer_finst = producer_finsts[&2];
+    let consumer_finst = consumer_finsts[&2];
     let mut producers = Vec::new();
     for backend_idx in 0..3 {
         let producer = services[backend_idx]

@@ -140,8 +140,8 @@ where
             }
             match scan_submit_fragment_request(bytes) {
                 Ok(()) | Err(WireScanError::Decode(_)) => {}
-                Err(WireScanError::LegacyRuntimeFilterParams) => {
-                    return Err(legacy_runtime_filter_params_status());
+                Err(WireScanError::RetiredInstanceParamsField) => {
+                    return Err(retired_instance_params_field_status());
                 }
                 Err(WireScanError::AmbiguousProducerBindingTarget) => {
                     return Err(ambiguous_producer_binding_target_status());
@@ -162,7 +162,9 @@ where
 pub(crate) fn validate_submit_fragment_request_wire(bytes: &[u8]) -> Result<(), Status> {
     match scan_submit_fragment_request(bytes) {
         Ok(()) => Ok(()),
-        Err(WireScanError::LegacyRuntimeFilterParams) => Err(legacy_runtime_filter_params_status()),
+        Err(WireScanError::RetiredInstanceParamsField) => {
+            Err(retired_instance_params_field_status())
+        }
         Err(WireScanError::AmbiguousProducerBindingTarget) => {
             Err(ambiguous_producer_binding_target_status())
         }
@@ -170,9 +172,9 @@ pub(crate) fn validate_submit_fragment_request_wire(bytes: &[u8]) -> Result<(), 
     }
 }
 
-fn legacy_runtime_filter_params_status() -> Status {
+fn retired_instance_params_field_status() -> Status {
     Status::invalid_argument(
-        "legacy InstanceParams tag 7 runtime_filter_params is not accepted by native submission",
+        "retired InstanceParams tag 7 runtime_filter_params is not accepted by native submission",
     )
 }
 
@@ -294,7 +296,7 @@ fn scan_instance_params(bytes: &[u8]) -> Result<(), WireScanError> {
     while cursor.has_remaining() {
         let (field, wire_type) = decode_key(&mut cursor)?;
         if field == LEGACY_RUNTIME_FILTER_PARAMS_FIELD {
-            return Err(WireScanError::LegacyRuntimeFilterParams);
+            return Err(WireScanError::RetiredInstanceParamsField);
         }
         skip_field(wire_type, field, &mut cursor, context.clone())?;
     }
@@ -304,7 +306,7 @@ fn scan_instance_params(bytes: &[u8]) -> Result<(), WireScanError> {
 #[derive(Debug)]
 enum WireScanError {
     Decode(prost::DecodeError),
-    LegacyRuntimeFilterParams,
+    RetiredInstanceParamsField,
     AmbiguousProducerBindingTarget,
 }
 
@@ -318,8 +320,8 @@ impl std::fmt::Display for WireScanError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Decode(error) => error.fmt(formatter),
-            Self::LegacyRuntimeFilterParams => formatter.write_str(
-                "legacy InstanceParams tag 7 runtime_filter_params is not accepted by native submission",
+            Self::RetiredInstanceParamsField => formatter.write_str(
+                "retired InstanceParams tag 7 runtime_filter_params is not accepted by native submission",
             ),
             Self::AmbiguousProducerBindingTarget => formatter.write_str(
                 "native runtime-filter producer target carries both join_build_key and aggregate_topn_key",

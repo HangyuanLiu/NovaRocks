@@ -200,7 +200,7 @@ pub(crate) fn lower_aggregate_node(
                 need_finalize: agg.need_finalize,
                 input_is_intermediate,
                 output_chunk_schema,
-                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
                     topn_producers: Vec::new(),
                 },
                 streaming_preaggregation_mode,
@@ -575,8 +575,7 @@ mod tests {
         let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
             panic!("compat aggregate node")
         };
-        let AggregateRuntimeFilterSpec::Native { topn_producers } = aggregate.runtime_filter_spec
-        else {
+        let AggregateRuntimeFilterSpec { topn_producers } = aggregate.runtime_filter_spec else {
             panic!("compat lowering must construct empty native aggregate producer specs")
         };
         assert!(topn_producers.is_empty());

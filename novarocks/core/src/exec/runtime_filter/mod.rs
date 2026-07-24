@@ -31,7 +31,6 @@ mod bitset;
 mod bloom;
 mod codec;
 mod in_filter;
-mod local;
 mod membership;
 mod merger;
 pub(crate) mod min_max;
@@ -54,8 +53,7 @@ pub(crate) use codec::{
     encode_starrocks_bitset_filter, encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
     encode_starrocks_in_filter, peek_starrocks_filter_type,
 };
-pub(crate) use in_filter::{LocalRuntimeInFilterSet, RuntimeInFilter};
-pub(crate) use local::LocalRuntimeFilterSet;
+pub(crate) use in_filter::RuntimeInFilter;
 pub(crate) use membership::{RuntimeEmptyFilter, RuntimeMembershipFilter};
 pub(crate) use merger::{
     MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger,

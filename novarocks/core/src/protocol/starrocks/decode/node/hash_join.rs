@@ -365,7 +365,7 @@ pub(crate) fn lower_hash_join_node(
                 build_keys,
                 eq_null_safe,
                 residual_predicate,
-                runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                runtime_filter_execution: JoinRuntimeFilterExecution {
                     producers: Vec::new(),
                 },
             }),

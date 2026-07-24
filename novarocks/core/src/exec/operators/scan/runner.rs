@@ -1404,9 +1404,8 @@ mod tests {
     use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
     use crate::exec::row_position::IcebergVirtualSpec;
     use crate::exec::runtime_filter::{
-        LocalRuntimeInFilterSet, RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter,
-        RuntimeEmptyFilter, RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter,
-        RuntimeMinMaxFilter,
+        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeEmptyFilter,
+        RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, LateApplyGranularity,
@@ -2093,43 +2092,25 @@ mod tests {
     }
 
     fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
-        let spec = crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-            filter_id,
-            expr_order: 0,
-            probe_expr_id: crate::exec::expr::ExprId(0),
-            build_expr_id: crate::exec::expr::ExprId(0),
-            probe_slot_id: SlotId::new(1),
-            build_data_type: DataType::Int32,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        };
         let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
-        let mut set =
-            LocalRuntimeInFilterSet::new(std::slice::from_ref(&spec), std::slice::from_ref(&array))
-                .expect("in filter set");
-        set.add_build_arrays(std::slice::from_ref(&array))
+        let mut filter =
+            RuntimeInFilter::new_for_test(filter_id, SlotId::new(1), array.data_type())
+                .expect("in filter");
+        filter
+            .insert_array_for_test(&array)
             .expect("add build values");
-        set.into_filters()
+        vec![filter]
     }
 
     fn string_in_filter(filter_id: i32, values: Vec<&str>) -> Vec<RuntimeInFilter> {
-        let spec = crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-            filter_id,
-            expr_order: 0,
-            probe_expr_id: crate::exec::expr::ExprId(0),
-            build_expr_id: crate::exec::expr::ExprId(0),
-            probe_slot_id: SlotId::new(1),
-            build_data_type: DataType::Utf8,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        };
         let array = Arc::new(StringArray::from(values)) as arrow::array::ArrayRef;
-        let mut set =
-            LocalRuntimeInFilterSet::new(std::slice::from_ref(&spec), std::slice::from_ref(&array))
-                .expect("string in filter set");
-        set.add_build_arrays(std::slice::from_ref(&array))
+        let mut filter =
+            RuntimeInFilter::new_for_test(filter_id, SlotId::new(1), array.data_type())
+                .expect("string in filter");
+        filter
+            .insert_array_for_test(&array)
             .expect("add string build values");
-        set.into_filters()
+        vec![filter]
     }
 
     fn pruning_membership_filter(filter_id: i32, values: Vec<i32>) -> RuntimeMembershipFilter {
