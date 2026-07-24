@@ -814,3 +814,15 @@ env NO_PROXY=127.0.0.1,localhost \
 ## 10. StarRocks Reference Code Location
 
 For StarRocks side-by-side reference implementation, use: `~/project/starrocks`
+
+---
+
+## 11. Architecture Decision Records (ADR)
+
+Durable design decisions, philosophies, and their honestly-recorded trade-offs live in
+`docs/adr/` (index and authoring rules: `docs/adr/README.md`).
+Before changing architecture-level behavior, check the index for the affected domain.
+Any PR that embodies a new design decision or accepts a compromise must add or
+supersede an ADR — use the `/adr` skill (`skills/adr/`, exposed to Claude Code via the
+`.claude/skills/adr` symlink), which embeds the template, numbering, supersede, and
+collision-renumbering rules.
