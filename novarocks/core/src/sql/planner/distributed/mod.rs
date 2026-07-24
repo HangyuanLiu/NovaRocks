@@ -42,7 +42,7 @@ pub(crate) use output::{
     FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeOutputCatalog, WriteContractCatalog,
 };
 pub(crate) use runtime_filter_progress::{
-    RuntimeFilterJoinProgressCatalog, RuntimeFilterJoinProgressCertificate,
+    FrontierEdge, JoinBuildProgressCatalog, JoinBuildProgressProof, JoinBuildProgressSkip,
 };
 pub(crate) use seal::DistributedPlan;
 

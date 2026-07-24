@@ -1767,6 +1767,63 @@ mod tests {
     }
 
     #[test]
+    fn acquire_timeout_resolves_to_pass_through_within_bound() {
+        struct GatedSubscription {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl BlockingSnapshotSubscription for GatedSubscription {
+            fn acquire(&self, timeout: Duration) -> ArtifactAcquireOutcome {
+                let (open, ready) = &*self.gate;
+                let opened = open.lock().unwrap();
+                let (opened, _) = ready
+                    .wait_timeout_while(opened, timeout, |open| !*open)
+                    .unwrap();
+                if *opened {
+                    unreachable!("test gate must remain closed")
+                }
+                ArtifactAcquireOutcome::TimedOut
+            }
+
+            fn snapshot(&self) -> Option<Arc<ArtifactBundle>> {
+                None
+            }
+        }
+
+        let mut arena = ExprArena::default();
+        let spec = consumer_spec(&mut arena);
+        let subscription: Arc<dyn BlockingSnapshotSubscription> = Arc::new(GatedSubscription {
+            gate: Arc::new((Mutex::new(false), Condvar::new())),
+        });
+        let consumers = NativeRuntimeFilterConsumerSet::from_bound_for_test(
+            vec![spec],
+            Arc::new(arena),
+            vec![subscription],
+        );
+
+        let started = std::time::Instant::now();
+        consumers
+            .acquire_blocking(Duration::from_millis(50))
+            .expect("bounded acquire");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "acquire must be bounded"
+        );
+
+        let input = chunk(&[1, 2, 3, 4]);
+        let output = consumers.apply_chunk(input).unwrap().unwrap();
+        let values = output.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("test input must remain Int32");
+        assert_eq!(
+            values.values(),
+            &[1, 2, 3, 4],
+            "timed-out binding must preserve the input values"
+        );
+    }
+
+    #[test]
     fn native_concurrent_acquire_is_single_flight_without_holding_bindings_lock() {
         struct GatedSubscription {
             calls: Arc<AtomicUsize>,

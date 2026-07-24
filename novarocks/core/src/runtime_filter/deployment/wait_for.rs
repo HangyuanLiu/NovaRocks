@@ -17,10 +17,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
+use crate::novarocks_logging::debug;
+use crate::runtime_filter::model::contract::{
+    BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+};
+use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
 use crate::sql::planner::distributed::{
-    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
-    RuntimeFilterJoinProgressCatalog, RuntimeFilterJoinProgressCertificate,
+    FragmentEdge, FragmentId, JoinBuildProgressCatalog, JoinBuildProgressProof,
+    JoinBuildProgressSkip,
 };
 
 use super::DeploymentError;
@@ -132,101 +136,506 @@ pub(crate) struct ConsumerWaitInput {
     pub producers: Vec<ProducerWaitInput>,
 }
 
-fn exact_partitioned_hash_edge(
-    edges: &[FragmentEdge],
-    source: FragmentId,
-    target: FragmentId,
-    target_exchange_node: i32,
-) -> bool {
-    edges.iter().any(|edge| {
-        edge.source_fragment_id == source
-            && edge.target_fragment_id == target
-            && edge.target_exchange_node_id == target_exchange_node
-            && matches!(edge.output_partition.kind, PartitionKind::Hash)
-            && edge.stream_kind == FragmentStreamKind::Partitioned
-            && edge.edge_kind == FragmentEdgeKind::Stream
-    })
+/// Why a sealed proof failed deployment revalidation. Rendered into the cycle
+/// error so the operator sees which proof rule was left unsatisfied
+/// (spec contract #9).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProofRejection {
+    /// The proof payload channel does not match the wait lookup key.
+    PayloadChannelMismatch,
+    /// The proof payload producer binding does not match the wait lookup key.
+    PayloadProducerBindingMismatch,
+    /// The proof payload producer fragment does not match the wait lookup key.
+    PayloadProducerFragmentMismatch,
+    /// The expected producer binding no longer exists in the sealed graph.
+    MissingProducerBinding,
+    /// The graph binding identity no longer matches the expected wait tuple.
+    GraphBindingIdentityMismatch,
+    /// The graph binding is no longer a producer.
+    ProducerRoleMismatch,
+    /// The producer no longer closes with the milestone proven here.
+    CompletionMismatch,
+    /// The proof join owner no longer matches the graph binding owner.
+    JoinOwnerMismatch,
+    /// Duplicate entries or frontier/non-build overlap.
+    OverlappingPartition,
+    /// The two sets do not exactly cover the fragment's sealed in-edges
+    /// (missing, extra, or forged edges).
+    PartitionMismatch,
+    /// Placement sanity: the consumer is neither fragment-local nor on/under
+    /// any non-build input.
+    ConsumerOutsideProbeRegion,
 }
 
-fn certifies_join_build_progress(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProofFallback {
+    Rejected(ProofRejection),
+    Skipped(JoinBuildProgressSkip),
+}
+
+/// Deployment-side revalidation of one planner-sealed proof against the exact
+/// sealed edge set. Checks: (1) every claimed edge exists; (2) the two sets
+/// form an exact, disjoint partition of the producer fragment's in-edges;
+/// (3) placement sanity: the consumer sits on/under some non-build input, or
+/// is fragment-local to the producer. Any failure means the proof is stale or
+/// forged; the caller keeps the coarse wait edge.
+fn revalidate_proof(
+    proof: &JoinBuildProgressProof,
+    edges: &[FragmentEdge],
     deps: &ExecutionDependencyGraph,
-    edges: &[FragmentEdge],
     consumer_fragment: FragmentId,
-    certificate: RuntimeFilterJoinProgressCertificate,
-) -> bool {
-    let producer_fragment = certificate.producer_fragment;
-    let probe_input = certificate.probe_input_fragment;
-    let build_input = certificate.build_input_fragment;
-
-    exact_partitioned_hash_edge(
-        edges,
-        probe_input,
-        producer_fragment,
-        certificate.probe_target_exchange_node,
-    ) && exact_partitioned_hash_edge(
-        edges,
-        build_input,
-        producer_fragment,
-        certificate.build_target_exchange_node,
-    ) && deps.reaches(producer_fragment, probe_input)
-        && deps.reaches(producer_fragment, build_input)
-        && (consumer_fragment == probe_input || deps.reaches(probe_input, consumer_fragment))
-        && build_input != consumer_fragment
-        && !deps.reaches(build_input, consumer_fragment)
-        && !deps.reaches(consumer_fragment, build_input)
+    expected_channel: ChannelId,
+    expected_binding: BindingId,
+    expected_fragment: FragmentId,
+    graph: &RuntimeFilterGraph,
+) -> Result<(), ProofRejection> {
+    if proof.channel != expected_channel {
+        return Err(ProofRejection::PayloadChannelMismatch);
+    }
+    if proof.producer_binding != expected_binding {
+        return Err(ProofRejection::PayloadProducerBindingMismatch);
+    }
+    if proof.producer_fragment != expected_fragment {
+        return Err(ProofRejection::PayloadProducerFragmentMismatch);
+    }
+    let binding = graph
+        .binding(expected_binding)
+        .ok_or(ProofRejection::MissingProducerBinding)?;
+    if binding.binding_id != expected_binding
+        || binding.channel_id != expected_channel
+        || binding.location.fragment_id.get() != expected_fragment
+    {
+        return Err(ProofRejection::GraphBindingIdentityMismatch);
+    }
+    let RuntimeFilterBindingRole::Producer(requirement) = &binding.role else {
+        return Err(ProofRejection::ProducerRoleMismatch);
+    };
+    if requirement.completion_requirement != CompletionRequirement::ProducerClosed {
+        return Err(ProofRejection::CompletionMismatch);
+    }
+    if binding.location.node_id.get() != proof.join_node_id {
+        return Err(ProofRejection::JoinOwnerMismatch);
+    }
+    let sealed_in_edges: BTreeSet<(FragmentId, i32)> = edges
+        .iter()
+        .filter(|e| e.target_fragment_id == proof.producer_fragment)
+        .map(|e| (e.source_fragment_id, e.target_exchange_node_id))
+        .collect();
+    let frontier: BTreeSet<(FragmentId, i32)> = proof
+        .build_frontier
+        .iter()
+        .map(|f| (f.source_fragment, f.target_exchange_node))
+        .collect();
+    let non_build: BTreeSet<(FragmentId, i32)> = proof
+        .non_build_inputs
+        .iter()
+        .map(|f| (f.source_fragment, f.target_exchange_node))
+        .collect();
+    // Duplicates inside either list, or overlap across them, break the
+    // partition (len check catches intra-list duplicates).
+    if frontier.len() != proof.build_frontier.len()
+        || non_build.len() != proof.non_build_inputs.len()
+        || !frontier.is_disjoint(&non_build)
+    {
+        return Err(ProofRejection::OverlappingPartition);
+    }
+    let union: BTreeSet<(FragmentId, i32)> = frontier.union(&non_build).copied().collect();
+    if union != sealed_in_edges {
+        return Err(ProofRejection::PartitionMismatch);
+    }
+    // Placement sanity: fragment-local consumer, or consumer on/under a
+    // non-build input's source fragment.
+    let sane = consumer_fragment == proof.producer_fragment
+        || non_build.iter().any(|(source, _)| {
+            *source == consumer_fragment || deps.reaches(*source, consumer_fragment)
+        });
+    if sane {
+        Ok(())
+    } else {
+        Err(ProofRejection::ConsumerOutsideProbeRegion)
+    }
 }
 
-/// Reject any `BlockingSnapshot` consumer whose wait edge closes an execution
-/// cycle: a producer fragment that transitively depends on the consumer fragment.
-/// `NonBlockingLive` consumers add no wait edge and always pass.
+/// Refined wait-graph node: a whole fragment, or the build-ready milestone of
+/// one hash join inside its fragment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum WaitNode {
+    Frag(FragmentId),
+    BuildReady {
+        fragment: FragmentId,
+        join_node: i32,
+    },
+}
+
+/// Edge provenance, kept for cycle-path rendering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct WaitProvenance {
+    channel: ChannelId,
+    consumer_binding: BindingId,
+    producer_binding: BindingId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum WaitEdgeKind {
+    DataFlow,
+    Frontier,
+    Wait(WaitProvenance),
+    Backpressure {
+        wait: WaitProvenance,
+        multicast_fragment: FragmentId,
+    },
+}
+
+type WaitGraph = BTreeMap<WaitNode, BTreeSet<(WaitNode, WaitEdgeKind)>>;
+
+fn ensure_wait_node(node: WaitNode, succ: &mut WaitGraph) {
+    succ.entry(node).or_default();
+}
+
+fn add_wait_edge(from: WaitNode, to: WaitNode, kind: WaitEdgeKind, succ: &mut WaitGraph) {
+    succ.entry(from).or_default().insert((to, kind));
+    succ.entry(to).or_default();
+}
+
+/// Reject a `BlockingSnapshot` consumer when data-flow, accepted build-ready
+/// proofs, waits, and multicast backpressure compose a global execution cycle.
+/// Rejected or missing proofs stay fail-closed as coarse fragment wait edges.
 pub(crate) fn validate_wait_for(
     deps: &ExecutionDependencyGraph,
     edges: &[FragmentEdge],
     consumers: &[ConsumerWaitInput],
-    join_progress: &RuntimeFilterJoinProgressCatalog,
+    join_progress: &JoinBuildProgressCatalog,
+    graph: &RuntimeFilterGraph,
 ) -> Result<(), DeploymentError> {
-    for c in consumers {
-        if c.activation != ConsumerActivation::BlockingSnapshot {
+    if !consumers
+        .iter()
+        .any(|c| c.activation == ConsumerActivation::BlockingSnapshot)
+    {
+        return Ok(());
+    }
+
+    // a -> b means "b depends on a". BTree collections make construction and
+    // traversal independent of input order.
+    let mut succ = WaitGraph::new();
+
+    // E1: sealed fragment data flow.
+    for edge in edges {
+        add_wait_edge(
+            WaitNode::Frag(edge.source_fragment_id),
+            WaitNode::Frag(edge.target_fragment_id),
+            WaitEdgeKind::DataFlow,
+            &mut succ,
+        );
+    }
+
+    // Resolve every producer wait independently. An accepted proof redirects
+    // the wait source to its build-ready milestone and contributes E2 frontier
+    // edges. Any missing or rejected proof preserves the coarse fragment edge.
+    let mut accepted_build_ready = BTreeSet::new();
+    let mut fallbacks = BTreeMap::new();
+    let mut wait_sources = Vec::with_capacity(consumers.len());
+    for consumer in consumers {
+        let mut sources = Vec::with_capacity(consumer.producers.len());
+        for producer in &consumer.producers {
+            let wait = WaitProvenance {
+                channel: consumer.channel,
+                consumer_binding: consumer.binding,
+                producer_binding: producer.binding,
+            };
+            let source = if consumer.activation == ConsumerActivation::BlockingSnapshot {
+                match join_progress.get(&(consumer.channel, producer.binding, producer.fragment)) {
+                    Some(proof) => {
+                        match revalidate_proof(
+                            proof,
+                            edges,
+                            deps,
+                            consumer.consumer_fragment,
+                            consumer.channel,
+                            producer.binding,
+                            producer.fragment,
+                            graph,
+                        ) {
+                            Ok(()) => {
+                                let build_ready = WaitNode::BuildReady {
+                                    fragment: proof.producer_fragment,
+                                    join_node: proof.join_node_id,
+                                };
+                                if accepted_build_ready
+                                    .insert((proof.producer_fragment, proof.join_node_id))
+                                {
+                                    for frontier in &proof.build_frontier {
+                                        add_wait_edge(
+                                            WaitNode::Frag(frontier.source_fragment),
+                                            build_ready,
+                                            WaitEdgeKind::Frontier,
+                                            &mut succ,
+                                        );
+                                    }
+                                    add_wait_edge(
+                                        build_ready,
+                                        WaitNode::Frag(proof.producer_fragment),
+                                        WaitEdgeKind::Frontier,
+                                        &mut succ,
+                                    );
+                                }
+                                build_ready
+                            }
+                            Err(reason) => {
+                                fallbacks.insert(wait, ProofFallback::Rejected(reason));
+                                WaitNode::Frag(producer.fragment)
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(skip) = join_progress.skipped(&(
+                            consumer.channel,
+                            producer.binding,
+                            producer.fragment,
+                        )) {
+                            fallbacks.insert(wait, ProofFallback::Skipped(*skip));
+                        }
+                        WaitNode::Frag(producer.fragment)
+                    }
+                }
+            } else {
+                WaitNode::Frag(producer.fragment)
+            };
+            sources.push(source);
+        }
+        wait_sources.push(sources);
+    }
+
+    // E3: only blocking consumers introduce waits.
+    for (consumer, sources) in consumers.iter().zip(&wait_sources) {
+        if consumer.activation != ConsumerActivation::BlockingSnapshot {
             continue;
         }
-        for producer in &c.producers {
-            // Blocking wait: consumer waits for the producer's first version. If
-            // the producer fragment depends (transitively) on the consumer
-            // fragment, the producer can't run until the consumer does, but the
-            // consumer is blocked on the producer → cycle.
-            if deps.reaches(producer.fragment, c.consumer_fragment) {
-                let certificate = join_progress
-                    .get(&(c.channel, producer.binding, producer.fragment))
-                    .copied();
-                if !certificate.is_some_and(|certificate| {
-                    certificate.channel == c.channel
-                        && certificate.producer_binding == producer.binding
-                        && certificate.producer_fragment == producer.fragment
-                        && certifies_join_build_progress(
-                            deps,
-                            edges,
-                            c.consumer_fragment,
-                            certificate,
-                        )
-                }) {
-                    return Err(DeploymentError::BlockingFeedbackCycle {
-                        channel: c.channel,
-                        binding: c.binding,
-                    });
+        ensure_wait_node(WaitNode::Frag(consumer.consumer_fragment), &mut succ);
+        for (producer, source) in consumer.producers.iter().zip(sources) {
+            add_wait_edge(
+                *source,
+                WaitNode::Frag(consumer.consumer_fragment),
+                WaitEdgeKind::Wait(WaitProvenance {
+                    channel: consumer.channel,
+                    consumer_binding: consumer.binding,
+                    producer_binding: producer.binding,
+                }),
+                &mut succ,
+            );
+        }
+    }
+
+    // E4: one blocked branch of a multicast/split/router stalls every branch.
+    // Therefore the multicast fragment cannot complete before each blocking
+    // wait on or below any branch target is released.
+    let mut out_edges: BTreeMap<FragmentId, BTreeSet<(FragmentId, i32)>> = BTreeMap::new();
+    for edge in edges {
+        out_edges
+            .entry(edge.source_fragment_id)
+            .or_default()
+            .insert((edge.target_fragment_id, edge.target_exchange_node_id));
+    }
+    for (multicast_fragment, branches) in &out_edges {
+        if branches.len() < 2 {
+            continue;
+        }
+        for (target, _) in branches {
+            for (consumer, sources) in consumers.iter().zip(&wait_sources) {
+                if consumer.activation != ConsumerActivation::BlockingSnapshot {
+                    continue;
+                }
+                let on_branch = consumer.consumer_fragment == *target
+                    || deps.reaches(consumer.consumer_fragment, *target);
+                if !on_branch {
+                    continue;
+                }
+                for (producer, source) in consumer.producers.iter().zip(sources) {
+                    add_wait_edge(
+                        *source,
+                        WaitNode::Frag(*multicast_fragment),
+                        WaitEdgeKind::Backpressure {
+                            wait: WaitProvenance {
+                                channel: consumer.channel,
+                                consumer_binding: consumer.binding,
+                                producer_binding: producer.binding,
+                            },
+                            multicast_fragment: *multicast_fragment,
+                        },
+                        &mut succ,
+                    );
                 }
             }
         }
     }
-    Ok(())
+
+    match find_cycle(&succ) {
+        None => {
+            for (fragment, join_node) in &accepted_build_ready {
+                debug!(
+                    "runtime-filter join progress proof accepted: fragment={fragment} join_node={join_node}"
+                );
+            }
+            Ok(())
+        }
+        Some(cycle_edges) => {
+            let (channel, binding) = cycle_edges
+                .iter()
+                .find_map(|(_, kind, _)| match kind {
+                    WaitEdgeKind::Wait(wait) | WaitEdgeKind::Backpressure { wait, .. } => {
+                        Some((wait.channel, wait.consumer_binding))
+                    }
+                    WaitEdgeKind::DataFlow | WaitEdgeKind::Frontier => None,
+                })
+                .expect("a refined-graph cycle must cross a wait or backpressure edge");
+            Err(DeploymentError::BlockingFeedbackCycle {
+                channel,
+                binding,
+                cycle: cycle_edges
+                    .iter()
+                    .map(|step| render_cycle_step(step, &fallbacks))
+                    .collect(),
+            })
+        }
+    }
+}
+
+/// Run Kahn's algorithm over the complete refined graph. If nodes remain,
+/// follow deterministic residual predecessors until one repeats, then reverse
+/// that backward walk into a closed, forward-oriented cycle.
+fn find_cycle(succ: &WaitGraph) -> Option<Vec<(WaitNode, WaitEdgeKind, WaitNode)>> {
+    let mut in_degree: BTreeMap<WaitNode, usize> = succ.keys().map(|node| (*node, 0)).collect();
+    let mut pred: BTreeMap<WaitNode, BTreeSet<(WaitNode, WaitEdgeKind)>> =
+        succ.keys().map(|node| (*node, BTreeSet::new())).collect();
+    for (from, tos) in succ {
+        for (to, kind) in tos {
+            *in_degree.get_mut(to).expect("node tracked") += 1;
+            pred.get_mut(to)
+                .expect("node tracked")
+                .insert((*from, *kind));
+        }
+    }
+
+    let mut queue: VecDeque<WaitNode> = in_degree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(node, _)| *node)
+        .collect();
+    let mut remaining = in_degree.len();
+    while let Some(node) = queue.pop_front() {
+        remaining -= 1;
+        for (to, _) in succ.get(&node).expect("node tracked") {
+            let degree = in_degree.get_mut(to).expect("node tracked");
+            *degree -= 1;
+            if *degree == 0 {
+                queue.push_back(*to);
+            }
+        }
+    }
+    if remaining == 0 {
+        return None;
+    }
+
+    let residual: BTreeSet<WaitNode> = in_degree
+        .iter()
+        .filter(|(_, degree)| **degree > 0)
+        .map(|(node, _)| *node)
+        .collect();
+    let mut current = *residual.iter().next().expect("nonempty residual");
+    let mut backward_path = Vec::new();
+    let mut seen = BTreeMap::new();
+    loop {
+        if let Some(&cycle_start) = seen.get(&current) {
+            let mut cycle = backward_path[cycle_start..].to_vec();
+            cycle.reverse();
+            return Some(cycle);
+        }
+        seen.insert(current, backward_path.len());
+        let (from, kind) = pred
+            .get(&current)
+            .expect("residual node tracked")
+            .iter()
+            .find(|(from, _)| residual.contains(from))
+            .copied()
+            .expect("residual node keeps a residual predecessor");
+        backward_path.push((from, kind, current));
+        current = from;
+    }
+}
+
+fn render_wait_node(node: &WaitNode) -> String {
+    match node {
+        WaitNode::Frag(fragment) => format!("frag {fragment}"),
+        WaitNode::BuildReady {
+            fragment,
+            join_node,
+        } => format!("build-ready(frag {fragment}, join {join_node})"),
+    }
+}
+
+fn render_cycle_step(
+    (from, kind, to): &(WaitNode, WaitEdgeKind, WaitNode),
+    fallbacks: &BTreeMap<WaitProvenance, ProofFallback>,
+) -> String {
+    let label = match kind {
+        WaitEdgeKind::DataFlow => "dataflow".to_string(),
+        WaitEdgeKind::Frontier => "frontier".to_string(),
+        WaitEdgeKind::Wait(wait) => render_wait_provenance("wait", wait, fallbacks),
+        WaitEdgeKind::Backpressure {
+            wait,
+            multicast_fragment,
+            ..
+        } => render_wait_provenance(
+            &format!("backpressure(frag {multicast_fragment})"),
+            wait,
+            fallbacks,
+        ),
+    };
+    format!(
+        "{} --{label}--> {}",
+        render_wait_node(from),
+        render_wait_node(to)
+    )
+}
+
+fn render_wait_provenance(
+    edge: &str,
+    wait: &WaitProvenance,
+    fallbacks: &BTreeMap<WaitProvenance, ProofFallback>,
+) -> String {
+    let fallback = match fallbacks.get(wait) {
+        Some(ProofFallback::Rejected(reason)) => format!(" (proof rejected: {reason:?})"),
+        Some(ProofFallback::Skipped(skip)) => format!(
+            " (proof skipped: join-node={} rule={:?})",
+            skip.join_node_id, skip.rule
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{edge} channel={} consumer-binding={} producer-binding={}{fallback}",
+        wait.channel.get(),
+        wait.consumer_binding.get(),
+        wait.producer_binding.get(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
+
     use super::DeploymentError;
     use super::*;
-    use crate::runtime_filter::model::contract::{ConsumerActivation, LateApplyGranularity};
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, CompletionFenceKind, CompletionRequirement, ConsumerActivation,
+        ContributionKind, LateApplyGranularity, PlanFragmentId, PlanNodeId,
+    };
+    use crate::runtime_filter::model::graph::{
+        ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+    };
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
-        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
+        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, FrontierEdge,
+        PartitionKind,
     };
 
     pub(super) fn edge(source: u32, target: u32) -> FragmentEdge {
@@ -259,15 +668,23 @@ mod tests {
         }
     }
 
-    fn join_certificate() -> RuntimeFilterJoinProgressCertificate {
-        RuntimeFilterJoinProgressCertificate {
+    fn proof(
+        producer_fragment: u32,
+        join_node: i32,
+        frontier: Vec<(u32, i32)>,
+        non_build: Vec<(u32, i32)>,
+    ) -> JoinBuildProgressProof {
+        let fe = |(s, x): &(u32, i32)| FrontierEdge {
+            source_fragment: *s,
+            target_exchange_node: *x,
+        };
+        JoinBuildProgressProof {
             channel: ChannelId::new(7),
             producer_binding: BindingId::new(100),
-            producer_fragment: 1,
-            probe_input_fragment: 2,
-            probe_target_exchange_node: 20,
-            build_input_fragment: 3,
-            build_target_exchange_node: 30,
+            producer_fragment,
+            join_node_id: join_node,
+            build_frontier: frontier.iter().map(fe).collect(),
+            non_build_inputs: non_build.iter().map(fe).collect(),
         }
     }
 
@@ -298,7 +715,86 @@ mod tests {
         edges: &[FragmentEdge],
         consumers: &[ConsumerWaitInput],
     ) -> Result<(), DeploymentError> {
-        validate_wait_for(deps, edges, consumers, &Default::default())
+        validate_wait_for(
+            deps,
+            edges,
+            consumers,
+            &Default::default(),
+            &RuntimeFilterGraph::default(),
+        )
+    }
+
+    fn catalog(proofs: Vec<JoinBuildProgressProof>) -> JoinBuildProgressCatalog {
+        proofs
+            .into_iter()
+            .map(|p| ((p.channel, p.producer_binding, p.producer_fragment), p))
+            .collect()
+    }
+
+    fn forged_catalog(proof: JoinBuildProgressProof) -> JoinBuildProgressCatalog {
+        [((ChannelId::new(7), BindingId::new(100), 1), proof)]
+            .into_iter()
+            .collect()
+    }
+
+    fn graph_for_catalog(catalog: &JoinBuildProgressCatalog) -> RuntimeFilterGraph {
+        let mut graph = RuntimeFilterGraph::default();
+        for proof in catalog.values() {
+            graph
+                .insert_binding(RuntimeFilterBindingSpec {
+                    binding_id: proof.producer_binding,
+                    channel_id: proof.channel,
+                    coverage_witness_id: None,
+                    location: PlanLocation {
+                        fragment_id: PlanFragmentId::new(proof.producer_fragment),
+                        node_id: PlanNodeId::new(proof.join_node_id),
+                    },
+                    expression: TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    apply_point: ApplyPoint::NodeOutput,
+                    role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                        contribution_kinds: BTreeSet::from([
+                            ContributionKind::ValueDomainDelta,
+                            ContributionKind::ProducerClosed,
+                        ]),
+                        completion_requirement: CompletionRequirement::ProducerClosed,
+                        join_key_ordinal: 0,
+                    }),
+                })
+                .unwrap();
+        }
+        graph
+    }
+
+    fn validate_with_progress(
+        deps: &ExecutionDependencyGraph,
+        edges: &[FragmentEdge],
+        consumers: &[ConsumerWaitInput],
+        catalog: &JoinBuildProgressCatalog,
+    ) -> Result<(), DeploymentError> {
+        validate_wait_for(deps, edges, consumers, catalog, &graph_for_catalog(catalog))
+    }
+
+    fn revalidate_exact(
+        proof: &JoinBuildProgressProof,
+        edges: &[FragmentEdge],
+        deps: &ExecutionDependencyGraph,
+        consumer_fragment: FragmentId,
+    ) -> Result<(), ProofRejection> {
+        let graph = graph_for_catalog(&catalog(vec![proof.clone()]));
+        revalidate_proof(
+            proof,
+            edges,
+            deps,
+            consumer_fragment,
+            proof.channel,
+            proof.producer_binding,
+            proof.producer_fragment,
+            &graph,
+        )
     }
 
     #[test]
@@ -338,6 +834,74 @@ mod tests {
     fn empty_edges_yields_empty_graph() {
         let g = ExecutionDependencyGraph::from_fragment_edges(&[]).unwrap();
         assert!(!g.reaches(1, 1));
+    }
+
+    #[test]
+    fn revalidation_accepts_exact_partition() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        assert_eq!(revalidate_exact(&p, &edges, &deps, 2), Ok(()));
+    }
+
+    #[test]
+    fn revalidation_rejects_forged_exchange_node() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 31)], vec![(2, 20)]); // 31 not sealed
+        assert_eq!(
+            revalidate_exact(&p, &edges, &deps, 2),
+            Err(ProofRejection::PartitionMismatch)
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_incomplete_partition() {
+        // Sealed in-edges of frag 1 are {2->1@20, 3->1@30, 4->1@40}; the proof
+        // omits 4->1@40 entirely -> planner missed an input, reject.
+        let edges = vec![
+            partitioned_edge(2, 1, 20),
+            partitioned_edge(3, 1, 30),
+            partitioned_edge(4, 1, 40),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        assert_eq!(
+            revalidate_exact(&p, &edges, &deps, 2),
+            Err(ProofRejection::PartitionMismatch)
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_overlapping_partition() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30), (2, 20)], vec![(2, 20)]);
+        assert_eq!(
+            revalidate_exact(&p, &edges, &deps, 2),
+            Err(ProofRejection::OverlappingPartition)
+        );
+    }
+
+    #[test]
+    fn revalidation_sanity_requires_consumer_under_non_build_input() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        // consumer on frag 3 (the build input) violates placement sanity.
+        assert_eq!(
+            revalidate_exact(&p, &edges, &deps, 3),
+            Err(ProofRejection::ConsumerOutsideProbeRegion)
+        );
+    }
+
+    #[test]
+    fn revalidation_allows_same_fragment_local_consumer() {
+        // Colocate-style: no in-edges at all, consumer co-located with producer.
+        let edges: Vec<FragmentEdge> = vec![];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p = proof(1, 10, vec![], vec![]);
+        assert_eq!(revalidate_exact(&p, &edges, &deps, 1), Ok(()));
     }
 
     #[test]
@@ -382,47 +946,127 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_join_progress_certificate_allows_probe_side_wait_cycle() {
+    fn accepted_proof_refines_wait_edge_and_passes() {
         let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
         let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
         let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let certificate = join_certificate();
-        let catalog = BTreeMap::from([(
-            (
-                certificate.channel,
-                certificate.producer_binding,
-                certificate.producer_fragment,
-            ),
-            certificate,
-        )]);
-
-        assert!(validate_wait_for(&deps, &edges, &[consumer], &catalog).is_ok());
+        let c = catalog(vec![proof(1, 10, vec![(3, 30)], vec![(2, 20)])]);
+        assert!(validate_with_progress(&deps, &edges, &[consumer], &c).is_ok());
     }
 
     #[test]
-    fn forged_join_progress_certificate_is_rejected() {
+    fn forged_proof_channel_cannot_redirect_wait_to_build_ready() {
         let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
         let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
         let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let mut certificate = join_certificate();
-        certificate.build_target_exchange_node = 31;
-        let catalog = BTreeMap::from([(
-            (
-                certificate.channel,
-                certificate.producer_binding,
-                certificate.producer_fragment,
-            ),
-            certificate,
-        )]);
+        let mut forged = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        forged.channel = ChannelId::new(8);
 
         assert!(matches!(
-            validate_wait_for(&deps, &edges, &[consumer], &catalog),
+            validate_with_progress(&deps, &edges, &[consumer], &forged_catalog(forged)),
             Err(DeploymentError::BlockingFeedbackCycle { .. })
         ));
     }
 
     #[test]
-    fn join_build_source_reverse_dependency_rejects_certificate() {
+    fn forged_proof_binding_cannot_redirect_wait_to_build_ready() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let mut forged = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        forged.producer_binding = BindingId::new(101);
+
+        assert!(matches!(
+            validate_with_progress(&deps, &edges, &[consumer], &forged_catalog(forged)),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn forged_proof_fragment_cannot_redirect_wait_to_build_ready() {
+        let edges = vec![
+            partitioned_edge(2, 1, 20),
+            partitioned_edge(3, 1, 30),
+            partitioned_edge(2, 9, 20),
+            partitioned_edge(3, 9, 30),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let forged = proof(9, 10, vec![(3, 30)], vec![(2, 20)]);
+
+        assert!(matches!(
+            validate_with_progress(&deps, &edges, &[consumer], &forged_catalog(forged)),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn forged_proof_join_owner_cannot_redirect_wait_to_build_ready() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let canonical = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        let graph = graph_for_catalog(&catalog(vec![canonical.clone()]));
+        let mut forged = canonical;
+        forged.join_node_id = 11;
+        let forged = forged_catalog(forged);
+
+        assert!(matches!(
+            validate_wait_for(&deps, &edges, &[consumer], &forged, &graph),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn non_producer_graph_binding_cannot_authorize_build_ready() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let c = catalog(vec![proof(1, 10, vec![(3, 30)], vec![(2, 20)])]);
+        let mut graph = graph_for_catalog(&c);
+        graph
+            .binding_mut_for_test(BindingId::new(100))
+            .unwrap()
+            .role = RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+            capabilities: BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            activation: ConsumerActivation::BlockingSnapshot,
+            target: ConsumerBindingTarget::SourceBoundary,
+        });
+
+        assert!(matches!(
+            validate_wait_for(&deps, &edges, &[consumer], &c, &graph),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn incompatible_completion_cannot_authorize_build_ready() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let c = catalog(vec![proof(1, 10, vec![(3, 30)], vec![(2, 20)])]);
+        let mut graph = graph_for_catalog(&c);
+        let RuntimeFilterBindingRole::Producer(requirement) = &mut graph
+            .binding_mut_for_test(BindingId::new(100))
+            .unwrap()
+            .role
+        else {
+            panic!("expected producer");
+        };
+        requirement.completion_requirement =
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen);
+
+        assert!(matches!(
+            validate_wait_for(&deps, &edges, &[consumer], &c, &graph),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn frontier_depending_on_consumer_is_rejected() {
         let edges = vec![
             partitioned_edge(2, 1, 20),
             partitioned_edge(3, 1, 30),
@@ -430,18 +1074,190 @@ mod tests {
         ];
         let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
         let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
-        let certificate = join_certificate();
-        let catalog = BTreeMap::from([(
+        let c = catalog(vec![proof(1, 10, vec![(3, 30)], vec![(2, 20)])]);
+        let err = validate_with_progress(&deps, &edges, &[consumer], &c).unwrap_err();
+        assert!(matches!(err, DeploymentError::BlockingFeedbackCycle { .. }));
+    }
+
+    #[test]
+    fn forged_proof_falls_back_to_coarse_edge_and_rejects() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let c = catalog(vec![proof(1, 10, vec![(3, 31)], vec![(2, 20)])]);
+        let err = validate_with_progress(&deps, &edges, &[consumer], &c).unwrap_err();
+        let DeploymentError::BlockingFeedbackCycle { cycle, .. } = err else {
+            panic!("expected cycle");
+        };
+        assert!(
+            cycle
+                .iter()
+                .any(|step| step.contains("proof rejected: PartitionMismatch"))
+        );
+    }
+
+    #[test]
+    fn cycle_provenance_attributes_consumer_and_producer_bindings() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let c = catalog(vec![proof(1, 10, vec![(3, 31)], vec![(2, 20)])]);
+        let err = validate_with_progress(&deps, &edges, &[consumer], &c).unwrap_err();
+        let DeploymentError::BlockingFeedbackCycle {
+            channel,
+            binding,
+            cycle,
+        } = err
+        else {
+            panic!("expected cycle");
+        };
+        assert_eq!(channel, ChannelId::new(7));
+        assert_eq!(binding, BindingId::new(10));
+        let rendered = cycle.join(", ");
+        assert!(rendered.contains("channel=7"));
+        assert!(rendered.contains("consumer-binding=10"));
+        assert!(rendered.contains("producer-binding=100"));
+        assert!(rendered.contains("proof rejected: PartitionMismatch"));
+    }
+
+    #[test]
+    fn two_individually_valid_proofs_composing_a_cycle_are_rejected() {
+        let edges = vec![
+            partitioned_edge(1, 2, 20),
+            partitioned_edge(3, 2, 30),
+            edge(4, 3),
+            partitioned_edge(4, 5, 50),
+            partitioned_edge(6, 5, 60),
+            edge(1, 6),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let p1 = proof(2, 10, vec![(3, 30)], vec![(1, 20)]);
+        let mut p2 = proof(5, 11, vec![(6, 60)], vec![(4, 50)]);
+        p2.channel = ChannelId::new(8);
+        p2.producer_binding = BindingId::new(200);
+        let c1 = ConsumerWaitInput {
+            channel: ChannelId::new(7),
+            binding: BindingId::new(10),
+            consumer_fragment: 1,
+            activation: ConsumerActivation::BlockingSnapshot,
+            producers: vec![ProducerWaitInput {
+                binding: BindingId::new(100),
+                fragment: 2,
+            }],
+        };
+        let c2 = ConsumerWaitInput {
+            channel: ChannelId::new(8),
+            binding: BindingId::new(11),
+            consumer_fragment: 4,
+            activation: ConsumerActivation::BlockingSnapshot,
+            producers: vec![ProducerWaitInput {
+                binding: BindingId::new(200),
+                fragment: 5,
+            }],
+        };
+        let c = catalog(vec![p1, p2]);
+        let err = validate_with_progress(&deps, &edges, &[c1, c2], &c).unwrap_err();
+        let DeploymentError::BlockingFeedbackCycle { cycle, .. } = err else {
+            panic!("expected cycle");
+        };
+        assert!(!cycle.is_empty());
+    }
+
+    #[test]
+    fn multicast_backpressure_edge_closes_cycle() {
+        let edges = vec![
+            partitioned_edge(1, 4, 21),
+            partitioned_edge(1, 3, 22),
+            partitioned_edge(4, 2, 20),
+            partitioned_edge(3, 5, 24),
+            partitioned_edge(5, 2, 23),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 5, ConsumerActivation::BlockingSnapshot, vec![2]);
+        let c = catalog(vec![proof(2, 10, vec![(4, 20)], vec![(5, 23)])]);
+        let err = validate_with_progress(&deps, &edges, &[consumer], &c).unwrap_err();
+        let DeploymentError::BlockingFeedbackCycle { binding, cycle, .. } = err else {
+            panic!("expected cycle");
+        };
+        assert_eq!(binding, BindingId::new(10));
+        assert!(cycle.iter().any(|step| step.contains(
+            "--backpressure(frag 1) channel=7 consumer-binding=10 producer-binding=100-->"
+        )));
+    }
+
+    #[test]
+    fn multicast_branch_without_consumer_adds_no_backpressure_edge() {
+        let edges = vec![
+            partitioned_edge(1, 4, 21),
+            partitioned_edge(1, 3, 22),
+            partitioned_edge(4, 2, 20),
+            partitioned_edge(5, 2, 23),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 5, ConsumerActivation::BlockingSnapshot, vec![2]);
+        let c = catalog(vec![proof(2, 10, vec![(4, 20)], vec![(5, 23)])]);
+        assert!(validate_with_progress(&deps, &edges, &[consumer], &c).is_ok());
+    }
+
+    #[test]
+    fn fragment_local_consumer_passes_with_empty_frontier_proof() {
+        let edges: Vec<FragmentEdge> = vec![];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 1, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let c = catalog(vec![proof(1, 10, vec![], vec![])]);
+        assert!(validate_with_progress(&deps, &edges, &[consumer], &c).is_ok());
+    }
+
+    #[test]
+    fn cycle_detection_is_deterministic_under_input_permutation() {
+        let edges_a = vec![
+            partitioned_edge(2, 1, 20),
+            partitioned_edge(3, 1, 30),
+            edge(2, 3),
+        ];
+        let mut edges_b = edges_a.clone();
+        edges_b.reverse();
+        let deps_a = ExecutionDependencyGraph::from_fragment_edges(&edges_a).unwrap();
+        let deps_b = ExecutionDependencyGraph::from_fragment_edges(&edges_b).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let c = catalog(vec![proof(1, 10, vec![(3, 30)], vec![(2, 20)])]);
+        let e_a = validate_with_progress(&deps_a, &edges_a, &[consumer.clone()], &c).unwrap_err();
+        let e_b = validate_with_progress(&deps_b, &edges_b, &[consumer], &c).unwrap_err();
+        let DeploymentError::BlockingFeedbackCycle { cycle, .. } = &e_a else {
+            panic!("expected cycle");
+        };
+        assert!(!cycle.is_empty());
+        assert_eq!(e_a, e_b);
+    }
+
+    #[test]
+    fn multi_build_frontier_proof_cannot_bypass_blocking_feedback_cycle() {
+        let edges = vec![
+            partitioned_edge(2, 1, 20),
+            partitioned_edge(3, 1, 30),
+            partitioned_edge(4, 1, 40),
+            edge(2, 4),
+        ];
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&edges).unwrap();
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let mut proof = proof(1, 10, vec![(3, 30)], vec![(2, 20)]);
+        proof.build_frontier.push(FrontierEdge {
+            source_fragment: 4,
+            target_exchange_node: 40,
+        });
+        let catalog = [(
             (
-                certificate.channel,
-                certificate.producer_binding,
-                certificate.producer_fragment,
+                proof.channel,
+                proof.producer_binding,
+                proof.producer_fragment,
             ),
-            certificate,
-        )]);
+            proof,
+        )]
+        .into_iter()
+        .collect();
 
         assert!(matches!(
-            validate_wait_for(&deps, &edges, &[consumer], &catalog),
+            validate_with_progress(&deps, &edges, &[consumer], &catalog),
             Err(DeploymentError::BlockingFeedbackCycle { .. })
         ));
     }

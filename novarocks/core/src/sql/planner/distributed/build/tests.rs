@@ -19,9 +19,10 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
 };
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::runtime_filter_progress::build_join_progress_proof_catalog;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
-    FragmentEdgeKind, FragmentStreamKind, PartitionKind, PlanFragment,
+    FragmentEdgeKind, FragmentStreamKind, FrontierEdge, PartitionKind, PlanFragment,
 };
 use crate::sql::planner::payload::{
     AggregateCall, PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode, PlanCTEProduceNode,
@@ -572,19 +573,24 @@ fn build_distributed_plan_seals_partitioned_join_progress_certificate() {
         join_node.runtime_filter_binding_ids,
         vec![producer.binding_id]
     );
-    let certificate = dp
+    let proof = dp
         .runtime_filter_join_progress()
         .get(&(
             producer.channel_id,
             producer.binding_id,
             join_node.fragment_id,
         ))
-        .expect("partitioned join progress certificate");
-    assert_eq!(certificate.producer_fragment, join_node.fragment_id);
-    assert_eq!(certificate.probe_input_fragment, probe_fragment.fragment_id);
+        .expect("partitioned join progress proof");
+    assert_eq!(proof.producer_fragment, join_node.fragment_id);
+    assert_eq!(proof.non_build_inputs.len(), 1);
+    assert_eq!(proof.build_frontier.len(), 1);
+    assert_eq!(
+        proof.non_build_inputs[0].source_fragment,
+        probe_fragment.fragment_id
+    );
     assert_ne!(
-        certificate.probe_input_fragment,
-        certificate.build_input_fragment
+        proof.non_build_inputs[0].source_fragment,
+        proof.build_frontier[0].source_fragment
     );
 
     let probe_project = &probe_fragment.root;
@@ -3167,6 +3173,55 @@ fn test_probe_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> ProbeBi
     }
 }
 
+fn distributed_hash_join_node_with_exchanges(
+    node_id: i32,
+    fragment_id: u32,
+    (probe_exchange_node_id, probe_source_fragment_id): (i32, u32),
+    (build_exchange_node_id, build_source_fragment_id): (i32, u32),
+) -> DistributedNode {
+    let exchange = |node_id, source_fragment_id| DistributedNode {
+        node_id,
+        fragment_id,
+        tuple_ids: vec![],
+        nullable_tuple_ids: vec![],
+        limit: -1,
+        runtime_filter_binding_ids: vec![],
+        children: vec![],
+        stats: stats(),
+        payload: DistributedNodeKind::Exchange(
+            crate::sql::planner::distributed::ExchangeReceiver {
+                partition: DataPartition::unpartitioned(),
+                source_fragment_id,
+                output_columns: vec![],
+                output_qualifier: None,
+                flavor: ExchangeFlavor::Distribution,
+            },
+        ),
+    };
+    DistributedNode {
+        node_id,
+        fragment_id,
+        tuple_ids: vec![],
+        nullable_tuple_ids: vec![],
+        limit: -1,
+        runtime_filter_binding_ids: vec![],
+        children: vec![
+            exchange(probe_exchange_node_id, probe_source_fragment_id),
+            exchange(build_exchange_node_id, build_source_fragment_id),
+        ],
+        stats: stats(),
+        payload: DistributedNodeKind::HashJoin(Box::new(PhysicalHashJoinNode {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+            execution_mode: Some(JoinExecutionMode::Partitioned),
+            build_runtime_filters: vec![],
+            output_columns: vec![],
+        })),
+    }
+}
+
 fn cte_produce_node(
     cte_id: CteId,
     output_columns: Vec<OutputColumn>,
@@ -3378,4 +3433,51 @@ fn assert_column_ref(expr: &TypedExpr, expected_column_id: u32, expected_column:
         }
         other => panic!("expected ColumnRef, got {other:?}"),
     }
+}
+
+#[test]
+fn join_progress_proof_catalog_partitions_fragment_inputs() {
+    // Real binding path: hash-join node 10 in fragment 1 with probe exchange
+    // (node 20 <- frag 2) and build exchange (node 30 <- frag 3); the probe
+    // consumer lives on a Values node 40 in fragment 2.
+    let join_root = distributed_hash_join_node_with_exchanges(10, 1, (20, 2), (30, 3));
+    let mut fragments = vec![
+        test_fragment(join_root),
+        test_fragment(distributed_values_node(40, 2)),
+        test_fragment(distributed_values_node(50, 3)),
+    ];
+    let build_bindings = vec![test_build_binding(10, 1, 7)];
+    let probe_bindings = vec![test_probe_binding(40, 2, 7)];
+
+    let mut graph = RuntimeFilterGraph::default();
+    populate_runtime_filter_graph(
+        &mut fragments,
+        &mut graph,
+        &RuntimeFilterBindings {
+            builds: build_bindings,
+            probes: probe_bindings,
+            node_input_columns: std::collections::BTreeMap::new(),
+        },
+    )
+    .expect("populate graph");
+
+    let catalog = build_join_progress_proof_catalog(&fragments, &graph);
+    assert_eq!(catalog.len(), 1);
+    let proof = catalog.values().next().expect("one proof");
+    assert_eq!(proof.producer_fragment, 1);
+    assert_eq!(proof.join_node_id, 10);
+    assert_eq!(
+        proof.build_frontier,
+        vec![FrontierEdge {
+            source_fragment: 3,
+            target_exchange_node: 30,
+        }]
+    );
+    assert_eq!(
+        proof.non_build_inputs,
+        vec![FrontierEdge {
+            source_fragment: 2,
+            target_exchange_node: 20,
+        }]
+    );
 }
