@@ -37,8 +37,6 @@ use crate::novarocks_logging::info;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
 
-#[cfg(feature = "compat")]
-use super::builder::build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop;
 use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context;
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
@@ -99,7 +97,8 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
-    execute_plan_with_pipeline_in_mode(
+    let runtime_filter_context = runtime_state.native_runtime_filter_context().cloned();
+    execute_plan_with_pipeline(
         plan,
         debug,
         time_slice,
@@ -114,7 +113,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
         fe_addr,
         backend_num,
         root_sink_dop,
-        PipelineExecutionMode::Native,
+        runtime_filter_context,
     )
 }
 
@@ -169,7 +168,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
-    execute_plan_with_pipeline_in_mode(
+    execute_plan_with_pipeline(
         plan,
         debug,
         time_slice,
@@ -184,18 +183,12 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
         fe_addr,
         backend_num,
         root_sink_dop,
-        PipelineExecutionMode::Compat,
+        None,
     )
 }
 
-enum PipelineExecutionMode {
-    Native,
-    #[cfg(feature = "compat")]
-    Compat,
-}
-
 #[allow(clippy::too_many_arguments)]
-fn execute_plan_with_pipeline_in_mode(
+fn execute_plan_with_pipeline(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,
@@ -210,27 +203,26 @@ fn execute_plan_with_pipeline_in_mode(
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
-    mode: PipelineExecutionMode,
+    runtime_filter_context: Option<
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    >,
 ) -> Result<(), String> {
     let fragment_profiler = profiler.clone();
     let dep_manager = DependencyManager::new();
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
-    let graph = match mode {
-        PipelineExecutionMode::Native => {
-            build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
-                &plan,
-                debug,
-                dep_manager.clone(),
-                exchange_finst_id,
-                exchange_bindings,
-                scan_bindings,
-                pipeline_dop,
-                root_sink_dop,
-                runtime_state.native_runtime_filter_context().cloned(),
-            )?
-        }
-    };
+    let graph =
+        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
+            &plan,
+            debug,
+            dep_manager.clone(),
+            exchange_finst_id,
+            exchange_bindings,
+            scan_bindings,
+            pipeline_dop,
+            root_sink_dop,
+            runtime_filter_context,
+        )?;
 
     let finst_id = runtime_state.fragment_instance_id();
     let ctx = Arc::new(FragmentContext::new(

@@ -366,9 +366,8 @@ impl ProcessorOperator for ExchangeSourceOperator {
     }
 }
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -379,7 +378,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::expr::ExprArena;
     use crate::exec::pipeline::binding::ExchangeBinding;
     use crate::runtime::runtime_state::RuntimeState;
 

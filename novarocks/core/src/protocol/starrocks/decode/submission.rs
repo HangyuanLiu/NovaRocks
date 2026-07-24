@@ -642,7 +642,7 @@ fn decode_draft_parts(
     let scan_assignments =
         ScanAssignments::try_new(std::mem::take(&mut captured_scan_ranges.borrow_mut()))
             .map_err(StarRocksFragmentDecodeError::Binding)?;
-    let instance_spec = FragmentInstanceSpec::new_compat(
+    let instance_spec = FragmentInstanceSpec::new_native(
         FragmentContractVersion::CURRENT,
         instance.query_id,
         instance.fragment_instance_id,
