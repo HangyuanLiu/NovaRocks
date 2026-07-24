@@ -15,114 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::runtime_filter::model::contract::{BindingId, ChannelId, CompletionRequirement};
+use crate::runtime_filter::model::contract::CompletionRequirement;
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+pub(crate) use crate::runtime_filter::model::join_progress::{
+    FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
+    JoinBuildProgressSkip,
+};
 use crate::sql::planner::physical::runtime_filter_placement::rf_sides_for_join;
 
 use super::{DistributedNode, DistributedNodeKind, FragmentId, PlanFragment};
-
-/// Planner-sealed proof that one hash-join producer can publish its runtime
-/// filter after only its build-side frontier completes, independent of the
-/// probe side and of the rest of the fragment.
-///
-/// `build_frontier` and `non_build_inputs` must form an EXACT partition of the
-/// producer fragment's sealed in-edges. The deployment compiler revalidates
-/// that partition against the sealed edge set and then uses the proof to
-/// refine the wait graph (see `runtime_filter/deployment/wait_for.rs`); a
-/// proof is never trusted as a boolean verdict.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct JoinBuildProgressProof {
-    pub(crate) channel: ChannelId,
-    pub(crate) producer_binding: BindingId,
-    pub(crate) producer_fragment: FragmentId,
-    pub(crate) join_node_id: i32,
-    pub(crate) build_frontier: Vec<FrontierEdge>,
-    pub(crate) non_build_inputs: Vec<FrontierEdge>,
-}
-
-/// One in-edge of the producer fragment, keyed exactly like a sealed
-/// `FragmentEdge`: (source fragment, target exchange node id).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct FrontierEdge {
-    pub(crate) source_fragment: FragmentId,
-    pub(crate) target_exchange_node: i32,
-}
-
-type JoinBuildProgressKey = (ChannelId, BindingId, FragmentId);
-
-/// Why a join was skipped (no proof sealed). Diagnostic only; a skipped join
-/// keeps its coarse-grained wait edges and the final cycle guard still runs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FrontierSkip {
-    NoRfSides,
-    MissingChild,
-    UnauditedNode { node_id: i32 },
-}
-
-/// Planner provenance for one producer that could not seal a build-frontier
-/// proof. Deployment keeps the coarse edge and uses this only for diagnostics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct JoinBuildProgressSkip {
-    pub(crate) join_node_id: i32,
-    pub(crate) rule: FrontierSkip,
-}
-
-/// Planner-sealed build-progress facts. Successful proofs and fail-closed skip
-/// provenance share the same expected producer tuple without conflating their
-/// semantics.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct JoinBuildProgressCatalog {
-    proofs: BTreeMap<JoinBuildProgressKey, JoinBuildProgressProof>,
-    skips: BTreeMap<JoinBuildProgressKey, JoinBuildProgressSkip>,
-}
-
-impl JoinBuildProgressCatalog {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.proofs.len() + self.skips.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn values(&self) -> impl Iterator<Item = &JoinBuildProgressProof> {
-        self.proofs.values()
-    }
-
-    pub(crate) fn get(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressProof> {
-        self.proofs.get(key)
-    }
-
-    pub(crate) fn skipped(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressSkip> {
-        self.skips.get(key)
-    }
-
-    fn insert_proof(&mut self, key: JoinBuildProgressKey, proof: JoinBuildProgressProof) {
-        self.skips.remove(&key);
-        self.proofs.insert(key, proof);
-    }
-
-    fn insert_skip(&mut self, key: JoinBuildProgressKey, skip: JoinBuildProgressSkip) {
-        self.proofs.remove(&key);
-        self.skips.insert(key, skip);
-    }
-}
-
-impl FromIterator<(JoinBuildProgressKey, JoinBuildProgressProof)> for JoinBuildProgressCatalog {
-    fn from_iter<T: IntoIterator<Item = (JoinBuildProgressKey, JoinBuildProgressProof)>>(
-        iter: T,
-    ) -> Self {
-        let mut catalog = Self::new();
-        for (key, proof) in iter {
-            catalog.insert_proof(key, proof);
-        }
-        catalog
-    }
-}
 
 /// Fragment-local input-closure audit.
 ///
@@ -292,7 +195,8 @@ mod tests {
         ConsumerWaitInput, ExecutionDependencyGraph, ProducerWaitInput, validate_wait_for,
     };
     use crate::runtime_filter::model::contract::{
-        ConsumerActivation, ContributionKind, CoverageWitnessId, PlanFragmentId, PlanNodeId,
+        BindingId, ChannelId, ConsumerActivation, ContributionKind, CoverageWitnessId,
+        PlanFragmentId, PlanNodeId,
     };
     use crate::runtime_filter::model::graph::{
         ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingSpec,
