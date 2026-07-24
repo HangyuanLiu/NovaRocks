@@ -55,7 +55,6 @@ use crate::exec::runtime_filter::{
     encode_starrocks_empty_filter, maybe_build_runtime_bitset_filter,
 };
 use crate::novarocks_logging::debug;
-use crate::novarocks_logging::warn;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 #[cfg(feature = "compat")]

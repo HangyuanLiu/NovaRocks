@@ -29,7 +29,9 @@ use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter, StarrocksRuntimeFilterType,
     decode_starrocks_in_filter, decode_starrocks_membership_filter, peek_starrocks_filter_type,
 };
-use crate::novarocks_logging::{debug, warn};
+use crate::novarocks_logging::debug;
+#[cfg(feature = "compat")]
+use crate::novarocks_logging::warn;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 

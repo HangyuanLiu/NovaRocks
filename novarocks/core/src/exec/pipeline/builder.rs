@@ -38,9 +38,7 @@ use crate::exec::node::aggregate::{
 use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode};
 use crate::exec::node::filter::FilterNode;
-use crate::exec::node::join::{
-    JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
-};
+use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::project::ProjectNode;

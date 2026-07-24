@@ -16,7 +16,6 @@
 // under the License.
 #[cfg(feature = "compat")]
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
@@ -32,7 +31,6 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::fs::scan_context::FileScanRange;
-use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterSnapshot};
 

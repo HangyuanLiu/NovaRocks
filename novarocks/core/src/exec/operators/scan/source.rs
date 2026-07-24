@@ -433,7 +433,7 @@ impl ScanSourceOperator {
             return;
         }
         for _ in 0..max_io_tasks {
-            let mut runner = ScanAsyncRunner::new(
+            let runner = ScanAsyncRunner::new(
                 self.name.clone(),
                 self.scan.clone(),
                 Arc::clone(&self.op),

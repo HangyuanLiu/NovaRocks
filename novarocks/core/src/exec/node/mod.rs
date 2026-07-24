@@ -43,7 +43,7 @@ pub use iceberg_delta_scan::{
 };
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprArena;
 use crate::exec::node::aggregate::AggregateNode;
 use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::AssertNumRowsNode;
