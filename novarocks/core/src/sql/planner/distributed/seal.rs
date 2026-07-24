@@ -616,7 +616,12 @@ mod tests {
         }
     }
 
-    fn cycle_fragment(fragment_id: u32, root: DistributedNode) -> PlanFragment {
+    fn cycle_fragment(
+        fragment_id: u32,
+        root: DistributedNode,
+        cte_id: Option<u32>,
+        cte_exchange_nodes: Vec<(u32, i32, Vec<ColumnId>)>,
+    ) -> PlanFragment {
         PlanFragment {
             fragment_id,
             root,
@@ -629,8 +634,8 @@ mod tests {
             },
             output_exprs: None,
             output_columns: vec![cycle_output_column()],
-            cte_id: Some(fragment_id),
-            cte_exchange_nodes: Vec::new(),
+            cte_id,
+            cte_exchange_nodes,
         }
     }
 
@@ -666,9 +671,19 @@ mod tests {
             node_id: PlanNodeId::new(24),
         };
 
-        let fragment_1 = cycle_fragment(1, cycle_values(11, 1, Vec::new()));
-        let fragment_3 = cycle_fragment(3, cycle_exchange(22, 3, 1, false));
-        let fragment_5 = cycle_fragment(5, cycle_exchange(24, 5, 3, true));
+        let fragment_1 = cycle_fragment(1, cycle_values(11, 1, Vec::new()), Some(1), Vec::new());
+        let fragment_3 = cycle_fragment(
+            3,
+            cycle_exchange(22, 3, 1, false),
+            Some(3),
+            vec![(1, 22, vec![ColumnId::new_for_test(1)])],
+        );
+        let fragment_5 = cycle_fragment(
+            5,
+            cycle_exchange(24, 5, 3, true),
+            Some(5),
+            vec![(3, 24, vec![ColumnId::new_for_test(1)])],
+        );
         let fragment_4 = cycle_fragment(
             4,
             cycle_values(
@@ -679,6 +694,11 @@ mod tests {
                     cycle_exchange(25, 4, 5, false),
                 ],
             ),
+            Some(4),
+            vec![
+                (1, 21, vec![ColumnId::new_for_test(1)]),
+                (5, 25, vec![ColumnId::new_for_test(1)]),
+            ],
         );
         let fragment_2 = cycle_fragment(
             2,
@@ -700,6 +720,11 @@ mod tests {
                 ],
                 vec![BindingId::new(1)],
             ),
+            None,
+            vec![
+                (4, 20, vec![ColumnId::new_for_test(1)]),
+                (5, 23, vec![ColumnId::new_for_test(1)]),
+            ],
         );
         DistributedPlanDraft {
             fragments: vec![fragment_1, fragment_2, fragment_3, fragment_4, fragment_5],
