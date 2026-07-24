@@ -590,7 +590,6 @@ fn decode_draft_parts(
         arena,
         root: lowered.node,
     };
-    super::runtime_filter_pushdown::push_down_local_runtime_filters(&mut plan.root, &plan.arena);
     let exchange_contracts = collect_exchange_contracts(&plan.root)?;
     let exchange_assignments = decode_exchange_assignments(
         &exchange_contracts,
