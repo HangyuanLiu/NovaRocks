@@ -993,6 +993,15 @@ impl NativeRuntimeFilterConsumerSet {
         let NativeConsumerBindingState::BoundLive { observed, .. } = &mut binding.state else {
             return Ok(());
         };
+        let observed_version = *observed;
+        if let Some(version) = observed_version
+            && version != LogicalVersion::FIRST
+        {
+            return Err(format!(
+                "native Join CompleteOnce runtime-filter binding_id={} private cursor must use LogicalVersion::FIRST, got {version:?}",
+                spec.binding_id
+            ));
+        }
         match outcome {
             LivePollOutcome::Updated { bundle, terminal } => {
                 if bundle.version() != LogicalVersion::FIRST {
@@ -1015,12 +1024,39 @@ impl NativeRuntimeFilterConsumerSet {
             }
             LivePollOutcome::Idle {
                 latest_version,
-                terminal: None,
+                terminal,
             } => {
-                *observed = latest_version;
-            }
-            LivePollOutcome::Idle {
-                terminal:
+                if let Some(version) = latest_version
+                    && version != LogicalVersion::FIRST
+                {
+                    return Err(format!(
+                        "native Join CompleteOnce runtime-filter binding_id={} Idle latest version must use LogicalVersion::FIRST, got {version:?}",
+                        spec.binding_id
+                    ));
+                }
+                if terminal == Some(LiveTerminal::Completed) {
+                    return Err(format!(
+                        "native Join CompleteOnce runtime-filter binding_id={} reported Completed without the final artifact",
+                        spec.binding_id
+                    ));
+                }
+                match (observed_version, latest_version) {
+                    (None, Some(_)) => {
+                        return Err(format!(
+                            "native Join CompleteOnce runtime-filter binding_id={} Idle cursor advanced without returning an artifact",
+                            spec.binding_id
+                        ));
+                    }
+                    (Some(_), None) => {
+                        return Err(format!(
+                            "native Join CompleteOnce runtime-filter binding_id={} Idle cursor regressed from LogicalVersion::FIRST",
+                            spec.binding_id
+                        ));
+                    }
+                    _ => {}
+                }
+                match terminal {
+                    None => {}
                     Some(
                         LiveTerminal::CompletedWithoutArtifact
                         | LiveTerminal::DegradedLogical(_)
@@ -1028,19 +1064,11 @@ impl NativeRuntimeFilterConsumerSet {
                         | LiveTerminal::DegradedDelivery(_)
                         | LiveTerminal::Unavailable(_)
                         | LiveTerminal::Cancelled,
-                    ),
-                ..
-            } => {
-                binding.state = NativeConsumerBindingState::PassThrough;
-            }
-            LivePollOutcome::Idle {
-                terminal: Some(LiveTerminal::Completed),
-                ..
-            } => {
-                return Err(format!(
-                    "native Join CompleteOnce runtime-filter binding_id={} reported Completed without the final artifact",
-                    spec.binding_id
-                ));
+                    ) => {
+                        binding.state = NativeConsumerBindingState::PassThrough;
+                    }
+                    Some(LiveTerminal::Completed) => unreachable!("handled above"),
+                }
             }
         }
         Ok(())
@@ -1552,7 +1580,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{
-        NativeConsumerTestSubscription, NativeRuntimeFilterConsumerSet,
+        NativeConsumerBindingState, NativeConsumerTestSubscription, NativeRuntimeFilterConsumerSet,
         subscription_kind_for_activation, validate_resolved_consumer_activation,
     };
     use crate::common::ids::SlotId;
@@ -1767,6 +1795,18 @@ mod tests {
         )
     }
 
+    fn set_live_observed(consumers: &NativeRuntimeFilterConsumerSet, next: Option<LogicalVersion>) {
+        let mut bindings = consumers
+            .inner
+            .bindings
+            .lock()
+            .expect("native RF consumer lock");
+        let NativeConsumerBindingState::BoundLive { observed, .. } = &mut bindings[0].state else {
+            panic!("fixture binding is live");
+        };
+        *observed = next;
+    }
+
     fn assert_values(output: Option<crate::exec::chunk::Chunk>, expected: &[i32]) {
         let output = output.expect("test expects a nonempty output chunk");
         assert_eq!(
@@ -1803,6 +1843,49 @@ mod tests {
         );
         assert_values(consumers.apply_chunk(chunk(&[5, 6])).unwrap(), &[5, 6]);
         assert_eq!(subscription.observed(), vec![None, None]);
+    }
+
+    #[test]
+    fn native_join_batch_live_idle_rejects_ahead_version_without_artifact() {
+        let (consumers, _) = live_fixture([LivePollOutcome::Idle {
+            latest_version: Some(LogicalVersion::FIRST),
+            terminal: None,
+        }]);
+
+        let error = consumers
+            .apply_chunk(chunk(&[1, 2, 3, 4]))
+            .expect_err("Idle must not advance a CompleteOnce cursor without an artifact");
+
+        assert!(error.contains("advanced without returning an artifact"));
+    }
+
+    #[test]
+    fn native_join_batch_live_idle_rejects_cursor_regression() {
+        let (consumers, _) = live_fixture([LivePollOutcome::Idle {
+            latest_version: None,
+            terminal: None,
+        }]);
+        set_live_observed(&consumers, Some(LogicalVersion::FIRST));
+
+        let error = consumers
+            .apply_chunk(chunk(&[1, 2, 3, 4]))
+            .expect_err("Idle must not regress a CompleteOnce cursor");
+
+        assert!(error.contains("regressed"));
+    }
+
+    #[test]
+    fn native_join_batch_live_idle_rejects_nonfirst_version() {
+        let (consumers, _) = live_fixture([LivePollOutcome::Idle {
+            latest_version: Some(LogicalVersion::new(2)),
+            terminal: None,
+        }]);
+
+        let error = consumers
+            .apply_chunk(chunk(&[1, 2, 3, 4]))
+            .expect_err("CompleteOnce Idle must reject a non-FIRST version");
+
+        assert!(error.contains("LogicalVersion::FIRST"));
     }
 
     #[test]

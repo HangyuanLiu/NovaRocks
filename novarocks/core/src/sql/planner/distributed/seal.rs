@@ -28,7 +28,7 @@ use super::boundary::{
 };
 use super::cycle_forced_activation::{
     CycleForcedActivation, CycleForcedActivationError, apply_cycle_forced_activations,
-    decide_cycle_forced_activations,
+    decide_cycle_forced_activations, log_cycle_forced_activations,
 };
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
 use super::output::{
@@ -203,23 +203,27 @@ fn apply_cycle_forced_activations_and_revalidate(
     fragments: &[PlanFragment],
     decisions: &[CycleForcedActivation],
 ) -> Result<(), DistributedPlanSealError> {
-    apply_cycle_forced_activations(runtime_filter_graph, decisions)
+    let mut candidate = runtime_filter_graph.clone();
+    apply_cycle_forced_activations(&mut candidate, decisions)
         .map_err(DistributedPlanSealError::CycleForcedActivation)?;
     #[cfg(test)]
     if !decisions.is_empty()
         && take_forced_final_plan_failure_after_cycle_forced_mutation_for_test()
     {
-        runtime_filter_graph
+        candidate
             .binding_mut_for_test(decisions[0].consumer_binding)
             .expect("cycle-forced decision owns an existing consumer")
             .location
             .node_id = crate::runtime_filter::model::contract::PlanNodeId::new(999);
     }
-    runtime_filter_graph
+    candidate
         .validate()
         .map_err(DistributedPlanSealError::RuntimeFilterGraph)?;
-    validation::validate_runtime_filter_graph_against_plan(runtime_filter_graph, fragments)
-        .map_err(DistributedPlanSealError::RuntimeFilterPlan)
+    validation::validate_runtime_filter_graph_against_plan(&candidate, fragments)
+        .map_err(DistributedPlanSealError::RuntimeFilterPlan)?;
+    *runtime_filter_graph = candidate;
+    log_cycle_forced_activations(decisions);
+    Ok(())
 }
 
 pub(in crate::sql::planner::distributed) fn seal_draft(
@@ -1114,6 +1118,57 @@ mod tests {
                 RuntimeFilterPlanValidationError::BindingLocationMismatch(binding)
             ) if binding == BindingId::new(2)
         ));
+    }
+
+    #[test]
+    fn seal_activation_stage_rolls_back_final_validation_failure() {
+        let mut draft = cycle_draft(JoinKind::Inner);
+        let decision = super::super::cycle_forced_activation::CycleForcedActivation {
+            channel: ChannelId::new(1),
+            consumer_binding: BindingId::new(2),
+            consumer_fragment: 5,
+            producer_bindings: vec![BindingId::new(1)],
+            witness: Vec::new(),
+        };
+        let binding_before = draft
+            .runtime_filter_graph
+            .binding(BindingId::new(2))
+            .expect("consumer binding");
+        let location_before = binding_before.location;
+        let RuntimeFilterBindingRole::Consumer(requirement_before) = &binding_before.role else {
+            panic!("fixture binding is a consumer");
+        };
+        let activation_before = requirement_before.activation;
+
+        super::force_final_plan_failure_after_cycle_forced_mutation_for_test();
+        let error = super::apply_cycle_forced_activations_and_revalidate(
+            &mut draft.runtime_filter_graph,
+            &draft.fragments,
+            &[decision],
+        )
+        .expect_err("final graph/plan validation must reject the candidate");
+
+        assert!(matches!(
+            error,
+            DistributedPlanSealError::RuntimeFilterPlan(
+                RuntimeFilterPlanValidationError::BindingLocationMismatch(binding)
+            ) if binding == BindingId::new(2)
+        ));
+        let binding_after = draft
+            .runtime_filter_graph
+            .binding(BindingId::new(2))
+            .expect("consumer binding");
+        assert_eq!(
+            binding_after.location, location_before,
+            "candidate location changes must not leak after final validation fails"
+        );
+        let RuntimeFilterBindingRole::Consumer(requirement_after) = &binding_after.role else {
+            panic!("fixture binding remains a consumer");
+        };
+        assert_eq!(
+            requirement_after.activation, activation_before,
+            "candidate activation changes must not leak after final validation fails"
+        );
     }
 
     #[test]

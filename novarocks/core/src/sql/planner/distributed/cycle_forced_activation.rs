@@ -130,8 +130,9 @@ pub(crate) fn apply_cycle_forced_activations(
     graph: &mut RuntimeFilterGraph,
     decisions: &[CycleForcedActivation],
 ) -> Result<(), CycleForcedActivationError> {
+    let mut candidate = graph.clone();
     for decision in decisions {
-        graph
+        candidate
             .replace_consumer_activation_checked(
                 decision.consumer_binding,
                 decision.channel,
@@ -142,6 +143,13 @@ pub(crate) fn apply_cycle_forced_activations(
                 },
             )
             .map_err(CycleForcedActivationError::Mutation)?;
+    }
+    *graph = candidate;
+    Ok(())
+}
+
+pub(crate) fn log_cycle_forced_activations(decisions: &[CycleForcedActivation]) {
+    for decision in decisions {
         let producers: Vec<u32> = decision
             .producer_bindings
             .iter()
@@ -155,7 +163,6 @@ pub(crate) fn apply_cycle_forced_activations(
             decision.witness,
         );
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -516,6 +523,53 @@ mod tests {
                 }
             ) if binding == BindingId::new(10)
         ));
+    }
+
+    #[test]
+    fn later_stale_decision_leaves_earlier_valid_activation_unchanged() {
+        let mut edges = q23_edges(0);
+        edges.extend(q23_edges(10));
+        let mut graph = graph(vec![
+            producer(100, 7, 2, 10),
+            consumer(10, 7, 5),
+            producer(200, 8, 12, 110),
+            consumer(20, 8, 15),
+        ]);
+        let progress = catalog(vec![proof(7, 100, 0, 10), proof(8, 200, 10, 110)]);
+        let decisions = decide_cycle_forced_activations(&edges, &graph, &progress).unwrap();
+        let RuntimeFilterBindingRole::Consumer(requirement) =
+            &mut graph.binding_mut_for_test(BindingId::new(20)).unwrap().role
+        else {
+            panic!("fixture binding is a consumer");
+        };
+        requirement.activation = ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Batch,
+        };
+
+        let error = apply_cycle_forced_activations(&mut graph, &decisions)
+            .expect_err("a later stale decision must reject the whole activation transaction");
+
+        assert!(matches!(
+            error,
+            CycleForcedActivationError::Mutation(
+                crate::runtime_filter::model::graph::ConsumerActivationUpdateError::CurrentActivationMismatch {
+                    binding,
+                    ..
+                }
+            ) if binding == BindingId::new(20)
+        ));
+        assert_eq!(
+            activation(&graph, 10),
+            ConsumerActivation::BlockingSnapshot,
+            "an earlier valid decision must roll back with the rejected transaction"
+        );
+        assert_eq!(
+            activation(&graph, 20),
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+            "the preexisting stale activation must remain unchanged"
+        );
     }
 
     #[test]
