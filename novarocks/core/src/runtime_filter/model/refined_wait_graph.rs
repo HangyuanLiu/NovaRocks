@@ -505,30 +505,18 @@ impl RefinedWaitGraph {
             }
 
             let mut waits = BTreeSet::new();
+            let mut all_waits_refined = true;
             for from in &nodes {
                 for (to, kind) in self.succ.get(from).expect("SCC node tracked") {
                     if !node_set.contains(to) {
                         continue;
                     }
-                    let wait = match kind {
-                        WaitEdgeKind::Wait(wait) | WaitEdgeKind::Backpressure { wait, .. } => {
-                            Some(*wait)
-                        }
-                        WaitEdgeKind::DataFlow | WaitEdgeKind::Frontier => None,
-                    };
-                    if let Some(wait) = wait {
-                        waits.insert(wait);
+                    if let WaitEdgeKind::Wait(wait) = kind {
+                        waits.insert(*wait);
+                        all_waits_refined &= matches!(from, WaitNode::BuildReady { .. });
                     }
                 }
             }
-            let all_waits_refined = waits.iter().all(|wait| {
-                self.succ.iter().any(|(from, edges)| {
-                    matches!(from, WaitNode::BuildReady { .. })
-                        && edges
-                            .iter()
-                            .any(|(_, kind)| matches!(kind, WaitEdgeKind::Wait(edge_wait) if edge_wait == wait))
-                })
-            });
             if waits.is_empty() || !all_waits_refined {
                 continue;
             }
@@ -772,6 +760,7 @@ mod tests {
 
     use super::{
         ConsumerWaitInput, ProducerWaitInput, ProofRejection, RefinedFragmentEdge,
+        RefinedWaitGraph, WaitEdgeKind, WaitGraph, WaitNode, WaitProvenance, add_wait_edge,
         build_refined_wait_graph,
     };
     use crate::runtime_filter::model::contract::{
@@ -874,6 +863,7 @@ mod tests {
             edge(4, 2, 20),
             edge(3, 5, 24),
             edge(5, 2, 23),
+            edge(5, 4, 25),
         ]
     }
 
@@ -886,6 +876,19 @@ mod tests {
             producers: vec![ProducerWaitInput {
                 binding: BindingId::new(100),
                 fragment: 2,
+            }],
+        }
+    }
+
+    fn unrelated_wait() -> ConsumerWaitInput {
+        ConsumerWaitInput {
+            channel: ChannelId::new(8),
+            binding: BindingId::new(11),
+            consumer_fragment: 9,
+            activation: ConsumerActivation::BlockingSnapshot,
+            producers: vec![ProducerWaitInput {
+                binding: BindingId::new(200),
+                fragment: 8,
             }],
         }
     }
@@ -920,6 +923,54 @@ mod tests {
 
         assert!(refined.pure_blocking_sccs().is_empty());
         assert!(refined.find_cycle().is_some());
+    }
+
+    #[test]
+    fn internal_backpressure_does_not_borrow_external_refined_wait_identity() {
+        let wait = WaitProvenance {
+            channel: ChannelId::new(7),
+            consumer_binding: BindingId::new(10),
+            producer_binding: BindingId::new(100),
+        };
+        let mut succ = WaitGraph::new();
+        add_wait_edge(
+            WaitNode::Frag(1),
+            WaitNode::Frag(2),
+            WaitEdgeKind::DataFlow,
+            &mut succ,
+        );
+        add_wait_edge(
+            WaitNode::Frag(2),
+            WaitNode::Frag(1),
+            WaitEdgeKind::Backpressure {
+                wait,
+                multicast_fragment: 1,
+            },
+            &mut succ,
+        );
+        add_wait_edge(
+            WaitNode::Frag(2),
+            WaitNode::Frag(3),
+            WaitEdgeKind::Wait(wait),
+            &mut succ,
+        );
+        add_wait_edge(
+            WaitNode::BuildReady {
+                fragment: 4,
+                join_node: 40,
+            },
+            WaitNode::Frag(5),
+            WaitEdgeKind::Wait(wait),
+            &mut succ,
+        );
+        let refined = RefinedWaitGraph {
+            succ,
+            fallbacks: Default::default(),
+            accepted_build_ready: Default::default(),
+        };
+
+        assert!(refined.find_cycle().is_some());
+        assert!(refined.pure_blocking_sccs().is_empty());
     }
 
     #[test]
@@ -1106,16 +1157,13 @@ mod tests {
         let graph = graph_for_proof(&proof);
         let mut reversed_edges = q23_edges();
         reversed_edges.reverse();
-        let mut reversed_waits = vec![q23_wait()];
+        let waits = vec![q23_wait(), unrelated_wait()];
+        let mut reversed_waits = waits.clone();
         reversed_waits.reverse();
 
-        let forward = build_refined_wait_graph(
-            &q23_edges(),
-            &[q23_wait()],
-            &catalog(Some(proof.clone())),
-            &graph,
-        )
-        .unwrap();
+        let forward =
+            build_refined_wait_graph(&q23_edges(), &waits, &catalog(Some(proof.clone())), &graph)
+                .unwrap();
         let reversed = build_refined_wait_graph(
             &reversed_edges,
             &reversed_waits,
