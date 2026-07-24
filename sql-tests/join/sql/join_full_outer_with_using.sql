@@ -564,7 +564,7 @@ SELECT k1, k2,
        END as match_status,
        COALESCE(v1, v2) as value
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
-ORDER BY k1, k2;
+ORDER BY k1, k2, match_status, value;
 
 -- query 57
 -- INNER + FULL OUTER + INNER + FULL OUTER chain

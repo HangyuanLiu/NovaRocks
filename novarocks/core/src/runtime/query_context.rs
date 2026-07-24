@@ -910,7 +910,6 @@ struct QueryContextManagerInner {
     fragment_completions: HashMap<UniqueId, FragmentCompletionEntry>,
     runtime_filter_deployment_terminals: HashMap<QueryId, RuntimeFilterDeploymentTerminalRecord>,
     runtime_filter_query_cancellations: HashMap<QueryId, RuntimeFilterQueryCancellationRecord>,
-    #[cfg(test)]
     runtime_filter_query_cancellation_errors: HashMap<QueryId, String>,
     #[cfg(test)]
     runtime_filter_terminal_now: Option<Instant>,
@@ -1030,6 +1029,17 @@ fn clean_expired_runtime_filter_terminals(inner: &mut QueryContextManagerInner) 
     inner
         .runtime_filter_query_cancellations
         .retain(|_, record| record.expires_at > now);
+    let retained_queries = inner
+        .active
+        .keys()
+        .chain(inner.second_chance.keys())
+        .chain(inner.runtime_filter_deployment_terminals.keys())
+        .chain(inner.runtime_filter_query_cancellations.keys())
+        .copied()
+        .collect::<HashSet<_>>();
+    inner
+        .runtime_filter_query_cancellation_errors
+        .retain(|query_id, _| retained_queries.contains(query_id));
 }
 
 fn runtime_filter_terminal_expiry(inner: &QueryContextManagerInner) -> Instant {
@@ -2159,15 +2169,22 @@ impl QueryContextManager {
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         clean_expired_runtime_filter_terminals(&mut guard);
-        if claim == LegacyRuntimeFilterExecutionClaim::NativeService
-            && (guard
+        if claim == LegacyRuntimeFilterExecutionClaim::NativeService {
+            if let Some(error) = guard
+                .runtime_filter_query_cancellation_errors
+                .get(&query_id)
+            {
+                return Err(error.clone());
+            }
+            if guard
                 .runtime_filter_deployment_terminals
                 .contains_key(&query_id)
                 || guard
                     .runtime_filter_query_cancellations
-                    .contains_key(&query_id))
-        {
-            return Err("runtime filter deployment query was already cancelled".to_string());
+                    .contains_key(&query_id)
+            {
+                return Err("runtime filter deployment query was already cancelled".to_string());
+            }
         }
         if claim == LegacyRuntimeFilterExecutionClaim::NativeService
             && guard
@@ -3159,6 +3176,7 @@ impl QueryContextManager {
         inner: &mut QueryContextManagerInner,
         query_id: QueryId,
         expected_execution: Option<QueryExecutionKey>,
+        cancellation_error: Option<&str>,
     ) -> RuntimeFilterQueryCancellationAction {
         clean_expired_runtime_filter_terminals(inner);
         let location = if inner.active.contains_key(&query_id) {
@@ -3184,6 +3202,12 @@ impl QueryContextManager {
         };
         if !matches {
             return RuntimeFilterQueryCancellationAction::default();
+        }
+        if let Some(error) = cancellation_error {
+            inner
+                .runtime_filter_query_cancellation_errors
+                .entry(query_id)
+                .or_insert_with(|| error.to_string());
         }
 
         let expires_at = runtime_filter_terminal_expiry(inner);
@@ -3296,7 +3320,7 @@ impl QueryContextManager {
         let (cancellation, finsts) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let cancellation =
-                Self::prepare_runtime_filter_query_cancellation(&mut guard, query_id, None);
+                Self::prepare_runtime_filter_query_cancellation(&mut guard, query_id, None, None);
             let finsts = guard
                 .finst_to_query
                 .iter()
@@ -3316,13 +3340,12 @@ impl QueryContextManager {
     pub(crate) fn cancel_query(&self, query_id: QueryId, err: String) -> Vec<UniqueId> {
         let (cancellation, finsts, completions) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            #[cfg(test)]
-            guard
-                .runtime_filter_query_cancellation_errors
-                .entry(query_id)
-                .or_insert_with(|| err.clone());
-            let cancellation =
-                Self::prepare_runtime_filter_query_cancellation(&mut guard, query_id, None);
+            let cancellation = Self::prepare_runtime_filter_query_cancellation(
+                &mut guard,
+                query_id,
+                None,
+                Some(&err),
+            );
 
             let mut finsts = Vec::new();
             let mut completions = Vec::new();
@@ -3369,6 +3392,7 @@ impl QueryContextManager {
                 &mut guard,
                 query_id,
                 Some(execution),
+                Some(&err),
             );
             let finsts = guard
                 .finst_to_query
@@ -3417,15 +3441,11 @@ impl QueryContextManager {
             };
             binding_observer();
             let query_id = execution.query_id();
-            #[cfg(test)]
-            guard
-                .runtime_filter_query_cancellation_errors
-                .entry(query_id)
-                .or_insert_with(|| err.clone());
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
                 &mut guard,
                 query_id,
                 Some(execution),
+                Some(&err),
             );
             let finsts = guard
                 .finst_to_query
@@ -6959,7 +6979,8 @@ mod tests {
                 .expect("install");
             assert!(manager.runtime_filter_deployment_is_installed_for_test(query));
 
-            manager.cancel_query(query, "query cancelled".to_string());
+            let primary_error = "fragment execution error: bitmap aggregate expects INTEGER input";
+            manager.cancel_query(query, primary_error.to_string());
 
             assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
             assert_eq!(
@@ -6969,7 +6990,8 @@ mod tests {
                     .kind(),
                 RuntimeFilterDeploymentInstallErrorKind::QueryAborted
             );
-            assert!(
+            manager.cancel_query(query, "secondary cancellation".to_string());
+            assert_eq!(
                 manager
                     .get_or_register_native(
                         query,
@@ -6977,7 +6999,8 @@ mod tests {
                         lifecycle().delivery_expire,
                         lifecycle().query_expire,
                     )
-                    .is_err()
+                    .expect_err("cancelled query rejects late fragment registration"),
+                primary_error
             );
             assert_eq!(manager.fragment_counts_for_test(query), Some((0, 0)));
         }
