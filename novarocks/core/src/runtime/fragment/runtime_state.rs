@@ -70,7 +70,6 @@ pub(crate) fn build_runtime_state(
             inputs.query_options,
             Some(cache_options),
             inputs.query_id,
-            None,
             inputs.fragment_instance_id,
             inputs.backend_num,
             inputs.mem_tracker,

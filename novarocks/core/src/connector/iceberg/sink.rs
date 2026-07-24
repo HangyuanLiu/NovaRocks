@@ -2720,17 +2720,7 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
         let finst_id = UniqueId { hi: 707, lo: 42 };
         crate::runtime::sink_commit::unregister(finst_id);
-        let state = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            Some(finst_id),
-            None,
-            None,
-            None,
-            None,
-        );
+        let state = RuntimeState::new(None, None, None, Some(finst_id), None, None, None, None);
         backend
             .bind_runtime_state(&state)
             .expect("bind runtime state");
@@ -3022,17 +3012,7 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
         let finst_id = UniqueId { hi: 701, lo: 42 };
         crate::runtime::sink_commit::unregister(finst_id);
-        let state = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            Some(finst_id),
-            None,
-            None,
-            None,
-            None,
-        );
+        let state = RuntimeState::new(None, None, None, Some(finst_id), None, None, None, None);
 
         backend
             .push_chunk_data(&state, chunk)
@@ -3255,17 +3235,7 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
         let finst_id = UniqueId { hi: 702, lo: 42 };
         crate::runtime::sink_commit::unregister(finst_id);
-        let state = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            Some(finst_id),
-            None,
-            None,
-            None,
-            None,
-        );
+        let state = RuntimeState::new(None, None, None, Some(finst_id), None, None, None, None);
 
         backend
             .push_chunk_position_delete(&state, chunk)
@@ -3392,17 +3362,7 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
         let finst_id = UniqueId { hi: 703, lo: 42 };
         crate::runtime::sink_commit::unregister(finst_id);
-        let state = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            Some(finst_id),
-            None,
-            None,
-            None,
-            None,
-        );
+        let state = RuntimeState::new(None, None, None, Some(finst_id), None, None, None, None);
 
         backend
             .push_chunk_position_delete(&state, chunk)
@@ -3531,17 +3491,7 @@ mod tests {
         .expect("chunk schema");
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
         crate::runtime::sink_commit::unregister(finst_id);
-        let state = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            Some(finst_id),
-            None,
-            None,
-            None,
-            None,
-        );
+        let state = RuntimeState::new(None, None, None, Some(finst_id), None, None, None, None);
         let backend = IcebergTableSinkBackend {
             arena: Arc::new(arena),
             plan,
