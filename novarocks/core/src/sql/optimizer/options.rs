@@ -46,6 +46,9 @@ pub(crate) struct SessionOptimizerSettings {
     /// Session override for the RF probe-side minimum selectivity gate.
     /// `None` means use the StarRocks default (0.5).
     pub rf_probe_min_selectivity: Option<f64>,
+    /// Session override for `enable_global_runtime_filter`.
+    /// `None` means the default (enabled).
+    pub enable_global_runtime_filter: Option<bool>,
     /// Session override for transparent MV query rewrite.
     /// `None` means the default (enabled).
     pub enable_materialized_view_rewrite: Option<bool>,
@@ -79,6 +82,10 @@ pub(crate) struct SessionOptimizerSettings {
 }
 
 impl SessionOptimizerSettings {
+    pub(crate) fn global_runtime_filter_enabled(&self) -> bool {
+        self.enable_global_runtime_filter.unwrap_or(true)
+    }
+
     pub(crate) fn mv_rewrite_enabled(&self) -> bool {
         self.enable_materialized_view_rewrite.unwrap_or(true)
     }
@@ -526,6 +533,20 @@ mod tests {
         settings.allow_cross_exchange_rf = Some(false);
         let opts = OptimizerOptions::from_session(&settings);
         assert!(!opts.allow_cross_exchange_rf);
+    }
+
+    #[test]
+    fn global_runtime_filter_defaults_enabled_and_honors_explicit_override() {
+        let settings = SessionOptimizerSettings::default();
+        assert!(settings.global_runtime_filter_enabled());
+
+        let mut off = SessionOptimizerSettings::default();
+        off.enable_global_runtime_filter = Some(false);
+        assert!(!off.global_runtime_filter_enabled());
+
+        let mut on = SessionOptimizerSettings::default();
+        on.enable_global_runtime_filter = Some(true);
+        assert!(on.global_runtime_filter_enabled());
     }
 
     #[test]

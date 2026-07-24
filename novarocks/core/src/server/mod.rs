@@ -1073,6 +1073,33 @@ fn parse_set_boolean(query: &str) -> Option<(String, bool)> {
     Some((name, enabled))
 }
 
+fn apply_optimizer_boolean_set(settings: &mut SessionOptimizerSettings, query: &str) -> bool {
+    let Some((name, enabled)) = parse_set_boolean(query) else {
+        return false;
+    };
+    match name.as_str() {
+        "enable_ukfk_opt" => settings.enable_ukfk_opt = enabled,
+        "enable_query_rewrite_table_prune" => settings.enable_query_rewrite_table_prune = enabled,
+        "enable_cbo_table_prune" => settings.enable_cbo_table_prune = enabled,
+        "enable_table_prune_on_update" => settings.enable_table_prune_on_update = enabled,
+        "enable_eliminate_agg" => settings.enable_eliminate_agg = enabled,
+        "enable_common_subexpr_reuse" => settings.enable_common_subexpr_reuse = Some(enabled),
+        "enable_global_runtime_filter" => settings.enable_global_runtime_filter = Some(enabled),
+        // Tri-state Option<bool> field: store Some(enabled) so an explicit
+        // SET is preserved as an override; None elsewhere means "default".
+        "enable_materialized_view_rewrite" => {
+            settings.enable_materialized_view_rewrite = Some(enabled)
+        }
+        "cbo_enable_dp_join_reorder" => settings.enable_dp_join_reorder = Some(enabled),
+        "cbo_enable_greedy_join_reorder" => settings.enable_greedy_join_reorder = Some(enabled),
+        "enable_global_runtime_filter_cross_exchange" => {
+            settings.allow_cross_exchange_rf = Some(enabled)
+        }
+        _ => {}
+    }
+    true
+}
+
 /// Parse `SET <name> = '<comma-list>'` or `SET <name> = <comma-list>`.
 /// Inner items are comma-separated, whitespace-trimmed, and empty items are dropped.
 /// Returns the list (possibly empty) when the statement matches the
@@ -1273,36 +1300,7 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
-    if let Some((name, enabled)) = parse_set_boolean(trimmed) {
-        match name.as_str() {
-            "enable_ukfk_opt" => shim.optimizer_settings.enable_ukfk_opt = enabled,
-            "enable_query_rewrite_table_prune" => {
-                shim.optimizer_settings.enable_query_rewrite_table_prune = enabled
-            }
-            "enable_cbo_table_prune" => shim.optimizer_settings.enable_cbo_table_prune = enabled,
-            "enable_table_prune_on_update" => {
-                shim.optimizer_settings.enable_table_prune_on_update = enabled
-            }
-            "enable_eliminate_agg" => shim.optimizer_settings.enable_eliminate_agg = enabled,
-            "enable_common_subexpr_reuse" => {
-                shim.optimizer_settings.enable_common_subexpr_reuse = Some(enabled)
-            }
-            // Tri-state Option<bool> field: store Some(enabled) so an explicit
-            // SET is preserved as an override; None elsewhere means "default".
-            "enable_materialized_view_rewrite" => {
-                shim.optimizer_settings.enable_materialized_view_rewrite = Some(enabled)
-            }
-            "cbo_enable_dp_join_reorder" => {
-                shim.optimizer_settings.enable_dp_join_reorder = Some(enabled)
-            }
-            "cbo_enable_greedy_join_reorder" => {
-                shim.optimizer_settings.enable_greedy_join_reorder = Some(enabled)
-            }
-            "enable_global_runtime_filter_cross_exchange" => {
-                shim.optimizer_settings.allow_cross_exchange_rf = Some(enabled)
-            }
-            _ => return Ok(StatementResult::Ok),
-        }
+    if apply_optimizer_boolean_set(&mut shim.optimizer_settings, trimmed) {
         return Ok(StatementResult::Ok);
     }
 
@@ -2424,6 +2422,23 @@ mod tests {
         assert_eq!(parse_set_boolean("SET @i = 1"), None);
         assert_eq!(parse_set_boolean("SET @i = 0"), None);
         assert_eq!(parse_set_boolean("SET @flag = true"), None);
+    }
+
+    #[test]
+    fn global_runtime_filter_set_stores_explicit_false_and_true() {
+        let mut settings = SessionOptimizerSettings::default();
+
+        assert!(apply_optimizer_boolean_set(
+            &mut settings,
+            "SET enable_global_runtime_filter = false"
+        ));
+        assert_eq!(settings.enable_global_runtime_filter, Some(false));
+
+        assert!(apply_optimizer_boolean_set(
+            &mut settings,
+            "SET enable_global_runtime_filter = true"
+        ));
+        assert_eq!(settings.enable_global_runtime_filter, Some(true));
     }
 
     #[test]
