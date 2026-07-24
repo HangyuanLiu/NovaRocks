@@ -511,9 +511,19 @@ impl RefinedWaitGraph {
                     if !node_set.contains(to) {
                         continue;
                     }
-                    if let WaitEdgeKind::Wait(wait) = kind {
-                        waits.insert(*wait);
-                        all_waits_refined &= matches!(from, WaitNode::BuildReady { .. });
+                    match kind {
+                        WaitEdgeKind::Wait(wait) => {
+                            waits.insert(*wait);
+                            all_waits_refined &= matches!(from, WaitNode::BuildReady { .. });
+                        }
+                        WaitEdgeKind::Backpressure { wait, .. } => {
+                            if matches!(from, WaitNode::BuildReady { .. }) {
+                                waits.insert(*wait);
+                            } else {
+                                all_waits_refined = false;
+                            }
+                        }
+                        WaitEdgeKind::DataFlow | WaitEdgeKind::Frontier => {}
                     }
                 }
             }
@@ -826,12 +836,12 @@ mod tests {
         let mut graph = RuntimeFilterGraph::default();
         graph
             .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: BindingId::new(100),
-                channel_id: ChannelId::new(7),
+                binding_id: proof.producer_binding,
+                channel_id: proof.channel,
                 coverage_witness_id: None,
                 location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(2),
-                    node_id: PlanNodeId::new(10),
+                    fragment_id: PlanFragmentId::new(proof.producer_fragment),
+                    node_id: PlanNodeId::new(proof.join_node_id),
                 },
                 expression: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -852,7 +862,6 @@ mod tests {
                 }),
             })
             .unwrap();
-        assert_eq!(proof.producer_binding, BindingId::new(100));
         graph
     }
 
@@ -923,6 +932,52 @@ mod tests {
 
         assert!(refined.pure_blocking_sccs().is_empty());
         assert!(refined.find_cycle().is_some());
+    }
+
+    #[test]
+    fn proof_backed_backpressure_with_external_wait_returns_pure_blocking_scc() {
+        let proof = JoinBuildProgressProof {
+            channel: ChannelId::new(7),
+            producer_binding: BindingId::new(100),
+            producer_fragment: 5,
+            join_node_id: 24,
+            build_frontier: vec![FrontierEdge {
+                source_fragment: 6,
+                target_exchange_node: 24,
+            }],
+            non_build_inputs: vec![FrontierEdge {
+                source_fragment: 3,
+                target_exchange_node: 25,
+            }],
+        };
+        let edges = vec![
+            edge(1, 6, 21),
+            edge(1, 3, 22),
+            edge(6, 5, 24),
+            edge(3, 5, 25),
+        ];
+        let wait = ConsumerWaitInput {
+            channel: ChannelId::new(7),
+            binding: BindingId::new(10),
+            consumer_fragment: 3,
+            activation: ConsumerActivation::BlockingSnapshot,
+            producers: vec![ProducerWaitInput {
+                binding: BindingId::new(100),
+                fragment: 5,
+            }],
+        };
+        let refined = build_refined_wait_graph(
+            &edges,
+            &[wait],
+            &catalog(Some(proof.clone())),
+            &graph_for_proof(&proof),
+        )
+        .unwrap();
+
+        let sccs = refined.pure_blocking_sccs();
+        assert_eq!(sccs.len(), 1);
+        assert_eq!(sccs[0].waits.len(), 1);
+        assert_eq!(sccs[0].waits[0].channel, ChannelId::new(7));
     }
 
     #[test]
