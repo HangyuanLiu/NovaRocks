@@ -148,23 +148,6 @@ fn validate_internal_addresses(
                 {
                     validate_nodes_info(nodes_info, "fetch.nodes_info")?;
                 }
-                if let Some(join) = node.hash_join_node.as_ref()
-                    && let Some(filters) = join.build_runtime_filters.as_ref()
-                {
-                    for (filter_idx, desc) in filters.iter().enumerate() {
-                        if let Some(merge_nodes) = desc.runtime_filter_merge_nodes.as_ref() {
-                            for (node_idx, addr) in merge_nodes.iter().enumerate() {
-                                validate_network_address(
-                                    Some(addr),
-                                    "missing runtime filter merge address",
-                                    &format!(
-                                        "hash_join.build_runtime_filters[{filter_idx}].runtime_filter_merge_nodes[{node_idx}]"
-                                    ),
-                                )?;
-                            }
-                        }
-                    }
-                }
             }
         }
         if let Some(sink) = fragment.output_sink.as_ref() {
