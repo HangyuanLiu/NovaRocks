@@ -830,6 +830,15 @@ mod tests {
     #[test]
     fn seal_activation_stage_rejects_stale_checked_mutation() {
         let mut draft = cycle_draft(JoinKind::Inner);
+        draft
+            .runtime_filter_graph
+            .validate()
+            .expect("initial graph validation must precede activation mutation");
+        super::validation::validate_runtime_filter_graph_against_plan(
+            &draft.runtime_filter_graph,
+            &draft.fragments,
+        )
+        .expect("initial graph/plan ownership must be valid");
         let RuntimeFilterBindingRole::Consumer(requirement) = &mut draft
             .runtime_filter_graph
             .binding_mut_for_test(BindingId::new(2))
@@ -865,6 +874,44 @@ mod tests {
                         ..
                     }
                 )
+            ) if binding == BindingId::new(2)
+        ));
+    }
+
+    #[test]
+    fn seal_activation_stage_rejects_final_plan_mismatch_after_initial_validation() {
+        let mut draft = cycle_draft(JoinKind::Inner);
+        draft
+            .runtime_filter_graph
+            .validate()
+            .expect("initial graph validation must pass");
+        super::validation::validate_runtime_filter_graph_against_plan(
+            &draft.runtime_filter_graph,
+            &draft.fragments,
+        )
+        .expect("initial graph/plan ownership must pass");
+
+        let consumer = draft
+            .runtime_filter_graph
+            .binding_mut_for_test(BindingId::new(2))
+            .expect("consumer binding");
+        consumer.location.node_id = PlanNodeId::new(999);
+        draft
+            .runtime_filter_graph
+            .validate()
+            .expect("location mutation stays graph-valid so final plan validation is exercised");
+
+        let error = super::apply_cycle_forced_activations_and_revalidate(
+            &mut draft.runtime_filter_graph,
+            &draft.fragments,
+            &[],
+        )
+        .expect_err("final graph/plan validation must reject a post-mutation location mismatch");
+
+        assert!(matches!(
+            error,
+            DistributedPlanSealError::RuntimeFilterPlan(
+                RuntimeFilterPlanValidationError::BindingLocationMismatch(binding)
             ) if binding == BindingId::new(2)
         ));
     }
