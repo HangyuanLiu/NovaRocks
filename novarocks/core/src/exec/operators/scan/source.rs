@@ -44,7 +44,7 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::scan_executor::scan_executor;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -438,10 +438,6 @@ impl ScanSourceOperator {
                 self.scan.clone(),
                 Arc::clone(&self.op),
                 Arc::clone(&dispatch),
-                self.state.runtime_filter_decision.clone(),
-                None,
-                HashMap::new(),
-                0,
                 self.native_runtime_filter_consumers.clone(),
                 self.native_ordered_live_consumers.clone(),
                 Arc::clone(&self.arena),

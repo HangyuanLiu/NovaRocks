@@ -649,7 +649,6 @@ fn decode_draft_parts(
         scan_assignments,
         exchange_assignments,
         assignment,
-        instance.runtime_filter_params,
         FragmentRuntimeOptions::new(
             instance.query_options,
             instance.report_endpoint,

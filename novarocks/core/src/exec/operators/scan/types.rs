@@ -28,19 +28,14 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::runtime_filter_hub::{
-    AcquireProgress, AcquiredRuntimeFilters, RuntimeFilterProbe,
-};
 use crate::runtime::runtime_state::RuntimeState;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
-const SCAN_DEPENDENCY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 pub(super) const NATIVE_ORDERED_LATE_PRUNED_UNITS: &str =
     "NativeOrderedRuntimeFilterLatePrunedUnits";
 
@@ -222,108 +217,5 @@ impl ScanAsyncState {
         };
         state.idle_since = Some(now);
         now.duration_since(start).as_nanos()
-    }
-}
-
-pub(super) fn wait_for_scan_dependency(state: &ScanAsyncState, dep: &DependencyHandle) -> bool {
-    if dep.is_ready() {
-        return true;
-    }
-    let pair = Arc::new((Mutex::new(false), Condvar::new()));
-    let pair_clone = Arc::clone(&pair);
-    dep.add_waiter(Arc::new(move || {
-        let (lock, cv) = &*pair_clone;
-        let mut ready = lock.lock().expect("scan dependency wait lock");
-        *ready = true;
-        cv.notify_all();
-    }));
-    let (lock, cv) = &*pair;
-    let mut ready = lock.lock().expect("scan dependency wait lock");
-    while !*ready {
-        if dep.is_ready() {
-            return true;
-        }
-        if state.is_canceled() {
-            return false;
-        }
-        let (guard, _) = cv
-            .wait_timeout(ready, SCAN_DEPENDENCY_WAIT_INTERVAL)
-            .expect("scan dependency wait");
-        ready = guard;
-    }
-    dep.is_ready()
-}
-
-#[derive(Clone)]
-pub(super) struct SharedRuntimeFilterDecision {
-    acquired: Arc<OnceLock<Result<Option<AcquiredRuntimeFilters>, String>>>,
-}
-
-impl SharedRuntimeFilterDecision {
-    pub(super) fn new() -> Self {
-        Self {
-            acquired: Arc::new(OnceLock::new()),
-        }
-    }
-
-    pub(super) fn get_or_acquire(
-        &self,
-        state: &ScanAsyncState,
-        probe: Option<&ScanRuntimeFilterProbe>,
-        expected: usize,
-    ) -> Result<Option<AcquiredRuntimeFilters>, String> {
-        self.acquired
-            .get_or_init(|| acquire_runtime_filters_once(state, probe, expected))
-            .clone()
-    }
-}
-
-fn acquire_runtime_filters_once(
-    state: &ScanAsyncState,
-    probe: Option<&ScanRuntimeFilterProbe>,
-    expected: usize,
-) -> Result<Option<AcquiredRuntimeFilters>, String> {
-    let Some(rf) = probe else {
-        return Ok(None);
-    };
-    if expected == 0 {
-        return Ok(None);
-    }
-    loop {
-        match rf.poll_acquire() {
-            AcquireProgress::Pending(dep) => {
-                if !wait_for_scan_dependency(state, &dep) {
-                    return Err("scan canceled while waiting for runtime filters".to_string());
-                }
-            }
-            AcquireProgress::Resolved(acquired) => return Ok(Some(acquired)),
-        }
-    }
-}
-
-#[derive(Clone)]
-/// Runtime-filter probe helper attached to scan pipelines for early row pruning.
-pub(super) struct ScanRuntimeFilterProbe {
-    probe: RuntimeFilterProbe,
-}
-
-impl ScanRuntimeFilterProbe {
-    pub(super) fn new(probe: RuntimeFilterProbe) -> Self {
-        Self { probe }
-    }
-
-    pub(super) fn dependency_or_timeout(&self) -> Option<DependencyHandle> {
-        match self.poll_acquire() {
-            AcquireProgress::Pending(dep) => Some(dep),
-            AcquireProgress::Resolved(_) => None,
-        }
-    }
-
-    pub(super) fn poll_acquire(&self) -> crate::runtime::runtime_filter_hub::AcquireProgress {
-        self.probe.poll_acquire(true)
-    }
-
-    pub(super) fn mark_ready(&self) -> Option<std::time::Duration> {
-        self.probe.mark_ready()
     }
 }

@@ -34,20 +34,16 @@ use crate::novarocks_logging::debug;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use super::types::SharedRuntimeFilterDecision;
-
 #[derive(Clone)]
 /// Shared scan-state payload used by scan dispatch and async scan workers.
 pub(super) struct SharedScanState {
     pub(super) dispatch: Arc<OnceLock<Result<Arc<ScanDispatchState>, String>>>,
-    pub(super) runtime_filter_decision: SharedRuntimeFilterDecision,
 }
 
 impl SharedScanState {
     pub(super) fn new() -> Self {
         Self {
             dispatch: Arc::new(OnceLock::new()),
-            runtime_filter_decision: SharedRuntimeFilterDecision::new(),
         }
     }
 }

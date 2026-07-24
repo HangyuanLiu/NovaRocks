@@ -32,7 +32,6 @@ use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPosi
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::fs::scan_context::FileScanRange;
 use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterSnapshot};
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -210,44 +209,39 @@ impl RuntimeFilterContext {
         }
     }
 
-    pub(crate) fn from_snapshot(snapshot: RuntimeFilterSnapshot) -> Self {
+    pub(crate) fn with_min_max_filters(
+        in_filters: Vec<RuntimeInFilter>,
+        membership_filters: Vec<RuntimeMembershipFilter>,
+        min_max_filters: Vec<(i32, Arc<RuntimeMinMaxFilter>)>,
+    ) -> Self {
         Self {
             inner: RuntimeFilterContextInner::Static {
-                in_filters: snapshot
-                    .in_filters()
-                    .iter()
-                    .map(|filter| filter.as_ref().clone())
-                    .collect(),
-                membership_filters: snapshot
-                    .membership_filters()
-                    .iter()
-                    .map(|filter| filter.as_ref().clone())
-                    .collect(),
-                min_max_filters: snapshot.min_max_filters().to_vec(),
+                in_filters,
+                membership_filters,
+                min_max_filters,
             },
         }
     }
 
-    pub(crate) fn snapshot(&self) -> RuntimeFilterSnapshot {
+    pub(crate) fn in_filters(&self) -> &[RuntimeInFilter] {
+        match &self.inner {
+            RuntimeFilterContextInner::Static { in_filters, .. } => in_filters,
+        }
+    }
+
+    pub(crate) fn membership_filters(&self) -> &[RuntimeMembershipFilter] {
         match &self.inner {
             RuntimeFilterContextInner::Static {
-                in_filters,
-                membership_filters,
-                min_max_filters,
-            } => {
-                let mut snapshot = RuntimeFilterSnapshot::from_filters(
-                    in_filters.clone(),
-                    membership_filters.clone(),
-                );
-                snapshot.min_max_filters = min_max_filters.clone();
-                snapshot
-            }
+                membership_filters, ..
+            } => membership_filters,
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.snapshot().is_empty()
+        self.in_filters().is_empty()
+            && self.membership_filters().is_empty()
+            && self.min_max_filters().is_empty()
     }
 
     pub(crate) fn min_max_filters(&self) -> Vec<(i32, Arc<RuntimeMinMaxFilter>)> {
@@ -267,26 +261,10 @@ impl Default for RuntimeFilterContext {
 
 impl std::fmt::Debug for RuntimeFilterContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let snapshot = self.snapshot();
         f.debug_struct("RuntimeFilterContext")
-            .field("in_filters", &snapshot.in_filters().len())
-            .field("membership_filters", &snapshot.membership_filters().len())
+            .field("in_filters", &self.in_filters().len())
+            .field("membership_filters", &self.membership_filters().len())
             .finish()
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct ScanRuntimeFilterDecision<'a> {
-    acquired: Option<&'a AcquiredRuntimeFilters>,
-}
-
-impl<'a> ScanRuntimeFilterDecision<'a> {
-    pub(crate) fn from_acquired(acquired: Option<&'a AcquiredRuntimeFilters>) -> Self {
-        Self { acquired }
-    }
-
-    pub(crate) fn acquired(&self) -> Option<&'a AcquiredRuntimeFilters> {
-        self.acquired
     }
 }
 
@@ -320,17 +298,6 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
-
-    fn materialize_morsels_after_runtime_filters(&self) -> bool {
-        false
-    }
-
-    fn build_morsels_with_runtime_filters(
-        &self,
-        _decision: ScanRuntimeFilterDecision<'_>,
-    ) -> Result<ScanMorsels, String> {
-        self.build_morsels()
-    }
 
     fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
 
@@ -655,22 +622,21 @@ mod tests {
 
     use super::RuntimeFilterContext;
     use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
-    use crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot;
 
     #[test]
-    fn runtime_filter_context_from_snapshot_preserves_min_max_filters() {
-        let mut snapshot = RuntimeFilterSnapshot::from_filters(Vec::new(), Vec::new());
-        snapshot.min_max_filters.push((
-            7,
-            Arc::new(
-                RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
-                    .expect("empty min/max filter"),
-            ),
-        ));
+    fn runtime_filter_context_preserves_min_max_filters() {
+        let ctx = RuntimeFilterContext::with_min_max_filters(
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                7,
+                Arc::new(
+                    RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
+                        .expect("empty min/max filter"),
+                ),
+            )],
+        );
 
-        let ctx = RuntimeFilterContext::from_snapshot(snapshot);
-
-        assert_eq!(ctx.snapshot().min_max_filters().len(), 1);
         assert_eq!(ctx.min_max_filters().len(), 1);
     }
 }

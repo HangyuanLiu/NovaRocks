@@ -4628,36 +4628,22 @@ mod tests {
         }
     }
 
-    /// Builds an in-filter `RuntimeFilterContext` (round-tripped through
-    /// `RuntimeFilterSnapshot`/`RuntimeFilterContext::from_snapshot`, matching
-    /// how the scan-runner path reconstructs a context from a hub snapshot)
-    /// whose min/max range is derived from `key_values` and bound to slot 1
-    /// (the `id` column).
+    /// Builds an in-filter `RuntimeFilterContext` whose min/max range is derived
+    /// from `key_values` and bound to slot 1 (the `id` column).
     fn runtime_filter_ctx_for_keys(
         key_values: Vec<i32>,
     ) -> crate::exec::node::scan::RuntimeFilterContext {
-        let specs = [crate::exec::node::join::CompatJoinRuntimeFilterSpec {
-            filter_id: 1,
-            expr_order: 0,
-            probe_expr_id: crate::exec::expr::ExprId(0),
-            build_expr_id: crate::exec::expr::ExprId(0),
-            probe_slot_id: SlotId::new(1),
-            build_data_type: DataType::Int32,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        }];
         let key_arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(key_values))];
-        let mut local_filters =
-            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
-                .expect("local runtime in-filter");
-        local_filters
-            .add_build_arrays(&key_arrays)
+        let mut filter = crate::exec::runtime_filter::RuntimeInFilter::new_for_test(
+            1,
+            SlotId::new(1),
+            &DataType::Int32,
+        )
+        .expect("create runtime in filter");
+        filter
+            .insert_array_for_test(&key_arrays[0])
             .expect("runtime in-filter build values");
-        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
-            local_filters.into_filters(),
-            Vec::new(),
-        );
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+        crate::exec::node::scan::RuntimeFilterContext::new(vec![filter], Vec::new())
     }
 
     fn runtime_min_max_filter_ctx_for_i32(
@@ -4669,20 +4655,19 @@ mod tests {
             RuntimeFilterType, RuntimeMinMaxFilter, min_max::MinMaxValue,
         };
 
-        let mut snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
+        crate::exec::node::scan::RuntimeFilterContext::with_min_max_filters(
             Vec::new(),
             Vec::new(),
-        );
-        snapshot.min_max_filters.push((
-            filter_id,
-            Arc::new(RuntimeMinMaxFilter::new(
-                RuntimeFilterType::Int32,
-                true,
-                MinMaxValue::Int32(min),
-                MinMaxValue::Int32(max),
-            )),
-        ));
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+            vec![(
+                filter_id,
+                Arc::new(RuntimeMinMaxFilter::new(
+                    RuntimeFilterType::Int32,
+                    true,
+                    MinMaxValue::Int32(min),
+                    MinMaxValue::Int32(max),
+                )),
+            )],
+        )
     }
 
     fn runtime_membership_filter_ctx_for_i32(
@@ -4709,11 +4694,7 @@ mod tests {
             2,
             min_max,
         ));
-        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
-            Vec::new(),
-            vec![membership],
-        );
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+        crate::exec::node::scan::RuntimeFilterContext::new(Vec::new(), vec![membership])
     }
 
     fn runtime_bloom_membership_filter_ctx_for_i32(
@@ -4736,11 +4717,7 @@ mod tests {
             )
             .expect("build runtime bloom filter"),
         );
-        let snapshot = crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot::from_filters(
-            Vec::new(),
-            vec![membership],
-        );
-        crate::exec::node::scan::RuntimeFilterContext::from_snapshot(snapshot)
+        crate::exec::node::scan::RuntimeFilterContext::new(Vec::new(), vec![membership])
     }
 
     #[test]

@@ -57,13 +57,7 @@ use crate::exec::runtime_filter::{
 use crate::novarocks_logging::debug;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
-#[cfg(feature = "compat")]
-use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
-#[cfg(feature = "compat")]
-use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::runtime::runtime_state::RuntimeState;
-#[cfg(feature = "compat")]
-use crate::service::exchange_sender;
 #[cfg(feature = "compat")]
 use std::collections::{HashMap, HashSet};
 

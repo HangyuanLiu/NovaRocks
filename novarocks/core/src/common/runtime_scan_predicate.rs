@@ -48,13 +48,12 @@ pub(crate) fn runtime_filters_to_scan_predicates(
     options: RuntimeScanPredicateOptions,
     counters: &mut RuntimeScanPredicateCounters,
 ) -> Result<Vec<ScanPredicate>, String> {
-    let snapshot = runtime_filters.snapshot();
-    if snapshot.is_empty() {
+    if runtime_filters.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut predicates = Vec::new();
-    for rf in snapshot.in_filters() {
+    for rf in runtime_filters.in_filters() {
         let Some(column) = bindings.slot_to_column.get(&rf.slot_id()) else {
             counters.unsupported += 1;
             continue;
@@ -97,7 +96,7 @@ pub(crate) fn runtime_filters_to_scan_predicates(
         ));
     }
 
-    for rf in snapshot.membership_filters() {
+    for rf in runtime_filters.membership_filters() {
         let Some(column) = bindings.slot_to_column.get(&rf.slot_id()) else {
             counters.unsupported += 1;
             continue;
@@ -132,8 +131,8 @@ pub(crate) fn runtime_filters_to_scan_predicates(
         ));
     }
 
-    for (filter_id, filter) in snapshot.min_max_filters() {
-        let Some(column) = bindings.min_max_filter_columns.get(filter_id) else {
+    for (filter_id, filter) in runtime_filters.min_max_filters() {
+        let Some(column) = bindings.min_max_filter_columns.get(&filter_id) else {
             counters.unsupported += 1;
             continue;
         };
@@ -167,7 +166,6 @@ mod tests {
     use crate::common::scan_predicate::{ScanPredicateDomain, ScanPredicateSource};
     use crate::exec::node::scan::RuntimeFilterContext;
     use crate::exec::runtime_filter::RuntimeInFilter;
-    use crate::runtime::runtime_filter_hub::RuntimeFilterSnapshot;
 
     fn int_in_filter(filter_id: i32, slot_id: u32, values: &[i32]) -> RuntimeInFilter {
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
@@ -180,10 +178,6 @@ mod tests {
 
     #[test]
     fn builds_discrete_set_for_bounded_runtime_in_filter() {
-        let snapshot = RuntimeFilterSnapshot::from_filters(
-            vec![int_in_filter(7, 3, &[30, 10, 20, 10])],
-            Vec::new(),
-        );
         let mut bindings = RuntimeScanPredicateBindings::default();
         bindings
             .slot_to_column
@@ -191,7 +185,7 @@ mod tests {
         let mut counters = RuntimeScanPredicateCounters::default();
 
         let predicates = runtime_filters_to_scan_predicates(
-            &RuntimeFilterContext::from_snapshot(snapshot),
+            &RuntimeFilterContext::new(vec![int_in_filter(7, 3, &[30, 10, 20, 10])], Vec::new()),
             &bindings,
             RuntimeScanPredicateOptions {
                 discrete_set_max_values: 256,
@@ -218,12 +212,10 @@ mod tests {
 
     #[test]
     fn missing_slot_binding_is_conservative() {
-        let snapshot =
-            RuntimeFilterSnapshot::from_filters(vec![int_in_filter(8, 4, &[1])], Vec::new());
         let mut counters = RuntimeScanPredicateCounters::default();
 
         let predicates = runtime_filters_to_scan_predicates(
-            &RuntimeFilterContext::from_snapshot(snapshot),
+            &RuntimeFilterContext::new(vec![int_in_filter(8, 4, &[1])], Vec::new()),
             &RuntimeScanPredicateBindings::default(),
             RuntimeScanPredicateOptions {
                 discrete_set_max_values: 256,

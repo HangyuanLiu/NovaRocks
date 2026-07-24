@@ -24,13 +24,7 @@ use crate::runtime::exchange;
 use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
 };
-use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
-use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
-use crate::service::grpc_runtime_filter_adapter::{
-    NativeRuntimeFilterRequest, NativeRuntimeFilterResponse,
-    decode_runtime_filter_transmission as decode_native_runtime_filter_transmission,
-    encode_runtime_filter_result as encode_native_runtime_filter_result,
-};
+use crate::runtime::query_context::{QueryId, query_context_manager};
 
 #[cfg(feature = "compat")]
 type CompatTransmitChunkRequest = proto::starrocks::PTransmitChunkParams; // cfg(feature = "compat")
@@ -235,46 +229,6 @@ pub(crate) fn handle_transmit_chunk_compat(
     let native_response = handle_transmit_chunk(native);
     response.status = native_response.status.map(common_status_to_compat);
     response
-}
-
-pub(crate) fn handle_transmit_runtime_filter(
-    params: NativeRuntimeFilterRequest,
-) -> NativeRuntimeFilterResponse {
-    let filter_id = params.filter_id;
-    let result = decode_native_runtime_filter_transmission(params).and_then(|params| {
-        handle_runtime_filter_transmission(params, RuntimeFilterIngress::Native)
-    });
-    encode_native_runtime_filter_result(filter_id, result)
-}
-
-enum RuntimeFilterIngress {
-    Native,
-}
-
-fn handle_runtime_filter_transmission(
-    params: RuntimeFilterTransmission,
-    ingress: RuntimeFilterIngress,
-) -> Result<(), String> {
-    let filter_id = params.filter_id;
-    let query_id = QueryId {
-        hi: params.query_id.hi,
-        lo: params.query_id.lo,
-    };
-
-    let (delivery_expire, query_expire) = query_expire_durations(None);
-    match ingress {
-        RuntimeFilterIngress::Native => {
-            query_context_manager().ensure_native_context(
-                query_id,
-                false,
-                delivery_expire,
-                query_expire,
-            )?;
-            Err(format!(
-                "legacy runtime-filter RPC is disabled for native query_id={query_id} filter_id={filter_id}"
-            ))
-        }
-    }
 }
 
 pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::LookupResponse {
@@ -493,100 +447,5 @@ mod native_runtime_filter_mode_tests {
                 ..Default::default()
             },
         )
-    }
-
-    #[test]
-    fn native_rf_rpc_before_fragment_claims_disabled_and_queues_nothing() {
-        let query_id = QueryId {
-            hi: 71_001,
-            lo: 71_002,
-        };
-        let response =
-            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
-                is_partial: true,
-                query_id: Some(proto::common::UniqueId {
-                    hi: query_id.hi,
-                    lo: query_id.lo,
-                }),
-                filter_id: 9,
-                data: vec![1, 2, 3],
-                build_be_number: 0,
-                column_type: None,
-            });
-
-        let status = response.status.expect("status");
-        assert_ne!(status.code, 0);
-        assert!(status.message.contains("disabled"), "{}", status.message);
-    }
-
-    #[test]
-    fn native_rf_rpc_before_fragment_claim_only_context_expires() {
-        let query_id = QueryId {
-            hi: 71_101,
-            lo: 71_102,
-        };
-        let query_key = crate::runtime::runtime_filter_observability::QueryKey::from_hi_lo(
-            query_id.hi,
-            query_id.lo,
-        );
-        let registry =
-            crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-
-        let response =
-            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
-                is_partial: true,
-                query_id: Some(proto::common::UniqueId {
-                    hi: query_id.hi,
-                    lo: query_id.lo,
-                }),
-                filter_id: 9,
-                data: vec![1, 2, 3],
-                build_be_number: 0,
-                column_type: None,
-            });
-        assert_ne!(response.status.expect("status").code, 0);
-
-        let manager = query_context_manager();
-        assert!(registry.snapshot(query_key).is_some());
-        manager
-            .with_context_mut(query_id, |context| {
-                assert_eq!(context.num_active_fragments, 0);
-                context.query_deadline =
-                    std::time::Instant::now() - std::time::Duration::from_millis(1);
-                Ok(())
-            })
-            .expect("claim-only active context");
-
-        manager.clean_expired_for_test();
-
-        assert!(manager.query_mem_tracker(query_id).is_none());
-        assert!(registry.snapshot(query_key).is_none());
-    }
-
-    #[test]
-    fn native_fragment_before_rf_rpc_claims_disabled_and_queues_nothing() {
-        let query_id = QueryId {
-            hi: 71_003,
-            lo: 71_004,
-        };
-        submit_native_fragment(query_id).expect("native fragment submission");
-
-        let response =
-            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
-                is_partial: true,
-                query_id: Some(proto::common::UniqueId {
-                    hi: query_id.hi,
-                    lo: query_id.lo,
-                }),
-                filter_id: 9,
-                data: vec![1, 2, 3],
-                build_be_number: 0,
-                column_type: None,
-            });
-
-        let status = response.status.expect("status");
-        assert_ne!(status.code, 0);
-        assert!(status.message.contains("disabled"), "{}", status.message);
     }
 }
