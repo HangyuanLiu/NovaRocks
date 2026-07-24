@@ -190,6 +190,7 @@ impl Operator for MultiCastDataStreamSinkOperator {
 }
 
 impl ProcessorOperator for MultiCastDataStreamSinkOperator {
+    // Design: ADR-0002 (docs/adr/ADR-0002-multicast-coupled-backpressure.md)
     fn need_input(&self) -> bool {
         if self.is_finished() || self.finishing {
             return false;

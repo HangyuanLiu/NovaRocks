@@ -297,6 +297,7 @@ fn add_wait_edge(from: WaitNode, to: WaitNode, kind: WaitEdgeKind, succ: &mut Wa
     succ.entry(to).or_default();
 }
 
+// Design: ADR-0001 (docs/adr/ADR-0001-runtime-filter-strict-fail-liveness-philosophy.md)
 /// Reject a `BlockingSnapshot` consumer when data-flow, accepted build-ready
 /// proofs, waits, and multicast backpressure compose a global execution cycle.
 /// Rejected or missing proofs stay fail-closed as coarse fragment wait edges.

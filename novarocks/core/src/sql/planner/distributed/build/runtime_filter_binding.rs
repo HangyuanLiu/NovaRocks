@@ -373,6 +373,7 @@ pub(super) fn populate_runtime_filter_graph(
                     expression: probe.expression,
                     target: probe.target,
                     capabilities: capabilities.clone(),
+                    // Design: ADR-0003 (docs/adr/ADR-0003-rf-activation-blocking-default-live-targeted.md)
                     activation: ConsumerActivation::BlockingSnapshot,
                 })
                 .collect(),
