@@ -10,6 +10,7 @@
 - **自包含**：结论、选项、妥协必须在文件内完整可读，不依赖外部文档才能理解；设计工坊（vault spec）、PR、讨论日期仅作 provenance 字段。
 - **编号**：`ADR-NNNN` = 现存最大编号 + 1，四位零填充。并行 PR 撞号时，**后合入者在 rebase 后重新编号**，并同步修改四处：①文件名、②frontmatter `id`、③本 README 索引行、④代码中全部 `Design: ADR-NNNN` 锚点（含其它 ADR 的交叉引用）。
 - **代码锚点**：承重代码处放一行英文注释 `// Design: ADR-NNNN (docs/adr/ADR-NNNN-<slug>.md)`，只放「改这里之前必须读」的位置，不铺开。
+- **引用持久性**：ADR 随仓库存续，正文与 provenance **不得依赖不随仓库维护的外部设计文档编号**（如设计工坊里的 RFD-* 任务号——那些文档后期可能删除失联）。指称某项工作用**机制名 + GitHub PR 号**（如「build-frontier proof 全局验环，PR #726」）或**其它 ADR 的编号**；尚未合入的工作用机制描述，PR 合入后回填编号（属允许的机械修正）。
 - **谱系**：业界标准 ADR（Architecture Decision Record，Nygard 2011 谱系）；本库模板为 MADR 风格的六节增强变体——「接受的妥协」与「何时重新评估」为必填节（标准模板中它们名义上属于 Consequences，实践中最常被敷衍，而它们恰是本库存在的意义）。
 
 ## 模板
@@ -25,7 +26,6 @@ superseded-by: null
 date: YYYY-MM-DD
 provenance:
   - "PR: <link>"
-  - "vault: <spec name>"
   - "discussion: <date + topic>"
 code-anchors:
   - "<path> (<symbol>)"

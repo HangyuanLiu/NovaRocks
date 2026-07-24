@@ -13,6 +13,7 @@ Non-negotiable rules (mirror of README):
 2. **Self-contained.** Verdict, options, and compromises must be fully readable inside the file. Vault specs / PRs / discussions are provenance strings only.
 3. **Language.** Body in Chinese; id/slug/tags/frontmatter keys in English.
 4. **The two signature sections** —「接受的妥协（诚实记录）」and「何时重新评估」— must never be empty or perfunctory. Record the REAL reason ("chosen for cost-of-change, not because it is better" must be written as such).
+5. **Durable references only.** ADRs live with the repo forever; design-workshop docs do not. Never cite workshop task codes (RFD-*, OQ-*, C5, ...) in the body or rely on them in provenance — refer to work by **mechanism name + GitHub PR number**, or by another ADR's id. For not-yet-merged work, describe the mechanism and backfill the PR number after merge (allowed mechanical edit).
 
 ## Operation: new
 
@@ -35,7 +36,6 @@ superseded-by: null
 date: YYYY-MM-DD
 provenance:
   - "PR: <link>"
-  - "vault: <spec name>"
   - "discussion: <date + topic>"
 code-anchors:
   - "<path> (<symbol>)"
@@ -77,6 +77,7 @@ If a duplicate id is only discovered after both PRs merged, the later-merged ADR
 - all six section headings present, the two signature sections non-empty;
 - README index line exists, matches the ADR's status and domain; superseded ADRs sit in「历史」;
 - `status: superseded` ⇔ `superseded-by` non-null; `supersedes`/`superseded-by` targets exist and agree both ways;
-- every `code-anchors` path exists; every in-code `Design: ADR-\d{4}` reference resolves to an existing file.
+- every `code-anchors` path exists; every in-code `Design: ADR-\d{4}` reference resolves to an existing file;
+- body and provenance contain no design-workshop task codes (`grep -nE "RFD-|OQ-[0-9]" <file>` should be empty) — mechanism names + PR numbers + ADR ids only.
 
 There is deliberately no CI gate for any of this — consistency is maintained here (at authoring time) and by PR review.
