@@ -70,7 +70,6 @@ pub(crate) fn execute_starrocks_submission(
                 instance.runtime_options().query_options().clone(),
             )),
             query_id: Some(query_id),
-            runtime_filter_params: Some(instance.runtime_filter_params().clone()),
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker,
@@ -161,7 +160,6 @@ mod tests {
     };
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
     use super::*;
 
@@ -182,7 +180,7 @@ mod tests {
             BTreeMap::new(),
             RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
         ));
-        let instance = FragmentInstanceSpec::new_compat(
+        let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             QueryId {
                 hi: 86_001,
@@ -195,7 +193,6 @@ mod tests {
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,
-            RuntimeFilterParams::default(),
             FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
             NonZeroUsize::new(1).expect("non-zero DOP"),
             BackendNum::try_new(1).expect("backend number"),

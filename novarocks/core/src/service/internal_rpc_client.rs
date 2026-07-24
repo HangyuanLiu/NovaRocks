@@ -20,24 +20,12 @@ use prost::Message;
 
 use crate::common::types::UniqueId;
 use crate::runtime::query_context::QueryId;
-use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::service::engine_ffi::NovaRocksRustBuf;
-use crate::service::starrocks_runtime_filter_wire::{
-    StarRocksRuntimeFilterResponse, encode_runtime_filter_transmission,
-};
 
 pub use crate::proto;
 
 unsafe extern "C" {
     fn novarocks_compat_transmit_chunk(
-        host: *const std::os::raw::c_char,
-        port: u16,
-        ptr: *const u8,
-        len: usize,
-        out_resp: *mut NovaRocksRustBuf,
-        out_err: *mut NovaRocksRustBuf,
-    ) -> i32;
-    fn novarocks_compat_transmit_runtime_filter(
         host: *const std::os::raw::c_char,
         port: u16,
         ptr: *const u8,
@@ -197,22 +185,6 @@ pub fn send_chunks(
         novarocks_compat_transmit_chunk,
     )?;
     status_error(response.status.as_ref(), "transmit_chunk")
-}
-
-pub(crate) fn transmit_runtime_filter(
-    dest_host: &str,
-    dest_port: u16,
-    params: RuntimeFilterTransmission,
-) -> Result<(), String> {
-    let compat_request = encode_runtime_filter_transmission(params);
-    let response: StarRocksRuntimeFilterResponse = call_unary(
-        dest_host,
-        dest_port,
-        compat_request,
-        "transmit_runtime_filter",
-        novarocks_compat_transmit_runtime_filter,
-    )?;
-    status_error(response.status.as_ref(), "transmit_runtime_filter")
 }
 
 pub fn lookup(

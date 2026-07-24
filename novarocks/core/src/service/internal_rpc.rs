@@ -19,7 +19,6 @@ use std::collections::HashMap;
 #[cfg(feature = "compat")]
 use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
-use crate::novarocks_logging::warn;
 use crate::proto;
 use crate::runtime::exchange;
 use crate::runtime::lookup::{
@@ -31,12 +30,6 @@ use crate::service::grpc_runtime_filter_adapter::{
     NativeRuntimeFilterRequest, NativeRuntimeFilterResponse,
     decode_runtime_filter_transmission as decode_native_runtime_filter_transmission,
     encode_runtime_filter_result as encode_native_runtime_filter_result,
-};
-#[cfg(feature = "compat")]
-use crate::service::starrocks_runtime_filter_wire::{
-    StarRocksRuntimeFilterRequest, StarRocksRuntimeFilterResponse,
-    decode_runtime_filter_transmission as decode_starrocks_runtime_filter_transmission,
-    encode_runtime_filter_result as encode_starrocks_runtime_filter_result,
 };
 
 #[cfg(feature = "compat")]
@@ -256,8 +249,6 @@ pub(crate) fn handle_transmit_runtime_filter(
 
 enum RuntimeFilterIngress {
     Native,
-    #[cfg(feature = "compat")]
-    StarRocks,
 }
 
 fn handle_runtime_filter_transmission(
@@ -283,93 +274,7 @@ fn handle_runtime_filter_transmission(
                 "legacy runtime-filter RPC is disabled for native query_id={query_id} filter_id={filter_id}"
             ))
         }
-        #[cfg(feature = "compat")]
-        RuntimeFilterIngress::StarRocks => {
-            query_context_manager().ensure_compat_context(
-                query_id,
-                false,
-                delivery_expire,
-                query_expire,
-            )?;
-
-            let payload = params.data.as_slice();
-            if payload.is_empty() {
-                return Err(format!(
-                    "runtime filter payload is empty: query_id={} filter_id={}",
-                    query_id, filter_id
-                ));
-            }
-
-            let build_data_type = params.column_type.clone();
-
-            if params.is_partial {
-                let worker =
-                    query_context_manager().get_or_create_runtime_filter_worker(query_id)?;
-                let Some(worker) = worker else {
-                    return query_context_manager().enqueue_pending_runtime_filter(
-                        query_id,
-                        filter_id,
-                        params.build_be_number,
-                        params.data,
-                        build_data_type,
-                    );
-                };
-                let build_be_number = params.build_be_number;
-                if let Err(err) =
-                    worker.receive_partial(filter_id, payload, build_be_number, build_data_type)
-                {
-                    warn!(
-                        "receive_partial_runtime_filter failed: query_id={} filter_id={} err={}",
-                        query_id, filter_id, err
-                    );
-                    return Err(err);
-                }
-                return Ok(());
-            }
-
-            if let Err(err) =
-                receive_total_runtime_filter(query_id, filter_id, params.is_partial, payload)
-            {
-                warn!(
-                    "receive_total_runtime_filter failed: query_id={} filter_id={} err={}",
-                    query_id, filter_id, err
-                );
-                return Err(err);
-            }
-            Ok(())
-        }
     }
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn handle_transmit_runtime_filter_compat(
-    params: StarRocksRuntimeFilterRequest,
-) -> StarRocksRuntimeFilterResponse {
-    let filter_id = params.filter_id;
-    let result = decode_starrocks_runtime_filter_transmission(params).and_then(|params| {
-        handle_runtime_filter_transmission(params, RuntimeFilterIngress::StarRocks)
-    });
-    encode_starrocks_runtime_filter_result(filter_id, result)
-}
-
-fn receive_total_runtime_filter(
-    query_id: QueryId,
-    filter_id: i32,
-    is_partial: bool,
-    payload: &[u8],
-) -> Result<(), String> {
-    // Complete-only contract (P0a section 5.4): the prober install path only handles
-    // TOTAL filters. Partial filters must be routed to the merge node above.
-    if is_partial {
-        return Err(
-            "runtime filter contract violation: partial filter reached prober install path"
-                .to_string(),
-        );
-    }
-    let Some(hub) = query_context_manager().get_runtime_filter_hub(query_id)? else {
-        return Err(format!("runtime filter hub not found: query_id={query_id}"));
-    };
-    hub.receive_remote_filter(filter_id, payload)
 }
 
 pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::LookupResponse {

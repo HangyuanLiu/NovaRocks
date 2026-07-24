@@ -27,8 +27,6 @@ use crate::exec::node::scan::BoundScanRanges;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
-#[cfg(feature = "compat")]
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FragmentInstanceId(UniqueId);
@@ -252,8 +250,6 @@ pub(crate) struct FragmentInstanceSpec {
     scan_assignments: ScanAssignments,
     exchange_inputs: ExchangeInputAssignments,
     sink_assignment: FragmentSinkAssignment,
-    #[cfg(feature = "compat")]
-    runtime_filter_params: Option<RuntimeFilterParams>,
     runtime_options: FragmentRuntimeOptions,
     pipeline_dop: NonZeroUsize,
     backend_num: BackendNum,
@@ -279,36 +275,6 @@ impl FragmentInstanceSpec {
             scan_assignments,
             exchange_inputs,
             sink_assignment,
-            #[cfg(feature = "compat")]
-            runtime_filter_params: None,
-            runtime_options,
-            pipeline_dop,
-            backend_num,
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_compat(
-        contract_version: FragmentContractVersion,
-        query_id: QueryId,
-        fragment_instance_id: FragmentInstanceId,
-        scan_assignments: ScanAssignments,
-        exchange_inputs: ExchangeInputAssignments,
-        sink_assignment: FragmentSinkAssignment,
-        runtime_filter_params: RuntimeFilterParams,
-        runtime_options: FragmentRuntimeOptions,
-        pipeline_dop: NonZeroUsize,
-        backend_num: BackendNum,
-    ) -> Self {
-        Self {
-            contract_version,
-            query_id,
-            fragment_instance_id,
-            scan_assignments,
-            exchange_inputs,
-            sink_assignment,
-            runtime_filter_params: Some(runtime_filter_params),
             runtime_options,
             pipeline_dop,
             backend_num,
@@ -339,13 +305,6 @@ impl FragmentInstanceSpec {
         &self.sink_assignment
     }
 
-    #[cfg(feature = "compat")]
-    pub(crate) fn runtime_filter_params(&self) -> &RuntimeFilterParams {
-        self.runtime_filter_params
-            .as_ref()
-            .expect("StarRocks fragment instance must carry runtime filter params")
-    }
-
     pub(crate) const fn runtime_options(&self) -> &FragmentRuntimeOptions {
         &self.runtime_options
     }
@@ -370,7 +329,6 @@ mod tests {
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
     use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRange, ScanRangeParams};
 
     use super::*;

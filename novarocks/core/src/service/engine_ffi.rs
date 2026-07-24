@@ -34,7 +34,7 @@ use crate::service::grpc_client::proto::starrocks::{
     PLookUpRequest, PLookUpResponse, PTransmitChunkParams, PTransmitChunkResult,
     PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult, PUpdateFailPointStatusRequest,
     PUpdateFailPointStatusResponse, PublishLogVersionBatchRequest, PublishLogVersionRequest,
-    PublishVersionRequest, TabletStatRequest, VacuumRequest,
+    PublishVersionRequest, StatusPb, TabletStatRequest, VacuumRequest,
 };
 use crate::service::internal_rpc;
 use crate::{FetchResult, UniqueId};
@@ -362,13 +362,21 @@ pub extern "C" fn novarocks_rs_transmit_runtime_filter(
     out_resp: *mut NovaRocksRustBuf,
     out_err: *mut NovaRocksRustBuf,
 ) -> i32 {
+    // Task 6 removes the matching C++ shim callback. Until then, preserve the FFI
+    // ABI while deliberately accepting the retired compat runtime-filter RPC.
     handle_unary_proto_rpc::<PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult, _>(
         ptr,
         len,
         out_resp,
         out_err,
         "transmit_runtime_filter",
-        internal_rpc::handle_transmit_runtime_filter_compat,
+        |request| PTransmitRuntimeFilterResult {
+            status: Some(StatusPb {
+                status_code: 0,
+                error_msgs: Vec::new(),
+            }),
+            filter_id: request.filter_id,
+        },
     )
 }
 

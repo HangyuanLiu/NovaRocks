@@ -90,12 +90,6 @@ pub(crate) fn send_runtime_filter(
     params: RuntimeFilterTransmission,
 ) -> Result<(), String> {
     match internal_rpc_transport_for_current_process() {
-        #[cfg(feature = "compat")]
-        InternalRpcTransport::BrpcCompat => {
-            crate::service::internal_rpc_client::transmit_runtime_filter(
-                dest_host, dest_port, params,
-            )
-        }
         InternalRpcTransport::Grpc => {
             crate::service::grpc_client::transmit_runtime_filter(dest_host, dest_port, params)
         }
