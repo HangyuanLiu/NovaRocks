@@ -67,7 +67,7 @@ When a rebase reveals the id is already taken on main, the LATER-merging PR renu
 1. filename (`git mv`);
 2. frontmatter `id`;
 3. the README index line;
-4. every `Design: ADR-OLD` code anchor, plus any cross-references in other ADRs (`supersedes`/`superseded-by`/body text) — find them with `grep -rn "ADR-OLD" docs/ novarocks/ .claude/`.
+4. every `Design: ADR-OLD` code anchor, plus any cross-references in other ADRs (`supersedes`/`superseded-by`/body text) — find them all with `git grep -n "ADR-OLD"`.
 
 If a duplicate id is only discovered after both PRs merged, the later-merged ADR does a follow-up renumber commit (this counts as an allowed mechanical edit).
 

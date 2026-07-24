@@ -2,7 +2,7 @@
 
 本目录是 NovaRocks 的架构决策知识库：每条 ADR 固化一个**已裁决的设计问题**——背景、考虑过的选项、裁决、**接受的妥协**与**何时重新评估**。检索单位是「架构师会问的问题」，不是「当年做过的任务」。改动某子系统的架构级行为前，先在下方领域索引里找到它。
 
-**怎么写**：用仓库内置的 `/adr` skill（`.claude/skills/adr/`）新建、supersede 或重编号——skill 内嵌模板与全部规则；人工手写请复制下方模板。正文中文；id/slug/tags/frontmatter 键用英文。
+**怎么写**：用仓库内置的 `/adr` skill（`skills/adr/`，经 `.claude/skills/adr` 软链暴露给 Claude Code）新建、supersede 或重编号——skill 内嵌模板与全部规则；人工手写请复制下方模板。正文中文；id/slug/tags/frontmatter 键用英文。
 
 **核心规则**：
 
