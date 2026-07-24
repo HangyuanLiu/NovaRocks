@@ -17,6 +17,7 @@
 
 pub(crate) mod boundary;
 pub(crate) mod build;
+mod cycle_forced_activation;
 mod fragment;
 mod node;
 pub(crate) mod output;
