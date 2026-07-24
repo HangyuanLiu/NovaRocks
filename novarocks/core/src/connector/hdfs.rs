@@ -25,14 +25,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::common::ids::SlotId;
-use crate::common::runtime_scan_predicate::{
-    RuntimeScanPredicateBindings, RuntimeScanPredicateCounters, RuntimeScanPredicateOptions,
-    runtime_filters_to_scan_predicates,
-};
+use crate::common::runtime_scan_predicate::RuntimeScanPredicateCounters;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
-use crate::connector::iceberg::file_pruning::{
-    IcebergFileNullState, IcebergFilePruningCounters, iceberg_range_may_satisfy_scan_predicates,
-};
+use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
 use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
@@ -976,7 +971,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
     use crate::cache::{CacheOptions, DataCacheManager};
@@ -996,23 +990,14 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::node::scan::{
         BoundScanRanges, HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange,
-        ScanMorsel, ScanMorselPruneDecision, ScanNode, ScanOp, ScanSource,
-    };
-    use crate::exec::operators::scan::ScanSourceFactory;
-    use crate::exec::pipeline::dependency::DependencyManager;
-    use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::exec::runtime_filter::{
-        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType, RuntimeInFilter,
-        RuntimeMembershipFilter, RuntimeMinMaxFilter,
+        ScanMorsel, ScanMorselPruneDecision, ScanOp, ScanSource,
     };
     use crate::formats::parquet::{
         ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
     };
     use crate::fs::scan_context::FileScanRange;
-    use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
     use crate::runtime_filter::exec::ordered_range_predicate::{
         NativeOrderedRangePredicate, OrderedRangePredicateContract,
     };

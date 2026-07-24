@@ -1401,7 +1401,6 @@ mod tests {
         RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
     };
     use crate::exec::operators::scan::dispatch::ScanDispatchState;
-    use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
     use crate::exec::row_position::IcebergVirtualSpec;
     use crate::exec::runtime_filter::{
@@ -1409,8 +1408,6 @@ mod tests {
         RuntimeEmptyFilter, RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter,
         RuntimeMinMaxFilter,
     };
-    use crate::runtime::query_context::QueryId;
-    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, LateApplyGranularity,
     };
@@ -1421,7 +1418,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::{BTreeSet, HashMap};
-    use std::thread;
 
     /// Helper: call the production synthesis helper from a RecordBatch fixture.
     fn synthesize(
@@ -1871,7 +1867,7 @@ mod tests {
             self.observed_min_max_counts
                 .lock()
                 .expect("observed min/max lock")
-                .push(runtime_filters.snapshot().min_max_filters().len());
+                .push(runtime_filters.min_max_filters().len());
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -2240,10 +2236,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             Some(consumers),
             arena,
@@ -2335,10 +2327,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             Some(consumers),
             arena,
@@ -2395,10 +2383,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             Some(consumers),
             arena,
@@ -2505,10 +2489,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             Some(blocking_consumers),
             Some(ordered_consumers),
             arena,
@@ -2597,10 +2577,6 @@ mod tests {
             scan.clone(),
             Arc::new(EmptyScanOp),
             Arc::clone(&dispatch),
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             Arc::clone(&arena),
@@ -2614,10 +2590,6 @@ mod tests {
             scan,
             Arc::new(EmptyScanOp),
             Arc::clone(&dispatch),
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
@@ -2680,10 +2652,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
@@ -2754,10 +2722,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
@@ -2806,10 +2770,6 @@ mod tests {
             scan,
             op,
             dispatch,
-            SharedRuntimeFilterDecision::new(),
-            None,
-            HashMap::new(),
-            0,
             None,
             None,
             arena,
