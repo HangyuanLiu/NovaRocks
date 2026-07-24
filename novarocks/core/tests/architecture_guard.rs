@@ -68,6 +68,23 @@ fn tokenize_use_paths(source: &str) -> Vec<UseToken> {
                     }
                 }
             }
+            b'r' if bytes.get(index + 1) == Some(&b'#')
+                && bytes
+                    .get(index + 2)
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_') =>
+            {
+                index += 2;
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                tokens.push(UseToken::Identifier(
+                    String::from_utf8_lossy(&bytes[start..index]).into_owned(),
+                ));
+            }
             byte if byte.is_ascii_alphabetic() || byte == b'_' => {
                 let start = index;
                 index += 1;
@@ -178,6 +195,19 @@ fn sql_planner_use_path_forms_are_rejected() {
         "use crate::sql::planner::distributed::PlanFragment;",
         "use crate::sql::{planner::distributed::PlanFragment, analysis::TypedExpr};",
         "use super::super::sql::planner::distributed::PlanFragment;",
+    ] {
+        assert!(
+            contains_sql_planner_use_path(source),
+            "{source} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn raw_identifier_planner_use_paths_are_rejected() {
+    for source in [
+        "use crate::sql::r#planner::distributed::PlanFragment;",
+        "use crate::sql::{r#planner::distributed::PlanFragment};",
     ] {
         assert!(
             contains_sql_planner_use_path(source),
