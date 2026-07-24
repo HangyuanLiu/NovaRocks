@@ -17,16 +17,13 @@
 use std::time::Duration;
 
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::node::RuntimeFilterProbeSpec;
 use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec;
 
 #[derive(Clone, Debug)]
 pub struct ExchangeSourceNode {
     pub node_id: i32,
     pub timeout: Duration,
-    pub runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     pub expected_chunk_schema: ChunkSchemaRef,
-    pub local_rf_waiting_set: Vec<i32>,
     pub(crate) native_runtime_filter_specs: Vec<NativeRuntimeFilterConsumerSpec>,
 }
 
@@ -35,9 +32,7 @@ impl ExchangeSourceNode {
         Self {
             node_id,
             timeout,
-            runtime_filter_specs: Vec::new(),
             expected_chunk_schema,
-            local_rf_waiting_set: Vec::new(),
             native_runtime_filter_specs: Vec::new(),
         }
     }
@@ -46,51 +41,12 @@ impl ExchangeSourceNode {
         format!("EXCHANGE_SOURCE (id={})", self.node_id)
     }
 
-    pub fn runtime_filter_specs(&self) -> &[RuntimeFilterProbeSpec] {
-        &self.runtime_filter_specs
-    }
-
     pub(crate) fn native_runtime_filter_specs(&self) -> &[NativeRuntimeFilterConsumerSpec] {
         &self.native_runtime_filter_specs
     }
 
     pub fn expected_chunk_schema(&self) -> ChunkSchemaRef {
         self.expected_chunk_schema.clone()
-    }
-
-    pub fn local_rf_waiting_set(&self) -> &[i32] {
-        &self.local_rf_waiting_set
-    }
-
-    pub fn with_local_rf_waiting_set(mut self, waiting_set: Vec<i32>) -> Self {
-        if waiting_set.is_empty() {
-            return self;
-        }
-        let mut seen = std::collections::HashMap::new();
-        for id in waiting_set {
-            seen.entry(id).or_insert(());
-        }
-        self.local_rf_waiting_set = seen.keys().copied().collect();
-        self.local_rf_waiting_set.sort_unstable();
-        self
-    }
-
-    pub fn add_runtime_filter_specs(&mut self, specs: &[RuntimeFilterProbeSpec]) {
-        if specs.is_empty() {
-            return;
-        }
-        let mut seen: std::collections::HashMap<i32, RuntimeFilterProbeSpec> = self
-            .runtime_filter_specs
-            .iter()
-            .map(|spec| (spec.filter_id, spec.clone()))
-            .collect();
-        for spec in specs {
-            if seen.contains_key(&spec.filter_id) {
-                continue;
-            }
-            self.runtime_filter_specs.push(spec.clone());
-            seen.insert(spec.filter_id, spec.clone());
-        }
     }
 
     pub(crate) fn set_native_runtime_filter_specs(

@@ -28,7 +28,7 @@ use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
-use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
+use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::fs::scan_context::FileScanRange;
@@ -449,7 +449,6 @@ pub struct RowPositionScanConfig {
 pub struct ScanNode {
     source: Arc<dyn ScanSource>,
     node_id: Option<i32>,
-    runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     native_runtime_filter_specs:
         Vec<crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec>,
     conjunct_predicate: Option<ExprId>,
@@ -458,7 +457,6 @@ pub struct ScanNode {
     /// Scan-level limit for early termination optimization.
     /// When set, scan operators will stop reading new morsels after outputting this many rows.
     limit: Option<usize>,
-    local_rf_waiting_set: Vec<i32>,
     accept_empty_scan_ranges: bool,
     row_position: Option<RowPositionSpec>,
     row_position_scan: Option<RowPositionScanConfig>,
@@ -487,13 +485,11 @@ impl ScanNode {
         Self {
             source,
             node_id: None,
-            runtime_filter_specs: Vec::new(),
             native_runtime_filter_specs: Vec::new(),
             conjunct_predicate: None,
             output_chunk_schema: Arc::new(ChunkSchema::empty()),
             connector_io_tasks_per_scan_operator: None,
             limit: None,
-            local_rf_waiting_set: Vec::new(),
             accept_empty_scan_ranges: false,
             row_position: None,
             row_position_scan: None,
@@ -517,11 +513,6 @@ impl ScanNode {
         self
     }
 
-    pub fn with_runtime_filter_specs(mut self, specs: Vec<RuntimeFilterProbeSpec>) -> Self {
-        self.add_runtime_filter_specs(&specs);
-        self
-    }
-
     pub(crate) fn set_native_runtime_filter_specs(
         &mut self,
         specs: Vec<crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec>,
@@ -541,19 +532,6 @@ impl ScanNode {
 
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
-        self
-    }
-
-    pub fn with_local_rf_waiting_set(mut self, waiting_set: Vec<i32>) -> Self {
-        if waiting_set.is_empty() {
-            return self;
-        }
-        let mut seen = HashMap::new();
-        for id in waiting_set {
-            seen.entry(id).or_insert(());
-        }
-        self.local_rf_waiting_set = seen.keys().copied().collect();
-        self.local_rf_waiting_set.sort_unstable();
         self
     }
 
@@ -604,10 +582,6 @@ impl ScanNode {
         Arc::clone(&self.source)
     }
 
-    pub fn runtime_filter_specs(&self) -> &[RuntimeFilterProbeSpec] {
-        &self.runtime_filter_specs
-    }
-
     pub(crate) fn native_runtime_filter_specs(
         &self,
     ) -> &[crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec] {
@@ -639,10 +613,6 @@ impl ScanNode {
         self.limit
     }
 
-    pub fn local_rf_waiting_set(&self) -> &[i32] {
-        &self.local_rf_waiting_set
-    }
-
     pub fn accept_empty_scan_ranges(&self) -> bool {
         self.accept_empty_scan_ranges
     }
@@ -670,29 +640,6 @@ impl ScanNode {
 
     pub fn iceberg_virtual(&self) -> Option<&IcebergVirtualSpec> {
         self.iceberg_virtual.as_ref()
-    }
-
-    pub fn add_runtime_filter_specs(&mut self, specs: &[RuntimeFilterProbeSpec]) {
-        if specs.is_empty() {
-            return;
-        }
-        let mut seen: HashMap<i32, RuntimeFilterProbeSpec> = HashMap::new();
-        for spec in &self.runtime_filter_specs {
-            seen.insert(spec.filter_id, spec.clone());
-        }
-        for spec in specs {
-            if let Some(existing) = seen.get(&spec.filter_id) {
-                if existing.slot_id != spec.slot_id {
-                    warn!(
-                        "scan runtime filter spec mismatch: filter_id={} existing_slot_id={:?} new_slot_id={:?}",
-                        spec.filter_id, existing.slot_id, spec.slot_id
-                    );
-                }
-                continue;
-            }
-            self.runtime_filter_specs.push(spec.clone());
-            seen.insert(spec.filter_id, spec.clone());
-        }
     }
 }
 

@@ -61,10 +61,6 @@ use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSh
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
-#[cfg(feature = "compat")]
-use crate::exec::runtime_filter::{MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger};
-#[cfg(feature = "compat")]
-use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime_filter::model::contract::ReductionRequirement;
 use crate::runtime_filter::port::producer::ProducerPortKind;
 use crate::runtime_filter::port::subscription::SubscriptionKind;
@@ -125,24 +121,8 @@ struct PipelineBuildContext {
     pipeline_dop: i32,
 }
 
-enum PipelineRuntimeFilterExecution {
-    Native {
-        context: Option<NativeRuntimeFilterExecutionContext>,
-    },
-    #[cfg(feature = "compat")]
-    Compat { hub: Arc<RuntimeFilterHub> },
-}
-
-impl PipelineBuildContext {
-    #[cfg(feature = "compat")]
-    fn compat_runtime_filter_hub(&self) -> Result<&Arc<RuntimeFilterHub>, String> {
-        match &self.runtime_filter_execution {
-            PipelineRuntimeFilterExecution::Compat { hub } => Ok(hub),
-            PipelineRuntimeFilterExecution::Native { .. } => {
-                Err("native pipeline cannot access legacy runtime-filter hub".to_string())
-            }
-        }
-    }
+struct PipelineRuntimeFilterExecution {
+    context: Option<NativeRuntimeFilterExecutionContext>,
 }
 
 impl PipelineBuildContext {
@@ -194,7 +174,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         scan_bindings,
         pipeline_dop,
         None,
-        PipelineRuntimeFilterExecution::Native { context: None },
+        PipelineRuntimeFilterExecution { context: None },
     )
 }
 
@@ -241,7 +221,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         scan_bindings,
         pipeline_dop,
         root_sink_dop,
-        PipelineRuntimeFilterExecution::Native { context },
+        PipelineRuntimeFilterExecution { context },
     )
 }
 
@@ -264,58 +244,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_cont
         scan_bindings,
         pipeline_dop,
         None,
-        PipelineRuntimeFilterExecution::Native { context },
-    )
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_dop(
-    plan: &ExecPlan,
-    debug: bool,
-    dep_manager: DependencyManager,
-    exchange_finst_id: Option<(i64, i64)>,
-    exchange_bindings: ExchangeBindings,
-    scan_bindings: ScanBindings,
-    pipeline_dop: i32,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
-) -> Result<PipelineGraph, String> {
-    build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
-        plan,
-        debug,
-        dep_manager,
-        exchange_finst_id,
-        exchange_bindings,
-        scan_bindings,
-        pipeline_dop,
-        None,
-        runtime_filter_hub,
-    )
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
-    plan: &ExecPlan,
-    debug: bool,
-    dep_manager: DependencyManager,
-    exchange_finst_id: Option<(i64, i64)>,
-    exchange_bindings: ExchangeBindings,
-    scan_bindings: ScanBindings,
-    pipeline_dop: i32,
-    root_sink_dop: Option<i32>,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
-) -> Result<PipelineGraph, String> {
-    build_pipeline_graph_in_mode(
-        plan,
-        debug,
-        dep_manager,
-        exchange_finst_id,
-        exchange_bindings,
-        scan_bindings,
-        pipeline_dop,
-        root_sink_dop,
-        PipelineRuntimeFilterExecution::Compat {
-            hub: runtime_filter_hub,
-        },
+        PipelineRuntimeFilterExecution { context },
     )
 }
 
@@ -720,15 +649,11 @@ fn native_runtime_filter_context(
     binding_id: u32,
 ) -> Result<&NativeRuntimeFilterExecutionContext, String> {
     match execution {
-        PipelineRuntimeFilterExecution::Native {
+        PipelineRuntimeFilterExecution {
             context: Some(context),
         } => Ok(context),
-        PipelineRuntimeFilterExecution::Native { context: None } => Err(format!(
+        PipelineRuntimeFilterExecution { context: None } => Err(format!(
             "native runtime-filter binding_id={binding_id} requires an installed runtime-filter context"
-        )),
-        #[cfg(feature = "compat")]
-        PipelineRuntimeFilterExecution::Compat { .. } => Err(format!(
-            "native runtime-filter binding_id={binding_id} cannot execute in compat mode"
         )),
     }
 }
@@ -1122,11 +1047,7 @@ fn build_pipeline_for_node(
         ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
             validate_native_consumer_specs(&consumer.bindings, ctx)?;
             let mut build = build_pipeline_for_node(&consumer.input, ctx)?;
-            if matches!(
-                &ctx.runtime_filter_execution,
-                PipelineRuntimeFilterExecution::Native { .. }
-            ) && !consumer.bindings.is_empty()
-            {
+            if !consumer.bindings.is_empty() {
                 build
                     .pipeline
                     .factories
@@ -1409,46 +1330,9 @@ fn build_pipeline_for_node(
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
             let output_slots = output_chunk_schema.slot_ids();
-            let (legacy_topn_rf_specs, native_topn_producers): (
-                Vec<crate::exec::node::aggregate::TopNRuntimeFilterSpec>,
-                &[NativeAggregateTopNProducerSpec],
-            ) = match (runtime_filter_spec, &ctx.runtime_filter_execution) {
-                (
-                    AggregateRuntimeFilterSpec::Native { topn_producers },
-                    PipelineRuntimeFilterExecution::Native { .. },
-                ) => {
-                    validate_native_aggregate_topn_specs(topn_producers, group_by, ctx)?;
-                    (Vec::new(), topn_producers)
-                }
-                #[cfg(feature = "compat")]
-                (
-                    AggregateRuntimeFilterSpec::Compat { legacy_topn_specs },
-                    PipelineRuntimeFilterExecution::Compat { .. },
-                ) => (legacy_topn_specs.clone(), &[]),
-                #[cfg(feature = "compat")]
-                (
-                    AggregateRuntimeFilterSpec::Native { topn_producers },
-                    PipelineRuntimeFilterExecution::Compat { .. },
-                ) => {
-                    let binding_id = topn_producers
-                        .first()
-                        .map(|spec| spec.binding_id)
-                        .unwrap_or_default();
-                    return Err(format!(
-                        "native aggregate TopN producer binding_id={binding_id} cannot execute in compat mode"
-                    ));
-                }
-                #[cfg(feature = "compat")]
-                (
-                    AggregateRuntimeFilterSpec::Compat { .. },
-                    PipelineRuntimeFilterExecution::Native { .. },
-                ) => {
-                    return Err(
-                        "compat aggregate runtime-filter specs cannot execute in native mode"
-                            .to_string(),
-                    );
-                }
-            };
+            let AggregateRuntimeFilterSpec { topn_producers } = runtime_filter_spec;
+            validate_native_aggregate_topn_specs(topn_producers, group_by, ctx)?;
+            let native_topn_producers = topn_producers.as_slice();
 
             let dop = build.pipeline.dop.max(1);
             let all_update = functions.iter().all(|f| !f.input_is_intermediate);
@@ -1493,47 +1377,30 @@ fn build_pipeline_for_node(
                     func.input_is_intermediate = false;
                 }
 
-                let partial_agg_factory: Box<dyn OperatorFactory> =
-                    match &ctx.runtime_filter_execution {
-                        PipelineRuntimeFilterExecution::Native { .. } => {
-                            let topn_producers = aggregate_topn_producers_for_site(
-                                producer_site,
-                                AggregateTopNProducerSite::PartialAggregateProcessor,
-                                native_topn_producers,
-                            );
-                            let runtime_filter_context = native_aggregate_topn_context(
-                                &topn_producers,
-                                &ctx.runtime_filter_execution,
-                            )?;
-                            Box::new(AggregateProcessorFactory::new_native(
-                                *node_id,
-                                Arc::clone(&ctx.arena),
-                                group_by.clone(),
-                                partial_functions,
-                                true,
-                                false,
-                                output_chunk_schema.clone(),
-                                topn_producers,
-                                runtime_filter_context,
-                                dop,
-                                None,
-                            )?)
-                        }
-                        #[cfg(feature = "compat")]
-                        PipelineRuntimeFilterExecution::Compat { hub } => {
-                            Box::new(AggregateProcessorFactory::new_compat(
-                                *node_id,
-                                Arc::clone(&ctx.arena),
-                                group_by.clone(),
-                                partial_functions,
-                                true,
-                                false,
-                                output_chunk_schema.clone(),
-                                legacy_topn_rf_specs.clone(),
-                                Arc::clone(hub),
-                            ))
-                        }
-                    };
+                let partial_agg_factory: Box<dyn OperatorFactory> = {
+                    let topn_producers = aggregate_topn_producers_for_site(
+                        producer_site,
+                        AggregateTopNProducerSite::PartialAggregateProcessor,
+                        native_topn_producers,
+                    );
+                    let runtime_filter_context = native_aggregate_topn_context(
+                        &topn_producers,
+                        &ctx.runtime_filter_execution,
+                    )?;
+                    Box::new(AggregateProcessorFactory::new_native(
+                        *node_id,
+                        Arc::clone(&ctx.arena),
+                        group_by.clone(),
+                        partial_functions,
+                        true,
+                        false,
+                        output_chunk_schema.clone(),
+                        topn_producers,
+                        runtime_filter_context,
+                        dop,
+                        None,
+                    )?)
+                };
 
                 build.pipeline.factories.push(partial_agg_factory);
 
@@ -1591,36 +1458,20 @@ fn build_pipeline_for_node(
                 for func in &mut partial_functions {
                     func.input_is_intermediate = false;
                 }
-                let local_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
-                    PipelineRuntimeFilterExecution::Native { .. } => {
-                        Box::new(AggregateProcessorFactory::new_native(
-                            *node_id,
-                            Arc::clone(&ctx.arena),
-                            group_by.clone(),
-                            partial_functions,
-                            true,
-                            false,
-                            output_chunk_schema.clone(),
-                            Vec::new(),
-                            None,
-                            dop,
-                            None,
-                        )?)
-                    }
-                    #[cfg(feature = "compat")]
-                    PipelineRuntimeFilterExecution::Compat { hub } => {
-                        Box::new(AggregateProcessorFactory::new_compat(
-                            *node_id,
-                            Arc::clone(&ctx.arena),
-                            group_by.clone(),
-                            partial_functions,
-                            true,
-                            false,
-                            output_chunk_schema.clone(),
-                            legacy_topn_rf_specs.clone(),
-                            Arc::clone(hub),
-                        ))
-                    }
+                let local_factory: Box<dyn OperatorFactory> = {
+                    Box::new(AggregateProcessorFactory::new_native(
+                        *node_id,
+                        Arc::clone(&ctx.arena),
+                        group_by.clone(),
+                        partial_functions,
+                        true,
+                        false,
+                        output_chunk_schema.clone(),
+                        Vec::new(),
+                        None,
+                        dop,
+                        None,
+                    )?)
                 };
                 build.pipeline.factories.push(local_factory);
 
@@ -1701,44 +1552,28 @@ fn build_pipeline_for_node(
                     ],
                 )?;
                 let streaming_state = AggregateStreamingState::new(dop.max(1) as usize);
-                let sink_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
-                    PipelineRuntimeFilterExecution::Native { .. } => {
-                        let topn_producers = aggregate_topn_producers_for_site(
-                            producer_site,
-                            AggregateTopNProducerSite::StreamingAggregateSink,
-                            native_topn_producers,
-                        );
-                        let runtime_filter_context = native_aggregate_topn_context(
-                            &topn_producers,
-                            &ctx.runtime_filter_execution,
-                        )?;
-                        Box::new(AggregateStreamingSinkFactory::new_native(
-                            *node_id,
-                            Arc::clone(&ctx.arena),
-                            group_by.clone(),
-                            functions.clone(),
-                            !*need_finalize,
-                            output_chunk_schema.clone(),
-                            streaming_state.clone(),
-                            topn_producers,
-                            runtime_filter_context,
-                            dop,
-                        )?)
-                    }
-                    #[cfg(feature = "compat")]
-                    PipelineRuntimeFilterExecution::Compat { hub } => {
-                        Box::new(AggregateStreamingSinkFactory::new_compat(
-                            *node_id,
-                            Arc::clone(&ctx.arena),
-                            group_by.clone(),
-                            functions.clone(),
-                            !*need_finalize,
-                            output_chunk_schema.clone(),
-                            legacy_topn_rf_specs.clone(),
-                            Arc::clone(hub),
-                            streaming_state.clone(),
-                        ))
-                    }
+                let sink_factory: Box<dyn OperatorFactory> = {
+                    let topn_producers = aggregate_topn_producers_for_site(
+                        producer_site,
+                        AggregateTopNProducerSite::StreamingAggregateSink,
+                        native_topn_producers,
+                    );
+                    let runtime_filter_context = native_aggregate_topn_context(
+                        &topn_producers,
+                        &ctx.runtime_filter_execution,
+                    )?;
+                    Box::new(AggregateStreamingSinkFactory::new_native(
+                        *node_id,
+                        Arc::clone(&ctx.arena),
+                        group_by.clone(),
+                        functions.clone(),
+                        !*need_finalize,
+                        output_chunk_schema.clone(),
+                        streaming_state.clone(),
+                        topn_producers,
+                        runtime_filter_context,
+                        dop,
+                    )?)
                 };
                 build.pipeline.factories.push(sink_factory);
                 build.pipeline.needs_sink = false;
@@ -1767,45 +1602,27 @@ fn build_pipeline_for_node(
                     owns_complete_group_identity: true,
                 }],
             )?;
-            let agg_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
-                PipelineRuntimeFilterExecution::Native { .. } => {
-                    let topn_producers = aggregate_topn_producers_for_site(
-                        producer_site,
-                        AggregateTopNProducerSite::AggregateProcessor,
-                        native_topn_producers,
-                    );
-                    let runtime_filter_context = native_aggregate_topn_context(
-                        &topn_producers,
-                        &ctx.runtime_filter_execution,
-                    )?;
-                    Box::new(AggregateProcessorFactory::new_native(
-                        *node_id,
-                        Arc::clone(&ctx.arena),
-                        group_by.clone(),
-                        functions.clone(),
-                        !*need_finalize,
-                        false,
-                        output_chunk_schema.clone(),
-                        topn_producers,
-                        runtime_filter_context,
-                        dop,
-                        None,
-                    )?)
-                }
-                #[cfg(feature = "compat")]
-                PipelineRuntimeFilterExecution::Compat { hub } => {
-                    Box::new(AggregateProcessorFactory::new_compat(
-                        *node_id,
-                        Arc::clone(&ctx.arena),
-                        group_by.clone(),
-                        functions.clone(),
-                        !*need_finalize,
-                        false,
-                        output_chunk_schema.clone(),
-                        legacy_topn_rf_specs.clone(),
-                        Arc::clone(hub),
-                    ))
-                }
+            let agg_factory: Box<dyn OperatorFactory> = {
+                let topn_producers = aggregate_topn_producers_for_site(
+                    producer_site,
+                    AggregateTopNProducerSite::AggregateProcessor,
+                    native_topn_producers,
+                );
+                let runtime_filter_context =
+                    native_aggregate_topn_context(&topn_producers, &ctx.runtime_filter_execution)?;
+                Box::new(AggregateProcessorFactory::new_native(
+                    *node_id,
+                    Arc::clone(&ctx.arena),
+                    group_by.clone(),
+                    functions.clone(),
+                    !*need_finalize,
+                    false,
+                    output_chunk_schema.clone(),
+                    topn_producers,
+                    runtime_filter_context,
+                    dop,
+                    None,
+                )?)
             };
 
             if *need_finalize && dop > 1 {
@@ -1869,36 +1686,7 @@ fn build_pipeline_for_node(
             residual_predicate,
             runtime_filter_execution,
         }) => {
-            if let JoinRuntimeFilterExecution::Native { producers } = runtime_filter_execution {
-                validate_native_producer_specs(producers, ctx)?;
-            }
-            match (runtime_filter_execution, &ctx.runtime_filter_execution) {
-                (
-                    JoinRuntimeFilterExecution::Native { .. },
-                    PipelineRuntimeFilterExecution::Native { .. },
-                ) => {}
-                #[cfg(feature = "compat")]
-                (
-                    JoinRuntimeFilterExecution::Compat { .. },
-                    PipelineRuntimeFilterExecution::Compat { .. },
-                ) => {}
-                _ => {
-                    return Err(format!(
-                        "join node_id={node_id} runtime-filter execution mode conflicts with pipeline mode"
-                    ));
-                }
-            }
-            #[cfg(feature = "compat")]
-            let compat_runtime_filters = match runtime_filter_execution {
-                JoinRuntimeFilterExecution::Native { .. } => None,
-                #[cfg(feature = "compat")]
-                JoinRuntimeFilterExecution::Compat { legacy_specs } => Some(legacy_specs),
-            };
-            #[cfg(feature = "compat")]
-            if let Some(runtime_filters) = compat_runtime_filters {
-                ctx.compat_runtime_filter_hub()?
-                    .register_filter_specs(*node_id, runtime_filters);
-            }
+            validate_native_producer_specs(&runtime_filter_execution.producers, ctx)?;
             let left_build = build_pipeline_for_node(left, ctx)?;
             let right_build = build_pipeline_for_node(right, ctx)?;
 
@@ -1918,16 +1706,6 @@ fn build_pipeline_for_node(
                     probe_build = gather_to_one(probe_build, ctx, *node_id);
                 }
                 build_build = gather_to_one(build_build, ctx, *node_id);
-                #[cfg(feature = "compat")]
-                let runtime_in_filter_merger = compat_runtime_filters
-                    .filter(|filters| !filters.is_empty())
-                    .map(|_| {
-                        Arc::new(PartialRuntimeInFilterMerger::new(
-                            1,
-                            MAX_RUNTIME_IN_FILTER_CONDITIONS,
-                        ))
-                    });
-
                 let probe_dop = probe_build.pipeline.dop.max(1) as usize;
                 let join_state = Arc::new(BroadcastJoinSharedState::new(
                     *node_id,
@@ -1935,85 +1713,43 @@ fn build_pipeline_for_node(
                     probe_dop,
                 ));
 
-                let probe_factory = match runtime_filter_execution {
-                    JoinRuntimeFilterExecution::Native { .. } => {
-                        BroadcastJoinProbeProcessorFactory::new_native(
-                            Arc::clone(&ctx.arena),
-                            *join_type,
-                            probe_keys.clone(),
-                            *residual_predicate,
-                            probe_is_left,
-                            has_equi_keys,
-                            Arc::clone(left_chunk_schema),
-                            Arc::clone(right_chunk_schema),
-                            Arc::clone(join_scope_chunk_schema),
-                            Arc::clone(&join_state),
-                        )
-                    }
-                    #[cfg(feature = "compat")]
-                    JoinRuntimeFilterExecution::Compat { .. } => {
-                        BroadcastJoinProbeProcessorFactory::new_compat(
-                            Arc::clone(&ctx.arena),
-                            *join_type,
-                            probe_keys.clone(),
-                            *residual_predicate,
-                            probe_is_left,
-                            has_equi_keys,
-                            Arc::clone(left_chunk_schema),
-                            Arc::clone(right_chunk_schema),
-                            Arc::clone(join_scope_chunk_schema),
-                            Arc::clone(&join_state),
-                        )
-                    }
+                let probe_factory = {
+                    BroadcastJoinProbeProcessorFactory::new_native(
+                        Arc::clone(&ctx.arena),
+                        *join_type,
+                        probe_keys.clone(),
+                        *residual_predicate,
+                        probe_is_left,
+                        has_equi_keys,
+                        Arc::clone(left_chunk_schema),
+                        Arc::clone(right_chunk_schema),
+                        Arc::clone(join_scope_chunk_schema),
+                        Arc::clone(&join_state),
+                    )
                 };
                 probe_build.pipeline.factories.push(Box::new(probe_factory));
 
                 let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-                let native_producers = match runtime_filter_execution {
-                    JoinRuntimeFilterExecution::Native { producers } => {
-                        native_join_producer_factory(
-                            producers,
-                            &build_keys,
-                            &eq_null_safe,
-                            build_build.pipeline.dop,
-                            ctx,
-                        )?
-                    }
-                    #[cfg(feature = "compat")]
-                    JoinRuntimeFilterExecution::Compat { .. } => None,
-                };
-                let build_factory = match runtime_filter_execution {
-                    JoinRuntimeFilterExecution::Native { .. } => {
-                        HashJoinBuildSinkFactory::new_native_with_runtime_filters(
-                            Arc::clone(&ctx.arena),
-                            *join_type,
-                            residual_predicate.is_some(),
-                            probe_is_left,
-                            has_equi_keys,
-                            build_keys.clone(),
-                            eq_null_safe.clone(),
-                            *distribution_mode,
-                            build_state,
-                            native_producers,
-                        )
-                    }
-                    #[cfg(feature = "compat")]
-                    JoinRuntimeFilterExecution::Compat { .. } => {
-                        HashJoinBuildSinkFactory::new_compat(
-                            Arc::clone(&ctx.arena),
-                            *join_type,
-                            residual_predicate.is_some(),
-                            probe_is_left,
-                            has_equi_keys,
-                            build_keys.clone(),
-                            eq_null_safe.clone(),
-                            compat_runtime_filters.expect("compat join filters").clone(),
-                            *distribution_mode,
-                            build_state,
-                            Arc::clone(ctx.compat_runtime_filter_hub()?),
-                            runtime_in_filter_merger,
-                        )
-                    }
+                let native_producers = native_join_producer_factory(
+                    &runtime_filter_execution.producers,
+                    &build_keys,
+                    &eq_null_safe,
+                    build_build.pipeline.dop,
+                    ctx,
+                )?;
+                let build_factory = {
+                    HashJoinBuildSinkFactory::new_native_with_runtime_filters(
+                        Arc::clone(&ctx.arena),
+                        *join_type,
+                        residual_predicate.is_some(),
+                        probe_is_left,
+                        has_equi_keys,
+                        build_keys.clone(),
+                        eq_null_safe.clone(),
+                        *distribution_mode,
+                        build_state,
+                        native_producers,
+                    )
                 };
                 build_build.pipeline.factories.push(Box::new(build_factory));
                 build_build.pipeline.needs_sink = false;
@@ -2045,16 +1781,6 @@ fn build_pipeline_for_node(
                 .dop
                 .max(1)
                 .max(build_build.pipeline.dop.max(1)) as usize;
-            #[cfg(feature = "compat")]
-            let runtime_in_filter_merger = compat_runtime_filters
-                .filter(|filters| !filters.is_empty())
-                .map(|_| {
-                    Arc::new(PartialRuntimeInFilterMerger::new(
-                        join_partitions,
-                        MAX_RUNTIME_IN_FILTER_CONDITIONS,
-                    ))
-                });
-
             if !probe_keys.is_empty() {
                 probe_build = ensure_hash(
                     probe_build,
@@ -2081,68 +1807,32 @@ fn build_pipeline_for_node(
                 *join_type == JoinType::NullAwareLeftAnti,
             ));
 
-            let probe_factory = match runtime_filter_execution {
-                JoinRuntimeFilterExecution::Native { .. } => {
-                    PartitionedJoinProbeProcessorFactory::new_native(
-                        Arc::clone(&ctx.arena),
-                        *join_type,
-                        probe_keys.clone(),
-                        *residual_predicate,
-                        probe_is_left,
-                        has_equi_keys,
-                        Arc::clone(left_chunk_schema),
-                        Arc::clone(right_chunk_schema),
-                        Arc::clone(join_scope_chunk_schema),
-                        Arc::clone(&join_state),
-                    )
-                }
-                #[cfg(feature = "compat")]
-                JoinRuntimeFilterExecution::Compat { .. } => {
-                    PartitionedJoinProbeProcessorFactory::new_compat(
-                        Arc::clone(&ctx.arena),
-                        *join_type,
-                        probe_keys.clone(),
-                        *residual_predicate,
-                        probe_is_left,
-                        has_equi_keys,
-                        Arc::clone(left_chunk_schema),
-                        Arc::clone(right_chunk_schema),
-                        Arc::clone(join_scope_chunk_schema),
-                        Arc::clone(&join_state),
-                    )
-                }
+            let probe_factory = {
+                PartitionedJoinProbeProcessorFactory::new_native(
+                    Arc::clone(&ctx.arena),
+                    *join_type,
+                    probe_keys.clone(),
+                    *residual_predicate,
+                    probe_is_left,
+                    has_equi_keys,
+                    Arc::clone(left_chunk_schema),
+                    Arc::clone(right_chunk_schema),
+                    Arc::clone(join_scope_chunk_schema),
+                    Arc::clone(&join_state),
+                )
             };
             probe_build.pipeline.factories.push(Box::new(probe_factory));
 
             let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-            let native_producers = match runtime_filter_execution {
-                JoinRuntimeFilterExecution::Native { producers } => native_join_producer_factory(
-                    producers,
-                    &build_keys,
-                    &eq_null_safe,
-                    build_build.pipeline.dop,
-                    ctx,
-                )?,
-                #[cfg(feature = "compat")]
-                JoinRuntimeFilterExecution::Compat { .. } => None,
-            };
-            let build_factory = match runtime_filter_execution {
-                JoinRuntimeFilterExecution::Native { .. } => {
-                    HashJoinBuildSinkFactory::new_native_with_runtime_filters(
-                        Arc::clone(&ctx.arena),
-                        *join_type,
-                        residual_predicate.is_some(),
-                        probe_is_left,
-                        has_equi_keys,
-                        build_keys.clone(),
-                        eq_null_safe.clone(),
-                        *distribution_mode,
-                        build_state,
-                        native_producers,
-                    )
-                }
-                #[cfg(feature = "compat")]
-                JoinRuntimeFilterExecution::Compat { .. } => HashJoinBuildSinkFactory::new_compat(
+            let native_producers = native_join_producer_factory(
+                &runtime_filter_execution.producers,
+                &build_keys,
+                &eq_null_safe,
+                build_build.pipeline.dop,
+                ctx,
+            )?;
+            let build_factory = {
+                HashJoinBuildSinkFactory::new_native_with_runtime_filters(
                     Arc::clone(&ctx.arena),
                     *join_type,
                     residual_predicate.is_some(),
@@ -2150,12 +1840,10 @@ fn build_pipeline_for_node(
                     has_equi_keys,
                     build_keys.clone(),
                     eq_null_safe.clone(),
-                    compat_runtime_filters.expect("compat join filters").clone(),
                     *distribution_mode,
                     build_state,
-                    Arc::clone(ctx.compat_runtime_filter_hub()?),
-                    runtime_in_filter_merger,
-                ),
+                    native_producers,
+                )
             };
             build_build.pipeline.factories.push(Box::new(build_factory));
             build_build.pipeline.needs_sink = false;
@@ -2303,11 +1991,7 @@ fn build_pipeline_for_node(
             // A1 single-driver: morsel-level parallelism deferred to a later
             // phase (see plan §"Phase 2 — IcebergDeltaScan Operator").
             let mut pipeline = new_source_pipeline_with_dop(ctx, source, 1);
-            if matches!(
-                &ctx.runtime_filter_execution,
-                PipelineRuntimeFilterExecution::Native { .. }
-            ) && !node.native_runtime_filter_specs().is_empty()
-            {
+            if !node.native_runtime_filter_specs().is_empty() {
                 pipeline
                     .factories
                     .push(Box::new(NativeRuntimeFilterProcessorFactory::new(
@@ -2338,22 +2022,8 @@ fn build_pipeline_for_node(
                 .exchange_bindings
                 .get(node.node_id)
                 .ok_or_else(|| format!("missing exchange binding for node {}", node.node_id))?;
-            let factory = match &ctx.runtime_filter_execution {
-                PipelineRuntimeFilterExecution::Native { .. } => ExchangeSourceFactory::new_native(
-                    node.clone(),
-                    binding,
-                    Arc::clone(&ctx.arena),
-                )?,
-                #[cfg(feature = "compat")]
-                PipelineRuntimeFilterExecution::Compat { hub } => {
-                    ExchangeSourceFactory::new_compat(
-                        node.clone(),
-                        binding,
-                        Arc::clone(hub),
-                        Arc::clone(&ctx.arena),
-                    )?
-                }
-            };
+            let factory =
+                ExchangeSourceFactory::new_native(node.clone(), binding, Arc::clone(&ctx.arena))?;
             let source: Box<dyn OperatorFactory> = Box::new(factory);
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
@@ -2384,18 +2054,7 @@ fn build_pipeline_for_node(
                 .scan_bindings
                 .get(node_id)
                 .ok_or_else(|| format!("missing scan binding for node {node_id}"))?;
-            let factory = match &ctx.runtime_filter_execution {
-                PipelineRuntimeFilterExecution::Native { .. } => {
-                    ScanSourceFactory::new_native(scan.clone(), op, Arc::clone(&ctx.arena))?
-                }
-                #[cfg(feature = "compat")]
-                PipelineRuntimeFilterExecution::Compat { hub } => ScanSourceFactory::new_compat(
-                    scan.clone(),
-                    op,
-                    Arc::clone(hub),
-                    Arc::clone(&ctx.arena),
-                ),
-            };
+            let factory = ScanSourceFactory::new_native(scan.clone(), op, Arc::clone(&ctx.arena))?;
             let source: Box<dyn OperatorFactory> = Box::new(factory);
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
@@ -2455,6 +2114,13 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
+    use super::{
+        AggregateTopNProducerSite, AggregateTopNProducerSiteCandidate,
+        build_native_pipeline_graph_for_exec_plan_with_dop,
+        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
+        build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context,
+        resolve_aggregate_topn_producer_site,
+    };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
@@ -2467,8 +2133,7 @@ mod tests {
         IcebergRuntimeHandles,
     };
     use crate::exec::node::join::{
-        CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
-        JoinType,
+        JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
     };
     use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::runtime_filter::{
@@ -2479,18 +2144,6 @@ mod tests {
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::dependency::DependencyManager;
-    #[cfg(feature = "compat")]
-    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-
-    #[cfg(feature = "compat")]
-    use super::build_compat_pipeline_graph_for_exec_plan_with_dop;
-    use super::{
-        AggregateTopNProducerSite, AggregateTopNProducerSiteCandidate,
-        build_native_pipeline_graph_for_exec_plan_with_dop,
-        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
-        build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context,
-        resolve_aggregate_topn_producer_site,
-    };
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
@@ -2871,7 +2524,7 @@ mod tests {
                     build_keys: vec![build_expr],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                    runtime_filter_execution: JoinRuntimeFilterExecution {
                         producers: vec![NativeJoinRuntimeFilterProducerSpec {
                             binding_id: 3,
                             channel_id: 1,
@@ -2991,7 +2644,7 @@ mod tests {
                     need_finalize,
                     input_is_intermediate: false,
                     output_chunk_schema: chunk_schema,
-                    runtime_filter_spec: AggregateRuntimeFilterSpec::Native { topn_producers },
+                    runtime_filter_spec: AggregateRuntimeFilterSpec { topn_producers },
                     streaming_preaggregation_mode,
                 }),
             },
@@ -3699,7 +3352,7 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
-                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
                     topn_producers: Vec::new(),
                 },
                 streaming_preaggregation_mode: None,
@@ -3725,7 +3378,7 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
-                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
                     topn_producers: Vec::new(),
                 },
                 streaming_preaggregation_mode: None,
@@ -3975,7 +3628,7 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: true,
                 output_chunk_schema: agg_output_chunk_schema,
-                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
                     topn_producers: Vec::new(),
                 },
                 streaming_preaggregation_mode: None,
@@ -4059,7 +3712,7 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: false,
                 output_chunk_schema: agg_output_chunk_schema,
-                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
                     topn_producers: Vec::new(),
                 },
                 streaming_preaggregation_mode: None,

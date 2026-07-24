@@ -214,41 +214,6 @@ fn execute_plan_with_pipeline_in_mode(
 ) -> Result<(), String> {
     let fragment_profiler = profiler.clone();
     let dep_manager = DependencyManager::new();
-    #[cfg(feature = "compat")]
-    let runtime_filter_hub = match (&mode, query_id) {
-        (PipelineExecutionMode::Native, _) => None,
-        (PipelineExecutionMode::Compat, Some(qid)) => {
-            if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid)? {
-                Some(hub)
-            } else {
-                let hub = Arc::new(
-                    crate::runtime::runtime_filter_hub::RuntimeFilterHub::new_for_query(
-                        DependencyManager::new(),
-                        qid,
-                    ),
-                );
-                query_context_manager().set_runtime_filter_hub(qid, Arc::clone(&hub))?;
-                Some(hub)
-            }
-        }
-        (PipelineExecutionMode::Compat, None) => Some(Arc::new(
-            crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(DependencyManager::new()),
-        )),
-    };
-    #[cfg(feature = "compat")]
-    if let Some(runtime_filter_hub) = runtime_filter_hub.as_ref() {
-        runtime_filter_hub.set_wait_timeouts(
-            runtime_state.runtime_filter_scan_wait_timeout(),
-            runtime_state.runtime_filter_wait_timeout(),
-        );
-        if let Some(qid) = query_id {
-            if let Some(params) = runtime_state.runtime_filter_params().cloned() {
-                query_context_manager().set_runtime_filter_params(qid, params)?;
-            }
-            query_context_manager().get_or_create_runtime_filter_worker(qid)?;
-        }
-    }
-
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
     let graph = match mode {
@@ -263,20 +228,6 @@ fn execute_plan_with_pipeline_in_mode(
                 pipeline_dop,
                 root_sink_dop,
                 runtime_state.native_runtime_filter_context().cloned(),
-            )?
-        }
-        #[cfg(feature = "compat")]
-        PipelineExecutionMode::Compat => {
-            build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
-                &plan,
-                debug,
-                dep_manager.clone(),
-                exchange_finst_id,
-                exchange_bindings,
-                scan_bindings,
-                pipeline_dop,
-                root_sink_dop,
-                runtime_filter_hub.expect("compat runtime-filter hub"),
             )?
         }
     };

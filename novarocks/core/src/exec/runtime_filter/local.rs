@@ -38,6 +38,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::{
     GroupKeyArrayView, build_group_key_hashes, build_group_key_views,
 };
+#[cfg(feature = "compat")]
 use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 
 #[derive(Clone, Debug)]
@@ -85,6 +86,7 @@ pub(in crate::exec::runtime_filter) fn row_has_null(
 }
 
 impl LocalRuntimeFilterSet {
+    #[cfg(feature = "compat")]
     pub(crate) fn new(specs: &[CompatJoinRuntimeFilterSpec], hash_seed: u64) -> Self {
         let mut filters = Vec::with_capacity(specs.len());
         for spec in specs {

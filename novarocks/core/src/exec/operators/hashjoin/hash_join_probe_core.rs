@@ -36,7 +36,7 @@ use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use super::build_artifact::{BuildView, JoinBuildArtifact, JoinBuildRuntimeFilterView};
+use super::build_artifact::{BuildView, JoinBuildArtifact};
 #[cfg(test)]
 use super::build_requirements;
 use super::build_requirements::{BuildComponentRequirements, required_build_components};
@@ -106,31 +106,6 @@ fn concat_schema_for_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Sch
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum JoinProbeRuntimeFilterExecution {
-    Native,
-    #[cfg(feature = "compat")]
-    Compat,
-}
-
-impl JoinProbeRuntimeFilterExecution {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            #[cfg(feature = "compat")]
-            Self::Compat => "compat",
-        }
-    }
-
-    fn matches(self, view: &JoinBuildRuntimeFilterView) -> bool {
-        match self {
-            Self::Native => matches!(view, JoinBuildRuntimeFilterView::Native),
-            #[cfg(feature = "compat")]
-            Self::Compat => matches!(view, JoinBuildRuntimeFilterView::Compat { .. }),
-        }
-    }
-}
-
 /// Core hash-join probing engine that performs key lookup and join-type specific row assembly.
 pub(crate) struct HashJoinProbeCore {
     arena: Arc<ExprArena>,
@@ -149,8 +124,6 @@ pub(crate) struct HashJoinProbeCore {
     build_chunk: Option<Arc<Chunk>>,
     build_null_key_rows: Option<Arc<Vec<u32>>>,
     build_table: Option<Arc<JoinHashMap>>,
-    expected_runtime_filter_execution: JoinProbeRuntimeFilterExecution,
-    runtime_filter_execution: Option<JoinBuildRuntimeFilterView>,
     output_schema: Option<SchemaRef>,
     build_matched: Option<BuildMatchFlags>,
     global_build_row_count: usize,
@@ -193,33 +166,6 @@ impl HashJoinProbeCore {
             left_chunk_schema,
             right_chunk_schema,
             join_scope_chunk_schema,
-            JoinProbeRuntimeFilterExecution::Native,
-        )
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn new_compat(
-        arena: Arc<ExprArena>,
-        join_type: JoinType,
-        probe_keys: Vec<ExprId>,
-        residual_predicate: Option<ExprId>,
-        probe_is_left: bool,
-        has_equi_keys: bool,
-        left_chunk_schema: ChunkSchemaRef,
-        right_chunk_schema: ChunkSchemaRef,
-        join_scope_chunk_schema: ChunkSchemaRef,
-    ) -> Self {
-        Self::new_in_mode(
-            arena,
-            join_type,
-            probe_keys,
-            residual_predicate,
-            probe_is_left,
-            has_equi_keys,
-            left_chunk_schema,
-            right_chunk_schema,
-            join_scope_chunk_schema,
-            JoinProbeRuntimeFilterExecution::Compat,
         )
     }
 
@@ -234,7 +180,6 @@ impl HashJoinProbeCore {
         left_chunk_schema: ChunkSchemaRef,
         right_chunk_schema: ChunkSchemaRef,
         join_scope_chunk_schema: ChunkSchemaRef,
-        expected_runtime_filter_execution: JoinProbeRuntimeFilterExecution,
     ) -> Self {
         Self {
             arena,
@@ -253,8 +198,6 @@ impl HashJoinProbeCore {
             build_chunk: None,
             build_null_key_rows: None,
             build_table: None,
-            expected_runtime_filter_execution,
-            runtime_filter_execution: None,
             output_schema: None,
             build_matched: None,
             global_build_row_count: 0,
@@ -410,26 +353,9 @@ impl HashJoinProbeCore {
             self.has_equi_keys,
         );
         let view = BuildView::new(Arc::clone(&artifact), requirements)?;
-        let runtime_filter_execution = view.runtime_filter_view();
-        if !self
-            .expected_runtime_filter_execution
-            .matches(&runtime_filter_execution)
-        {
-            let expected = self.expected_runtime_filter_execution.name();
-            let actual = match &runtime_filter_execution {
-                JoinBuildRuntimeFilterView::Native => "native",
-                #[cfg(feature = "compat")]
-                JoinBuildRuntimeFilterView::Compat { .. } => "compat",
-            };
-            return Err(format!(
-                "hash join build artifact runtime-filter execution mode mismatch: expected={expected} actual={actual}"
-            ));
-        }
-
         self.build_chunk = view.optional_build_chunk();
         self.build_null_key_rows = view.build_null_key_rows();
         self.build_table = view.build_table();
-        self.runtime_filter_execution = Some(runtime_filter_execution);
         self.build_partition_row_count = view.build_row_count();
         self.build_partition_has_null_key = view.build_has_null_key();
         self.global_build_row_count = global_build_row_count;
@@ -1784,35 +1710,6 @@ impl HashJoinProbeCore {
         Ok(())
     }
 
-    #[cfg(feature = "compat")]
-    fn apply_runtime_filters(&self, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
-        if !self.should_apply_runtime_filters() {
-            return Ok(chunks);
-        }
-        let filters = match self.runtime_filter_execution.as_ref() {
-            None => return Err("hash join build artifact not loaded".to_string()),
-            Some(JoinBuildRuntimeFilterView::Native) => return Ok(chunks),
-            #[cfg(feature = "compat")]
-            Some(JoinBuildRuntimeFilterView::Compat { local_filters }) => {
-                let Some(filters) = local_filters.as_ref() else {
-                    return Ok(chunks);
-                };
-                filters
-            }
-        };
-        let mut out = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            if let Some(filtered) =
-                filters.filter_probe_chunk(&self.arena, &self.probe_keys, chunk)?
-                && !filtered.is_empty()
-            {
-                out.push(filtered);
-            }
-        }
-        Ok(out)
-    }
-
-    #[cfg(not(feature = "compat"))]
     fn apply_runtime_filters(&self, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
         Ok(chunks)
     }

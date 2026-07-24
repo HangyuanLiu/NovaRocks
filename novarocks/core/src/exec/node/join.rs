@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
@@ -43,24 +42,6 @@ pub enum JoinDistributionMode {
     Partitioned,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RuntimeFilterMergeNode {
-    pub host: String,
-    pub port: i32,
-}
-
-#[derive(Clone, Debug)]
-pub struct CompatJoinRuntimeFilterSpec {
-    pub filter_id: i32,
-    pub expr_order: usize,
-    pub probe_expr_id: ExprId,
-    pub build_expr_id: ExprId,
-    pub probe_slot_id: SlotId,
-    pub build_data_type: arrow::datatypes::DataType,
-    pub merge_nodes: Vec<RuntimeFilterMergeNode>,
-    pub has_remote_targets: bool,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct NativeJoinRuntimeFilterProducerSpec {
     pub(crate) binding_id: u32,
@@ -74,14 +55,8 @@ pub(crate) struct NativeJoinRuntimeFilterProducerSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum JoinRuntimeFilterExecution {
-    Native {
-        producers: Vec<NativeJoinRuntimeFilterProducerSpec>,
-    },
-    #[cfg(feature = "compat")]
-    Compat {
-        legacy_specs: Vec<CompatJoinRuntimeFilterSpec>,
-    },
+pub(crate) struct JoinRuntimeFilterExecution {
+    pub(crate) producers: Vec<NativeJoinRuntimeFilterProducerSpec>,
 }
 
 #[derive(Clone, Debug)]

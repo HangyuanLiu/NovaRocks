@@ -41,8 +41,6 @@ use super::native_runtime_filter::{
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-#[cfg(feature = "compat")]
-use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 use crate::exec::node::join::{JoinDistributionMode, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -60,8 +58,6 @@ use crate::novarocks_logging::debug;
 use crate::novarocks_logging::warn;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
-#[cfg(feature = "compat")]
-use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 #[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 #[cfg(feature = "compat")]
@@ -88,43 +84,21 @@ pub struct HashJoinBuildSinkFactory {
     runtime_filter_execution: HashJoinBuildRuntimeFilterExecution,
 }
 
-enum HashJoinBuildRuntimeFilterExecution {
-    Native {
-        producers: Option<Arc<NativeRuntimeFilterProducerFactory>>,
-    },
-    #[cfg(feature = "compat")]
-    Compat {
-        specs: Vec<CompatJoinRuntimeFilterSpec>,
-        hub: Arc<RuntimeFilterHub>,
-        in_filter_merger: Option<Arc<PartialRuntimeInFilterMerger>>,
-    },
+struct HashJoinBuildRuntimeFilterExecution {
+    producers: Option<Arc<NativeRuntimeFilterProducerFactory>>,
 }
 
-enum HashJoinBuildOperatorRuntimeFilterExecution {
-    Native {
-        producers: Option<NativeRuntimeFilterProducerSet>,
-        bind_error: Option<String>,
-        local_partition_count: Option<u32>,
-    },
-    #[cfg(feature = "compat")]
-    Compat {
-        specs: Vec<CompatJoinRuntimeFilterSpec>,
-        hub: Arc<RuntimeFilterHub>,
-        in_filter_merger: Option<Arc<PartialRuntimeInFilterMerger>>,
-        filters: Option<LocalRuntimeFilterSet>,
-        in_filters: Option<LocalRuntimeInFilterSet>,
-    },
+struct HashJoinBuildOperatorRuntimeFilterExecution {
+    producers: Option<NativeRuntimeFilterProducerSet>,
+    bind_error: Option<String>,
+    local_partition_count: Option<u32>,
 }
 
 impl HashJoinBuildRuntimeFilterExecution {
     fn spec_count(&self) -> usize {
-        match self {
-            Self::Native { producers } => producers
-                .as_ref()
-                .map_or(0, |producers| producers.binding_count()),
-            #[cfg(feature = "compat")]
-            Self::Compat { specs, .. } => specs.len(),
-        }
+        self.producers
+            .as_ref()
+            .map_or(0, |producers| producers.binding_count())
     }
 }
 
@@ -179,47 +153,8 @@ impl HashJoinBuildSinkFactory {
             eq_null_safe,
             distribution_mode,
             state,
-            runtime_filter_execution: HashJoinBuildRuntimeFilterExecution::Native {
+            runtime_filter_execution: HashJoinBuildRuntimeFilterExecution {
                 producers: runtime_filter_producers,
-            },
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn new_compat(
-        arena: Arc<ExprArena>,
-        join_type: JoinType,
-        has_residual_predicate: bool,
-        probe_is_left: bool,
-        has_equi_keys: bool,
-        build_keys: Vec<ExprId>,
-        eq_null_safe: Vec<bool>,
-        runtime_filters: Vec<CompatJoinRuntimeFilterSpec>,
-        distribution_mode: JoinDistributionMode,
-        state: Arc<dyn JoinBuildSinkState>,
-        runtime_filter_hub: Arc<RuntimeFilterHub>,
-        runtime_in_filter_merger: Option<Arc<PartialRuntimeInFilterMerger>>,
-    ) -> Self {
-        let node_id = parse_join_node_id_from_dep_key(state.dep_name(0));
-        if node_id >= 0 {
-            let _ = runtime_filter_hub.local_dependency(node_id);
-        }
-        Self {
-            name: format!("HASH_JOIN (id={})", node_id),
-            node_id,
-            arena,
-            join_type,
-            has_residual_predicate,
-            probe_is_left,
-            has_equi_keys,
-            build_keys,
-            eq_null_safe,
-            distribution_mode,
-            state,
-            runtime_filter_execution: HashJoinBuildRuntimeFilterExecution::Compat {
-                specs: runtime_filters,
-                hub: runtime_filter_hub,
-                in_filter_merger: runtime_in_filter_merger,
             },
         }
     }
@@ -254,45 +189,32 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             self.eq_null_safe.iter().filter(|v| **v).count(),
             self.runtime_filter_execution.spec_count()
         );
-        let runtime_filter_execution = match &self.runtime_filter_execution {
-            HashJoinBuildRuntimeFilterExecution::Native { producers } => {
-                let (producers, bind_error, local_partition_count) = match producers {
-                    Some(factory) => {
-                        let expected = factory.local_partition_count();
-                        let dop_error = match u32::try_from(dop) {
-                            Ok(actual) if actual == expected => None,
-                            Ok(actual) => Some(format!(
-                                "native runtime-filter build DOP drifted between planning and operator creation: expected={expected} actual={actual}"
-                            )),
-                            Err(_) => Some(format!(
-                                "native runtime-filter build DOP {dop} cannot be represented as a partition count"
-                            )),
-                        };
-                        match factory.create(driver_id) {
-                            Ok(producers) => (Some(producers), dop_error, Some(expected)),
-                            Err(error) => (None, Some(error), Some(expected)),
-                        }
+        let runtime_filter_execution = {
+            let producers = &self.runtime_filter_execution.producers;
+            let (producers, bind_error, local_partition_count) = match producers {
+                Some(factory) => {
+                    let expected = factory.local_partition_count();
+                    let dop_error = match u32::try_from(dop) {
+                        Ok(actual) if actual == expected => None,
+                        Ok(actual) => Some(format!(
+                            "native runtime-filter build DOP drifted between planning and operator creation: expected={expected} actual={actual}"
+                        )),
+                        Err(_) => Some(format!(
+                            "native runtime-filter build DOP {dop} cannot be represented as a partition count"
+                        )),
+                    };
+                    match factory.create(driver_id) {
+                        Ok(producers) => (Some(producers), dop_error, Some(expected)),
+                        Err(error) => (None, Some(error), Some(expected)),
                     }
-                    None => (None, None, None),
-                };
-                HashJoinBuildOperatorRuntimeFilterExecution::Native {
-                    producers,
-                    bind_error,
-                    local_partition_count,
                 }
+                None => (None, None, None),
+            };
+            HashJoinBuildOperatorRuntimeFilterExecution {
+                producers,
+                bind_error,
+                local_partition_count,
             }
-            #[cfg(feature = "compat")]
-            HashJoinBuildRuntimeFilterExecution::Compat {
-                specs,
-                hub,
-                in_filter_merger,
-            } => HashJoinBuildOperatorRuntimeFilterExecution::Compat {
-                specs: specs.clone(),
-                hub: Arc::clone(hub),
-                in_filter_merger: in_filter_merger.as_ref().map(Arc::clone),
-                filters: None,
-                in_filters: None,
-            },
         };
         Box::new(HashJoinBuildSinkOperator {
             name: self.name.clone(),
@@ -539,41 +461,6 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 .saturating_add(retained_bytes);
             self.refresh_build_key_batches_accounting();
             self.submit_native_runtime_filters(&key_arrays)?;
-            #[cfg(feature = "compat")]
-            if let HashJoinBuildOperatorRuntimeFilterExecution::Compat { specs, .. } =
-                &self.runtime_filter_execution
-                && !specs.is_empty()
-            {
-                if self.build_keys.is_empty() {
-                    return Err("runtime filters require join build keys".to_string());
-                }
-                let specs = specs.clone();
-                let hash_seed = self.runtime_filter_hash_seed()?;
-                let HashJoinBuildOperatorRuntimeFilterExecution::Compat {
-                    filters,
-                    in_filters,
-                    ..
-                } = &mut self.runtime_filter_execution
-                else {
-                    unreachable!()
-                };
-                if self.build_row_count > MAX_RUNTIME_IN_FILTER_CONDITIONS {
-                    *in_filters = None;
-                } else {
-                    if in_filters.is_none() {
-                        *in_filters = Some(LocalRuntimeInFilterSet::new(&specs, &key_arrays)?);
-                    }
-                    if let Some(in_filters) = in_filters.as_mut() {
-                        in_filters.add_build_arrays(&key_arrays)?;
-                    }
-                }
-                if filters.is_none() {
-                    *filters = Some(LocalRuntimeFilterSet::new(&specs, hash_seed));
-                }
-                if let Some(filters) = filters.as_mut() {
-                    filters.add_build_arrays(&key_arrays)?;
-                }
-            }
             Ok(())
         })();
         if result.is_err() {
@@ -665,12 +552,6 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 self.input_rows,
                 self.input_chunks
             );
-            #[cfg(feature = "compat")]
-            if let HashJoinBuildOperatorRuntimeFilterExecution::Compat { hub, .. } =
-                &self.runtime_filter_execution
-            {
-                hub.mark_local_filters_ready(self.node_id);
-            }
 
             let build_store_rows = if retain_build_rows {
                 self.build_store_builder.row_count()
@@ -707,30 +588,14 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 .as_ref()
                 .map(|t| t.method_kind().as_profile_str())
                 .unwrap_or("None");
-            let artifact = Arc::new(match &mut self.runtime_filter_execution {
-                HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => {
-                    JoinBuildArtifact::new_native(
-                        requirements,
-                        build_store,
-                        table,
-                        self.build_row_count,
-                        self.build_has_null_key,
-                        build_null_key_rows,
-                    )
-                }
-                #[cfg(feature = "compat")]
-                HashJoinBuildOperatorRuntimeFilterExecution::Compat { filters, .. } => {
-                    JoinBuildArtifact::new_compat(
-                        requirements,
-                        build_store,
-                        table,
-                        self.build_row_count,
-                        self.build_has_null_key,
-                        build_null_key_rows,
-                        filters.take().map(Arc::new),
-                    )
-                }
-            });
+            let artifact = Arc::new(JoinBuildArtifact::new_native(
+                requirements,
+                build_store,
+                table,
+                self.build_row_count,
+                self.build_has_null_key,
+                build_null_key_rows,
+            ));
             artifact.validate_components(requirements)?;
             self.state
                 .set_build(self.partition, artifact)
@@ -765,14 +630,11 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
 
 impl HashJoinBuildSinkOperator {
     fn bind_native_runtime_filters(&mut self) -> Result<(), String> {
-        let HashJoinBuildOperatorRuntimeFilterExecution::Native {
+        let HashJoinBuildOperatorRuntimeFilterExecution {
             producers,
             bind_error,
             local_partition_count,
-        } = &mut self.runtime_filter_execution
-        else {
-            return Ok(());
-        };
+        } = &mut self.runtime_filter_execution;
         if let Some(error) = bind_error.take() {
             return Err(error);
         }
@@ -785,22 +647,16 @@ impl HashJoinBuildSinkOperator {
     }
 
     fn submit_native_runtime_filters(&mut self, key_arrays: &[ArrayRef]) -> Result<(), String> {
-        match &mut self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Native {
-                producers: Some(producers),
-                ..
-            } => producers.submit(key_arrays),
-            _ => Ok(()),
+        match self.runtime_filter_execution.producers.as_mut() {
+            Some(producers) => producers.submit(key_arrays),
+            None => Ok(()),
         }
     }
 
     fn finish_native_runtime_filters(&mut self) -> Result<(), String> {
-        match &mut self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Native {
-                producers: Some(producers),
-                ..
-            } => producers.finish(),
-            _ => Ok(()),
+        match self.runtime_filter_execution.producers.as_mut() {
+            Some(producers) => producers.finish(),
+            None => Ok(()),
         }
     }
 
@@ -808,65 +664,9 @@ impl HashJoinBuildSinkOperator {
         &mut self,
         reason: crate::runtime_filter::port::producer::ProducerFailureReason,
     ) -> Result<(), String> {
-        match &mut self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Native {
-                producers: Some(producers),
-                ..
-            } => producers.fail(reason),
-            _ => Ok(()),
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn runtime_filter_specs(&self) -> &[CompatJoinRuntimeFilterSpec] {
-        match &self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => &[],
-            #[cfg(feature = "compat")]
-            HashJoinBuildOperatorRuntimeFilterExecution::Compat { specs, .. } => specs,
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn runtime_filter_hub(&self) -> Result<Arc<RuntimeFilterHub>, String> {
-        match &self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Compat { hub, .. } => Ok(Arc::clone(hub)),
-            HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => {
-                Err("native hash join cannot access legacy runtime-filter hub".to_string())
-            }
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn runtime_in_filter_merger(&self) -> Option<Arc<PartialRuntimeInFilterMerger>> {
-        match &self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Compat {
-                in_filter_merger, ..
-            } => in_filter_merger.as_ref().map(Arc::clone),
-            HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => None,
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn ensure_runtime_filters(&mut self, hash_seed: u64) -> Result<(), String> {
-        let specs = self.runtime_filter_specs().to_vec();
-        let HashJoinBuildOperatorRuntimeFilterExecution::Compat { filters, .. } =
-            &mut self.runtime_filter_execution
-        else {
-            return Err("native hash join cannot build legacy runtime filters".to_string());
-        };
-        if filters.is_none() {
-            *filters = Some(LocalRuntimeFilterSet::new(&specs, hash_seed));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "compat")]
-    fn take_runtime_in_filters(&mut self) -> Option<LocalRuntimeInFilterSet> {
-        match &mut self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Compat { in_filters, .. } => {
-                in_filters.take()
-            }
-            HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => None,
+        match self.runtime_filter_execution.producers.as_mut() {
+            Some(producers) => producers.fail(reason),
+            None => Ok(()),
         }
     }
 
@@ -901,663 +701,9 @@ impl HashJoinBuildSinkOperator {
         self.build_key_batches_accounting = None;
     }
 
-    fn publish_runtime_filters(&mut self, state: &RuntimeState) -> Result<(), String> {
-        match &self.runtime_filter_execution {
-            HashJoinBuildOperatorRuntimeFilterExecution::Native { .. } => Ok(()),
-            #[cfg(feature = "compat")]
-            HashJoinBuildOperatorRuntimeFilterExecution::Compat { specs, .. }
-                if specs.is_empty() =>
-            {
-                Ok(())
-            }
-            #[cfg(feature = "compat")]
-            HashJoinBuildOperatorRuntimeFilterExecution::Compat { .. } => {
-                if self.build_keys.is_empty() {
-                    return Err("runtime filters require join build keys".to_string());
-                }
-                let _timer = self
-                    .profiles
-                    .as_ref()
-                    .map(|p| p.common.scoped_timer("RuntimeFilterBuildTime"));
-
-                let hash_seed = self.runtime_filter_hash_seed()?;
-                self.ensure_runtime_filters(hash_seed)?;
-
-                let mut in_filters = Vec::new();
-                if self.build_row_count > 0
-                    && self.build_row_count <= MAX_RUNTIME_IN_FILTER_CONDITIONS
-                    && let Some(filters) = self.take_runtime_in_filters()
-                {
-                    in_filters = filters.into_filters();
-                }
-
-                let membership_params = self.build_membership_filter_params()?;
-                let membership_build_options = self.membership_build_options(state);
-
-                if let Some(merger) = self.runtime_in_filter_merger() {
-                    let merged_in =
-                        merger.add_partial(self.partition, self.build_row_count, in_filters)?;
-                    let merged_membership = merger.add_partial_membership(
-                        self.partition,
-                        membership_params,
-                        membership_build_options,
-                    )?;
-                    self.add_runtime_filter_drop_counters_to_profile(merger.drain_drop_counters());
-                    if let (Some(in_filters), Some(membership_filters)) =
-                        (merged_in, merged_membership)
-                    {
-                        self.log_in_filters("publish", &in_filters);
-                        self.log_membership_filters("publish", &membership_filters);
-                        if let Some(profile) = self.profiles.as_ref() {
-                            profile.common.counter_set_unit(
-                                "RuntimeFilterNum",
-                                membership_filters.len() as i64,
-                            );
-                            profile
-                                .common
-                                .counter_set_unit("RuntimeInFilterNum", in_filters.len() as i64);
-                        }
-                        let local_filters = self.build_local_filters(&in_filters);
-                        let membership_for_publish = membership_filters.clone();
-                        let membership_for_remote =
-                            self.filter_membership_for_remote(&membership_filters);
-                        self.runtime_filter_hub()?
-                            .publish_filters(&local_filters, &membership_for_publish);
-                        self.record_built_lifecycle(state, &membership_for_publish);
-                        self.send_runtime_filters_remote(state, &membership_for_remote)?;
-                    }
-                } else {
-                    let in_filters = in_filters;
-                    let membership_filters = self.build_membership_filters_from_params(
-                        self.build_row_count as u64,
-                        &membership_params,
-                        membership_build_options,
-                    )?;
-                    self.log_in_filters("publish", &in_filters);
-                    self.log_membership_filters("publish", &membership_filters);
-                    if let Some(profile) = self.profiles.as_ref() {
-                        profile
-                            .common
-                            .counter_set_unit("RuntimeFilterNum", membership_filters.len() as i64);
-                        profile
-                            .common
-                            .counter_set_unit("RuntimeInFilterNum", in_filters.len() as i64);
-                    }
-                    let local_filters = self.build_local_filters(&in_filters);
-                    let membership_for_publish = membership_filters.clone();
-                    let membership_for_remote =
-                        self.filter_membership_for_remote(&membership_filters);
-                    self.runtime_filter_hub()?
-                        .publish_filters(&local_filters, &membership_for_publish);
-                    self.record_built_lifecycle(state, &membership_for_publish);
-                    self.send_runtime_filters_remote(state, &membership_for_remote)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn record_built_lifecycle(&self, state: &RuntimeState, filters: &[RuntimeMembershipFilter]) {
-        let Some(query_id) = state.query_id() else {
-            return;
-        };
-        let recorder = RuntimeFilterLifecycleRegistry::global()
-            .recorder(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
-        for filter in filters {
-            recorder.built(
-                filter.filter_id(),
-                self.build_row_count as i64,
-                filter.size() as i64,
-            );
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn record_sent_lifecycle(
-        &self,
-        query_id: crate::runtime::query_context::QueryId,
-        filter_id: i32,
-        bytes: usize,
-    ) {
-        RuntimeFilterLifecycleRegistry::global()
-            .recorder(QueryKey::from_hi_lo(query_id.hi, query_id.lo))
-            .sent_partial(filter_id, bytes as i64);
-    }
-
-    #[cfg(feature = "compat")]
-    fn send_runtime_filters_remote(
-        &self,
-        state: &RuntimeState,
-        filters: &[RuntimeMembershipFilter],
-    ) -> Result<(), String> {
-        let remote_specs: Vec<&CompatJoinRuntimeFilterSpec> = self
-            .runtime_filter_specs()
-            .iter()
-            .filter(|spec| spec.has_remote_targets)
-            .collect();
-        if remote_specs.is_empty() {
-            return Ok(());
-        }
-
-        let Some(query_id) = state.query_id() else {
-            return Ok(());
-        };
-        let id_to_probers = state
-            .runtime_filter_params()
-            .map(|params| params.id_to_prober_params());
-        let filters: Vec<RuntimeMembershipFilter> = if filters.is_empty() {
-            self.build_empty_remote_membership_filters(&remote_specs)?
-        } else {
-            filters.to_vec()
-        };
-        if filters.is_empty() {
-            return Ok(());
-        }
-        let build_be_number = state.backend_num().unwrap_or(0);
-
-        let mut encoded_bytes: i64 = 0;
-        for filter in &filters {
-            if self.distribution_mode == JoinDistributionMode::Broadcast && filter.size() == 0 {
-                continue;
-            }
-            let Some(spec) = self
-                .runtime_filter_specs()
-                .iter()
-                .find(|spec| spec.filter_id == filter.filter_id())
-            else {
-                continue;
-            };
-            let use_merge_nodes = !spec.merge_nodes.is_empty();
-            if !use_merge_nodes && self.distribution_mode == JoinDistributionMode::Partitioned {
-                warn!(
-                    "partitioned runtime filter missing merge nodes: filter_id={}",
-                    filter.filter_id()
-                );
-                continue;
-            }
-
-            let data = match filter {
-                RuntimeMembershipFilter::Bloom(bloom) => {
-                    match encode_starrocks_bloom_filter(bloom) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(
-                                "skip remote runtime filter encode: filter_id={} err={}",
-                                filter.filter_id(),
-                                e
-                            );
-                            continue;
-                        }
-                    }
-                }
-                RuntimeMembershipFilter::Empty(empty) => {
-                    match encode_starrocks_empty_filter(empty) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(
-                                "skip remote runtime filter encode: filter_id={} err={}",
-                                filter.filter_id(),
-                                e
-                            );
-                            continue;
-                        }
-                    }
-                }
-                RuntimeMembershipFilter::Bitset(bitset) => {
-                    match encode_starrocks_bitset_filter(bitset) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(
-                                "skip remote runtime filter encode: filter_id={} err={}",
-                                filter.filter_id(),
-                                e
-                            );
-                            continue;
-                        }
-                    }
-                }
-            };
-            encoded_bytes = encoded_bytes.saturating_add(data.len() as i64);
-
-            let mut recorded_sent = false;
-            let mut seen_hosts = HashSet::new();
-            if use_merge_nodes {
-                for addr in &spec.merge_nodes {
-                    if addr.host.is_empty() {
-                        continue;
-                    }
-                    if !seen_hosts.insert(addr.host.clone()) {
-                        continue;
-                    }
-                    let req = RuntimeFilterTransmission {
-                        is_partial: true,
-                        query_id: crate::common::types::UniqueId {
-                            hi: query_id.hi,
-                            lo: query_id.lo,
-                        },
-                        filter_id: filter.filter_id(),
-                        data: data.clone(),
-                        build_be_number,
-                        column_type: Some(spec.build_data_type.clone()),
-                    };
-                    let dest_port = addr.port as u16;
-                    if !recorded_sent {
-                        self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());
-                        recorded_sent = true;
-                    }
-                    if let Err(e) = exchange_sender::send_runtime_filter(&addr.host, dest_port, req)
-                    {
-                        warn!(
-                            "send runtime filter failed: dest={} filter_id={} err={}",
-                            addr.host,
-                            filter.filter_id(),
-                            e
-                        );
-                    }
-                }
-            } else {
-                let Some(id_to_probers) = id_to_probers else {
-                    continue;
-                };
-                let Some(probers) = id_to_probers.get(&filter.filter_id()) else {
-                    continue;
-                };
-                for prober in probers {
-                    let endpoint = prober.endpoint();
-                    if !seen_hosts.insert(endpoint.host().to_string()) {
-                        continue;
-                    }
-                    let req = RuntimeFilterTransmission {
-                        is_partial: false,
-                        query_id: crate::common::types::UniqueId {
-                            hi: query_id.hi,
-                            lo: query_id.lo,
-                        },
-                        filter_id: filter.filter_id(),
-                        data: data.clone(),
-                        build_be_number: 0,
-                        column_type: None,
-                    };
-                    let dest_port = endpoint.port() as u16;
-                    if !recorded_sent {
-                        self.record_sent_lifecycle(query_id, filter.filter_id(), data.len());
-                        recorded_sent = true;
-                    }
-                    if let Err(e) =
-                        exchange_sender::send_runtime_filter(endpoint.host(), dest_port, req)
-                    {
-                        warn!(
-                            "send runtime filter failed: dest={} filter_id={} err={}",
-                            endpoint.host(),
-                            filter.filter_id(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-        if encoded_bytes > 0
-            && let Some(profile) = self.profiles.as_ref()
-        {
-            profile
-                .common
-                .counter_add_bytes("PartialRuntimeMembershipFilterBytes", encoded_bytes);
-        }
+    fn publish_runtime_filters(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        // Native runtime filters are produced through RuntimeFilterService, not here.
         Ok(())
-    }
-
-    #[cfg(feature = "compat")]
-    fn filter_membership_for_remote(
-        &self,
-        filters: &[RuntimeMembershipFilter],
-    ) -> Vec<RuntimeMembershipFilter> {
-        if filters.is_empty() {
-            return Vec::new();
-        }
-        let mut spec_by_id = HashMap::with_capacity(self.runtime_filter_specs().len());
-        for spec in self.runtime_filter_specs() {
-            spec_by_id.insert(spec.filter_id, spec);
-        }
-        filters
-            .iter()
-            .filter(|filter| {
-                spec_by_id
-                    .get(&filter.filter_id())
-                    .map(|spec| spec.has_remote_targets)
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect()
-    }
-
-    #[cfg(feature = "compat")]
-    fn log_in_filters(&self, label: &str, filters: &[RuntimeInFilter]) {
-        debug!(
-            "runtime in filters {}: node_id={} partition={} count={}",
-            label,
-            self.node_id,
-            self.partition,
-            filters.len()
-        );
-        for filter in filters {
-            debug!(
-                "runtime in filter {}: node_id={} partition={} filter_id={} slot_id={:?} empty={}",
-                label,
-                self.node_id,
-                self.partition,
-                filter.filter_id(),
-                filter.slot_id(),
-                filter.is_empty()
-            );
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn log_membership_filters(&self, label: &str, filters: &[RuntimeMembershipFilter]) {
-        debug!(
-            "runtime membership filters {}: node_id={} partition={} count={}",
-            label,
-            self.node_id,
-            self.partition,
-            filters.len()
-        );
-        for filter in filters {
-            let kind = match filter {
-                RuntimeMembershipFilter::Bloom(_) => "bloom",
-                RuntimeMembershipFilter::Bitset(_) => "bitset",
-                RuntimeMembershipFilter::Empty(_) => "empty",
-            };
-            debug!(
-                "runtime membership filter {}: node_id={} partition={} filter_id={} kind={} slot_id={:?} ltype={:?} size={} has_null={} join_mode={} empty={}",
-                label,
-                self.node_id,
-                self.partition,
-                filter.filter_id(),
-                kind,
-                filter.slot_id(),
-                filter.ltype(),
-                filter.size(),
-                filter.has_null(),
-                filter.join_mode(),
-                filter.is_empty()
-            );
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn add_runtime_filter_drop_counters_to_profile(
-        &self,
-        counters: RuntimeFilterMergeDropCounters,
-    ) {
-        let Some(profile) = self.profiles.as_ref() else {
-            return;
-        };
-        if counters.in_filters > 0 {
-            profile
-                .common
-                .counter_add_unit("RuntimeInFilterDropped", counters.in_filters as i64);
-        }
-        if counters.membership_filters > 0 {
-            profile.common.counter_add_unit(
-                "RuntimeMembershipFilterDropped",
-                counters.membership_filters as i64,
-            );
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn build_membership_filter_params(
-        &self,
-    ) -> Result<Vec<RuntimeMembershipFilterBuildParam>, String> {
-        if self.runtime_filter_specs().is_empty() {
-            return Ok(Vec::new());
-        }
-        let join_mode: i8 = match self.distribution_mode {
-            JoinDistributionMode::Broadcast => RUNTIME_FILTER_JOIN_MODE_BROADCAST,
-            JoinDistributionMode::Partitioned => RUNTIME_FILTER_JOIN_MODE_PARTITIONED,
-        };
-        let mut params = Vec::with_capacity(self.runtime_filter_specs().len());
-        for spec in self.runtime_filter_specs() {
-            let Some(data_type) = self
-                .build_keys
-                .get(spec.expr_order)
-                .and_then(|id| self.arena.data_type(*id))
-            else {
-                return Err(format!(
-                    "runtime membership filter missing build key type: filter_id={} expr_order={}",
-                    spec.filter_id, spec.expr_order
-                ));
-            };
-            let ltype = RuntimeFilterType::from_arrow_data_type(data_type).map_err(|e| {
-                format!(
-                    "runtime membership filter unsupported build key type: filter_id={} expr_order={} err={}",
-                    spec.filter_id, spec.expr_order, e
-                )
-            })?;
-            params.push(RuntimeMembershipFilterBuildParam::new(
-                spec.filter_id,
-                spec.probe_slot_id,
-                ltype,
-                join_mode,
-            ));
-        }
-
-        if self.build_row_count == 0 || params.is_empty() {
-            return Ok(params);
-        }
-
-        // Collect build values from `build_key_batches`: they hold the already
-        // evaluated key arrays for every sunk chunk and are retained until
-        // after publish regardless of row-payload elision. `build_input_chunks`
-        // must NOT be used here — presence-only builds (e.g. LEFT SEMI without
-        // residual) do not retain input chunks, and collecting from them would
-        // publish an empty membership filter that wrongly prunes every probe
-        // row while build_row_count > 0.
-        for batch in &self.build_key_batches {
-            for (idx, spec) in self.runtime_filter_specs().iter().enumerate() {
-                let Some(array) = batch.arrays().get(spec.expr_order) else {
-                    continue;
-                };
-                if let Some(param) = params.get_mut(idx) {
-                    param.add_array(Arc::clone(array));
-                }
-            }
-        }
-
-        Ok(params)
-    }
-
-    #[cfg(feature = "compat")]
-    fn build_membership_filters_from_params(
-        &self,
-        total_rows: u64,
-        params: &[RuntimeMembershipFilterBuildParam],
-        options: RuntimeMembershipBuildOptions,
-    ) -> Result<Vec<RuntimeMembershipFilter>, String> {
-        if params.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut filters = Vec::with_capacity(params.len());
-        for param in params {
-            let min_max = RuntimeMinMaxFilter::from_arrays(param.ltype(), param.arrays())?;
-            if total_rows == 0 {
-                filters.push(RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
-                    param.filter_id(),
-                    param.slot_id(),
-                    param.ltype(),
-                    false,
-                    param.join_mode(),
-                    0,
-                    min_max,
-                )));
-                continue;
-            }
-            let can_try_bitset = options.enable_join_runtime_bitset_filter
-                && total_rows <= options.global_runtime_filter_build_max_size
-                && param.join_mode() == RUNTIME_FILTER_JOIN_MODE_BROADCAST;
-            if can_try_bitset
-                && let Some(bitset) = maybe_build_runtime_bitset_filter(
-                    param.filter_id(),
-                    param.slot_id(),
-                    param.ltype(),
-                    param.join_mode(),
-                    total_rows,
-                    param.arrays(),
-                    min_max.clone(),
-                )?
-            {
-                filters.push(RuntimeMembershipFilter::Bitset(bitset));
-                continue;
-            }
-            let mut bloom = RuntimeBloomFilter::with_capacity(
-                param.filter_id(),
-                param.slot_id(),
-                param.ltype(),
-                param.join_mode(),
-                total_rows,
-                min_max,
-            );
-            for array in param.arrays() {
-                bloom.insert_array(array)?;
-            }
-            filters.push(RuntimeMembershipFilter::Bloom(bloom));
-        }
-        Ok(filters)
-    }
-
-    #[cfg(feature = "compat")]
-    fn membership_build_options(&self, state: &RuntimeState) -> RuntimeMembershipBuildOptions {
-        let opts = state.query_options();
-        let enabled = opts
-            .and_then(|o| o.enable_join_runtime_bitset_filter)
-            .unwrap_or(true)
-            && self.distribution_mode == JoinDistributionMode::Broadcast;
-        let global_limit = opts
-            .and_then(|o| o.global_runtime_filter_build_max_size)
-            .and_then(|v| (v > 0).then_some(v as u64))
-            .unwrap_or(u64::MAX);
-        RuntimeMembershipBuildOptions {
-            enable_join_runtime_bitset_filter: enabled,
-            global_runtime_filter_build_max_size: global_limit,
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn build_local_filters(&self, filters: &[RuntimeInFilter]) -> Vec<RuntimeInFilter> {
-        if filters.len() == self.runtime_filter_specs().len() {
-            return filters.to_vec();
-        }
-        let mut by_id: HashMap<i32, RuntimeInFilter> = HashMap::new();
-        for filter in filters {
-            by_id.insert(filter.filter_id(), filter.clone());
-        }
-        for spec in self.runtime_filter_specs() {
-            if by_id.contains_key(&spec.filter_id) {
-                continue;
-            }
-            let Some(expr) = self.build_keys.get(spec.expr_order) else {
-                continue;
-            };
-            let Some(data_type) = self.arena.data_type(*expr) else {
-                continue;
-            };
-            match RuntimeInFilter::empty(spec.filter_id, spec.probe_slot_id, data_type) {
-                Ok(filter) => {
-                    by_id.insert(spec.filter_id, filter);
-                }
-                Err(e) => warn!(
-                    "skip empty runtime filter for local: filter_id={} err={}",
-                    spec.filter_id, e
-                ),
-            }
-        }
-        by_id.into_values().collect()
-    }
-
-    #[allow(dead_code)]
-    #[cfg(feature = "compat")]
-    fn build_empty_remote_filters(&self) -> Vec<RuntimeInFilter> {
-        let mut filters = Vec::new();
-        for spec in self.runtime_filter_specs() {
-            let Some(expr) = self.build_keys.get(spec.expr_order) else {
-                continue;
-            };
-            let Some(data_type) = self.arena.data_type(*expr) else {
-                continue;
-            };
-            match RuntimeInFilter::empty(spec.filter_id, spec.probe_slot_id, data_type) {
-                Ok(filter) => filters.push(filter),
-                Err(e) => warn!(
-                    "skip empty runtime filter for remote: filter_id={} err={}",
-                    spec.filter_id, e
-                ),
-            }
-        }
-        filters
-    }
-
-    #[cfg(feature = "compat")]
-    fn build_empty_remote_membership_filters(
-        &self,
-        specs: &[&CompatJoinRuntimeFilterSpec],
-    ) -> Result<Vec<RuntimeMembershipFilter>, String> {
-        let join_mode: i8 = match self.distribution_mode {
-            JoinDistributionMode::Broadcast => RUNTIME_FILTER_JOIN_MODE_BROADCAST,
-            JoinDistributionMode::Partitioned => RUNTIME_FILTER_JOIN_MODE_PARTITIONED,
-        };
-        let mut filters = Vec::new();
-        for spec in specs {
-            let Some(data_type) = self
-                .build_keys
-                .get(spec.expr_order)
-                .and_then(|id| self.arena.data_type(*id))
-            else {
-                return Err(format!(
-                    "runtime membership filter missing build key type: filter_id={} expr_order={}",
-                    spec.filter_id, spec.expr_order
-                ));
-            };
-            let ltype = RuntimeFilterType::from_arrow_data_type(data_type).map_err(|e| {
-                format!(
-                    "runtime membership filter unsupported build key type: filter_id={} expr_order={} err={}",
-                    spec.filter_id, spec.expr_order, e
-                )
-            })?;
-            let min_max = if self.build_row_count == 0 {
-                RuntimeMinMaxFilter::empty_range(ltype)?
-            } else {
-                RuntimeMinMaxFilter::full_range(ltype)?
-            };
-            filters.push(RuntimeMembershipFilter::Empty(RuntimeEmptyFilter::new(
-                spec.filter_id,
-                spec.probe_slot_id,
-                ltype,
-                false,
-                join_mode,
-                0,
-                min_max,
-            )));
-        }
-        Ok(filters)
-    }
-
-    #[cfg(feature = "compat")]
-    fn runtime_filter_hash_seed(&self) -> Result<u64, String> {
-        if let Some(table) = self.build_table.as_ref() {
-            return Ok(table.hash_seed());
-        }
-        let mut key_types = Vec::with_capacity(self.build_keys.len());
-        for expr in &self.build_keys {
-            let data_type = self
-                .arena
-                .data_type(*expr)
-                .ok_or_else(|| "runtime filter build key type missing".to_string())?;
-            key_types.push(data_type.clone());
-        }
-        let temp_table = JoinHashMap::new_chained(key_types, self.eq_null_safe.clone())
-            .map_err(|e| e.to_string())?;
-        Ok(temp_table.hash_seed())
     }
 
     fn init_profile_if_needed(&mut self) {

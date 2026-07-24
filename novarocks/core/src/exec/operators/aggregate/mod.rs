@@ -46,15 +46,9 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-#[cfg(feature = "compat")]
-use crate::exec::node::aggregate::TopNRuntimeFilterSpec;
 use crate::exec::node::aggregate::{AggFunction, NativeAggregateTopNProducerSpec};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-#[cfg(feature = "compat")]
-use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
-#[cfg(feature = "compat")]
-use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 use crate::exec::hash_table::key_builder::build_group_key_views;
@@ -398,15 +392,8 @@ pub struct AggregateProcessorFactory {
 }
 
 #[derive(Clone)]
-enum AggregateRuntimeFilterExecution {
-    Native {
-        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
-    },
-    #[cfg(feature = "compat")]
-    Compat {
-        topn_specs: Vec<TopNRuntimeFilterSpec>,
-        hub: Arc<RuntimeFilterHub>,
-    },
+struct AggregateRuntimeFilterExecution {
+    topn_producers: Vec<NativeAggregateTopNProducerSpec>,
 }
 
 impl AggregateProcessorFactory {
@@ -493,51 +480,13 @@ impl AggregateProcessorFactory {
             output_intermediate,
             direct_input,
             output_chunk_schema,
-            runtime_filter_execution: AggregateRuntimeFilterExecution::Native { topn_producers },
+            runtime_filter_execution: AggregateRuntimeFilterExecution { topn_producers },
             native_topn_session_factory,
             final_domain_session,
             final_domain_shape_error,
             #[cfg(test)]
             fail_output_construction: false,
         })
-    }
-
-    #[cfg(feature = "compat")]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_compat(
-        node_id: i32,
-        arena: Arc<ExprArena>,
-        group_by: Vec<ExprId>,
-        functions: Vec<AggFunction>,
-        output_intermediate: bool,
-        direct_input: bool,
-        output_chunk_schema: ChunkSchemaRef,
-        topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-        runtime_filter_hub: Arc<RuntimeFilterHub>,
-    ) -> Self {
-        let name = if node_id >= 0 {
-            format!("AGGREGATE (id={node_id})")
-        } else {
-            "AGGREGATE".to_string()
-        };
-        Self {
-            name,
-            arena,
-            group_by,
-            functions,
-            output_intermediate,
-            direct_input,
-            output_chunk_schema,
-            runtime_filter_execution: AggregateRuntimeFilterExecution::Compat {
-                topn_specs: topn_rf_specs,
-                hub: runtime_filter_hub,
-            },
-            native_topn_session_factory: None,
-            final_domain_session: None,
-            final_domain_shape_error: None,
-            #[cfg(test)]
-            fail_output_construction: false,
-        }
     }
 
     #[cfg(test)]
@@ -622,11 +571,7 @@ impl OperatorFactory for AggregateProcessorFactory {
 
     #[cfg(test)]
     fn native_aggregate_topn_producers(&self) -> &[NativeAggregateTopNProducerSpec] {
-        match &self.runtime_filter_execution {
-            AggregateRuntimeFilterExecution::Native { topn_producers } => topn_producers,
-            #[cfg(feature = "compat")]
-            AggregateRuntimeFilterExecution::Compat { .. } => &[],
-        }
+        &self.runtime_filter_execution.topn_producers
     }
 }
 
@@ -775,51 +720,6 @@ impl AggregateProcessorOperator {
             group_key_nullable,
         )?);
         Ok(())
-    }
-
-    #[cfg(feature = "compat")]
-    fn try_publish_legacy_topn_runtime_filter(&mut self) {
-        const PUBLISH_THRESHOLD: usize = 4096;
-
-        let AggregateRuntimeFilterExecution::Compat { topn_specs, hub } =
-            &self.runtime_filter_execution
-        else {
-            return;
-        };
-        if topn_specs.is_empty() {
-            return;
-        }
-        let Some(key_table) = &self.key_table else {
-            return;
-        };
-        if self.topn_rf_rows_since_publish < PUBLISH_THRESHOLD {
-            return;
-        }
-
-        for spec in topn_specs {
-            if key_table.group_count() < spec.limit {
-                continue;
-            }
-            // Get the group-by key column at expr_order.
-            let key_columns = key_table.key_columns();
-            let Some(key_col) = key_columns.get(spec.expr_order) else {
-                continue;
-            };
-            let column_array = match key_col.to_array() {
-                Ok(arr) => arr,
-                Err(_) => continue,
-            };
-            let filter = match RuntimeMinMaxFilter::from_array_one_sided(
-                spec.build_type,
-                &column_array,
-                spec.is_asc,
-            ) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            hub.publish_min_max_filter(spec.filter_id, filter);
-        }
-        self.topn_rf_rows_since_publish = 0;
     }
 
     fn try_submit_native_topn_bound(&mut self) -> Result<(), String> {
@@ -1216,8 +1116,6 @@ impl ProcessorOperator for AggregateProcessorOperator {
                 return Err("aggregate produced output before finishing".to_string());
             }
             self.topn_rf_rows_since_publish += num_rows;
-            #[cfg(feature = "compat")]
-            self.try_publish_legacy_topn_runtime_filter();
             self.try_submit_native_topn_bound()?;
             Ok(())
         })();
@@ -1479,11 +1377,7 @@ impl AggregateProcessorOperator {
             return Ok(());
         }
 
-        let native_topn_producers = match &self.runtime_filter_execution {
-            AggregateRuntimeFilterExecution::Native { topn_producers } => topn_producers.as_slice(),
-            #[cfg(feature = "compat")]
-            AggregateRuntimeFilterExecution::Compat { .. } => &[],
-        };
+        let native_topn_producers = self.runtime_filter_execution.topn_producers.as_slice();
         self.topn_boundary_bindings = build_topn_boundary_bindings(native_topn_producers)
             .map_err(|error| error.to_string())?;
 
@@ -1795,7 +1689,7 @@ fn aggregate_topn_test_operator(
         output_intermediate: false,
         direct_input: false,
         output_chunk_schema: Arc::new(ChunkSchema::empty()),
-        runtime_filter_execution: AggregateRuntimeFilterExecution::Native { topn_producers },
+        runtime_filter_execution: AggregateRuntimeFilterExecution { topn_producers },
         native_topn_session_factory: Some(Arc::new(session_factory)),
         final_domain_session: None,
         final_domain_shape_error: None,
@@ -2075,33 +1969,6 @@ mod tests {
             session,
         )
         .expect("build aggregate factory")
-    }
-
-    #[cfg(feature = "compat")]
-    fn compat_aggregate_factory() -> AggregateProcessorFactory {
-        let mut arena = ExprArena::default();
-        let group_expr = arena.push_typed(ExprNode::SlotId(GROUP_SLOT), DataType::Int64);
-        let output_field = Field::new("group_key", DataType::Int64, true);
-        let output_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                ChunkSlotSchema::from_field(GROUP_SLOT, &output_field, None)
-                    .expect("aggregate output slot"),
-            ])
-            .expect("aggregate output schema"),
-        );
-        AggregateProcessorFactory::new_compat(
-            7,
-            Arc::new(arena),
-            vec![group_expr],
-            Vec::new(),
-            false,
-            true,
-            output_schema,
-            Vec::new(),
-            Arc::new(crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(
-                crate::exec::pipeline::dependency::DependencyManager::new(),
-            )),
-        )
     }
 
     fn group_chunk(values: impl IntoIterator<Item = i64>) -> Chunk {
@@ -2553,24 +2420,6 @@ mod tests {
         processor
             .push_chunk(&state, group_chunk([4]))
             .expect("sessionless completed aggregate preserves terminal no-op input");
-        assert!(processor.is_finished());
-        assert!(!processor.has_output());
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_aggregate_without_session_preserves_completed_push_noop() {
-        let factory = compat_aggregate_factory();
-        let mut operator = prepare_processor(&factory, 1, 0);
-        let output = finish_operator(&mut operator, [3, 1, 3, 2]);
-        assert_eq!(sorted_int64_output(&output), vec![1, 2, 3]);
-        assert!(operator.is_finished());
-
-        let state = RuntimeState::default();
-        let processor = operator.as_processor_mut().expect("aggregate processor");
-        processor
-            .push_chunk(&state, group_chunk([4]))
-            .expect("compat completed aggregate preserves terminal no-op input");
         assert!(processor.is_finished());
         assert!(!processor.has_output());
     }

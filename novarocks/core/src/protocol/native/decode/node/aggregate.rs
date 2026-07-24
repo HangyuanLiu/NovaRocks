@@ -235,7 +235,7 @@ pub(super) fn lower_hash_aggregate_node(
                 need_finalize,
                 input_is_intermediate,
                 output_chunk_schema: aggregate_output_schema.clone(),
-                runtime_filter_spec: AggregateRuntimeFilterSpec::Native {
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
                     topn_producers: Vec::new(),
                 },
                 streaming_preaggregation_mode: None,

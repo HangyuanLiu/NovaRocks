@@ -40,6 +40,7 @@ use hashbrown::HashSet;
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicateValue;
 use crate::exec::chunk::Chunk;
+#[cfg(feature = "compat")]
 use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 use novarocks_types::largeint;
 
@@ -1101,6 +1102,7 @@ impl RuntimeInFilter {
 }
 
 impl LocalRuntimeInFilterSet {
+    #[cfg(feature = "compat")]
     pub(crate) fn new(
         specs: &[CompatJoinRuntimeFilterSpec],
         key_arrays: &[ArrayRef],

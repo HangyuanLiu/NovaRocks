@@ -950,7 +950,7 @@ fn attach_hash_join_producers(
             reduction: native_reduction(&binding.reduction),
         });
     }
-    join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
+    join.runtime_filter_execution = JoinRuntimeFilterExecution { producers };
     Ok(())
 }
 
@@ -1122,7 +1122,7 @@ fn attach_hash_aggregate_producers(
             completion_requirement: *completion_requirement,
         });
     }
-    aggregate.runtime_filter_spec = AggregateRuntimeFilterSpec::Native {
+    aggregate.runtime_filter_spec = AggregateRuntimeFilterSpec {
         topn_producers: producers,
     };
     Ok(())
@@ -2539,9 +2539,7 @@ mod tests {
         let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("producer seam")
         };
-        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
-            panic!("native producer execution")
-        };
+        let JoinRuntimeFilterExecution { producers } = join.runtime_filter_execution;
         assert_eq!(producers.len(), 1);
 
         let mut nullable_mismatch = column_ref(2, DataType::Int64);
@@ -2667,10 +2665,7 @@ mod tests {
         let ExecNodeKind::Aggregate(aggregate) = project.input.kind else {
             panic!("producer must attach to the physical aggregate below the projection")
         };
-        let AggregateRuntimeFilterSpec::Native { topn_producers } = aggregate.runtime_filter_spec
-        else {
-            panic!("native aggregate runtime-filter execution")
-        };
+        let AggregateRuntimeFilterSpec { topn_producers } = aggregate.runtime_filter_spec;
         assert_eq!(topn_producers.len(), 1);
         let spec = &topn_producers[0];
         assert_eq!(spec.binding_id, 1);
@@ -2700,8 +2695,8 @@ mod tests {
             keys[0].null_order(),
             crate::runtime_filter::model::contract::NullOrder::First
         );
-        assert_ne!(*comparator_digest, [0; 32]);
-        assert_ne!(*order_contract_digest, [0; 32]);
+        assert_ne!(comparator_digest, [0; 32]);
+        assert_ne!(order_contract_digest, [0; 32]);
         assert_eq!(
             spec.reduction,
             NativeRuntimeFilterReduction::TightenOrderedBound
@@ -2772,10 +2767,7 @@ mod tests {
         let ExecNodeKind::Aggregate(aggregate) = project.input.kind else {
             panic!("binding must target the unique physical aggregate below controlled wrappers")
         };
-        let AggregateRuntimeFilterSpec::Native { topn_producers } = aggregate.runtime_filter_spec
-        else {
-            panic!("native aggregate runtime-filter execution")
-        };
+        let AggregateRuntimeFilterSpec { topn_producers } = aggregate.runtime_filter_spec;
         assert_eq!(topn_producers.len(), 1);
         assert_eq!(topn_producers[0].binding_id, 1);
     }
@@ -3058,9 +3050,7 @@ mod tests {
             panic!("producer seam")
         };
         let lowered_build_key = join.build_keys[0];
-        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
-            panic!("native producer execution")
-        };
+        let JoinRuntimeFilterExecution { producers } = join.runtime_filter_execution;
         let build_expr_id = producers[0].build_expr_id;
         assert_eq!(
             build_expr_id, lowered_build_key,
@@ -3114,9 +3104,7 @@ mod tests {
         let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("producer seam")
         };
-        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
-            panic!("native producer execution")
-        };
+        let JoinRuntimeFilterExecution { producers } = join.runtime_filter_execution;
         assert_eq!(
             producers
                 .iter()
@@ -3180,9 +3168,7 @@ mod tests {
         let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("producer seam")
         };
-        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
-            panic!("native producer execution")
-        };
+        let JoinRuntimeFilterExecution { producers } = join.runtime_filter_execution;
         assert_eq!(
             producers
                 .iter()
@@ -3281,7 +3267,6 @@ mod tests {
             panic!("scan")
         };
         assert_eq!(scan.native_runtime_filter_specs().len(), 1);
-        assert!(scan.runtime_filter_specs().is_empty());
     }
 
     #[test]
@@ -3321,7 +3306,6 @@ mod tests {
             panic!("exchange")
         };
         assert_eq!(exchange.native_runtime_filter_specs().len(), 1);
-        assert!(exchange.runtime_filter_specs().is_empty());
     }
 
     #[test]
@@ -3427,7 +3411,6 @@ mod tests {
             panic!("scan remains the direct input")
         };
         assert!(scan.native_runtime_filter_specs().is_empty());
-        assert!(scan.runtime_filter_specs().is_empty());
     }
 
     #[test]

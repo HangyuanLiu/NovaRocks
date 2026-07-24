@@ -42,7 +42,6 @@ pub use iceberg_delta_scan::{
     EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
 };
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::aggregate::AggregateNode;
@@ -68,14 +67,6 @@ use crate::exec::node::values::ValuesNode;
 
 pub type ExecResult = Result<Chunk, String>;
 pub type BoxedExecIter = Box<dyn Iterator<Item = ExecResult> + Send>;
-
-#[derive(Clone, Debug)]
-pub struct RuntimeFilterProbeSpec {
-    pub filter_id: i32,
-    pub expr_id: ExprId,
-    pub slot_id: SlotId,
-    pub data_type: arrow::datatypes::DataType,
-}
 
 #[derive(Clone, Debug)]
 pub enum ExecNodeKind {

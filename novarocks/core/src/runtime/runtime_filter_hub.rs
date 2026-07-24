@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::common::ids::SlotId;
+#[cfg(feature = "compat")]
 use crate::exec::node::RuntimeFilterProbeSpec;
+#[cfg(feature = "compat")]
 use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 use crate::exec::pipeline::dependency::{DependencyHandle, DependencyManager};
 use crate::exec::runtime_filter::{
@@ -278,6 +280,7 @@ impl RuntimeFilterHub {
         self.wait_timeout_ms.store(wait_ms, Ordering::Release);
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn register_filter_specs(
         &self,
         node_id: i32,
@@ -304,6 +307,7 @@ impl RuntimeFilterHub {
         );
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn register_probe_specs(&self, node_id: i32, specs: &[RuntimeFilterProbeSpec]) {
         if specs.is_empty() {
             return;
@@ -984,7 +988,7 @@ fn ms_to_duration(ms: i64) -> Option<Duration> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::time::Duration;
 

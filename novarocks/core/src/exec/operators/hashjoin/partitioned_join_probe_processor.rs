@@ -30,9 +30,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use super::hash_join_probe_core::{
-    HashJoinProbeCore, JoinProbeRuntimeFilterExecution, join_type_str,
-};
+use super::hash_join_probe_core::{HashJoinProbeCore, join_type_str};
 use super::partitioned_join_shared::PartitionedJoinSharedState;
 use crate::common::config::operator_buffer_chunks;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -58,7 +56,6 @@ pub struct PartitionedJoinProbeProcessorFactory {
     right_chunk_schema: ChunkSchemaRef,
     join_scope_chunk_schema: ChunkSchemaRef,
     state: Arc<PartitionedJoinSharedState>,
-    runtime_filter_execution: JoinProbeRuntimeFilterExecution,
 }
 
 impl PartitionedJoinProbeProcessorFactory {
@@ -86,36 +83,6 @@ impl PartitionedJoinProbeProcessorFactory {
             right_chunk_schema,
             join_scope_chunk_schema,
             state,
-            JoinProbeRuntimeFilterExecution::Native,
-        )
-    }
-
-    #[cfg(feature = "compat")]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_compat(
-        arena: Arc<ExprArena>,
-        join_type: JoinType,
-        probe_keys: Vec<ExprId>,
-        residual_predicate: Option<ExprId>,
-        probe_is_left: bool,
-        has_equi_keys: bool,
-        left_chunk_schema: ChunkSchemaRef,
-        right_chunk_schema: ChunkSchemaRef,
-        join_scope_chunk_schema: ChunkSchemaRef,
-        state: Arc<PartitionedJoinSharedState>,
-    ) -> Self {
-        Self::new_in_mode(
-            arena,
-            join_type,
-            probe_keys,
-            residual_predicate,
-            probe_is_left,
-            has_equi_keys,
-            left_chunk_schema,
-            right_chunk_schema,
-            join_scope_chunk_schema,
-            state,
-            JoinProbeRuntimeFilterExecution::Compat,
         )
     }
 
@@ -131,7 +98,6 @@ impl PartitionedJoinProbeProcessorFactory {
         right_chunk_schema: ChunkSchemaRef,
         join_scope_chunk_schema: ChunkSchemaRef,
         state: Arc<PartitionedJoinSharedState>,
-        runtime_filter_execution: JoinProbeRuntimeFilterExecution,
     ) -> Self {
         let node_id = parse_join_node_id_from_dep_key(state.dep_name(0));
         Self {
@@ -147,7 +113,6 @@ impl PartitionedJoinProbeProcessorFactory {
             right_chunk_schema,
             join_scope_chunk_schema,
             state,
-            runtime_filter_execution,
         }
     }
 }
@@ -180,31 +145,17 @@ impl OperatorFactory for PartitionedJoinProbeProcessorFactory {
             finishing: false,
             finishing_done: false,
             finished: false,
-            core: match self.runtime_filter_execution {
-                JoinProbeRuntimeFilterExecution::Native => HashJoinProbeCore::new_native(
-                    Arc::clone(&self.arena),
-                    self.join_type,
-                    self.probe_keys.clone(),
-                    self.residual_predicate,
-                    self.probe_is_left,
-                    self.has_equi_keys,
-                    Arc::clone(&self.left_chunk_schema),
-                    Arc::clone(&self.right_chunk_schema),
-                    Arc::clone(&self.join_scope_chunk_schema),
-                ),
-                #[cfg(feature = "compat")]
-                JoinProbeRuntimeFilterExecution::Compat => HashJoinProbeCore::new_compat(
-                    Arc::clone(&self.arena),
-                    self.join_type,
-                    self.probe_keys.clone(),
-                    self.residual_predicate,
-                    self.probe_is_left,
-                    self.has_equi_keys,
-                    Arc::clone(&self.left_chunk_schema),
-                    Arc::clone(&self.right_chunk_schema),
-                    Arc::clone(&self.join_scope_chunk_schema),
-                ),
-            },
+            core: HashJoinProbeCore::new_native(
+                Arc::clone(&self.arena),
+                self.join_type,
+                self.probe_keys.clone(),
+                self.residual_predicate,
+                self.probe_is_left,
+                self.has_equi_keys,
+                Arc::clone(&self.left_chunk_schema),
+                Arc::clone(&self.right_chunk_schema),
+                Arc::clone(&self.join_scope_chunk_schema),
+            ),
             buffered_rows: 0,
             input_rows: 0,
             input_chunks: 0,
