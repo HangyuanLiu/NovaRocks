@@ -17,6 +17,7 @@
 
 pub(crate) mod boundary;
 pub(crate) mod build;
+mod cycle_forced_activation;
 mod fragment;
 mod node;
 pub(crate) mod output;
@@ -42,7 +43,8 @@ pub(crate) use output::{
     FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeOutputCatalog, WriteContractCatalog,
 };
 pub(crate) use runtime_filter_progress::{
-    FrontierEdge, JoinBuildProgressCatalog, JoinBuildProgressProof, JoinBuildProgressSkip,
+    FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
+    JoinBuildProgressSkip,
 };
 pub(crate) use seal::DistributedPlan;
 

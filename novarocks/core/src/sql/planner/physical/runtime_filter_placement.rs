@@ -43,7 +43,8 @@ impl RuntimeFilterPlacementConfig {
     pub(crate) fn from_current_session() -> Self {
         let s = current_session_optimizer_settings();
         Self {
-            enabled: !s.disabled_rules.iter().any(|r| r == RUNTIME_FILTER_RULE),
+            enabled: s.global_runtime_filter_enabled()
+                && !s.disabled_rules.iter().any(|r| r == RUNTIME_FILTER_RULE),
             build_max_bytes: s.rf_build_max_bytes.unwrap_or(64 * 1024 * 1024),
             build_min_bytes: s.rf_build_min_bytes.unwrap_or(128 * 1024),
             probe_min_bytes: s.rf_probe_min_bytes.unwrap_or(100 * 1024),
@@ -1052,6 +1053,7 @@ mod tests {
     #[test]
     fn config_disabled_when_rule_in_disabled_set() {
         let settings = SessionOptimizerSettings {
+            enable_global_runtime_filter: Some(true),
             disabled_rules: vec![RUNTIME_FILTER_RULE.to_string()],
             ..SessionOptimizerSettings::default()
         };
@@ -1059,6 +1061,61 @@ mod tests {
             RuntimeFilterPlacementConfig::from_current_session()
         });
         assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn global_runtime_filter_session_toggle_controls_placement() {
+        fn candidate_join() -> PhysicalPlanNode {
+            hash_join_node(
+                JoinKind::Inner,
+                JoinDistribution::Broadcast,
+                Some(JoinExecutionMode::Broadcast),
+                vec![eq_cond(
+                    col_ref(1, "probe_key"),
+                    col_ref(2, "build_key"),
+                    false,
+                )],
+                vec![
+                    leaf(vec![out_col(1, "probe_key")]),
+                    leaf(vec![out_col(2, "build_key")]),
+                ],
+                stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+            )
+        }
+
+        let disabled = SessionOptimizerSettings {
+            enable_global_runtime_filter: Some(false),
+            ..SessionOptimizerSettings::default()
+        };
+        let mut disabled_join = candidate_join();
+        with_session_optimizer_settings(disabled, || {
+            place_runtime_filters(&mut disabled_join);
+        });
+        assert!(
+            expect_hash_join(&disabled_join)
+                .build_runtime_filters
+                .is_empty()
+        );
+        assert!(
+            disabled_join
+                .children
+                .iter()
+                .all(|child| child.probe_runtime_filters.is_empty())
+        );
+
+        let enabled = SessionOptimizerSettings {
+            enable_global_runtime_filter: Some(true),
+            ..SessionOptimizerSettings::default()
+        };
+        let mut enabled_join = candidate_join();
+        with_session_optimizer_settings(enabled, || {
+            place_runtime_filters(&mut enabled_join);
+        });
+        assert_eq!(
+            expect_hash_join(&enabled_join).build_runtime_filters.len(),
+            1
+        );
+        assert_probe_filter(&enabled_join.children[0], 0, 1);
     }
 
     #[test]

@@ -164,6 +164,18 @@ pub(crate) enum ConsumerActivation {
     NonBlockingLive { late_apply: LateApplyGranularity },
 }
 
+impl ConsumerActivation {
+    pub(crate) fn is_blocking_or_batch_live(self) -> bool {
+        matches!(
+            self,
+            Self::BlockingSnapshot
+                | Self::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch
+                }
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterPolicyRequirement {
     pub max_contribution_bytes: u64,
@@ -208,6 +220,29 @@ mod tests {
     #[test]
     fn comparator_digest_round_trips_its_stable_bytes() {
         assert_eq!(ComparatorDigest::new([7; 32]).get(), [7; 32]);
+    }
+
+    #[test]
+    fn blocking_or_batch_live_activation_is_a_closed_set() {
+        assert!(ConsumerActivation::BlockingSnapshot.is_blocking_or_batch_live());
+        assert!(
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            }
+            .is_blocking_or_batch_live()
+        );
+
+        for late_apply in [
+            LateApplyGranularity::Row,
+            LateApplyGranularity::RowGroup,
+            LateApplyGranularity::Split,
+            LateApplyGranularity::File,
+        ] {
+            assert!(
+                !ConsumerActivation::NonBlockingLive { late_apply }.is_blocking_or_batch_live(),
+                "{late_apply:?} must remain outside the Join activation contract"
+            );
+        }
     }
 
     #[test]

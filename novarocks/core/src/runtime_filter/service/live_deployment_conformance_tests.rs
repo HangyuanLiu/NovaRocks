@@ -26,6 +26,7 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::scan_model::{
     IcebergColumnStats, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
@@ -41,11 +42,18 @@ use crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeployment
 use crate::coordinator::scheduler::FragmentScheduler;
 use crate::coordinator::write::handle_fragment_report_exec_status;
 use crate::coordinator::write::report::FragmentExecStatusReport;
+use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::node::runtime_filter::{
+    NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+};
+use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
+use crate::exec::operators::runtime_filter::tests_support::chunk;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::profile::{ProfileNode, RuntimeProfileTree};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::deployment::participant_id_for_backend;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
@@ -60,20 +68,32 @@ use crate::runtime_filter::model::graph::{
     RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
     RuntimeFilterGraph,
 };
-use crate::runtime_filter::port::artifact::{ArtifactBundle, ResidentMembershipIndexView};
+use crate::runtime_filter::port::artifact::{
+    ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
+    ResidentMembershipIndexView,
+};
+use crate::runtime_filter::port::events::RuntimeFilterEventSink;
 use crate::runtime_filter::port::events::{
     RuntimeFilterEvent, TransportEventKind, TransportFailOpenReason,
 };
 use crate::runtime_filter::port::identity::{
-    DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
+    DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, RouteEdgeId,
+    RuntimeFilterParticipantId,
 };
-use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
+use crate::runtime_filter::port::install::{
+    ConsumerDeployment, MaterializationPolicy, ProducerDeployment, RuntimeFilterChannelDeployment,
+    RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+    local_participant_install_for_test,
+};
 use crate::runtime_filter::port::producer::{ProducerPortKind, SubmitOutcome};
 use crate::runtime_filter::port::routing::{
     RuntimeFilterChannelRoutingView, RuntimeFilterRoutePeer, RuntimeFilterRouteRole,
     RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
 };
-use crate::runtime_filter::port::subscription::{ArtifactAcquireOutcome, SubscriptionKind};
+use crate::runtime_filter::port::subscription::{LivePollOutcome, LiveTerminal, SubscriptionKind};
+use crate::runtime_filter::port::support::{
+    MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+};
 use crate::runtime_filter::port::transport::{
     RuntimeFilterAcceptStatus, RuntimeFilterEnvelopeKind,
 };
@@ -367,7 +387,9 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
             apply_point: ApplyPoint::NodeInput,
             role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
                 capabilities,
-                activation: ConsumerActivation::BlockingSnapshot,
+                activation: ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
                 target: ConsumerBindingTarget::SourceBoundary,
             }),
         })
@@ -867,11 +889,11 @@ fn run_live_conformance(topology: ConformanceTopology) {
         .subscribe(
             CONSUMER_BINDING,
             consumer_finst,
-            SubscriptionKind::BlockingSnapshot,
+            SubscriptionKind::NonBlockingLive,
         )
         .expect("consumer role is authorized on BE two")
-        .into_blocking()
-        .expect("blocking snapshot consumer");
+        .into_live()
+        .expect("Batch Live consumer");
 
     if matches!(topology, ConformanceTopology::AllOfAggregate) {
         for remote_idx in (0..3).filter(|idx| *idx != aggregator_idx) {
@@ -962,8 +984,20 @@ fn run_live_conformance(topology: ConformanceTopology) {
         }
     }
 
-    let ArtifactAcquireOutcome::Published(bundle) = subscription.acquire(MAX_WAIT) else {
-        panic!("remote consumer did not receive a published artifact within {MAX_WAIT:?}");
+    let deadline = Instant::now() + MAX_WAIT;
+    let bundle = loop {
+        match subscription.poll_after(None) {
+            LivePollOutcome::Updated {
+                bundle,
+                terminal: Some(LiveTerminal::Completed),
+            } => break bundle,
+            LivePollOutcome::Idle { terminal: None, .. } if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+            outcome => panic!(
+                "remote Batch Live consumer did not receive one completed final artifact within {MAX_WAIT:?}: {outcome:?}"
+            ),
+        }
     };
     assert!(
         !bundle.artifacts().is_empty(),
@@ -1020,6 +1054,220 @@ fn live_three_be_anyof_direct_install_ack_and_delivery() {
 #[test]
 fn live_three_be_allof_aggregate_install_ack_and_delivery() {
     run_live_conformance(ConformanceTopology::AllOfAggregate);
+}
+
+#[test]
+fn live_join_complete_once_operator_applies_real_service_final_artifact() {
+    struct WallClock;
+    impl RuntimeFilterClock for WallClock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+
+    struct NoopEvents;
+    impl RuntimeFilterEventSink for NoopEvents {
+        fn record(&self, _event: RuntimeFilterEvent) {}
+    }
+
+    struct UnlimitedMemory;
+    impl RuntimeFilterMemoryAccount for UnlimitedMemory {
+        fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
+            Ok(())
+        }
+
+        fn release(&self, _bytes: usize) {}
+    }
+
+    let query_id = UniqueId { hi: 620, lo: 621 };
+    let producer_finst = UniqueId { hi: 620, lo: 622 };
+    let consumer_finst = UniqueId { hi: 620, lo: 623 };
+    let epoch = DeploymentEpoch::new(624);
+    let participant = RuntimeFilterParticipantId::new(625);
+    let channel_id = ChannelId::new(626);
+    let producer_binding = BindingId::new(627);
+    let consumer_binding = BindingId::new(628);
+    let route_edge = RouteEdgeId::new(629);
+    let witness = CoverageWitnessId::new(630);
+    let activation = ConsumerActivation::NonBlockingLive {
+        late_apply: LateApplyGranularity::Batch,
+    };
+    let capabilities = BTreeSet::from([
+        ArtifactCapability::Membership,
+        ArtifactCapability::EmptyDomain,
+    ]);
+    let profile = ConsumerArtifactProfile::new(
+        BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+        None,
+    )
+    .unwrap();
+    let coverage = Coverage::Leaf(witness);
+    let deployment = RuntimeFilterChannelDeployment::new(
+        channel_id,
+        RuntimeFilterLogicalDomain::Membership {
+            value_type: DataType::Int32,
+            null_semantics: NullSemantics::NeverMatches,
+        },
+        RuntimeFilterLifecycle::CompleteOnce,
+        coverage.clone(),
+        coverage,
+        ReductionRequirement::SetUnion,
+        BTreeSet::from([
+            ContributionKind::ValueDomainDelta,
+            ContributionKind::ProducerClosed,
+        ]),
+        CompletionRequirement::ProducerClosed,
+        RuntimeFilterPolicyRequirement {
+            max_contribution_bytes: 1024,
+            max_artifact_bytes: 1024,
+            deadline_ms: 1_000,
+            max_retries: 2,
+        },
+        RuntimeFilterCoreBudget::new(8192),
+        MaterializationPolicy::for_test(),
+        BTreeMap::from([(
+            producer_binding,
+            ProducerDeployment::new(witness, BTreeSet::from([producer_finst])),
+        )]),
+        BTreeMap::from([(
+            consumer_binding,
+            ConsumerDeployment::with_profile(
+                activation,
+                capabilities.clone(),
+                profile,
+                BTreeSet::from([route_edge]),
+                BTreeSet::from([consumer_finst]),
+            ),
+        )]),
+    );
+    let service = Arc::new(RuntimeFilterService::new_for_lifecycle_test(
+        query_id,
+        Arc::new(WallClock),
+        Arc::new(NoopEvents),
+        Arc::new(UnlimitedMemory),
+    ));
+    service
+        .install(local_participant_install_for_test(
+            RuntimeFilterInstallView::new(
+                epoch,
+                participant,
+                BTreeMap::from([(channel_id, deployment)]),
+            ),
+        ))
+        .expect("install the real CompleteOnce Batch Live deployment");
+
+    let mut arena = ExprArena::default();
+    let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+    let schema =
+        ArtifactMembershipSchema::new(&DataType::Int32, NullSemantics::NeverMatches).unwrap();
+    let spec = NativeRuntimeFilterConsumerSpec {
+        binding_id: consumer_binding.get(),
+        channel_id: channel_id.get(),
+        expr_id,
+        activation,
+        capabilities,
+        contract: NativeRuntimeFilterContract::Membership {
+            canonical_schema: Arc::from(schema.canonical_bytes()),
+            schema_digest: schema.digest().bytes(),
+        },
+        reduction: NativeRuntimeFilterReduction::SetUnion,
+    };
+    let consumers = NativeRuntimeFilterConsumerSet::from_plan(&[spec], Arc::new(arena))
+        .expect("build the operator consumer from the plan");
+    let state = RuntimeState::default().with_native_runtime_filter_context(Some(
+        super::NativeRuntimeFilterExecutionContext::new(
+            Arc::clone(&service),
+            query_id,
+            epoch,
+            consumer_finst,
+        ),
+    ));
+    consumers
+        .bind(&state)
+        .expect("bind through RuntimeState into the installed service");
+    consumers
+        .acquire_configured()
+        .expect("an all-live consumer has no blocking acquire work");
+
+    let before = consumers
+        .apply_chunk(chunk(&[1, 2]))
+        .expect("pending live apply")
+        .expect("pending live keeps the whole batch");
+    assert_eq!(before.len(), 2);
+
+    let producer = service
+        .open_producer(
+            producer_binding,
+            producer_finst,
+            1,
+            ProducerPortKind::Membership,
+        )
+        .expect("open the installed real producer")
+        .into_membership()
+        .expect("resolve the membership producer port");
+    let submit = producer
+        .submit(
+            PartitionId::new(0),
+            ProducerSequence::new(0),
+            ValueDomainDelta::new(MembershipValues::int32([2]), false),
+        )
+        .expect("submit the unique membership contribution");
+    assert!(matches!(
+        submit,
+        SubmitOutcome::Applied
+            | SubmitOutcome::Published
+            | SubmitOutcome::StreamAcceptedNoGlobalChange
+    ));
+    producer
+        .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+        .expect("close the unique producer stream");
+
+    let after = consumers
+        .apply_chunk(chunk(&[1, 2]))
+        .expect("completed live apply")
+        .expect("the final membership artifact keeps one row");
+    assert_eq!(
+        after.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[2]
+    );
+    let again = consumers
+        .apply_chunk(chunk(&[2, 3]))
+        .expect("active predicate applies without a second live version")
+        .expect("the active predicate keeps one row");
+    assert_eq!(
+        again.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[2]
+    );
+
+    let public_live = service
+        .subscribe(
+            consumer_binding,
+            consumer_finst,
+            SubscriptionKind::NonBlockingLive,
+        )
+        .expect("the service exposes the installed live subscription")
+        .into_live()
+        .expect("the public subscription is live");
+    let LivePollOutcome::Updated { bundle, terminal } = public_live.poll_after(None) else {
+        panic!("the service must expose its unique final bundle")
+    };
+    assert_eq!(bundle.version(), LogicalVersion::FIRST);
+    assert_eq!(terminal, Some(LiveTerminal::Completed));
+    assert!(matches!(
+        public_live.poll_after(Some(LogicalVersion::FIRST)),
+        LivePollOutcome::Idle {
+            latest_version: Some(LogicalVersion::FIRST),
+            terminal: Some(LiveTerminal::Completed),
+        }
+    ));
 }
 
 #[test]

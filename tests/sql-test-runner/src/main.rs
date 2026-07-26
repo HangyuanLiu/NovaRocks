@@ -316,6 +316,10 @@ struct Cli {
     #[arg(long)]
     cluster_size: Option<usize>,
 
+    /// SQL statements applied, in order, to each target case session before its first step.
+    #[arg(long = "target-session-sql", value_name = "SQL", action = ArgAction::Append)]
+    target_session_sql: Vec<String>,
+
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
 
@@ -365,6 +369,18 @@ fn query_order_sensitive(step: &SqlStep, default: bool) -> bool {
 
 fn query_float_epsilon(step: &SqlStep, default: Option<f64>) -> Option<f64> {
     step.meta.float_epsilon.or(default)
+}
+
+fn execute_target_session_sql_with<S>(
+    session: &mut S,
+    statements: &[String],
+    mut execute: impl FnMut(&mut S, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    for statement in statements {
+        execute(session, statement)
+            .map_err(|error| format!("target session SQL failed for {statement:?}: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Best-effort TCP probe for a MinIO-style endpoint like `http://127.0.0.1:9000`.
@@ -440,6 +456,7 @@ struct SuiteRunContext {
     float_epsilon: Option<f64>,
     preview_lines: usize,
     update_expected: bool,
+    target_session_sql: Vec<String>,
     marker_re: Regex,
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
@@ -1327,6 +1344,27 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     } else {
         None
     };
+
+    if let Err(error) = execute_target_session_sql_with(
+        &mut target_session,
+        &ctx.target_session_sql,
+        |session, statement| {
+            let (ok, _, message) = session.execute_query(ctx.query_timeout, statement, None);
+            if ok { Ok(()) } else { Err(message) }
+        },
+    ) {
+        drop_all_case_dbs(ctx, &case_dbs);
+        let _ = writeln!(log, "    ❌ {error}");
+        if ctx.fail_fast {
+            abort.store(true, Ordering::Relaxed);
+        }
+        return CaseOutcome {
+            case_id: case.case_id.clone(),
+            status: CaseStatus::Fail,
+            elapsed: case_elapsed,
+            log,
+        };
+    }
 
     // --- step execution loop ---
     let mut recorded_results: BTreeMap<usize, ResultSet> = BTreeMap::new();
@@ -2969,6 +3007,7 @@ fn run() -> Result<i32> {
             float_epsilon: cli.float_epsilon,
             preview_lines: cli.preview_lines,
             update_expected: cli.update_expected,
+            target_session_sql: cli.target_session_sql.clone(),
             marker_re: marker_re.clone(),
             fail_fast: cli.fail_fast,
             server_handle: Arc::clone(&server_handle),
@@ -3128,8 +3167,8 @@ mod tests {
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
         Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
-        expected_engine_error_code_diff_result, expected_engine_error_code_result,
-        finish_expected_error_step, validate_fault_injection_jobs,
+        execute_target_session_sql_with, expected_engine_error_code_diff_result,
+        expected_engine_error_code_result, finish_expected_error_step, validate_fault_injection_jobs,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3528,6 +3567,84 @@ mod tests {
     fn cli_cluster_mode_defaults_to_all_in_one() {
         let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
         assert_eq!(cli.cluster_mode, ClusterMode::AllInOne);
+    }
+
+    #[test]
+    fn target_session_sql_defaults_to_empty() {
+        let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
+
+        assert!(cli.target_session_sql.is_empty());
+    }
+
+    #[test]
+    fn target_session_sql_repeated_arguments_preserve_order() {
+        let cli = crate::Cli::parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--target-session-sql",
+            "SET first = true",
+            "--target-session-sql",
+            "SET second = false",
+        ]);
+
+        assert_eq!(
+            cli.target_session_sql,
+            ["SET first = true", "SET second = false"]
+        );
+    }
+
+    #[test]
+    fn target_session_sql_failure_prevents_case_step() {
+        let statements = vec![
+            "SET first = true".to_string(),
+            "SET rejected = true".to_string(),
+        ];
+        let mut events = Vec::new();
+
+        let setup = execute_target_session_sql_with(
+            &mut events,
+            &statements,
+            |events, statement| {
+                events.push(statement.to_string());
+                if statement.contains("rejected") {
+                    Err("session override rejected".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        if setup.is_ok() {
+            events.push("CASE STEP".to_string());
+        }
+
+        assert_eq!(
+            setup,
+            Err("target session SQL failed for \"SET rejected = true\": session override rejected"
+                .to_string())
+        );
+        assert_eq!(events, ["SET first = true", "SET rejected = true"]);
+        assert!(!events.iter().any(|event| event == "CASE STEP"));
+    }
+
+    #[test]
+    fn target_session_sql_does_not_touch_reference_session() {
+        let statements = vec!["SET target_only = true".to_string()];
+        let mut target_events = Vec::new();
+        let reference_events: Vec<String> = Vec::new();
+
+        execute_target_session_sql_with(
+            &mut target_events,
+            &statements,
+            |events, statement| {
+                events.push(statement.to_string());
+                Ok(())
+            },
+        )
+        .expect("target session SQL should pass");
+
+        assert_eq!(target_events, ["SET target_only = true"]);
+        assert!(reference_events.is_empty());
     }
 
     #[test]

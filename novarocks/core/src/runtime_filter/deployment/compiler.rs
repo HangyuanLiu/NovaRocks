@@ -28,9 +28,7 @@ use crate::runtime_filter::deployment::routing_shard::project_routing_shards;
 use crate::runtime_filter::deployment::shard::{
     ChannelProjectionSpec, ConsumerBindingFacts, project_install_views,
 };
-use crate::runtime_filter::deployment::wait_for::{
-    ConsumerWaitInput, ExecutionDependencyGraph, ProducerWaitInput, validate_wait_for,
-};
+use crate::runtime_filter::deployment::wait_for::validate_wait_for;
 use crate::runtime_filter::deployment::{
     DeploymentError, RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
     participant_id_for_backend,
@@ -39,6 +37,7 @@ use crate::runtime_filter::model::contract::{
     BindingId, ChannelId, CompletionRequirement, CoverageWitnessId,
 };
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+use crate::runtime_filter::model::refined_wait_graph::project_consumer_waits;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
 use crate::sql::planner::distributed::{FragmentEdge, FragmentId, JoinBuildProgressCatalog};
 
@@ -88,11 +87,7 @@ pub(crate) fn compile_with_join_progress(
     // model itself already rejects.
     graph.validate().map_err(DeploymentError::GraphInvalid)?;
 
-    // 2. Fragment execution dependency graph (also rejects a cyclic plan).
-    let exec_deps = ExecutionDependencyGraph::from_fragment_edges(edges)
-        .map_err(|_| DeploymentError::FragmentCycle)?;
-
-    // 3. Resolve per-(channel,binding) participant placement + the expected
+    // 2. Resolve per-(channel,binding) participant placement + the expected
     // finst instances from the scheduling plan. Participant identity is the
     // checked, nonzero deployment identity derived from `backend_idx`; the
     // original backend index remains the scheduling and endpoint-map key.
@@ -182,39 +177,16 @@ pub(crate) fn compile_with_join_progress(
         }
     }
 
-    // 4. Wait-for cycle validation: only `BlockingSnapshot` consumers add a
+    // 3. Wait-for cycle validation: only `BlockingSnapshot` consumers add a
     // wait edge, and only a real execution-topology cycle is rejected.
-    let mut consumer_waits: Vec<ConsumerWaitInput> = Vec::new();
-    for channel in graph.channels() {
-        let producers: Vec<ProducerWaitInput> = graph
-            .bindings()
-            .filter(|binding| {
-                binding.channel_id == channel.channel_id
-                    && matches!(binding.role, RuntimeFilterBindingRole::Producer(_))
-            })
-            .map(|binding| ProducerWaitInput {
-                binding: binding.binding_id,
-                fragment: binding.location.fragment_id.get(),
-            })
-            .collect();
-        for binding in graph
-            .bindings()
-            .filter(|binding| binding.channel_id == channel.channel_id)
-        {
-            if let RuntimeFilterBindingRole::Consumer(req) = &binding.role {
-                consumer_waits.push(ConsumerWaitInput {
-                    channel: channel.channel_id,
-                    binding: binding.binding_id,
-                    consumer_fragment: binding.location.fragment_id.get(),
-                    activation: req.activation,
-                    producers: producers.clone(),
-                });
-            }
-        }
-    }
-    validate_wait_for(&exec_deps, edges, &consumer_waits, join_progress, graph)?;
+    let refined_edges = edges
+        .iter()
+        .map(FragmentEdge::as_refined_runtime_filter_edge)
+        .collect::<Vec<_>>();
+    let consumer_waits = project_consumer_waits(graph);
+    validate_wait_for(&refined_edges, &consumer_waits, join_progress, graph)?;
 
-    // 5. Role graph per channel + the per-channel projection spec the shard
+    // 4. Role graph per channel + the per-channel projection spec the shard
     // projector needs. The completion requirement is precomputed here from
     // the channel's producer bindings, since the model channel spec itself
     // carries no completion field (`graph.validate()` guarantees every

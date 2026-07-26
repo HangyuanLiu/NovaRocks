@@ -657,10 +657,10 @@ fn validate_membership_channel<'a>(
 
     let mut unique_profiles = BTreeSet::new();
     for consumer in channel.consumers().values() {
-        if ordinary && consumer.activation() != ConsumerActivation::BlockingSnapshot {
+        if ordinary && !consumer.activation().is_blocking_or_batch_live() {
             return Err(install_error(
                 InstallContractErrorKind::InvalidConsumerActivation,
-                "M1 consumers must use BlockingSnapshot activation",
+                "M1 consumers must use BlockingSnapshot or Batch NonBlockingLive activation",
             ));
         }
         if fenced_final
@@ -1159,4 +1159,105 @@ fn install_error(
     detail: impl Into<String>,
 ) -> InstallContractError {
     InstallContractError::new(kind, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use arrow::datatypes::DataType;
+
+    use crate::common::types::UniqueId;
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement,
+    };
+    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::port::identity::RouteEdgeId;
+    use crate::runtime_filter::port::install::{
+        ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
+        RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget,
+    };
+
+    use super::validate_channel_contract_for_test;
+
+    fn ordinary_membership_channel(
+        activation: ConsumerActivation,
+    ) -> RuntimeFilterChannelDeployment {
+        let witness = CoverageWitnessId::new(1);
+        RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NeverMatches,
+            },
+            RuntimeFilterLifecycle::CompleteOnce,
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::SetUnion,
+            BTreeSet::from([
+                ContributionKind::ValueDomainDelta,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 3,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(10),
+                ProducerDeployment::new(witness, BTreeSet::from([UniqueId { hi: 1, lo: 10 }])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(20),
+                ConsumerDeployment::new(
+                    activation,
+                    BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    BTreeSet::from([RouteEdgeId::new(30)]),
+                    BTreeSet::from([UniqueId { hi: 1, lo: 20 }]),
+                ),
+            )]),
+        )
+    }
+
+    #[test]
+    fn ordinary_membership_install_accepts_only_blocking_or_batch_live() {
+        assert!(
+            validate_channel_contract_for_test(&ordinary_membership_channel(
+                ConsumerActivation::BlockingSnapshot,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_channel_contract_for_test(&ordinary_membership_channel(
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+            ))
+            .is_ok()
+        );
+
+        for late_apply in [
+            LateApplyGranularity::Row,
+            LateApplyGranularity::RowGroup,
+            LateApplyGranularity::Split,
+            LateApplyGranularity::File,
+        ] {
+            assert!(
+                validate_channel_contract_for_test(&ordinary_membership_channel(
+                    ConsumerActivation::NonBlockingLive { late_apply },
+                ))
+                .is_err()
+            );
+        }
+    }
 }
