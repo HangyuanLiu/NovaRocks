@@ -6053,7 +6053,7 @@ mysql_port = 47892
     fn explain_analyze_runs_distributed_plan_and_renders_actuals() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(3,300)");
+        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(4,400)");
 
         let result = session
             .execute_in_context(
