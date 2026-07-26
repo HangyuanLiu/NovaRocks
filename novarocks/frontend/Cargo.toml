@@ -8,8 +8,10 @@ doctest = false
 
 [dependencies]
 async-trait = "0.1"
+arrow = { version = "58.2.0" }
 bytes = "1"
 novarocks = { path = "../core" }
+novarocks-catalog = { path = "../catalog" }
 novarocks-state-store = { path = "../state-store" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "signal"] }

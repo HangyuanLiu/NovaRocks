@@ -3270,9 +3270,11 @@ dependencies = [
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "bytes",
  "novarocks",
+ "novarocks-catalog",
  "novarocks-state-store",
  "sha2",
  "tempfile",
