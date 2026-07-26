@@ -536,7 +536,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Vec::new()),
+            None,
         ));
         let layout = Layout {
             order: Vec::new(),
