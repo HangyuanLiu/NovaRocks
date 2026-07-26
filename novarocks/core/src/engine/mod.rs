@@ -371,11 +371,6 @@ pub(crate) struct StandaloneState {
     /// derived tables on `FROM <view>` references.
     pub(crate) views:
         RwLock<std::collections::HashMap<(String, String), Box<sqlparser::ast::Query>>>,
-    /// information_schema virtual tables (`schemata`, ...). Rows are
-    /// materialized at query rewrite time by [`virtual_table::inject_query_refs`]
-    /// and injected into a cloned catalog snapshot, so the standard SQL
-    /// pipeline scans them as ordinary base tables.
-    pub(crate) virtual_tables: virtual_table::VirtualTableRegistry,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -404,7 +399,6 @@ impl Default for StandaloneState {
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
             views: RwLock::new(std::collections::HashMap::new()),
-            virtual_tables: virtual_table::VirtualTableRegistry::with_defaults(),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,

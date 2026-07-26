@@ -15,32 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Virtual-table provider framework for standalone information_schema.
+//! information_schema AST rewriter for standalone queries.
 //!
 //! StarRocks exposes information_schema tables (`schemata`, `tables`, ...) as
-//! real tables on the FE side: each is a `SystemTable` subclass under
-//! `InfoSchemaDb`, materialized through `SchemaScanNode` at query time. This
-//! module mirrors that shape for NovaRocks standalone mode: each virtual table
-//! provides its own column schema and a `scan` function that materializes rows
-//! from the current `StandaloneState`.
+//! real tables on the FE side. NovaRocks standalone delegates their schema and
+//! row materialization to the frontend-injected `SystemCatalog` port.
 //!
-//! Rows are eagerly materialized at query-rewrite time and embedded as a
-//! `ScanSource::SystemRows` variant in a cloned catalog snapshot, so the
-//! standard SQL pipeline (analyzer / planner / optimizer / codegen / pipeline)
-//! handles them like any other base table — no handler-style SQL-subset
-//! interpretation required.
-//!
-//! Adding a new virtual table is one concrete `VirtualTableProvider` impl plus
-//! a single `register` call in `VirtualTableRegistry::with_defaults`.
+//! The rewriter replaces system-table references with VALUES-backed derived
+//! tables, which the standard SQL pipeline handles like ordinary relations.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
@@ -48,77 +38,6 @@ use crate::engine::StandaloneState;
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
-
-/// Implementation contract for a single information_schema virtual table.
-pub(crate) trait VirtualTableProvider: Send + Sync {
-    /// Lower-case database name this table lives under (typically
-    /// `"information_schema"`).
-    fn database(&self) -> &str;
-
-    /// Lower-case table name (e.g. `"schemata"`).
-    fn table(&self) -> &str;
-
-    /// Column definitions, in the order they will appear in `SELECT *`. The
-    /// Arrow data type here must match the schema of every `RecordBatch`
-    /// returned by `scan`.
-    fn columns(&self) -> Vec<ColumnDef>;
-
-    /// Materialize rows from the current standalone state. Called once per
-    /// query that references this virtual table.
-    fn scan(&self, state: &StandaloneState) -> Result<Vec<RecordBatch>, String>;
-}
-
-/// Registry mapping `(database, table)` → provider.
-pub(crate) struct VirtualTableRegistry {
-    providers: HashMap<(String, String), Arc<dyn VirtualTableProvider>>,
-}
-
-impl VirtualTableRegistry {
-    pub(crate) fn with_defaults() -> Self {
-        let mut registry = Self {
-            providers: HashMap::new(),
-        };
-        registry.register(Arc::new(super::information_schema::SchemataProvider));
-        registry
-    }
-
-    fn register(&mut self, provider: Arc<dyn VirtualTableProvider>) {
-        let key = (
-            provider.database().to_ascii_lowercase(),
-            provider.table().to_ascii_lowercase(),
-        );
-        self.providers.insert(key, provider);
-    }
-
-    pub(crate) fn lookup(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Option<Arc<dyn VirtualTableProvider>> {
-        let key = (database.to_ascii_lowercase(), table.to_ascii_lowercase());
-        self.providers.get(&key).cloned()
-    }
-
-    /// Returns every `(database, table)` pair owned by some provider. Used to
-    /// pre-register placeholder databases (e.g. `information_schema`) in the
-    /// catalog snapshot before per-query injection runs.
-    pub(crate) fn databases(&self) -> impl Iterator<Item = &str> {
-        self.providers.keys().map(|(db, _)| db.as_str())
-    }
-}
-
-/// Build an Arrow `Schema` from a provider's `columns()` output. The field
-/// names use the lower-case form (matching catalog identifier normalization)
-/// so downstream codegen/lower can index by slot id without extra mapping.
-pub(crate) fn arrow_schema_for_provider(provider: &dyn VirtualTableProvider) -> Arc<Schema> {
-    use arrow::datatypes::Field;
-    let fields: Vec<Field> = provider
-        .columns()
-        .into_iter()
-        .map(|c| Field::new(c.name, c.data_type, c.nullable))
-        .collect();
-    Arc::new(Schema::new(fields))
-}
 
 // ---------------------------------------------------------------------------
 // AST rewriter: substitute virtual-table refs with a VALUES derived table.
