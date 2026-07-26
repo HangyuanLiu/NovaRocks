@@ -623,14 +623,16 @@ mod tests {
 
     #[test]
     fn cluster_membership_is_absent_without_registry() {
-        let _guard = BackendRegistryTestGuard::new();
+        let _standalone = crate::engine::acquire_standalone_test_guard();
+        let _registry = BackendRegistryTestGuard::new();
         assert!(cluster_membership().is_none());
     }
 
     #[test]
     fn backend_registry_test_guard_clears_membership_override_on_drop() {
+        let _standalone = crate::engine::acquire_standalone_test_guard();
         {
-            let _guard = BackendRegistryTestGuard::new();
+            let _registry = BackendRegistryTestGuard::new();
             replace_cluster_membership_for_test(Some(Arc::new(FakeClusterMembership::new(vec![
                 (0, "127.0.0.1:19081".parse().unwrap()),
             ]))));
@@ -642,7 +644,8 @@ mod tests {
 
     #[test]
     fn cluster_membership_derives_from_registry() {
-        let _guard = BackendRegistryTestGuard::new();
+        let _standalone = crate::engine::acquire_standalone_test_guard();
+        let _registry = BackendRegistryTestGuard::new();
         let endpoint: SocketAddr = "127.0.0.1:19090".parse().unwrap();
         let registry = Arc::new(BackendRegistry::new(3));
         let be_id = registry.add_backend_with_state(endpoint, BackendState::Live);
@@ -665,7 +668,8 @@ mod tests {
 
     #[test]
     fn cluster_membership_test_override_takes_precedence() {
-        let _guard = BackendRegistryTestGuard::new();
+        let _standalone = crate::engine::acquire_standalone_test_guard();
+        let _registry = BackendRegistryTestGuard::new();
         // Registry present, but the test override must win.
         let registry = Arc::new(BackendRegistry::new(3));
         registry.add_backend_with_state("127.0.0.1:19091".parse().unwrap(), BackendState::Live);

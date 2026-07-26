@@ -8561,7 +8561,8 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn live_effective_backend_count_reads_injected_membership() {
-        let _guard = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+        let _standalone = super::acquire_standalone_test_guard();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
         let ep1: std::net::SocketAddr = "127.0.0.1:19081".parse().unwrap();
         let ep2: std::net::SocketAddr = "127.0.0.1:19082".parse().unwrap();
         crate::coordinator::cluster::replace_cluster_membership_for_test(Some(

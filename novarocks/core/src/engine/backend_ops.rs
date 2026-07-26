@@ -554,7 +554,8 @@ mod tests {
 
     #[test]
     fn live_backend_dispatch_entries_reads_injected_membership() {
-        let _guard = BackendRegistryReset::new();
+        let _standalone = crate::engine::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
         let endpoint: std::net::SocketAddr = "127.0.0.1:19080".parse().unwrap();
         crate::coordinator::cluster::replace_cluster_membership_for_test(Some(
             std::sync::Arc::new(crate::coordinator::cluster::FakeClusterMembership::new(
