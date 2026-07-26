@@ -494,6 +494,25 @@ backends = [{backends_list}]
         }
     }
 
+    fn start_three_be_sqlite_state_store(state_store_path: &Path, cluster_id: &str) -> Self {
+        assert!(
+            state_store_path.is_absolute(),
+            "SQLite StateStore path must be absolute: {}",
+            state_store_path.display()
+        );
+        let state_store_config = format!(
+            r#"
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "{cluster_id}"
+deployment_owner = "fe-1"
+"#,
+            state_store_path.display()
+        );
+        Self::start_n_be(3, "", &state_store_config)
+    }
+
     fn fe_mysql_port(&self) -> u16 {
         self.fe_mysql
     }
@@ -1334,6 +1353,107 @@ deployment_owner = "fe-1"
     assert_eq!(rows, vec![1i64, 2i64]);
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_session_view_lifecycle() {
+    let _guard = lock_cluster_mvp();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create state store tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
+    let cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store(&state_store_path, "session-view");
+
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create fixture warehouse");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG session_view_fixture PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create fixture catalog");
+    conn.query_drop("CREATE DATABASE session_view_fixture.session_view_e2e")
+        .expect("create fixture database");
+    conn.query_drop("SET catalog default_catalog")
+        .expect("use session-view catalog");
+
+    let base_rows: Vec<String> = conn
+        .query(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name = 'default'",
+        )
+        .expect("query session-view base table");
+    assert_eq!(base_rows, vec!["default".to_string()]);
+
+    conn.query_drop(
+        "CREATE VIEW session_view_e2e.v AS \
+         SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'default'",
+    )
+    .expect("create session view");
+    let view_rows: Vec<String> = conn
+        .query("SELECT schema_name FROM session_view_e2e.v")
+        .expect("query session view");
+    assert_eq!(
+        view_rows, base_rows,
+        "session view must match its direct base-table query"
+    );
+
+    conn.query_drop(
+        "CREATE OR REPLACE VIEW session_view_e2e.v AS \
+         SELECT catalog_name FROM information_schema.schemata WHERE schema_name = 'default'",
+    )
+    .expect("replace session view");
+    let replaced_direct_rows: Vec<String> = conn
+        .query(
+            "SELECT catalog_name FROM information_schema.schemata \
+             WHERE schema_name = 'default'",
+        )
+        .expect("query replacement base-table projection");
+    let replaced_view_rows: Vec<String> = conn
+        .query("SELECT catalog_name FROM session_view_e2e.v")
+        .expect("query replaced session view");
+    assert_eq!(
+        replaced_view_rows, replaced_direct_rows,
+        "CREATE OR REPLACE VIEW must expose the replacement query"
+    );
+
+    let views: Vec<String> = conn
+        .query("SHOW VIEWS FROM session_view_e2e")
+        .expect("show session views");
+    assert_eq!(views, vec!["v".to_string()]);
+
+    conn.query_drop("DROP VIEW session_view_e2e.v")
+        .expect("drop session view");
+    let views_after_drop: Vec<String> = conn
+        .query("SHOW VIEWS FROM session_view_e2e")
+        .expect("show session views after drop");
+    assert!(
+        views_after_drop.is_empty(),
+        "DROP VIEW must remove v from SHOW VIEWS: {views_after_drop:?}"
+    );
+
+    conn.query_drop(
+        "CREATE VIEW session_view_e2e.v AS \
+         SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'default'",
+    )
+    .expect("recreate session view before database drop");
+    conn.query_drop("DROP DATABASE session_view_fixture.session_view_e2e")
+        .expect("drop fixture database");
+    conn.query_drop("CREATE DATABASE session_view_fixture.session_view_e2e")
+        .expect("recreate fixture database");
+    conn.query_drop(
+        "CREATE VIEW session_view_e2e.v AS \
+         SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'default'",
+    )
+    .expect("database drop must clear same-name session view");
+
+    conn.query_drop("DROP VIEW session_view_e2e.v")
+        .expect("clean up recreated session view");
+    conn.query_drop("DROP DATABASE session_view_fixture.session_view_e2e")
+        .expect("clean up fixture database");
+    conn.query_drop("DROP CATALOG session_view_fixture")
+        .expect("clean up fixture catalog");
 }
 
 #[test]
