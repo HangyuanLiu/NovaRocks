@@ -79,6 +79,7 @@ pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
 pub(crate) mod statistics;
+pub mod system_catalog;
 pub(crate) mod view_rewrite;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
@@ -375,6 +376,9 @@ pub(crate) struct StandaloneState {
     /// and injected into a cloned catalog snapshot, so the standard SQL
     /// pipeline scans them as ordinary base tables.
     pub(crate) virtual_tables: virtual_table::VirtualTableRegistry,
+    /// Frontend-owned system catalog (information_schema). Injected at open;
+    /// defaults to a no-op. See `engine::system_catalog`.
+    pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
     #[cfg(test)]
     pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
@@ -401,6 +405,7 @@ impl Default for StandaloneState {
             maintenance_signal_tx: std::sync::Mutex::new(None),
             views: RwLock::new(std::collections::HashMap::new()),
             virtual_tables: virtual_table::VirtualTableRegistry::with_defaults(),
+            system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,
         }
@@ -4330,6 +4335,7 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
+    use crate::engine::system_catalog::SystemCatalogInputs;
     use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::meta::MetaStoreProvider;
     use crate::runtime::query_options::QueryOptions;
@@ -4341,6 +4347,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn standalone_state_default_has_empty_system_catalog() {
+        let names = vec!["a".to_string()];
+        let inputs = SystemCatalogInputs {
+            catalog_name: "default_catalog",
+            schema_names: &names,
+        };
+        assert!(
+            StandaloneState::default()
+                .system_catalog
+                .resolve("information_schema", "schemata", &inputs)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn explain_analyze_query_options_only_enable_profile() {
