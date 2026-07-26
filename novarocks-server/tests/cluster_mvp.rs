@@ -1262,6 +1262,25 @@ fn cross_process_three_be_state_store_baseline() {
         vec![1i64, 2i64],
         "3-BE multi-fragment query must return sorted results [1, 2]"
     );
+    let backend_rows = show_backends(&mut conn);
+    let scheduled_fragments: u64 = backend_rows
+        .iter()
+        .filter(|row| row.get::<String, usize>(3).as_deref() == Some("Live"))
+        .map(|row| {
+            let value = row.get::<String, usize>(9).unwrap_or_else(|| {
+                panic!("Live backend must expose ScheduledFragments; rows={backend_rows:?}")
+            });
+            value.parse::<u64>().unwrap_or_else(|err| {
+                panic!(
+                    "Live backend ScheduledFragments must be an unsigned integer ({value:?}): {err}; rows={backend_rows:?}"
+                )
+            })
+        })
+        .sum();
+    assert!(
+        scheduled_fragments > 0,
+        "3 Live backends must report scheduled fragments after the multi-fragment query; rows={backend_rows:?}"
+    );
     eprintln!("NOVAROCKS_CLUSTER_BASELINE_RESULT fragments=multi rows=[1,2]");
 }
 
