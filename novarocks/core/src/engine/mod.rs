@@ -366,12 +366,11 @@ pub(crate) struct StandaloneState {
     pub(crate) maintenance_signal_tx: std::sync::Mutex<
         Option<std::sync::mpsc::Sender<crate::engine::mv_maintenance::MaintenanceSignal>>,
     >,
-    /// In-memory registry of user-defined views, keyed by lowercase
-    /// (database, view-name). Each entry stores the analysed `Query` AST
-    /// from `CREATE VIEW ... AS <query>`. The analyzer expands these to
-    /// derived tables on `FROM <view>` references.
-    pub(crate) views:
-        RwLock<std::collections::HashMap<(String, String), Box<sqlparser::ast::Query>>>,
+    /// Session-view registry seam. FEH-4a: the in-memory `CREATE VIEW`
+    /// registry now lives behind `ViewCatalog` (core adapter
+    /// `InMemoryViewCatalog`); FEH-4b swaps in a frontend, StateStore-backed
+    /// implementation injected through the server seam.
+    pub(crate) session_views: std::sync::Arc<dyn crate::engine::view::ViewCatalog>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -399,7 +398,7 @@ impl Default for StandaloneState {
             job_repo: JobMetaRepository,
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
-            views: RwLock::new(std::collections::HashMap::new()),
+            session_views: std::sync::Arc::new(crate::engine::view::InMemoryViewCatalog::new()),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,
@@ -1102,7 +1101,7 @@ impl StandaloneSession {
                 let mut prepared = query.as_ref().clone();
                 self::view_rewrite::expand_views_in_query(
                     &mut prepared,
-                    &self.inner.views,
+                    self.inner.session_views.as_ref(),
                     current_database,
                 );
                 // Inline iceberg-catalog views (REST only). Runs after session
@@ -1585,17 +1584,8 @@ impl StandaloneSession {
                 backend.list_views(catalog, db)?
             }
             None => {
-                let views = self
-                    .inner
-                    .views
-                    .read()
-                    .map_err(|e| format!("view registry read lock: {e}"))?;
                 let db_lower = db.to_ascii_lowercase();
-                let mut names: Vec<String> = views
-                    .keys()
-                    .filter(|(database, _)| database == &db_lower)
-                    .map(|(_, view)| view.clone())
-                    .collect();
+                let mut names = self.inner.session_views.list_in_database(&db_lower);
                 names.sort();
                 names
             }
@@ -2506,7 +2496,11 @@ fn prepare_explain_query(
 ) -> Result<sqlparser::ast::Query, String> {
     // Inline any user-defined views before the analyzer sees the query.
     let mut prepared = query.clone();
-    self::view_rewrite::expand_views_in_query(&mut prepared, &state.views, current_database);
+    self::view_rewrite::expand_views_in_query(
+        &mut prepared,
+        state.session_views.as_ref(),
+        current_database,
+    );
     // Inline iceberg-catalog views (REST only). Runs after session
     // views so local definitions keep precedence.
     self::iceberg_view_rewrite::expand_iceberg_views_in_query(

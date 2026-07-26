@@ -18,7 +18,7 @@
 //! Inline expansion of user-defined views.
 //!
 //! StarRocks's standalone server stores `CREATE VIEW` definitions on
-//! `StandaloneState::views` as the underlying SELECT `Query` AST. This
+//! `StandaloneState::session_views` as the underlying SELECT `Query` AST. This
 //! module walks a query before it reaches the analyzer and replaces any
 //! `TableFactor::Table` reference that resolves to a registered view
 //! with a `TableFactor::Derived` subquery carrying the view's body.
@@ -28,16 +28,15 @@
 //! so views can reference other views.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 use sqlparser::ast as sqlast;
 
 pub(crate) fn expand_views_in_query(
     query: &mut sqlast::Query,
-    views: &RwLock<HashMap<(String, String), Box<sqlast::Query>>>,
+    views: &dyn crate::engine::view::ViewCatalog,
     current_database: &str,
 ) {
-    let registry = views.read().expect("view registry read lock");
+    let registry = views.snapshot();
     if registry.is_empty() {
         return;
     }
@@ -146,5 +145,67 @@ fn expand_table_factor(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::view::{InMemoryViewCatalog, ViewCatalog};
+    use crate::sql::parser::dialect::StarRocksDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_query(sql: &str) -> Box<sqlast::Query> {
+        let mut parser = Parser::new(&StarRocksDialect).try_with_sql(sql).unwrap();
+        match parser.parse_statement().unwrap() {
+            sqlast::Statement::Query(q) => q,
+            other => panic!("expected query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_catalog_leaves_query_unchanged() {
+        let catalog = InMemoryViewCatalog::new();
+        let mut q = *parse_query("SELECT * FROM t");
+        expand_views_in_query(&mut q, &catalog, "db");
+        assert_eq!(q.to_string(), "SELECT * FROM t");
+    }
+
+    #[test]
+    fn registered_view_is_inlined_as_derived_subquery() {
+        let catalog = InMemoryViewCatalog::new();
+        catalog
+            .create("db".into(), "v".into(), parse_query("SELECT 1 AS a"), false)
+            .unwrap();
+        let mut q = *parse_query("SELECT * FROM v");
+        expand_views_in_query(&mut q, &catalog, "db");
+        assert_eq!(q.to_string(), "SELECT * FROM (SELECT 1 AS a) v");
+    }
+
+    #[test]
+    fn views_over_views_resolve_recursively() {
+        let catalog = InMemoryViewCatalog::new();
+        catalog
+            .create(
+                "db".into(),
+                "base".into(),
+                parse_query("SELECT 1 AS a"),
+                false,
+            )
+            .unwrap();
+        catalog
+            .create(
+                "db".into(),
+                "wrap".into(),
+                parse_query("SELECT * FROM base"),
+                false,
+            )
+            .unwrap();
+        let mut q = *parse_query("SELECT * FROM wrap");
+        expand_views_in_query(&mut q, &catalog, "db");
+        assert_eq!(
+            q.to_string(),
+            "SELECT * FROM (SELECT * FROM (SELECT 1 AS a) base) wrap"
+        );
     }
 }

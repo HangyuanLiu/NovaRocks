@@ -24,6 +24,7 @@ use arrow::record_batch::RecordBatch;
 use regex::Regex;
 use sqlparser::ast as sqlast;
 
+use crate::engine::view::ViewCatalogError;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::literal::sqlparser_expr_to_custom_expr;
@@ -405,11 +406,9 @@ pub(crate) fn drop_database(state: &Arc<StandaloneState>, database: &str) {
     stats.column_usage.retain(|key, _| key.db != db);
     drop(stats);
     // Views are tied to a database; remove all of this database's views from
-    // the in-memory registry so subsequent `CREATE VIEW` in a freshly-recreated
+    // the registry so a subsequent `CREATE VIEW` in a freshly-recreated
     // database does not fail with "view already exists".
-    if let Ok(mut views) = state.views.write() {
-        views.retain(|(view_db, _), _| view_db != &db);
-    }
+    state.session_views.remove_database(&db);
 }
 
 fn handle_admin_statement(state: &Arc<StandaloneState>, sql: &str) -> Result<(), String> {
@@ -2413,14 +2412,15 @@ fn handle_create_view(
         return crate::engine::iceberg_view::create_iceberg_view(state, &target, create_view);
     }
     let (db, name) = view_name_parts(&create_view.name, current_database)?;
-    let mut views = state
-        .views
-        .write()
-        .map_err(|e| format!("view registry write lock: {e}"))?;
-    if views.contains_key(&(db.clone(), name.clone())) && !create_view.or_replace {
-        return Err(format!("view already exists: {db}.{name}"));
-    }
-    views.insert((db, name), create_view.query);
+    state
+        .session_views
+        .create(
+            db.clone(),
+            name.clone(),
+            create_view.query,
+            create_view.or_replace,
+        )
+        .map_err(|ViewCatalogError::AlreadyExists| format!("view already exists: {db}.{name}"))?;
     Ok(StatementResult::Ok)
 }
 
@@ -2461,11 +2461,7 @@ fn handle_drop_view(
             continue;
         }
         let (db, view) = view_name_parts(&name, current_database)?;
-        let mut views = state
-            .views
-            .write()
-            .map_err(|e| format!("view registry write lock: {e}"))?;
-        views.remove(&(db, view));
+        state.session_views.remove(&db, &view);
     }
     Ok(StatementResult::Ok)
 }
