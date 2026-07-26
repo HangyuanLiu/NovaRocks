@@ -386,6 +386,7 @@ impl BackendRegistryTestGuard {
 impl Drop for BackendRegistryTestGuard {
     fn drop(&mut self) {
         replace_backend_registry_for_test(None);
+        replace_cluster_membership_for_test(None);
     }
 }
 
@@ -623,6 +624,19 @@ mod tests {
     #[test]
     fn cluster_membership_is_absent_without_registry() {
         let _guard = BackendRegistryTestGuard::new();
+        assert!(cluster_membership().is_none());
+    }
+
+    #[test]
+    fn backend_registry_test_guard_clears_membership_override_on_drop() {
+        {
+            let _guard = BackendRegistryTestGuard::new();
+            replace_cluster_membership_for_test(Some(Arc::new(FakeClusterMembership::new(vec![
+                (0, "127.0.0.1:19081".parse().unwrap()),
+            ]))));
+            assert!(cluster_membership().is_some());
+        }
+
         assert!(cluster_membership().is_none());
     }
 
