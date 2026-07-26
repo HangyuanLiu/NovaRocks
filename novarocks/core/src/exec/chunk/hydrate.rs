@@ -49,6 +49,7 @@ pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
     Ok(())
 }
 
+// Design: ADR-0005 (docs/adr/ADR-0005-low-cardinality-runtime-carrier-first.md)
 pub(crate) fn hydrate_dictionary_columns(chunk: &Chunk) -> Result<Chunk, String> {
     hydrate_dictionary_columns_except(chunk, |_, _| false)
 }
