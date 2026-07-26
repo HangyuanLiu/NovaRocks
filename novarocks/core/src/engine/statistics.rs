@@ -24,7 +24,6 @@ use arrow::record_batch::RecordBatch;
 use regex::Regex;
 use sqlparser::ast as sqlast;
 
-use crate::engine::view::ViewCatalogError;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::literal::sqlparser_expr_to_custom_expr;
@@ -125,12 +124,6 @@ pub(crate) fn try_handle_statement(
     if lower.starts_with("admin ") {
         handle_admin_statement(state, trimmed)?;
         return Ok(Some(StatementResult::Ok));
-    }
-    if lower.starts_with("create view ") || lower.starts_with("create or replace view ") {
-        return handle_create_view(state, trimmed, current_catalog, current_database).map(Some);
-    }
-    if lower.starts_with("drop view ") {
-        return handle_drop_view(state, trimmed, current_catalog, current_database).map(Some);
     }
     if lower.starts_with("alter table ") && lower.contains("enable_statistic_collect_on_first_load")
     {
@@ -2375,116 +2368,6 @@ fn string_result(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<QueryRe
             .collect(),
         chunks: vec![record_batch_to_chunk(batch)?],
     })
-}
-
-/// Handle `CREATE VIEW [IF NOT EXISTS] [db.]name AS <query>` by parsing
-/// the trailing query AST and registering it in the in-memory view
-/// registry on `StandaloneState`. The view is later expanded inline by
-/// the analyzer whenever a `FROM <view>` reference resolves to this
-/// name. Views live for the lifetime of the standalone process.
-fn handle_create_view(
-    state: &Arc<StandaloneState>,
-    trimmed: &str,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<StatementResult, String> {
-    use crate::sql::parser::dialect::StarRocksDialect;
-    use sqlparser::parser::Parser;
-    let dialect = StarRocksDialect;
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(trimmed)
-        .map_err(|e| format!("CREATE VIEW parse error: {e}"))?;
-    let stmt = parser
-        .parse_statement()
-        .map_err(|e| format!("CREATE VIEW parse error: {e}"))?;
-    let sqlparser::ast::Statement::CreateView(create_view) = stmt else {
-        return Err("CREATE VIEW: failed to parse statement".to_string());
-    };
-    // A 3-part name, or a 1/2-part name under an active `SET CATALOG`, routes
-    // to the iceberg REST backend. `default_catalog` names fall through to the
-    // existing session-view registration below.
-    if let Some(target) = crate::engine::iceberg_view::resolve_iceberg_view_target(
-        state,
-        &create_view.name,
-        current_catalog,
-        current_database,
-    )? {
-        return crate::engine::iceberg_view::create_iceberg_view(state, &target, create_view);
-    }
-    let (db, name) = view_name_parts(&create_view.name, current_database)?;
-    state
-        .session_views
-        .create(
-            db.clone(),
-            name.clone(),
-            create_view.query,
-            create_view.or_replace,
-        )
-        .map_err(|ViewCatalogError::AlreadyExists| format!("view already exists: {db}.{name}"))?;
-    Ok(StatementResult::Ok)
-}
-
-/// Handle `DROP VIEW [IF EXISTS] [db.]name` by removing the matching
-/// entry from the in-memory view registry.
-fn handle_drop_view(
-    state: &Arc<StandaloneState>,
-    trimmed: &str,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<StatementResult, String> {
-    use crate::sql::parser::dialect::StarRocksDialect;
-    use sqlparser::parser::Parser;
-    let dialect = StarRocksDialect;
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(trimmed)
-        .map_err(|e| format!("DROP VIEW parse error: {e}"))?;
-    let stmt = parser
-        .parse_statement()
-        .map_err(|e| format!("DROP VIEW parse error: {e}"))?;
-    let sqlparser::ast::Statement::Drop {
-        object_type: sqlparser::ast::ObjectType::View,
-        names,
-        if_exists,
-        ..
-    } = stmt
-    else {
-        return Err("DROP VIEW: failed to parse statement".to_string());
-    };
-    for name in names {
-        if let Some(target) = crate::engine::iceberg_view::resolve_iceberg_view_target(
-            state,
-            &name,
-            current_catalog,
-            current_database,
-        )? {
-            crate::engine::iceberg_view::drop_iceberg_view(state, &target, if_exists)?;
-            continue;
-        }
-        let (db, view) = view_name_parts(&name, current_database)?;
-        state.session_views.remove(&db, &view);
-    }
-    Ok(StatementResult::Ok)
-}
-
-fn view_name_parts(
-    name: &sqlparser::ast::ObjectName,
-    current_database: &str,
-) -> Result<(String, String), String> {
-    let parts: Vec<String> = name
-        .0
-        .iter()
-        .filter_map(|part| match part {
-            sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-            _ => None,
-        })
-        .collect();
-    let (db, view) = match parts.as_slice() {
-        [view] => (current_database.to_string(), view.clone()),
-        [db, view] => (db.clone(), view.clone()),
-        [_cat, db, view] => (db.clone(), view.clone()),
-        _ => return Err(format!("invalid view name: {name}")),
-    };
-    Ok((db.to_lowercase(), view.to_lowercase()))
 }
 
 #[cfg(test)]

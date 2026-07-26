@@ -758,6 +758,14 @@ impl StandaloneSession {
         normalized =
             rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
         normalized = rewrite_named_partition_insert_overwrite(&normalized)?;
+        if let Some(result) = self::view::try_handle_statement(
+            &self.inner,
+            &normalized,
+            current_catalog,
+            current_database,
+        )? {
+            return Ok(result);
+        }
         if let Some(result) = self::statistics::try_handle_statement(
             &self.inner,
             &normalized,
