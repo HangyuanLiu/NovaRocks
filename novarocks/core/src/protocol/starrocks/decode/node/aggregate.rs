@@ -513,8 +513,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
         )
     }
 
@@ -539,7 +537,6 @@ mod tests {
             None,
             None,
             Some(Vec::new()),
-            None,
         ));
         let layout = Layout {
             order: Vec::new(),
