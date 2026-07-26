@@ -237,15 +237,12 @@ fn current_time_millis() -> i64 {
 }
 
 pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
-    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
-        let live = registry.live_endpoints();
+    if let Some(membership) = crate::coordinator::cluster::cluster_membership() {
+        let live = membership.live_endpoints();
         if live.is_empty() {
             return Err("no live backend available".to_string());
         }
-        return Ok(live
-            .into_iter()
-            .map(|(be_id, endpoint)| (be_id as usize, endpoint))
-            .collect());
+        return Ok(live);
     }
 
     configured_backend_entries()
@@ -551,6 +548,22 @@ mod tests {
         assert!(snapshot[0].last_heartbeat_ms > 0);
         assert_eq!(
             live_backend_dispatch_entries().expect("dispatch entries"),
+            vec![(0usize, endpoint)]
+        );
+    }
+
+    #[test]
+    fn live_backend_dispatch_entries_reads_injected_membership() {
+        let _guard = BackendRegistryReset::new();
+        let endpoint: std::net::SocketAddr = "127.0.0.1:19080".parse().unwrap();
+        crate::coordinator::cluster::replace_cluster_membership_for_test(Some(
+            std::sync::Arc::new(crate::coordinator::cluster::FakeClusterMembership::new(
+                vec![(0, endpoint)],
+            )),
+        ));
+
+        assert_eq!(
+            live_backend_dispatch_entries().expect("dispatch entries from injected membership"),
             vec![(0usize, endpoint)]
         );
     }
