@@ -468,9 +468,16 @@ impl StandaloneNovaRocks {
             }
         }
         #[cfg(test)]
-        return Self::open_body(opts, _test_guard);
+        return Self::open_body(
+            opts,
+            std::sync::Arc::new(system_catalog::EmptySystemCatalog),
+            _test_guard,
+        );
         #[cfg(not(test))]
-        Self::open_body(opts)
+        Self::open_body(
+            opts,
+            std::sync::Arc::new(system_catalog::EmptySystemCatalog),
+        )
     }
 
     /// Open the engine using an already-loaded, validated config.
@@ -482,6 +489,7 @@ impl StandaloneNovaRocks {
     pub fn open_with_config(
         opts: StandaloneOptions,
         cfg: novarocks_config::NovaRocksConfig,
+        system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -489,15 +497,16 @@ impl StandaloneNovaRocks {
         crate::coordinator::cluster::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
-        return Self::open_body(opts, _test_guard);
+        return Self::open_body(opts, system_catalog, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(opts)
+        Self::open_body(opts, system_catalog)
     }
 
     /// Common engine-open body.  Called after the process-wide config has
     /// already been installed by the caller.
     fn open_body(
         opts: StandaloneOptions,
+        system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -553,6 +562,7 @@ impl StandaloneNovaRocks {
             catalog_attachment_repo: CatalogAttachmentRepository,
             job_repo: JobMetaRepository,
             exchange_port,
+            system_catalog,
             #[cfg(test)]
             _test_guard,
             ..Default::default()
@@ -4335,7 +4345,7 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
-    use crate::engine::system_catalog::SystemCatalogInputs;
+    use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::meta::MetaStoreProvider;
     use crate::runtime::query_options::QueryOptions;
@@ -4362,6 +4372,86 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    struct TestSchemataCatalog;
+
+    impl SystemCatalog for TestSchemataCatalog {
+        fn resolve(
+            &self,
+            db: &str,
+            tbl: &str,
+            _inputs: &SystemCatalogInputs<'_>,
+        ) -> Result<Option<SystemTableData>, String> {
+            if !(db.eq_ignore_ascii_case("information_schema")
+                && tbl.eq_ignore_ascii_case("schemata"))
+            {
+                return Ok(None);
+            }
+            let columns = vec![
+                ("catalog_name", false),
+                ("schema_name", false),
+                ("default_character_set_name", false),
+                ("default_collation_name", false),
+                ("sql_path", true),
+            ]
+            .into_iter()
+            .map(|(name, nullable)| novarocks_catalog::schema::ColumnDef {
+                name: name.to_string(),
+                data_type: DataType::Utf8,
+                nullable,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("catalog_name", DataType::Utf8, false),
+                Field::new("schema_name", DataType::Utf8, false),
+                Field::new("default_character_set_name", DataType::Utf8, false),
+                Field::new("default_collation_name", DataType::Utf8, false),
+                Field::new("sql_path", DataType::Utf8, true),
+            ]));
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["default_catalog"])),
+                    Arc::new(StringArray::from(vec!["injected_schema"])),
+                    Arc::new(StringArray::from(vec!["utf8"])),
+                    Arc::new(StringArray::from(vec!["utf8_general_ci"])),
+                    Arc::new(StringArray::from(vec![None::<&str>])),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Some(SystemTableData {
+                columns,
+                batches: vec![batch],
+            }))
+        }
+    }
+
+    #[test]
+    fn open_with_config_injected_system_catalog_serves_schemata() {
+        let cfg = crate::common::app_config::NovaRocksConfig::default();
+        let engine = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions::default(),
+            cfg,
+            Arc::new(TestSchemataCatalog),
+        )
+        .expect("open engine with injected system catalog");
+
+        let result = engine
+            .session()
+            .execute_in_context(
+                "SELECT schema_name FROM information_schema.schemata",
+                None,
+                "",
+                None,
+            )
+            .expect("query injected information_schema.schemata");
+        let StatementResult::Query(result) = result else {
+            panic!("expected query result");
+        };
+        assert!(result.row_count() > 0);
     }
 
     #[test]
@@ -4468,8 +4558,12 @@ path = "{metadata_path}"
         let mut cfg = crate::common::app_config::NovaRocksConfig::default();
         cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
         cfg.cluster.backends.clear();
-        let engine = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
-            .expect("open FE engine");
+        let engine = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions::default(),
+            cfg,
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+        )
+        .expect("open FE engine");
         let session = engine.session();
 
         session
@@ -4500,17 +4594,24 @@ path = "{metadata_path}"
             path: metadata_path.clone(),
         });
 
-        let engine =
-            StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg.clone())
-                .expect("open FE engine");
+        let engine = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions::default(),
+            cfg.clone(),
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+        )
+        .expect("open FE engine");
         engine
             .session()
             .execute("ADD BACKEND '127.0.0.1:19172'")
             .expect("ADD BACKEND");
         drop(engine);
 
-        let reopened = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
-            .expect("reopen FE engine");
+        let reopened = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions::default(),
+            cfg,
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+        )
+        .expect("reopen FE engine");
         let result = reopened
             .session()
             .query("SHOW BACKENDS")
@@ -4524,8 +4625,12 @@ path = "{metadata_path}"
     fn add_backend_requires_fe_role_but_show_backends_works_in_all_in_one() {
         let mut cfg = crate::common::app_config::NovaRocksConfig::default();
         cfg.cluster.role = crate::common::app_config::ClusterRole::AllInOne;
-        let engine = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
-            .expect("open all-in-one engine");
+        let engine = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions::default(),
+            cfg,
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+        )
+        .expect("open all-in-one engine");
         let session = engine.session();
 
         let err = session
@@ -4898,6 +5003,7 @@ mysql_port = 47892
                 config_path: Some(config_path),
             },
             cfg,
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
         );
         assert!(
             result.is_ok(),
