@@ -80,6 +80,7 @@ mod query_stats;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub mod system_catalog;
+pub(crate) mod view;
 pub(crate) mod view_rewrite;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
