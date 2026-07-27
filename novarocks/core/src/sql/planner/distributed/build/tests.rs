@@ -7,10 +7,11 @@ use super::fragment_cut::stream_exchange_output_columns;
 use super::lowering::{NodeIdAllocator, lower_fragment_local_node};
 use super::runtime_filter_binding::{
     RuntimeFilterBindings, RuntimeFilterBuildBinding as BuildBinding,
-    RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
+    RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_draft,
+    populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
-use crate::runtime_filter::model::contract::BindingId;
+use crate::runtime_filter::model::contract::{BindingId, ConsumerActivation};
 use crate::runtime_filter::model::graph::{
     ProducerBindingTarget, RuntimeFilterBindingRole, RuntimeFilterGraph,
 };
@@ -19,6 +20,9 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
 };
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::activation_decision::{
+    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
+};
 use crate::sql::planner::distributed::runtime_filter_progress::build_join_progress_proof_catalog;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
@@ -955,6 +959,108 @@ fn populate_runtime_filter_graph_deduplicates_and_skips_incomplete_channels() {
     assert_eq!(fragments[1].root.runtime_filter_binding_ids.len(), 1);
     assert_eq!(fragments[2].root.runtime_filter_binding_ids.len(), 1);
     assert!(fragments[3].root.runtime_filter_binding_ids.is_empty());
+}
+
+#[test]
+fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activation() {
+    let bindings = RuntimeFilterBindings {
+        builds: vec![test_build_binding(1, 0, 10)],
+        probes: vec![test_probe_binding(2, 1, 10)],
+        node_input_columns: std::collections::BTreeMap::new(),
+    };
+    let fragments = vec![
+        test_fragment(distributed_values_node(1, 0)),
+        test_fragment(distributed_values_node(2, 1)),
+    ];
+
+    let mut sealed_fragments = fragments.clone();
+    let mut sealed_graph = RuntimeFilterGraph::default();
+    populate_runtime_filter_graph(&mut sealed_fragments, &mut sealed_graph, &bindings)
+        .expect("populate sealed graph");
+
+    let mut draft_fragments = fragments;
+    let mut draft_graph = DraftRuntimeFilterGraph::default();
+    populate_runtime_filter_draft(&mut draft_fragments, &mut draft_graph, &bindings)
+        .expect("populate draft graph");
+    sealed_graph.validate().expect("sealed graph validates");
+    draft_graph.validate().expect("draft graph validates");
+
+    assert_eq!(draft_graph.channel_count(), sealed_graph.channel_count());
+    assert_eq!(draft_graph.binding_count(), sealed_graph.binding_count());
+    assert_eq!(
+        draft_graph
+            .channels()
+            .map(|channel| channel.channel_id)
+            .collect::<Vec<_>>(),
+        sealed_graph
+            .channels()
+            .map(|channel| channel.channel_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        draft_graph
+            .bindings()
+            .map(|binding| {
+                (
+                    binding.binding_id,
+                    binding.channel_id,
+                    binding.coverage_witness_id,
+                    binding.location,
+                    format!("{:?}", binding.expression),
+                    binding.apply_point,
+                )
+            })
+            .collect::<Vec<_>>(),
+        sealed_graph
+            .bindings()
+            .map(|binding| {
+                (
+                    binding.binding_id,
+                    binding.channel_id,
+                    binding.coverage_witness_id,
+                    binding.location,
+                    format!("{:?}", binding.expression),
+                    binding.apply_point,
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        draft_fragments
+            .iter()
+            .map(|fragment| fragment.root.runtime_filter_binding_ids.clone())
+            .collect::<Vec<_>>(),
+        sealed_fragments
+            .iter()
+            .map(|fragment| fragment.root.runtime_filter_binding_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    let draft_consumer = draft_graph
+        .bindings()
+        .find_map(|binding| match &binding.role {
+            crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Consumer(
+                consumer,
+            ) => Some(consumer),
+            crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Producer(_) => None,
+        })
+        .expect("draft consumer");
+    assert_eq!(
+        draft_consumer.activation,
+        ActivationConstraint::BlockingOrBatchLive {
+            fallback: ActivationFallback::BlockingSnapshot,
+        }
+    );
+    let sealed_consumer = sealed_graph
+        .bindings()
+        .find_map(|binding| match &binding.role {
+            RuntimeFilterBindingRole::Consumer(consumer) => Some(consumer),
+            RuntimeFilterBindingRole::Producer(_) => None,
+        })
+        .expect("sealed consumer");
+    assert_eq!(
+        sealed_consumer.activation,
+        ConsumerActivation::BlockingSnapshot
+    );
 }
 
 #[test]

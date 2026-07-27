@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::num::NonZeroU32;
 
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
@@ -26,14 +25,18 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerBindingTarget,
-    ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
-    RuntimeFilterChannelSpec, RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
+    ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
+    RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraph,
+    RuntimeFilterGraphData,
 };
 use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
+use crate::sql::planner::distributed::activation_decision::{
+    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
+};
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, FragmentId, PlanFragment,
 };
@@ -72,20 +75,20 @@ pub(super) struct RuntimeFilterProducerCandidate {
 }
 
 #[derive(Clone)]
-pub(super) struct RuntimeFilterConsumerCandidate {
+pub(super) struct RuntimeFilterConsumerCandidate<A> {
     pub(super) location: PlanLocation,
     pub(super) expression: TypedExpr,
     pub(super) target: ConsumerBindingTarget,
     pub(super) capabilities: BTreeSet<ArtifactCapability>,
-    pub(super) activation: ConsumerActivation,
+    pub(super) activation: A,
 }
 
 #[derive(Clone)]
-pub(super) struct RuntimeFilterChannelCandidate {
+pub(super) struct RuntimeFilterChannelCandidate<A> {
     pub(super) legacy_filter_id: i32,
     pub(super) channel: RuntimeFilterChannelSpec,
     pub(super) producer: RuntimeFilterProducerCandidate,
-    pub(super) consumers: Vec<RuntimeFilterConsumerCandidate>,
+    pub(super) consumers: Vec<RuntimeFilterConsumerCandidate<A>>,
 }
 
 impl RuntimeFilterBindings {
@@ -133,10 +136,10 @@ impl RuntimeFilterBindings {
     }
 }
 
-pub(super) fn populate_runtime_filter_candidates(
+pub(super) fn populate_runtime_filter_candidates<A>(
     fragments: &mut [PlanFragment],
-    graph: &mut RuntimeFilterGraph,
-    mut candidates: Vec<RuntimeFilterChannelCandidate>,
+    graph: &mut RuntimeFilterGraphData<A>,
+    mut candidates: Vec<RuntimeFilterChannelCandidate<A>>,
 ) -> Result<(), String> {
     candidates.sort_by_key(|candidate| candidate.legacy_filter_id);
     candidates.dedup_by_key(|candidate| candidate.legacy_filter_id);
@@ -206,14 +209,14 @@ pub(super) fn populate_runtime_filter_candidates(
             .checked_add(1)
             .ok_or_else(|| "runtime filter binding id overflow".to_string())?;
         graph
-            .insert_binding(RuntimeFilterBindingSpec {
+            .insert_binding(RuntimeFilterBindingSpecData {
                 binding_id: producer_binding_id,
                 channel_id,
                 coverage_witness_id: Some(witness_id),
                 location: candidate.producer.location,
                 expression: candidate.producer.expression,
                 apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                     contribution_kinds: candidate.producer.contribution_kinds,
                     completion_requirement: candidate.producer.completion_requirement,
                     target: candidate.producer.target,
@@ -239,14 +242,14 @@ pub(super) fn populate_runtime_filter_candidates(
                 .checked_add(1)
                 .ok_or_else(|| "runtime filter binding id overflow".to_string())?;
             graph
-                .insert_binding(RuntimeFilterBindingSpec {
+                .insert_binding(RuntimeFilterBindingSpecData {
                     binding_id,
                     channel_id,
                     coverage_witness_id: None,
                     location: consumer.location,
                     expression: consumer.expression,
                     apply_point: ApplyPoint::NodeInput,
-                    role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                         capabilities: consumer.capabilities,
                         activation: consumer.activation,
                         target: consumer.target,
@@ -278,6 +281,31 @@ pub(super) fn populate_runtime_filter_graph(
     graph: &mut RuntimeFilterGraph,
     bindings: &RuntimeFilterBindings,
 ) -> Result<(), String> {
+    let candidates = collect_join_runtime_filter_candidates(fragments, bindings, || {
+        // Design: ADR-0003 (docs/adr/ADR-0003-rf-activation-blocking-default-live-targeted.md)
+        ConsumerActivation::BlockingSnapshot
+    });
+    populate_runtime_filter_candidates(fragments, graph, candidates)
+}
+
+pub(super) fn populate_runtime_filter_draft(
+    fragments: &mut [PlanFragment],
+    graph: &mut DraftRuntimeFilterGraph,
+    bindings: &RuntimeFilterBindings,
+) -> Result<(), String> {
+    let candidates = collect_join_runtime_filter_candidates(fragments, bindings, || {
+        ActivationConstraint::BlockingOrBatchLive {
+            fallback: ActivationFallback::BlockingSnapshot,
+        }
+    });
+    populate_runtime_filter_candidates(fragments, graph, candidates)
+}
+
+fn collect_join_runtime_filter_candidates<A>(
+    fragments: &[PlanFragment],
+    bindings: &RuntimeFilterBindings,
+    mut activation: impl FnMut() -> A,
+) -> Vec<RuntimeFilterChannelCandidate<A>> {
     let mut builds_by_filter = BTreeMap::new();
     for build in &bindings.builds {
         builds_by_filter
@@ -373,13 +401,12 @@ pub(super) fn populate_runtime_filter_graph(
                     expression: probe.expression,
                     target: probe.target,
                     capabilities: capabilities.clone(),
-                    // Design: ADR-0003 (docs/adr/ADR-0003-rf-activation-blocking-default-live-targeted.md)
-                    activation: ConsumerActivation::BlockingSnapshot,
+                    activation: activation(),
                 })
                 .collect(),
         });
     }
-    populate_runtime_filter_candidates(fragments, graph, candidates)
+    candidates
 }
 
 fn join_execution_coverage(
@@ -828,6 +855,8 @@ fn attach_binding_ids(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use arrow::datatypes::DataType;
 
     use crate::runtime_filter::deployment::role_graph::{
@@ -838,6 +867,7 @@ mod tests {
         ComparatorDigest, CompletionFenceKind, LateApplyGranularity, NullOrder, OrderContract,
         OrderKeyContract, SortDirection,
     };
+    use crate::runtime_filter::model::graph::RuntimeFilterBindingRole;
     use crate::runtime_filter::model::validation::GraphValidationErrorKind;
     use crate::runtime_filter::port::identity::RuntimeFilterParticipantId;
     use crate::sql::analysis::{ExprKind, LiteralValue};
