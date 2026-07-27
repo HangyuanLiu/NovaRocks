@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -27,7 +27,8 @@ use novarocks_spi::state_store::{
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -43,6 +44,7 @@ pub struct StoredDatabaseViewsV1 {
     pub catalog: String,
     pub database: String,
     pub last_operation_id: Uuid,
+    #[serde(deserialize_with = "deserialize_views")]
     pub views: BTreeMap<String, String>,
 }
 
@@ -107,6 +109,7 @@ impl ViewRepository {
             continuation: None,
         };
         let mut records = Vec::new();
+        let mut identities = BTreeSet::new();
 
         loop {
             let page = transaction
@@ -114,7 +117,15 @@ impl ViewRepository {
                 .await
                 .map_err(|error| format!("load frontend view database page failed: {error}"))?;
             for record in page.records {
-                records.push(decode_record(record.key, record.value)?);
+                let record = decode_record(record.key, record.value)?;
+                let identity = (record.catalog.clone(), record.database.clone());
+                if !identities.insert(identity) {
+                    return Err(format!(
+                        "duplicate frontend view database identity: {}.{}",
+                        record.catalog, record.database
+                    ));
+                }
+                records.push(record);
             }
             let Some(continuation) = page.continuation else {
                 break;
@@ -261,10 +272,13 @@ fn decode_database_key(key: &Key) -> Result<(String, String), String> {
     if catalog.is_empty() || database.is_empty() || parts.next().is_some() {
         return Err("frontend view database key is malformed".to_string());
     }
-    Ok((
-        decode_key_part(catalog, "catalog")?,
-        decode_key_part(database, "database")?,
-    ))
+    let catalog = decode_key_part(catalog, "catalog")?;
+    let database = decode_key_part(database, "database")?;
+    let canonical = database_key(&catalog, &database)?;
+    if canonical != *key {
+        return Err("frontend view database key is not canonical".to_string());
+    }
+    Ok((catalog, database))
 }
 
 fn decode_key_part(encoded: &[u8], identity: &str) -> Result<String, String> {
@@ -272,6 +286,41 @@ fn decode_key_part(encoded: &[u8], identity: &str) -> Result<String, String> {
         .map_err(|_| format!("frontend view database key has invalid {identity} encoding"))?;
     String::from_utf8(raw)
         .map_err(|_| format!("frontend view database key has non-UTF-8 {identity}"))
+}
+
+fn deserialize_views<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ViewsVisitor;
+
+    impl<'de> Visitor<'de> for ViewsVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of normalized frontend view names to query SQL")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut views = BTreeMap::new();
+            let mut normalized_names = BTreeSet::new();
+            while let Some((view, sql)) = access.next_entry::<String, String>()? {
+                let normalized = normalize_identifier(&view).unwrap_or_else(|_| view.clone());
+                if !normalized_names.insert(normalized.clone()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate normalized frontend view name `{normalized}`"
+                    )));
+                }
+                views.insert(view, sql);
+            }
+            Ok(views)
+        }
+    }
+
+    deserializer.deserialize_map(ViewsVisitor)
 }
 
 fn validate_record(record: &StoredDatabaseViewsV1) -> Result<(), String> {

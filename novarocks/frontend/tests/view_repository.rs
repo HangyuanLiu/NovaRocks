@@ -29,7 +29,7 @@ use novarocks_frontend::view::repository::{
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, Precondition, RangePage,
     RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId, Value,
+    StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId, Value, VersionToken,
     WriteTransaction,
 };
 use novarocks_state_store::{
@@ -66,6 +66,31 @@ fn decode_rejects_key_value_identity_mismatch() {
             .unwrap_err()
             .contains("view record identity mismatch")
     );
+}
+
+#[test]
+fn decode_rejects_duplicate_normalized_view_keys() {
+    let operation_id = Uuid::now_v7();
+    let json = format!(
+        r#"{{"schema_version":1,"catalog":"default_catalog","database":"db","last_operation_id":"{operation_id}","views":{{"v":"SELECT 1","v":"SELECT 2"}}}}"#
+    );
+    let error = decode_record(
+        database_key("default_catalog", "db").unwrap(),
+        Value::try_from(Bytes::from(json)).unwrap(),
+    )
+    .unwrap_err();
+    assert!(error.contains("duplicate normalized frontend view name `v`"));
+}
+
+#[test]
+fn decode_rejects_non_canonical_hex_key_encoding() {
+    let key = Key::try_from(Bytes::from_static(
+        b"novarocks/frontend/views/v1/64656661756C745F636174616C6F67/6462",
+    ))
+    .unwrap();
+    let error =
+        decode_record(key, encode_record(record("default_catalog", "db")).unwrap()).unwrap_err();
+    assert!(error.contains("frontend view database key is not canonical"));
 }
 
 #[test]
@@ -257,6 +282,96 @@ async fn write_raw(store: &dyn StateStore, key: Key, value: Value) {
         transaction.commit().await,
         CommitOutcome::Committed(_)
     ));
+}
+
+struct DuplicateRangeStore {
+    inner: Arc<dyn StateStore>,
+    record: StateRecord,
+}
+
+#[async_trait]
+impl StateStore for DuplicateRangeStore {
+    fn provider_name(&self) -> &'static str {
+        "duplicate-range-test"
+    }
+
+    fn limits(&self) -> &StateStoreLimits {
+        self.inner.limits()
+    }
+
+    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+        self.inner.metrics_snapshot()
+    }
+
+    async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+        Ok(Box::new(DuplicateRangeTransaction {
+            record: self.record.clone(),
+        }))
+    }
+
+    async fn begin_write(
+        &self,
+        transaction_id: TransactionId,
+        purpose: &str,
+    ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+        self.inner.begin_write(transaction_id, purpose).await
+    }
+
+    async fn poll_changes(
+        &self,
+        request: &ChangePollRequest,
+    ) -> Result<ChangePage, StateStoreError> {
+        self.inner.poll_changes(request).await
+    }
+
+    async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+        self.inner.identity().await
+    }
+
+    async fn resolve_commit(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<CommitResolution, StateStoreError> {
+        self.inner.resolve_commit(transaction_id).await
+    }
+}
+
+struct DuplicateRangeTransaction {
+    record: StateRecord,
+}
+
+#[async_trait]
+impl ReadTransaction for DuplicateRangeTransaction {
+    async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+        Ok((key == &self.record.key).then(|| self.record.clone()))
+    }
+
+    async fn range(&mut self, _request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+        Ok(RangePage {
+            records: vec![self.record.clone(), self.record.clone()],
+            continuation: None,
+        })
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn repository_open_rejects_duplicate_logical_database_identity() {
+    let temp = TempDir::new().unwrap();
+    let inner = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let record = StateRecord {
+        key: database_key("default_catalog", "db").unwrap(),
+        value: encode_record(record("default_catalog", "db")).unwrap(),
+        version: VersionToken::try_from(Bytes::from_static(b"version")).unwrap(),
+    };
+    let store: Arc<dyn StateStore> = Arc::new(DuplicateRangeStore { inner, record });
+    let error = ViewRepository::open(store, tokio::runtime::Handle::current())
+        .await
+        .unwrap_err();
+    assert!(error.contains("duplicate frontend view database identity: default_catalog.db"));
 }
 
 struct CommitUnknownStore {
