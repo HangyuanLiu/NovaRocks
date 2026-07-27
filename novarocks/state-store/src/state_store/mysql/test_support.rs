@@ -18,9 +18,9 @@
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,
-    Precondition, StateRecord, StateStore, StoreRevision, TransactionId, Value,
+    StateRecord, StateStore, StoreRevision, TransactionId, Value,
 };
-use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+use novarocks_spi::state_store::{Precondition, StateStoreError, StateStoreErrorKind};
 
 use super::super::StateStoreRuntime;
 use super::client::MysqlPoolConnection;
