@@ -163,7 +163,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn force_final_plan_failure_for_test() {
+pub(super) fn force_final_plan_failure_for_test() {
     FORCE_FINAL_PLAN_FAILURE.with(|enabled| enabled.set(true));
 }
 

@@ -3309,6 +3309,59 @@ mod tests {
     }
 
     #[test]
+    fn exchange_binding_preserves_concrete_live_activation_from_wire() {
+        let baseline = lower(&one_col_values_node(10));
+        let mut wire = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode::default()),
+            Vec::new(),
+            Vec::new(),
+        );
+        wire.payload = Some(plan::distributed_node::Payload::Exchange(
+            plan::ExchangeReceiver::default(),
+        ));
+        let mut binding = dormant_source_consumer(1, 10, 1);
+        let DecodedBindingRole::Consumer { activation, .. } = &mut binding.role else {
+            panic!("fixture remains a consumer");
+        };
+        *activation = crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+        };
+        let mut lowered = DecodedNode {
+            node: ExecNode {
+                kind: ExecNodeKind::ExchangeSource(
+                    crate::exec::node::exchange_source::ExchangeSourceNode::new(
+                        3,
+                        std::time::Duration::from_secs(1),
+                        Arc::clone(&baseline.output_schema),
+                    ),
+                ),
+            },
+            layout: baseline.layout,
+            output_schema: baseline.output_schema,
+        };
+
+        attach_leaf_consumers(
+            &wire,
+            &[binding],
+            &mut lowered,
+            &mut ExprArena::default(),
+            FieldPath::root("test_node"),
+        )
+        .expect("exchange leaf binding");
+
+        let ExecNodeKind::ExchangeSource(exchange) = &lowered.node.kind else {
+            panic!("exchange");
+        };
+        assert_eq!(
+            exchange.native_runtime_filter_specs()[0].activation,
+            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            }
+        );
+    }
+
+    #[test]
     fn unary_node_wraps_only_its_direct_input() {
         let mut children = vec![lower(&one_col_values_node(10))];
         let mut arena = ExprArena::default();

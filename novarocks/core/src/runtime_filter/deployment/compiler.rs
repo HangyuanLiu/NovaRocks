@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_rejects_blocking_feedback_cycle() {
+    fn compile_missing_live_activation_decision_rejects_blocking_feedback_cycle() {
         let mut graph = RuntimeFilterGraph::default();
         // A Membership channel (not OrderedBound) is used deliberately: an
         // OrderedBound/FinalDomainShard channel forbids `BlockingSnapshot`

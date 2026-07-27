@@ -963,12 +963,11 @@ mod tests {
             .first()
             .expect("one decoded consumer spec")
             .activation;
-        assert!(matches!(
+        assert_eq!(
             decoded_activation,
-            ConsumerActivation::NonBlockingLive {
-                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
-            }
-        ));
+            plan.activation_decisions()[&BindingId::new(2)].activation,
+            "only the sealed concrete activation crosses the native wire boundary"
+        );
 
         let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
         let policy = cycle_deployment_policy();
@@ -1015,6 +1014,68 @@ mod tests {
             sealed_consumer_activation(&plan),
             ConsumerActivation::BlockingSnapshot
         );
+
+        let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
+        assert!(matches!(
+            compile_with_join_progress(
+                plan.runtime_filter_graph(),
+                &cycle_scheduling_plan(&plan),
+                plan.edges(),
+                plan.runtime_filter_join_progress(),
+                &backends,
+                &cycle_deployment_policy(),
+                DeploymentEpoch::new(1),
+            ),
+            Err(DeploymentError::BlockingFeedbackCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn seal_catalog_covers_each_consumer_in_binding_id_order() {
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft
+            .runtime_filter_graph
+            .insert_binding(join_consumer_binding(BindingId::new(3), ChannelId::new(1)))
+            .expect("second consumer uses the existing channel");
+        draft.fragments[0].root.runtime_filter_binding_ids =
+            vec![BindingId::new(1), BindingId::new(2), BindingId::new(3)];
+
+        let plan = seal_draft(draft).expect("valid acyclic consumers must seal");
+        let decisions = plan.activation_decisions();
+
+        assert_eq!(
+            decisions.keys().copied().collect::<Vec<_>>(),
+            vec![BindingId::new(2), BindingId::new(3)],
+            "the catalog is the deterministic provenance source for every consumer"
+        );
+        for decision in decisions.values() {
+            assert_eq!(decision.activation, ConsumerActivation::BlockingSnapshot);
+            assert!(matches!(
+                &decision.reason,
+                super::super::activation_decision::ActivationDecisionReason::ConservativeFallback
+            ));
+        }
+    }
+
+    #[test]
+    fn seal_final_activation_validation_failure_returns_no_plan() {
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.fragments[0].root.runtime_filter_binding_ids =
+            vec![BindingId::new(1), BindingId::new(2)];
+
+        super::super::activation_decision::force_final_plan_failure_for_test();
+        let error = seal_draft(draft).expect_err("a failed final activation check must not seal");
+
+        assert!(matches!(
+            error,
+            DistributedPlanSealError::ActivationDecision(
+                super::super::activation_decision::ActivationDecisionError::FinalPlan(
+                    RuntimeFilterPlanValidationError::BindingLocationMismatch(binding)
+                )
+            ) if binding == BindingId::new(2)
+        ));
     }
 
     #[test]
