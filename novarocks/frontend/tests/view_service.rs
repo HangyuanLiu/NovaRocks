@@ -564,6 +564,104 @@ async fn session_cte_shadows_a_same_named_session_view() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
+    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let engine = FakeViewEngine::default();
+    for view in ["nested", "first", "second"] {
+        service
+            .try_handle_statement(
+                &engine,
+                &format!("CREATE VIEW {view} AS SELECT 7 AS a"),
+                context(None, "db"),
+            )
+            .unwrap();
+    }
+
+    for sql in [
+        "WITH nested AS (SELECT 3 AS a) \
+         SELECT * FROM (SELECT * FROM nested) AS s",
+        "WITH first AS (SELECT 1 AS a), \
+         second AS (SELECT * FROM (SELECT * FROM first) AS s) \
+         SELECT * FROM second",
+        "WITH RECURSIVE nested AS (\
+         SELECT 1 AS a UNION ALL SELECT * FROM nested\
+         ) SELECT * FROM nested",
+    ] {
+        let mut query = parse_query(sql);
+        let expected = query.to_string();
+        service
+            .rewrite_query(&engine, &mut query, context(None, "db"))
+            .unwrap();
+        assert_eq!(query.to_string(), expected, "input: {sql}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
+    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    for view in ["nested", "first", "second"] {
+        engine.insert_view(
+            ViewTarget {
+                catalog: "ice".to_string(),
+                database: "db".to_string(),
+                view: view.to_string(),
+            },
+            "SELECT 7 AS a",
+            "db",
+        );
+    }
+
+    for sql in [
+        "WITH nested AS (SELECT 3 AS a) \
+         SELECT * FROM (SELECT * FROM nested) AS s",
+        "WITH first AS (SELECT 1 AS a), \
+         second AS (SELECT * FROM (SELECT * FROM first) AS s) \
+         SELECT * FROM second",
+        "WITH RECURSIVE nested AS (\
+         SELECT 1 AS a UNION ALL SELECT * FROM nested\
+         ) SELECT * FROM nested",
+    ] {
+        let mut query = parse_query(sql);
+        let expected = query.to_string();
+        service
+            .rewrite_query(&engine, &mut query, context(Some("ice"), "db"))
+            .unwrap();
+        assert_eq!(query.to_string(), expected, "input: {sql}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_view_qualification_preserves_ctes_inside_nested_queries() {
+    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    engine.insert_view(
+        ViewTarget {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            view: "wrapper".to_string(),
+        },
+        "WITH nested AS (SELECT 3 AS a) \
+         SELECT * FROM (SELECT * FROM nested) AS s",
+        "db",
+    );
+
+    let mut query = parse_query("SELECT * FROM wrapper");
+    service
+        .rewrite_query(&engine, &mut query, context(Some("ice"), "db"))
+        .unwrap();
+    let rendered = query.to_string();
+    assert!(!rendered.contains("ice.db.nested"), "got: {rendered}");
+    assert!(rendered.contains("FROM nested"), "got: {rendered}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rewrite_keeps_tables_and_table_probe_failures_and_reports_view_cycles() {
     let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
         .await

@@ -36,26 +36,39 @@ pub(super) fn expand_session_views(
     if registry.is_empty() {
         return;
     }
-    expand_session_query(query, registry, current_database);
+    expand_session_query(query, registry, current_database, &HashSet::new());
 }
 
 fn expand_session_query(
     query: &mut sqlast::Query,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
+    visible_ctes: &HashSet<String>,
 ) {
-    let mut cte_names = HashSet::new();
-    if let Some(with_clause) = query.with.as_ref() {
-        for cte in &with_clause.cte_tables {
-            cte_names.insert(cte.alias.name.value.to_ascii_lowercase());
-        }
-    }
+    let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
+        let recursive = with_clause.recursive;
         for cte in &mut with_clause.cte_tables {
-            expand_session_query(cte.query.as_mut(), registry, current_database);
+            let name = cte.alias.name.value.to_ascii_lowercase();
+            let mut cte_visible_ctes = body_visible_ctes.clone();
+            if recursive {
+                cte_visible_ctes.insert(name.clone());
+            }
+            expand_session_query(
+                cte.query.as_mut(),
+                registry,
+                current_database,
+                &cte_visible_ctes,
+            );
+            body_visible_ctes.insert(name);
         }
     }
-    expand_session_set_expr(query.body.as_mut(), registry, current_database, &cte_names);
+    expand_session_set_expr(
+        query.body.as_mut(),
+        registry,
+        current_database,
+        &body_visible_ctes,
+    );
 }
 
 fn expand_session_set_expr(
@@ -84,7 +97,7 @@ fn expand_session_set_expr(
             }
         }
         sqlast::SetExpr::Query(query) => {
-            expand_session_query(query.as_mut(), registry, current_database)
+            expand_session_query(query.as_mut(), registry, current_database, cte_names)
         }
         sqlast::SetExpr::SetOperation { left, right, .. } => {
             expand_session_set_expr(left.as_mut(), registry, current_database, cte_names);
@@ -116,7 +129,7 @@ fn expand_session_table_factor(
                 return;
             };
             let mut expanded = stored.query.as_ref().clone();
-            expand_session_query(&mut expanded, registry, &key.database);
+            expand_session_query(&mut expanded, registry, &key.database, &HashSet::new());
             let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
                 name: sqlast::Ident::new(parts.last().cloned().unwrap_or_else(|| key.view.clone())),
                 columns: Vec::new(),
@@ -130,7 +143,7 @@ fn expand_session_table_factor(
             };
         }
         sqlast::TableFactor::Derived { subquery, .. } => {
-            expand_session_query(subquery.as_mut(), registry, current_database);
+            expand_session_query(subquery.as_mut(), registry, current_database, cte_names);
         }
         sqlast::TableFactor::NestedJoin {
             table_with_joins, ..
@@ -168,27 +181,42 @@ pub(super) fn expand_external_views(
     context: ViewRequestContext<'_>,
 ) -> Result<(), String> {
     let mut stack = Vec::new();
-    expand_external_query(engine, query, context, &mut stack)
+    expand_external_query(engine, query, context, &HashSet::new(), &mut stack)
 }
 
 fn expand_external_query(
     engine: &dyn ViewEngine,
     query: &mut sqlast::Query,
     context: ViewRequestContext<'_>,
+    visible_ctes: &HashSet<String>,
     stack: &mut Vec<ExternalViewKey>,
 ) -> Result<(), String> {
-    let mut cte_names = HashSet::new();
-    if let Some(with_clause) = query.with.as_ref() {
-        for cte in &with_clause.cte_tables {
-            cte_names.insert(cte.alias.name.value.to_ascii_lowercase());
-        }
-    }
+    let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
+        let recursive = with_clause.recursive;
         for cte in &mut with_clause.cte_tables {
-            expand_external_query(engine, cte.query.as_mut(), context, stack)?;
+            let name = cte.alias.name.value.to_ascii_lowercase();
+            let mut cte_visible_ctes = body_visible_ctes.clone();
+            if recursive {
+                cte_visible_ctes.insert(name.clone());
+            }
+            expand_external_query(
+                engine,
+                cte.query.as_mut(),
+                context,
+                &cte_visible_ctes,
+                stack,
+            )?;
+            body_visible_ctes.insert(name);
         }
     }
-    expand_external_set_expr(engine, query.body.as_mut(), context, &cte_names, stack)
+    expand_external_set_expr(
+        engine,
+        query.body.as_mut(),
+        context,
+        &body_visible_ctes,
+        stack,
+    )
 }
 
 fn expand_external_set_expr(
@@ -221,7 +249,7 @@ fn expand_external_set_expr(
             Ok(())
         }
         sqlast::SetExpr::Query(query) => {
-            expand_external_query(engine, query.as_mut(), context, stack)
+            expand_external_query(engine, query.as_mut(), context, cte_names, stack)
         }
         sqlast::SetExpr::SetOperation { left, right, .. } => {
             expand_external_set_expr(engine, left.as_mut(), context, cte_names, stack)?;
@@ -275,6 +303,7 @@ fn expand_external_table_factor(
                     current_catalog: Some(&target.catalog),
                     current_database: &view.default_database,
                 },
+                &HashSet::new(),
                 stack,
             )?;
             stack.pop();
@@ -293,7 +322,7 @@ fn expand_external_table_factor(
             Ok(())
         }
         sqlast::TableFactor::Derived { subquery, .. } => {
-            expand_external_query(engine, subquery.as_mut(), context, stack)
+            expand_external_query(engine, subquery.as_mut(), context, cte_names, stack)
         }
         sqlast::TableFactor::NestedJoin {
             table_with_joins, ..
@@ -360,18 +389,39 @@ fn external_view_parse_error(key: &ExternalViewKey, dialect: &str, error: &str) 
 }
 
 fn qualify_view_body_names(query: &mut sqlast::Query, catalog: &str, default_database: &str) {
-    let mut cte_names = HashSet::new();
-    if let Some(with_clause) = query.with.as_ref() {
-        for cte in &with_clause.cte_tables {
-            cte_names.insert(cte.alias.name.value.to_ascii_lowercase());
-        }
-    }
+    qualify_view_body_query(query, catalog, default_database, &HashSet::new());
+}
+
+fn qualify_view_body_query(
+    query: &mut sqlast::Query,
+    catalog: &str,
+    default_database: &str,
+    visible_ctes: &HashSet<String>,
+) {
+    let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
+        let recursive = with_clause.recursive;
         for cte in &mut with_clause.cte_tables {
-            qualify_view_body_names(cte.query.as_mut(), catalog, default_database);
+            let name = cte.alias.name.value.to_ascii_lowercase();
+            let mut cte_visible_ctes = body_visible_ctes.clone();
+            if recursive {
+                cte_visible_ctes.insert(name.clone());
+            }
+            qualify_view_body_query(
+                cte.query.as_mut(),
+                catalog,
+                default_database,
+                &cte_visible_ctes,
+            );
+            body_visible_ctes.insert(name);
         }
     }
-    qualify_set_expr(query.body.as_mut(), catalog, default_database, &cte_names);
+    qualify_set_expr(
+        query.body.as_mut(),
+        catalog,
+        default_database,
+        &body_visible_ctes,
+    );
 }
 
 fn qualify_set_expr(
@@ -395,7 +445,7 @@ fn qualify_set_expr(
             }
         }
         sqlast::SetExpr::Query(query) => {
-            qualify_view_body_names(query.as_mut(), catalog, default_database)
+            qualify_view_body_query(query.as_mut(), catalog, default_database, cte_names)
         }
         sqlast::SetExpr::SetOperation { left, right, .. } => {
             qualify_set_expr(left.as_mut(), catalog, default_database, cte_names);
@@ -442,7 +492,7 @@ fn qualify_table_factor(
             }
         }
         sqlast::TableFactor::Derived { subquery, .. } => {
-            qualify_view_body_names(subquery.as_mut(), catalog, default_database);
+            qualify_view_body_query(subquery.as_mut(), catalog, default_database, cte_names);
         }
         sqlast::TableFactor::NestedJoin {
             table_with_joins, ..
