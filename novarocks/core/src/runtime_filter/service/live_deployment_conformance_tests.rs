@@ -1792,7 +1792,7 @@ fn sealed_topn_plan(
     }
     let mut draft = draft_builder_from_plan(&base);
     let (producer, consumer) = find_topn_binding_locations(draft.fragments());
-    *draft.runtime_filter_graph_mut() = topn_runtime_filter_graph(producer, consumer, deadline_ms);
+    draft.set_runtime_filter_graph(topn_runtime_filter_graph(producer, consumer, deadline_ms));
     for fragment in draft.fragments_mut() {
         attach_topn_binding(&mut fragment.root, producer, TOPN_PRODUCER_BINDING);
         attach_topn_binding(&mut fragment.root, consumer, TOPN_CONSUMER_BINDING);

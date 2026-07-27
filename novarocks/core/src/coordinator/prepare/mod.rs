@@ -583,7 +583,7 @@ mod tests {
             |builder| {
                 builder.fragments_mut()[0].root.runtime_filter_binding_ids =
                     vec![BindingId::new(1), BindingId::new(2)];
-                *builder.runtime_filter_graph_mut() = sealed_runtime_filter_graph();
+                builder.set_runtime_filter_graph(sealed_runtime_filter_graph());
             },
         );
         let prepared = prepare_fragments(&plan, &crate::connector::ConnectorRegistry::new(), None)

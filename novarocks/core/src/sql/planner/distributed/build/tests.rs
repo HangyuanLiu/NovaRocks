@@ -7,8 +7,7 @@ use super::fragment_cut::stream_exchange_output_columns;
 use super::lowering::{NodeIdAllocator, lower_fragment_local_node};
 use super::runtime_filter_binding::{
     RuntimeFilterBindings, RuntimeFilterBuildBinding as BuildBinding,
-    RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_draft,
-    populate_runtime_filter_graph,
+    RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
 use crate::runtime_filter::model::contract::{
@@ -1083,7 +1082,7 @@ fn populate_runtime_filter_graph_deduplicates_and_skips_incomplete_channels() {
         test_probe_binding(4, 3, 99),
     ];
 
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     populate_runtime_filter_graph(
         &mut fragments,
         &mut graph,
@@ -1115,17 +1114,21 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
         test_fragment(distributed_values_node(2, 1)),
     ];
 
-    let mut sealed_fragments = fragments.clone();
-    let mut sealed_graph = RuntimeFilterGraph::default();
-    populate_runtime_filter_graph(&mut sealed_fragments, &mut sealed_graph, &bindings)
-        .expect("populate sealed graph");
-
     let mut draft_fragments = fragments;
     let mut draft_graph = DraftRuntimeFilterGraph::default();
-    populate_runtime_filter_draft(&mut draft_fragments, &mut draft_graph, &bindings)
+    populate_runtime_filter_graph(&mut draft_fragments, &mut draft_graph, &bindings)
         .expect("populate draft graph");
-    sealed_graph.validate().expect("sealed graph validates");
     draft_graph.validate().expect("draft graph validates");
+    let sealed_fragments = draft_fragments.clone();
+    let sealed_graph = draft_graph
+        .clone()
+        .map_consumer_activations(|_, _, _, _| {
+            Ok::<_, std::convert::Infallible>(ConsumerActivation::BlockingSnapshot)
+        })
+        .expect("infallible test-only materialization");
+    sealed_graph
+        .validate()
+        .expect("materialized graph validates");
 
     assert_eq!(draft_graph.channel_count(), sealed_graph.channel_count());
     assert_eq!(draft_graph.binding_count(), sealed_graph.binding_count());
@@ -3847,7 +3850,7 @@ fn join_progress_proof_catalog_partitions_fragment_inputs() {
     let build_bindings = vec![test_build_binding(10, 1, 7)];
     let probe_bindings = vec![test_probe_binding(40, 2, 7)];
 
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     populate_runtime_filter_graph(
         &mut fragments,
         &mut graph,

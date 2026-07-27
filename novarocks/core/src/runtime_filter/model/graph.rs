@@ -22,9 +22,8 @@ use crate::sql::analysis::TypedExpr;
 
 use super::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-    ContributionKind, CoverageWitnessId, LateApplyGranularity, PlanFragmentId, PlanNodeId,
-    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-    RuntimeFilterPolicyRequirement,
+    ContributionKind, CoverageWitnessId, PlanFragmentId, PlanNodeId, ReductionRequirement,
+    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
 };
 use super::coverage::Coverage;
 
@@ -125,28 +124,6 @@ pub(crate) type RuntimeFilterGraph = RuntimeFilterGraphData<ConsumerActivation>;
 pub(crate) enum GraphBuildError {
     DuplicateChannel(ChannelId),
     DuplicateBinding(BindingId),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConsumerActivationUpdateError {
-    MissingBinding(BindingId),
-    ProducerRole(BindingId),
-    ChannelMismatch {
-        binding: BindingId,
-        expected: ChannelId,
-        actual: ChannelId,
-    },
-    FragmentMismatch {
-        binding: BindingId,
-        expected: u32,
-        actual: u32,
-    },
-    CurrentActivationMismatch {
-        binding: BindingId,
-        expected: ConsumerActivation,
-        actual: ConsumerActivation,
-    },
-    InvalidNextActivation(ConsumerActivation),
 }
 
 impl<A> RuntimeFilterGraphData<A> {
@@ -292,57 +269,6 @@ impl<A> RuntimeFilterGraphData<A> {
         binding_id: BindingId,
     ) -> Option<&mut RuntimeFilterBindingSpecData<A>> {
         self.bindings.get_mut(&binding_id)
-    }
-}
-
-impl RuntimeFilterGraphData<ConsumerActivation> {
-    pub(crate) fn replace_consumer_activation_checked(
-        &mut self,
-        binding: BindingId,
-        expected_channel: ChannelId,
-        expected_fragment: u32,
-        expected_current: ConsumerActivation,
-        next: ConsumerActivation,
-    ) -> Result<(), ConsumerActivationUpdateError> {
-        let binding_spec = self
-            .bindings
-            .get_mut(&binding)
-            .ok_or(ConsumerActivationUpdateError::MissingBinding(binding))?;
-        if binding_spec.channel_id != expected_channel {
-            return Err(ConsumerActivationUpdateError::ChannelMismatch {
-                binding,
-                expected: expected_channel,
-                actual: binding_spec.channel_id,
-            });
-        }
-        let actual_fragment = binding_spec.location.fragment_id.get();
-        if actual_fragment != expected_fragment {
-            return Err(ConsumerActivationUpdateError::FragmentMismatch {
-                binding,
-                expected: expected_fragment,
-                actual: actual_fragment,
-            });
-        }
-        let RuntimeFilterBindingRole::Consumer(requirement) = &mut binding_spec.role else {
-            return Err(ConsumerActivationUpdateError::ProducerRole(binding));
-        };
-        if requirement.activation != expected_current {
-            return Err(ConsumerActivationUpdateError::CurrentActivationMismatch {
-                binding,
-                expected: expected_current,
-                actual: requirement.activation,
-            });
-        }
-        if expected_current != ConsumerActivation::BlockingSnapshot
-            || next
-                != (ConsumerActivation::NonBlockingLive {
-                    late_apply: LateApplyGranularity::Batch,
-                })
-        {
-            return Err(ConsumerActivationUpdateError::InvalidNextActivation(next));
-        }
-        requirement.activation = next;
-        Ok(())
     }
 }
 
@@ -706,7 +632,11 @@ pub(super) mod tests {
     fn generic_and_sealed_graphs_share_validation_contract() {
         let generic: RuntimeFilterGraphData<TestActivation> =
             generic_join_graph(TestActivation::Blocking);
-        let sealed: RuntimeFilterGraph = activation_update_graph();
+        let sealed: RuntimeFilterGraph = generic_join_graph(TestActivation::Blocking)
+            .map_consumer_activations(|_, _, _, _| {
+                Ok::<_, std::convert::Infallible>(ConsumerActivation::BlockingSnapshot)
+            })
+            .expect("infallible test activation mapping");
 
         assert!(generic.validate().is_ok());
         assert!(sealed.validate().is_ok());
@@ -833,207 +763,5 @@ pub(super) mod tests {
             graph.binding(BindingId::new(2)).unwrap().binding_id,
             BindingId::new(2)
         );
-    }
-
-    fn activation_update_graph() -> RuntimeFilterGraph {
-        let mut graph = RuntimeFilterGraph::default();
-        graph
-            .insert_channel(join_channel(ChannelId::new(1)))
-            .unwrap();
-        graph
-            .insert_binding(join_producer_binding(
-                BindingId::new(1),
-                ChannelId::new(1),
-                CoverageWitnessId::new(1),
-            ))
-            .unwrap();
-        graph
-            .insert_binding(join_consumer_binding(BindingId::new(2), ChannelId::new(1)))
-            .unwrap();
-        graph
-    }
-
-    fn batch_live_activation() -> ConsumerActivation {
-        ConsumerActivation::NonBlockingLive {
-            late_apply: super::super::contract::LateApplyGranularity::Batch,
-        }
-    }
-
-    #[test]
-    fn checked_activation_update_rejects_missing_binding() {
-        let mut graph = activation_update_graph();
-
-        let error = graph
-            .replace_consumer_activation_checked(
-                BindingId::new(99),
-                ChannelId::new(1),
-                0,
-                ConsumerActivation::BlockingSnapshot,
-                batch_live_activation(),
-            )
-            .expect_err("missing binding must fail");
-
-        assert!(matches!(
-            error,
-            ConsumerActivationUpdateError::MissingBinding(binding)
-                if binding == BindingId::new(99)
-        ));
-    }
-
-    #[test]
-    fn checked_activation_update_rejects_producer_role() {
-        let mut graph = activation_update_graph();
-
-        let error = graph
-            .replace_consumer_activation_checked(
-                BindingId::new(1),
-                ChannelId::new(1),
-                0,
-                ConsumerActivation::BlockingSnapshot,
-                batch_live_activation(),
-            )
-            .expect_err("producer role must fail");
-
-        assert!(matches!(
-            error,
-            ConsumerActivationUpdateError::ProducerRole(binding)
-                if binding == BindingId::new(1)
-        ));
-    }
-
-    #[test]
-    fn checked_activation_update_rejects_wrong_channel() {
-        let mut graph = activation_update_graph();
-
-        let error = graph
-            .replace_consumer_activation_checked(
-                BindingId::new(2),
-                ChannelId::new(7),
-                0,
-                ConsumerActivation::BlockingSnapshot,
-                batch_live_activation(),
-            )
-            .expect_err("wrong channel must fail");
-
-        assert!(matches!(
-            error,
-            ConsumerActivationUpdateError::ChannelMismatch {
-                binding,
-                expected,
-                actual,
-            } if binding == BindingId::new(2)
-                && expected == ChannelId::new(7)
-                && actual == ChannelId::new(1)
-        ));
-    }
-
-    #[test]
-    fn checked_activation_update_rejects_wrong_fragment() {
-        let mut graph = activation_update_graph();
-
-        let error = graph
-            .replace_consumer_activation_checked(
-                BindingId::new(2),
-                ChannelId::new(1),
-                7,
-                ConsumerActivation::BlockingSnapshot,
-                batch_live_activation(),
-            )
-            .expect_err("wrong fragment must fail");
-
-        assert!(matches!(
-            error,
-            ConsumerActivationUpdateError::FragmentMismatch {
-                binding,
-                expected: 7,
-                actual: 0,
-            } if binding == BindingId::new(2)
-        ));
-    }
-
-    #[test]
-    fn checked_activation_update_rejects_expected_current_mismatch() {
-        let mut graph = activation_update_graph();
-        let expected = batch_live_activation();
-
-        let error = graph
-            .replace_consumer_activation_checked(
-                BindingId::new(2),
-                ChannelId::new(1),
-                0,
-                expected,
-                batch_live_activation(),
-            )
-            .expect_err("stale expected activation must fail");
-
-        assert!(matches!(
-            error,
-            ConsumerActivationUpdateError::CurrentActivationMismatch {
-                binding,
-                expected: error_expected,
-                actual: ConsumerActivation::BlockingSnapshot,
-            } if binding == BindingId::new(2) && error_expected == expected
-        ));
-    }
-
-    #[test]
-    fn checked_activation_update_rejects_non_batch_live_target() {
-        let mut graph = activation_update_graph();
-        let next = ConsumerActivation::NonBlockingLive {
-            late_apply: super::super::contract::LateApplyGranularity::RowGroup,
-        };
-
-        let error = graph
-            .replace_consumer_activation_checked(
-                BindingId::new(2),
-                ChannelId::new(1),
-                0,
-                ConsumerActivation::BlockingSnapshot,
-                next,
-            )
-            .expect_err("only Batch live target is legal");
-
-        assert!(matches!(
-            error,
-            ConsumerActivationUpdateError::InvalidNextActivation(actual) if actual == next
-        ));
-    }
-
-    #[test]
-    fn checked_activation_update_changes_only_consumer_activation_to_batch_live() {
-        let mut graph = activation_update_graph();
-        let before = graph.binding(BindingId::new(2)).unwrap().clone();
-
-        graph
-            .replace_consumer_activation_checked(
-                BindingId::new(2),
-                ChannelId::new(1),
-                0,
-                ConsumerActivation::BlockingSnapshot,
-                batch_live_activation(),
-            )
-            .expect("valid checked activation update");
-
-        let after = graph.binding(BindingId::new(2)).unwrap();
-        assert_eq!(after.binding_id, before.binding_id);
-        assert_eq!(after.channel_id, before.channel_id);
-        assert_eq!(after.coverage_witness_id, before.coverage_witness_id);
-        assert_eq!(after.location, before.location);
-        assert_eq!(after.expression.data_type, before.expression.data_type);
-        assert_eq!(after.expression.nullable, before.expression.nullable);
-        assert_eq!(
-            format!("{:?}", after.expression.kind),
-            format!("{:?}", before.expression.kind)
-        );
-        assert_eq!(after.apply_point, before.apply_point);
-        let RuntimeFilterBindingRole::Consumer(requirement) = &after.role else {
-            panic!("binding remains a consumer");
-        };
-        assert_eq!(requirement.activation, batch_live_activation());
-        let RuntimeFilterBindingRole::Consumer(before_requirement) = before.role else {
-            panic!("fixture is a consumer");
-        };
-        assert_eq!(requirement.capabilities, before_requirement.capabilities);
-        assert_eq!(requirement.target, before_requirement.target);
     }
 }

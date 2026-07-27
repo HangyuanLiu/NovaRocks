@@ -17,18 +17,13 @@
 
 use std::fmt;
 
-#[cfg(test)]
-use std::cell::Cell;
-
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
-use crate::runtime_filter::model::validation::GraphValidationError;
 
+use super::activation_decision::{
+    ActivationDecisionCatalog, ActivationDecisionError, ActivationDecisionPass,
+};
 use super::boundary::{
     BoundaryCatalog, BoundaryError, ExecutionColumnIdAllocator, build_boundary_catalog,
-};
-use super::cycle_forced_activation::{
-    CycleForcedActivation, CycleForcedActivationError, apply_cycle_forced_activations,
-    decide_cycle_forced_activations, log_cycle_forced_activations,
 };
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
 use super::output::{
@@ -36,24 +31,9 @@ use super::output::{
     WriteContractError, build_fragment_edge_output_catalog, build_node_output_catalog,
     build_write_contract_catalog,
 };
-use super::runtime_filter_progress::{JoinBuildProgressCatalog, build_join_progress_proof_catalog};
+use super::runtime_filter_progress::JoinBuildProgressCatalog;
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
-use super::validation::{self, DistributedPlanValidationError, RuntimeFilterPlanValidationError};
-
-#[cfg(test)]
-thread_local! {
-    static FORCE_FINAL_PLAN_FAILURE_AFTER_CYCLE_FORCED_MUTATION: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(test)]
-fn force_final_plan_failure_after_cycle_forced_mutation_for_test() {
-    FORCE_FINAL_PLAN_FAILURE_AFTER_CYCLE_FORCED_MUTATION.with(|enabled| enabled.set(true));
-}
-
-#[cfg(test)]
-fn take_forced_final_plan_failure_after_cycle_forced_mutation_for_test() -> bool {
-    FORCE_FINAL_PLAN_FAILURE_AFTER_CYCLE_FORCED_MUTATION.with(|enabled| enabled.replace(false))
-}
+use super::validation::{self, DistributedPlanValidationError};
 
 #[derive(Clone, Debug)]
 struct DistributedPlanData {
@@ -61,6 +41,8 @@ struct DistributedPlanData {
     root_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
     runtime_filter_graph: RuntimeFilterGraph,
+    // Deterministic provenance for every sealed consumer activation.
+    activation_decisions: ActivationDecisionCatalog,
     // Authoritative planner-sealed proofs for hash-join
     // build-before-probe progress. The coordinator only projects this catalog.
     runtime_filter_join_progress: JoinBuildProgressCatalog,
@@ -107,6 +89,12 @@ impl DistributedPlan {
 
     pub(crate) fn runtime_filter_join_progress(&self) -> &JoinBuildProgressCatalog {
         &self.data.runtime_filter_join_progress
+    }
+
+    pub(in crate::sql::planner::distributed) fn activation_decisions(
+        &self,
+    ) -> &ActivationDecisionCatalog {
+        &self.data.activation_decisions
     }
 
     // Consumed by coordinator preparation for production boundary validation.
@@ -166,9 +154,7 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     MissingRootFragmentId,
     RootFragmentNotFound { root_fragment_id: FragmentId },
     Structural(DistributedPlanValidationError),
-    RuntimeFilterGraph(GraphValidationError),
-    RuntimeFilterPlan(RuntimeFilterPlanValidationError),
-    CycleForcedActivation(CycleForcedActivationError),
+    ActivationDecision(ActivationDecisionError),
     Boundary(BoundaryError),
     Topology(TopologyError),
     NodeOutput(NodeOutputError),
@@ -187,43 +173,13 @@ impl fmt::Display for DistributedPlanSealError {
                 "distributed plan root fragment id={root_fragment_id} was not found"
             ),
             Self::Structural(error) => error.fmt(formatter),
-            Self::RuntimeFilterGraph(error) => error.fmt(formatter),
-            Self::RuntimeFilterPlan(error) => error.fmt(formatter),
-            Self::CycleForcedActivation(error) => error.fmt(formatter),
+            Self::ActivationDecision(error) => error.fmt(formatter),
             Self::Boundary(error) => error.fmt(formatter),
             Self::Topology(error) => error.fmt(formatter),
             Self::NodeOutput(error) => error.fmt(formatter),
             Self::WriteContract(error) => error.fmt(formatter),
         }
     }
-}
-
-fn apply_cycle_forced_activations_and_revalidate(
-    runtime_filter_graph: &mut RuntimeFilterGraph,
-    fragments: &[PlanFragment],
-    decisions: &[CycleForcedActivation],
-) -> Result<(), DistributedPlanSealError> {
-    let mut candidate = runtime_filter_graph.clone();
-    apply_cycle_forced_activations(&mut candidate, decisions)
-        .map_err(DistributedPlanSealError::CycleForcedActivation)?;
-    #[cfg(test)]
-    if !decisions.is_empty()
-        && take_forced_final_plan_failure_after_cycle_forced_mutation_for_test()
-    {
-        candidate
-            .binding_mut_for_test(decisions[0].consumer_binding)
-            .expect("cycle-forced decision owns an existing consumer")
-            .location
-            .node_id = crate::runtime_filter::model::contract::PlanNodeId::new(999);
-    }
-    candidate
-        .validate()
-        .map_err(DistributedPlanSealError::RuntimeFilterGraph)?;
-    validation::validate_runtime_filter_graph_against_plan(&candidate, fragments)
-        .map_err(DistributedPlanSealError::RuntimeFilterPlan)?;
-    *runtime_filter_graph = candidate;
-    log_cycle_forced_activations(decisions);
-    Ok(())
 }
 
 pub(in crate::sql::planner::distributed) fn seal_draft(
@@ -233,7 +189,7 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
         fragments,
         root_fragment_id,
         edges,
-        mut runtime_filter_graph,
+        runtime_filter_graph,
     } = draft;
     if fragments.is_empty() {
         return Err(DistributedPlanSealError::EmptyFragments);
@@ -256,30 +212,12 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     // the runtime-filter graph check.
     let topology = build_topology_contract(&fragments, root_fragment_id, &edges)
         .map_err(DistributedPlanSealError::Topology)?;
-    // Validate the query-global graph first, then its bidirectional ownership
-    // relation with the distributed nodes. No node carries a semantic RF DTO.
-    runtime_filter_graph
-        .validate()
-        .map_err(DistributedPlanSealError::RuntimeFilterGraph)?;
-    validation::validate_runtime_filter_graph_against_plan(&runtime_filter_graph, &fragments)
-        .map_err(DistributedPlanSealError::RuntimeFilterPlan)?;
-    let runtime_filter_join_progress =
-        build_join_progress_proof_catalog(&fragments, &runtime_filter_graph);
     let refined_edges = edges
         .iter()
         .map(FragmentEdge::as_refined_runtime_filter_edge)
         .collect::<Vec<_>>();
-    let cycle_forced_activations = decide_cycle_forced_activations(
-        &refined_edges,
-        &runtime_filter_graph,
-        &runtime_filter_join_progress,
-    )
-    .map_err(DistributedPlanSealError::CycleForcedActivation)?;
-    apply_cycle_forced_activations_and_revalidate(
-        &mut runtime_filter_graph,
-        &fragments,
-        &cycle_forced_activations,
-    )?;
+    let activation = ActivationDecisionPass::run(runtime_filter_graph, &fragments, &refined_edges)
+        .map_err(DistributedPlanSealError::ActivationDecision)?;
     // Finalize logical boundary membership and occurrence identity. This only
     // derives from the now known-valid fragments/edges/sinks; it fails fast on
     // any unresolved column reference and never repairs or guesses. The final
@@ -322,8 +260,9 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
             fragments,
             root_fragment_id,
             edges,
-            runtime_filter_graph,
-            runtime_filter_join_progress,
+            runtime_filter_graph: activation.graph,
+            activation_decisions: activation.decisions,
+            runtime_filter_join_progress: activation.join_progress,
             boundaries,
             execution_column_id_allocator,
             topology,
@@ -336,7 +275,7 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+    use crate::sql::planner::distributed::activation_decision::DraftRuntimeFilterGraph;
     use crate::sql::planner::distributed::fragment::{
         DataPartition, DataSink, DistributedPlanDraft, PlanFragment,
     };
@@ -379,7 +318,7 @@ pub(super) mod test_support {
             }],
             root_fragment_id,
             edges: Vec::new(),
-            runtime_filter_graph: RuntimeFilterGraph::default(),
+            runtime_filter_graph: DraftRuntimeFilterGraph::default(),
         }
     }
 }
@@ -545,6 +484,28 @@ mod tests {
             .insert_binding(join_consumer_binding(BindingId::new(2), ChannelId::new(1)))
             .unwrap();
         graph
+    }
+
+    fn draft_graph(
+        graph: RuntimeFilterGraph,
+    ) -> super::super::activation_decision::DraftRuntimeFilterGraph {
+        graph
+            .map_consumer_activations(|_, _, _, activation| {
+                Ok::<_, std::convert::Infallible>(match activation {
+                    ConsumerActivation::BlockingSnapshot => {
+                        super::super::activation_decision::ActivationConstraint::BlockingOrBatchLive {
+                            fallback: super::super::activation_decision::ActivationFallback::BlockingSnapshot,
+                        }
+                    }
+                    ConsumerActivation::NonBlockingLive { late_apply } => {
+                        super::super::activation_decision::ActivationConstraint::LiveOnly {
+                            late_apply: *late_apply,
+                            reason: super::super::activation_decision::RequiredLiveReason::OrderedBoundContract,
+                        }
+                    }
+                })
+            })
+            .expect("infallible test graph activation projection")
     }
 
     fn cycle_node(
@@ -749,7 +710,7 @@ mod tests {
                 cycle_edge(5, 2, 23),
                 cycle_edge(5, 4, 25),
             ],
-            runtime_filter_graph: graph,
+            runtime_filter_graph: draft_graph(graph),
         }
     }
 
@@ -862,7 +823,8 @@ mod tests {
             fragments: Vec::new(),
             root_fragment_id: None,
             edges: Vec::new(),
-            runtime_filter_graph: RuntimeFilterGraph::default(),
+            runtime_filter_graph:
+                super::super::activation_decision::DraftRuntimeFilterGraph::default(),
         };
 
         let error = seal_draft(draft).expect_err("empty draft must not seal");
@@ -929,7 +891,7 @@ mod tests {
     #[test]
     fn seal_validates_and_accepts_a_valid_non_empty_runtime_filter_graph() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
         draft.fragments[0].root.runtime_filter_binding_ids =
             vec![BindingId::new(1), BindingId::new(2)];
 
@@ -950,6 +912,12 @@ mod tests {
                 late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
             }
         );
+        let decisions = plan.activation_decisions();
+        assert_eq!(decisions.len(), 1);
+        assert!(matches!(
+            &decisions[&BindingId::new(2)].reason,
+            super::super::activation_decision::ActivationDecisionReason::CycleForced { .. }
+        ));
         let producer_node = &plan
             .fragments()
             .iter()
@@ -1056,138 +1024,6 @@ mod tests {
     }
 
     #[test]
-    fn seal_activation_stage_rejects_stale_checked_mutation() {
-        let mut draft = cycle_draft(JoinKind::Inner);
-        let RuntimeFilterBindingRole::Consumer(requirement) = &mut draft
-            .runtime_filter_graph
-            .binding_mut_for_test(BindingId::new(2))
-            .expect("consumer binding")
-            .role
-        else {
-            panic!("fixture binding is a consumer");
-        };
-        requirement.activation = ConsumerActivation::NonBlockingLive {
-            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
-        };
-        let decision = super::super::cycle_forced_activation::CycleForcedActivation {
-            channel: ChannelId::new(1),
-            consumer_binding: BindingId::new(2),
-            consumer_fragment: 5,
-            producer_bindings: vec![BindingId::new(1)],
-            witness: Vec::new(),
-        };
-
-        let error = super::apply_cycle_forced_activations_and_revalidate(
-            &mut draft.runtime_filter_graph,
-            &draft.fragments,
-            &[decision],
-        )
-        .expect_err("stale mutation must fail the seal activation stage");
-
-        assert!(matches!(
-            error,
-            DistributedPlanSealError::CycleForcedActivation(
-                super::super::cycle_forced_activation::CycleForcedActivationError::Mutation(
-                    crate::runtime_filter::model::graph::ConsumerActivationUpdateError::CurrentActivationMismatch {
-                        binding,
-                        ..
-                    }
-                )
-            ) if binding == BindingId::new(2)
-        ));
-    }
-
-    #[test]
-    fn seal_draft_revalidates_after_policy_mutation() {
-        let draft = cycle_draft(JoinKind::Inner);
-        draft
-            .runtime_filter_graph
-            .validate()
-            .expect("initial graph validation passes before production seal");
-        super::validation::validate_runtime_filter_graph_against_plan(
-            &draft.runtime_filter_graph,
-            &draft.fragments,
-        )
-        .expect("initial graph/plan validation passes before production seal");
-        super::force_final_plan_failure_after_cycle_forced_mutation_for_test();
-        let error = seal_draft(draft)
-            .expect_err("post-policy mutation must be rejected by production final validation");
-        assert!(matches!(
-            error,
-            DistributedPlanSealError::RuntimeFilterPlan(
-                RuntimeFilterPlanValidationError::BindingLocationMismatch(binding)
-            ) if binding == BindingId::new(2)
-        ));
-    }
-
-    #[test]
-    fn seal_activation_stage_rolls_back_final_validation_failure() {
-        let mut draft = cycle_draft(JoinKind::Inner);
-        let decision = super::super::cycle_forced_activation::CycleForcedActivation {
-            channel: ChannelId::new(1),
-            consumer_binding: BindingId::new(2),
-            consumer_fragment: 5,
-            producer_bindings: vec![BindingId::new(1)],
-            witness: Vec::new(),
-        };
-        let binding_before = draft
-            .runtime_filter_graph
-            .binding(BindingId::new(2))
-            .expect("consumer binding");
-        let location_before = binding_before.location;
-        let RuntimeFilterBindingRole::Consumer(requirement_before) = &binding_before.role else {
-            panic!("fixture binding is a consumer");
-        };
-        let activation_before = requirement_before.activation;
-
-        super::force_final_plan_failure_after_cycle_forced_mutation_for_test();
-        let error = super::apply_cycle_forced_activations_and_revalidate(
-            &mut draft.runtime_filter_graph,
-            &draft.fragments,
-            &[decision],
-        )
-        .expect_err("final graph/plan validation must reject the candidate");
-
-        assert!(matches!(
-            error,
-            DistributedPlanSealError::RuntimeFilterPlan(
-                RuntimeFilterPlanValidationError::BindingLocationMismatch(binding)
-            ) if binding == BindingId::new(2)
-        ));
-        let binding_after = draft
-            .runtime_filter_graph
-            .binding(BindingId::new(2))
-            .expect("consumer binding");
-        assert_eq!(
-            binding_after.location, location_before,
-            "candidate location changes must not leak after final validation fails"
-        );
-        let RuntimeFilterBindingRole::Consumer(requirement_after) = &binding_after.role else {
-            panic!("fixture binding remains a consumer");
-        };
-        assert_eq!(
-            requirement_after.activation, activation_before,
-            "candidate activation changes must not leak after final validation fails"
-        );
-    }
-
-    #[test]
-    fn seal_activation_stage_rejects_invalid_final_graph() {
-        let draft = super::test_support::single_fragment_draft(Some(0));
-        let mut graph = graph_with_binding_to_unknown_channel();
-
-        let error =
-            super::apply_cycle_forced_activations_and_revalidate(&mut graph, &draft.fragments, &[])
-                .expect_err("invalid final graph must fail the seal activation stage");
-
-        assert!(matches!(
-            error,
-            DistributedPlanSealError::RuntimeFilterGraph(graph_error)
-                if graph_error.kind == GraphValidationErrorKind::UnknownChannel
-        ));
-    }
-
-    #[test]
     fn seal_keeps_impure_cycle_blocking_for_deployment_validator() {
         let plan =
             seal_draft(cycle_draft(JoinKind::LeftOuter)).expect("impure cycle draft must seal");
@@ -1201,11 +1037,14 @@ mod tests {
     #[test]
     fn seal_rejects_a_structurally_invalid_runtime_filter_graph() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = graph_with_binding_to_unknown_channel();
+        draft.runtime_filter_graph = draft_graph(graph_with_binding_to_unknown_channel());
 
         let error = seal_draft(draft).expect_err("a graph that fails validation must not seal");
 
-        let DistributedPlanSealError::RuntimeFilterGraph(graph_error) = error else {
+        let DistributedPlanSealError::ActivationDecision(
+            super::super::activation_decision::ActivationDecisionError::DraftGraph(graph_error),
+        ) = error
+        else {
             panic!("expected a runtime filter graph seal error, got {error:?}");
         };
         // The typed `GraphValidationError` is preserved verbatim through the seal.
@@ -1220,7 +1059,7 @@ mod tests {
         // after `validate_distributed_structure` succeeds.
         let mut draft = super::test_support::single_fragment_draft(Some(0));
         draft.fragments[0].sink = crate::sql::planner::distributed::fragment::DataSink::Noop;
-        draft.runtime_filter_graph = graph_with_binding_to_unknown_channel();
+        draft.runtime_filter_graph = draft_graph(graph_with_binding_to_unknown_channel());
 
         let error = seal_draft(draft).expect_err("a structurally invalid draft must not seal");
 
@@ -1233,14 +1072,16 @@ mod tests {
     #[test]
     fn seal_rejects_a_graph_binding_that_is_not_attached_to_its_node() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
 
         let error = seal_draft(draft).expect_err("unattached graph bindings must fail sealing");
 
         assert!(matches!(
             error,
-            DistributedPlanSealError::RuntimeFilterPlan(
-                RuntimeFilterPlanValidationError::BindingNotAttached(binding_id)
+            DistributedPlanSealError::ActivationDecision(
+                super::super::activation_decision::ActivationDecisionError::DraftPlan(
+                    RuntimeFilterPlanValidationError::BindingNotAttached(binding_id)
+                )
             ) if binding_id == BindingId::new(1)
         ));
     }
@@ -1248,7 +1089,7 @@ mod tests {
     #[test]
     fn seal_rejects_an_attached_binding_with_a_mismatched_location() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
         draft.fragments[0].root.runtime_filter_binding_ids =
             vec![BindingId::new(1), BindingId::new(2)];
         draft
@@ -1262,8 +1103,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            DistributedPlanSealError::RuntimeFilterPlan(
-                RuntimeFilterPlanValidationError::BindingLocationMismatch(binding_id)
+            DistributedPlanSealError::ActivationDecision(
+                super::super::activation_decision::ActivationDecisionError::DraftPlan(
+                    RuntimeFilterPlanValidationError::BindingLocationMismatch(binding_id)
+                )
             ) if binding_id == BindingId::new(2)
         ));
     }
@@ -1271,7 +1114,7 @@ mod tests {
     #[test]
     fn seal_rejects_a_binding_expression_type_that_disagrees_with_its_channel() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
         draft.fragments[0].root.runtime_filter_binding_ids =
             vec![BindingId::new(1), BindingId::new(2)];
         draft
@@ -1285,8 +1128,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            DistributedPlanSealError::RuntimeFilterPlan(
-                RuntimeFilterPlanValidationError::ExpressionTypeMismatch(binding_id)
+            DistributedPlanSealError::ActivationDecision(
+                super::super::activation_decision::ActivationDecisionError::DraftPlan(
+                    RuntimeFilterPlanValidationError::ExpressionTypeMismatch(binding_id)
+                )
             ) if binding_id == BindingId::new(2)
         ));
     }

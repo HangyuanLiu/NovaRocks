@@ -18,17 +18,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-    ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
-    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-    RuntimeFilterPolicyRequirement,
+    ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
+    CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId, ReductionRequirement,
+    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
     ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
     ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
-    RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraph,
-    RuntimeFilterGraphData,
+    RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
 };
 use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
@@ -277,18 +275,6 @@ pub(super) fn populate_runtime_filter_candidates<A>(
 }
 
 pub(super) fn populate_runtime_filter_graph(
-    fragments: &mut [PlanFragment],
-    graph: &mut RuntimeFilterGraph,
-    bindings: &RuntimeFilterBindings,
-) -> Result<(), String> {
-    let candidates = collect_join_runtime_filter_candidates(fragments, bindings, || {
-        // Design: ADR-0003 (docs/adr/ADR-0003-rf-activation-blocking-default-live-targeted.md)
-        ConsumerActivation::BlockingSnapshot
-    });
-    populate_runtime_filter_candidates(fragments, graph, candidates)
-}
-
-pub(super) fn populate_runtime_filter_draft(
     fragments: &mut [PlanFragment],
     graph: &mut DraftRuntimeFilterGraph,
     bindings: &RuntimeFilterBindings,
@@ -864,10 +850,10 @@ mod tests {
         RouteEdgeAllocator, RouteKind, build_channel_role_graph,
     };
     use crate::runtime_filter::model::contract::{
-        ComparatorDigest, CompletionFenceKind, LateApplyGranularity, NullOrder, OrderContract,
-        OrderKeyContract, SortDirection,
+        ComparatorDigest, CompletionFenceKind, ConsumerActivation, LateApplyGranularity, NullOrder,
+        OrderContract, OrderKeyContract, SortDirection,
     };
-    use crate::runtime_filter::model::graph::RuntimeFilterBindingRole;
+    use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
     use crate::runtime_filter::model::validation::GraphValidationErrorKind;
     use crate::runtime_filter::port::identity::RuntimeFilterParticipantId;
     use crate::sql::analysis::{ExprKind, LiteralValue};
@@ -996,7 +982,7 @@ mod tests {
         }
     }
 
-    fn join_graph(modes: &[(i32, JoinExecutionMode)]) -> RuntimeFilterGraph {
+    fn join_graph(modes: &[(i32, JoinExecutionMode)]) -> DraftRuntimeFilterGraph {
         let mut fragments = vec![
             fragment(0, values_node(1, 0), Vec::new()),
             fragment(1, values_node(2, 1), Vec::new()),
@@ -1024,32 +1010,32 @@ mod tests {
             });
         }
 
-        let mut graph = RuntimeFilterGraph::default();
+        let mut graph = DraftRuntimeFilterGraph::default();
         populate_runtime_filter_graph(&mut fragments, &mut graph, &bindings)
             .expect("populate Join runtime-filter graph");
         graph.validate().expect("Join graph must validate");
         graph
     }
 
-    fn only_producer_witness(graph: &RuntimeFilterGraph) -> CoverageWitnessId {
+    fn only_producer_witness(graph: &DraftRuntimeFilterGraph) -> CoverageWitnessId {
         graph
             .bindings()
             .find_map(|binding| match binding.role {
-                RuntimeFilterBindingRole::Producer(_) => binding.coverage_witness_id,
-                RuntimeFilterBindingRole::Consumer(_) => None,
+                RuntimeFilterBindingRoleData::Producer(_) => binding.coverage_witness_id,
+                RuntimeFilterBindingRoleData::Consumer(_) => None,
             })
             .expect("one producer witness")
     }
 
-    fn projected_role_graph(graph: &RuntimeFilterGraph) -> ChannelRoleGraph {
+    fn projected_role_graph(graph: &DraftRuntimeFilterGraph) -> ChannelRoleGraph {
         let channel = graph.channels().next().expect("one channel");
         let producer = graph
             .bindings()
-            .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+            .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Producer(_)))
             .expect("producer binding");
         let consumer = graph
             .bindings()
-            .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
+            .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Consumer(_)))
             .expect("consumer binding");
         let inputs = ChannelRoleInputs {
             channel_id: channel.channel_id,
@@ -1154,7 +1140,7 @@ mod tests {
             (10, JoinExecutionMode::Broadcast),
             (20, JoinExecutionMode::Partitioned),
         ]);
-        let channel_summary = |graph: &RuntimeFilterGraph| {
+        let channel_summary = |graph: &DraftRuntimeFilterGraph| {
             graph
                 .channels()
                 .map(|channel| {
@@ -1166,7 +1152,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let binding_summary = |graph: &RuntimeFilterGraph| {
+        let binding_summary = |graph: &DraftRuntimeFilterGraph| {
             graph
                 .bindings()
                 .map(|binding| {
@@ -1198,7 +1184,7 @@ mod tests {
 
         let mut existing_producer = seed
             .bindings()
-            .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+            .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Producer(_)))
             .expect("seed producer")
             .clone();
         existing_producer.binding_id = BindingId::new(11);
@@ -1207,13 +1193,13 @@ mod tests {
 
         let mut existing_consumer = seed
             .bindings()
-            .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
+            .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Consumer(_)))
             .expect("seed consumer")
             .clone();
         existing_consumer.binding_id = BindingId::new(19);
         existing_consumer.channel_id = existing_channel_id;
 
-        let mut graph = RuntimeFilterGraph::default();
+        let mut graph = DraftRuntimeFilterGraph::default();
         graph
             .insert_channel(existing_channel)
             .expect("insert sparse channel");
