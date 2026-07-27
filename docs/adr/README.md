@@ -77,3 +77,13 @@ code-anchors:
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
 - ADR-0006 — 可替换 provider 契约为何统一进入一个系统 SPI，而普通跨 crate port 不进入（active）
+
+### distributed-query-lifecycle
+
+领域哲学：FE coordinator 拥有全局编排，BE query lifecycle 拥有本地执行与资源；两者是独立进程、故障域与状态机，
+只通过版本化 wire protocol 交换事实。共享面仅限 immutable wire/value contract、codec 与 pure validation，
+不得以 all-in-one 便利、feature-specific flow 或共享 runtime state 绕过边界。协议必须正面处理重复、延迟、乱序、
+丢失、过期 ownership 与进程失败，使分布式生命周期可测试、可观察并可独立演进。
+
+- ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
+- ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（active）
