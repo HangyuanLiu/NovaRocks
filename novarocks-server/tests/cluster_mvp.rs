@@ -914,6 +914,45 @@ backends = ["127.0.0.1:{be_grpc_port}"]
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn native_be_signal_shutdown_releases_port_for_restart() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let grpc = ReservedPort::new();
+    let grpc_port = grpc.port();
+    let config = write_config(
+        "native-be-signal-restart",
+        &format!(
+            r#"
+[server]
+host = "127.0.0.1"
+grpc_port = {grpc_port}
+
+[cluster]
+role = "be"
+"#
+        ),
+    );
+
+    let _ = grpc.release();
+    let mut first = ProcessGuard::spawn(config.path());
+    first.wait_for_ready("NOVAROCKS_READY role=be");
+    first.shutdown_cleanly(Duration::from_secs(10));
+
+    let rebound = TcpListener::bind(("127.0.0.1", grpc_port))
+        .expect("native BE gRPC port must be reusable immediately after SIGINT shutdown");
+    drop(rebound);
+
+    let mut restarted = ProcessGuard::spawn(config.path());
+    restarted.wait_for_ready("NOVAROCKS_READY role=be");
+    restarted.shutdown_cleanly(Duration::from_secs(10));
+}
+
 #[test]
 fn d4_dynamic_backend_sql_and_metrics_smoke() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));

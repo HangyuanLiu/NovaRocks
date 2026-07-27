@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 novarocks = { path = "../novarocks/core" }
+novarocks-backend = { path = "../novarocks/backend" }
 novarocks-frontend = { path = "../novarocks/frontend" }
 anyhow = "1"
 ctrlc = "3.4"
