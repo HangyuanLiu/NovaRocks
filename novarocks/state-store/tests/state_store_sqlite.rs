@@ -39,9 +39,9 @@ use tempfile::TempDir;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use common::state_store_conformance::{
-    FaultGate, FaultInjectingStateStore, PostDispatchControl, PostDispatchController,
-    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
+use novarocks_spi::state_store::conformance::{
+    self as state_store_conformance, FaultGate, FaultInjectingStateStore, PostDispatchControl,
+    PostDispatchController, PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -270,7 +270,6 @@ impl PostDispatchControl for SqlitePostDispatchControl {
 
 mod conformance {
     use super::*;
-    use common::state_store_conformance;
 
     fn hold_sqlite_writer_lock(path: &std::path::Path) -> Connection {
         let connection = Connection::open(path).expect("open SQLite conformance blocker");

@@ -21,6 +21,9 @@ mod limits;
 mod metrics;
 mod range;
 
+#[cfg(feature = "state-store-conformance")]
+pub mod conformance;
+
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,
     Precondition, RangePage, ReadTransaction, StateRecord, StateStore, StoreIdentity,

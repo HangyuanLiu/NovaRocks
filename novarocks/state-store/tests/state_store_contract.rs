@@ -46,7 +46,9 @@ use novarocks_state_store::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use common::state_store_conformance::{FaultGate, FaultInjectingStateStore, ScriptedCommitResult};
+use novarocks_spi::state_store::conformance::{
+    FaultGate, FaultInjectingStateStore, ScriptedCommitResult,
+};
 
 #[test]
 fn coordination_contract_rejects_invalid_opaque_identities() {

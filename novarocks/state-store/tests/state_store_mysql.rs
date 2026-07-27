@@ -53,9 +53,9 @@ use uuid::{Uuid, Version};
 
 mod common;
 
-use common::state_store_conformance::{
-    PostDispatchControl, PostDispatchController, PostDispatchScenario,
-    StateStoreConformanceFixture, StateStoreFactory,
+use novarocks_spi::state_store::conformance::{
+    self as state_store_conformance, PostDispatchControl, PostDispatchController,
+    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
 const CLUSTER_ID: &str = "mysql-schema-test-cluster";
@@ -858,7 +858,7 @@ async fn mysql_shared_snapshot_repeatable_read() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::snapshot_repeatable_read(&factory).await;
+    state_store_conformance::snapshot_repeatable_read(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -933,7 +933,7 @@ async fn mysql_shared_forward_reverse_pages() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::forward_reverse_pages(&factory).await;
+    state_store_conformance::forward_reverse_pages(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -1348,7 +1348,7 @@ async fn mysql_shared_limits_before_io() {
         .expect("open limited MySQL store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::limits_before_io(&factory).await;
+    state_store_conformance::limits_before_io(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -1364,7 +1364,7 @@ async fn mysql_shared_arbitrary_binary_payloads() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::arbitrary_binary_payloads(&factory).await;
+    state_store_conformance::arbitrary_binary_payloads(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -1994,7 +1994,7 @@ async fn mysql_shared_preconditions() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::preconditions(&factory).await;
+    state_store_conformance::preconditions(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -2015,7 +2015,7 @@ async fn mysql_shared_same_key_conflict_first_commit_does_not_wait_for_second_re
 
     tokio::time::timeout(
         Duration::from_secs(4),
-        common::state_store_conformance::same_key_conflict(&factory),
+        state_store_conformance::same_key_conflict(&factory),
     )
     .await
     .expect("first same-key commit must not wait for second reader");
@@ -2039,7 +2039,7 @@ async fn mysql_shared_write_skew_conflict_first_commit_does_not_wait_for_second_
 
     tokio::time::timeout(
         Duration::from_secs(4),
-        common::state_store_conformance::write_skew_conflict(&factory),
+        state_store_conformance::write_skew_conflict(&factory),
     )
     .await
     .expect("first write-skew commit must not wait for second reader");
@@ -2063,7 +2063,7 @@ async fn mysql_shared_range_phantom_conflict_first_commit_does_not_wait_for_seco
 
     tokio::time::timeout(
         Duration::from_secs(4),
-        common::state_store_conformance::range_phantom_conflict(&factory),
+        state_store_conformance::range_phantom_conflict(&factory),
     )
     .await
     .expect("first phantom commit must not wait for second reader");
@@ -3375,7 +3375,7 @@ async fn mysql_shared_same_revision_change_pages() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_same_revision", "same_revision_pages").await;
     let factory = shared_factory(Arc::clone(&store));
-    common::state_store_conformance::same_revision_change_pages(&factory).await;
+    state_store_conformance::same_revision_change_pages(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3387,7 +3387,7 @@ async fn mysql_shared_atomic_commit() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_atomic", "shared_atomic").await;
     let factory = shared_factory(Arc::clone(&store));
-    common::state_store_conformance::atomic_commit(&factory).await;
+    state_store_conformance::atomic_commit(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3399,7 +3399,7 @@ async fn mysql_shared_notification_delivery_faults() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_notifications", "shared_notifications").await;
     let factory = shared_factory(Arc::clone(&store));
-    common::state_store_conformance::notification_delivery_faults(&factory).await;
+    state_store_conformance::notification_delivery_faults(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3411,7 +3411,7 @@ async fn mysql_shared_post_dispatch_response_loss_reconciles() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_response_loss", "shared_response_loss").await;
     let factory = shared_post_dispatch_factory(Arc::clone(&store));
-    common::state_store_conformance::post_dispatch_response_loss_reconciles(&factory).await;
+    state_store_conformance::post_dispatch_response_loss_reconciles(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3423,7 +3423,7 @@ async fn mysql_shared_post_dispatch_cancel_waiter_reconciles() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_cancel_waiter", "shared_cancel_waiter").await;
     let factory = shared_post_dispatch_factory(Arc::clone(&store));
-    common::state_store_conformance::post_dispatch_cancel_waiter_reconciles(&factory).await;
+    state_store_conformance::post_dispatch_cancel_waiter_reconciles(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3437,7 +3437,7 @@ async fn mysql_suite() {
     );
     let databases = Rc::new(RefCell::new(Vec::new()));
     let factory = mysql_conformance_factory(Rc::clone(&runtime), Rc::clone(&databases));
-    common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+    state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
     common::state_store_coordination_conformance::run_coordination_conformance(Rc::clone(&factory))
         .await;
     drop(factory);

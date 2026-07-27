@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use super::state_store_conformance::{
+use novarocks_spi::state_store::conformance::{
     PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 

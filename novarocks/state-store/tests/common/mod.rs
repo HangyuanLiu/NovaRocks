@@ -19,7 +19,6 @@
 
 use std::path::{Path, PathBuf};
 
-pub mod state_store_conformance;
 pub mod state_store_coordination_conformance;
 
 pub fn repo_root() -> PathBuf {

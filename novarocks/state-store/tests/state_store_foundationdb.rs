@@ -44,9 +44,9 @@ use uuid::Uuid;
 mod common;
 
 #[cfg(feature = "state-store-test-hooks")]
-use common::state_store_conformance::{
-    PostDispatchControl, PostDispatchController, PostDispatchScenario,
-    StateStoreConformanceFixture, StateStoreFactory,
+use novarocks_spi::state_store::conformance::{
+    self as state_store_conformance, PostDispatchControl, PostDispatchController,
+    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
 fn client_config() -> FoundationDbClientConfig {
@@ -936,7 +936,7 @@ async fn foundationdb_suite() {
     #[cfg(feature = "state-store-test-hooks")]
     {
         let factory = conformance_factory(Rc::clone(&runtime));
-        common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+        state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
         common::state_store_coordination_conformance::run_coordination_conformance(Rc::clone(
             &factory,
         ))

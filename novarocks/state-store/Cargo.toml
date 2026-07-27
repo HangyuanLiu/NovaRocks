@@ -41,6 +41,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
+novarocks-spi = { path = "../spi", features = ["state-store-conformance"] }
 tempfile = "3"
 toml = "0.8"
 
