@@ -108,4 +108,15 @@ rm "$default_tokio_root/Cargo.toml.bak"
 assert_rejected "$default_tokio_root" \
   "default feature graph must not enable Tokio"
 
+transitive_tokio_root="$tmpdir/transitive-tokio"
+cp -R "$valid_root" "$transitive_tokio_root"
+sed -i.bak '/edition = "2024"/a\
+\
+[dependencies]\
+tokio = { path = "../tokio" }
+' "$transitive_tokio_root/deps/bytes/Cargo.toml"
+rm "$transitive_tokio_root/deps/bytes/Cargo.toml.bak"
+assert_rejected "$transitive_tokio_root" \
+  "default normal dependency DAG must not contain Tokio"
+
 echo "spi-dependency-boundary-test: PASS"

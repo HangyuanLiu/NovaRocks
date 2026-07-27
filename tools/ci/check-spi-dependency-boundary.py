@@ -142,22 +142,24 @@ def verify_default_dependency_dag(manifest_path):
         PACKAGE_NAME,
         "-e",
         "normal",
-        "--depth",
-        "1",
         "--prefix",
         "none",
         "--format",
         "{p}",
     )
-    package_names = tuple(
-        sorted(line.split(maxsplit=1)[0] for line in output.splitlines()[1:])
+    package_names = {
+        line.split(maxsplit=1)[0] for line in output.splitlines()[1:]
+    }
+    if "tokio" in package_names:
+        fail("default normal dependency DAG must not contain Tokio")
+
+    internal_dependencies = sorted(
+        package for package in package_names if package.startswith("novarocks-")
     )
-    if package_names != REQUIRED_NORMAL_DEPENDENCIES:
-        if "tokio" in package_names:
-            fail("default feature graph must not enable Tokio")
+    if internal_dependencies:
         fail(
-            "default normal dependency DAG must contain exactly: "
-            + ", ".join(REQUIRED_NORMAL_DEPENDENCIES)
+            "default normal dependency DAG must not contain internal crates: "
+            + ", ".join(internal_dependencies)
         )
 
 
