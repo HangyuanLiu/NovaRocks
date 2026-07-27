@@ -26,3 +26,4 @@ pub use application::{
 };
 pub use server::{FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown};
 pub use system_catalog::SystemCatalogService;
+pub use view::FrontendViewService;
