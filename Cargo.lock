@@ -3261,6 +3261,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-backend"
+version = "0.1.0"
+dependencies = [
+ "novarocks",
+ "tokio",
+]
+
+[[package]]
 name = "novarocks-catalog"
 version = "0.1.0"
 dependencies = [
