@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use arrow::datatypes::DataType;
 
@@ -11,9 +11,16 @@ use super::runtime_filter_binding::{
     populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
-use crate::runtime_filter::model::contract::{BindingId, ConsumerActivation};
+use crate::runtime_filter::model::contract::{
+    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, CoverageWitnessId, ReductionRequirement,
+    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+};
+use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ProducerBindingTarget, RuntimeFilterBindingRole, RuntimeFilterGraph,
+    ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
+    RuntimeFilterBindingRoleData, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+    RuntimeFilterGraph, RuntimeFilterGraphData,
 };
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
@@ -47,6 +54,115 @@ use crate::sql::planner::physical::{
 };
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivationNeutralGraphStructure {
+    channels: Vec<ActivationNeutralChannelStructure>,
+    bindings: Vec<ActivationNeutralBindingStructure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivationNeutralChannelStructure {
+    channel_id: ChannelId,
+    logical_domain: RuntimeFilterLogicalDomain,
+    lifecycle: RuntimeFilterLifecycle,
+    availability_coverage: Coverage,
+    terminal_coverage: Coverage,
+    reduction_requirement: ReductionRequirement,
+    allowed_contribution_kinds: BTreeSet<ContributionKind>,
+    required_consumer_capabilities: BTreeSet<ArtifactCapability>,
+    policy: RuntimeFilterPolicyRequirement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivationNeutralBindingStructure {
+    binding_id: BindingId,
+    channel_id: ChannelId,
+    coverage_witness_id: Option<CoverageWitnessId>,
+    location: crate::runtime_filter::model::graph::PlanLocation,
+    expression: String,
+    apply_point: crate::runtime_filter::model::graph::ApplyPoint,
+    role: ActivationNeutralBindingRoleStructure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActivationNeutralBindingRoleStructure {
+    Producer {
+        contribution_kinds: BTreeSet<ContributionKind>,
+        completion_requirement: CompletionRequirement,
+        target: ProducerBindingTarget,
+    },
+    Consumer {
+        capabilities: BTreeSet<ArtifactCapability>,
+        target: ConsumerBindingTarget,
+    },
+}
+
+fn activation_neutral_graph_structure<A>(
+    graph: &RuntimeFilterGraphData<A>,
+) -> ActivationNeutralGraphStructure {
+    ActivationNeutralGraphStructure {
+        channels: graph
+            .channels()
+            .map(|channel| ActivationNeutralChannelStructure {
+                channel_id: channel.channel_id,
+                logical_domain: channel.logical_domain.clone(),
+                lifecycle: channel.lifecycle,
+                availability_coverage: channel.availability_coverage.clone(),
+                terminal_coverage: channel.terminal_coverage.clone(),
+                reduction_requirement: channel.reduction_requirement,
+                allowed_contribution_kinds: channel.allowed_contribution_kinds.clone(),
+                required_consumer_capabilities: channel.required_consumer_capabilities.clone(),
+                policy: channel.policy,
+            })
+            .collect(),
+        bindings: graph
+            .bindings()
+            .map(|binding| ActivationNeutralBindingStructure {
+                binding_id: binding.binding_id,
+                channel_id: binding.channel_id,
+                coverage_witness_id: binding.coverage_witness_id,
+                location: binding.location,
+                expression: format!("{:?}", binding.expression),
+                apply_point: binding.apply_point,
+                role: match &binding.role {
+                    RuntimeFilterBindingRoleData::Producer(producer) => {
+                        ActivationNeutralBindingRoleStructure::Producer {
+                            contribution_kinds: producer.contribution_kinds.clone(),
+                            completion_requirement: producer.completion_requirement,
+                            target: producer.target,
+                        }
+                    }
+                    RuntimeFilterBindingRoleData::Consumer(consumer) => {
+                        ActivationNeutralBindingRoleStructure::Consumer {
+                            capabilities: consumer.capabilities.clone(),
+                            target: consumer.target,
+                        }
+                    }
+                },
+            })
+            .collect(),
+    }
+}
+
+fn copy_graph_with_structural_drift(
+    graph: &RuntimeFilterGraph,
+    mutate_channel: impl Fn(&mut RuntimeFilterChannelSpec),
+    mutate_binding: impl Fn(&mut RuntimeFilterBindingSpec),
+) -> RuntimeFilterGraph {
+    let mut copy = RuntimeFilterGraph::default();
+    for channel in graph.channels() {
+        let mut channel = channel.clone();
+        mutate_channel(&mut channel);
+        copy.insert_channel(channel).expect("copy channel");
+    }
+    for binding in graph.bindings() {
+        let mut binding = binding.clone();
+        mutate_binding(&mut binding);
+        copy.insert_binding(binding).expect("copy binding");
+    }
+    copy
+}
 
 #[test]
 fn build_distributed_plan_values_shapes_root_fragment() {
@@ -988,42 +1104,46 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     assert_eq!(draft_graph.channel_count(), sealed_graph.channel_count());
     assert_eq!(draft_graph.binding_count(), sealed_graph.binding_count());
     assert_eq!(
-        draft_graph
-            .channels()
-            .map(|channel| channel.channel_id)
-            .collect::<Vec<_>>(),
-        sealed_graph
-            .channels()
-            .map(|channel| channel.channel_id)
-            .collect::<Vec<_>>()
+        activation_neutral_graph_structure(&draft_graph),
+        activation_neutral_graph_structure(&sealed_graph),
+        "Draft and sealed population must differ only in consumer activation"
     );
-    assert_eq!(
-        draft_graph
-            .bindings()
-            .map(|binding| {
-                (
-                    binding.binding_id,
-                    binding.channel_id,
-                    binding.coverage_witness_id,
-                    binding.location,
-                    format!("{:?}", binding.expression),
-                    binding.apply_point,
-                )
-            })
-            .collect::<Vec<_>>(),
-        sealed_graph
-            .bindings()
-            .map(|binding| {
-                (
-                    binding.binding_id,
-                    binding.channel_id,
-                    binding.coverage_witness_id,
-                    binding.location,
-                    format!("{:?}", binding.expression),
-                    binding.apply_point,
-                )
-            })
-            .collect::<Vec<_>>()
+    let coverage_drift = copy_graph_with_structural_drift(
+        &sealed_graph,
+        |channel| {
+            channel.availability_coverage =
+                Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(99))]);
+            channel.terminal_coverage =
+                Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(98))]);
+        },
+        |_| {},
+    );
+    assert_ne!(
+        activation_neutral_graph_structure(&sealed_graph),
+        activation_neutral_graph_structure(&coverage_drift),
+        "activation-neutral comparison must detect both coverage fields"
+    );
+    let role_drift = copy_graph_with_structural_drift(
+        &sealed_graph,
+        |_| {},
+        |binding| match &mut binding.role {
+            RuntimeFilterBindingRole::Producer(producer) => {
+                producer.contribution_kinds = BTreeSet::new();
+                producer.completion_requirement = CompletionRequirement::FencedFinalDomain(
+                    CompletionFenceKind::CommittedDomainFrozen,
+                );
+                producer.target = ProducerBindingTarget::JoinBuildKey { ordinal: 99 };
+            }
+            RuntimeFilterBindingRole::Consumer(consumer) => {
+                consumer.capabilities = BTreeSet::new();
+                consumer.target = ConsumerBindingTarget::SourceBoundary;
+            }
+        },
+    );
+    assert_ne!(
+        activation_neutral_graph_structure(&sealed_graph),
+        activation_neutral_graph_structure(&role_drift),
+        "activation-neutral comparison must detect producer and consumer role fields"
     );
     assert_eq!(
         draft_fragments
