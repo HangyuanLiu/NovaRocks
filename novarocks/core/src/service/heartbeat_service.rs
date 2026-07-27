@@ -378,21 +378,102 @@ fn join_heartbeat_server_thread(handle: thread::JoinHandle<()>) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    fn lock_server_state_test() -> MutexGuard<'static, ()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn reset_server_state() {
+        let state = super::heartbeat_server_state();
+        state.clear_poison();
+        *state.lock().expect("lock heartbeat state for reset") =
+            super::HeartbeatServerState::default();
+    }
+
     #[test]
     fn stop_heartbeat_server_is_idempotent() {
+        let _test_guard = lock_server_state_test();
+        reset_server_state();
+        {
+            let mut state = super::heartbeat_server_state()
+                .lock()
+                .expect("lock heartbeat state");
+            state.started = true;
+            state.join_handle = Some(std::thread::spawn(|| {}));
+        }
+
         super::stop_heartbeat_server().expect("first stop");
         super::stop_heartbeat_server().expect("second stop");
     }
 
     #[test]
-    fn listener_thread_panic_is_reported() {
-        let handle = std::thread::spawn(|| panic!("heartbeat listener failed"));
-        let error =
-            super::join_heartbeat_server_thread(handle).expect_err("panic must be reported");
+    fn stop_heartbeat_server_reports_stored_listener_panic() {
+        let _test_guard = lock_server_state_test();
+        reset_server_state();
+        {
+            let mut state = super::heartbeat_server_state()
+                .lock()
+                .expect("lock heartbeat state");
+            state.started = true;
+            state.join_handle = Some(std::thread::spawn(|| panic!("heartbeat listener failed")));
+        }
+
+        let error = super::stop_heartbeat_server().expect_err("panic must be reported");
 
         assert_eq!(
             error,
             "HeartbeatService listener thread panicked: heartbeat listener failed"
         );
+    }
+
+    #[test]
+    fn stop_heartbeat_server_reports_state_lock_poison() {
+        let _test_guard = lock_server_state_test();
+        reset_server_state();
+        let state = super::heartbeat_server_state();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.lock().expect("lock heartbeat state before poison");
+            panic!("poison heartbeat state");
+        });
+
+        let error = super::stop_heartbeat_server().expect_err("poison must be reported");
+
+        assert_eq!(error, "lock heartbeat service state failed");
+        state.clear_poison();
+        reset_server_state();
+    }
+
+    #[test]
+    fn stop_heartbeat_server_reports_active_connection_lock_poison() {
+        let _test_guard = lock_server_state_test();
+        reset_server_state();
+        let active_connections = Arc::new(Mutex::new(HashMap::new()));
+        let poison_target = active_connections.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target
+                .lock()
+                .expect("lock active connections before poison");
+            panic!("poison active connections");
+        })
+        .join();
+        {
+            let mut state = super::heartbeat_server_state()
+                .lock()
+                .expect("lock heartbeat state");
+            state.started = true;
+            state.active_connections = Some(active_connections);
+            state.join_handle = Some(std::thread::spawn(|| {}));
+        }
+
+        let error =
+            super::stop_heartbeat_server().expect_err("connection lock poison must be reported");
+
+        assert_eq!(error, "lock heartbeat active connections failed");
     }
 }
