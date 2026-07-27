@@ -66,13 +66,15 @@ where
         config,
         shutdown,
         |state_store| async move { FrontendApplicationHost::open(state_store).await },
-        move |config, shutdown| async move {
+        FrontendApplicationHost::view_service,
+        move |config, view_service, shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
                 config.port_override,
                 config.local_exchange,
                 system_catalog,
+                view_service,
                 shutdown,
             )
             .await
@@ -99,13 +101,15 @@ where
         config,
         signal,
         FrontendApplicationHost::open,
-        move |config, shutdown| async move {
+        FrontendApplicationHost::view_service,
+        move |config, view_service, shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
                 config.port_override,
                 config.local_exchange,
                 system_catalog,
+                view_service,
                 shutdown,
             )
             .await
@@ -123,6 +127,8 @@ async fn run_frontend_server_until_shutdown_with_ports<
     Host,
     OpenHost,
     OpenHostFuture,
+    ExtractService,
+    Service,
     Serve,
     ServeFuture,
     ShutdownHost,
@@ -131,6 +137,7 @@ async fn run_frontend_server_until_shutdown_with_ports<
     config: FrontendServerConfig,
     shutdown: F,
     open_host: OpenHost,
+    extract_service: ExtractService,
     serve: Serve,
     shutdown_host: ShutdownHost,
 ) -> Result<(), FrontendApplicationError>
@@ -138,13 +145,15 @@ where
     F: Future<Output = ()> + Send,
     OpenHost: FnOnce(Option<StateStoreAppConfig>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
-    Serve: FnOnce(FrontendServerConfig, F) -> ServeFuture,
+    ExtractService: FnOnce(&Host) -> Service,
+    Serve: FnOnce(FrontendServerConfig, Service, F) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
     let host = open_host(config.config.state_store.clone()).await?;
-    let server_result = serve(config, shutdown).await;
+    let service = extract_service(&host);
+    let server_result = serve(config, service, shutdown).await;
     let shutdown_result = shutdown_host(host).await;
 
     combine_server_and_shutdown(server_result, shutdown_result)
@@ -156,6 +165,8 @@ async fn run_frontend_server_with_signal_and_ports<
     Host,
     OpenHost,
     OpenHostFuture,
+    ExtractService,
+    Service,
     Serve,
     ServeFuture,
     ShutdownHost,
@@ -164,6 +175,7 @@ async fn run_frontend_server_with_signal_and_ports<
     config: FrontendServerConfig,
     signal: S,
     open_host: OpenHost,
+    extract_service: ExtractService,
     serve: Serve,
     shutdown_host: ShutdownHost,
 ) -> Result<(), FrontendApplicationError>
@@ -172,13 +184,15 @@ where
     E: std::fmt::Display + Send + 'static,
     OpenHost: FnOnce(Option<StateStoreAppConfig>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
-    Serve: FnOnce(FrontendServerConfig, ShutdownSignal) -> ServeFuture,
+    ExtractService: FnOnce(&Host) -> Service,
+    Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
     let host = open_host(config.config.state_store.clone()).await?;
-    let server_result = run_server_until_signal(config, signal, serve).await;
+    let service = extract_service(&host);
+    let server_result = run_server_until_signal(config, service, signal, serve).await;
     let shutdown_result = shutdown_host(host).await;
 
     combine_server_and_shutdown(server_result, shutdown_result)
@@ -198,15 +212,16 @@ fn combine_server_and_shutdown(
     }
 }
 
-async fn run_server_until_signal<S, E, Serve, ServeFuture>(
+async fn run_server_until_signal<S, E, Service, Serve, ServeFuture>(
     config: FrontendServerConfig,
+    service: Service,
     signal: S,
     serve: Serve,
 ) -> Result<(), FrontendApplicationError>
 where
     S: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    Serve: FnOnce(FrontendServerConfig, ShutdownSignal) -> ServeFuture,
+    Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
     let mut signal = Box::pin(signal);
@@ -237,6 +252,7 @@ where
 
     let server_result = serve(
         config,
+        service,
         Box::pin(async move {
             let _ = shutdown_rx.await;
         }),
@@ -338,7 +354,8 @@ mod tests {
                 host_port.record("host_open");
                 async { Ok(RecordingHostPort) }
             },
-            move |_, shutdown| async move {
+            |_| (),
+            move |_, (), shutdown| async move {
                 server_port.record("server_bind");
                 shutdown.await;
                 Ok(())
@@ -364,7 +381,8 @@ mod tests {
             frontend_config(),
             async {},
             |_| async { Ok(RecordingHostPort) },
-            move |_, shutdown| async move {
+            |_| (),
+            move |_, (), shutdown| async move {
                 server_port.record("server_started");
                 shutdown.await;
                 server_port.record("server_drained");
@@ -393,7 +411,8 @@ mod tests {
             frontend_config(),
             std::future::pending::<()>(),
             |_| async { Ok(RecordingHostPort) },
-            |_, _| async { Err(FrontendApplicationError::server("core startup failed")) },
+            |_| (),
+            |_, (), _| async { Err(FrontendApplicationError::server("core startup failed")) },
             move |_| async move {
                 shutdown_port.record("store_shutdown");
                 Ok(())
@@ -416,7 +435,8 @@ mod tests {
             frontend_config(),
             std::future::pending::<()>(),
             |_| async { Ok(RecordingHostPort) },
-            |_, _| async { Err(FrontendApplicationError::server("core server failed")) },
+            |_| (),
+            |_, (), _| async { Err(FrontendApplicationError::server("core server failed")) },
             |_| async { Err(FrontendApplicationError::server("store shutdown failed")) },
         )
         .await
@@ -445,7 +465,8 @@ mod tests {
             config,
             async {},
             |_| async { Ok(RecordingHostPort) },
-            move |config, shutdown| async move {
+            |_| (),
+            move |config, (), shutdown| async move {
                 assert_eq!(config.config.log_level, "sentinel-preloaded");
                 assert_eq!(config.config_path, Some(unreadable_config_path));
                 server_called_in_port.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -474,7 +495,8 @@ mod tests {
                 host_port.record("host_open");
                 async { Ok(RecordingHostPort) }
             },
-            move |_, _| async move {
+            |_| (),
+            move |_, (), _| async move {
                 server_port.record("server_bind");
                 Ok(())
             },
@@ -492,5 +514,33 @@ mod tests {
             events.lock().expect("events lock").as_slice(),
             ["host_open", "store_shutdown"]
         );
+    }
+
+    #[tokio::test]
+    async fn host_open_failure_does_not_bind_server() {
+        let server_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_called_in_port = Arc::clone(&server_called);
+
+        let error = run_frontend_server_until_shutdown_with_ports(
+            frontend_config(),
+            async {},
+            |_| async {
+                Err::<RecordingHostPort, _>(FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::ViewServiceOpen,
+                    "corrupt frontend view record",
+                ))
+            },
+            |_| (),
+            move |_, (), _| async move {
+                server_called_in_port.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect_err("host open failure must abort before server bind");
+
+        assert_eq!(error.kind(), FrontendApplicationErrorKind::ViewServiceOpen);
+        assert!(!server_called.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

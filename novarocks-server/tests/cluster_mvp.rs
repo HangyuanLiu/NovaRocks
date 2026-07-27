@@ -1361,20 +1361,13 @@ fn cross_process_three_be_session_view_lifecycle() {
     let _guard = lock_cluster_mvp();
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create state store tempdir");
     let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
-    let cluster =
+    let mut cluster =
         MultiBeClusterHarness::start_three_be_sqlite_state_store(&state_store_path, "session-view");
 
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create fixture warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
 
-    conn.query_drop(format!(
-        r#"CREATE EXTERNAL CATALOG session_view_fixture PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-        warehouse.path().display()
-    ))
-    .expect("create fixture catalog");
-    conn.query_drop("CREATE DATABASE session_view_fixture.session_view_e2e")
-        .expect("create fixture database");
     conn.query_drop("SET catalog default_catalog")
         .expect("use session-view catalog");
 
@@ -1398,6 +1391,38 @@ fn cross_process_three_be_session_view_lifecycle() {
         view_rows, base_rows,
         "session view must match its direct base-table query"
     );
+    let views: Vec<String> = conn
+        .query("SHOW VIEWS FROM session_view_e2e")
+        .expect("show session views");
+    assert_eq!(views, vec!["v".to_string()]);
+
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    assert!(
+        state_store_path.is_file(),
+        "SQLite state store must exist after persisting the session view"
+    );
+
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop("SET catalog default_catalog")
+        .expect("restore session-view catalog after FE restart");
+    let restored_rows: Vec<String> = conn
+        .query("SELECT schema_name FROM session_view_e2e.v")
+        .expect("query restored session view");
+    assert_eq!(
+        restored_rows, base_rows,
+        "session view query must survive FE restart"
+    );
+    let restored_views: Vec<String> = conn
+        .query("SHOW VIEWS FROM session_view_e2e")
+        .expect("show restored session views");
+    assert_eq!(
+        restored_views,
+        vec!["v".to_string()],
+        "SHOW VIEWS must restore the durable session view"
+    );
 
     conn.query_drop(
         "CREATE OR REPLACE VIEW session_view_e2e.v AS \
@@ -1418,42 +1443,65 @@ fn cross_process_three_be_session_view_lifecycle() {
         "CREATE OR REPLACE VIEW must expose the replacement query"
     );
 
-    let views: Vec<String> = conn
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop("SET catalog default_catalog")
+        .expect("restore session-view catalog after replacement restart");
+    let durable_replacement_rows: Vec<String> = conn
+        .query("SELECT catalog_name FROM session_view_e2e.v")
+        .expect("query durable replacement view");
+    assert_eq!(
+        durable_replacement_rows, replaced_direct_rows,
+        "CREATE OR REPLACE VIEW definition must survive FE restart"
+    );
+    let durable_views: Vec<String> = conn
         .query("SHOW VIEWS FROM session_view_e2e")
-        .expect("show session views");
-    assert_eq!(views, vec!["v".to_string()]);
+        .expect("show session views after replacement restart");
+    assert_eq!(durable_views, vec!["v".to_string()]);
 
-    conn.query_drop("DROP VIEW session_view_e2e.v")
-        .expect("drop session view");
-    let views_after_drop: Vec<String> = conn
-        .query("SHOW VIEWS FROM session_view_e2e")
-        .expect("show session views after drop");
-    assert!(
-        views_after_drop.is_empty(),
-        "DROP VIEW must remove v from SHOW VIEWS: {views_after_drop:?}"
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG session_view_fixture PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create fixture catalog");
+    conn.query_drop("CREATE DATABASE session_view_fixture.session_view_e2e")
+        .expect("create same-name external database");
+    conn.query_drop("DROP DATABASE session_view_fixture.session_view_e2e")
+        .expect("drop same-name external database");
+    conn.query_drop("SET catalog default_catalog")
+        .expect("return to the default session-view catalog");
+    let rows_after_external_drop: Vec<String> = conn
+        .query("SELECT catalog_name FROM session_view_e2e.v")
+        .expect("external database drop must preserve default-catalog view");
+    assert_eq!(
+        rows_after_external_drop, replaced_direct_rows,
+        "external database cleanup must not cross into default_catalog"
     );
 
-    conn.query_drop(
-        "CREATE VIEW session_view_e2e.v AS \
-         SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'default'",
-    )
-    .expect("recreate session view before database drop");
-    conn.query_drop("DROP DATABASE session_view_fixture.session_view_e2e")
-        .expect("drop fixture database");
-    conn.query_drop("CREATE DATABASE session_view_fixture.session_view_e2e")
-        .expect("recreate fixture database");
-    conn.query_drop(
-        "CREATE VIEW session_view_e2e.v AS \
-         SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'default'",
-    )
-    .expect("database drop must clear same-name session view");
-
-    conn.query_drop("DROP VIEW session_view_e2e.v")
-        .expect("clean up recreated session view");
-    conn.query_drop("DROP DATABASE session_view_fixture.session_view_e2e")
-        .expect("clean up fixture database");
+    conn.query_drop("DROP DATABASE default_catalog.session_view_e2e")
+        .expect("drop default-catalog view database");
     conn.query_drop("DROP CATALOG session_view_fixture")
         .expect("clean up fixture catalog");
+
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop("SET catalog default_catalog")
+        .expect("restore default catalog after final FE restart");
+    let views_after_drop: Vec<String> = conn
+        .query("SHOW VIEWS FROM session_view_e2e")
+        .expect("show session views after default database drop and restart");
+    assert!(
+        views_after_drop.is_empty(),
+        "dropped default-catalog database must not restore views: {views_after_drop:?}"
+    );
+    conn.query_drop("SELECT catalog_name FROM session_view_e2e.v")
+        .expect_err("dropped default-catalog view must remain absent after FE restart");
 }
 
 #[test]

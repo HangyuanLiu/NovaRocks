@@ -22,12 +22,14 @@ use novarocks_spi::state_store::{StateStore, StateStoreError};
 use novarocks_state_store::{StateStoreAppConfig, StateStoreRuntime, open_state_store};
 
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
+use crate::view::FrontendViewService;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
     RuntimeOpen,
     StoreOpen,
+    ViewServiceOpen,
     Server,
     Shutdown,
 }
@@ -70,6 +72,7 @@ impl fmt::Display for FrontendApplicationError {
 impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
+    view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     state_store: Option<Arc<dyn StateStore>>,
     runtime: Option<StateStoreRuntime>,
 }
@@ -79,6 +82,7 @@ impl FrontendApplicationHost {
         config: Option<StateStoreAppConfig>,
     ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
+            view_service: None,
             state_store: None,
             runtime: None,
         };
@@ -88,8 +92,28 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
+        match FrontendViewService::open(host.state_store.clone(), tokio::runtime::Handle::current())
+            .await
+        {
+            Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
+            Err(error) => {
+                let error = FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::ViewServiceOpen,
+                    error,
+                );
+                return Err(host.cleanup_open_error(error).await);
+            }
+        }
 
         Ok(host)
+    }
+
+    pub fn view_service(&self) -> Arc<dyn novarocks::engine::view::ViewService> {
+        Arc::clone(
+            self.view_service
+                .as_ref()
+                .expect("frontend view service is installed before host open returns"),
+        )
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -143,6 +167,7 @@ impl FrontendApplicationHost {
     }
 
     async fn release_resources(&mut self) -> Result<(), StateStoreError> {
+        self.view_service.take();
         self.state_store.take();
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.shutdown().await

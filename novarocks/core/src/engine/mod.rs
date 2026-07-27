@@ -64,8 +64,6 @@ pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
-pub(crate) mod iceberg_view;
-pub(crate) mod iceberg_view_rewrite;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
@@ -80,8 +78,7 @@ mod query_stats;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub mod system_catalog;
-pub(crate) mod view;
-pub(crate) mod view_rewrite;
+pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
@@ -97,11 +94,11 @@ use self::statement::{
     looks_like_alter_table_expire_snapshots, looks_like_alter_table_optimize,
     looks_like_alter_table_remove_orphan_files, looks_like_alter_table_rewrite_manifests,
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
-    looks_like_show_create_view, looks_like_show_views, parse_add_legacy_range_partition_sql,
-    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql,
-    parse_alter_table_expire_snapshots_sql, parse_alter_table_optimize_sql,
-    parse_alter_table_remove_orphan_files_sql, parse_alter_table_rewrite_manifests_sql,
-    parse_show_alter_table_optimize_sql, parse_show_create_table,
+    parse_add_legacy_range_partition_sql, parse_alter_iceberg_properties_sql,
+    parse_alter_partition_column_sql, parse_alter_table_expire_snapshots_sql,
+    parse_alter_table_optimize_sql, parse_alter_table_remove_orphan_files_sql,
+    parse_alter_table_rewrite_manifests_sql, parse_show_alter_table_optimize_sql,
+    parse_show_create_table,
 };
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 #[cfg(test)]
@@ -366,11 +363,8 @@ pub(crate) struct StandaloneState {
     pub(crate) maintenance_signal_tx: std::sync::Mutex<
         Option<std::sync::mpsc::Sender<crate::engine::mv_maintenance::MaintenanceSignal>>,
     >,
-    /// Session-view registry seam. FEH-4a: the in-memory `CREATE VIEW`
-    /// registry now lives behind `ViewCatalog` (core adapter
-    /// `InMemoryViewCatalog`); FEH-4b swaps in a frontend, StateStore-backed
-    /// implementation injected through the server seam.
-    pub(crate) session_views: std::sync::Arc<dyn crate::engine::view::ViewCatalog>,
+    /// Frontend-owned view application service, injected at engine open.
+    pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -398,7 +392,7 @@ impl Default for StandaloneState {
             job_repo: JobMetaRepository,
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
-            session_views: std::sync::Arc::new(crate::engine::view::InMemoryViewCatalog::new()),
+            view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,
@@ -465,12 +459,14 @@ impl StandaloneNovaRocks {
         return Self::open_body(
             opts,
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
+            std::sync::Arc::new(crate::engine::view::EmptyViewService),
             _test_guard,
         );
         #[cfg(not(test))]
         Self::open_body(
             opts,
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
+            std::sync::Arc::new(crate::engine::view::EmptyViewService),
         )
     }
 
@@ -484,6 +480,7 @@ impl StandaloneNovaRocks {
         opts: StandaloneOptions,
         cfg: novarocks_config::NovaRocksConfig,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
+        view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -491,9 +488,9 @@ impl StandaloneNovaRocks {
         crate::coordinator::cluster::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
-        return Self::open_body(opts, system_catalog, _test_guard);
+        return Self::open_body(opts, system_catalog, view_service, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(opts, system_catalog)
+        Self::open_body(opts, system_catalog, view_service)
     }
 
     /// Common engine-open body.  Called after the process-wide config has
@@ -501,6 +498,7 @@ impl StandaloneNovaRocks {
     fn open_body(
         opts: StandaloneOptions,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
+        view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -557,6 +555,7 @@ impl StandaloneNovaRocks {
             job_repo: JobMetaRepository,
             exchange_port,
             system_catalog,
+            view_service,
             #[cfg(test)]
             _test_guard,
             ..Default::default()
@@ -758,13 +757,20 @@ impl StandaloneSession {
         normalized =
             rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
         normalized = rewrite_named_partition_insert_overwrite(&normalized)?;
-        if let Some(result) = self::view::try_handle_statement(
-            &self.inner,
+        if let Some(result) = self.inner.view_service.try_handle_statement(
+            self.inner.as_ref(),
             &normalized,
-            current_catalog,
-            current_database,
+            crate::engine::view::ViewRequestContext {
+                current_catalog,
+                current_database,
+            },
         )? {
-            return Ok(result);
+            return Ok(match result {
+                crate::engine::view::ViewStatementResult::Ok => StatementResult::Ok,
+                crate::engine::view::ViewStatementResult::Query(result) => {
+                    StatementResult::Query(result)
+                }
+            });
         }
         if let Some(result) = self::statistics::try_handle_statement(
             &self.inner,
@@ -979,26 +985,6 @@ impl StandaloneSession {
             return self.handle_show_create_table(&normalized, current_catalog, current_database);
         }
 
-        // SHOW CREATE VIEW ...
-        if looks_like_show_create_view(&normalized) {
-            return self::view::handle_show_create_view(
-                &self.inner,
-                &normalized,
-                current_catalog,
-                current_database,
-            );
-        }
-
-        // SHOW VIEWS [FROM db]
-        if looks_like_show_views(&normalized) {
-            return self::view::handle_show_views(
-                &self.inner,
-                &normalized,
-                current_catalog,
-                current_database,
-            );
-        }
-
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
             return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
@@ -1113,22 +1099,14 @@ impl StandaloneSession {
                     return Ok(result);
                 }
 
-                // Inline any user-defined views referenced in the query so the
-                // remaining rewrites see only base tables. `expand_views_in_query`
-                // is a no-op when no views are registered.
                 let mut prepared = query.as_ref().clone();
-                self::view_rewrite::expand_views_in_query(
+                self.inner.view_service.rewrite_query(
+                    self.inner.as_ref(),
                     &mut prepared,
-                    self.inner.session_views.as_ref(),
-                    current_database,
-                );
-                // Inline iceberg-catalog views (REST only). Runs after session
-                // views so local definitions keep precedence.
-                self::iceberg_view_rewrite::expand_iceberg_views_in_query(
-                    &self.inner,
-                    &mut prepared,
-                    current_catalog,
-                    current_database,
+                    crate::engine::view::ViewRequestContext {
+                        current_catalog,
+                        current_database,
+                    },
                 )?;
                 // Materialize information_schema virtual tables (e.g. `schemata`)
                 // into VALUES-backed derived tables. Run after view expansion
@@ -1766,6 +1744,19 @@ impl StandaloneSession {
                 execute_drop_catalog_statement(&self.inner, &stmt.name, stmt.if_exists)
             }
             DropResult::Database(stmt) => {
+                if let Some(database) = resolve_default_view_database(&stmt.name, current_catalog)?
+                {
+                    self.inner
+                        .view_service
+                        .drop_database("default_catalog", &database)?;
+                    self::statistics::drop_database(&self.inner, &database);
+                    return Ok(StatementResult::Ok);
+                }
+                let target = crate::engine::backend_resolver::resolve_namespace_target(
+                    &self.inner,
+                    &stmt.name,
+                    current_catalog,
+                )?;
                 let result = execute_drop_database_statement(
                     &self.inner,
                     &stmt.name,
@@ -1773,9 +1764,10 @@ impl StandaloneSession {
                     stmt.if_exists,
                     stmt.force,
                 )?;
-                if let Some(database) = stmt.name.parts.last() {
-                    self::statistics::drop_database(&self.inner, database);
-                }
+                self.inner
+                    .view_service
+                    .drop_database(&target.catalog, &target.namespace)?;
+                self::statistics::drop_database(&self.inner, &target.namespace);
                 Ok(result)
             }
             DropResult::Table(stmt) => {
@@ -1834,6 +1826,23 @@ impl StandaloneSession {
             query_opts,
         )
     }
+}
+
+fn resolve_default_view_database(
+    name: &crate::sql::parser::ast::ObjectName,
+    current_catalog: Option<&str>,
+) -> Result<Option<String>, String> {
+    let database = match name.parts.as_slice() {
+        [database]
+            if current_catalog
+                .is_some_and(|catalog| catalog.eq_ignore_ascii_case("default_catalog")) =>
+        {
+            database
+        }
+        [catalog, database] if catalog.eq_ignore_ascii_case("default_catalog") => database,
+        _ => return Ok(None),
+    };
+    normalize_identifier(database).map(Some)
 }
 
 fn standalone_now_ms() -> i64 {
@@ -2392,29 +2401,21 @@ fn snapshot_effective_backend_count_into_session() {
     }
 }
 
-/// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`:
-/// inline user-defined views and rewrite time-travel refs. Ordinary Iceberg
-/// table resolution is handled by the analyzer provider.
+/// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`.
 fn prepare_explain_query(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<sqlparser::ast::Query, String> {
-    // Inline any user-defined views before the analyzer sees the query.
     let mut prepared = query.clone();
-    self::view_rewrite::expand_views_in_query(
+    state.view_service.rewrite_query(
+        state.as_ref(),
         &mut prepared,
-        state.session_views.as_ref(),
-        current_database,
-    );
-    // Inline iceberg-catalog views (REST only). Runs after session
-    // views so local definitions keep precedence.
-    self::iceberg_view_rewrite::expand_iceberg_views_in_query(
-        state,
-        &mut prepared,
-        current_catalog,
-        current_database,
+        crate::engine::view::ViewRequestContext {
+            current_catalog,
+            current_database,
+        },
     )?;
 
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
@@ -4242,6 +4243,7 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
+    use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::meta::MetaStoreProvider;
     use crate::runtime::query_options::QueryOptions;
@@ -4251,6 +4253,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -4267,6 +4270,122 @@ mod tests {
                 .resolve("information_schema", "schemata", &inputs)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingViewService {
+        statements: AtomicUsize,
+        rewrites: AtomicUsize,
+        dropped_databases: Mutex<Vec<(String, String)>>,
+    }
+
+    impl ViewService for RecordingViewService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn ViewEngine,
+            sql: &str,
+            _context: ViewRequestContext<'_>,
+        ) -> Result<Option<ViewStatementResult>, String> {
+            if sql.to_ascii_lowercase().starts_with("create view ") {
+                self.statements.fetch_add(1, Ordering::SeqCst);
+                return Ok(Some(ViewStatementResult::Ok));
+            }
+            Ok(None)
+        }
+
+        fn rewrite_query(
+            &self,
+            _engine: &dyn ViewEngine,
+            _query: &mut sqlparser::ast::Query,
+            _context: ViewRequestContext<'_>,
+        ) -> Result<(), String> {
+            self.rewrites.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String> {
+            self.dropped_databases
+                .lock()
+                .expect("dropped databases")
+                .push((catalog.to_string(), database.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn engine_delegates_view_statements_rewrites_and_database_cleanup_once() {
+        let service = Arc::new(RecordingViewService::default());
+        let engine = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions::default(),
+            crate::common::app_config::NovaRocksConfig::default(),
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::clone(&service) as Arc<dyn ViewService>,
+        )
+        .expect("open engine with recording view service");
+        let session = engine.session();
+
+        session
+            .execute("CREATE VIEW delegated AS SELECT 1")
+            .expect("view DDL must delegate");
+        session.query("SELECT 1").expect("SELECT must execute");
+        session
+            .query("EXPLAIN SELECT 1")
+            .expect("EXPLAIN must execute");
+        let warehouse = TempDir::new().expect("view delegation warehouse");
+        session
+            .execute(&format!(
+                r#"CREATE EXTERNAL CATALOG delegated_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+                warehouse.path().display()
+            ))
+            .expect("catalog create");
+        session
+            .execute_in_context(
+                "CREATE DATABASE delegated_db",
+                Some("delegated_catalog"),
+                "",
+                None,
+            )
+            .expect("database create");
+        session
+            .execute_in_context(
+                "DROP DATABASE delegated_db",
+                Some("delegated_catalog"),
+                "",
+                None,
+            )
+            .expect("database drop");
+        let missing_catalog_error = session
+            .execute_in_context("DROP DATABASE unqualified_without_catalog", None, "", None)
+            .expect_err("unqualified database drop without a catalog must keep failing");
+        assert!(
+            missing_catalog_error.contains("requires an Iceberg catalog"),
+            "unexpected missing-catalog error: {missing_catalog_error}"
+        );
+        session
+            .execute_in_context(
+                "DROP DATABASE default_catalog.delegated_view_db",
+                Some("default_catalog"),
+                "",
+                None,
+            )
+            .expect("default-catalog view database drop");
+
+        assert_eq!(service.statements.load(Ordering::SeqCst), 1);
+        assert_eq!(service.rewrites.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            service
+                .dropped_databases
+                .lock()
+                .expect("dropped databases")
+                .as_slice(),
+            [
+                ("delegated_catalog".to_string(), "delegated_db".to_string()),
+                (
+                    "default_catalog".to_string(),
+                    "delegated_view_db".to_string()
+                ),
+            ]
         );
     }
 
@@ -4332,6 +4451,7 @@ mod tests {
             StandaloneOptions::default(),
             cfg,
             Arc::new(TestSchemataCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open engine with injected system catalog");
 
@@ -4458,6 +4578,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open FE engine");
         let session = engine.session();
@@ -4494,6 +4615,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg.clone(),
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open FE engine");
         engine
@@ -4506,6 +4628,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("reopen FE engine");
         let result = reopened
@@ -4525,6 +4648,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open all-in-one engine");
         let session = engine.session();
@@ -4900,6 +5024,7 @@ mysql_port = 47892
             },
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         );
         assert!(
             result.is_ok(),

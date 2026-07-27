@@ -180,6 +180,7 @@ pub async fn run_standalone_server_with_config_until_shutdown<F>(
     port_override: Option<u16>,
     local_exchange: bool,
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
+    view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -193,7 +194,7 @@ where
         start_coordinator_report_grpc: true,
         ..resolved
     };
-    run_with_resolved_options_until_shutdown(resolved, system_catalog, shutdown).await
+    run_with_resolved_options_until_shutdown(resolved, system_catalog, view_service, shutdown).await
 }
 
 /// Run the standalone server for `role=fe`.
@@ -233,6 +234,7 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
     runtime.block_on(run_with_resolved_options_until_shutdown(
         resolved,
         std::sync::Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+        std::sync::Arc::new(crate::engine::view::EmptyViewService),
         std::future::pending(),
     ))
 }
@@ -240,6 +242,7 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
 async fn run_with_resolved_options_until_shutdown<F>(
     resolved: ResolvedStandaloneServerOptions,
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
+    view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -251,7 +254,9 @@ where
         config_path: resolved.config_path.clone(),
     };
     let engine = match resolved.preloaded_config {
-        Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg, system_catalog)?,
+        Some(cfg) => {
+            StandaloneNovaRocks::open_with_config(opts, cfg, system_catalog, view_service)?
+        }
         None => StandaloneNovaRocks::open(opts)?,
     };
     let coordinator_handles = (
@@ -871,6 +876,19 @@ fn is_materialized_view_management_statement(query: &str) -> bool {
         || lower.starts_with("show alter materialized view ")
 }
 
+fn is_view_management_statement(query: &str) -> bool {
+    let words = query
+        .split_whitespace()
+        .map(|word| word.trim_end_matches(';').to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    matches!(words.as_slice(), [show, views, ..] if show == "show" && views == "views")
+        || matches!(
+            words.as_slice(),
+            [show, create, view, ..]
+                if show == "show" && create == "create" && view == "view"
+        )
+}
+
 fn split_sql_statements(query: &str) -> Result<Vec<String>, String> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum QuoteState {
@@ -1387,8 +1405,7 @@ async fn execute_statement_text(
         && !is_materialized_view_management_statement(trimmed)
         && !looks_like_show_alter_table_optimize(trimmed)
         && !looks_like_show_create_table(trimmed)
-        && !crate::engine::statement::looks_like_show_create_view(trimmed)
-        && !crate::engine::statement::looks_like_show_views(trimmed)
+        && !is_view_management_statement(trimmed)
     {
         return Ok(StatementResult::Ok);
     }
@@ -1414,8 +1431,7 @@ async fn execute_statement_text(
         && !is_materialized_view_management_statement(&rewritten)
         && !looks_like_show_alter_table_optimize(&rewritten)
         && !looks_like_show_create_table(&rewritten)
-        && !crate::engine::statement::looks_like_show_create_view(&rewritten)
-        && !crate::engine::statement::looks_like_show_views(&rewritten)
+        && !is_view_management_statement(&rewritten)
     {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,
@@ -2567,6 +2583,13 @@ mod tests {
             is_backend_management_statement("SHOW BACKENDS"),
             "SHOW BACKENDS must not be swallowed as a session no-op"
         );
+    }
+
+    #[test]
+    fn view_show_statements_reach_the_embedded_engine() {
+        assert!(is_view_management_statement("SHOW VIEWS"));
+        assert!(is_view_management_statement("SHOW   CREATE VIEW ice.db.v"));
+        assert!(!is_view_management_statement("SHOW MATERIALIZED VIEWS"));
     }
 
     #[test]
