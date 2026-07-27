@@ -3298,6 +3298,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-spi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-state-store"
 version = "0.1.0"
 dependencies = [
