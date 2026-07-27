@@ -353,9 +353,9 @@ mod tests {
     };
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-        RuntimeFilterGraph,
+        ApplyPoint, ConsumerRequirementData, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData,
+        RuntimeFilterChannelSpec,
     };
     use crate::runtime_filter::model::validation::GraphValidationErrorKind;
     use crate::runtime_filter::port::identity::DeploymentEpoch;
@@ -376,6 +376,9 @@ mod tests {
         JoinDistribution, PhysicalHashJoinNode, PhysicalPlanStats, PlannerConfidence,
     };
 
+    use super::super::activation_decision::{
+        ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
+    };
     use super::{DistributedPlanSealError, seal_draft};
 
     /// Minimal `TypedExpr` used to populate binding expressions. The seal only
@@ -421,8 +424,8 @@ mod tests {
     fn join_producer_binding(
         binding_id: BindingId,
         channel_id: ChannelId,
-    ) -> RuntimeFilterBindingSpec {
-        RuntimeFilterBindingSpec {
+    ) -> RuntimeFilterBindingSpecData<ActivationConstraint> {
+        RuntimeFilterBindingSpecData {
             binding_id,
             channel_id,
             coverage_witness_id: Some(CoverageWitnessId::new(1)),
@@ -432,7 +435,7 @@ mod tests {
             },
             expression: expression(),
             apply_point: ApplyPoint::NodeOutput,
-            role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+            role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                 contribution_kinds: BTreeSet::from([
                     ContributionKind::ValueDomainDelta,
                     ContributionKind::ProducerClosed,
@@ -448,8 +451,8 @@ mod tests {
     fn join_consumer_binding(
         binding_id: BindingId,
         channel_id: ChannelId,
-    ) -> RuntimeFilterBindingSpec {
-        RuntimeFilterBindingSpec {
+    ) -> RuntimeFilterBindingSpecData<ActivationConstraint> {
+        RuntimeFilterBindingSpecData {
             binding_id,
             channel_id,
             coverage_witness_id: None,
@@ -459,21 +462,23 @@ mod tests {
             },
             expression: expression(),
             apply_point: ApplyPoint::NodeInput,
-            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+            role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                 capabilities: BTreeSet::from([
                     ArtifactCapability::Membership,
                     ArtifactCapability::EmptyDomain,
                 ]),
-                activation: ConsumerActivation::BlockingSnapshot,
+                activation: ActivationConstraint::BlockingOrBatchLive {
+                    fallback: ActivationFallback::BlockingSnapshot,
+                },
                 target: crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }
 
     /// A structurally valid, non-empty graph: one channel with a matched
-    /// producer/consumer pair. `RuntimeFilterGraph::validate` accepts it.
-    fn valid_non_empty_graph() -> RuntimeFilterGraph {
-        let mut graph = RuntimeFilterGraph::default();
+    /// producer/consumer pair. Draft graph validation accepts it.
+    fn valid_non_empty_graph() -> DraftRuntimeFilterGraph {
+        let mut graph = DraftRuntimeFilterGraph::default();
         graph
             .insert_channel(join_channel_spec(ChannelId::new(1)))
             .unwrap();
@@ -484,28 +489,6 @@ mod tests {
             .insert_binding(join_consumer_binding(BindingId::new(2), ChannelId::new(1)))
             .unwrap();
         graph
-    }
-
-    fn draft_graph(
-        graph: RuntimeFilterGraph,
-    ) -> super::super::activation_decision::DraftRuntimeFilterGraph {
-        graph
-            .map_consumer_activations(|_, _, _, activation| {
-                Ok::<_, std::convert::Infallible>(match activation {
-                    ConsumerActivation::BlockingSnapshot => {
-                        super::super::activation_decision::ActivationConstraint::BlockingOrBatchLive {
-                            fallback: super::super::activation_decision::ActivationFallback::BlockingSnapshot,
-                        }
-                    }
-                    ConsumerActivation::NonBlockingLive { late_apply } => {
-                        super::super::activation_decision::ActivationConstraint::LiveOnly {
-                            late_apply: *late_apply,
-                            reason: super::super::activation_decision::RequiredLiveReason::OrderedBoundContract,
-                        }
-                    }
-                })
-            })
-            .expect("infallible test graph activation projection")
     }
 
     fn cycle_node(
@@ -710,7 +693,7 @@ mod tests {
                 cycle_edge(5, 2, 23),
                 cycle_edge(5, 4, 25),
             ],
-            runtime_filter_graph: draft_graph(graph),
+            runtime_filter_graph: graph,
         }
     }
 
@@ -809,8 +792,8 @@ mod tests {
 
     /// A non-empty but structurally invalid graph: a producer binding points at a
     /// channel that was never inserted. `validate` rejects it with `UnknownChannel`.
-    fn graph_with_binding_to_unknown_channel() -> RuntimeFilterGraph {
-        let mut graph = RuntimeFilterGraph::default();
+    fn graph_with_binding_to_unknown_channel() -> DraftRuntimeFilterGraph {
+        let mut graph = DraftRuntimeFilterGraph::default();
         graph
             .insert_binding(join_producer_binding(BindingId::new(1), ChannelId::new(99)))
             .unwrap();
@@ -891,7 +874,7 @@ mod tests {
     #[test]
     fn seal_validates_and_accepts_a_valid_non_empty_runtime_filter_graph() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
+        draft.runtime_filter_graph = valid_non_empty_graph();
         draft.fragments[0].root.runtime_filter_binding_ids =
             vec![BindingId::new(1), BindingId::new(2)];
 
@@ -1037,7 +1020,7 @@ mod tests {
     #[test]
     fn seal_rejects_a_structurally_invalid_runtime_filter_graph() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = draft_graph(graph_with_binding_to_unknown_channel());
+        draft.runtime_filter_graph = graph_with_binding_to_unknown_channel();
 
         let error = seal_draft(draft).expect_err("a graph that fails validation must not seal");
 
@@ -1059,7 +1042,7 @@ mod tests {
         // after `validate_distributed_structure` succeeds.
         let mut draft = super::test_support::single_fragment_draft(Some(0));
         draft.fragments[0].sink = crate::sql::planner::distributed::fragment::DataSink::Noop;
-        draft.runtime_filter_graph = draft_graph(graph_with_binding_to_unknown_channel());
+        draft.runtime_filter_graph = graph_with_binding_to_unknown_channel();
 
         let error = seal_draft(draft).expect_err("a structurally invalid draft must not seal");
 
@@ -1072,7 +1055,7 @@ mod tests {
     #[test]
     fn seal_rejects_a_graph_binding_that_is_not_attached_to_its_node() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
+        draft.runtime_filter_graph = valid_non_empty_graph();
 
         let error = seal_draft(draft).expect_err("unattached graph bindings must fail sealing");
 
@@ -1089,7 +1072,7 @@ mod tests {
     #[test]
     fn seal_rejects_an_attached_binding_with_a_mismatched_location() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
+        draft.runtime_filter_graph = valid_non_empty_graph();
         draft.fragments[0].root.runtime_filter_binding_ids =
             vec![BindingId::new(1), BindingId::new(2)];
         draft
@@ -1114,7 +1097,7 @@ mod tests {
     #[test]
     fn seal_rejects_a_binding_expression_type_that_disagrees_with_its_channel() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.runtime_filter_graph = draft_graph(valid_non_empty_graph());
+        draft.runtime_filter_graph = valid_non_empty_graph();
         draft.fragments[0].root.runtime_filter_binding_ids =
             vec![BindingId::new(1), BindingId::new(2)];
         draft

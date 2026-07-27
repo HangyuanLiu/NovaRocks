@@ -93,7 +93,7 @@ fn hash_aggregate_payload_maps_group_layout_and_mode() {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 
@@ -206,7 +206,7 @@ fn encoded_join_output_maps_reconciled_children_not_stale_payload() {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 

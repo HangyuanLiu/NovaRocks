@@ -378,7 +378,6 @@ fn select_execution_anchor(
 mod tests {
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::column_id::ColumnId;
@@ -492,7 +491,7 @@ mod tests {
             vec![fragment(0, DataSink::Result)],
             Some(0),
             Vec::new(),
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("single result plan seals")
@@ -514,7 +513,7 @@ mod tests {
             }],
             Some(0),
             Vec::new(),
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("single write plan seals")
@@ -575,7 +574,7 @@ mod tests {
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: vec![1],
             }],
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("stream plan seals")
@@ -650,7 +649,7 @@ mod tests {
                 },
                 output_slot_ids: vec![1, 2],
             }],
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("cte multicast plan seals")
@@ -676,7 +675,7 @@ mod tests {
             }],
             Some(0),
             Vec::new(),
-            RuntimeFilterGraph::default(),
+            Default::default(),
         );
         let mut branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
         branch.output_partition_ordinals = vec![2];

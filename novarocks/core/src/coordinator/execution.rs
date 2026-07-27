@@ -2066,7 +2066,7 @@ mod native_contract_tests {
             fragments: vec![fragment],
             root_fragment_id: 7,
             edges: Vec::new(),
-            runtime_filter_graph: crate::runtime_filter::model::graph::RuntimeFilterGraph::default(),
+            runtime_filter_graph: Default::default(),
         };
         let prepared = crate::coordinator::prepare::prepare_fragments(
             &plan,
@@ -3814,15 +3814,14 @@ mod native_contract_tests {
         use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
         use crate::runtime_filter::deployment::RuntimeFilterQueryDeploymentPolicy;
         use crate::runtime_filter::model::contract::{
-            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
-            PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
-            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
+            CoverageWitnessId, LateApplyGranularity, NullSemantics, PlanFragmentId, PlanNodeId,
+            ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+            RuntimeFilterPolicyRequirement,
         };
         use crate::runtime_filter::model::coverage::Coverage;
         use crate::runtime_filter::model::graph::{
-            ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
-            ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+            ApplyPoint, ConsumerBindingTarget, PlanLocation, ProducerRequirement,
             RuntimeFilterChannelSpec, RuntimeFilterGraph,
         };
         use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
@@ -4062,7 +4061,14 @@ mod native_contract_tests {
                 .expect("test deployment installs")
         }
 
-        fn membership_graph() -> RuntimeFilterGraph {
+        fn membership_graph() -> crate::sql::planner::distributed::DraftRuntimeFilterGraph {
+            use crate::runtime_filter::model::graph::{
+                ConsumerRequirementData, RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData,
+            };
+            use crate::sql::planner::distributed::{
+                ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
+            };
+
             let channel_id = ChannelId::new(1);
             let witness = CoverageWitnessId::new(1);
             let location = PlanLocation {
@@ -4074,7 +4080,7 @@ mod native_contract_tests {
                 data_type: DataType::Int64,
                 nullable: false,
             };
-            let mut graph = RuntimeFilterGraph::default();
+            let mut graph = DraftRuntimeFilterGraph::default();
             graph
                 .insert_channel(RuntimeFilterChannelSpec {
                     channel_id,
@@ -4103,14 +4109,14 @@ mod native_contract_tests {
                 })
                 .unwrap();
             graph
-                .insert_binding(RuntimeFilterBindingSpec {
+                .insert_binding(RuntimeFilterBindingSpecData {
                     binding_id: BindingId::new(1),
                     channel_id,
                     coverage_witness_id: Some(witness),
                     location,
                     expression: expression(),
                     apply_point: ApplyPoint::NodeOutput,
-                    role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                         contribution_kinds: BTreeSet::from([
                             ContributionKind::ValueDomainDelta,
                             ContributionKind::ProducerClosed,
@@ -4123,20 +4129,21 @@ mod native_contract_tests {
                 })
                 .unwrap();
             graph
-                .insert_binding(RuntimeFilterBindingSpec {
+                .insert_binding(RuntimeFilterBindingSpecData {
                     binding_id: BindingId::new(2),
                     channel_id,
                     coverage_witness_id: None,
                     location,
                     expression: expression(),
                     apply_point: ApplyPoint::NodeInput,
-                    role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                         capabilities: BTreeSet::from([
                             ArtifactCapability::Membership,
                             ArtifactCapability::EmptyDomain,
                         ]),
-                        activation: ConsumerActivation::NonBlockingLive {
+                        activation: ActivationConstraint::LiveOnly {
                             late_apply: LateApplyGranularity::Batch,
+                            reason: RequiredLiveReason::FencedFinalDomainContract,
                         },
                         target: ConsumerBindingTarget::DirectInput { input_ordinal: 0 },
                     }),
@@ -4146,7 +4153,7 @@ mod native_contract_tests {
         }
 
         fn execution_artifacts(
-            graph: RuntimeFilterGraph,
+            graph: crate::sql::planner::distributed::DraftRuntimeFilterGraph,
         ) -> (PreparedFragmentSet, NativeFragmentBundle) {
             let fragment = PlanFragment {
                 fragment_id: 7,
@@ -4208,7 +4215,7 @@ mod native_contract_tests {
         }
 
         fn coordinator(
-            graph: RuntimeFilterGraph,
+            graph: crate::sql::planner::distributed::DraftRuntimeFilterGraph,
             dispatcher: Arc<CapturingDispatcher>,
             control: Arc<dyn RuntimeFilterDeploymentControlPort>,
             policy_provider: Arc<dyn RuntimeFilterDeploymentPolicyProvider>,
@@ -4612,7 +4619,7 @@ mod native_contract_tests {
             let control = Arc::new(RecordingDeploymentControl::default());
             let dispatcher = CapturingDispatcher::new(None);
             coordinator(
-                RuntimeFilterGraph::default(),
+                Default::default(),
                 dispatcher.clone(),
                 control.clone(),
                 policy.clone(),

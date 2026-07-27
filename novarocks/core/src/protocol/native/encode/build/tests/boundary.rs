@@ -86,7 +86,7 @@ fn cte_multicast_plan() -> DistributedPlan {
     crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![producer_fragment, consumer_fragment],
         root_fragment_id: consumer_fragment_id,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![FragmentEdge {
             source_fragment_id: producer_fragment_id,
             target_fragment_id: consumer_fragment_id,

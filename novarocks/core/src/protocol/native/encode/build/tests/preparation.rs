@@ -57,6 +57,7 @@ impl crate::coordinator::prepare::scan::ScanBindingResolver for SentinelDeltaRes
 fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
     let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
         iceberg_scan_plan(Some(vec!["id"])),
+        Default::default(),
         |draft| {
             let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
                 panic!("root must be scan");
@@ -102,6 +103,7 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
 fn fragment_build_reports_missing_delta_resolver_before_encoding() {
     let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
         iceberg_scan_plan(Some(vec!["id"])),
+        Default::default(),
         |draft| {
             let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
                 panic!("root must be scan");

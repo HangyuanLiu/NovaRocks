@@ -2079,7 +2079,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::NodeExecutionKind;
-    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -2344,7 +2343,7 @@ mod tests {
             }],
             Some(0),
             Vec::new(),
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
     }
@@ -2619,7 +2618,7 @@ mod tests {
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: vec![1, 2],
             }],
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("producer/consumer stream plan seals");
@@ -3107,7 +3106,7 @@ mod tests {
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: edge_output_slot_ids,
             }],
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
     }
@@ -3526,7 +3525,7 @@ mod tests {
             )],
             Some(0),
             Vec::new(),
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("write plan seals");
@@ -3580,7 +3579,7 @@ mod tests {
             )],
             Some(0),
             Vec::new(),
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("write plan seals");
@@ -3618,7 +3617,7 @@ mod tests {
             )],
             Some(0),
             Vec::new(),
-            RuntimeFilterGraph::default(),
+            Default::default(),
         )
         .seal()
         .expect("router plan seals");

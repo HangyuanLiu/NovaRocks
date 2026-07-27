@@ -43,10 +43,10 @@ use super::validation::{
     RuntimeFilterPlanValidationError, validate_runtime_filter_graph_against_plan,
 };
 
-pub(super) type DraftRuntimeFilterGraph = RuntimeFilterGraphData<ActivationConstraint>;
+pub(crate) type DraftRuntimeFilterGraph = RuntimeFilterGraphData<ActivationConstraint>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ActivationConstraint {
+pub(crate) enum ActivationConstraint {
     LiveOnly {
         late_apply: LateApplyGranularity,
         reason: RequiredLiveReason,
@@ -57,12 +57,12 @@ pub(super) enum ActivationConstraint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ActivationFallback {
+pub(crate) enum ActivationFallback {
     BlockingSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RequiredLiveReason {
+pub(crate) enum RequiredLiveReason {
     OrderedBoundContract,
     FencedFinalDomainContract,
 }
@@ -938,6 +938,21 @@ mod tests {
                 _
             ))
         ));
+    }
+
+    #[test]
+    fn refined_fragment_cycle_returns_no_output() {
+        let graph = graph(vec![producer(100, 7, 1, 10), consumer(10, 7, 2)]);
+        let edges = vec![edge(1, 2, 20), edge(2, 1, 21)];
+        let fragments = fragments_for(&graph, &edges);
+
+        let error = ActivationDecisionPass::run(graph, &fragments, &edges)
+            .expect_err("a cyclic fragment dependency graph must not return an output");
+
+        assert_eq!(
+            error,
+            ActivationDecisionError::RefinedGraph(RefinedWaitGraphBuildError::FragmentCycle)
+        );
     }
 
     #[test]

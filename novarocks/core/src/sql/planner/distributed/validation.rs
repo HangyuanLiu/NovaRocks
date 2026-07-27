@@ -918,7 +918,6 @@ fn find_exchange_node(node: &DistributedNode, node_id: i32) -> Option<&Distribut
 mod tests {
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
@@ -1022,7 +1021,7 @@ mod tests {
         distributed_plan_for_test! {
             fragments: vec![producer_fragment, consumer_fragment],
             root_fragment_id: consumer_fragment_id,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
+            runtime_filter_graph: Default::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: producer_fragment_id,
                 target_fragment_id: consumer_fragment_id,
@@ -1054,7 +1053,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
+            runtime_filter_graph: Default::default(),
             edges: Vec::new(),
         };
         let mut branch =
@@ -1133,7 +1132,7 @@ mod tests {
         distributed_plan_for_test! {
             fragments: vec![producer_fragment, consumer_fragment],
             root_fragment_id: consumer_fragment_id,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
+            runtime_filter_graph: Default::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: producer_fragment_id,
                 target_fragment_id: consumer_fragment_id,
@@ -1185,7 +1184,7 @@ mod tests {
         let builder = distributed_plan_draft_builder_for_test! {
             fragments,
             root_fragment_id: 0,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
+            runtime_filter_graph: Default::default(),
             edges: Vec::new(),
         };
 
@@ -1199,8 +1198,10 @@ mod tests {
     #[test]
     fn unpartitioned_stream_rejects_other_and_partitioned_with_edge_context() {
         for stream_kind in [FragmentStreamKind::Other, FragmentStreamKind::Partitioned] {
-            let mut builder =
-                draft_builder_from_plan(&stream_exchange_plan(ExchangeFlavor::Distribution));
+            let mut builder = draft_builder_from_plan(
+                &stream_exchange_plan(ExchangeFlavor::Distribution),
+                Default::default(),
+            );
             builder.edges_mut()[0].stream_kind = stream_kind;
 
             let err = builder
@@ -1216,8 +1217,10 @@ mod tests {
 
     #[test]
     fn finalized_stream_validation_rejects_stale_partition_contracts() {
-        let mut empty_hash =
-            draft_builder_from_plan(&stream_exchange_plan(ExchangeFlavor::Distribution));
+        let mut empty_hash = draft_builder_from_plan(
+            &stream_exchange_plan(ExchangeFlavor::Distribution),
+            Default::default(),
+        );
         empty_hash.edges_mut()[0].output_partition = DataPartition {
             kind: PartitionKind::Hash,
             exprs: Vec::new(),
@@ -1241,8 +1244,10 @@ mod tests {
             kind: PartitionKind::Random,
             exprs: Vec::new(),
         };
-        let mut receiver_mismatch =
-            draft_builder_from_plan(&stream_exchange_plan(ExchangeFlavor::Distribution));
+        let mut receiver_mismatch = draft_builder_from_plan(
+            &stream_exchange_plan(ExchangeFlavor::Distribution),
+            Default::default(),
+        );
         receiver_mismatch.fragments_mut()[0].output_partition = random.clone();
         receiver_mismatch.edges_mut()[0].output_partition = random.clone();
         receiver_mismatch.edges_mut()[0].stream_kind = FragmentStreamKind::Other;
@@ -1256,8 +1261,10 @@ mod tests {
             "{err}"
         );
 
-        let mut source_mismatch =
-            draft_builder_from_plan(&stream_exchange_plan(ExchangeFlavor::Distribution));
+        let mut source_mismatch = draft_builder_from_plan(
+            &stream_exchange_plan(ExchangeFlavor::Distribution),
+            Default::default(),
+        );
         source_mismatch.fragments_mut()[0].output_partition = DataPartition {
             kind: PartitionKind::Random,
             exprs: Vec::new(),
@@ -1279,7 +1286,7 @@ mod tests {
         let source_fragment_id = planned.edges()[0].source_fragment_id;
         let target_fragment_id = planned.edges()[0].target_fragment_id;
 
-        let mut wrong_sink = draft_builder_from_plan(&planned);
+        let mut wrong_sink = draft_builder_from_plan(&planned, Default::default());
         wrong_sink
             .fragments_mut()
             .iter_mut()
@@ -1294,7 +1301,7 @@ mod tests {
             "{err}"
         );
 
-        let mut route_mismatch = draft_builder_from_plan(&planned);
+        let mut route_mismatch = draft_builder_from_plan(&planned, Default::default());
         {
             let FragmentEdgeKind::IcebergChangeStreamRouter { branch_id, .. } =
                 &mut route_mismatch.edges_mut()[0].edge_kind
@@ -1311,14 +1318,14 @@ mod tests {
             "{err}"
         );
 
-        let mut slot_mismatch = draft_builder_from_plan(&planned);
+        let mut slot_mismatch = draft_builder_from_plan(&planned, Default::default());
         slot_mismatch.edges_mut()[0].output_slot_ids = vec![2];
         let err = slot_mismatch
             .seal()
             .expect_err("router output slot mismatch must fail");
         assert!(err.contains("router output_slot_ids mismatch"), "{err}");
 
-        let mut route_partition_mismatch = draft_builder_from_plan(&planned);
+        let mut route_partition_mismatch = draft_builder_from_plan(&planned, Default::default());
         route_partition_mismatch.edges_mut()[0].output_partition = DataPartition::unpartitioned();
         route_partition_mismatch.edges_mut()[0].stream_kind = FragmentStreamKind::Gather;
         let err = route_partition_mismatch
@@ -1331,7 +1338,7 @@ mod tests {
             "{err}"
         );
 
-        let mut receiver_partition_mismatch = draft_builder_from_plan(&planned);
+        let mut receiver_partition_mismatch = draft_builder_from_plan(&planned, Default::default());
         {
             let target = receiver_partition_mismatch
                 .fragments_mut()
@@ -1353,7 +1360,7 @@ mod tests {
             "{err}"
         );
 
-        let mut stream_mismatch = draft_builder_from_plan(&planned);
+        let mut stream_mismatch = draft_builder_from_plan(&planned, Default::default());
         stream_mismatch.edges_mut()[0].stream_kind = FragmentStreamKind::Gather;
         let err = stream_mismatch
             .seal()
@@ -1376,7 +1383,7 @@ mod tests {
         // has one group), so that backstop is subsumed and never reached.
         let planned = finalized_router_plan();
         let first_edge = planned.edges()[0].clone();
-        let mut builder = draft_builder_from_plan(&planned);
+        let mut builder = draft_builder_from_plan(&planned, Default::default());
         {
             let source = builder
                 .fragments_mut()
@@ -1438,8 +1445,10 @@ mod tests {
 
     #[test]
     fn shared_edge_validation_rejects_source_mismatch_and_empty_hash_partition() {
-        let mut source_mismatch =
-            draft_builder_from_plan(&stream_exchange_plan(ExchangeFlavor::Distribution));
+        let mut source_mismatch = draft_builder_from_plan(
+            &stream_exchange_plan(ExchangeFlavor::Distribution),
+            Default::default(),
+        );
         {
             let DistributedNodeKind::Exchange(exchange) =
                 &mut source_mismatch.fragments_mut()[1].root.payload
@@ -1458,8 +1467,10 @@ mod tests {
             "{err}"
         );
 
-        let mut empty_hash =
-            draft_builder_from_plan(&stream_exchange_plan(ExchangeFlavor::Distribution));
+        let mut empty_hash = draft_builder_from_plan(
+            &stream_exchange_plan(ExchangeFlavor::Distribution),
+            Default::default(),
+        );
         {
             let DistributedNodeKind::Exchange(exchange) =
                 &mut empty_hash.fragments_mut()[1].root.payload
@@ -1484,7 +1495,7 @@ mod tests {
     fn finalized_cte_multicast_validation_rejects_stale_contracts() {
         let dp = cte_multicast_plan();
 
-        let mut arity_mismatch = draft_builder_from_plan(&dp);
+        let mut arity_mismatch = draft_builder_from_plan(&dp, Default::default());
         {
             let FragmentEdgeKind::CteMulticast {
                 receive_producer_column_ids,
@@ -1513,7 +1524,7 @@ mod tests {
             .expect_err("CTE receive/output arity mismatch must fail");
         assert!(err.contains("CTE receive/output arity mismatch"), "{err}");
 
-        let mut mapping_mismatch = draft_builder_from_plan(&dp);
+        let mut mapping_mismatch = draft_builder_from_plan(&dp, Default::default());
         {
             let FragmentEdgeKind::CteMulticast {
                 receive_producer_column_ids,
@@ -1545,7 +1556,7 @@ mod tests {
             "{err}"
         );
 
-        let mut slot_mismatch = draft_builder_from_plan(&dp);
+        let mut slot_mismatch = draft_builder_from_plan(&dp, Default::default());
         slot_mismatch.edges_mut()[0].output_slot_ids = vec![1, 2];
         let err = slot_mismatch
             .seal()
@@ -1606,8 +1617,7 @@ mod tests {
         fragments: Vec<PlanFragment>,
         edges: Vec<FragmentEdge>,
     ) -> Result<DistributedPlan, String> {
-        DistributedPlanDraftBuilder::new(fragments, Some(0), edges, RuntimeFilterGraph::default())
-            .seal()
+        DistributedPlanDraftBuilder::new(fragments, Some(0), edges, Default::default()).seal()
     }
 
     #[test]

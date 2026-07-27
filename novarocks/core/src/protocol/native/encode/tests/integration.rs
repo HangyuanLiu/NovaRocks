@@ -22,7 +22,6 @@ use super::super::plan;
 use super::{column_expr, int_expr};
 use crate::coordinator::prepare::scan::ScanExecutionBindings;
 use crate::protocol::native::type_mapping::decode_type;
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::column_id::ColumnId;
 
 fn empty_scan_bindings() -> &'static ScanExecutionBindings {
@@ -181,7 +180,7 @@ fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange(
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![source, target],
         root_fragment_id: 1,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![crate::sql::planner::distributed::FragmentEdge {
             source_fragment_id: 0,
             target_fragment_id: 1,
@@ -317,7 +316,7 @@ fn stream_edge_projects_pruned_scan_columns_by_column_id() {
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![source, target],
         root_fragment_id: 1,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![crate::sql::planner::distributed::FragmentEdge {
             source_fragment_id: 0,
             target_fragment_id: 1,
@@ -421,7 +420,7 @@ fn stream_edge_patches_exchange_columns_from_aggregate_layout_when_fragment_outp
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![source, target],
         root_fragment_id: 1,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![crate::sql::planner::distributed::FragmentEdge {
             source_fragment_id: 0,
             target_fragment_id: 1,
@@ -534,7 +533,7 @@ fn stream_edge_patches_local_avg_exchange_schema_to_intermediate_type() {
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![source, target],
         root_fragment_id: 1,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![crate::sql::planner::distributed::FragmentEdge {
             source_fragment_id: 0,
             target_fragment_id: 1,
@@ -617,7 +616,7 @@ fn stream_edge_allows_zero_column_source_when_no_slots_are_requested() {
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![source, target],
         root_fragment_id: 1,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![crate::sql::planner::distributed::FragmentEdge {
             source_fragment_id: 0,
             target_fragment_id: 1,

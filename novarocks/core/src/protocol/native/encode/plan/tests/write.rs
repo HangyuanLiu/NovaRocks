@@ -27,7 +27,6 @@ use super::super::write::{
 };
 use super::*;
 use crate::protocol::native::encode::plan;
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::write::change_stream::{
     IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
@@ -142,7 +141,7 @@ fn single_fragment_router_plan_for_test() -> DistributedPlan {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     }
 }
@@ -461,7 +460,7 @@ fn iceberg_write_fragment_uses_sink_output_contract_for_duplicate_input_columns(
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![fragment],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
     let encoded_plan = plan::encode_distributed_plan(&plan, empty_scan_bindings())

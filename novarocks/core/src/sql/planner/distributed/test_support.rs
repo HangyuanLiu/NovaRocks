@@ -15,32 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime_filter::model::contract::ConsumerActivation;
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
-
 use super::DistributedPlan;
-use super::activation_decision::{
-    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph, RequiredLiveReason,
-};
+use super::activation_decision::DraftRuntimeFilterGraph;
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
-
-fn into_draft_runtime_filter_graph(graph: RuntimeFilterGraph) -> DraftRuntimeFilterGraph {
-    graph
-        .map_consumer_activations(|_, _, _, activation| {
-            Ok::<_, std::convert::Infallible>(match activation {
-                ConsumerActivation::BlockingSnapshot => ActivationConstraint::BlockingOrBatchLive {
-                    fallback: ActivationFallback::BlockingSnapshot,
-                },
-                ConsumerActivation::NonBlockingLive { late_apply } => {
-                    ActivationConstraint::LiveOnly {
-                        late_apply: *late_apply,
-                        reason: RequiredLiveReason::OrderedBoundContract,
-                    }
-                }
-            })
-        })
-        .expect("infallible test graph activation projection")
-}
 
 /// Planner-owned test fixture that constructs a draft and seals it through the
 /// same production entrypoint. It never exposes mutable sealed-plan state.
@@ -53,14 +30,14 @@ impl DistributedPlanDraftBuilder {
         fragments: Vec<PlanFragment>,
         root_fragment_id: Option<FragmentId>,
         edges: Vec<FragmentEdge>,
-        runtime_filter_graph: RuntimeFilterGraph,
+        runtime_filter_graph: DraftRuntimeFilterGraph,
     ) -> Self {
         Self {
             draft: DistributedPlanDraft {
                 fragments,
                 root_fragment_id,
                 edges,
-                runtime_filter_graph: into_draft_runtime_filter_graph(runtime_filter_graph),
+                runtime_filter_graph,
             },
         }
     }
@@ -77,8 +54,8 @@ impl DistributedPlanDraftBuilder {
         &mut self.draft.edges
     }
 
-    pub(crate) fn set_runtime_filter_graph(&mut self, graph: RuntimeFilterGraph) {
-        self.draft.runtime_filter_graph = into_draft_runtime_filter_graph(graph);
+    pub(crate) fn set_runtime_filter_graph(&mut self, graph: DraftRuntimeFilterGraph) {
+        self.draft.runtime_filter_graph = graph;
     }
 
     pub(crate) fn seal(self) -> Result<DistributedPlan, String> {
@@ -90,20 +67,24 @@ impl DistributedPlanDraftBuilder {
     }
 }
 
-pub(crate) fn draft_builder_from_plan(plan: &DistributedPlan) -> DistributedPlanDraftBuilder {
+pub(crate) fn draft_builder_from_plan(
+    plan: &DistributedPlan,
+    runtime_filter_graph: DraftRuntimeFilterGraph,
+) -> DistributedPlanDraftBuilder {
     DistributedPlanDraftBuilder::new(
         plan.fragments().to_vec(),
         Some(plan.root_fragment_id()),
         plan.edges().to_vec(),
-        plan.runtime_filter_graph().clone(),
+        runtime_filter_graph,
     )
 }
 
 pub(crate) fn rebuild_test_plan(
     plan: DistributedPlan,
+    runtime_filter_graph: DraftRuntimeFilterGraph,
     mutate: impl FnOnce(&mut DistributedPlanDraftBuilder),
 ) -> DistributedPlan {
-    let mut builder = draft_builder_from_plan(&plan);
+    let mut builder = draft_builder_from_plan(&plan, runtime_filter_graph);
     mutate(&mut builder);
     builder
         .seal()

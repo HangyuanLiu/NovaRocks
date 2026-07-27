@@ -138,6 +138,7 @@ fn planner_broadcast_edge_remains_broadcast_through_builder_and_scheduling() {
 fn random_partition_with_other_stream_kind_remains_other() {
     let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
         stream_exchange_plan(ExchangeFlavor::Distribution),
+        Default::default(),
         |draft| {
             let partition = DataPartition {
                 kind: PartitionKind::Random,
@@ -200,6 +201,7 @@ fn legal_stream_partition_kind_combinations_remain_unchanged() {
     for (partition, stream_kind) in cases {
         let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
             stream_exchange_plan(ExchangeFlavor::Distribution),
+            Default::default(),
             |draft| {
                 let DistributedNodeKind::Exchange(exchange) =
                     &mut draft.fragments_mut()[1].root.payload
@@ -410,7 +412,7 @@ fn lower_distributed_plan_owns_native_write_sink_shape() {
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![fragment],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 
@@ -515,7 +517,7 @@ fn fragment_build_preserves_finalized_cte_multicast_edge_output_slots() {
     let dp = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![producer_fragment, consumer_fragment],
         root_fragment_id: consumer_fragment_id,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![FragmentEdge {
             source_fragment_id: producer_fragment_id,
             target_fragment_id: consumer_fragment_id,

@@ -64,9 +64,8 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
-    RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-    RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation, ProducerRequirement,
+    RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec,
 };
 use crate::runtime_filter::port::artifact::{
     ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
@@ -109,6 +108,9 @@ use crate::sql::planner::distributed::test_support::{
 };
 use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFragmentSink, IcebergWriteInputBinding,
+};
+use crate::sql::planner::distributed::{
+    ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
 };
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
@@ -322,7 +324,7 @@ fn expression() -> TypedExpr {
     }
 }
 
-fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
+fn runtime_filter_graph(topology: ConformanceTopology) -> DraftRuntimeFilterGraph {
     let coverage = topology.coverage();
     let contributions = BTreeSet::from([
         ContributionKind::ValueDomainDelta,
@@ -332,7 +334,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
         ArtifactCapability::Membership,
         ArtifactCapability::EmptyDomain,
     ]);
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     graph
         .insert_channel(RuntimeFilterChannelSpec {
             channel_id: CHANNEL,
@@ -355,7 +357,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
         })
         .expect("insert conformance channel");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: PRODUCER_BINDING,
             channel_id: CHANNEL,
             coverage_witness_id: Some(WITNESS),
@@ -365,7 +367,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
             },
             expression: expression(),
             apply_point: ApplyPoint::NodeOutput,
-            role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+            role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
                 target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
@@ -375,7 +377,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
         })
         .expect("insert conformance producer binding");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: CONSUMER_BINDING,
             channel_id: CHANNEL,
             coverage_witness_id: None,
@@ -385,10 +387,11 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
             },
             expression: expression(),
             apply_point: ApplyPoint::NodeInput,
-            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+            role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                 capabilities,
-                activation: ConsumerActivation::NonBlockingLive {
+                activation: ActivationConstraint::LiveOnly {
                     late_apply: LateApplyGranularity::Batch,
+                    reason: RequiredLiveReason::FencedFinalDomainContract,
                 },
                 target: ConsumerBindingTarget::SourceBoundary,
             }),
@@ -1694,7 +1697,7 @@ fn topn_runtime_filter_graph(
     producer: (u32, i32),
     consumer: (u32, i32),
     deadline_ms: u64,
-) -> RuntimeFilterGraph {
+) -> DraftRuntimeFilterGraph {
     let keys = vec![OrderKeyContract {
         data_type: DataType::Int32,
         direction: SortDirection::Ascending,
@@ -1710,7 +1713,7 @@ fn topn_runtime_filter_graph(
     ]);
     let capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
     let coverage = Coverage::Leaf(TOPN_WITNESS);
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     graph
         .insert_channel(RuntimeFilterChannelSpec {
             channel_id: TOPN_CHANNEL,
@@ -1734,7 +1737,7 @@ fn topn_runtime_filter_graph(
         })
         .expect("insert live TopN channel");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: TOPN_PRODUCER_BINDING,
             channel_id: TOPN_CHANNEL,
             coverage_witness_id: Some(TOPN_WITNESS),
@@ -1744,7 +1747,7 @@ fn topn_runtime_filter_graph(
             },
             expression: topn_column_expr(1, Some("source"), "k"),
             apply_point: ApplyPoint::NodeOutput,
-            role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+            role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
                 target:
@@ -1756,7 +1759,7 @@ fn topn_runtime_filter_graph(
         })
         .expect("insert live TopN producer");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: TOPN_CONSUMER_BINDING,
             channel_id: TOPN_CHANNEL,
             coverage_witness_id: None,
@@ -1766,10 +1769,11 @@ fn topn_runtime_filter_graph(
             },
             expression: topn_column_expr(1, Some("source"), "k"),
             apply_point: ApplyPoint::NodeInput,
-            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+            role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                 capabilities,
-                activation: ConsumerActivation::NonBlockingLive {
+                activation: ActivationConstraint::LiveOnly {
                     late_apply: LateApplyGranularity::Split,
+                    reason: RequiredLiveReason::OrderedBoundContract,
                 },
                 target: ConsumerBindingTarget::SourceBoundary,
             }),
@@ -1790,7 +1794,7 @@ fn sealed_topn_plan(
     if !runtime_filter {
         return base;
     }
-    let mut draft = draft_builder_from_plan(&base);
+    let mut draft = draft_builder_from_plan(&base, Default::default());
     let (producer, consumer) = find_topn_binding_locations(draft.fragments());
     draft.set_runtime_filter_graph(topn_runtime_filter_graph(producer, consumer, deadline_ms));
     for fragment in draft.fragments_mut() {
