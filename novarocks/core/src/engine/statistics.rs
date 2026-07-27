@@ -397,11 +397,6 @@ pub(crate) fn drop_database(state: &Arc<StandaloneState>, database: &str) {
         .table_collect_on_first_load
         .retain(|key, _| key.db != db);
     stats.column_usage.retain(|key, _| key.db != db);
-    drop(stats);
-    // Views are tied to a database; remove all of this database's views from
-    // the registry so a subsequent `CREATE VIEW` in a freshly-recreated
-    // database does not fail with "view already exists".
-    state.session_views.remove_database(&db);
 }
 
 fn handle_admin_statement(state: &Arc<StandaloneState>, sql: &str) -> Result<(), String> {

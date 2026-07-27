@@ -15,12 +15,84 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
+use novarocks::engine::view::{
+    CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
+    ViewRequestContext, ViewSqlDialect, ViewTarget,
+};
+use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::{FrontendApplicationErrorKind, FrontendApplicationHost};
+use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
 };
+use sqlparser::ast::{Query, Statement};
+use sqlparser::parser::Parser;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+struct SessionViewEngine;
+
+impl ViewEngine for SessionViewEngine {
+    fn validate_iceberg_catalog(&self, _catalog: &str) -> Result<(), String> {
+        unreachable!("session view must not access an external catalog")
+    }
+
+    fn is_rest_iceberg_catalog(&self, _catalog: &str) -> bool {
+        false
+    }
+
+    fn table_exists(&self, _target: &ViewTarget) -> Result<bool, String> {
+        unreachable!("session view must not probe external tables")
+    }
+
+    fn view_exists(&self, _target: &ViewTarget) -> Result<bool, String> {
+        unreachable!("session view must not probe external views")
+    }
+
+    fn create_external_view(&self, _request: CreateExternalViewRequest) -> Result<(), String> {
+        unreachable!("session view must not create external views")
+    }
+
+    fn drop_external_view(&self, _target: &ViewTarget) -> Result<(), String> {
+        unreachable!("session view must not drop external views")
+    }
+
+    fn load_external_view(
+        &self,
+        _target: &ViewTarget,
+    ) -> Result<Option<ResolvedExternalView>, String> {
+        Ok(None)
+    }
+
+    fn list_external_views(&self, _catalog: &str, _database: &str) -> Result<Vec<String>, String> {
+        unreachable!("session view must not list external views")
+    }
+
+    fn analyze_external_view(
+        &self,
+        _catalog: &str,
+        _database: &str,
+        _query: &Query,
+    ) -> Result<Vec<ViewColumnDefinition>, String> {
+        unreachable!("session view must not analyze external views")
+    }
+}
+
+fn view_context() -> ViewRequestContext<'static> {
+    ViewRequestContext {
+        current_catalog: None,
+        current_database: "db",
+    }
+}
+
+fn parse_query(sql: &str) -> Box<Query> {
+    let mut parser = Parser::new(&ViewSqlDialect).try_with_sql(sql).unwrap();
+    match parser.parse_statement().unwrap() {
+        Statement::Query(query) => query,
+        other => panic!("expected query, got {other:?}"),
+    }
+}
 
 fn sqlite_config(temp: &TempDir) -> StateStoreAppConfig {
     StateStoreAppConfig {
@@ -43,6 +115,15 @@ async fn absent_config_opens_disabled_host() {
         .expect("absent state store configuration must open a disabled host");
 
     assert!(host.state_store().is_none());
+    assert!(
+        host.view_service()
+            .try_handle_statement(
+                &SessionViewEngine,
+                "CREATE VIEW memory_view AS SELECT 1",
+                view_context(),
+            )
+            .is_ok()
+    );
     host.shutdown()
         .await
         .expect("disabled host shutdown must succeed");
@@ -179,4 +260,73 @@ async fn shutdown_is_required_to_reopen_same_deployment() {
         .shutdown()
         .await
         .expect("reopened SQLite host shutdown must succeed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_host_restores_views_through_its_service_after_reopen() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let config = sqlite_config(&temp);
+    let host = FrontendApplicationHost::open(Some(config.clone()))
+        .await
+        .expect("configured host must open");
+    host.view_service()
+        .try_handle_statement(
+            &SessionViewEngine,
+            "CREATE VIEW durable_view AS SELECT 42 AS answer",
+            view_context(),
+        )
+        .expect("host view service must persist the view");
+    host.shutdown().await.expect("first host shutdown");
+
+    let reopened = FrontendApplicationHost::open(Some(config))
+        .await
+        .expect("configured host must reopen");
+    let mut query = parse_query("SELECT * FROM durable_view");
+    reopened
+        .view_service()
+        .rewrite_query(&SessionViewEngine, &mut query, view_context())
+        .expect("reopened host must restore the view");
+    assert_eq!(
+        query.to_string(),
+        "SELECT * FROM (SELECT 42 AS answer) durable_view"
+    );
+    reopened.shutdown().await.expect("reopened host shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_view_record_fails_host_open_at_the_view_service_boundary() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let config = sqlite_config(&temp);
+    let host = FrontendApplicationHost::open(Some(config.clone()))
+        .await
+        .expect("configured host must open");
+    let store = host.state_store().expect("configured host state store");
+    let mut transaction = store
+        .begin_write(
+            TransactionId::from(Uuid::now_v7()),
+            "seed corrupt frontend view record",
+        )
+        .await
+        .expect("begin corrupt record write");
+    transaction
+        .put(
+            database_key("default_catalog", "db").expect("view database key"),
+            Value::try_from(Bytes::from_static(b"not-json")).expect("corrupt value"),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage corrupt record");
+    assert!(matches!(
+        transaction.commit().await,
+        CommitOutcome::Committed(_)
+    ));
+    drop(store);
+    host.shutdown().await.expect("seed host shutdown");
+
+    let error = match FrontendApplicationHost::open(Some(config)).await {
+        Ok(_) => panic!("corrupt durable view metadata must reject host open"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::ViewServiceOpen);
+    assert!(error.to_string().contains("decode frontend view database"));
 }
