@@ -80,6 +80,7 @@ mod query_stats;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub mod system_catalog;
+pub(crate) mod view;
 pub(crate) mod view_rewrite;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
@@ -365,12 +366,11 @@ pub(crate) struct StandaloneState {
     pub(crate) maintenance_signal_tx: std::sync::Mutex<
         Option<std::sync::mpsc::Sender<crate::engine::mv_maintenance::MaintenanceSignal>>,
     >,
-    /// In-memory registry of user-defined views, keyed by lowercase
-    /// (database, view-name). Each entry stores the analysed `Query` AST
-    /// from `CREATE VIEW ... AS <query>`. The analyzer expands these to
-    /// derived tables on `FROM <view>` references.
-    pub(crate) views:
-        RwLock<std::collections::HashMap<(String, String), Box<sqlparser::ast::Query>>>,
+    /// Session-view registry seam. FEH-4a: the in-memory `CREATE VIEW`
+    /// registry now lives behind `ViewCatalog` (core adapter
+    /// `InMemoryViewCatalog`); FEH-4b swaps in a frontend, StateStore-backed
+    /// implementation injected through the server seam.
+    pub(crate) session_views: std::sync::Arc<dyn crate::engine::view::ViewCatalog>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -398,7 +398,7 @@ impl Default for StandaloneState {
             job_repo: JobMetaRepository,
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
-            views: RwLock::new(std::collections::HashMap::new()),
+            session_views: std::sync::Arc::new(crate::engine::view::InMemoryViewCatalog::new()),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,
@@ -758,6 +758,14 @@ impl StandaloneSession {
         normalized =
             rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
         normalized = rewrite_named_partition_insert_overwrite(&normalized)?;
+        if let Some(result) = self::view::try_handle_statement(
+            &self.inner,
+            &normalized,
+            current_catalog,
+            current_database,
+        )? {
+            return Ok(result);
+        }
         if let Some(result) = self::statistics::try_handle_statement(
             &self.inner,
             &normalized,
@@ -973,12 +981,22 @@ impl StandaloneSession {
 
         // SHOW CREATE VIEW ...
         if looks_like_show_create_view(&normalized) {
-            return self.handle_show_create_view(&normalized, current_catalog, current_database);
+            return self::view::handle_show_create_view(
+                &self.inner,
+                &normalized,
+                current_catalog,
+                current_database,
+            );
         }
 
         // SHOW VIEWS [FROM db]
         if looks_like_show_views(&normalized) {
-            return self.handle_show_views(&normalized, current_catalog, current_database);
+            return self::view::handle_show_views(
+                &self.inner,
+                &normalized,
+                current_catalog,
+                current_database,
+            );
         }
 
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
@@ -1101,7 +1119,7 @@ impl StandaloneSession {
                 let mut prepared = query.as_ref().clone();
                 self::view_rewrite::expand_views_in_query(
                     &mut prepared,
-                    &self.inner.views,
+                    self.inner.session_views.as_ref(),
                     current_database,
                 );
                 // Inline iceberg-catalog views (REST only). Runs after session
@@ -1491,126 +1509,6 @@ impl StandaloneSession {
                     logical_type: None,
                 },
             ],
-            chunks: vec![record_batch_to_chunk(batch)?],
-        }))
-    }
-
-    fn handle_show_create_view(
-        &self,
-        sql: &str,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let view_name = crate::engine::statement::parse_show_create_view(sql)?;
-        let Some(target) = crate::engine::iceberg_view::resolve_iceberg_view_target_parts(
-            &self.inner,
-            &view_name.parts,
-            current_catalog,
-            current_database,
-        )?
-        else {
-            return Err("SHOW CREATE VIEW only supports views in iceberg catalogs".to_string());
-        };
-        let backend = self
-            .inner
-            .connectors
-            .read()
-            .expect("connector registry read")
-            .catalog_backend("iceberg")?;
-        let view = backend.load_view(&target.catalog, &target.namespace, &target.view)?;
-
-        let columns = view
-            .column_names
-            .iter()
-            .map(|name| format!("`{name}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut ddl = format!(
-            "CREATE VIEW `{}`.`{}`.`{}` ({})",
-            target.catalog, target.namespace, target.view, columns
-        );
-        if let Some(comment) = &view.comment {
-            ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));
-        }
-        ddl.push_str(&format!("\nAS {};", view.sql));
-
-        let fields = vec![
-            Field::new("View", DataType::Utf8, false),
-            Field::new("Create View", DataType::Utf8, false),
-        ];
-        let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![
-            Arc::new(StringArray::from(vec![target.view.clone()])),
-            Arc::new(StringArray::from(vec![ddl])),
-        ];
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-            .map_err(|e| format!("build SHOW CREATE VIEW result failed: {e}"))?;
-        Ok(StatementResult::Query(QueryResult {
-            columns: vec![
-                QueryResultColumn {
-                    name: "View".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    logical_type: None,
-                },
-                QueryResultColumn {
-                    name: "Create View".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    logical_type: None,
-                },
-            ],
-            chunks: vec![record_batch_to_chunk(batch)?],
-        }))
-    }
-
-    fn handle_show_views(
-        &self,
-        sql: &str,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let from_db = crate::engine::statement::parse_show_views(sql)?;
-        let db = from_db.as_deref().unwrap_or(current_database);
-        let session_catalog =
-            current_catalog.filter(|catalog| !catalog.eq_ignore_ascii_case("default_catalog"));
-        let names: Vec<String> = match session_catalog {
-            Some(catalog) => {
-                let backend = self
-                    .inner
-                    .connectors
-                    .read()
-                    .expect("connector registry read")
-                    .catalog_backend("iceberg")?;
-                backend.list_views(catalog, db)?
-            }
-            None => {
-                let views = self
-                    .inner
-                    .views
-                    .read()
-                    .map_err(|e| format!("view registry read lock: {e}"))?;
-                let db_lower = db.to_ascii_lowercase();
-                let mut names: Vec<String> = views
-                    .keys()
-                    .filter(|(database, _)| database == &db_lower)
-                    .map(|(_, view)| view.clone())
-                    .collect();
-                names.sort();
-                names
-            }
-        };
-        let column_name = format!("Views_in_{db}");
-        let fields = vec![Field::new(column_name.clone(), DataType::Utf8, false)];
-        let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![Arc::new(StringArray::from(names))];
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-            .map_err(|e| format!("build SHOW VIEWS result failed: {e}"))?;
-        Ok(StatementResult::Query(QueryResult {
-            columns: vec![QueryResultColumn {
-                name: column_name,
-                data_type: DataType::Utf8,
-                nullable: false,
-                logical_type: None,
-            }],
             chunks: vec![record_batch_to_chunk(batch)?],
         }))
     }
@@ -2505,7 +2403,11 @@ fn prepare_explain_query(
 ) -> Result<sqlparser::ast::Query, String> {
     // Inline any user-defined views before the analyzer sees the query.
     let mut prepared = query.clone();
-    self::view_rewrite::expand_views_in_query(&mut prepared, &state.views, current_database);
+    self::view_rewrite::expand_views_in_query(
+        &mut prepared,
+        state.session_views.as_ref(),
+        current_database,
+    );
     // Inline iceberg-catalog views (REST only). Runs after session
     // views so local definitions keep precedence.
     self::iceberg_view_rewrite::expand_iceberg_views_in_query(
