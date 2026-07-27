@@ -51,9 +51,9 @@ use crate::common::types::format_uuid;
 use crate::connector::starrocks::starmgr;
 use crate::coordinator::ports::CoordinatorReportHandler;
 use crate::coordinator::report::CoordinatorExecStatusReportHandler;
-use crate::novarocks_logging::info;
 #[cfg(feature = "compat")]
 use crate::novarocks_logging::warn;
+use crate::novarocks_logging::{error, info};
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
@@ -1427,6 +1427,11 @@ fn supervise_grpc_server_thread<F>(
             panic_payload_message(payload)
         ),
     };
+    error!(
+        target: "novarocks::grpc",
+        error = %detail,
+        "grpc server stopped unexpectedly"
+    );
     let _ = failure_tx.send(format!("grpc server {detail}"));
 }
 
@@ -2001,9 +2006,27 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use prost::Message;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Duration;
+    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
+
+    #[derive(Clone)]
+    struct ErrorEventCounter {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ErrorEventCounter
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: LayerContext<'_, S>) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 
     #[derive(Clone, PartialEq, Message)]
     struct RawSubmitFragmentRequest {
@@ -2181,15 +2204,26 @@ mod tests {
     #[test]
     fn grpc_supervisor_reports_post_ready_serve_exit() {
         let (failure_tx, failure_rx) = mpsc::channel();
-        super::supervise_grpc_server_thread(
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            failure_tx,
-            || Ok(()),
-        );
+        let error_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(ErrorEventCounter {
+            count: Arc::clone(&error_events),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            super::supervise_grpc_server_thread(
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                failure_tx,
+                || Ok(()),
+            );
+        });
 
         let failure = failure_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("unexpected post-ready serve exit must be reported");
+        assert_eq!(
+            error_events.load(Ordering::Relaxed),
+            1,
+            "unexpected supervisor exit must remain observable without polling"
+        );
         assert!(failure.contains("grpc server"), "{failure}");
         assert!(
             failure.contains("ended unexpectedly after readiness"),
