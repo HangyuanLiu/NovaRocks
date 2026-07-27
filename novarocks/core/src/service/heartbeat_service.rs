@@ -314,14 +314,13 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub fn stop_heartbeat_server() {
+pub fn stop_heartbeat_server() -> Result<(), String> {
     let (stop, wake_addr, join_handle, active_connections) = {
-        let mut state = match heartbeat_server_state().lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
+        let mut state = heartbeat_server_state()
+            .lock()
+            .map_err(|_| "lock heartbeat service state failed".to_string())?;
         if !state.started {
-            return;
+            return Ok(());
         }
         state.started = false;
         (
@@ -334,10 +333,15 @@ pub fn stop_heartbeat_server() {
     if let Some(stop) = stop {
         stop.store(true, Ordering::Release);
     }
+    let mut failures = Vec::new();
     if let Some(active_connections) = active_connections {
-        let connections = active_connections
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connections = match active_connections.lock() {
+            Ok(connections) => connections,
+            Err(poisoned) => {
+                failures.push("lock heartbeat active connections failed".to_string());
+                poisoned.into_inner()
+            }
+        };
         for stream in connections.values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
@@ -346,6 +350,49 @@ pub fn stop_heartbeat_server() {
         let _ = TcpStream::connect(wake_addr);
     }
     if let Some(join_handle) = join_handle {
-        let _ = join_handle.join();
+        if let Err(error) = join_heartbeat_server_thread(join_handle) {
+            failures.push(error);
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn join_heartbeat_server_thread(handle: thread::JoinHandle<()>) -> Result<(), String> {
+    handle.join().map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|value| (*value).to_string())
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        format!("HeartbeatService listener thread panicked: {detail}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stop_heartbeat_server_is_idempotent() {
+        super::stop_heartbeat_server().expect("first stop");
+        super::stop_heartbeat_server().expect("second stop");
+    }
+
+    #[test]
+    fn listener_thread_panic_is_reported() {
+        let handle = std::thread::spawn(|| panic!("heartbeat listener failed"));
+        let error =
+            super::join_heartbeat_server_thread(handle).expect_err("panic must be reported");
+
+        assert_eq!(
+            error,
+            "HeartbeatService listener thread panicked: heartbeat listener failed"
+        );
     }
 }

@@ -880,14 +880,13 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
     Ok(())
 }
 
-pub fn stop_backend_service() {
+pub fn stop_backend_service() -> Result<(), String> {
     let (stop, wake_addr, join_handle) = {
-        let mut state = match backend_server_state().lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
+        let mut state = backend_server_state()
+            .lock()
+            .map_err(|_| "lock backend service state failed".to_string())?;
         if !state.started {
-            return;
+            return Ok(());
         }
         state.started = false;
         (
@@ -904,6 +903,42 @@ pub fn stop_backend_service() {
         let _ = TcpStream::connect(addr);
     }
     if let Some(handle) = join_handle {
-        let _ = handle.join();
+        join_backend_service_thread(handle)?;
+    }
+    Ok(())
+}
+
+fn join_backend_service_thread(handle: thread::JoinHandle<()>) -> Result<(), String> {
+    handle.join().map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|value| (*value).to_string())
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        format!("BackendService listener thread panicked: {detail}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stop_backend_service_is_idempotent() {
+        super::stop_backend_service().expect("first stop");
+        super::stop_backend_service().expect("second stop");
+    }
+
+    #[test]
+    fn listener_thread_panic_is_reported() {
+        let handle = std::thread::spawn(|| panic!("backend listener failed"));
+        let error = super::join_backend_service_thread(handle).expect_err("panic must be reported");
+
+        assert_eq!(
+            error,
+            "BackendService listener thread panicked: backend listener failed"
+        );
     }
 }
