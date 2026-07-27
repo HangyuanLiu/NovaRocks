@@ -180,6 +180,7 @@ pub async fn run_standalone_server_with_config_until_shutdown<F>(
     port_override: Option<u16>,
     local_exchange: bool,
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
+    view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -193,7 +194,7 @@ where
         start_coordinator_report_grpc: true,
         ..resolved
     };
-    run_with_resolved_options_until_shutdown(resolved, system_catalog, shutdown).await
+    run_with_resolved_options_until_shutdown(resolved, system_catalog, view_service, shutdown).await
 }
 
 /// Run the standalone server for `role=fe`.
@@ -233,6 +234,7 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
     runtime.block_on(run_with_resolved_options_until_shutdown(
         resolved,
         std::sync::Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+        std::sync::Arc::new(crate::engine::view::EmptyViewService),
         std::future::pending(),
     ))
 }
@@ -240,6 +242,7 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
 async fn run_with_resolved_options_until_shutdown<F>(
     resolved: ResolvedStandaloneServerOptions,
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
+    view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -251,7 +254,9 @@ where
         config_path: resolved.config_path.clone(),
     };
     let engine = match resolved.preloaded_config {
-        Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg, system_catalog)?,
+        Some(cfg) => {
+            StandaloneNovaRocks::open_with_config(opts, cfg, system_catalog, view_service)?
+        }
         None => StandaloneNovaRocks::open(opts)?,
     };
     let coordinator_handles = (

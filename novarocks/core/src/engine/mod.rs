@@ -80,7 +80,7 @@ mod query_stats;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub mod system_catalog;
-pub(crate) mod view;
+pub mod view;
 pub(crate) mod view_rewrite;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
@@ -366,6 +366,9 @@ pub(crate) struct StandaloneState {
     pub(crate) maintenance_signal_tx: std::sync::Mutex<
         Option<std::sync::mpsc::Sender<crate::engine::mv_maintenance::MaintenanceSignal>>,
     >,
+    /// Frontend-owned view application service. Injected at open; legacy core
+    /// callers remain on `session_views` until the staged FEH-4b cutover.
+    pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     /// Session-view registry seam. FEH-4a: the in-memory `CREATE VIEW`
     /// registry now lives behind `ViewCatalog` (core adapter
     /// `InMemoryViewCatalog`); FEH-4b swaps in a frontend, StateStore-backed
@@ -398,6 +401,7 @@ impl Default for StandaloneState {
             job_repo: JobMetaRepository,
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
+            view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
             session_views: std::sync::Arc::new(crate::engine::view::InMemoryViewCatalog::new()),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
@@ -465,12 +469,14 @@ impl StandaloneNovaRocks {
         return Self::open_body(
             opts,
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
+            std::sync::Arc::new(crate::engine::view::EmptyViewService),
             _test_guard,
         );
         #[cfg(not(test))]
         Self::open_body(
             opts,
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
+            std::sync::Arc::new(crate::engine::view::EmptyViewService),
         )
     }
 
@@ -484,6 +490,7 @@ impl StandaloneNovaRocks {
         opts: StandaloneOptions,
         cfg: novarocks_config::NovaRocksConfig,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
+        view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -491,9 +498,9 @@ impl StandaloneNovaRocks {
         crate::coordinator::cluster::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
-        return Self::open_body(opts, system_catalog, _test_guard);
+        return Self::open_body(opts, system_catalog, view_service, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(opts, system_catalog)
+        Self::open_body(opts, system_catalog, view_service)
     }
 
     /// Common engine-open body.  Called after the process-wide config has
@@ -501,6 +508,7 @@ impl StandaloneNovaRocks {
     fn open_body(
         opts: StandaloneOptions,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
+        view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -557,6 +565,7 @@ impl StandaloneNovaRocks {
             job_repo: JobMetaRepository,
             exchange_port,
             system_catalog,
+            view_service,
             #[cfg(test)]
             _test_guard,
             ..Default::default()
@@ -4332,6 +4341,7 @@ mod tests {
             StandaloneOptions::default(),
             cfg,
             Arc::new(TestSchemataCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open engine with injected system catalog");
 
@@ -4458,6 +4468,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open FE engine");
         let session = engine.session();
@@ -4494,6 +4505,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg.clone(),
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open FE engine");
         engine
@@ -4506,6 +4518,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("reopen FE engine");
         let result = reopened
@@ -4525,6 +4538,7 @@ path = "{metadata_path}"
             StandaloneOptions::default(),
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         )
         .expect("open all-in-one engine");
         let session = engine.session();
@@ -4900,6 +4914,7 @@ mysql_port = 47892
             },
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
         );
         assert!(
             result.is_ok(),
