@@ -26,8 +26,8 @@ use super::contract::{
 };
 use super::coverage::CoverageShapeError;
 use super::graph::{
-    ApplyPoint, ConsumerRequirement, ProducerRequirement, RuntimeFilterBindingRole,
-    RuntimeFilterBindingSpec, RuntimeFilterChannelSpec, RuntimeFilterGraph,
+    ApplyPoint, ConsumerRequirementData, ProducerRequirement, RuntimeFilterBindingRoleData,
+    RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
 };
 use super::policy::{RuntimeFilterPolicyValidationError, validate_runtime_filter_policy};
 
@@ -113,7 +113,17 @@ impl fmt::Display for GraphValidationError {
 
 impl std::error::Error for GraphValidationError {}
 
-impl RuntimeFilterGraph {
+pub(crate) trait ActivationContract {
+    fn satisfies_required_non_blocking(&self) -> bool;
+}
+
+impl ActivationContract for ConsumerActivation {
+    fn satisfies_required_non_blocking(&self) -> bool {
+        !matches!(self, Self::BlockingSnapshot)
+    }
+}
+
+impl<A: ActivationContract> RuntimeFilterGraphData<A> {
     pub(crate) fn validate(&self) -> Result<(), GraphValidationError> {
         self.validate_channels()?;
         self.validate_bindings()?;
@@ -170,9 +180,12 @@ impl RuntimeFilterGraph {
             let apply_point_matches = matches!(
                 (&binding.role, binding.apply_point),
                 (
-                    RuntimeFilterBindingRole::Producer(_),
+                    RuntimeFilterBindingRoleData::Producer(_),
                     ApplyPoint::NodeOutput
-                ) | (RuntimeFilterBindingRole::Consumer(_), ApplyPoint::NodeInput)
+                ) | (
+                    RuntimeFilterBindingRoleData::Consumer(_),
+                    ApplyPoint::NodeInput
+                )
             );
             if !apply_point_matches {
                 return Err(binding_error(
@@ -181,13 +194,13 @@ impl RuntimeFilterGraph {
                 ));
             }
             match (&binding.role, binding.coverage_witness_id) {
-                (RuntimeFilterBindingRole::Producer(_), None) => {
+                (RuntimeFilterBindingRoleData::Producer(_), None) => {
                     return Err(binding_error(
                         binding,
                         GraphValidationErrorKind::ProducerCoverageWitnessMissing,
                     ));
                 }
-                (RuntimeFilterBindingRole::Consumer(_), Some(witness_id)) => {
+                (RuntimeFilterBindingRoleData::Consumer(_), Some(witness_id)) => {
                     return Err(binding_error(
                         binding,
                         GraphValidationErrorKind::ConsumerOwnedCoverageWitness(witness_id),
@@ -214,19 +227,19 @@ impl RuntimeFilterGraph {
             let producers = bindings
                 .iter()
                 .filter_map(|binding| match &binding.role {
-                    RuntimeFilterBindingRole::Producer(requirement) => {
+                    RuntimeFilterBindingRoleData::Producer(requirement) => {
                         Some((*binding, requirement))
                     }
-                    RuntimeFilterBindingRole::Consumer(_) => None,
+                    RuntimeFilterBindingRoleData::Consumer(_) => None,
                 })
                 .collect::<Vec<_>>();
             let consumers = bindings
                 .iter()
                 .filter_map(|binding| match &binding.role {
-                    RuntimeFilterBindingRole::Consumer(requirement) => {
+                    RuntimeFilterBindingRoleData::Consumer(requirement) => {
                         Some((*binding, requirement))
                     }
-                    RuntimeFilterBindingRole::Producer(_) => None,
+                    RuntimeFilterBindingRoleData::Producer(_) => None,
                 })
                 .collect::<Vec<_>>();
 
@@ -479,7 +492,7 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
 
 fn validate_producer(
     channel: &RuntimeFilterChannelSpec,
-    binding: &RuntimeFilterBindingSpec,
+    binding: &RuntimeFilterBindingSpecData<impl ActivationContract>,
     requirement: &ProducerRequirement,
 ) -> Result<(), GraphValidationError> {
     if requirement.contribution_kinds.is_empty() {
@@ -582,10 +595,10 @@ fn validate_coverage_ownership(
     Ok(())
 }
 
-fn validate_consumer(
+fn validate_consumer<A: ActivationContract>(
     channel: &RuntimeFilterChannelSpec,
-    binding: &RuntimeFilterBindingSpec,
-    requirement: &ConsumerRequirement,
+    binding: &RuntimeFilterBindingSpecData<A>,
+    requirement: &ConsumerRequirementData<A>,
 ) -> Result<(), GraphValidationError> {
     if matches!(
         channel.reduction_requirement,
@@ -614,7 +627,7 @@ fn validate_consumer(
     ) || channel
         .allowed_contribution_kinds
         .contains(&ContributionKind::FinalDomainShard);
-    if requires_non_blocking && requirement.activation == ConsumerActivation::BlockingSnapshot {
+    if requires_non_blocking && !requirement.activation.satisfies_required_non_blocking() {
         return Err(binding_error(
             binding,
             GraphValidationErrorKind::BlockingFeedbackConsumer,
@@ -632,7 +645,7 @@ fn channel_error(channel_id: ChannelId, kind: GraphValidationErrorKind) -> Graph
 }
 
 fn binding_error(
-    binding: &RuntimeFilterBindingSpec,
+    binding: &RuntimeFilterBindingSpecData<impl ActivationContract>,
     kind: GraphValidationErrorKind,
 ) -> GraphValidationError {
     GraphValidationError {

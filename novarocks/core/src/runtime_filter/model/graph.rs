@@ -66,9 +66,9 @@ pub(crate) enum ConsumerBindingTarget {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ConsumerRequirement {
+pub(crate) struct ConsumerRequirementData<A> {
     pub capabilities: BTreeSet<ArtifactCapability>,
-    pub activation: ConsumerActivation,
+    pub activation: A,
     pub target: ConsumerBindingTarget,
 }
 
@@ -85,27 +85,41 @@ pub(crate) enum ApplyPoint {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum RuntimeFilterBindingRole {
+pub(crate) enum RuntimeFilterBindingRoleData<A> {
     Producer(ProducerRequirement),
-    Consumer(ConsumerRequirement),
+    Consumer(ConsumerRequirementData<A>),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeFilterBindingSpec {
+pub(crate) struct RuntimeFilterBindingSpecData<A> {
     pub binding_id: BindingId,
     pub channel_id: ChannelId,
     pub coverage_witness_id: Option<CoverageWitnessId>,
     pub location: PlanLocation,
     pub expression: TypedExpr,
     pub apply_point: ApplyPoint,
-    pub role: RuntimeFilterBindingRole,
+    pub role: RuntimeFilterBindingRoleData<A>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RuntimeFilterGraph {
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeFilterGraphData<A> {
     channels: BTreeMap<ChannelId, RuntimeFilterChannelSpec>,
-    bindings: BTreeMap<BindingId, RuntimeFilterBindingSpec>,
+    bindings: BTreeMap<BindingId, RuntimeFilterBindingSpecData<A>>,
 }
+
+impl<A> Default for RuntimeFilterGraphData<A> {
+    fn default() -> Self {
+        Self {
+            channels: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        }
+    }
+}
+
+pub(crate) type ConsumerRequirement = ConsumerRequirementData<ConsumerActivation>;
+pub(crate) type RuntimeFilterBindingRole = RuntimeFilterBindingRoleData<ConsumerActivation>;
+pub(crate) type RuntimeFilterBindingSpec = RuntimeFilterBindingSpecData<ConsumerActivation>;
+pub(crate) type RuntimeFilterGraph = RuntimeFilterGraphData<ConsumerActivation>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GraphBuildError {
@@ -135,7 +149,7 @@ pub(crate) enum ConsumerActivationUpdateError {
     InvalidNextActivation(ConsumerActivation),
 }
 
-impl RuntimeFilterGraph {
+impl<A> RuntimeFilterGraphData<A> {
     pub(crate) fn insert_channel(
         &mut self,
         channel: RuntimeFilterChannelSpec,
@@ -149,7 +163,7 @@ impl RuntimeFilterGraph {
 
     pub(crate) fn insert_binding(
         &mut self,
-        binding: RuntimeFilterBindingSpec,
+        binding: RuntimeFilterBindingSpecData<A>,
     ) -> Result<(), GraphBuildError> {
         if self.bindings.contains_key(&binding.binding_id) {
             return Err(GraphBuildError::DuplicateBinding(binding.binding_id));
@@ -174,7 +188,10 @@ impl RuntimeFilterGraph {
         self.channels.get(&channel_id)
     }
 
-    pub(crate) fn binding(&self, binding_id: BindingId) -> Option<&RuntimeFilterBindingSpec> {
+    pub(crate) fn binding(
+        &self,
+        binding_id: BindingId,
+    ) -> Option<&RuntimeFilterBindingSpecData<A>> {
         self.bindings.get(&binding_id)
     }
 
@@ -182,10 +199,103 @@ impl RuntimeFilterGraph {
         self.channels.values()
     }
 
-    pub(crate) fn bindings(&self) -> impl Iterator<Item = &RuntimeFilterBindingSpec> {
+    pub(crate) fn bindings(&self) -> impl Iterator<Item = &RuntimeFilterBindingSpecData<A>> {
         self.bindings.values()
     }
 
+    pub(crate) fn map_consumer_activations<B, E>(
+        self,
+        mut decide: impl FnMut(BindingId, ChannelId, PlanLocation, &A) -> Result<B, E>,
+    ) -> Result<RuntimeFilterGraphData<B>, E> {
+        let bindings = self
+            .bindings
+            .into_iter()
+            .map(|(binding_id, binding)| {
+                let role = match binding.role {
+                    RuntimeFilterBindingRoleData::Producer(requirement) => {
+                        RuntimeFilterBindingRoleData::Producer(requirement)
+                    }
+                    RuntimeFilterBindingRoleData::Consumer(requirement) => {
+                        RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
+                            capabilities: requirement.capabilities,
+                            activation: decide(
+                                binding.binding_id,
+                                binding.channel_id,
+                                binding.location,
+                                &requirement.activation,
+                            )?,
+                            target: requirement.target,
+                        })
+                    }
+                };
+                Ok((
+                    binding_id,
+                    RuntimeFilterBindingSpecData {
+                        binding_id: binding.binding_id,
+                        channel_id: binding.channel_id,
+                        coverage_witness_id: binding.coverage_witness_id,
+                        location: binding.location,
+                        expression: binding.expression,
+                        apply_point: binding.apply_point,
+                        role,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, E>>()?;
+        Ok(RuntimeFilterGraphData {
+            channels: self.channels,
+            bindings,
+        })
+    }
+
+    pub(super) fn channel_entries(
+        &self,
+    ) -> impl Iterator<Item = (&ChannelId, &RuntimeFilterChannelSpec)> {
+        self.channels.iter()
+    }
+
+    pub(super) fn binding_entries(
+        &self,
+    ) -> impl Iterator<Item = (&BindingId, &RuntimeFilterBindingSpecData<A>)> {
+        self.bindings.iter()
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_raw_channel(
+        &mut self,
+        map_key: ChannelId,
+        channel: RuntimeFilterChannelSpec,
+    ) {
+        self.channels.insert(map_key, channel);
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_raw_binding(
+        &mut self,
+        map_key: BindingId,
+        binding: RuntimeFilterBindingSpecData<A>,
+    ) {
+        self.bindings.insert(map_key, binding);
+    }
+
+    #[cfg(test)]
+    pub(super) fn channel_mut_for_test(
+        &mut self,
+        channel_id: ChannelId,
+    ) -> Option<&mut RuntimeFilterChannelSpec> {
+        self.channels.get_mut(&channel_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn binding_mut_for_test(
+        &mut self,
+        binding_id: BindingId,
+    ) -> Option<&mut RuntimeFilterBindingSpecData<A>> {
+        self.bindings.get_mut(&binding_id)
+    }
+}
+
+impl RuntimeFilterGraphData<ConsumerActivation> {
     pub(crate) fn replace_consumer_activation_checked(
         &mut self,
         binding: BindingId,
@@ -234,52 +344,6 @@ impl RuntimeFilterGraph {
         requirement.activation = next;
         Ok(())
     }
-
-    pub(super) fn channel_entries(
-        &self,
-    ) -> impl Iterator<Item = (&ChannelId, &RuntimeFilterChannelSpec)> {
-        self.channels.iter()
-    }
-
-    pub(super) fn binding_entries(
-        &self,
-    ) -> impl Iterator<Item = (&BindingId, &RuntimeFilterBindingSpec)> {
-        self.bindings.iter()
-    }
-
-    #[cfg(test)]
-    pub(super) fn insert_raw_channel(
-        &mut self,
-        map_key: ChannelId,
-        channel: RuntimeFilterChannelSpec,
-    ) {
-        self.channels.insert(map_key, channel);
-    }
-
-    #[cfg(test)]
-    pub(super) fn insert_raw_binding(
-        &mut self,
-        map_key: BindingId,
-        binding: RuntimeFilterBindingSpec,
-    ) {
-        self.bindings.insert(map_key, binding);
-    }
-
-    #[cfg(test)]
-    pub(super) fn channel_mut_for_test(
-        &mut self,
-        channel_id: ChannelId,
-    ) -> Option<&mut RuntimeFilterChannelSpec> {
-        self.channels.get_mut(&channel_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn binding_mut_for_test(
-        &mut self,
-        binding_id: BindingId,
-    ) -> Option<&mut RuntimeFilterBindingSpec> {
-        self.bindings.get_mut(&binding_id)
-    }
 }
 
 #[cfg(test)]
@@ -293,13 +357,26 @@ pub(super) mod tests {
 
     use super::super::contract::{
         ArtifactCapability, BindingId, ChannelId, ComparatorDigest, CompletionRequirement,
-        ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder, NullSemantics,
-        OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
-        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
-        SortDirection,
+        ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder,
+        NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement, SortDirection,
     };
     use super::super::coverage::Coverage;
+    use super::super::validation::ActivationContract;
     use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestActivation {
+        Blocking,
+        Live,
+    }
+
+    impl ActivationContract for TestActivation {
+        fn satisfies_required_non_blocking(&self) -> bool {
+            matches!(self, Self::Live)
+        }
+    }
 
     #[test]
     fn producer_binding_target_preserves_exact_owner_payloads() {
@@ -521,6 +598,160 @@ pub(super) mod tests {
             ]),
             ConsumerActivation::BlockingSnapshot,
         )
+    }
+
+    fn generic_join_graph(activation: TestActivation) -> RuntimeFilterGraphData<TestActivation> {
+        let mut graph = RuntimeFilterGraphData::default();
+        graph
+            .insert_channel(join_channel(ChannelId::new(1)))
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpecData {
+                binding_id: BindingId::new(1),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: Some(CoverageWitnessId::new(1)),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(1),
+                },
+                expression: expression(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
+                }),
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpecData {
+                binding_id: BindingId::new(2),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: None,
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(2),
+                },
+                expression: expression(),
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
+                    capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    activation,
+                    target: ConsumerBindingTarget::SourceBoundary,
+                }),
+            })
+            .unwrap();
+        graph
+    }
+
+    fn generic_required_live_graph(
+        activation: TestActivation,
+    ) -> RuntimeFilterGraphData<TestActivation> {
+        let mut graph = RuntimeFilterGraphData::default();
+        graph
+            .insert_channel(topn_channel(ChannelId::new(1)))
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpecData {
+                binding_id: BindingId::new(1),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: Some(CoverageWitnessId::new(1)),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(1),
+                },
+                expression: expression(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::OrderedBoundUpdate,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    target: ProducerBindingTarget::AggregateTopNKey {
+                        group_key_ordinal: 0,
+                        limit: NonZeroU32::new(10).unwrap(),
+                    },
+                }),
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpecData {
+                binding_id: BindingId::new(2),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: None,
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(2),
+                },
+                expression: expression(),
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
+                    capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
+                    activation,
+                    target: ConsumerBindingTarget::SourceBoundary,
+                }),
+            })
+            .unwrap();
+        graph
+    }
+
+    #[test]
+    fn generic_and_sealed_graphs_share_validation_contract() {
+        let generic: RuntimeFilterGraphData<TestActivation> =
+            generic_join_graph(TestActivation::Blocking);
+        let sealed: RuntimeFilterGraph = activation_update_graph();
+
+        assert!(generic.validate().is_ok());
+        assert!(sealed.validate().is_ok());
+    }
+
+    #[test]
+    fn generic_graph_requires_live_activation_when_channel_contract_requires_it() {
+        assert!(
+            generic_required_live_graph(TestActivation::Blocking)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            generic_required_live_graph(TestActivation::Live)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mapping_consumer_activations_preserves_binding_identity() {
+        let graph = generic_join_graph(TestActivation::Blocking);
+        let mapped = graph
+            .map_consumer_activations(|_, _, _, activation| match activation {
+                TestActivation::Blocking => Ok::<_, ()>(ConsumerActivation::BlockingSnapshot),
+                TestActivation::Live => Ok(ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                }),
+            })
+            .unwrap();
+
+        let producer = mapped.binding(BindingId::new(1)).unwrap();
+        let consumer = mapped.binding(BindingId::new(2)).unwrap();
+        assert_eq!(producer.channel_id, ChannelId::new(1));
+        assert_eq!(consumer.channel_id, ChannelId::new(1));
+        assert_eq!(producer.binding_id, BindingId::new(1));
+        assert_eq!(consumer.binding_id, BindingId::new(2));
+        assert!(matches!(
+            producer.role,
+            RuntimeFilterBindingRole::Producer(_)
+        ));
+        assert!(matches!(
+            consumer.role,
+            RuntimeFilterBindingRole::Consumer(_)
+        ));
     }
 
     #[test]
