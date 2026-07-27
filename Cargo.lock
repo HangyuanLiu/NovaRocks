@@ -3305,6 +3305,7 @@ dependencies = [
  "libc",
  "mysql",
  "novarocks",
+ "novarocks-backend",
  "novarocks-frontend",
  "reqwest",
  "tempfile",

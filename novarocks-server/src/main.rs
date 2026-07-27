@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "compat")]
 use novarocks::common::network;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
@@ -143,38 +144,6 @@ fn resolve_cluster_role(
     role_override.unwrap_or(cfg.cluster.role)
 }
 
-fn wait_for_tcp_ready(
-    addr: std::net::SocketAddr,
-    timeout: Duration,
-    label: &str,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    let mut last_error = None;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let attempt_timeout = remaining.min(Duration::from_millis(100));
-        match TcpStream::connect_timeout(&addr, attempt_timeout) {
-            Ok(_) => return Ok(()),
-            Err(e) => last_error = Some(e),
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-
-    match last_error {
-        Some(e) => Err(anyhow::anyhow!(
-            "{label} at {addr} did not become ready within {}ms: {e}",
-            timeout.as_millis()
-        )),
-        None => Err(anyhow::anyhow!(
-            "{label} at {addr} did not become ready within {}ms",
-            timeout.as_millis()
-        )),
-    }
-}
-
 /// Load config from `cli.config_path` (or use defaults when absent), resolve
 /// the effective cluster role (CLI override wins over config), and validate the
 /// loaded cluster section.  Returns the owned config, the resolved role, and
@@ -289,33 +258,8 @@ fn run_standalone_be_role(
     if let Some(warn) = be_role_start_warning(port_override) {
         eprintln!("WARN: {warn}");
     }
-    let host = cfg.server.host.clone();
-    let grpc_port = cfg.server.grpc_port;
-    let advertised = network::standalone_advertise_endpoint_for_config(&cfg)
-        .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
-    let advertised_addr = advertised_probe_addr(&advertised.host, advertised.port)
-        .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
-    let pid = std::process::id();
-    novarocks::common::app_config::install_preloaded_config(cfg);
-    // Spec (PR-4): standalone BE exposes NovaRocksGrpc
-    // (SubmitFragment/FetchResult/CancelFragment/Exchange) on grpc_port.
-    // FE cluster.backends must point to this port.
-    novarocks::start_grpc_exchange_server(&host, grpc_port).map_err(|e| {
-        anyhow::anyhow!("role=be: failed to start NovaRocksGrpc server on {host}:{grpc_port}: {e}")
-    })?;
-    wait_for_tcp_ready(
-        advertised_addr,
-        Duration::from_secs(5),
-        "advertised endpoint",
-    )
-    .map_err(|e| anyhow::anyhow!("role=be: failed to reach advertised endpoint: {e}"))?;
-    println!(
-        "NOVAROCKS_READY role=be grpc_port={grpc_port} advertise_host={} pid={pid}",
-        advertised.host
-    );
-    let (_tx, rx) = std::sync::mpsc::channel::<()>();
-    rx.recv().ok();
-    Ok(())
+    novarocks_backend::run_backend_server(novarocks_backend::BackendServerConfig { config: cfg })
+        .map_err(|error| anyhow::anyhow!("role=be: {error}"))
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
@@ -445,15 +389,6 @@ fn be_readiness_probe_addr(bind_host: &str, port: u16) -> Result<std::net::Socke
                 .parse::<std::net::SocketAddr>()
                 .map_err(|e| format!("invalid BE readiness probe addr '{bracketed}': {e}"))
         })
-}
-
-fn advertised_probe_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
-    let host = host.trim().trim_matches(|c| c == '[' || c == ']');
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("invalid advertised endpoint {host}:{port}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("advertised endpoint {host}:{port} resolved no addresses"))
 }
 
 fn heartbeat_ready(host: &str, port: u16) -> Result<(), String> {
@@ -1075,7 +1010,7 @@ mod tests {
     use super::{
         StandaloneServerCliArgs, dispatch_standalone_role, dispatch_standalone_role_with_backend,
         load_config_and_resolve_role, parse_standalone_server_args, probe_all_backends,
-        resolve_cluster_role, wait_for_tcp_ready,
+        resolve_cluster_role,
     };
 
     mod frontend_dispatch {
@@ -1087,50 +1022,54 @@ mod tests {
                 (novarocks::common::app_config::ClusterRole::Fe, false),
                 (novarocks::common::app_config::ClusterRole::AllInOne, true),
             ] {
-                let frontend_called = std::cell::Cell::new(false);
-                let backend_called = std::cell::Cell::new(false);
+                let frontend_calls = std::cell::Cell::new(0);
+                let backend_calls = std::cell::Cell::new(0);
                 dispatch_standalone_role_with_backend(
                     role,
                     novarocks::common::app_config::NovaRocksConfig::default(),
                     None,
                     |_, _, local_exchange| {
-                        frontend_called.set(true);
+                        frontend_calls.set(frontend_calls.get() + 1);
                         assert_eq!(local_exchange, expected_local_exchange);
                         Ok(())
                     },
                     |_, _| {
-                        backend_called.set(true);
+                        backend_calls.set(backend_calls.get() + 1);
                         Ok(())
                     },
                 )
                 .expect("frontend role dispatch should succeed");
-                assert!(frontend_called.get());
-                assert!(!backend_called.get());
+                assert_eq!(
+                    frontend_calls.get(),
+                    1,
+                    "{role:?} must invoke frontend once"
+                );
+                assert_eq!(backend_calls.get(), 0, "{role:?} must not invoke backend");
             }
         }
 
         #[test]
-        fn be_dispatch_does_not_open_frontend_host() {
-            let frontend_called = std::cell::Cell::new(false);
-            let backend_called = std::cell::Cell::new(false);
+        fn be_dispatch_invokes_backend_runner_exactly_once() {
+            let frontend_calls = std::cell::Cell::new(0);
+            let backend_calls = std::cell::Cell::new(0);
 
             dispatch_standalone_role_with_backend(
                 novarocks::common::app_config::ClusterRole::Be,
                 novarocks::common::app_config::NovaRocksConfig::default(),
                 None,
                 |_, _, _| {
-                    frontend_called.set(true);
+                    frontend_calls.set(frontend_calls.get() + 1);
                     Ok(())
                 },
                 |_, _| {
-                    backend_called.set(true);
+                    backend_calls.set(backend_calls.get() + 1);
                     Ok(())
                 },
             )
             .expect("BE role dispatch should succeed");
 
-            assert!(!frontend_called.get());
-            assert!(backend_called.get());
+            assert_eq!(frontend_calls.get(), 0, "BE must not invoke frontend");
+            assert_eq!(backend_calls.get(), 1, "BE must invoke backend once");
         }
     }
 
@@ -1340,24 +1279,6 @@ mod tests {
             "error must name the failing backend: {err}"
         );
         drop(live);
-    }
-
-    #[test]
-    fn test_wait_for_tcp_ready_returns_ok_for_listening_socket() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        wait_for_tcp_ready(addr, std::time::Duration::from_millis(100), "test")
-            .expect("listening socket should be ready");
-    }
-
-    #[test]
-    fn test_wait_for_tcp_ready_errors_for_unbound_socket() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        drop(listener);
-        let err = wait_for_tcp_ready(addr, std::time::Duration::from_millis(10), "test")
-            .expect_err("unbound socket should not be ready");
-        assert!(err.to_string().contains("test"));
     }
 
     // Serialize tests that mutate process-wide state (env vars, CWD) so they
