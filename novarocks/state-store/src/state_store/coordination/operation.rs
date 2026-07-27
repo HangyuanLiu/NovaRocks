@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    CommitOutcome, CommitResolution, OperationId, StateStore, TransactionId, derive_transaction_id,
-};
+use crate::{OperationId, derive_transaction_id};
+use novarocks_spi::state_store::{CommitOutcome, CommitResolution, StateStore, TransactionId};
 
 use super::{ControlPlaneIncarnation, CoordinationError};
 
@@ -84,8 +83,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{ReadBackCertainty, candidate_mismatch};
-    use crate::TransactionId;
     use crate::coordination::{ControlPlaneIncarnation, CoordinationErrorKind};
+    use novarocks_spi::state_store::TransactionId;
 
     fn incarnation(value: u64) -> ControlPlaneIncarnation {
         ControlPlaneIncarnation::new(value).expect("nonzero incarnation")

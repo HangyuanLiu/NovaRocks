@@ -24,22 +24,24 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use novarocks_state_store::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
-use novarocks_state_store::{
+use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
-    FeDeploymentView, Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig,
-    StateStoreErrorKind, StateStoreLimitOverrides, StateStoreOperation, StateStoreOutcome,
-    StateStoreProviderConfig, StateStoreRuntime, StoreRevision, TransactionId, Value,
-    open_state_store,
+    Key, KeyRange, MAX_KEY_BYTES, MAX_VALUE_BYTES, Precondition, RangeRequest, StateStore,
+    StateStoreErrorKind, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId,
+    Value,
+};
+use novarocks_state_store::{
+    FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+    StateStoreRuntime, open_state_store,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use common::state_store_conformance::{
-    FaultGate, FaultInjectingStateStore, PostDispatchControl, PostDispatchController,
-    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
+use novarocks_spi::state_store::conformance::{
+    self as state_store_conformance, FaultGate, FaultInjectingStateStore, PostDispatchControl,
+    PostDispatchController, PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -70,15 +72,15 @@ fn transaction_id() -> TransactionId {
 }
 
 fn operation_total(
-    snapshot: &novarocks_state_store::StateStoreMetricsSnapshot,
+    snapshot: &novarocks_spi::state_store::StateStoreMetricsSnapshot,
     operation: StateStoreOperation,
 ) -> u64 {
     snapshot.operation_outcomes[operation as usize].iter().sum()
 }
 
 fn assert_failed_operation_observed(
-    before: &novarocks_state_store::StateStoreMetricsSnapshot,
-    after: &novarocks_state_store::StateStoreMetricsSnapshot,
+    before: &novarocks_spi::state_store::StateStoreMetricsSnapshot,
+    after: &novarocks_spi::state_store::StateStoreMetricsSnapshot,
     operation: StateStoreOperation,
 ) {
     assert_eq!(
@@ -127,7 +129,7 @@ async fn open_store_with_limits(
 async fn read_state_record(
     store: &Arc<dyn StateStore>,
     item: &Key,
-) -> Option<novarocks_state_store::StateRecord> {
+) -> Option<novarocks_spi::state_store::StateRecord> {
     let mut reader = store.begin_read().await.expect("begin state record read");
     let record = reader.get(item).await.expect("read state record");
     reader.abort().await.expect("abort state record read");
@@ -268,7 +270,6 @@ impl PostDispatchControl for SqlitePostDispatchControl {
 
 mod conformance {
     use super::*;
-    use common::state_store_conformance;
 
     fn hold_sqlite_writer_lock(path: &std::path::Path) -> Connection {
         let connection = Connection::open(path).expect("open SQLite conformance blocker");
@@ -358,7 +359,7 @@ mod conformance {
         path: &std::path::Path,
         iteration: u8,
     ) {
-        let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+        let fault = FaultInjectingStateStore::new(Arc::clone(store));
         let transaction_id = transaction_id();
         let keys = [
             key(vec![b'c', iteration, b'a']),
@@ -375,7 +376,7 @@ mod conformance {
                 .expect("stage cancelled real commit row");
         }
 
-        let blocker = hold_sqlite_writer_lock(&path);
+        let blocker = hold_sqlite_writer_lock(path);
         let gate = FaultGate::new();
         fault.pause_next_post_dispatch(gate.clone());
         let waiter = tokio::spawn(async move { transaction.commit().await });
@@ -399,14 +400,14 @@ mod conformance {
                 "a cancelled waiter must not publish NotCommitted while its worker is blocked"
             );
         }
-        assert_eq!(durable_counts(&path), (0, 0, 0));
+        assert_eq!(durable_counts(path), (0, 0, 0));
 
         gate.release().await;
         gate.wait_inner_dropped().await;
-        wait_for_resolution(&store, &transaction_id, CommitResolution::NotCommitted).await;
-        assert_eq!(durable_counts(&path), (0, 0, 0));
+        wait_for_resolution(store, &transaction_id, CommitResolution::NotCommitted).await;
+        assert_eq!(durable_counts(path), (0, 0, 0));
         for item in keys {
-            assert!(read_state_record(&store, &item).await.is_none());
+            assert!(read_state_record(store, &item).await.is_none());
         }
         blocker
             .execute_batch("ROLLBACK")

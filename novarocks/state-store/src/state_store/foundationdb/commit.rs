@@ -27,11 +27,11 @@ use uuid::Uuid;
 
 use super::codec::{DurableCommitState, KeyspaceCodec, REVISION_BYTES};
 use super::txn::create_raw_transaction_with_observer;
+use crate::state_store::metrics::StateStoreMetrics;
 use crate::state_store::runtime::OperationHandle;
-use crate::state_store::{
+use novarocks_spi::state_store::{
     CommitOutcome, CommitReceipt, CommitResolution, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreRevision,
-    TransactionId,
+    StateStoreLimits, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId,
 };
 
 const AUXILIARY_MAX_ATTEMPTS: usize = 5;

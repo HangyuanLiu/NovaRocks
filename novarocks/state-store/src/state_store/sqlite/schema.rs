@@ -18,7 +18,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::{Uuid, Version};
 
-use crate::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
 use super::sqlite_error;
 

@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::client::{MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection};
 use super::codec::{DurableCommitState, MysqlCodec};
-use crate::state_store::{
+use novarocks_spi::state_store::{
     CommitReceipt, CommitResolution, StateStoreError, StateStoreErrorKind, StoreRevision,
     TransactionId,
 };

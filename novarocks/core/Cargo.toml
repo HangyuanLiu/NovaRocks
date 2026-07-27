@@ -112,6 +112,7 @@ datasketches = "0.2.0"
 tdigest = { version = "0.2.3", features = ["use_serde"] }
 
 [dev-dependencies]
+novarocks-spi = { path = "../spi" }
 tempfile = "3"
 mockito = "1"
 

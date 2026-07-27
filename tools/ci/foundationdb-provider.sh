@@ -56,6 +56,10 @@ test -x "$NOVA_FDB_FDBCLI"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
+cargo test -p novarocks-spi
+cargo check -p novarocks-spi --no-default-features
+"$SCRIPT_DIR/check-spi-dependency-boundary.py" \
+  --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
 cargo test -p novarocks-state-store --lib
 cargo test -p novarocks-state-store --test state_store_contract
 cargo test -p novarocks-state-store --test state_store_sqlite -- --test-threads=1

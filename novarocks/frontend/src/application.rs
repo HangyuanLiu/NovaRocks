@@ -18,9 +18,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_state_store::{
-    StateStore, StateStoreAppConfig, StateStoreError, StateStoreRuntime, open_state_store,
-};
+use novarocks_spi::state_store::{StateStore, StateStoreError};
+use novarocks_state_store::{StateStoreAppConfig, StateStoreRuntime, open_state_store};
 
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 

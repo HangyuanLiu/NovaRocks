@@ -25,7 +25,6 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::super::{StateStoreError, StateStoreErrorKind};
 use super::MysqlOpenCancellation;
 use super::client::{
     MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection, execute_owned_with_deadline,
@@ -38,6 +37,7 @@ use super::identity::{
 };
 #[cfg(feature = "state-store-test-hooks")]
 use super::open_test_hooks::{MysqlOpenGatePhase, take_mysql_open_gate};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
 
 const SCHEMA_MANIFEST: &str = concat!(
     "CREATE TABLE state_store_meta (\n",

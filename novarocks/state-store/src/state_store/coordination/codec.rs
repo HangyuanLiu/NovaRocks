@@ -19,7 +19,8 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{Key, OperationId, StoreIdentity, Value};
+use crate::OperationId;
+use novarocks_spi::state_store::{Key, StoreIdentity, Value};
 
 use super::{
     AttemptId, ControlPlaneIncarnation, ControlPlaneMode, CoordinationError, FencingToken,
@@ -321,11 +322,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::{LeaseRecord, LeaseState, decode_lease, encode_lease, lease_storage_key};
+    use crate::OperationId;
     use crate::coordination::{
         AttemptId, ControlPlaneIncarnation, CoordinationErrorKind, HolderId, ResourceEpoch,
         ResourceKey,
     };
-    use crate::{OperationId, Value};
+    use novarocks_spi::state_store::Value;
 
     fn resource(bytes: &'static [u8]) -> ResourceKey {
         ResourceKey::try_from(Bytes::from_static(bytes)).expect("valid resource")

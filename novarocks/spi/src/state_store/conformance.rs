@@ -22,15 +22,15 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
+use super::{
+    ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
+    Direction, Key, KeyRange, MAX_KEY_BYTES, Precondition, RangePage, RangeRequest,
+    ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId, Value,
+    WriteTransaction,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
-use novarocks_state_store::limits::MAX_KEY_BYTES;
-use novarocks_state_store::{
-    ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
-    Direction, Key, KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
-    StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-    StoreIdentity, TransactionId, Value, WriteTransaction,
-};
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
@@ -1030,9 +1030,7 @@ async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostD
             control.release_response().await;
             control.wait_inner_dropped().await;
             control.allow_provider_progress().await;
-            let terminal =
-                await_expected_terminal(&store, transaction_id, scenario.expected_terminal()).await;
-            terminal
+            await_expected_terminal(&store, transaction_id, scenario.expected_terminal()).await
         }
         PostDispatchScenario::LoseCommittedResponse => {
             control.allow_provider_progress().await;

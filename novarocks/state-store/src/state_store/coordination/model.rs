@@ -23,7 +23,8 @@ use uuid::Uuid;
 
 use super::error::CoordinationError;
 use super::metrics::CoordinationMetrics;
-use crate::{OperationId, VersionToken};
+use crate::OperationId;
+use novarocks_spi::state_store::VersionToken;
 
 const MAX_RESOURCE_KEY_BYTES: usize = 8 * 1024;
 const MAX_HOLDER_ID_BYTES: usize = 256;

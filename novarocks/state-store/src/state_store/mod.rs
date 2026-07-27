@@ -18,14 +18,14 @@
 use std::sync::Arc;
 
 pub mod config;
-pub mod contract;
 pub mod coordination;
-pub mod error;
+mod deployment;
 pub mod limits;
 pub mod metrics;
-pub mod range;
 pub mod runner;
 mod runtime;
+
+use novarocks_spi::state_store::{StateStore, StateStoreError, StateStoreErrorKind};
 
 mod sqlite;
 
@@ -43,19 +43,11 @@ pub use config::{
     FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
     StateStoreConfig, StateStoreProviderConfig,
 };
-pub use contract::{
-    ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
-    FeDeploymentView, Key, OperationId, Precondition, RangePage, ReadTransaction, StateRecord,
-    StateStore, StoreIdentity, StoreRevision, TransactionId, Value, VersionToken, WriteTransaction,
+pub use deployment::FeDeploymentView;
+pub use limits::StateStoreLimitOverrides;
+pub use runner::{
+    OperationId, RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free,
 };
-pub use error::{StateStoreError, StateStoreErrorKind};
-pub use limits::{StateStoreLimitOverrides, StateStoreLimits};
-pub use metrics::{
-    STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetrics,
-    StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
-};
-pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};
-pub use runner::{RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free};
 pub use runtime::StateStoreRuntime;
 
 pub async fn open_state_store(

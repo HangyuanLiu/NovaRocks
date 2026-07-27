@@ -18,15 +18,14 @@
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use novarocks_spi::state_store::{
+    CommitOutcome, CommitReceipt, MAX_RUNNER_ATTEMPTS, StateStore, StateStoreError,
+    StateStoreErrorKind, TransactionId, WriteTransaction,
+};
 use sha2::{Digest, Sha256};
 use tokio::time::{Instant, sleep_until, timeout_at};
 use uuid::Uuid;
 
-use super::contract::{
-    CommitOutcome, CommitReceipt, OperationId, StateStore, TransactionId, WriteTransaction,
-};
-use super::error::{StateStoreError, StateStoreErrorKind};
-use super::limits::MAX_RUNNER_ATTEMPTS;
 use super::metrics::StateStoreMetrics;
 
 const RETRY_BACKOFFS: [Duration; MAX_RUNNER_ATTEMPTS - 1] = [
@@ -35,6 +34,25 @@ const RETRY_BACKOFFS: [Duration; MAX_RUNNER_ATTEMPTS - 1] = [
     Duration::from_millis(40),
     Duration::from_millis(80),
 ];
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OperationId(uuid::Uuid);
+
+impl OperationId {
+    pub fn new_v7() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+
+    pub const fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+impl From<uuid::Uuid> for OperationId {
+    fn from(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunSuccess<T> {

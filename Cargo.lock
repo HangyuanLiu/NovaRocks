@@ -3215,6 +3215,7 @@ dependencies = [
  "mysql",
  "mysql_common 0.32.4",
  "novarocks-catalog",
+ "novarocks-spi",
  "novarocks-state-store",
  "novarocks-types",
  "novarocks-version",
@@ -3275,6 +3276,7 @@ dependencies = [
  "bytes",
  "novarocks",
  "novarocks-catalog",
+ "novarocks-spi",
  "novarocks-state-store",
  "sha2",
  "tempfile",
@@ -3298,6 +3300,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-spi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "sha2",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-state-store"
 version = "0.1.0"
 dependencies = [
@@ -3310,6 +3323,7 @@ dependencies = [
  "hex",
  "libc",
  "mysql_async",
+ "novarocks-spi",
  "rusqlite",
  "rustls",
  "serde",

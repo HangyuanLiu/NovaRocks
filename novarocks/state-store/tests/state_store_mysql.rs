@@ -28,7 +28,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(feature = "state-store-test-hooks")]
-use novarocks_state_store::ContinuationToken;
+use novarocks_spi::state_store::ContinuationToken;
+use novarocks_spi::state_store::{
+    CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, StateStore,
+    StateStoreErrorKind, TransactionId, Value,
+};
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store::mysql::test_support::{
     MysqlChangeTestApi, MysqlCommitTestApi, MysqlOpenGatePhase, MysqlPostDispatchTestControl,
@@ -41,19 +45,17 @@ use novarocks_state_store::mysql::test_support::{
     schema_timeout_connection_is_destroyed, store_readiness_snapshot,
 };
 use novarocks_state_store::{
-    CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, MySqlClientConfig, MySqlTlsMode,
-    Precondition, RangeRequest, StateStore, StateStoreConfig, StateStoreErrorKind,
-    StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, TransactionId, Value,
-    open_state_store,
+    FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
+    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
 };
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Version};
 
 mod common;
 
-use common::state_store_conformance::{
-    PostDispatchControl, PostDispatchController, PostDispatchScenario,
-    StateStoreConformanceFixture, StateStoreFactory,
+use novarocks_spi::state_store::conformance::{
+    self as state_store_conformance, PostDispatchControl, PostDispatchController,
+    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
 const CLUSTER_ID: &str = "mysql-schema-test-cluster";
@@ -159,7 +161,7 @@ async fn open_store(
     database: &str,
     cluster_id: &str,
     deadline_ms: u64,
-) -> Result<std::sync::Arc<dyn StateStore>, novarocks_state_store::StateStoreError> {
+) -> Result<std::sync::Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
     open_state_store(
         runtime,
         store_config(database, cluster_id, deadline_ms),
@@ -856,7 +858,7 @@ async fn mysql_shared_snapshot_repeatable_read() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::snapshot_repeatable_read(&factory).await;
+    state_store_conformance::snapshot_repeatable_read(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -931,7 +933,7 @@ async fn mysql_shared_forward_reverse_pages() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::forward_reverse_pages(&factory).await;
+    state_store_conformance::forward_reverse_pages(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -1346,7 +1348,7 @@ async fn mysql_shared_limits_before_io() {
         .expect("open limited MySQL store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::limits_before_io(&factory).await;
+    state_store_conformance::limits_before_io(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -1362,7 +1364,7 @@ async fn mysql_shared_arbitrary_binary_payloads() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::arbitrary_binary_payloads(&factory).await;
+    state_store_conformance::arbitrary_binary_payloads(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -1952,7 +1954,7 @@ async fn mysql_preconditions_stage_successfully_and_fail_only_at_commit() {
     .await
     .expect("stage precondition seed");
     assert_committed(seed.commit().await);
-    let stale = novarocks_state_store::VersionToken::try_from(Bytes::from_static(b"stale"))
+    let stale = novarocks_spi::state_store::VersionToken::try_from(Bytes::from_static(b"stale"))
         .expect("stale version");
 
     for (item, precondition) in [
@@ -1992,7 +1994,7 @@ async fn mysql_shared_preconditions() {
         .expect("open MySQL transaction store");
     let factory = shared_factory(store);
 
-    common::state_store_conformance::preconditions(&factory).await;
+    state_store_conformance::preconditions(&factory).await;
 
     drop(factory);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -2013,7 +2015,7 @@ async fn mysql_shared_same_key_conflict_first_commit_does_not_wait_for_second_re
 
     tokio::time::timeout(
         Duration::from_secs(4),
-        common::state_store_conformance::same_key_conflict(&factory),
+        state_store_conformance::same_key_conflict(&factory),
     )
     .await
     .expect("first same-key commit must not wait for second reader");
@@ -2037,7 +2039,7 @@ async fn mysql_shared_write_skew_conflict_first_commit_does_not_wait_for_second_
 
     tokio::time::timeout(
         Duration::from_secs(4),
-        common::state_store_conformance::write_skew_conflict(&factory),
+        state_store_conformance::write_skew_conflict(&factory),
     )
     .await
     .expect("first write-skew commit must not wait for second reader");
@@ -2061,7 +2063,7 @@ async fn mysql_shared_range_phantom_conflict_first_commit_does_not_wait_for_seco
 
     tokio::time::timeout(
         Duration::from_secs(4),
-        common::state_store_conformance::range_phantom_conflict(&factory),
+        state_store_conformance::range_phantom_conflict(&factory),
     )
     .await
     .expect("first phantom commit must not wait for second reader");
@@ -2992,7 +2994,7 @@ async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve gated pre-dispatch commit"),
-        novarocks_state_store::CommitResolution::Unresolved
+        novarocks_spi::state_store::CommitResolution::Unresolved
     );
     let outcome = waiter.await.expect("join pre-dispatch deadline waiter");
     assert!(
@@ -3008,7 +3010,7 @@ async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve terminalized pre-dispatch commit"),
-        novarocks_state_store::CommitResolution::NotCommitted
+        novarocks_spi::state_store::CommitResolution::NotCommitted
     );
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3055,7 +3057,7 @@ async fn assert_prepare_failure_terminalizes_after_rollback_failure(
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve terminalized prepare failure"),
-        novarocks_state_store::CommitResolution::NotCommitted
+        novarocks_spi::state_store::CommitResolution::NotCommitted
     );
     let failed_connection = MysqlCommitTestApi::last_prepare_failure_connection_id();
     assert_ne!(failed_connection, 0);
@@ -3131,7 +3133,7 @@ async fn mysql_prepare_error_reports_unknown_when_terminalization_cannot_checkou
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve pending after unknown terminalization"),
-        novarocks_state_store::CommitResolution::Unresolved
+        novarocks_spi::state_store::CommitResolution::Unresolved
     );
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3191,7 +3193,7 @@ async fn mysql_prepare_error_terminalization_timeout_destroys_locked_connection(
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve locked terminalization timeout"),
-        novarocks_state_store::CommitResolution::Unresolved
+        novarocks_spi::state_store::CommitResolution::Unresolved
     );
 
     let mut first = hold_connection(&runtime, &database.name, Duration::from_secs(4))
@@ -3272,7 +3274,7 @@ async fn mysql_prepare_error_prefers_authoritative_committed_receipt() {
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve authoritative committed ledger"),
-        novarocks_state_store::CommitResolution::Committed(_)
+        novarocks_spi::state_store::CommitResolution::Committed(_)
     ));
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3339,7 +3341,7 @@ async fn mysql_change_poll_cancellation_destroys_active_connection_and_holds_gua
     let poll_store = Arc::clone(&store);
     let waiter = tokio::spawn(async move {
         poll_store
-            .poll_changes(&novarocks_state_store::ChangePollRequest {
+            .poll_changes(&novarocks_spi::state_store::ChangePollRequest {
                 after: None,
                 page_size: 1,
             })
@@ -3373,7 +3375,7 @@ async fn mysql_shared_same_revision_change_pages() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_same_revision", "same_revision_pages").await;
     let factory = shared_factory(Arc::clone(&store));
-    common::state_store_conformance::same_revision_change_pages(&factory).await;
+    state_store_conformance::same_revision_change_pages(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3385,7 +3387,7 @@ async fn mysql_shared_atomic_commit() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_atomic", "shared_atomic").await;
     let factory = shared_factory(Arc::clone(&store));
-    common::state_store_conformance::atomic_commit(&factory).await;
+    state_store_conformance::atomic_commit(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3397,7 +3399,7 @@ async fn mysql_shared_notification_delivery_faults() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_notifications", "shared_notifications").await;
     let factory = shared_factory(Arc::clone(&store));
-    common::state_store_conformance::notification_delivery_faults(&factory).await;
+    state_store_conformance::notification_delivery_faults(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3409,7 +3411,7 @@ async fn mysql_shared_post_dispatch_response_loss_reconciles() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_response_loss", "shared_response_loss").await;
     let factory = shared_post_dispatch_factory(Arc::clone(&store));
-    common::state_store_conformance::post_dispatch_response_loss_reconciles(&factory).await;
+    state_store_conformance::post_dispatch_response_loss_reconciles(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3421,7 +3423,7 @@ async fn mysql_shared_post_dispatch_cancel_waiter_reconciles() {
     let (_database, mut runtime, store) =
         open_task6_shared_fixture("task6_shared_cancel_waiter", "shared_cancel_waiter").await;
     let factory = shared_post_dispatch_factory(Arc::clone(&store));
-    common::state_store_conformance::post_dispatch_cancel_waiter_reconciles(&factory).await;
+    state_store_conformance::post_dispatch_cancel_waiter_reconciles(&factory).await;
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -3435,7 +3437,7 @@ async fn mysql_suite() {
     );
     let databases = Rc::new(RefCell::new(Vec::new()));
     let factory = mysql_conformance_factory(Rc::clone(&runtime), Rc::clone(&databases));
-    common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+    state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
     common::state_store_coordination_conformance::run_coordination_conformance(Rc::clone(&factory))
         .await;
     drop(factory);

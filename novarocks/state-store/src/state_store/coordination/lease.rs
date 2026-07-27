@@ -24,8 +24,9 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use crate::{
-    OperationId, Precondition, StateRecord, StateStore, StoreIdentity, TransactionId, VersionToken,
+use crate::OperationId;
+use novarocks_spi::state_store::{
+    Precondition, StateRecord, StateStore, StoreIdentity, TransactionId, VersionToken,
 };
 
 use super::clock::{ClockHealth, LeaseClock, LeaseSettings};
@@ -329,7 +330,7 @@ impl LeaseGuard {
 impl LeaseFence {
     pub async fn validate_in(
         &self,
-        transaction: &mut dyn crate::WriteTransaction,
+        transaction: &mut dyn novarocks_spi::state_store::WriteTransaction,
     ) -> Result<(), CoordinationError> {
         let result = async {
             let control_key = control_storage_key()?;
@@ -1447,6 +1448,7 @@ mod tests {
     use super::{
         LeaseManager, LeaseMutationRecoveryEvidence, LeaseSettings, recovered_mutation_matches,
     };
+    use crate::OperationId;
     use crate::coordination::codec::{
         ControlRecord, LeaseRecord, LeaseState, control_storage_key, encode_control,
     };
@@ -1455,11 +1457,12 @@ mod tests {
         CoordinationErrorKind, FencingToken, HolderId, LeaseClock, LeaseFence, ResourceEpoch,
         ResourceKey,
     };
-    use crate::{
-        ChangePage, ChangePollRequest, CommitResolution, Key, OperationId, RangePage, RangeRequest,
+    use crate::metrics::StateStoreMetrics;
+    use novarocks_spi::state_store::{
+        ChangePage, ChangePollRequest, CommitResolution, Key, RangePage, RangeRequest,
         ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
-        StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot, StoreIdentity,
-        TransactionId, VersionToken, WriteTransaction,
+        StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId, VersionToken,
+        WriteTransaction,
     };
 
     struct FixedClock {

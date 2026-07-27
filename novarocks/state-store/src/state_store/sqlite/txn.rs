@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +27,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rusqlite::{Connection, InterruptHandle, OptionalExtension, ffi, params};
 
-use crate::state_store::{
+use novarocks_spi::state_store::{
     CommitOutcome, CommitReceipt, CommitResolution, Key, Precondition, RangePage, RangeRequest,
     ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value, VersionToken,
+    WriteTransaction,
 };
+
+use crate::state_store::metrics::StateStoreMetrics;
 
 use super::{SqliteStateStore, open_connection, schema};
 
@@ -405,7 +407,7 @@ impl SqliteReadTransaction {
 
     pub(super) async fn abort(mut self) -> Result<(), StateStoreError> {
         let owner = self.take_owner()?;
-        run_operation(&owner, |state| rollback(state)).await
+        run_operation(&owner, rollback).await
     }
 
     fn owner(&self) -> Result<&TxnOwner, StateStoreError> {
@@ -548,7 +550,7 @@ impl SqliteWriteTransaction {
 
     pub(super) async fn abort(mut self) -> Result<(), StateStoreError> {
         let owner = self.take_owner()?;
-        run_operation(&owner, |state| rollback(state)).await
+        run_operation(&owner, rollback).await
     }
 
     pub(super) async fn commit(self) -> CommitOutcome {
@@ -1178,7 +1180,7 @@ fn commit_metric_outcome(outcome: &CommitOutcome) -> StateStoreOutcome {
 fn commit_blocking(
     state: &mut SqliteTxnState,
     transaction_id: TransactionId,
-    path: &PathBuf,
+    path: &Path,
 ) -> CommitOutcome {
     if !state.active {
         return CommitOutcome::DefiniteFailure(transaction_finished());
@@ -1483,7 +1485,7 @@ fn classify_apply_error(error: &rusqlite::Error) -> CommitOutcome {
 fn classify_commit_error(
     state: &mut SqliteTxnState,
     transaction_id: TransactionId,
-    path: &PathBuf,
+    path: &Path,
     error: &rusqlite::Error,
 ) -> CommitOutcome {
     let mapped = operation_error(error, "SQLite transaction commit failed");
@@ -1584,7 +1586,7 @@ fn finalize_registry(
 }
 
 fn lookup_commit(
-    path: &PathBuf,
+    path: &Path,
     transaction_id: TransactionId,
 ) -> Result<Option<CommitReceipt>, StateStoreError> {
     let connection = open_connection(path)?;
@@ -1835,9 +1837,11 @@ mod tests {
     use super::*;
     use crate::state_store::sqlite::SqliteStateStore;
     use crate::state_store::{
-        CommitOutcome, CommitReceipt, CommitResolution, Direction, FeDeploymentView, Key, KeyRange,
-        Precondition, RangeRequest, StateRecord, StateStoreConfig, StateStoreErrorKind,
-        StateStoreLimitOverrides, StateStoreProviderConfig, TransactionId, Value, VersionToken,
+        FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+    };
+    use novarocks_spi::state_store::{
+        CommitOutcome, CommitReceipt, CommitResolution, Direction, Key, KeyRange, Precondition,
+        RangeRequest, StateRecord, StateStoreErrorKind, TransactionId, Value, VersionToken,
     };
 
     fn key(value: &'static [u8]) -> Key {

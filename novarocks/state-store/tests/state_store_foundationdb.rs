@@ -28,11 +28,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use foundationdb::Database;
 use foundationdb::options::TransactionOption;
+use novarocks_spi::state_store::{
+    ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange, Precondition,
+    RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
+};
 use novarocks_state_store::{
-    ChangePollRequest, CommitOutcome, CommitResolution, Direction, FeDeploymentView,
-    FoundationDbClientConfig, Key, KeyRange, Precondition, RangeRequest, StateStore,
-    StateStoreConfig, StateStoreErrorKind, StateStoreLimitOverrides, StateStoreProviderConfig,
-    StateStoreRuntime, TransactionId, Value, open_state_store,
+    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreLimitOverrides,
+    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
 };
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
@@ -42,9 +44,9 @@ use uuid::Uuid;
 mod common;
 
 #[cfg(feature = "state-store-test-hooks")]
-use common::state_store_conformance::{
-    PostDispatchControl, PostDispatchController, PostDispatchScenario,
-    StateStoreConformanceFixture, StateStoreFactory,
+use novarocks_spi::state_store::conformance::{
+    self as state_store_conformance, PostDispatchControl, PostDispatchController,
+    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
 fn client_config() -> FoundationDbClientConfig {
@@ -934,7 +936,7 @@ async fn foundationdb_suite() {
     #[cfg(feature = "state-store-test-hooks")]
     {
         let factory = conformance_factory(Rc::clone(&runtime));
-        common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+        state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
         common::state_store_coordination_conformance::run_coordination_conformance(Rc::clone(
             &factory,
         ))

@@ -110,7 +110,6 @@ impl RangeRequest {
                 "continuation key is outside the requested range",
             ));
         }
-
         let fingerprint = request_fingerprint(&self.range, self.direction)?;
         let key_len = u32::try_from(last_key.as_bytes().len()).map_err(|_| invalid_token())?;
         let capacity = 2usize
@@ -135,7 +134,6 @@ impl ContinuationToken {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_ref()
     }
-
     pub fn into_bytes(self) -> Bytes {
         self.0
     }
@@ -166,7 +164,6 @@ impl ContinuationToken {
 
 impl TryFrom<Bytes> for ContinuationToken {
     type Error = StateStoreError;
-
     fn try_from(value: Bytes) -> Result<Self, Self::Error> {
         Ok(Self(value))
     }
@@ -197,15 +194,12 @@ impl ChangeCursor {
         encoded.put_u32(sequence);
         Ok(Self(encoded.freeze()))
     }
-
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_ref()
     }
-
     pub fn into_bytes(self) -> Bytes {
         self.0
     }
-
     pub fn decode(&self, expected_store_id: Uuid) -> Result<(StoreRevision, u32), StateStoreError> {
         let mut reader = CheckedReader::new(self.as_bytes(), invalid_cursor);
         if reader.read_u8()? != CODEC_VERSION {
@@ -225,7 +219,6 @@ impl ChangeCursor {
 
 impl TryFrom<Bytes> for ChangeCursor {
     type Error = StateStoreError;
-
     fn try_from(value: Bytes) -> Result<Self, Self::Error> {
         Ok(Self(value))
     }
@@ -252,7 +245,6 @@ struct CheckedReader<'a> {
     offset: usize,
     invalid: fn() -> StateStoreError,
 }
-
 impl<'a> CheckedReader<'a> {
     const fn new(bytes: &'a [u8], invalid: fn() -> StateStoreError) -> Self {
         Self {
@@ -261,12 +253,10 @@ impl<'a> CheckedReader<'a> {
             invalid,
         }
     }
-
     fn read_u8(&mut self) -> Result<u8, StateStoreError> {
         let bytes = self.read_exact(1)?;
         bytes.first().copied().ok_or_else(self.invalid)
     }
-
     fn read_u32(&mut self) -> Result<u32, StateStoreError> {
         let bytes: [u8; 4] = self
             .read_exact(4)?
@@ -274,14 +264,12 @@ impl<'a> CheckedReader<'a> {
             .map_err(|_| (self.invalid)())?;
         Ok(u32::from_be_bytes(bytes))
     }
-
     fn read_exact(&mut self, length: usize) -> Result<&'a [u8], StateStoreError> {
         let end = self.offset.checked_add(length).ok_or_else(self.invalid)?;
         let bytes = self.bytes.get(self.offset..end).ok_or_else(self.invalid)?;
         self.offset = end;
         Ok(bytes)
     }
-
     fn finish(self) -> Result<(), StateStoreError> {
         if self.offset != self.bytes.len() {
             return Err((self.invalid)());
@@ -296,7 +284,6 @@ const fn invalid_token() -> StateStoreError {
         "invalid continuation token",
     )
 }
-
 const fn invalid_cursor() -> StateStoreError {
     StateStoreError::new(StateStoreErrorKind::InvalidRequest, "invalid change cursor")
 }

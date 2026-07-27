@@ -24,7 +24,7 @@ use tokio::time::{Instant, timeout_at};
 
 use super::codec::MysqlCodec;
 use super::error::{MysqlNativeError, MysqlReadStatementError};
-use crate::state_store::{
+use novarocks_spi::state_store::{
     Direction, RangePage, RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, Value,
     VersionToken,
 };

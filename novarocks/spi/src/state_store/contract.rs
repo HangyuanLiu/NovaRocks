@@ -15,16 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::num::NonZeroUsize;
-
-use async_trait::async_trait;
 use bytes::Bytes;
 use uuid::Uuid;
 
 use super::error::{StateStoreError, StateStoreErrorKind};
 use super::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES, StateStoreLimits};
 use super::metrics::StateStoreMetricsSnapshot;
-use super::range::{ChangeCursor, RangeRequest};
+use super::range::{ChangeCursor, ContinuationToken, RangeRequest};
 
 macro_rules! opaque_bytes {
     ($name:ident, $validate:expr) => {
@@ -112,25 +109,6 @@ impl From<Uuid> for TransactionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct OperationId(Uuid);
-
-impl OperationId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    pub const fn as_uuid(&self) -> &Uuid {
-        &self.0
-    }
-}
-
-impl From<Uuid> for OperationId {
-    fn from(value: Uuid) -> Self {
-        Self(value)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateRecord {
     pub key: Key,
@@ -149,13 +127,7 @@ pub enum Precondition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RangePage {
     pub records: Vec<StateRecord>,
-    pub continuation: Option<super::range::ContinuationToken>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeDeploymentView {
-    pub active_fe_count: NonZeroUsize,
-    pub topology_revision: Bytes,
+    pub continuation: Option<ContinuationToken>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,14 +195,14 @@ pub(crate) fn validate_page_size(page_size: usize, maximum: usize) -> Result<(),
     Ok(())
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 pub trait ReadTransaction: Send {
     async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError>;
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError>;
     async fn abort(self: Box<Self>) -> Result<(), StateStoreError>;
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 pub trait WriteTransaction: ReadTransaction {
     fn transaction_id(&self) -> &TransactionId;
     async fn put(
@@ -244,7 +216,7 @@ pub trait WriteTransaction: ReadTransaction {
     async fn commit(self: Box<Self>) -> CommitOutcome;
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 pub trait StateStore: Send + Sync {
     fn provider_name(&self) -> &'static str;
     fn limits(&self) -> &StateStoreLimits;

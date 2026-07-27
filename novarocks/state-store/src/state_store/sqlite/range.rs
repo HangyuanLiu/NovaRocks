@@ -17,18 +17,19 @@
 
 use std::collections::VecDeque;
 use std::ops::Bound::{Excluded, Included};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 
-use crate::state_store::{
+use novarocks_spi::state_store::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Direction, Key, RangePage,
-    RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreMetrics,
-    StoreIdentity, StoreRevision,
+    RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, StoreIdentity, StoreRevision,
 };
+
+use crate::state_store::metrics::StateStoreMetrics;
 
 use super::open_connection;
 use super::schema::load_change_retention_floor;
@@ -301,7 +302,7 @@ pub(super) async fn poll_changes(
 }
 
 fn poll_changes_blocking(
-    path: &PathBuf,
+    path: &Path,
     identity: &StoreIdentity,
     request: &ChangePollRequest,
     decoded_after: Option<(u64, u32)>,

@@ -37,12 +37,13 @@ use super::client::{
 use super::codec::MysqlCodec;
 use super::error::{MysqlNativeError, MysqlReadStatementError, MysqlTransactionDisposition};
 use super::range::{decode_record, read_range_page};
+use crate::state_store::metrics::StateStoreMetrics;
 use crate::state_store::runtime::MysqlRuntimeGuard;
-use crate::state_store::{
+use novarocks_spi::state_store::{
     CommitOutcome, CommitReceipt, ContinuationToken, Direction, Key, Precondition, RangePage,
     RangeRequest, ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreRevision,
-    TransactionId, Value, VersionToken, WriteTransaction,
+    StateStoreLimits, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value,
+    VersionToken, WriteTransaction,
 };
 
 const PROVISIONAL_VERSION_TAG: &[u8] = b"mysql-provisional-v1\0";
@@ -2128,7 +2129,7 @@ pub(crate) async fn insert_malformed_kv_row_for_test(
         statement_in_flight: false,
     };
     let key = key.to_vec();
-    let oversized_value = vec![0x5a; crate::state_store::limits::MAX_VALUE_BYTES + 1];
+    let oversized_value = vec![0x5a; novarocks_spi::state_store::MAX_VALUE_BYTES + 1];
     transaction
         .run(move |connection| {
             Box::pin(connection.exec_drop(

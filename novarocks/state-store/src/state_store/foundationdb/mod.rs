@@ -32,12 +32,14 @@ use uuid::Uuid;
 
 use self::codec::KeyspaceCodec;
 use self::identity::open_identity;
-use super::runtime::ProviderHandle;
-use super::{
+use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot,
-    StoreIdentity, TransactionId, WriteTransaction,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
+    WriteTransaction,
 };
+
+use super::metrics::StateStoreMetrics;
+use super::runtime::ProviderHandle;
 
 pub(super) struct FoundationDbStateStore {
     lease: ProviderHandle,
@@ -192,7 +194,7 @@ impl StateStore for FoundationDbStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_store::{StateStoreErrorKind, StateStoreOperation};
+    use novarocks_spi::state_store::{StateStoreErrorKind, StateStoreOperation};
 
     #[test]
     fn provider_error_metrics_count_each_blocker_without_public_operation_duplication() {

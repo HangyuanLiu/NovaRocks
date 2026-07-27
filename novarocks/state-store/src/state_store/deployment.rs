@@ -15,21 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(dead_code)]
+use std::num::NonZeroUsize;
 
-use std::path::{Path, PathBuf};
+use bytes::Bytes;
 
-pub mod state_store_coordination_conformance;
-
-pub fn repo_root() -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("state-store manifest must be nested under the repository novarocks directory")
-        .to_path_buf();
-    assert!(
-        root.join("docker/mysql-state-store").is_dir(),
-        "state-store tests must resolve the repository Docker fixtures"
-    );
-    root
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeDeploymentView {
+    pub active_fe_count: NonZeroUsize,
+    pub topology_revision: Bytes,
 }

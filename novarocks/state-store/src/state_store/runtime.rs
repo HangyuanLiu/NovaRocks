@@ -17,7 +17,27 @@
 
 use std::fmt;
 
-use super::{StateStoreError, StateStoreErrorKind};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+
+#[cfg(any(
+    feature = "mysql-state-store-provider",
+    feature = "foundationdb-provider"
+))]
+use novarocks_spi::state_store::{StateStore, StateStoreLimits};
+#[cfg(any(
+    feature = "mysql-state-store-provider",
+    feature = "foundationdb-provider"
+))]
+use {
+    super::StateStoreConfig,
+    super::limits::resolve_state_store_limits,
+    std::collections::HashMap,
+    std::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    std::sync::{Arc, Mutex},
+    std::time::Duration,
+    tokio::sync::Notify,
+    tokio::time::{Instant, timeout_at},
+};
 
 #[cfg(all(
     feature = "mysql-state-store-provider",
@@ -36,31 +56,21 @@ use {
         MysqlSchemaMutation, MysqlSchemaSnapshot, MysqlStoreReadinessSnapshot, MysqlTestHandle,
     },
     super::mysql::{MysqlOpenCancellation, MysqlStateStore},
-    super::{FeDeploymentView, MySqlClientConfig, StateStore, StateStoreConfig, StateStoreLimits},
-    std::collections::HashMap,
-    std::sync::Arc,
-    std::sync::Mutex,
-    std::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    std::time::Duration,
-    tokio::sync::{Notify, oneshot},
-    tokio::time::{Instant, timeout_at},
+    super::{FeDeploymentView, MySqlClientConfig},
+    tokio::sync::oneshot,
 };
 
 #[cfg(feature = "foundationdb-provider")]
 use {
+    super::FoundationDbClientConfig,
     super::foundationdb::FoundationDbStateStore,
-    super::{FoundationDbClientConfig, StateStore, StateStoreConfig, StateStoreLimits},
     foundationdb::Database,
     foundationdb::api::{FdbApiBuilder, NetworkRunner, NetworkStop},
     foundationdb::options::NetworkOption,
-    std::collections::HashMap,
+    novarocks_spi::state_store::MAX_KEY_BYTES,
     std::panic::{AssertUnwindSafe, catch_unwind},
-    std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    std::sync::{Arc, Mutex},
+    std::sync::atomic::AtomicU64,
     std::thread::JoinHandle,
-    std::time::Duration,
-    tokio::sync::Notify,
-    tokio::time::{Instant, timeout_at},
 };
 
 const RUNTIME_PID_ERROR: &str = "state store runtime belongs to a different process";
@@ -629,13 +639,12 @@ impl MysqlRuntime {
             _ => return Err(mysql_runtime_mismatch()),
         };
         let limits =
-            StateStoreLimits::from_overrides_with_max_key(&config.limits, MYSQL_MAX_KEY_BYTES)
-                .map_err(|_| {
-                    StateStoreError::new(
-                        StateStoreErrorKind::InvalidConfiguration,
-                        "MySQL state store limits are invalid",
-                    )
-                })?;
+            resolve_state_store_limits(&config.limits, MYSQL_MAX_KEY_BYTES).map_err(|_| {
+                StateStoreError::new(
+                    StateStoreErrorKind::InvalidConfiguration,
+                    "MySQL state store limits are invalid",
+                )
+            })?;
         let opening = self.acquire_operation()?;
         let pool = self.get_or_create_pool(&database)?;
         let deadline = Instant::now() + limits.transaction_deadline;
@@ -1608,7 +1617,7 @@ impl FoundationDbRuntime {
                 ));
             }
         };
-        let limits = StateStoreLimits::from_overrides(&config.limits).map_err(|_| {
+        let limits = resolve_state_store_limits(&config.limits, MAX_KEY_BYTES).map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "state store limits are invalid",

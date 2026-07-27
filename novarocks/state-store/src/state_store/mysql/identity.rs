@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Version};
 
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
+
 use super::super::limits::MYSQL_MAX_META_VALUE_BYTES;
-use super::super::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 use super::codec::MysqlCodec;
 
 pub(super) const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";

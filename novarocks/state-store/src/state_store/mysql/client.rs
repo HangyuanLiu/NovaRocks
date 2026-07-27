@@ -29,7 +29,9 @@ use mysql_async::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout_at};
 
-use super::super::{MySqlClientConfig, MySqlTlsMode, StateStoreError, StateStoreErrorKind};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+
+use super::super::{MySqlClientConfig, MySqlTlsMode};
 use super::error::MysqlNativeError;
 
 #[cfg(feature = "state-store-test-hooks")]

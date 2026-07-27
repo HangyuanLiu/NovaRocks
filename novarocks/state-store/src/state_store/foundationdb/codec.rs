@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::state_store::{StateStoreError, StateStoreErrorKind};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
 
 const KEYSPACE_PREFIX: &[u8] = b"NRSS\x01";
 const META_TAG: u8 = 0x00;
@@ -324,7 +324,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DurableCommitState, KeyspaceCodec};
-    use crate::state_store::StateStoreErrorKind;
+    use novarocks_spi::state_store::StateStoreErrorKind;
 
     fn codec() -> KeyspaceCodec {
         KeyspaceCodec::new(Uuid::from_bytes([0x11; 16]))

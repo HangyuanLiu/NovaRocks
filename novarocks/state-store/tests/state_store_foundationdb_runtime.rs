@@ -22,9 +22,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use bytes::Bytes;
+use novarocks_spi::state_store::StateStoreErrorKind;
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreErrorKind,
-    StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreLimitOverrides,
+    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
 };
 use tempfile::TempDir;
 use uuid::Uuid;

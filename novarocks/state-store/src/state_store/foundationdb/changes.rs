@@ -25,9 +25,10 @@ use tokio::time::{Instant, timeout_at};
 use super::codec::{KeyspaceCodec, REVISION_BYTES};
 use super::txn::create_raw_transaction;
 use super::{classify_native_read_error, record_provider_error_metric};
-use crate::state_store::{
+use crate::state_store::metrics::StateStoreMetrics;
+use novarocks_spi::state_store::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Key, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StoreIdentity, StoreRevision,
+    StateStoreErrorKind, StateStoreLimits, StoreIdentity, StoreRevision,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

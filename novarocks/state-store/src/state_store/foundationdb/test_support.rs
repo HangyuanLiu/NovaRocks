@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::Notify;
 
-use crate::state_store::{CommitOutcome, StateStoreError, StateStoreErrorKind};
+use novarocks_spi::state_store::{CommitOutcome, StateStoreError, StateStoreErrorKind};
 
 static NEXT_COMMIT_GATES: OnceLock<Mutex<Option<Arc<GateState>>>> = OnceLock::new();
 
@@ -219,9 +219,9 @@ mod tests {
             gates.before_native_commit().await;
             gates
                 .before_response(CommitOutcome::Committed(
-                    crate::state_store::CommitReceipt {
+                    novarocks_spi::state_store::CommitReceipt {
                         transaction_id: uuid::Uuid::from_bytes([0x11; 16]).into(),
-                        revision: crate::state_store::StoreRevision::try_from(
+                        revision: novarocks_spi::state_store::StoreRevision::try_from(
                             bytes::Bytes::from_static(&[0x22; 10]),
                         )
                         .expect("revision"),
