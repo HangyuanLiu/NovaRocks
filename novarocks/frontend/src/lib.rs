@@ -18,8 +18,10 @@
 pub mod application;
 pub mod deployment;
 mod server;
+pub mod system_catalog;
 
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
 };
 pub use server::{FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown};
+pub use system_catalog::SystemCatalogService;

@@ -15,32 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Virtual-table provider framework for standalone information_schema.
+//! information_schema AST rewriter for standalone queries.
 //!
 //! StarRocks exposes information_schema tables (`schemata`, `tables`, ...) as
-//! real tables on the FE side: each is a `SystemTable` subclass under
-//! `InfoSchemaDb`, materialized through `SchemaScanNode` at query time. This
-//! module mirrors that shape for NovaRocks standalone mode: each virtual table
-//! provides its own column schema and a `scan` function that materializes rows
-//! from the current `StandaloneState`.
+//! real tables on the FE side. NovaRocks standalone delegates their schema and
+//! row materialization to the frontend-injected `SystemCatalog` port.
 //!
-//! Rows are eagerly materialized at query-rewrite time and embedded as a
-//! `ScanSource::SystemRows` variant in a cloned catalog snapshot, so the
-//! standard SQL pipeline (analyzer / planner / optimizer / codegen / pipeline)
-//! handles them like any other base table — no handler-style SQL-subset
-//! interpretation required.
-//!
-//! Adding a new virtual table is one concrete `VirtualTableProvider` impl plus
-//! a single `register` call in `VirtualTableRegistry::with_defaults`.
+//! The rewriter replaces system-table references with VALUES-backed derived
+//! tables, which the standard SQL pipeline handles like ordinary relations.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
@@ -48,77 +38,6 @@ use crate::engine::StandaloneState;
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
-
-/// Implementation contract for a single information_schema virtual table.
-pub(crate) trait VirtualTableProvider: Send + Sync {
-    /// Lower-case database name this table lives under (typically
-    /// `"information_schema"`).
-    fn database(&self) -> &str;
-
-    /// Lower-case table name (e.g. `"schemata"`).
-    fn table(&self) -> &str;
-
-    /// Column definitions, in the order they will appear in `SELECT *`. The
-    /// Arrow data type here must match the schema of every `RecordBatch`
-    /// returned by `scan`.
-    fn columns(&self) -> Vec<ColumnDef>;
-
-    /// Materialize rows from the current standalone state. Called once per
-    /// query that references this virtual table.
-    fn scan(&self, state: &StandaloneState) -> Result<Vec<RecordBatch>, String>;
-}
-
-/// Registry mapping `(database, table)` → provider.
-pub(crate) struct VirtualTableRegistry {
-    providers: HashMap<(String, String), Arc<dyn VirtualTableProvider>>,
-}
-
-impl VirtualTableRegistry {
-    pub(crate) fn with_defaults() -> Self {
-        let mut registry = Self {
-            providers: HashMap::new(),
-        };
-        registry.register(Arc::new(super::information_schema::SchemataProvider));
-        registry
-    }
-
-    fn register(&mut self, provider: Arc<dyn VirtualTableProvider>) {
-        let key = (
-            provider.database().to_ascii_lowercase(),
-            provider.table().to_ascii_lowercase(),
-        );
-        self.providers.insert(key, provider);
-    }
-
-    pub(crate) fn lookup(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Option<Arc<dyn VirtualTableProvider>> {
-        let key = (database.to_ascii_lowercase(), table.to_ascii_lowercase());
-        self.providers.get(&key).cloned()
-    }
-
-    /// Returns every `(database, table)` pair owned by some provider. Used to
-    /// pre-register placeholder databases (e.g. `information_schema`) in the
-    /// catalog snapshot before per-query injection runs.
-    pub(crate) fn databases(&self) -> impl Iterator<Item = &str> {
-        self.providers.keys().map(|(db, _)| db.as_str())
-    }
-}
-
-/// Build an Arrow `Schema` from a provider's `columns()` output. The field
-/// names use the lower-case form (matching catalog identifier normalization)
-/// so downstream codegen/lower can index by slot id without extra mapping.
-pub(crate) fn arrow_schema_for_provider(provider: &dyn VirtualTableProvider) -> Arc<Schema> {
-    use arrow::datatypes::Field;
-    let fields: Vec<Field> = provider
-        .columns()
-        .into_iter()
-        .map(|c| Field::new(c.name, c.data_type, c.nullable))
-        .collect();
-    Arc::new(Schema::new(fields))
-}
 
 // ---------------------------------------------------------------------------
 // AST rewriter: substitute virtual-table refs with a VALUES derived table.
@@ -221,18 +140,25 @@ fn rewrite_table_factor(
                         Ok(entry) => {
                             let databases =
                                 crate::connector::iceberg::catalog::list_namespaces(&entry)?;
-                            let schemata_cols =
-                                crate::engine::information_schema::schemata_columns();
-                            let batches = crate::engine::information_schema::build_schemata_batch(
-                                cat, &databases,
-                            )?;
+                            let inputs = crate::engine::system_catalog::SystemCatalogInputs {
+                                catalog_name: cat,
+                                schema_names: &databases,
+                            };
+                            let Some(data) = state.system_catalog.resolve(
+                                INFORMATION_SCHEMA_DB,
+                                "schemata",
+                                &inputs,
+                            )?
+                            else {
+                                return Ok(());
+                            };
                             let tbl_name = tbl.clone();
                             let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
                                 explicit: false,
                                 name: sqlast::Ident::new(tbl_name),
                                 columns: Vec::new(),
                             });
-                            *factor = derived_values_factor(&schemata_cols, &batches, alias)?;
+                            *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
                             return Ok(());
                         }
                         Err(_) => {
@@ -247,18 +173,35 @@ fn rewrite_table_factor(
             let Some((db, tbl)) = key else {
                 return Ok(());
             };
-            let Some(provider) = state.virtual_tables.lookup(&db, &tbl) else {
+            // Only information_schema hosts system tables; gate before gathering inputs so
+            // ordinary table references never trigger a catalog read (behavior-preserving).
+            if !db.eq_ignore_ascii_case(INFORMATION_SCHEMA_DB) {
+                return Ok(());
+            }
+            let mut schema_names: Vec<String> = {
+                let catalog = state
+                    .catalog_service
+                    .local()
+                    .read()
+                    .expect("standalone catalog read lock");
+                catalog.database_names().map(str::to_string).collect()
+            };
+            schema_names.sort();
+            schema_names.dedup();
+            let inputs = crate::engine::system_catalog::SystemCatalogInputs {
+                catalog_name: "default_catalog",
+                schema_names: &schema_names,
+            };
+            let Some(data) = state.system_catalog.resolve(&db, &tbl, &inputs)? else {
                 return Ok(());
             };
 
-            let columns = provider.columns();
-            let batches = provider.scan(state)?;
             let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
                 explicit: false,
                 name: sqlast::Ident::new(tbl),
                 columns: Vec::new(),
             });
-            *factor = derived_values_factor(&columns, &batches, alias)?;
+            *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
             Ok(())
         }
         sqlast::TableFactor::Derived { subquery, .. } => {
@@ -487,11 +430,59 @@ fn num_to_expr<N: std::fmt::Display>(n: N) -> Result<sqlast::Expr, String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::connector::iceberg::catalog::registry::build_catalog_entry;
     use crate::engine::StandaloneState;
+    use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::sql::parser::dialect::StarRocksDialect;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_catalog::schema::ColumnDef;
     use sqlparser::parser::Parser;
+
+    #[derive(Default)]
+    struct EchoSchemaNames {
+        calls: AtomicUsize,
+    }
+
+    impl SystemCatalog for EchoSchemaNames {
+        fn resolve(
+            &self,
+            db: &str,
+            tbl: &str,
+            inputs: &SystemCatalogInputs<'_>,
+        ) -> Result<Option<SystemTableData>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !(db.eq_ignore_ascii_case("information_schema")
+                && tbl.eq_ignore_ascii_case("schemata"))
+            {
+                return Ok(None);
+            }
+            let col = ColumnDef {
+                name: "schema_name".into(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            };
+            let arr = StringArray::from(inputs.schema_names.to_vec());
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "schema_name",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![Arc::new(arr)],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Some(SystemTableData {
+                columns: vec![col],
+                batches: vec![batch],
+            }))
+        }
+    }
 
     /// Parse a SELECT query into a mutable `sqlparser::ast::Query`.
     fn parse_query(sql: &str) -> Box<sqlparser::ast::Query> {
@@ -510,7 +501,10 @@ mod tests {
     /// Build a minimal `StandaloneState` with a local Iceberg (Hadoop) catalog
     /// registered under `catalog_name`, whose warehouse is `warehouse_path`.
     fn state_with_local_catalog(catalog_name: &str, warehouse_path: &str) -> Arc<StandaloneState> {
-        let state = Arc::new(StandaloneState::default());
+        let state = Arc::new(StandaloneState {
+            system_catalog: Arc::new(EchoSchemaNames::default()),
+            ..StandaloneState::default()
+        });
         let properties = vec![(
             "iceberg.catalog.warehouse".to_string(),
             warehouse_path.to_string(),
@@ -535,7 +529,10 @@ mod tests {
         // `default_catalog.information_schema.schemata` must be rewritten into
         // a VALUES-backed derived table even when the local in-memory catalog is
         // empty.
-        let state = Arc::new(StandaloneState::default());
+        let state = Arc::new(StandaloneState {
+            system_catalog: Arc::new(EchoSchemaNames::default()),
+            ..StandaloneState::default()
+        });
         // Seed one database so the rewriter has at least one row to produce.
         {
             let mut cat = state
@@ -573,7 +570,10 @@ mod tests {
         // A 3-part reference to an unregistered catalog must NOT be rewritten.
         // The rewriter leaves the AST untouched so downstream resolvers can
         // surface the proper "unknown catalog" error.
-        let state = Arc::new(StandaloneState::default());
+        let state = Arc::new(StandaloneState {
+            system_catalog: Arc::new(EchoSchemaNames::default()),
+            ..StandaloneState::default()
+        });
         let mut query =
             parse_query("SELECT schema_name FROM no_such_cat.information_schema.schemata");
         super::rewrite_query(&state, &mut query).expect("rewrite_query returns Ok for unknown cat");
@@ -602,7 +602,13 @@ mod tests {
         std::fs::create_dir_all(&ns_dir).expect("create namespace dir");
 
         let warehouse_path = warehouse_dir.path().to_str().unwrap();
-        let state = state_with_local_catalog("myice", warehouse_path);
+        let base_state = state_with_local_catalog("myice", warehouse_path);
+        let state = Arc::new(StandaloneState {
+            catalog_service: Arc::clone(&base_state.catalog_service),
+            iceberg_catalogs: Arc::clone(&base_state.iceberg_catalogs),
+            system_catalog: Arc::new(EchoSchemaNames::default()),
+            ..StandaloneState::default()
+        });
 
         std::fs::create_dir_all(warehouse_dir.path().join("ns_live"))
             .expect("create live namespace");
@@ -623,5 +629,38 @@ mod tests {
             "expected Derived VALUES factor for registered external catalog, got {:?}",
             select.from[0].relation
         );
+    }
+
+    #[test]
+    fn empty_system_catalog_leaves_schemata_untouched() {
+        let state = Arc::new(StandaloneState::default());
+        let mut query = parse_query("SELECT schema_name FROM information_schema.schemata");
+
+        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected Select body");
+        };
+        assert!(
+            matches!(
+                select.from[0].relation,
+                sqlparser::ast::TableFactor::Table { .. }
+            ),
+            "expected Table factor when the injected system catalog returns None"
+        );
+    }
+
+    #[test]
+    fn non_information_schema_reference_does_not_invoke_resolve() {
+        let fake = Arc::new(EchoSchemaNames::default());
+        let state = Arc::new(StandaloneState {
+            system_catalog: fake.clone(),
+            ..StandaloneState::default()
+        });
+        let mut query = parse_query("SELECT * FROM mydb.mytbl");
+
+        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
     }
 }

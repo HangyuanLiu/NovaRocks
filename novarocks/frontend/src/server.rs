@@ -60,16 +60,19 @@ pub async fn run_frontend_server_until_shutdown<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
+        Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
         |state_store| async move { FrontendApplicationHost::open(state_store).await },
-        |config, shutdown| async move {
+        move |config, shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
                 config.port_override,
                 config.local_exchange,
+                system_catalog,
                 shutdown,
             )
             .await
@@ -90,16 +93,19 @@ where
     S: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
+        Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     run_frontend_server_with_signal_and_ports(
         config,
         signal,
         FrontendApplicationHost::open,
-        |config, shutdown| async move {
+        move |config, shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
                 config.port_override,
                 config.local_exchange,
+                system_catalog,
                 shutdown,
             )
             .await
