@@ -1744,6 +1744,14 @@ impl StandaloneSession {
                 execute_drop_catalog_statement(&self.inner, &stmt.name, stmt.if_exists)
             }
             DropResult::Database(stmt) => {
+                if let Some(database) = resolve_default_view_database(&stmt.name, current_catalog)?
+                {
+                    self.inner
+                        .view_service
+                        .drop_database("default_catalog", &database)?;
+                    self::statistics::drop_database(&self.inner, &database);
+                    return Ok(StatementResult::Ok);
+                }
                 let target = crate::engine::backend_resolver::resolve_namespace_target(
                     &self.inner,
                     &stmt.name,
@@ -1818,6 +1826,23 @@ impl StandaloneSession {
             query_opts,
         )
     }
+}
+
+fn resolve_default_view_database(
+    name: &crate::sql::parser::ast::ObjectName,
+    current_catalog: Option<&str>,
+) -> Result<Option<String>, String> {
+    let database = match name.parts.as_slice() {
+        [database]
+            if current_catalog
+                .is_some_and(|catalog| catalog.eq_ignore_ascii_case("default_catalog")) =>
+        {
+            database
+        }
+        [catalog, database] if catalog.eq_ignore_ascii_case("default_catalog") => database,
+        _ => return Ok(None),
+    };
+    normalize_identifier(database).map(Some)
 }
 
 fn standalone_now_ms() -> i64 {
@@ -4330,6 +4355,21 @@ mod tests {
                 None,
             )
             .expect("database drop");
+        let missing_catalog_error = session
+            .execute_in_context("DROP DATABASE unqualified_without_catalog", None, "", None)
+            .expect_err("unqualified database drop without a catalog must keep failing");
+        assert!(
+            missing_catalog_error.contains("requires an Iceberg catalog"),
+            "unexpected missing-catalog error: {missing_catalog_error}"
+        );
+        session
+            .execute_in_context(
+                "DROP DATABASE default_catalog.delegated_view_db",
+                Some("default_catalog"),
+                "",
+                None,
+            )
+            .expect("default-catalog view database drop");
 
         assert_eq!(service.statements.load(Ordering::SeqCst), 1);
         assert_eq!(service.rewrites.load(Ordering::SeqCst), 2);
@@ -4339,7 +4379,13 @@ mod tests {
                 .lock()
                 .expect("dropped databases")
                 .as_slice(),
-            [("delegated_catalog".to_string(), "delegated_db".to_string())]
+            [
+                ("delegated_catalog".to_string(), "delegated_db".to_string()),
+                (
+                    "default_catalog".to_string(),
+                    "delegated_view_db".to_string()
+                ),
+            ]
         );
     }
 
