@@ -80,10 +80,15 @@ const CANCEL_FRAGMENT_NOT_OWNED: i32 = 3;
 static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static STANDALONE_GRPC_STARTUP_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 struct GrpcServerState {
     started: bool,
+    starting: bool,
     bound_port: Option<u16>,
     shutdown_tx: Option<watch::Sender<bool>>,
     join_handle: Option<JoinHandle<()>>,
@@ -94,6 +99,17 @@ struct GrpcServerState {
 fn grpc_server_state() -> &'static Mutex<GrpcServerState> {
     static STATE: OnceLock<Mutex<GrpcServerState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(GrpcServerState::default()))
+}
+
+#[cfg(test)]
+fn pause_standalone_grpc_startup_after_reservation() {
+    if !PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION.load(Ordering::Acquire) {
+        return;
+    }
+    STANDALONE_GRPC_STARTUP_RESERVATIONS.fetch_add(1, Ordering::AcqRel);
+    while PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
 }
 
 #[derive(Clone)]
@@ -1869,16 +1885,28 @@ fn start_standalone_grpc_server(
     mode: StandaloneGrpcMode,
 ) -> Result<(), String> {
     {
-        let state = grpc_server_state()
+        let mut state = grpc_server_state()
             .lock()
             .map_err(|_| "lock grpc server state failed".to_string())?;
         if state.started {
             return Ok(());
         }
+        if state.starting {
+            return Err("grpc server startup already in progress".to_string());
+        }
+        state.starting = true;
     }
+    #[cfg(test)]
+    pause_standalone_grpc_startup_after_reservation();
 
     let host = host.to_string();
-    let std_listener = bind_tcp_listener(&host, port, mode.label())?;
+    let std_listener = match bind_tcp_listener(&host, port, mode.label()) {
+        Ok(listener) => listener,
+        Err(error) => {
+            clear_grpc_server_startup_reservation();
+            return Err(error);
+        }
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (failure_tx, failure_rx) = mpsc::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
@@ -1937,12 +1965,18 @@ fn start_standalone_grpc_server(
         });
     });
 
-    let mut state = grpc_server_state()
-        .lock()
-        .map_err(|_| "lock grpc server state failed".to_string())?;
-    if state.started {
-        return Ok(());
-    }
+    let mut state = match grpc_server_state().lock() {
+        Ok(state) => state,
+        Err(_) => {
+            stop_requested.store(true, Ordering::Release);
+            let _ = shutdown_tx.send(true);
+            let _ = join_grpc_server_thread(join_handle);
+            clear_grpc_server_startup_reservation();
+            return Err("lock grpc server state failed".to_string());
+        }
+    };
+    debug_assert!(state.starting, "standalone grpc start lost its reservation");
+    state.starting = false;
     state.started = true;
     state.bound_port = Some(port);
     state.shutdown_tx = Some(shutdown_tx);
@@ -1950,6 +1984,12 @@ fn start_standalone_grpc_server(
     state.stop_requested = Some(stop_requested);
     state.failure_rx = Some(failure_rx);
     Ok(())
+}
+
+fn clear_grpc_server_startup_reservation() {
+    if let Ok(mut state) = grpc_server_state().lock() {
+        state.starting = false;
+    }
 }
 
 #[cfg(test)]
@@ -1961,6 +2001,7 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use prost::Message;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -2176,6 +2217,42 @@ mod tests {
     }
 
     #[test]
+    fn grpc_poll_reports_post_ready_supervisor_error() {
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut state = super::grpc_server_state()
+                .lock()
+                .expect("lock grpc server state");
+            *state = super::GrpcServerState {
+                started: true,
+                starting: false,
+                bound_port: Some(19080),
+                shutdown_tx: None,
+                join_handle: None,
+                stop_requested: Some(std::sync::Arc::clone(&stop_requested)),
+                failure_rx: Some(failure_rx),
+            };
+        }
+
+        super::supervise_grpc_server_thread(stop_requested, failure_tx, || {
+            Err("injected runtime/serve failure".to_string())
+        });
+
+        let failure = super::poll_grpc_server_failure()
+            .expect("poll grpc server failure")
+            .expect("post-ready supervisor error must be observable");
+        assert!(
+            failure.contains("injected runtime/serve failure"),
+            "{failure}"
+        );
+
+        *super::grpc_server_state()
+            .lock()
+            .expect("reset grpc server state") = super::GrpcServerState::default();
+    }
+
+    #[test]
     fn grpc_poll_reports_unexpected_post_ready_supervisor_exit() {
         let (failure_tx, failure_rx) = mpsc::channel();
         let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2185,6 +2262,7 @@ mod tests {
                 .expect("lock grpc server state");
             *state = super::GrpcServerState {
                 started: true,
+                starting: false,
                 bound_port: Some(19080),
                 shutdown_tx: None,
                 join_handle: None,
@@ -2218,6 +2296,7 @@ mod tests {
                 .expect("lock grpc server state");
             *state = super::GrpcServerState {
                 started: false,
+                starting: false,
                 bound_port: None,
                 shutdown_tx: None,
                 join_handle: None,
@@ -2236,6 +2315,73 @@ mod tests {
         *super::grpc_server_state()
             .lock()
             .expect("reset grpc server state") = super::GrpcServerState::default();
+    }
+
+    #[test]
+    fn concurrent_standalone_grpc_start_releases_the_losing_listener() {
+        fn unused_port() -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            let port = listener.local_addr().expect("read ephemeral port").port();
+            drop(listener);
+            port
+        }
+
+        let first_port = unused_port();
+        let second_port = unused_port();
+        super::STANDALONE_GRPC_STARTUP_RESERVATIONS.store(0, Ordering::Release);
+        super::PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION.store(true, Ordering::Release);
+
+        let first =
+            std::thread::spawn(move || super::start_grpc_exchange_server("127.0.0.1", first_port));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while super::STANDALONE_GRPC_STARTUP_RESERVATIONS.load(Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first startup did not reserve gRPC lifecycle ownership"
+            );
+            std::thread::yield_now();
+        }
+
+        let second =
+            std::thread::spawn(move || super::start_grpc_exchange_server("127.0.0.1", second_port));
+        let second_deadline = std::time::Instant::now() + Duration::from_millis(100);
+        while super::STANDALONE_GRPC_STARTUP_RESERVATIONS.load(Ordering::Acquire) < 2
+            && std::time::Instant::now() < second_deadline
+        {
+            std::thread::yield_now();
+        }
+        super::PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION.store(false, Ordering::Release);
+
+        let first_result = first.join().expect("first startup thread panicked");
+        let second_result = second.join().expect("second startup thread panicked");
+        let successful_starts =
+            usize::from(first_result.is_ok()) + usize::from(second_result.is_ok());
+        let failed_starts =
+            usize::from(first_result.is_err()) + usize::from(second_result.is_err());
+        let rejected_start = first_result
+            .as_ref()
+            .err()
+            .or_else(|| second_result.as_ref().err());
+        let stop_result = super::stop_grpc_server();
+        let first_released = TcpListener::bind(("127.0.0.1", first_port)).is_ok();
+        let second_released = TcpListener::bind(("127.0.0.1", second_port)).is_ok();
+
+        assert_eq!(successful_starts, 1, "only the owner may start a listener");
+        assert_eq!(
+            failed_starts, 1,
+            "the concurrent non-owner must be rejected"
+        );
+        assert!(
+            rejected_start
+                .expect("concurrent non-owner must return an error")
+                .contains("startup already in progress")
+        );
+        assert!(
+            stop_result.is_ok(),
+            "owner shutdown failed: {stop_result:?}"
+        );
+        assert!(first_released, "first listener was not released");
+        assert!(second_released, "second listener was not released");
     }
 
     #[test]
