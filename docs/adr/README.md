@@ -71,3 +71,9 @@ code-anchors:
 领域哲学：编码是执行载体的自描述物理属性，不是 plan 必须背书的正确性契约。correctness 由载体保证——`Dictionary(Int32, Utf8)` 自描述 + 算子入口 hydrate 兜底，算子不认识编码时的默认后果必须是「慢」而非「错」（fail-safe，不是 fail-open）；plan/元数据层只声明快路径资格，误判最坏是少一次加速。lake-native（不拥有数据、无内表）是前提约束：native 侧不建表级全局字典，FE-compatible 全局字典执行是隔离的协议侧支。
 
 - ADR-0005 — 低基数编码为何运行时载体优先：DictionaryArray 是 correctness owner、plan 层只是加速器（active）
+
+### provider-spi
+
+领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
+
+- ADR-0006 — 可替换 provider 契约为何统一进入一个系统 SPI，而普通跨 crate port 不进入（active）
