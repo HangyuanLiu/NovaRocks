@@ -374,7 +374,10 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::model::contract::{
+        BindingId, ChannelId, ConsumerActivation, LateApplyGranularity,
+    };
+    use crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
@@ -385,9 +388,10 @@ mod tests {
 
     fn draft_runtime_filter_graph() -> crate::sql::planner::distributed::DraftRuntimeFilterGraph {
         use crate::runtime_filter::model::contract::{
-            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
-            CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId, ReductionRequirement,
-            RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+            ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
+            PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
+            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
         };
         use crate::runtime_filter::model::coverage::Coverage;
         use crate::runtime_filter::model::graph::{
@@ -397,7 +401,7 @@ mod tests {
         };
         use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
         use crate::sql::planner::distributed::{
-            ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
+            ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
         };
 
         let channel_id = ChannelId::new(1);
@@ -417,14 +421,14 @@ mod tests {
                 channel_id,
                 logical_domain: RuntimeFilterLogicalDomain::Membership {
                     value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NeverMatches,
+                    null_semantics: NullSemantics::NullSafeEqual,
                 },
                 lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                availability_coverage: Coverage::Leaf(witness_id),
-                terminal_coverage: Coverage::Leaf(witness_id),
+                availability_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness_id)]),
+                terminal_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness_id)]),
                 reduction_requirement: ReductionRequirement::SetUnion,
                 allowed_contribution_kinds: BTreeSet::from([
-                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::FinalDomainShard,
                     ContributionKind::ProducerClosed,
                 ]),
                 required_consumer_capabilities: BTreeSet::from([
@@ -449,10 +453,12 @@ mod tests {
                 apply_point: ApplyPoint::NodeOutput,
                 role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                     contribution_kinds: BTreeSet::from([
-                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::FinalDomainShard,
                         ContributionKind::ProducerClosed,
                     ]),
-                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    completion_requirement: CompletionRequirement::FencedFinalDomain(
+                        CompletionFenceKind::CommittedDomainFrozen,
+                    ),
                     target:
                         crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
                             ordinal: 0,
@@ -473,8 +479,9 @@ mod tests {
                         ArtifactCapability::Membership,
                         ArtifactCapability::EmptyDomain,
                     ]),
-                    activation: ActivationConstraint::BlockingOrBatchLive {
-                        fallback: ActivationFallback::BlockingSnapshot,
+                    activation: ActivationConstraint::LiveOnly {
+                        late_apply: LateApplyGranularity::Batch,
+                        reason: RequiredLiveReason::FencedFinalDomainContract,
                     },
                     target: ConsumerBindingTarget::DirectInput { input_ordinal: 0 },
                 }),
@@ -593,6 +600,20 @@ mod tests {
 
         assert_eq!(prepared.runtime_filter_graph().channel_count(), 1);
         assert_eq!(prepared.runtime_filter_graph().binding_count(), 2);
+        let RuntimeFilterBindingRoleData::Consumer(consumer) = &prepared
+            .runtime_filter_graph()
+            .binding(BindingId::new(2))
+            .expect("sealed consumer binding")
+            .role
+        else {
+            panic!("binding 2 must remain a consumer");
+        };
+        assert_eq!(
+            consumer.activation,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            }
+        );
         assert_eq!(
             prepared
                 .runtime_filter_graph()

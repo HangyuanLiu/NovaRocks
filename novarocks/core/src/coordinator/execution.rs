@@ -3814,10 +3814,10 @@ mod native_contract_tests {
         use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
         use crate::runtime_filter::deployment::RuntimeFilterQueryDeploymentPolicy;
         use crate::runtime_filter::model::contract::{
-            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
-            CoverageWitnessId, LateApplyGranularity, NullSemantics, PlanFragmentId, PlanNodeId,
-            ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-            RuntimeFilterPolicyRequirement,
+            ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
+            PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
+            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
         };
         use crate::runtime_filter::model::coverage::Coverage;
         use crate::runtime_filter::model::graph::{
@@ -4086,14 +4086,14 @@ mod native_contract_tests {
                     channel_id,
                     logical_domain: RuntimeFilterLogicalDomain::Membership {
                         value_type: DataType::Int64,
-                        null_semantics: NullSemantics::NeverMatches,
+                        null_semantics: NullSemantics::NullSafeEqual,
                     },
                     lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                    availability_coverage: Coverage::Leaf(witness),
-                    terminal_coverage: Coverage::Leaf(witness),
+                    availability_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness)]),
+                    terminal_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness)]),
                     reduction_requirement: ReductionRequirement::SetUnion,
                     allowed_contribution_kinds: BTreeSet::from([
-                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::FinalDomainShard,
                         ContributionKind::ProducerClosed,
                     ]),
                     required_consumer_capabilities: BTreeSet::from([
@@ -4118,10 +4118,12 @@ mod native_contract_tests {
                     apply_point: ApplyPoint::NodeOutput,
                     role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                         contribution_kinds: BTreeSet::from([
-                            ContributionKind::ValueDomainDelta,
+                            ContributionKind::FinalDomainShard,
                             ContributionKind::ProducerClosed,
                         ]),
-                        completion_requirement: CompletionRequirement::ProducerClosed,
+                        completion_requirement: CompletionRequirement::FencedFinalDomain(
+                            CompletionFenceKind::CommittedDomainFrozen,
+                        ),
                         target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
                             ordinal: 0,
                         },

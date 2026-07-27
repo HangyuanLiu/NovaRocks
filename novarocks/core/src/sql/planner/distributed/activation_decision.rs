@@ -23,7 +23,8 @@ use std::cell::Cell;
 
 use crate::novarocks_logging::debug;
 use crate::runtime_filter::model::contract::{
-    BindingId, ChannelId, ConsumerActivation, LateApplyGranularity,
+    BindingId, ChannelId, ConsumerActivation, ContributionKind, LateApplyGranularity,
+    RuntimeFilterLogicalDomain,
 };
 #[cfg(test)]
 use crate::runtime_filter::model::graph::PlanLocation;
@@ -107,6 +108,12 @@ pub(super) enum ActivationDecisionReason {
 pub(super) enum ActivationDecisionError {
     DraftGraph(GraphValidationError),
     DraftPlan(RuntimeFilterPlanValidationError),
+    RequiredLiveReasonMismatch {
+        channel: ChannelId,
+        consumer_binding: BindingId,
+        declared: RequiredLiveReason,
+        expected: Option<RequiredLiveReason>,
+    },
     RefinedGraph(RefinedWaitGraphBuildError),
     DuplicateDecision(BindingId),
     MissingDecision(BindingId),
@@ -123,6 +130,17 @@ impl fmt::Display for ActivationDecisionError {
             Self::DraftPlan(error) => {
                 write!(formatter, "draft runtime-filter plan is invalid: {error}")
             }
+            Self::RequiredLiveReasonMismatch {
+                channel,
+                consumer_binding,
+                declared,
+                expected,
+            } => write!(
+                formatter,
+                "runtime-filter consumer binding={} on channel={} declares required-live reason {declared:?}, but the validated channel contract requires {expected:?}",
+                consumer_binding.get(),
+                channel.get(),
+            ),
             Self::RefinedGraph(error) => {
                 write!(
                     formatter,
@@ -185,6 +203,7 @@ impl ActivationDecisionPass {
             .map_err(ActivationDecisionError::DraftGraph)?;
         validate_runtime_filter_graph_against_plan(&draft, fragments)
             .map_err(ActivationDecisionError::DraftPlan)?;
+        validate_required_live_reasons(&draft)?;
         let join_progress = build_join_progress_proof_catalog(fragments, &draft);
         Self::decide_and_materialize(draft, fragments, edges, join_progress)
     }
@@ -201,6 +220,7 @@ impl ActivationDecisionPass {
             .map_err(ActivationDecisionError::DraftGraph)?;
         validate_runtime_filter_graph_against_plan(&draft, fragments)
             .map_err(ActivationDecisionError::DraftPlan)?;
+        validate_required_live_reasons(&draft)?;
         Self::decide_and_materialize(draft, fragments, edges, join_progress)
     }
 
@@ -366,6 +386,44 @@ impl ActivationDecisionPass {
     }
 }
 
+fn validate_required_live_reasons(
+    draft: &DraftRuntimeFilterGraph,
+) -> Result<(), ActivationDecisionError> {
+    for binding in draft.bindings() {
+        let RuntimeFilterBindingRoleData::Consumer(requirement) = &binding.role else {
+            continue;
+        };
+        let ActivationConstraint::LiveOnly { reason, .. } = requirement.activation else {
+            continue;
+        };
+        let channel = draft
+            .channel(binding.channel_id)
+            .expect("validated draft bindings reference an existing channel");
+        let expected = match &channel.logical_domain {
+            RuntimeFilterLogicalDomain::OrderedBound(_) => {
+                Some(RequiredLiveReason::OrderedBoundContract)
+            }
+            RuntimeFilterLogicalDomain::Membership { .. }
+                if channel
+                    .allowed_contribution_kinds
+                    .contains(&ContributionKind::FinalDomainShard) =>
+            {
+                Some(RequiredLiveReason::FencedFinalDomainContract)
+            }
+            RuntimeFilterLogicalDomain::Membership { .. } => None,
+        };
+        if expected != Some(reason) {
+            return Err(ActivationDecisionError::RequiredLiveReasonMismatch {
+                channel: binding.channel_id,
+                consumer_binding: binding.binding_id,
+                declared: reason,
+                expected,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn log_decisions(decisions: &ActivationDecisionCatalog) {
     for decision in decisions.values() {
         debug!(
@@ -387,10 +445,11 @@ mod tests {
 
     use super::*;
     use crate::runtime_filter::model::contract::{
-        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
+        ArtifactCapability, BindingId, ChannelId, ComparatorDigest, CompletionFenceKind,
+        CompletionRequirement, ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder,
+        NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
         ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-        RuntimeFilterPolicyRequirement,
+        RuntimeFilterPolicyRequirement, SortDirection,
     };
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::model::graph::{
@@ -567,6 +626,91 @@ mod tests {
         let mut graph = DraftRuntimeFilterGraph::default();
         for channel_id in channels {
             graph.insert_channel(channel(channel_id.get())).unwrap();
+        }
+        for binding in bindings {
+            graph.insert_binding(binding).unwrap();
+        }
+        graph
+    }
+
+    fn fenced_graph(
+        mut bindings: Vec<RuntimeFilterBindingSpecData<ActivationConstraint>>,
+    ) -> DraftRuntimeFilterGraph {
+        let channels: BTreeSet<ChannelId> =
+            bindings.iter().map(|binding| binding.channel_id).collect();
+        let mut graph = DraftRuntimeFilterGraph::default();
+        for channel_id in channels {
+            let mut channel = channel(channel_id.get());
+            channel.logical_domain = RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NullSafeEqual,
+            };
+            channel.availability_coverage =
+                Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+            channel.terminal_coverage =
+                Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+            channel.allowed_contribution_kinds = BTreeSet::from([
+                ContributionKind::FinalDomainShard,
+                ContributionKind::ProducerClosed,
+            ]);
+            graph.insert_channel(channel).unwrap();
+        }
+        for binding in &mut bindings {
+            if let RuntimeFilterBindingRoleData::Producer(requirement) = &mut binding.role {
+                requirement.contribution_kinds = BTreeSet::from([
+                    ContributionKind::FinalDomainShard,
+                    ContributionKind::ProducerClosed,
+                ]);
+                requirement.completion_requirement = CompletionRequirement::FencedFinalDomain(
+                    CompletionFenceKind::CommittedDomainFrozen,
+                );
+            }
+        }
+        for binding in bindings {
+            graph.insert_binding(binding).unwrap();
+        }
+        graph
+    }
+
+    fn ordered_graph(
+        mut bindings: Vec<RuntimeFilterBindingSpecData<ActivationConstraint>>,
+    ) -> DraftRuntimeFilterGraph {
+        let channels: BTreeSet<ChannelId> =
+            bindings.iter().map(|binding| binding.channel_id).collect();
+        let mut graph = DraftRuntimeFilterGraph::default();
+        for channel_id in channels {
+            let mut channel = channel(channel_id.get());
+            channel.logical_domain = RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
+                keys: vec![OrderKeyContract {
+                    data_type: DataType::Int64,
+                    direction: SortDirection::Ascending,
+                    null_order: NullOrder::Last,
+                }],
+                inclusive: true,
+                comparator_digest: ComparatorDigest::new([7; 32]),
+            });
+            channel.lifecycle = RuntimeFilterLifecycle::MonotonicUpdates;
+            channel.reduction_requirement = ReductionRequirement::TightenOrderedBound;
+            channel.allowed_contribution_kinds = BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]);
+            channel.required_consumer_capabilities =
+                BTreeSet::from([ArtifactCapability::OrderedRange]);
+            graph.insert_channel(channel).unwrap();
+        }
+        for binding in &mut bindings {
+            match &mut binding.role {
+                RuntimeFilterBindingRoleData::Producer(requirement) => {
+                    requirement.contribution_kinds = BTreeSet::from([
+                        ContributionKind::OrderedBoundUpdate,
+                        ContributionKind::ProducerClosed,
+                    ]);
+                }
+                RuntimeFilterBindingRoleData::Consumer(requirement) => {
+                    requirement.capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
+                }
+            }
         }
         for binding in bindings {
             graph.insert_binding(binding).unwrap();
@@ -783,7 +927,7 @@ mod tests {
     #[test]
     fn live_only_is_required_by_contract_with_requested_granularity() {
         let output = run_with_progress(
-            graph(vec![
+            fenced_graph(vec![
                 producer(100, 7, 2, 10),
                 consumer_with(
                     10,
@@ -810,6 +954,70 @@ mod tests {
             output.decisions[&BindingId::new(10)].reason,
             ActivationDecisionReason::RequiredByContract {
                 reason: RequiredLiveReason::FencedFinalDomainContract,
+            }
+        );
+    }
+
+    #[test]
+    fn ordinary_membership_cannot_claim_fenced_final_domain_contract() {
+        let result = run_with_progress(
+            graph(vec![
+                producer(100, 7, 2, 10),
+                consumer_with(
+                    10,
+                    7,
+                    1,
+                    ActivationConstraint::LiveOnly {
+                        late_apply: LateApplyGranularity::Batch,
+                        reason: RequiredLiveReason::FencedFinalDomainContract,
+                    },
+                ),
+            ]),
+            &[edge(2, 1, 20)],
+            JoinBuildProgressCatalog::new(),
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            ActivationDecisionError::RequiredLiveReasonMismatch {
+                channel: ChannelId::new(7),
+                consumer_binding: BindingId::new(10),
+                declared: RequiredLiveReason::FencedFinalDomainContract,
+                expected: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ordered_bound_accepts_ordered_live_contract_provenance() {
+        let output = run_with_progress(
+            ordered_graph(vec![
+                producer(100, 7, 2, 10),
+                consumer_with(
+                    10,
+                    7,
+                    1,
+                    ActivationConstraint::LiveOnly {
+                        late_apply: LateApplyGranularity::RowGroup,
+                        reason: RequiredLiveReason::OrderedBoundContract,
+                    },
+                ),
+            ]),
+            &[edge(2, 1, 20)],
+            JoinBuildProgressCatalog::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            activation(&output, 10),
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::RowGroup,
+            }
+        );
+        assert_eq!(
+            output.decisions[&BindingId::new(10)].reason,
+            ActivationDecisionReason::RequiredByContract {
+                reason: RequiredLiveReason::OrderedBoundContract,
             }
         );
     }
