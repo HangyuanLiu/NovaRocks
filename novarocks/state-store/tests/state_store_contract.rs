@@ -26,18 +26,22 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use novarocks_spi::state_store::{
+    ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
+    ContinuationToken, Direction, Key, KeyRange, Precondition, RangePage, RangeRequest,
+    ReadTransaction, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
+    StateStoreOperation, StateStoreOutcome, StoreIdentity, StoreRevision, TransactionId, Value,
+    VersionToken, WriteTransaction,
+};
 use novarocks_state_store::coordination::{
     AttemptId, ControlPlaneIncarnation, FencingToken, HolderId, ResourceEpoch, ResourceKey,
 };
+use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{
-    ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
-    ContinuationToken, Direction, FeDeploymentView, FoundationDbClientConfig, Key, KeyRange,
-    MySqlClientConfig, MySqlTlsMode, OperationId, Precondition, RangePage, RangeRequest,
-    ReadTransaction, RunFailure, StateStore, StateStoreAppConfig, StateStoreConfig,
-    StateStoreError, StateStoreErrorKind, StateStoreLimitOverrides, StateStoreLimits,
-    StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StateStoreProviderConfig,
-    StateStoreRuntime, StoreIdentity, StoreRevision, TransactionId, Value, VersionToken,
-    WriteTransaction, derive_transaction_id, open_state_store, run_side_effect_free,
+    FeDeploymentView, FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, OperationId,
+    RunFailure, StateStoreAppConfig, StateStoreConfig, StateStoreLimitOverrides,
+    StateStoreProviderConfig, StateStoreRuntime, derive_transaction_id, open_state_store,
+    run_side_effect_free,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -472,7 +476,7 @@ impl ReadTransaction for ScriptedWriteTransaction {
     async fn get(
         &mut self,
         _key: &Key,
-    ) -> Result<Option<novarocks_state_store::StateRecord>, StateStoreError> {
+    ) -> Result<Option<novarocks_spi::state_store::StateRecord>, StateStoreError> {
         unreachable!("runner tests do not read")
     }
 
@@ -553,7 +557,7 @@ impl StateStore for ScriptedStore {
         &self.limits
     }
 
-    fn metrics_snapshot(&self) -> novarocks_state_store::StateStoreMetricsSnapshot {
+    fn metrics_snapshot(&self) -> novarocks_spi::state_store::StateStoreMetricsSnapshot {
         self.metrics.snapshot()
     }
 
@@ -842,7 +846,7 @@ fn contract_codecs_reject_malformed_and_mismatched_tokens() {
     let mut trailing = token.as_bytes().to_vec();
     trailing.push(0);
     assert_eq!(
-        novarocks_state_store::ContinuationToken::try_from(Bytes::from(trailing))
+        novarocks_spi::state_store::ContinuationToken::try_from(Bytes::from(trailing))
             .expect("opaque token")
             .resume_after(&request)
             .expect_err("trailing bytes")

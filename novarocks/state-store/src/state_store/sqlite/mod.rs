@@ -29,12 +29,15 @@ use fs2::FileExt;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags};
 
-use crate::state_store::{
-    ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction, StateStore,
-    StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetrics,
-    StateStoreMetricsSnapshot, StateStoreProviderConfig, StoreIdentity, TransactionId,
-    WriteTransaction,
+use novarocks_spi::state_store::{
+    ChangePage, ChangePollRequest, CommitResolution, MAX_KEY_BYTES, ReadTransaction, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    StoreIdentity, TransactionId, WriteTransaction,
 };
+
+use crate::state_store::limits::resolve_state_store_limits;
+use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::{FeDeploymentView, StateStoreConfig, StateStoreProviderConfig};
 
 pub(super) struct SqliteStateStore {
     pub(super) path: PathBuf,
@@ -151,7 +154,7 @@ impl SqliteStateStore {
                 "SQLite state store requires a persistent file path",
             ));
         }
-        let limits = StateStoreLimits::from_overrides(&config.limits).map_err(|_| {
+        let limits = resolve_state_store_limits(&config.limits, MAX_KEY_BYTES).map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "SQLite state store limits are invalid",
@@ -441,9 +444,9 @@ mod tests {
 
     use super::*;
     use crate::state_store::{
-        FeDeploymentView, StateStoreConfig, StateStoreErrorKind, StateStoreLimitOverrides,
-        StateStoreProviderConfig,
+        FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
     };
+    use novarocks_spi::state_store::StateStoreErrorKind;
 
     fn runtime() -> Runtime {
         Builder::new_multi_thread()
@@ -485,7 +488,7 @@ mod tests {
         runtime: &Runtime,
         config: StateStoreConfig,
         deployment: FeDeploymentView,
-    ) -> crate::state_store::StateStoreError {
+    ) -> novarocks_spi::state_store::StateStoreError {
         runtime.block_on(async {
             match SqliteStateStore::open(config, deployment).await {
                 Ok(_) => panic!("SQLite open unexpectedly succeeded"),

@@ -19,8 +19,9 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use novarocks_spi::state_store::{Key, StateStoreError, StateStoreErrorKind};
+
 use super::super::limits::MYSQL_MAX_KEY_BYTES;
-use super::super::{Key, StateStoreError, StateStoreErrorKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum DurableCommitState {
@@ -167,10 +168,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DurableCommitState, MysqlCodec, redacted_identity_hash};
-    use crate::state_store::StateStoreErrorKind;
+    use novarocks_spi::state_store::StateStoreErrorKind;
 
     fn assert_corruption<T: std::fmt::Debug>(
-        result: Result<T, crate::state_store::StateStoreError>,
+        result: Result<T, novarocks_spi::state_store::StateStoreError>,
     ) {
         assert_eq!(
             result

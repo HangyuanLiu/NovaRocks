@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::{StateStoreError, StateStoreErrorKind};
 use mysql_async::{DriverError, Error, IoError, TlsError};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
 
 #[derive(Clone, Copy)]
 enum MysqlTlsErrorClass {

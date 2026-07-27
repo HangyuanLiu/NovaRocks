@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state_store::{Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits};
+use novarocks_spi::state_store::{
+    Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits,
+};
 
 const RECORD_TAG_BYTES: usize = 1;
 const RECORD_ENVELOPE_BYTES: usize = 1 + 16;
@@ -220,14 +222,18 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::state_store::{StateStoreLimitOverrides, VersionToken};
+    use crate::state_store::StateStoreLimitOverrides;
+    use novarocks_spi::state_store::VersionToken;
 
     fn limits(bytes: usize, operations: usize) -> StateStoreLimits {
-        StateStoreLimits::from_overrides(&StateStoreLimitOverrides {
-            max_transaction_bytes: Some(bytes),
-            max_transaction_operations: Some(operations),
-            ..Default::default()
-        })
+        crate::state_store::limits::resolve_state_store_limits(
+            &StateStoreLimitOverrides {
+                max_transaction_bytes: Some(bytes),
+                max_transaction_operations: Some(operations),
+                ..Default::default()
+            },
+            novarocks_spi::state_store::MAX_KEY_BYTES,
+        )
         .expect("test limits")
     }
 

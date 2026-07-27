@@ -21,19 +21,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use novarocks_spi::state_store::{
+    ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, Precondition, RangePage,
+    RangeRequest, ReadTransaction, STATE_STORE_OUTCOME_COUNT, StateRecord, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    StateStoreOperation, StoreIdentity, TransactionId, Value, WriteTransaction,
+};
 use novarocks_state_store::coordination::{
     AcquireOutcome, AttemptId, ClockHealth, ControlPlaneMode, CoordinationError,
     CoordinationErrorKind, CoordinationMetrics, CoordinationOperation, CoordinationOutcome,
     HolderId, IncarnationGate, LeaseCancellationReason, LeaseClock, LeaseGuard, LeaseManager,
     LeaseSettings, ResourceKey,
 };
-use novarocks_state_store::{
-    ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, OperationId, Precondition,
-    RangePage, RangeRequest, ReadTransaction, STATE_STORE_OUTCOME_COUNT, StateRecord, StateStore,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-    StateStoreOperation, StoreIdentity, TransactionId, Value, WriteTransaction,
-    derive_transaction_id,
-};
+use novarocks_state_store::{OperationId, derive_transaction_id};
 use sha2::{Digest, Sha256};
 use tokio::sync::Barrier;
 use uuid::Uuid;

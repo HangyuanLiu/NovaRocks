@@ -17,7 +17,9 @@
 
 use std::mem::size_of;
 
-use crate::state_store::{Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits};
+use novarocks_spi::state_store::{
+    Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits,
+};
 
 const MUTATION_KIND_BYTES: usize = 1;
 const PRECONDITION_KIND_BYTES: usize = 1;
@@ -151,7 +153,9 @@ mod tests {
     use super::{
         TRANSACTION_ENVELOPE_BYTES, TransactionBudget, accounted_delete_bytes, accounted_put_bytes,
     };
-    use crate::state_store::{Precondition, StateStoreErrorKind, StateStoreLimits, VersionToken};
+    use novarocks_spi::state_store::{
+        Precondition, StateStoreErrorKind, StateStoreLimits, VersionToken,
+    };
 
     fn limits(bytes: usize, operations: usize) -> StateStoreLimits {
         StateStoreLimits {

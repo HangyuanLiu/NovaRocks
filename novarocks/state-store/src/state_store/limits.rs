@@ -15,20 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::time::Duration;
-
 use anyhow::{Result, bail};
+use novarocks_spi::state_store::{
+    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS,
+    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
+};
 use serde::Deserialize;
 
-pub const MAX_KEY_BYTES: usize = 8 * 1024;
-pub const MYSQL_MAX_KEY_BYTES: usize = 3072;
-pub const MYSQL_MAX_META_VALUE_BYTES: usize = 4096;
-pub const MAX_VALUE_BYTES: usize = 64 * 1024;
-pub const MAX_PAGE_SIZE: usize = 1_000;
-pub const MAX_TRANSACTION_OPERATIONS: usize = 10_000;
-pub const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
-pub const DEFAULT_TRANSACTION_DEADLINE: Duration = Duration::from_secs(4);
-pub const MAX_RUNNER_ATTEMPTS: usize = 5;
+pub(crate) const MYSQL_MAX_KEY_BYTES: usize = 3072;
+pub(crate) const MYSQL_MAX_META_VALUE_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -42,84 +37,49 @@ pub struct StateStoreLimitOverrides {
     pub runner_max_attempts: Option<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StateStoreLimits {
-    pub max_key_bytes: usize,
-    pub max_value_bytes: usize,
-    pub max_page_size: usize,
-    pub max_transaction_operations: usize,
-    pub max_transaction_bytes: usize,
-    pub transaction_deadline: Duration,
-    pub runner_max_attempts: usize,
-}
-
-impl StateStoreLimits {
-    pub fn from_overrides(overrides: &StateStoreLimitOverrides) -> Result<Self> {
-        Self::from_overrides_with_max_key(overrides, MAX_KEY_BYTES)
+pub(crate) fn resolve_state_store_limits(
+    overrides: &StateStoreLimitOverrides,
+    provider_max_key_bytes: usize,
+) -> Result<StateStoreLimits> {
+    if provider_max_key_bytes == 0 || provider_max_key_bytes > MAX_KEY_BYTES {
+        bail!(
+            "InvalidStateStoreConfig: provider_max_key_bytes must be between 1 and {MAX_KEY_BYTES}, got {provider_max_key_bytes}"
+        );
     }
-
-    pub fn from_overrides_with_max_key(
-        overrides: &StateStoreLimitOverrides,
-        provider_max_key_bytes: usize,
-    ) -> Result<Self> {
-        if provider_max_key_bytes == 0 || provider_max_key_bytes > MAX_KEY_BYTES {
-            bail!(
-                "InvalidStateStoreConfig: provider_max_key_bytes must be between 1 and {MAX_KEY_BYTES}, got {provider_max_key_bytes}"
-            );
-        }
-        let transaction_deadline_ms = tightened_u64(
-            "transaction_deadline_ms",
-            overrides.transaction_deadline_ms,
-            DEFAULT_TRANSACTION_DEADLINE.as_millis() as u64,
-        )?;
-        Ok(Self {
-            max_key_bytes: tightened_usize(
-                "max_key_bytes",
-                overrides.max_key_bytes,
-                provider_max_key_bytes,
-            )?,
-            max_value_bytes: tightened_usize(
-                "max_value_bytes",
-                overrides.max_value_bytes,
-                MAX_VALUE_BYTES,
-            )?,
-            max_page_size: tightened_usize(
-                "max_page_size",
-                overrides.max_page_size,
-                MAX_PAGE_SIZE,
-            )?,
-            max_transaction_operations: tightened_usize(
-                "max_transaction_operations",
-                overrides.max_transaction_operations,
-                MAX_TRANSACTION_OPERATIONS,
-            )?,
-            max_transaction_bytes: tightened_usize(
-                "max_transaction_bytes",
-                overrides.max_transaction_bytes,
-                MAX_TRANSACTION_BYTES,
-            )?,
-            transaction_deadline: Duration::from_millis(transaction_deadline_ms),
-            runner_max_attempts: tightened_usize(
-                "runner_max_attempts",
-                overrides.runner_max_attempts,
-                MAX_RUNNER_ATTEMPTS,
-            )?,
-        })
-    }
-}
-
-impl Default for StateStoreLimits {
-    fn default() -> Self {
-        Self {
-            max_key_bytes: MAX_KEY_BYTES,
-            max_value_bytes: MAX_VALUE_BYTES,
-            max_page_size: MAX_PAGE_SIZE,
-            max_transaction_operations: MAX_TRANSACTION_OPERATIONS,
-            max_transaction_bytes: MAX_TRANSACTION_BYTES,
-            transaction_deadline: DEFAULT_TRANSACTION_DEADLINE,
-            runner_max_attempts: MAX_RUNNER_ATTEMPTS,
-        }
-    }
+    let deadline_ms = tightened_u64(
+        "transaction_deadline_ms",
+        overrides.transaction_deadline_ms,
+        DEFAULT_TRANSACTION_DEADLINE.as_millis() as u64,
+    )?;
+    Ok(StateStoreLimits {
+        max_key_bytes: tightened_usize(
+            "max_key_bytes",
+            overrides.max_key_bytes,
+            provider_max_key_bytes,
+        )?,
+        max_value_bytes: tightened_usize(
+            "max_value_bytes",
+            overrides.max_value_bytes,
+            MAX_VALUE_BYTES,
+        )?,
+        max_page_size: tightened_usize("max_page_size", overrides.max_page_size, MAX_PAGE_SIZE)?,
+        max_transaction_operations: tightened_usize(
+            "max_transaction_operations",
+            overrides.max_transaction_operations,
+            MAX_TRANSACTION_OPERATIONS,
+        )?,
+        max_transaction_bytes: tightened_usize(
+            "max_transaction_bytes",
+            overrides.max_transaction_bytes,
+            MAX_TRANSACTION_BYTES,
+        )?,
+        transaction_deadline: std::time::Duration::from_millis(deadline_ms),
+        runner_max_attempts: tightened_usize(
+            "runner_max_attempts",
+            overrides.runner_max_attempts,
+            MAX_RUNNER_ATTEMPTS,
+        )?,
+    })
 }
 
 fn tightened_usize(name: &str, override_value: Option<usize>, maximum: usize) -> Result<usize> {
@@ -146,8 +106,9 @@ mod tests {
 
     #[test]
     fn state_store_limits_use_fixed_contract_defaults() {
-        let limits = StateStoreLimits::from_overrides(&StateStoreLimitOverrides::default())
-            .expect("common limits");
+        let limits =
+            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MAX_KEY_BYTES)
+                .expect("common limits");
 
         assert_eq!(limits.max_key_bytes, MAX_KEY_BYTES);
         assert_eq!(limits.max_value_bytes, MAX_VALUE_BYTES);
@@ -173,7 +134,7 @@ mod tests {
             runner_max_attempts: Some(2),
         };
 
-        let limits = StateStoreLimits::from_overrides(&overrides).expect("tighter limits");
+        let limits = resolve_state_store_limits(&overrides, MAX_KEY_BYTES).expect("tighter limits");
 
         assert_eq!(limits.max_key_bytes, 1024);
         assert_eq!(limits.max_value_bytes, 2048);
@@ -290,7 +251,7 @@ mod tests {
         ];
 
         for (field, overrides) in invalid {
-            let error = StateStoreLimits::from_overrides(&overrides)
+            let error = resolve_state_store_limits(&overrides, MAX_KEY_BYTES)
                 .expect_err("zero or relaxed limits must fail closed");
             let message = error.to_string();
             assert!(message.contains("InvalidStateStoreConfig"), "{message}");
@@ -300,18 +261,16 @@ mod tests {
 
     #[test]
     fn mysql_effective_key_limit_defaults_to_3072() {
-        let limits = StateStoreLimits::from_overrides_with_max_key(
-            &StateStoreLimitOverrides::default(),
-            MYSQL_MAX_KEY_BYTES,
-        )
-        .expect("MySQL effective limits");
+        let limits =
+            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MYSQL_MAX_KEY_BYTES)
+                .expect("MySQL effective limits");
 
         assert_eq!(limits.max_key_bytes, 3072);
     }
 
     #[test]
     fn mysql_effective_key_limit_rejects_3073_before_io() {
-        let error = StateStoreLimits::from_overrides_with_max_key(
+        let error = resolve_state_store_limits(
             &StateStoreLimitOverrides {
                 max_key_bytes: Some(3073),
                 ..StateStoreLimitOverrides::default()
@@ -328,18 +287,15 @@ mod tests {
 
     #[test]
     fn mysql_limit_does_not_change_sqlite_or_foundationdb() {
-        let common = StateStoreLimits::from_overrides(&StateStoreLimitOverrides::default())
-            .expect("common provider limits");
-        let explicit_common = StateStoreLimits::from_overrides_with_max_key(
-            &StateStoreLimitOverrides::default(),
-            MAX_KEY_BYTES,
-        )
-        .expect("explicit common provider limits");
-        let mysql = StateStoreLimits::from_overrides_with_max_key(
-            &StateStoreLimitOverrides::default(),
-            MYSQL_MAX_KEY_BYTES,
-        )
-        .expect("MySQL effective limits");
+        let common =
+            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MAX_KEY_BYTES)
+                .expect("common provider limits");
+        let explicit_common =
+            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MAX_KEY_BYTES)
+                .expect("explicit common provider limits");
+        let mysql =
+            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MYSQL_MAX_KEY_BYTES)
+                .expect("MySQL effective limits");
 
         assert_eq!(common.max_key_bytes, MAX_KEY_BYTES);
         assert_eq!(explicit_common, common);

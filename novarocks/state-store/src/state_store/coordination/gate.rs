@@ -17,9 +17,10 @@
 
 use std::sync::Arc;
 
-use crate::{
-    Key, OperationId, Precondition, StateRecord, StateStore, StateStoreLimits, StoreIdentity,
-    TransactionId, Value, WriteTransaction,
+use crate::OperationId;
+use novarocks_spi::state_store::{
+    Key, Precondition, StateRecord, StateStore, StateStoreLimits, StoreIdentity, TransactionId,
+    Value, WriteTransaction,
 };
 
 use super::codec::{ControlRecord, control_storage_key, decode_control, encode_control};
@@ -565,7 +566,7 @@ fn validate_write_limits(
     limits: &StateStoreLimits,
     key: &Key,
     value: &Value,
-    expected_version: Option<&crate::VersionToken>,
+    expected_version: Option<&novarocks_spi::state_store::VersionToken>,
 ) -> Result<(), CoordinationError> {
     if expected_version.is_some() {
         validate_write_limits_with_read_keys(
@@ -584,7 +585,7 @@ pub(crate) fn validate_write_limits_with_read_keys(
     limits: &StateStoreLimits,
     key: &Key,
     value: &Value,
-    expected_version: Option<&crate::VersionToken>,
+    expected_version: Option<&novarocks_spi::state_store::VersionToken>,
     additional_read_key_bytes: &[usize],
 ) -> Result<(), CoordinationError> {
     if key.as_bytes().len() > limits.max_key_bytes
@@ -735,12 +736,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{IncarnationGate, coordination_transaction_upper_bound, validate_write_limits};
+    use crate::OperationId;
     use crate::coordination::CoordinationErrorKind;
-    use crate::{
-        ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, OperationId,
-        Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
-        StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-        StoreIdentity, TransactionId, Value, VersionToken, WriteTransaction,
+    use novarocks_spi::state_store::{
+        ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, Precondition,
+        RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError,
+        StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity,
+        TransactionId, Value, VersionToken, WriteTransaction,
     };
 
     fn complete_v1_write_budget(

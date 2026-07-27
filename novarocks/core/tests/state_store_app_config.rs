@@ -20,9 +20,9 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use novarocks::common::app_config::NovaRocksConfig;
+use novarocks_spi::state_store::StateStoreErrorKind;
 use novarocks_state_store::{
-    FeDeploymentView, MySqlTlsMode, StateStoreErrorKind, StateStoreProviderConfig,
-    StateStoreRuntime, open_state_store,
+    FeDeploymentView, MySqlTlsMode, StateStoreProviderConfig, StateStoreRuntime, open_state_store,
 };
 use uuid::Uuid;
 

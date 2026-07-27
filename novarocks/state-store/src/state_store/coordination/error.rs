@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use crate::{StateStoreError, StateStoreErrorKind, TransactionId};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind, TransactionId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CoordinationErrorKind {
@@ -177,7 +177,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::CoordinationError;
-    use crate::{StateStoreError, StateStoreErrorKind, TransactionId};
+    use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind, TransactionId};
 
     fn transaction_id() -> TransactionId {
         TransactionId::from(Uuid::now_v7())

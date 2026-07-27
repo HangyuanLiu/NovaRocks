@@ -23,7 +23,7 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use super::codec::{KeyspaceCodec, REVISION_BYTES};
-use crate::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_AUTHORITATIVE_READ_ATTEMPTS: usize = 5;
@@ -264,8 +264,8 @@ mod tests {
         IdentityCommitErrorDisposition, IdentityRead, classify_identity_commit_error,
         decode_identity_values,
     };
-    use crate::state_store::StateStoreErrorKind;
     use crate::state_store::foundationdb::codec::KeyspaceCodec;
+    use novarocks_spi::state_store::StateStoreErrorKind;
 
     fn codec() -> KeyspaceCodec {
         KeyspaceCodec::new(Uuid::from_bytes([0x11; 16]))

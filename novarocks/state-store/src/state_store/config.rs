@@ -25,8 +25,10 @@ use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
 use super::limits::{
-    MYSQL_MAX_KEY_BYTES, MYSQL_MAX_META_VALUE_BYTES, StateStoreLimitOverrides, StateStoreLimits,
+    MYSQL_MAX_KEY_BYTES, MYSQL_MAX_META_VALUE_BYTES, StateStoreLimitOverrides,
+    resolve_state_store_limits,
 };
+use novarocks_spi::state_store::MAX_KEY_BYTES;
 
 const MYSQL_MAX_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const MYSQL_MAX_INACTIVE_CONNECTION_TTL_MS: u64 = 86_400_000;
@@ -159,11 +161,11 @@ impl StateStoreConfig {
                 if deployment_owner.trim().is_empty() {
                     bail!("InvalidStateStoreConfig: deployment_owner must not be empty");
                 }
-                StateStoreLimits::from_overrides(&self.limits)?;
+                resolve_state_store_limits(&self.limits, MAX_KEY_BYTES)?;
             }
             StateStoreProviderConfig::Foundationdb { cluster_file, .. } => {
                 validate_readable_file(cluster_file, "cluster_file")?;
-                StateStoreLimits::from_overrides(&self.limits)?;
+                resolve_state_store_limits(&self.limits, MAX_KEY_BYTES)?;
             }
             StateStoreProviderConfig::Mysql { database } => {
                 if self.cluster_id.len() > MYSQL_MAX_META_VALUE_BYTES {
@@ -181,7 +183,7 @@ impl StateStoreConfig {
                         "InvalidStateStoreConfig: database must match ASCII [A-Za-z0-9_]{{1,64}}"
                     );
                 }
-                StateStoreLimits::from_overrides_with_max_key(&self.limits, MYSQL_MAX_KEY_BYTES)?;
+                resolve_state_store_limits(&self.limits, MYSQL_MAX_KEY_BYTES)?;
             }
         }
         Ok(())

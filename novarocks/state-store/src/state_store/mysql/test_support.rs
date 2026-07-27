@@ -16,11 +16,13 @@
 // under the License.
 
 #[cfg(feature = "state-store-test-hooks")]
-use super::super::{
-    ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, Key, Precondition,
-    StateStore, TransactionId, Value,
+use novarocks_spi::state_store::{
+    ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,
+    Precondition, StateRecord, StateStore, StoreRevision, TransactionId, Value,
 };
-use super::super::{StateStoreError, StateStoreErrorKind, StateStoreRuntime};
+use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+
+use super::super::StateStoreRuntime;
 use super::client::MysqlPoolConnection;
 #[cfg(feature = "state-store-test-hooks")]
 use bytes::Bytes;
@@ -139,14 +141,14 @@ impl MysqlWriteTestApi {
     pub fn put_accounted_bytes(
         key: &[u8],
         value: &[u8],
-        precondition: &super::super::Precondition,
+        precondition: &Precondition,
     ) -> Result<usize, StateStoreError> {
         super::budget::accounted_put_bytes(key, value, precondition)
     }
 
     pub fn delete_accounted_bytes(
         key: &[u8],
-        precondition: &super::super::Precondition,
+        precondition: &Precondition,
     ) -> Result<usize, StateStoreError> {
         super::budget::accounted_delete_bytes(key, precondition)
     }
@@ -305,9 +307,7 @@ impl MysqlChangeTestApi {
                 }
                 let future = ChangeCursor::new(
                     identity.store_id,
-                    super::super::StoreRevision::try_from(Bytes::copy_from_slice(
-                        &1_u64.to_be_bytes(),
-                    ))?,
+                    StoreRevision::try_from(Bytes::copy_from_slice(&1_u64.to_be_bytes()))?,
                     u32::MAX,
                 )?;
                 if store
@@ -350,9 +350,7 @@ impl MysqlChangeTestApi {
                     .map_err(super::error::MysqlNativeError::into_public)?;
                 let zero_change = ChangeCursor::new(
                     identity.store_id,
-                    super::super::StoreRevision::try_from(Bytes::copy_from_slice(
-                        &2_u64.to_be_bytes(),
-                    ))?,
+                    StoreRevision::try_from(Bytes::copy_from_slice(&2_u64.to_be_bytes()))?,
                     u32::MAX,
                 )?;
                 let page = store
@@ -1157,7 +1155,7 @@ impl MysqlPostDispatchTestControl {
 async fn commit_keys(
     store: &Arc<dyn StateStore>,
     rows: &[(&[u8], &[u8])],
-) -> Result<super::super::CommitReceipt, StateStoreError> {
+) -> Result<CommitReceipt, StateStoreError> {
     let mut writer = store
         .begin_write(
             TransactionId::from(Uuid::now_v7()),
@@ -1177,7 +1175,7 @@ async fn commit_keys(
 }
 
 #[cfg(feature = "state-store-test-hooks")]
-fn committed(outcome: CommitOutcome) -> Result<super::super::CommitReceipt, StateStoreError> {
+fn committed(outcome: CommitOutcome) -> Result<CommitReceipt, StateStoreError> {
     match outcome {
         CommitOutcome::Committed(receipt) => Ok(receipt),
         CommitOutcome::Conflict(error)
@@ -1191,7 +1189,7 @@ fn committed(outcome: CommitOutcome) -> Result<super::super::CommitReceipt, Stat
 async fn read_key(
     store: &Arc<dyn StateStore>,
     key_bytes: &[u8],
-) -> Result<Option<super::super::StateRecord>, StateStoreError> {
+) -> Result<Option<StateRecord>, StateStoreError> {
     let mut reader = store.begin_read().await?;
     let record = reader
         .get(&Key::try_from(Bytes::copy_from_slice(key_bytes))?)

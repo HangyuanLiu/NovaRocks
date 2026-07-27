@@ -29,7 +29,7 @@ use tokio::time::{Instant, timeout_at};
 use super::client::{MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection};
 use super::codec::MysqlCodec;
 use super::identity::MysqlIdentitySnapshot;
-use crate::state_store::{
+use novarocks_spi::state_store::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, StateStoreError, StateStoreErrorKind,
     StateStoreLimits, StoreRevision,
 };
@@ -311,7 +311,7 @@ fn build_page(
     identity: &MysqlIdentitySnapshot,
     high_revision: u64,
     cursor: ChangePosition,
-    rows: Vec<(ChangePosition, crate::state_store::Key)>,
+    rows: Vec<(ChangePosition, novarocks_spi::state_store::Key)>,
     resync_required: bool,
 ) -> Result<ChangePage, StateStoreError> {
     let high_watermark = revision(high_revision)?;

@@ -28,13 +28,17 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use super::test_support::MysqlCommitTestApi;
-use crate::state_store::limits::{MAX_VALUE_BYTES, MYSQL_MAX_KEY_BYTES};
+use novarocks_spi::state_store::MAX_VALUE_BYTES;
+
+use crate::state_store::limits::MYSQL_MAX_KEY_BYTES;
 use crate::state_store::{
+    FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
+    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+};
+use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
-    Direction as StoreDirection, FeDeploymentView, Key, KeyRange, MySqlClientConfig, MySqlTlsMode,
-    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, StateStoreConfig,
-    StateStoreError, StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime,
-    TransactionId, Value, VersionToken, WriteTransaction, open_state_store,
+    Direction as StoreDirection, Key, KeyRange, Precondition as StorePrecondition, RangeRequest,
+    StateRecord, StateStore, StateStoreError, TransactionId, Value, VersionToken, WriteTransaction,
 };
 
 const MAX_LINE_BYTES: usize = 160 * 1024;

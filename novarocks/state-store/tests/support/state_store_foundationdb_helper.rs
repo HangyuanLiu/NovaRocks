@@ -21,11 +21,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use novarocks_spi::state_store::{
+    CommitOutcome, CommitResolution, Key, KeyRange, Precondition as StorePrecondition,
+    RangeRequest, StateRecord, StateStore, TransactionId, Value, VersionToken, WriteTransaction,
+};
 use novarocks_state_store::{
-    CommitOutcome, CommitResolution, FeDeploymentView, FoundationDbClientConfig, Key, KeyRange,
-    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, StateStoreConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, TransactionId, Value,
-    VersionToken, WriteTransaction, arm_next_foundationdb_commit, open_state_store,
+    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreLimitOverrides,
+    StateStoreProviderConfig, StateStoreRuntime, arm_next_foundationdb_commit, open_state_store,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -444,8 +446,8 @@ impl HelperState {
             range: KeyRange::new(store_key(raw_start)?, store_key(raw_end)?)
                 .map_err(display_error)?,
             direction: match direction {
-                Direction::Forward => novarocks_state_store::Direction::Forward,
-                Direction::Reverse => novarocks_state_store::Direction::Reverse,
+                Direction::Forward => novarocks_spi::state_store::Direction::Forward,
+                Direction::Reverse => novarocks_spi::state_store::Direction::Reverse,
             },
             page_size,
             continuation: None,

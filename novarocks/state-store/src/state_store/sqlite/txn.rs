@@ -27,12 +27,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rusqlite::{Connection, InterruptHandle, OptionalExtension, ffi, params};
 
-use crate::state_store::{
+use novarocks_spi::state_store::{
     CommitOutcome, CommitReceipt, CommitResolution, Key, Precondition, RangePage, RangeRequest,
     ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value, VersionToken,
+    WriteTransaction,
 };
+
+use crate::state_store::metrics::StateStoreMetrics;
 
 use super::{SqliteStateStore, open_connection, schema};
 
@@ -1835,9 +1837,11 @@ mod tests {
     use super::*;
     use crate::state_store::sqlite::SqliteStateStore;
     use crate::state_store::{
-        CommitOutcome, CommitReceipt, CommitResolution, Direction, FeDeploymentView, Key, KeyRange,
-        Precondition, RangeRequest, StateRecord, StateStoreConfig, StateStoreErrorKind,
-        StateStoreLimitOverrides, StateStoreProviderConfig, TransactionId, Value, VersionToken,
+        FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+    };
+    use novarocks_spi::state_store::{
+        CommitOutcome, CommitReceipt, CommitResolution, Direction, Key, KeyRange, Precondition,
+        RangeRequest, StateRecord, StateStoreErrorKind, TransactionId, Value, VersionToken,
     };
 
     fn key(value: &'static [u8]) -> Key {

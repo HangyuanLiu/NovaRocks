@@ -41,12 +41,14 @@ use async_trait::async_trait;
 use tokio::time::Instant;
 
 use self::identity::MysqlIdentitySnapshot;
-use super::runtime::MysqlProviderHandle;
-use super::{
+use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot,
-    StoreIdentity, TransactionId, WriteTransaction,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
+    WriteTransaction,
 };
+
+use super::metrics::StateStoreMetrics;
+use super::runtime::MysqlProviderHandle;
 
 pub(super) struct MysqlStateStore {
     lease: MysqlProviderHandle,
