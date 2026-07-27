@@ -72,6 +72,20 @@ fn continuation_is_bound_to_range_and_direction() {
             .kind(),
         StateStoreErrorKind::InvalidRequest
     );
+
+    let wrong_range = RangeRequest {
+        range: KeyRange::new(key(b"a"), key(b"y")).expect("different valid range"),
+        direction: Direction::Forward,
+        page_size: 10,
+        continuation: Some(request.continuation_after(&key(b"m")).expect("continuation")),
+    };
+    assert_eq!(
+        wrong_range
+            .validate(&StateStoreLimits::default())
+            .expect_err("range mismatch")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
 }
 
 #[test]
