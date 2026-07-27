@@ -30,7 +30,6 @@ use crate::coordinator::prepare::scan::{
     ScanExecutionBindings,
 };
 use crate::protocol::native::encode::plan as native_plan;
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::DataPartition;
@@ -53,7 +52,10 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
         write_default: None,
         logical_type: None,
     };
-    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
+    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
+        &plan,
+        Default::default(),
+    );
     root_scan_for_test(&mut plan)
         .table
         .columns
@@ -154,7 +156,10 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
 #[test]
 fn ordinary_iceberg_binding_preserves_existing_encoding() {
     let plan = iceberg_delta_distributed_plan_for_test();
-    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
+    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
+        &plan,
+        Default::default(),
+    );
     let scan = root_scan_for_test(&mut plan);
     scan.table.columns.push(column_def_for_test(
         "unprojected_payload",
@@ -242,8 +247,10 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
 
     for source in refresh_sources {
         let plan = iceberg_delta_distributed_plan_for_test();
-        let mut plan =
-            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
+        let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
+            &plan,
+            Default::default(),
+        );
         let scan = root_scan_for_test(&mut plan);
         scan.table.source = source;
         scan.table.columns = vec![
@@ -440,7 +447,10 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
 #[test]
 fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     let plan = iceberg_delta_distributed_plan_for_test();
-    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
+    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
+        &plan,
+        Default::default(),
+    );
     let scan = root_scan_for_test(&mut plan);
     let mut table = iceberg_table_info_for_test();
     table.schema.fields[0].name = "v".to_string();
@@ -663,7 +673,7 @@ fn iceberg_delta_distributed_plan_for_test() -> DistributedPlan {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     }
 }

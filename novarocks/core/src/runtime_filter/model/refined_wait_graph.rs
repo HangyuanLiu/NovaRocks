@@ -18,10 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::novarocks_logging::debug;
-use crate::runtime_filter::model::contract::{
-    BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-};
-use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+use crate::runtime_filter::model::contract::{BindingId, ChannelId, CompletionRequirement};
+use crate::runtime_filter::model::graph::{RuntimeFilterBindingRoleData, RuntimeFilterGraphData};
 use crate::runtime_filter::model::join_progress::{
     JoinBuildProgressCatalog, JoinBuildProgressProof, JoinBuildProgressSkip,
 };
@@ -33,18 +31,27 @@ pub(crate) struct RefinedFragmentEdge {
     pub(crate) target_exchange_node: i32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProducerWaitInput {
+    pub(crate) channel: ChannelId,
     pub(crate) binding: BindingId,
     pub(crate) fragment: u32,
+    pub(crate) node_id: i32,
+    pub(crate) completion_requirement: CompletionRequirement,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConsumerWaitBehavior {
+    BlocksUntilComplete,
+    NeverBlocks,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConsumerWaitInput {
     pub(crate) channel: ChannelId,
     pub(crate) binding: BindingId,
     pub(crate) consumer_fragment: u32,
-    pub(crate) activation: ConsumerActivation,
+    pub(crate) behavior: ConsumerWaitBehavior,
     pub(crate) producers: Vec<ProducerWaitInput>,
 }
 
@@ -202,30 +209,40 @@ impl ExecutionDependencyGraph {
     }
 }
 
-pub(crate) fn project_consumer_waits(graph: &RuntimeFilterGraph) -> Vec<ConsumerWaitInput> {
+pub(crate) fn project_consumer_waits<A>(
+    graph: &RuntimeFilterGraphData<A>,
+    behavior: impl Fn(&A) -> ConsumerWaitBehavior,
+) -> Vec<ConsumerWaitInput> {
     let mut waits = Vec::new();
     for channel in graph.channels() {
         let producers: Vec<ProducerWaitInput> = graph
             .bindings()
-            .filter(|binding| {
-                binding.channel_id == channel.channel_id
-                    && matches!(binding.role, RuntimeFilterBindingRole::Producer(_))
-            })
-            .map(|binding| ProducerWaitInput {
-                binding: binding.binding_id,
-                fragment: binding.location.fragment_id.get(),
+            .filter_map(|binding| {
+                if binding.channel_id != channel.channel_id {
+                    return None;
+                }
+                let RuntimeFilterBindingRoleData::Producer(requirement) = &binding.role else {
+                    return None;
+                };
+                Some(ProducerWaitInput {
+                    channel: binding.channel_id,
+                    binding: binding.binding_id,
+                    fragment: binding.location.fragment_id.get(),
+                    node_id: binding.location.node_id.get(),
+                    completion_requirement: requirement.completion_requirement,
+                })
             })
             .collect();
         for binding in graph
             .bindings()
             .filter(|binding| binding.channel_id == channel.channel_id)
         {
-            if let RuntimeFilterBindingRole::Consumer(requirement) = &binding.role {
+            if let RuntimeFilterBindingRoleData::Consumer(requirement) = &binding.role {
                 waits.push(ConsumerWaitInput {
                     channel: channel.channel_id,
                     binding: binding.binding_id,
                     consumer_fragment: binding.location.fragment_id.get(),
-                    activation: requirement.activation,
+                    behavior: behavior(&requirement.activation),
                     producers: producers.clone(),
                 });
             }
@@ -240,35 +257,27 @@ pub(crate) fn revalidate_proof(
     deps: &ExecutionDependencyGraph,
     consumer_fragment: u32,
     expected_channel: ChannelId,
-    expected_binding: BindingId,
-    expected_fragment: u32,
-    graph: &RuntimeFilterGraph,
+    producer: &ProducerWaitInput,
 ) -> Result<(), ProofRejection> {
     if proof.channel != expected_channel {
         return Err(ProofRejection::PayloadChannelMismatch);
     }
-    if proof.producer_binding != expected_binding {
+    if proof.producer_binding != producer.binding {
         return Err(ProofRejection::PayloadProducerBindingMismatch);
     }
-    if proof.producer_fragment != expected_fragment {
+    if proof.producer_fragment != producer.fragment {
         return Err(ProofRejection::PayloadProducerFragmentMismatch);
     }
-    let binding = graph
-        .binding(expected_binding)
-        .ok_or(ProofRejection::MissingProducerBinding)?;
-    if binding.binding_id != expected_binding
-        || binding.channel_id != expected_channel
-        || binding.location.fragment_id.get() != expected_fragment
+    if producer.binding != proof.producer_binding
+        || producer.channel != expected_channel
+        || producer.fragment != proof.producer_fragment
     {
         return Err(ProofRejection::GraphBindingIdentityMismatch);
     }
-    let RuntimeFilterBindingRole::Producer(requirement) = &binding.role else {
-        return Err(ProofRejection::ProducerRoleMismatch);
-    };
-    if requirement.completion_requirement != CompletionRequirement::ProducerClosed {
+    if producer.completion_requirement != CompletionRequirement::ProducerClosed {
         return Err(ProofRejection::CompletionMismatch);
     }
-    if binding.location.node_id.get() != proof.join_node_id {
+    if producer.node_id != proof.join_node_id {
         return Err(ProofRejection::JoinOwnerMismatch);
     }
     let sealed_in_edges: BTreeSet<(u32, i32)> = edges
@@ -320,7 +329,6 @@ pub(crate) fn build_refined_wait_graph(
     edges: &[RefinedFragmentEdge],
     consumers: &[ConsumerWaitInput],
     join_progress: &JoinBuildProgressCatalog,
-    graph: &RuntimeFilterGraph,
 ) -> Result<RefinedWaitGraph, RefinedWaitGraphBuildError> {
     let deps = ExecutionDependencyGraph::from_fragment_edges(edges)?;
     let mut succ = WaitGraph::new();
@@ -345,7 +353,7 @@ pub(crate) fn build_refined_wait_graph(
                 consumer_binding: consumer.binding,
                 producer_binding: producer.binding,
             };
-            let source = if consumer.activation == ConsumerActivation::BlockingSnapshot {
+            let source = if consumer.behavior == ConsumerWaitBehavior::BlocksUntilComplete {
                 match join_progress.get(&(consumer.channel, producer.binding, producer.fragment)) {
                     Some(proof) => match revalidate_proof(
                         proof,
@@ -353,9 +361,7 @@ pub(crate) fn build_refined_wait_graph(
                         &deps,
                         consumer.consumer_fragment,
                         consumer.channel,
-                        producer.binding,
-                        producer.fragment,
-                        graph,
+                        producer,
                     ) {
                         Ok(()) => {
                             let build_ready = WaitNode::BuildReady {
@@ -407,7 +413,7 @@ pub(crate) fn build_refined_wait_graph(
     }
 
     for (consumer, sources) in consumers.iter().zip(&wait_sources) {
-        if consumer.activation != ConsumerActivation::BlockingSnapshot {
+        if consumer.behavior != ConsumerWaitBehavior::BlocksUntilComplete {
             continue;
         }
         ensure_wait_node(WaitNode::Frag(consumer.consumer_fragment), &mut succ);
@@ -438,7 +444,7 @@ pub(crate) fn build_refined_wait_graph(
         }
         for (target, _) in branches {
             for (consumer, sources) in consumers.iter().zip(&wait_sources) {
-                if consumer.activation != ConsumerActivation::BlockingSnapshot {
+                if consumer.behavior != ConsumerWaitBehavior::BlocksUntilComplete {
                     continue;
                 }
                 let on_branch = consumer.consumer_fragment == *target
@@ -769,17 +775,21 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{
-        ConsumerWaitInput, ProducerWaitInput, ProofRejection, RefinedFragmentEdge,
-        RefinedWaitGraph, WaitEdgeKind, WaitGraph, WaitNode, WaitProvenance, add_wait_edge,
-        build_refined_wait_graph,
+        ConsumerWaitBehavior, ConsumerWaitInput, ProducerWaitInput, ProofRejection,
+        RefinedFragmentEdge, RefinedWaitGraph, WaitEdgeKind, WaitGraph, WaitNode, WaitProvenance,
+        add_wait_edge, build_refined_wait_graph,
     };
     use crate::runtime_filter::model::contract::{
-        ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-        ConsumerActivation, ContributionKind, PlanFragmentId, PlanNodeId,
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement,
     };
+    use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterGraph,
+        ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
+        ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
+        RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
     };
     use crate::runtime_filter::model::join_progress::{
         FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
@@ -832,33 +842,105 @@ mod tests {
             .collect()
     }
 
-    fn graph_for_proof(proof: &JoinBuildProgressProof) -> RuntimeFilterGraph {
-        let mut graph = RuntimeFilterGraph::default();
+    fn producer(binding: u32, fragment: u32, node_id: i32) -> ProducerWaitInput {
+        ProducerWaitInput {
+            channel: ChannelId::new(7),
+            binding: BindingId::new(binding),
+            fragment,
+            node_id,
+            completion_requirement: CompletionRequirement::ProducerClosed,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum DraftActivation {
+        BlockingOrBatchLive,
+        LiveOnly,
+    }
+
+    fn wait_fixture<A>(activation: A) -> RuntimeFilterGraphData<A> {
+        let mut graph = RuntimeFilterGraphData::default();
         graph
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: proof.producer_binding,
-                channel_id: proof.channel,
+            .insert_channel(RuntimeFilterChannelSpec {
+                channel_id: ChannelId::new(7),
+                logical_domain: RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NeverMatches,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+                terminal_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+                reduction_requirement: ReductionRequirement::SetUnion,
+                allowed_contribution_kinds: BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ]),
+                required_consumer_capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
+                policy: RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 4096,
+                    deadline_ms: 30_000,
+                    max_retries: 3,
+                },
+            })
+            .unwrap();
+        for (binding_id, fragment_id, node_id, role) in [(
+            BindingId::new(100),
+            2,
+            10,
+            RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
+                contribution_kinds: BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ]),
+                completion_requirement: CompletionRequirement::ProducerClosed,
+                target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
+            }),
+        )] {
+            graph
+                .insert_binding(RuntimeFilterBindingSpecData {
+                    binding_id,
+                    channel_id: ChannelId::new(7),
+                    coverage_witness_id: Some(CoverageWitnessId::new(1)),
+                    location: PlanLocation {
+                        fragment_id: PlanFragmentId::new(fragment_id),
+                        node_id: PlanNodeId::new(node_id),
+                    },
+                    expression: TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    apply_point: ApplyPoint::NodeOutput,
+                    role,
+                })
+                .unwrap();
+        }
+        graph
+            .insert_binding(RuntimeFilterBindingSpecData {
+                binding_id: BindingId::new(10),
+                channel_id: ChannelId::new(7),
                 coverage_witness_id: None,
                 location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(proof.producer_fragment),
-                    node_id: PlanNodeId::new(proof.join_node_id),
+                    fragment_id: PlanFragmentId::new(5),
+                    node_id: PlanNodeId::new(24),
                 },
                 expression: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
                     data_type: DataType::Int64,
                     nullable: false,
                 },
-                apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
-                    contribution_kinds: BTreeSet::from([
-                        ContributionKind::ValueDomainDelta,
-                        ContributionKind::ProducerClosed,
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
+                    capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
                     ]),
-                    completion_requirement: CompletionRequirement::ProducerClosed,
-                    target:
-                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
-                            ordinal: 0,
-                        },
+                    activation,
+                    target: ConsumerBindingTarget::SourceBoundary,
                 }),
             })
             .unwrap();
@@ -881,11 +963,8 @@ mod tests {
             channel: ChannelId::new(7),
             binding: BindingId::new(10),
             consumer_fragment: 5,
-            activation: ConsumerActivation::BlockingSnapshot,
-            producers: vec![ProducerWaitInput {
-                binding: BindingId::new(100),
-                fragment: 2,
-            }],
+            behavior: ConsumerWaitBehavior::BlocksUntilComplete,
+            producers: vec![producer(100, 2, 10)],
         }
     }
 
@@ -894,10 +973,13 @@ mod tests {
             channel: ChannelId::new(8),
             binding: BindingId::new(11),
             consumer_fragment: 9,
-            activation: ConsumerActivation::BlockingSnapshot,
+            behavior: ConsumerWaitBehavior::BlocksUntilComplete,
             producers: vec![ProducerWaitInput {
+                channel: ChannelId::new(8),
                 binding: BindingId::new(200),
                 fragment: 8,
+                node_id: 0,
+                completion_requirement: CompletionRequirement::ProducerClosed,
             }],
         }
     }
@@ -905,13 +987,9 @@ mod tests {
     #[test]
     fn q23_shape_returns_one_pure_blocking_scc() {
         let proof = proof();
-        let refined = build_refined_wait_graph(
-            &q23_edges(),
-            &[q23_wait()],
-            &catalog(Some(proof.clone())),
-            &graph_for_proof(&proof),
-        )
-        .unwrap();
+        let refined =
+            build_refined_wait_graph(&q23_edges(), &[q23_wait()], &catalog(Some(proof.clone())))
+                .unwrap();
 
         let sccs = refined.pure_blocking_sccs();
         assert_eq!(sccs.len(), 1);
@@ -921,12 +999,59 @@ mod tests {
     }
 
     #[test]
+    fn generic_projection_keeps_draft_and_sealed_wait_results_equivalent() {
+        let draft = wait_fixture(DraftActivation::BlockingOrBatchLive);
+        let sealed = wait_fixture(ConsumerActivation::BlockingSnapshot);
+        let draft_waits = super::project_consumer_waits(&draft, |activation| match activation {
+            DraftActivation::BlockingOrBatchLive => ConsumerWaitBehavior::BlocksUntilComplete,
+            DraftActivation::LiveOnly => ConsumerWaitBehavior::NeverBlocks,
+        });
+        let sealed_waits = super::project_consumer_waits(&sealed, |activation| match activation {
+            ConsumerActivation::BlockingSnapshot => ConsumerWaitBehavior::BlocksUntilComplete,
+            ConsumerActivation::NonBlockingLive { .. } => ConsumerWaitBehavior::NeverBlocks,
+        });
+        assert_eq!(draft_waits, sealed_waits);
+
+        let proof = proof();
+        let draft_refined =
+            build_refined_wait_graph(&q23_edges(), &draft_waits, &catalog(Some(proof.clone())))
+                .unwrap();
+        let sealed_refined =
+            build_refined_wait_graph(&q23_edges(), &sealed_waits, &catalog(Some(proof))).unwrap();
+        assert_eq!(
+            draft_refined.find_cycle().unwrap().render(),
+            sealed_refined.find_cycle().unwrap().render()
+        );
+        assert_eq!(
+            draft_refined.pure_blocking_sccs(),
+            sealed_refined.pure_blocking_sccs()
+        );
+
+        let live_draft = wait_fixture(DraftActivation::LiveOnly);
+        let live_sealed = wait_fixture(ConsumerActivation::NonBlockingLive {
+            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+        });
+        for waits in [
+            super::project_consumer_waits(&live_draft, |_| ConsumerWaitBehavior::NeverBlocks),
+            super::project_consumer_waits(&live_sealed, |_| ConsumerWaitBehavior::NeverBlocks),
+        ] {
+            let refined = build_refined_wait_graph(
+                &q23_edges(),
+                &waits,
+                &JoinBuildProgressCatalog::default(),
+            )
+            .unwrap();
+            assert!(refined.find_cycle().is_none());
+            assert!(refined.pure_blocking_sccs().is_empty());
+        }
+    }
+
+    #[test]
     fn missing_proof_makes_blocking_scc_impure() {
         let refined = build_refined_wait_graph(
             &q23_edges(),
             &[q23_wait()],
             &JoinBuildProgressCatalog::default(),
-            &RuntimeFilterGraph::default(),
         )
         .unwrap();
 
@@ -960,19 +1085,11 @@ mod tests {
             channel: ChannelId::new(7),
             binding: BindingId::new(10),
             consumer_fragment: 3,
-            activation: ConsumerActivation::BlockingSnapshot,
-            producers: vec![ProducerWaitInput {
-                binding: BindingId::new(100),
-                fragment: 5,
-            }],
+            behavior: ConsumerWaitBehavior::BlocksUntilComplete,
+            producers: vec![producer(100, 5, 24)],
         };
-        let refined = build_refined_wait_graph(
-            &edges,
-            &[wait],
-            &catalog(Some(proof.clone())),
-            &graph_for_proof(&proof),
-        )
-        .unwrap();
+        let refined =
+            build_refined_wait_graph(&edges, &[wait], &catalog(Some(proof.clone()))).unwrap();
 
         let sccs = refined.pure_blocking_sccs();
         assert_eq!(sccs.len(), 1);
@@ -1065,14 +1182,13 @@ mod tests {
         ];
 
         let assert_coarse = |rejected: JoinBuildProgressProof,
-                             graph: &RuntimeFilterGraph,
                              wait: ConsumerWaitInput,
                              expected: ProofRejection| {
             let forged: JoinBuildProgressCatalog =
                 [((ChannelId::new(7), BindingId::new(100), 2), rejected)]
                     .into_iter()
                     .collect();
-            let refined = build_refined_wait_graph(&q23_edges(), &[wait], &forged, graph).unwrap();
+            let refined = build_refined_wait_graph(&q23_edges(), &[wait], &forged).unwrap();
             assert!(
                 refined.pure_blocking_sccs().is_empty(),
                 "{expected:?} unexpectedly produced a pure SCC"
@@ -1088,63 +1204,26 @@ mod tests {
             );
         };
 
-        let canonical_graph = graph_for_proof(&canonical);
         for (rejected, expected) in payload_cases {
-            assert_coarse(rejected, &canonical_graph, q23_wait(), expected);
+            assert_coarse(rejected, q23_wait(), expected);
         }
 
+        let mut identity_wait = q23_wait();
+        identity_wait.producers[0].channel = ChannelId::new(8);
         assert_coarse(
             canonical.clone(),
-            &RuntimeFilterGraph::default(),
-            q23_wait(),
-            ProofRejection::MissingProducerBinding,
-        );
-
-        let mut identity_graph = graph_for_proof(&canonical);
-        identity_graph
-            .binding_mut_for_test(BindingId::new(100))
-            .unwrap()
-            .channel_id = ChannelId::new(8);
-        assert_coarse(
-            canonical.clone(),
-            &identity_graph,
-            q23_wait(),
+            identity_wait,
             ProofRejection::GraphBindingIdentityMismatch,
         );
 
-        let mut consumer_graph = graph_for_proof(&canonical);
-        consumer_graph
-            .binding_mut_for_test(BindingId::new(100))
-            .unwrap()
-            .role = RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            activation: ConsumerActivation::BlockingSnapshot,
-            target: ConsumerBindingTarget::SourceBoundary,
-        });
+        let mut completion_wait = q23_wait();
+        completion_wait.producers[0].completion_requirement =
+            CompletionRequirement::FencedFinalDomain(
+                crate::runtime_filter::model::contract::CompletionFenceKind::CommittedDomainFrozen,
+            );
         assert_coarse(
             canonical.clone(),
-            &consumer_graph,
-            q23_wait(),
-            ProofRejection::ProducerRoleMismatch,
-        );
-
-        let mut completion_graph = graph_for_proof(&canonical);
-        let RuntimeFilterBindingRole::Producer(requirement) = &mut completion_graph
-            .binding_mut_for_test(BindingId::new(100))
-            .unwrap()
-            .role
-        else {
-            panic!("expected producer");
-        };
-        requirement.completion_requirement =
-            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen);
-        assert_coarse(
-            canonical.clone(),
-            &completion_graph,
-            q23_wait(),
+            completion_wait,
             ProofRejection::CompletionMismatch,
         );
 
@@ -1152,7 +1231,6 @@ mod tests {
         outside_probe.consumer_fragment = 4;
         assert_coarse(
             canonical,
-            &canonical_graph,
             outside_probe,
             ProofRejection::ConsumerOutsideProbeRegion,
         );
@@ -1169,13 +1247,7 @@ mod tests {
             },
         );
 
-        let refined = build_refined_wait_graph(
-            &q23_edges(),
-            &[q23_wait()],
-            &skipped,
-            &RuntimeFilterGraph::default(),
-        )
-        .unwrap();
+        let refined = build_refined_wait_graph(&q23_edges(), &[q23_wait()], &skipped).unwrap();
         let cycle = refined.find_cycle().unwrap().render();
         assert!(cycle.iter().any(|step| {
             step.contains("proof skipped: join-node=10 rule=UnauditedNode { node_id: 44 }")
@@ -1191,14 +1263,10 @@ mod tests {
                 channel: ChannelId::new(7),
                 binding: BindingId::new(10),
                 consumer_fragment: 1,
-                activation: ConsumerActivation::BlockingSnapshot,
-                producers: vec![ProducerWaitInput {
-                    binding: BindingId::new(100),
-                    fragment: 2,
-                }],
+                behavior: ConsumerWaitBehavior::BlocksUntilComplete,
+                producers: vec![producer(100, 2, 0)],
             }],
             &JoinBuildProgressCatalog::default(),
-            &RuntimeFilterGraph::default(),
         )
         .unwrap();
 
@@ -1209,7 +1277,6 @@ mod tests {
     #[test]
     fn reversed_inputs_produce_identical_cycle_and_scc_outputs() {
         let proof = proof();
-        let graph = graph_for_proof(&proof);
         let mut reversed_edges = q23_edges();
         reversed_edges.reverse();
         let waits = vec![q23_wait(), unrelated_wait()];
@@ -1217,15 +1284,10 @@ mod tests {
         reversed_waits.reverse();
 
         let forward =
-            build_refined_wait_graph(&q23_edges(), &waits, &catalog(Some(proof.clone())), &graph)
+            build_refined_wait_graph(&q23_edges(), &waits, &catalog(Some(proof.clone()))).unwrap();
+        let reversed =
+            build_refined_wait_graph(&reversed_edges, &reversed_waits, &catalog(Some(proof)))
                 .unwrap();
-        let reversed = build_refined_wait_graph(
-            &reversed_edges,
-            &reversed_waits,
-            &catalog(Some(proof)),
-            &graph,
-        )
-        .unwrap();
 
         assert_eq!(
             forward.find_cycle().unwrap().render(),

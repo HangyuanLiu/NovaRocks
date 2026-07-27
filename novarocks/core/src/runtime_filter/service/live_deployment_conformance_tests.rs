@@ -64,9 +64,8 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
-    RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-    RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation, ProducerRequirement,
+    RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec,
 };
 use crate::runtime_filter::port::artifact::{
     ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
@@ -102,7 +101,7 @@ use crate::service::grpc_fragment_dispatcher::{
     GrpcRuntimeFilterDeploymentControl, RemoteDispatcher,
 };
 use crate::service::grpc_server::IndependentGrpcRuntimeFilterNode;
-use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
+use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::test_support::{
     DistributedPlanDraftBuilder, draft_builder_from_plan,
@@ -111,12 +110,18 @@ use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFragmentSink, IcebergWriteInputBinding,
 };
 use crate::sql::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
+    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph, RequiredLiveReason,
+};
+use crate::sql::planner::distributed::{
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
+    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PlanFragment,
 };
 use crate::sql::planner::payload::{PlanLimitNode, PlanScanNode, PlanSortNode};
+use crate::sql::planner::physical::runtime_filter::JoinExecutionMode;
 use crate::sql::planner::physical::{
-    AggMode, AggregateOutputLayout, PhysicalHashAggregateNode, PhysicalPlanKind, PhysicalPlanNode,
-    PhysicalPlanStats, PlannerConfidence, RedistributeMode, RedistributeNode,
+    AggMode, AggregateOutputLayout, JoinDistribution, PhysicalHashAggregateNode,
+    PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlannerConfidence,
+    RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
@@ -179,31 +184,33 @@ impl FragmentDispatcher for RecordingFragmentDispatcher {
             .unwrap()
             .push((backend_idx, submission.fragment_id(), finst_id));
         self.submit_count.fetch_add(1, Ordering::SeqCst);
-        handle_fragment_report_exec_status(FragmentExecStatusReport {
-            query_id,
-            fragment_instance_id: finst_id,
-            backend_num,
-            done: true,
-            status: crate::proto::common::Status {
-                code: 0,
-                message: String::new(),
-            },
-            iceberg_commits: vec![crate::proto::novarocks::IcebergCommitInfo {
-                iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
-                    path: Some(format!("s3://live-conformance/be-{backend_idx}.parquet")),
-                    record_count: Some(1),
-                    file_size_in_bytes: Some(1),
-                    file_content: crate::proto::novarocks::IcebergFileContent::Data as i32,
+        if submission.fragment_id() == PRODUCER_FRAGMENT {
+            handle_fragment_report_exec_status(FragmentExecStatusReport {
+                query_id,
+                fragment_instance_id: finst_id,
+                backend_num,
+                done: true,
+                status: crate::proto::common::Status {
+                    code: 0,
+                    message: String::new(),
+                },
+                iceberg_commits: vec![crate::proto::novarocks::IcebergCommitInfo {
+                    iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
+                        path: Some(format!("s3://live-conformance/be-{backend_idx}.parquet")),
+                        record_count: Some(1),
+                        file_size_in_bytes: Some(1),
+                        file_content: crate::proto::novarocks::IcebergFileContent::Data as i32,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            load_counters: BTreeMap::new(),
-            loaded_rows: 1,
-            loaded_bytes: 1,
-            filtered_rows: 0,
-        })
-        .map_err(|error| format!("recording dispatcher writer completion failed: {error}"))?;
+                }],
+                load_counters: BTreeMap::new(),
+                loaded_rows: 1,
+                loaded_bytes: 1,
+                filtered_rows: 0,
+            })
+            .map_err(|error| format!("recording dispatcher writer completion failed: {error}"))?;
+        }
         Ok(())
     }
 
@@ -322,7 +329,7 @@ fn expression() -> TypedExpr {
     }
 }
 
-fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
+fn runtime_filter_graph(topology: ConformanceTopology) -> DraftRuntimeFilterGraph {
     let coverage = topology.coverage();
     let contributions = BTreeSet::from([
         ContributionKind::ValueDomainDelta,
@@ -332,7 +339,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
         ArtifactCapability::Membership,
         ArtifactCapability::EmptyDomain,
     ]);
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     graph
         .insert_channel(RuntimeFilterChannelSpec {
             channel_id: CHANNEL,
@@ -355,7 +362,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
         })
         .expect("insert conformance channel");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: PRODUCER_BINDING,
             channel_id: CHANNEL,
             coverage_witness_id: Some(WITNESS),
@@ -365,7 +372,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
             },
             expression: expression(),
             apply_point: ApplyPoint::NodeOutput,
-            role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+            role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
                 target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
@@ -375,7 +382,7 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
         })
         .expect("insert conformance producer binding");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: CONSUMER_BINDING,
             channel_id: CHANNEL,
             coverage_witness_id: None,
@@ -385,10 +392,10 @@ fn runtime_filter_graph(topology: ConformanceTopology) -> RuntimeFilterGraph {
             },
             expression: expression(),
             apply_point: ApplyPoint::NodeInput,
-            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+            role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                 capabilities,
-                activation: ConsumerActivation::NonBlockingLive {
-                    late_apply: LateApplyGranularity::Batch,
+                activation: ActivationConstraint::BlockingOrBatchLive {
+                    fallback: ActivationFallback::BlockingSnapshot,
                 },
                 target: ConsumerBindingTarget::SourceBoundary,
             }),
@@ -454,7 +461,70 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
             binding: IcebergDataFileBinding::ExplicitFiles,
         },
     };
-    let mut producer_fragment = PlanFragment {
+    let exchange = |node_id| DistributedNode {
+        node_id,
+        fragment_id: PRODUCER_FRAGMENT,
+        tuple_ids: vec![node_id],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: Vec::new(),
+        stats: stats(),
+        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+            partition: DataPartition::unpartitioned(),
+            source_fragment_id: CONSUMER_FRAGMENT,
+            output_columns: vec![column.clone()],
+            output_qualifier: None,
+            flavor: ExchangeFlavor::CteMulticast {
+                cte_id: CONSUMER_FRAGMENT,
+                receive_producer_column_ids: vec![column.column_id],
+            },
+        }),
+    };
+    let producer_scan = DistributedNode {
+        node_id: 814,
+        fragment_id: PRODUCER_FRAGMENT,
+        tuple_ids: vec![814],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: Vec::new(),
+        stats: stats(),
+        payload: DistributedNodeKind::Scan(PlanScanNode {
+            database: "default".to_string(),
+            table: source.clone(),
+            alias: None,
+            columns: vec![column.clone()],
+            predicates: Vec::new(),
+            required_columns: Some(vec!["k".to_string()]),
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        }),
+    };
+    // The consumer multicast feeds both the probe subtree (812) and build
+    // frontier (813). Blocking on the producer therefore closes the real
+    // consumer -> build-ready -> consumer SCC, while this scan preserves the
+    // three-way producer placement exercised by the deployment conformance.
+    let probe_join = DistributedNode {
+        node_id: 815,
+        fragment_id: PRODUCER_FRAGMENT,
+        tuple_ids: vec![815],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: vec![exchange(812), producer_scan],
+        stats: stats(),
+        payload: DistributedNodeKind::HashJoin(Box::new(PhysicalHashJoinNode {
+            join_type: JoinKind::Inner,
+            eq_conditions: Vec::new(),
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+            execution_mode: Some(JoinExecutionMode::Partitioned),
+            build_runtime_filters: Vec::new(),
+            output_columns: vec![column.clone()],
+        })),
+    };
+    let producer_fragment = PlanFragment {
         fragment_id: PRODUCER_FRAGMENT,
         root: DistributedNode {
             node_id: PRODUCER_NODE,
@@ -463,6 +533,42 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
             nullable_tuple_ids: Vec::new(),
             limit: -1,
             runtime_filter_binding_ids: vec![PRODUCER_BINDING],
+            children: vec![probe_join, exchange(813)],
+            stats: stats(),
+            payload: DistributedNodeKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: Vec::new(),
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+                execution_mode: Some(JoinExecutionMode::Partitioned),
+                build_runtime_filters: Vec::new(),
+                output_columns: vec![column.clone()],
+            })),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::IcebergWrite(IcebergWriteFragmentSink {
+            descriptor_database: "default".to_string(),
+            spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
+            input: IcebergWriteInputBinding::RootOutputByOrdinal,
+        }),
+        output_exprs: None,
+        output_columns: vec![column.clone()],
+        cte_id: None,
+        cte_exchange_nodes: vec![
+            (CONSUMER_FRAGMENT, 812, vec![ColumnId::new_for_test(1)]),
+            (CONSUMER_FRAGMENT, 813, vec![ColumnId::new_for_test(1)]),
+        ],
+    };
+    let consumer_fragment = PlanFragment {
+        fragment_id: CONSUMER_FRAGMENT,
+        root: DistributedNode {
+            node_id: CONSUMER_NODE,
+            fragment_id: CONSUMER_FRAGMENT,
+            tuple_ids: vec![CONSUMER_NODE],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: vec![CONSUMER_BINDING],
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Scan(PlanScanNode {
@@ -478,31 +584,48 @@ fn sealed_plan(topology: ConformanceTopology) -> crate::sql::planner::distribute
         },
         data_partition: DataPartition::unpartitioned(),
         output_partition: DataPartition::unpartitioned(),
-        sink: DataSink::IcebergWrite(IcebergWriteFragmentSink {
-            descriptor_database: "default".to_string(),
-            spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
-            input: IcebergWriteInputBinding::RootOutputByOrdinal,
-        }),
+        sink: DataSink::Noop,
         output_exprs: None,
-        output_columns: vec![column],
-        cte_id: None,
+        output_columns: vec![column.clone()],
+        cte_id: Some(CONSUMER_FRAGMENT),
         cte_exchange_nodes: Vec::new(),
     };
-    let mut consumer_fragment = producer_fragment.clone();
-    consumer_fragment.fragment_id = CONSUMER_FRAGMENT;
-    consumer_fragment.root.node_id = CONSUMER_NODE;
-    consumer_fragment.root.fragment_id = CONSUMER_FRAGMENT;
-    consumer_fragment.root.tuple_ids = vec![CONSUMER_NODE];
-    consumer_fragment.root.runtime_filter_binding_ids = vec![CONSUMER_BINDING];
-    producer_fragment.root.runtime_filter_binding_ids = vec![PRODUCER_BINDING];
-    DistributedPlanDraftBuilder::new(
+    let edge = |target_exchange_node_id| FragmentEdge {
+        source_fragment_id: CONSUMER_FRAGMENT,
+        target_fragment_id: PRODUCER_FRAGMENT,
+        target_exchange_node_id,
+        output_partition: DataPartition::unpartitioned(),
+        stream_kind: FragmentStreamKind::Gather,
+        edge_kind: FragmentEdgeKind::CteMulticast {
+            cte_id: CONSUMER_FRAGMENT,
+            receive_producer_column_ids: vec![ColumnId::new_for_test(1)],
+        },
+        output_slot_ids: vec![1],
+    };
+    let plan = DistributedPlanDraftBuilder::new(
         vec![producer_fragment, consumer_fragment],
-        Some(CONSUMER_FRAGMENT),
-        Vec::new(),
+        Some(PRODUCER_FRAGMENT),
+        vec![edge(812), edge(813)],
         runtime_filter_graph(topology),
     )
     .seal()
-    .expect("conformance fixture must pass the production distributed-plan seal")
+    .expect("conformance fixture must pass the production distributed-plan seal");
+    let RuntimeFilterBindingRoleData::Consumer(requirement) = &plan
+        .runtime_filter_graph()
+        .binding(CONSUMER_BINDING)
+        .expect("conformance consumer binding")
+        .role
+    else {
+        panic!("conformance consumer binding remains a consumer");
+    };
+    assert_eq!(
+        requirement.activation,
+        ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Batch,
+        },
+        "the real feedback cycle forces the ordinary membership consumer live"
+    );
+    plan
 }
 
 fn wait_for_transport_ack(
@@ -1694,7 +1817,7 @@ fn topn_runtime_filter_graph(
     producer: (u32, i32),
     consumer: (u32, i32),
     deadline_ms: u64,
-) -> RuntimeFilterGraph {
+) -> DraftRuntimeFilterGraph {
     let keys = vec![OrderKeyContract {
         data_type: DataType::Int32,
         direction: SortDirection::Ascending,
@@ -1710,7 +1833,7 @@ fn topn_runtime_filter_graph(
     ]);
     let capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
     let coverage = Coverage::Leaf(TOPN_WITNESS);
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     graph
         .insert_channel(RuntimeFilterChannelSpec {
             channel_id: TOPN_CHANNEL,
@@ -1734,7 +1857,7 @@ fn topn_runtime_filter_graph(
         })
         .expect("insert live TopN channel");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: TOPN_PRODUCER_BINDING,
             channel_id: TOPN_CHANNEL,
             coverage_witness_id: Some(TOPN_WITNESS),
@@ -1744,7 +1867,7 @@ fn topn_runtime_filter_graph(
             },
             expression: topn_column_expr(1, Some("source"), "k"),
             apply_point: ApplyPoint::NodeOutput,
-            role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+            role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
                 target:
@@ -1756,7 +1879,7 @@ fn topn_runtime_filter_graph(
         })
         .expect("insert live TopN producer");
     graph
-        .insert_binding(RuntimeFilterBindingSpec {
+        .insert_binding(RuntimeFilterBindingSpecData {
             binding_id: TOPN_CONSUMER_BINDING,
             channel_id: TOPN_CHANNEL,
             coverage_witness_id: None,
@@ -1766,10 +1889,11 @@ fn topn_runtime_filter_graph(
             },
             expression: topn_column_expr(1, Some("source"), "k"),
             apply_point: ApplyPoint::NodeInput,
-            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+            role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                 capabilities,
-                activation: ConsumerActivation::NonBlockingLive {
+                activation: ActivationConstraint::LiveOnly {
                     late_apply: LateApplyGranularity::Split,
+                    reason: RequiredLiveReason::OrderedBoundContract,
                 },
                 target: ConsumerBindingTarget::SourceBoundary,
             }),
@@ -1790,9 +1914,9 @@ fn sealed_topn_plan(
     if !runtime_filter {
         return base;
     }
-    let mut draft = draft_builder_from_plan(&base);
+    let mut draft = draft_builder_from_plan(&base, Default::default());
     let (producer, consumer) = find_topn_binding_locations(draft.fragments());
-    *draft.runtime_filter_graph_mut() = topn_runtime_filter_graph(producer, consumer, deadline_ms);
+    draft.set_runtime_filter_graph(topn_runtime_filter_graph(producer, consumer, deadline_ms));
     for fragment in draft.fragments_mut() {
         attach_topn_binding(&mut fragment.root, producer, TOPN_PRODUCER_BINDING);
         attach_topn_binding(&mut fragment.root, consumer, TOPN_CONSUMER_BINDING);

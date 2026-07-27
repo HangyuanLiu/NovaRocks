@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
@@ -120,7 +119,7 @@ pub(super) fn two_fragment_stream_plan_for_test() -> DistributedPlan {
             },
         ],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![FragmentEdge {
             source_fragment_id: 1,
             target_fragment_id: 0,

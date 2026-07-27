@@ -2012,11 +2012,11 @@ mod tests {
                 "missing graph header at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("runtime filter channel 0"),
-                "missing channel id at {level:?}:\n{text}"
+                text.contains("runtime filter channel "),
+                "missing channel at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("producer binding 0") && text.contains("consumer binding 1"),
+                text.contains("producer binding ") && text.contains("consumer binding "),
                 "missing graph bindings at {level:?}:\n{text}"
             );
         }

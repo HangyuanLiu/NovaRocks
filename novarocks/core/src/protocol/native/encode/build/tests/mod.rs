@@ -25,7 +25,6 @@ use super::*;
 use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
 use crate::coordinator::prepare::build_iceberg_metadata_scan_range_params;
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog::PlannerTableProvider;
@@ -221,7 +220,7 @@ fn iceberg_scan_plan_with_outputs(
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     }
 }
@@ -291,7 +290,7 @@ fn stream_exchange_plan(flavor: ExchangeFlavor) -> DistributedPlan {
     crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![producer_fragment, consumer_fragment],
         root_fragment_id: consumer_fragment_id,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![FragmentEdge {
             source_fragment_id: producer_fragment_id,
             target_fragment_id: consumer_fragment_id,
@@ -323,7 +322,7 @@ fn finalized_router_plan() -> DistributedPlan {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
     let mut branch =

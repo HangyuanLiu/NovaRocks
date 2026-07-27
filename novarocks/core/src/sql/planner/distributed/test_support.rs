@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
-
 use super::DistributedPlan;
+use super::activation_decision::DraftRuntimeFilterGraph;
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
 
 /// Planner-owned test fixture that constructs a draft and seals it through the
@@ -31,7 +30,7 @@ impl DistributedPlanDraftBuilder {
         fragments: Vec<PlanFragment>,
         root_fragment_id: Option<FragmentId>,
         edges: Vec<FragmentEdge>,
-        runtime_filter_graph: RuntimeFilterGraph,
+        runtime_filter_graph: DraftRuntimeFilterGraph,
     ) -> Self {
         Self {
             draft: DistributedPlanDraft {
@@ -55,8 +54,8 @@ impl DistributedPlanDraftBuilder {
         &mut self.draft.edges
     }
 
-    pub(crate) fn runtime_filter_graph_mut(&mut self) -> &mut RuntimeFilterGraph {
-        &mut self.draft.runtime_filter_graph
+    pub(crate) fn set_runtime_filter_graph(&mut self, graph: DraftRuntimeFilterGraph) {
+        self.draft.runtime_filter_graph = graph;
     }
 
     pub(crate) fn seal(self) -> Result<DistributedPlan, String> {
@@ -68,20 +67,24 @@ impl DistributedPlanDraftBuilder {
     }
 }
 
-pub(crate) fn draft_builder_from_plan(plan: &DistributedPlan) -> DistributedPlanDraftBuilder {
+pub(crate) fn draft_builder_from_plan(
+    plan: &DistributedPlan,
+    runtime_filter_graph: DraftRuntimeFilterGraph,
+) -> DistributedPlanDraftBuilder {
     DistributedPlanDraftBuilder::new(
         plan.fragments().to_vec(),
         Some(plan.root_fragment_id()),
         plan.edges().to_vec(),
-        plan.runtime_filter_graph().clone(),
+        runtime_filter_graph,
     )
 }
 
 pub(crate) fn rebuild_test_plan(
     plan: DistributedPlan,
+    runtime_filter_graph: DraftRuntimeFilterGraph,
     mutate: impl FnOnce(&mut DistributedPlanDraftBuilder),
 ) -> DistributedPlan {
-    let mut builder = draft_builder_from_plan(&plan);
+    let mut builder = draft_builder_from_plan(&plan, runtime_filter_graph);
     mutate(&mut builder);
     builder
         .seal()

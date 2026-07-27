@@ -162,12 +162,16 @@ fn set_iceberg_scan_predicates(
     plan: DistributedPlan,
     predicates: Vec<TypedExpr>,
 ) -> DistributedPlan {
-    crate::sql::planner::distributed::test_support::rebuild_test_plan(plan, |draft| {
-        let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
-            panic!("root must be scan");
-        };
-        scan.predicates = predicates;
-    })
+    crate::sql::planner::distributed::test_support::rebuild_test_plan(
+        plan,
+        Default::default(),
+        |draft| {
+            let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
+                panic!("root must be scan");
+            };
+            scan.predicates = predicates;
+        },
+    )
 }
 
 fn id_eq_literal(value: i64) -> TypedExpr {

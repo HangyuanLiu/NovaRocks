@@ -18,10 +18,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::activation_decision::DraftRuntimeFilterGraph;
 use crate::sql::planner::distributed::fragment::DistributedPlanDraft;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
@@ -92,7 +92,7 @@ pub(super) fn cut(plan: &PhysicalPlanNode) -> Result<FragmentCutResult, String> 
             fragments,
             root_fragment_id: Some(root_fragment_id),
             edges: builder.edges,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
+            runtime_filter_graph: DraftRuntimeFilterGraph::default(),
         },
         bindings,
     })

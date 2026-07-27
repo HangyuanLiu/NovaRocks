@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 
 use crate::runtime_filter::model::contract::CompletionRequirement;
-use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+use crate::runtime_filter::model::graph::{RuntimeFilterBindingRoleData, RuntimeFilterGraphData};
 pub(crate) use crate::runtime_filter::model::join_progress::{
     FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
     JoinBuildProgressSkip,
@@ -125,14 +125,14 @@ pub(crate) fn split_join_inputs(
     })
 }
 
-pub(super) fn build_join_progress_proof_catalog(
+pub(super) fn build_join_progress_proof_catalog<A>(
     fragments: &[PlanFragment],
-    graph: &RuntimeFilterGraph,
+    graph: &RuntimeFilterGraphData<A>,
 ) -> JoinBuildProgressCatalog {
-    fn visit(
+    fn visit<A>(
         fragment: &PlanFragment,
         node: &DistributedNode,
-        graph: &RuntimeFilterGraph,
+        graph: &RuntimeFilterGraphData<A>,
         catalog: &mut JoinBuildProgressCatalog,
     ) {
         if matches!(node.payload, DistributedNodeKind::HashJoin(_))
@@ -143,7 +143,7 @@ pub(super) fn build_join_progress_proof_catalog(
                 let Some(binding) = graph.binding(*binding_id) else {
                     continue;
                 };
-                let RuntimeFilterBindingRole::Producer(requirement) = &binding.role else {
+                let RuntimeFilterBindingRoleData::Producer(requirement) = &binding.role else {
                     continue;
                 };
                 if requirement.completion_requirement != CompletionRequirement::ProducerClosed {
@@ -193,13 +193,15 @@ mod tests {
     use crate::runtime_filter::deployment::DeploymentError;
     use crate::runtime_filter::deployment::wait_for::validate_wait_for;
     use crate::runtime_filter::model::contract::{
-        BindingId, ChannelId, ConsumerActivation, ContributionKind, CoverageWitnessId,
-        PlanFragmentId, PlanNodeId,
+        BindingId, ChannelId, ContributionKind, CoverageWitnessId, PlanFragmentId, PlanNodeId,
     };
     use crate::runtime_filter::model::graph::{
-        ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingSpec,
+        ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingRole,
+        RuntimeFilterBindingSpec, RuntimeFilterGraph,
     };
-    use crate::runtime_filter::model::refined_wait_graph::{ConsumerWaitInput, ProducerWaitInput};
+    use crate::runtime_filter::model::refined_wait_graph::{
+        ConsumerWaitBehavior, ConsumerWaitInput, ProducerWaitInput,
+    };
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
@@ -513,14 +515,17 @@ mod tests {
             channel: ChannelId::new(7),
             binding: BindingId::new(10),
             consumer_fragment: 2,
-            activation: ConsumerActivation::BlockingSnapshot,
+            behavior: ConsumerWaitBehavior::BlocksUntilComplete,
             producers: vec![ProducerWaitInput {
+                channel: ChannelId::new(7),
                 binding: BindingId::new(100),
                 fragment: 1,
+                node_id: 10,
+                completion_requirement: CompletionRequirement::ProducerClosed,
             }],
         };
 
-        let err = validate_wait_for(&refined_edges, &[consumer], &catalog, &graph).unwrap_err();
+        let err = validate_wait_for(&refined_edges, &[consumer], &catalog).unwrap_err();
         let DeploymentError::BlockingFeedbackCycle { cycle, .. } = err else {
             panic!("expected coarse fallback cycle");
         };

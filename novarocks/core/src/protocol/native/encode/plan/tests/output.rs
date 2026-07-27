@@ -91,7 +91,7 @@ fn result_fragment_output_columns_map_finalized_project_root_unique_ids() {
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![fragment],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 
@@ -136,7 +136,7 @@ fn topn_root_fragment_output_columns_map_finalized_child_unique_ids() {
     let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![fragment],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 
@@ -215,7 +215,7 @@ fn encoder_maps_sealed_join_output_columns_from_the_node_output_contract() {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 
@@ -303,7 +303,7 @@ fn encoder_maps_sealed_nest_loop_join_output_columns_from_the_node_output_contra
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 
@@ -383,7 +383,7 @@ fn assert_one_row_root_fragment_output_columns_follow_finalized_child_schema() {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 
@@ -458,7 +458,7 @@ fn sort_root_fragment_output_columns_follow_finalized_child_schema() {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
 

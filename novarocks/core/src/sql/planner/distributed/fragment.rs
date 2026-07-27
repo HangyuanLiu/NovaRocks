@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::runtime_filter::model::refined_wait_graph::RefinedFragmentEdge;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
+use super::activation_decision::DraftRuntimeFilterGraph;
 use super::node::DistributedNode;
 
 pub(crate) type FragmentId = u32;
@@ -151,8 +151,7 @@ pub(in crate::sql::planner::distributed) struct DistributedPlanDraft {
     pub(in crate::sql::planner::distributed) fragments: Vec<PlanFragment>,
     pub(in crate::sql::planner::distributed) root_fragment_id: Option<FragmentId>,
     pub(in crate::sql::planner::distributed) edges: Vec<FragmentEdge>,
-    // Mutable pre-seal runtime filter graph. `seal_draft` runs RFD-1's
-    // `RuntimeFilterGraph::validate` on it before moving it into the sealed plan,
-    // so (unlike the sealed slot) it is consumed here and carries no allowance.
-    pub(in crate::sql::planner::distributed) runtime_filter_graph: RuntimeFilterGraph,
+    // Planner-private graph whose consumer activations remain constraints until
+    // the seal-time activation decision pass consumes and materializes them.
+    pub(in crate::sql::planner::distributed) runtime_filter_graph: DraftRuntimeFilterGraph,
 }

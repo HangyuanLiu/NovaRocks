@@ -36,7 +36,6 @@ use crate::connector::scan_planning::{
 use crate::coordinator::prepare::scan::{
     ResolvedIcebergFileScan, ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
@@ -258,7 +257,7 @@ fn plan(root: DistributedNode) -> DistributedPlan {
             cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     }
 }

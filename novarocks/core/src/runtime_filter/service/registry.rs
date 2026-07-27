@@ -2212,7 +2212,6 @@ mod tests {
         DuplicateCoverageWitness,
         EmptyProducerInstances,
         EmptyConsumerInstances,
-        NonBlockingConsumer,
         MissingMembershipCapability,
         DuplicateProducerWitness,
     }
@@ -2287,19 +2286,6 @@ mod tests {
                         BTreeSet::from([ArtifactCapability::Membership]),
                         BTreeSet::from([RouteEdgeId::new(40)]),
                         BTreeSet::new(),
-                    ),
-                );
-            }
-            InvalidDeployment::NonBlockingConsumer => {
-                consumers.insert(
-                    BindingId::new(30),
-                    ConsumerDeployment::new(
-                        ConsumerActivation::NonBlockingLive {
-                            late_apply: LateApplyGranularity::Batch,
-                        },
-                        BTreeSet::from([ArtifactCapability::Membership]),
-                        BTreeSet::from([RouteEdgeId::new(40)]),
-                        BTreeSet::from([uid(30)]),
                     ),
                 );
             }
@@ -4076,10 +4062,6 @@ mod tests {
             (
                 InvalidDeployment::EmptyConsumerInstances,
                 InstallContractErrorKind::EmptyExpectedInstances,
-            ),
-            (
-                InvalidDeployment::NonBlockingConsumer,
-                InstallContractErrorKind::InvalidConsumerActivation,
             ),
             (
                 InvalidDeployment::MissingMembershipCapability,

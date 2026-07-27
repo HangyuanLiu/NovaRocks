@@ -122,6 +122,8 @@ fn spawn_exec_fragment_native(
             .err()
             .filter(|_| !worker_readiness.is_ready())
             .cloned();
+        let rolled_back_pre_ready = pre_ready_failure.is_some()
+            && mgr.rollback_pre_ready_native_fragment(query_id, finst_id);
         let mut report_error: Option<String> = None;
         if uses_fetch_result_buffer {
             match &out {
@@ -158,7 +160,9 @@ fn spawn_exec_fragment_native(
                 "exec_plan_fragment_native failed"
             );
         }
-        if let Some(ref err_msg) = report_error {
+        if let Some(ref err_msg) = report_error
+            && !rolled_back_pre_ready
+        {
             let finsts = mgr.cancel_query(query_id, err_msg.clone());
             for id in finsts {
                 if id != finst_id || worker_readiness.is_ready() {

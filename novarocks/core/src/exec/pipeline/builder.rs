@@ -2158,7 +2158,7 @@ mod tests {
         }
     }
 
-    fn assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+    fn assert_dormant_consumer_installs_fail_open_processor_without_dependency_or_wait(
         activation: crate::runtime_filter::model::contract::ConsumerActivation,
     ) {
         let (_manager, runtime_filter_context) =
@@ -2212,11 +2212,15 @@ mod tests {
         assert_eq!(wrapped.pipelines.len(), baseline.pipelines.len());
         assert_eq!(
             wrapped.pipelines[0].factories.len(),
-            baseline.pipelines[0].factories.len()
+            baseline.pipelines[0].factories.len() + 1
         );
         assert_eq!(
-            wrapped.pipelines[0].factories[0].name(),
-            baseline.pipelines[0].factories[0].name()
+            wrapped.pipelines[0]
+                .factories
+                .last()
+                .expect("fail-open factory")
+                .name(),
+            "NativeRuntimeFilter (id=2)"
         );
     }
 
@@ -3194,15 +3198,15 @@ mod tests {
     }
 
     #[test]
-    fn dormant_blocking_consumer_has_no_dependency_or_wait() {
-        assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+    fn dormant_blocking_consumer_installs_fail_open_processor_without_dependency_or_wait() {
+        assert_dormant_consumer_installs_fail_open_processor_without_dependency_or_wait(
             crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
         );
     }
 
     #[test]
-    fn dormant_live_consumer_has_no_snapshot_poll() {
-        assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+    fn dormant_live_consumer_installs_fail_open_processor_without_snapshot_poll() {
+        assert_dormant_consumer_installs_fail_open_processor_without_dependency_or_wait(
             crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
                 late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
             },
@@ -3291,11 +3295,15 @@ mod tests {
         assert_eq!(wrapped.pipelines.len(), baseline.pipelines.len());
         assert_eq!(
             wrapped.pipelines[0].factories.len(),
-            baseline.pipelines[0].factories.len()
+            baseline.pipelines[0].factories.len() + 1
         );
         assert_eq!(
-            wrapped.pipelines[0].factories[0].name(),
-            baseline.pipelines[0].factories[0].name()
+            wrapped.pipelines[0]
+                .factories
+                .last()
+                .expect("fail-open factory")
+                .name(),
+            "NativeRuntimeFilter (id=2)"
         );
     }
 

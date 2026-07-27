@@ -191,7 +191,7 @@ fn two_fragment_stream_plan_with_lowered_slots_for_test() -> DistributedPlan {
             },
         ],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![FragmentEdge {
             source_fragment_id: 1,
             target_fragment_id: 0,
@@ -262,7 +262,7 @@ fn two_fragment_zero_column_stream_plan_for_test() -> DistributedPlan {
             },
         ],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![FragmentEdge {
             source_fragment_id: 1,
             target_fragment_id: 0,
@@ -377,7 +377,7 @@ fn two_fragment_generate_series_stream_plan_for_test() -> DistributedPlan {
             },
         ],
         root_fragment_id: 0,
-        runtime_filter_graph: RuntimeFilterGraph::default(),
+        runtime_filter_graph: Default::default(),
         edges: vec![FragmentEdge {
             source_fragment_id: 1,
             target_fragment_id: 0,

@@ -362,7 +362,7 @@ mod test_support {
             fragments: vec![fragment],
             root_fragment_id: 7,
             edges: Vec::new(),
-            runtime_filter_graph: crate::runtime_filter::model::graph::RuntimeFilterGraph::default(),
+            runtime_filter_graph: Default::default(),
         }
     }
 }
@@ -374,7 +374,10 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::model::contract::{
+        BindingId, ChannelId, ConsumerActivation, LateApplyGranularity,
+    };
+    use crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
@@ -383,20 +386,23 @@ mod tests {
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
-    fn sealed_runtime_filter_graph() -> crate::runtime_filter::model::graph::RuntimeFilterGraph {
+    fn draft_runtime_filter_graph() -> crate::sql::planner::distributed::DraftRuntimeFilterGraph {
         use crate::runtime_filter::model::contract::{
-            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+            ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
             ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
             PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
             RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
         };
         use crate::runtime_filter::model::coverage::Coverage;
         use crate::runtime_filter::model::graph::{
-            ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
-            ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
-            RuntimeFilterChannelSpec, RuntimeFilterGraph,
+            ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
+            ProducerRequirement, RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData,
+            RuntimeFilterChannelSpec,
         };
         use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+        use crate::sql::planner::distributed::{
+            ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
+        };
 
         let channel_id = ChannelId::new(1);
         let witness_id = CoverageWitnessId::new(1);
@@ -409,20 +415,20 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         };
-        let mut graph = RuntimeFilterGraph::default();
+        let mut graph = DraftRuntimeFilterGraph::default();
         graph
             .insert_channel(RuntimeFilterChannelSpec {
                 channel_id,
                 logical_domain: RuntimeFilterLogicalDomain::Membership {
                     value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NeverMatches,
+                    null_semantics: NullSemantics::NullSafeEqual,
                 },
                 lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                availability_coverage: Coverage::Leaf(witness_id),
-                terminal_coverage: Coverage::Leaf(witness_id),
+                availability_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness_id)]),
+                terminal_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness_id)]),
                 reduction_requirement: ReductionRequirement::SetUnion,
                 allowed_contribution_kinds: BTreeSet::from([
-                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::FinalDomainShard,
                     ContributionKind::ProducerClosed,
                 ]),
                 required_consumer_capabilities: BTreeSet::from([
@@ -438,19 +444,21 @@ mod tests {
             })
             .expect("unique channel");
         graph
-            .insert_binding(RuntimeFilterBindingSpec {
+            .insert_binding(RuntimeFilterBindingSpecData {
                 binding_id: BindingId::new(1),
                 channel_id,
                 coverage_witness_id: Some(witness_id),
                 location,
                 expression: expression(),
                 apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
                     contribution_kinds: BTreeSet::from([
-                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::FinalDomainShard,
                         ContributionKind::ProducerClosed,
                     ]),
-                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    completion_requirement: CompletionRequirement::FencedFinalDomain(
+                        CompletionFenceKind::CommittedDomainFrozen,
+                    ),
                     target:
                         crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
                             ordinal: 0,
@@ -459,20 +467,21 @@ mod tests {
             })
             .expect("unique producer binding");
         graph
-            .insert_binding(RuntimeFilterBindingSpec {
+            .insert_binding(RuntimeFilterBindingSpecData {
                 binding_id: BindingId::new(2),
                 channel_id,
                 coverage_witness_id: None,
                 location,
                 expression: expression(),
                 apply_point: ApplyPoint::NodeInput,
-                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                     capabilities: BTreeSet::from([
                         ArtifactCapability::Membership,
                         ArtifactCapability::EmptyDomain,
                     ]),
-                    activation: ConsumerActivation::NonBlockingLive {
+                    activation: ActivationConstraint::LiveOnly {
                         late_apply: LateApplyGranularity::Batch,
+                        reason: RequiredLiveReason::FencedFinalDomainContract,
                     },
                     target: ConsumerBindingTarget::DirectInput { input_ordinal: 0 },
                 }),
@@ -533,7 +542,7 @@ mod tests {
             fragments: vec![fragment],
             root_fragment_id: 9,
             edges: Vec::new(),
-            runtime_filter_graph: crate::runtime_filter::model::graph::RuntimeFilterGraph::default(),
+            runtime_filter_graph: Default::default(),
         }
     }
 
@@ -580,10 +589,10 @@ mod tests {
     fn prepared_fragment_set_retains_sealed_runtime_filter_graph() {
         let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
             test_support::result_plan(),
+            draft_runtime_filter_graph(),
             |builder| {
                 builder.fragments_mut()[0].root.runtime_filter_binding_ids =
                     vec![BindingId::new(1), BindingId::new(2)];
-                *builder.runtime_filter_graph_mut() = sealed_runtime_filter_graph();
             },
         );
         let prepared = prepare_fragments(&plan, &crate::connector::ConnectorRegistry::new(), None)
@@ -591,6 +600,20 @@ mod tests {
 
         assert_eq!(prepared.runtime_filter_graph().channel_count(), 1);
         assert_eq!(prepared.runtime_filter_graph().binding_count(), 2);
+        let RuntimeFilterBindingRoleData::Consumer(consumer) = &prepared
+            .runtime_filter_graph()
+            .binding(BindingId::new(2))
+            .expect("sealed consumer binding")
+            .role
+        else {
+            panic!("binding 2 must remain a consumer");
+        };
+        assert_eq!(
+            consumer.activation,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            }
+        );
         assert_eq!(
             prepared
                 .runtime_filter_graph()

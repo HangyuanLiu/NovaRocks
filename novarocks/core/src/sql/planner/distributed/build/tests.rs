@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use arrow::datatypes::DataType;
 
@@ -10,15 +10,25 @@ use super::runtime_filter_binding::{
     RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
-use crate::runtime_filter::model::contract::BindingId;
+use crate::runtime_filter::model::contract::{
+    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, CoverageWitnessId, NullSemantics, ReductionRequirement,
+    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+};
+use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ProducerBindingTarget, RuntimeFilterBindingRole, RuntimeFilterGraph,
+    ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
+    RuntimeFilterBindingRoleData, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+    RuntimeFilterGraph, RuntimeFilterGraphData,
 };
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
 };
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::activation_decision::{
+    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
+};
 use crate::sql::planner::distributed::runtime_filter_progress::build_join_progress_proof_catalog;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
@@ -43,6 +53,141 @@ use crate::sql::planner::physical::{
 };
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivationNeutralGraphStructure {
+    channels: Vec<ActivationNeutralChannelStructure>,
+    bindings: Vec<ActivationNeutralBindingStructure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivationNeutralChannelStructure {
+    channel_id: ChannelId,
+    logical_domain: RuntimeFilterLogicalDomain,
+    lifecycle: RuntimeFilterLifecycle,
+    availability_coverage: Coverage,
+    terminal_coverage: Coverage,
+    reduction_requirement: ReductionRequirement,
+    allowed_contribution_kinds: BTreeSet<ContributionKind>,
+    required_consumer_capabilities: BTreeSet<ArtifactCapability>,
+    policy: RuntimeFilterPolicyRequirement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivationNeutralBindingStructure {
+    binding_id: BindingId,
+    channel_id: ChannelId,
+    coverage_witness_id: Option<CoverageWitnessId>,
+    location: crate::runtime_filter::model::graph::PlanLocation,
+    expression: String,
+    apply_point: crate::runtime_filter::model::graph::ApplyPoint,
+    role: ActivationNeutralBindingRoleStructure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActivationNeutralBindingRoleStructure {
+    Producer {
+        contribution_kinds: BTreeSet<ContributionKind>,
+        completion_requirement: CompletionRequirement,
+        target: ProducerBindingTarget,
+    },
+    Consumer {
+        capabilities: BTreeSet<ArtifactCapability>,
+        target: ConsumerBindingTarget,
+    },
+}
+
+fn activation_neutral_graph_structure<A>(
+    graph: &RuntimeFilterGraphData<A>,
+) -> ActivationNeutralGraphStructure {
+    ActivationNeutralGraphStructure {
+        channels: graph
+            .channels()
+            .map(|channel| ActivationNeutralChannelStructure {
+                channel_id: channel.channel_id,
+                logical_domain: channel.logical_domain.clone(),
+                lifecycle: channel.lifecycle,
+                availability_coverage: channel.availability_coverage.clone(),
+                terminal_coverage: channel.terminal_coverage.clone(),
+                reduction_requirement: channel.reduction_requirement,
+                allowed_contribution_kinds: channel.allowed_contribution_kinds.clone(),
+                required_consumer_capabilities: channel.required_consumer_capabilities.clone(),
+                policy: channel.policy,
+            })
+            .collect(),
+        bindings: graph
+            .bindings()
+            .map(|binding| ActivationNeutralBindingStructure {
+                binding_id: binding.binding_id,
+                channel_id: binding.channel_id,
+                coverage_witness_id: binding.coverage_witness_id,
+                location: binding.location,
+                expression: format!("{:?}", binding.expression),
+                apply_point: binding.apply_point,
+                role: match &binding.role {
+                    RuntimeFilterBindingRoleData::Producer(producer) => {
+                        ActivationNeutralBindingRoleStructure::Producer {
+                            contribution_kinds: producer.contribution_kinds.clone(),
+                            completion_requirement: producer.completion_requirement,
+                            target: producer.target,
+                        }
+                    }
+                    RuntimeFilterBindingRoleData::Consumer(consumer) => {
+                        ActivationNeutralBindingRoleStructure::Consumer {
+                            capabilities: consumer.capabilities.clone(),
+                            target: consumer.target,
+                        }
+                    }
+                },
+            })
+            .collect(),
+    }
+}
+
+fn copy_graph_with_structural_drift(
+    graph: &RuntimeFilterGraph,
+    mutate_channel: impl Fn(&mut RuntimeFilterChannelSpec),
+    mutate_binding: impl Fn(&mut RuntimeFilterBindingSpec),
+) -> RuntimeFilterGraph {
+    let mut copy = RuntimeFilterGraph::default();
+    for channel in graph.channels() {
+        let mut channel = channel.clone();
+        mutate_channel(&mut channel);
+        copy.insert_channel(channel).expect("copy channel");
+    }
+    for binding in graph.bindings() {
+        let mut binding = binding.clone();
+        mutate_binding(&mut binding);
+        copy.insert_binding(binding).expect("copy binding");
+    }
+    copy
+}
+
+fn assert_snapshot_detects_channel_mutation(
+    graph: &RuntimeFilterGraph,
+    field: &str,
+    mutate: impl Fn(&mut RuntimeFilterChannelSpec),
+) {
+    let drift = copy_graph_with_structural_drift(graph, mutate, |_| {});
+    assert_ne!(
+        activation_neutral_graph_structure(graph),
+        activation_neutral_graph_structure(&drift),
+        "activation-neutral snapshot must include channel.{field}"
+    );
+}
+
+fn assert_snapshot_detects_binding_mutation(
+    graph: &RuntimeFilterGraph,
+    field: &str,
+    mutate: impl Fn(&mut RuntimeFilterBindingSpec),
+) {
+    let drift = copy_graph_with_structural_drift(graph, |_| {}, mutate);
+    assert_ne!(
+        activation_neutral_graph_structure(graph),
+        activation_neutral_graph_structure(&drift),
+        "activation-neutral snapshot must include binding.{field}"
+    );
+}
 
 #[test]
 fn build_distributed_plan_values_shapes_root_fragment() {
@@ -937,7 +1082,7 @@ fn populate_runtime_filter_graph_deduplicates_and_skips_incomplete_channels() {
         test_probe_binding(4, 3, 99),
     ];
 
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     populate_runtime_filter_graph(
         &mut fragments,
         &mut graph,
@@ -955,6 +1100,262 @@ fn populate_runtime_filter_graph_deduplicates_and_skips_incomplete_channels() {
     assert_eq!(fragments[1].root.runtime_filter_binding_ids.len(), 1);
     assert_eq!(fragments[2].root.runtime_filter_binding_ids.len(), 1);
     assert!(fragments[3].root.runtime_filter_binding_ids.is_empty());
+}
+
+#[test]
+fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activation() {
+    let bindings = RuntimeFilterBindings {
+        builds: vec![test_build_binding(1, 0, 10)],
+        probes: vec![test_probe_binding(2, 1, 10)],
+        node_input_columns: std::collections::BTreeMap::new(),
+    };
+    let fragments = vec![
+        test_fragment(distributed_values_node(1, 0)),
+        test_fragment(distributed_values_node(2, 1)),
+    ];
+
+    let mut draft_fragments = fragments;
+    let mut draft_graph = DraftRuntimeFilterGraph::default();
+    populate_runtime_filter_graph(&mut draft_fragments, &mut draft_graph, &bindings)
+        .expect("populate draft graph");
+    draft_graph.validate().expect("draft graph validates");
+    let sealed_fragments = draft_fragments.clone();
+    let sealed_graph = draft_graph
+        .clone()
+        .map_consumer_activations(|_, _, _, _| {
+            Ok::<_, std::convert::Infallible>(ConsumerActivation::BlockingSnapshot)
+        })
+        .expect("infallible test-only materialization");
+    sealed_graph
+        .validate()
+        .expect("materialized graph validates");
+
+    assert_eq!(draft_graph.channel_count(), sealed_graph.channel_count());
+    assert_eq!(draft_graph.binding_count(), sealed_graph.binding_count());
+    assert_eq!(
+        activation_neutral_graph_structure(&draft_graph),
+        activation_neutral_graph_structure(&sealed_graph),
+        "Draft and sealed population must differ only in consumer activation"
+    );
+    // This is deliberately a one-field-at-a-time mutation list. Consumer activation is the
+    // only intentionally excluded field from `activation_neutral_graph_structure`.
+    assert_snapshot_detects_channel_mutation(&sealed_graph, "channel_id", |channel| {
+        channel.channel_id = ChannelId::new(99);
+    });
+    assert_snapshot_detects_channel_mutation(&sealed_graph, "logical_domain", |channel| {
+        channel.logical_domain = match &channel.logical_domain {
+            RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics,
+            } => RuntimeFilterLogicalDomain::Membership {
+                value_type: value_type.clone(),
+                null_semantics: match null_semantics {
+                    NullSemantics::NeverMatches => NullSemantics::NullSafeEqual,
+                    NullSemantics::NullSafeEqual => NullSemantics::NeverMatches,
+                },
+            },
+            RuntimeFilterLogicalDomain::OrderedBound(_) => RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Utf8,
+                null_semantics: NullSemantics::NeverMatches,
+            },
+        };
+    });
+    assert_snapshot_detects_channel_mutation(&sealed_graph, "lifecycle", |channel| {
+        channel.lifecycle = match channel.lifecycle {
+            RuntimeFilterLifecycle::CompleteOnce => RuntimeFilterLifecycle::MonotonicUpdates,
+            RuntimeFilterLifecycle::MonotonicUpdates => RuntimeFilterLifecycle::CompleteOnce,
+        };
+    });
+    assert_snapshot_detects_channel_mutation(&sealed_graph, "availability_coverage", |channel| {
+        channel.availability_coverage = Coverage::AnyOf(vec![
+            channel.availability_coverage.clone(),
+            Coverage::Leaf(CoverageWitnessId::new(99)),
+        ]);
+    });
+    assert_snapshot_detects_channel_mutation(&sealed_graph, "terminal_coverage", |channel| {
+        channel.terminal_coverage = Coverage::AllOf(vec![
+            channel.terminal_coverage.clone(),
+            Coverage::Leaf(CoverageWitnessId::new(98)),
+        ]);
+    });
+    assert_snapshot_detects_channel_mutation(&sealed_graph, "reduction_requirement", |channel| {
+        channel.reduction_requirement = match channel.reduction_requirement {
+            ReductionRequirement::SetUnion => ReductionRequirement::TightenOrderedBound,
+            ReductionRequirement::TightenOrderedBound
+            | ReductionRequirement::MergeTopKSummary(_) => ReductionRequirement::SetUnion,
+        };
+    });
+    assert_snapshot_detects_channel_mutation(
+        &sealed_graph,
+        "allowed_contribution_kinds",
+        |channel| {
+            if !channel
+                .allowed_contribution_kinds
+                .insert(ContributionKind::TopKSummary)
+            {
+                channel
+                    .allowed_contribution_kinds
+                    .remove(&ContributionKind::TopKSummary);
+            }
+        },
+    );
+    assert_snapshot_detects_channel_mutation(
+        &sealed_graph,
+        "required_consumer_capabilities",
+        |channel| {
+            if !channel
+                .required_consumer_capabilities
+                .insert(ArtifactCapability::OrderedRange)
+            {
+                channel
+                    .required_consumer_capabilities
+                    .remove(&ArtifactCapability::OrderedRange);
+            }
+        },
+    );
+    assert_snapshot_detects_channel_mutation(&sealed_graph, "policy", |channel| {
+        channel.policy.deadline_ms = if channel.policy.deadline_ms == 0 {
+            1
+        } else {
+            0
+        };
+    });
+
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "binding_id", |binding| {
+        if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
+            binding.binding_id = BindingId::new(99);
+        }
+    });
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "channel_id", |binding| {
+        if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
+            binding.channel_id = ChannelId::new(99);
+        }
+    });
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "coverage_witness_id", |binding| {
+        if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
+            binding.coverage_witness_id = Some(CoverageWitnessId::new(99));
+        }
+    });
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "location", |binding| {
+        if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
+            binding.location.node_id = crate::runtime_filter::model::contract::PlanNodeId::new(99);
+        }
+    });
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "expression", |binding| {
+        if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
+            binding.expression = column_ref_expr(99, "changed", DataType::Int64, false);
+        }
+    });
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "apply_point", |binding| {
+        if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
+            binding.apply_point = crate::runtime_filter::model::graph::ApplyPoint::NodeInput;
+        }
+    });
+    assert_snapshot_detects_binding_mutation(
+        &sealed_graph,
+        "producer.contribution_kinds",
+        |binding| {
+            if let RuntimeFilterBindingRole::Producer(producer) = &mut binding.role {
+                if !producer
+                    .contribution_kinds
+                    .insert(ContributionKind::FinalDomainShard)
+                {
+                    producer
+                        .contribution_kinds
+                        .remove(&ContributionKind::FinalDomainShard);
+                }
+            }
+        },
+    );
+    assert_snapshot_detects_binding_mutation(
+        &sealed_graph,
+        "producer.completion_requirement",
+        |binding| {
+            if let RuntimeFilterBindingRole::Producer(producer) = &mut binding.role {
+                producer.completion_requirement = match producer.completion_requirement {
+                    CompletionRequirement::ProducerClosed => {
+                        CompletionRequirement::FencedFinalDomain(
+                            CompletionFenceKind::CommittedDomainFrozen,
+                        )
+                    }
+                    CompletionRequirement::FencedFinalDomain(_) => {
+                        CompletionRequirement::ProducerClosed
+                    }
+                };
+            }
+        },
+    );
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "producer.target", |binding| {
+        if let RuntimeFilterBindingRole::Producer(producer) = &mut binding.role {
+            producer.target = ProducerBindingTarget::JoinBuildKey { ordinal: 99 };
+        }
+    });
+
+    let consumer_target = sealed_graph
+        .bindings()
+        .find_map(|binding| match &binding.role {
+            RuntimeFilterBindingRole::Consumer(consumer) => Some(consumer.target),
+            RuntimeFilterBindingRole::Producer(_) => None,
+        })
+        .expect("sealed consumer target");
+    let changed_consumer_target = ConsumerBindingTarget::DirectInput { input_ordinal: 99 };
+    assert_ne!(
+        consumer_target, changed_consumer_target,
+        "the consumer target mutation must not be a no-op"
+    );
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "consumer.capabilities", |binding| {
+        if let RuntimeFilterBindingRole::Consumer(consumer) = &mut binding.role {
+            if !consumer
+                .capabilities
+                .insert(ArtifactCapability::OrderedRange)
+            {
+                consumer
+                    .capabilities
+                    .remove(&ArtifactCapability::OrderedRange);
+            }
+        }
+    });
+    assert_snapshot_detects_binding_mutation(&sealed_graph, "consumer.target", |binding| {
+        if let RuntimeFilterBindingRole::Consumer(consumer) = &mut binding.role {
+            consumer.target = changed_consumer_target;
+        }
+    });
+    assert_eq!(
+        draft_fragments
+            .iter()
+            .map(|fragment| fragment.root.runtime_filter_binding_ids.clone())
+            .collect::<Vec<_>>(),
+        sealed_fragments
+            .iter()
+            .map(|fragment| fragment.root.runtime_filter_binding_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    let draft_consumer = draft_graph
+        .bindings()
+        .find_map(|binding| match &binding.role {
+            crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Consumer(
+                consumer,
+            ) => Some(consumer),
+            crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Producer(_) => None,
+        })
+        .expect("draft consumer");
+    assert_eq!(
+        draft_consumer.activation,
+        ActivationConstraint::BlockingOrBatchLive {
+            fallback: ActivationFallback::BlockingSnapshot,
+        }
+    );
+    let sealed_consumer = sealed_graph
+        .bindings()
+        .find_map(|binding| match &binding.role {
+            RuntimeFilterBindingRole::Consumer(consumer) => Some(consumer),
+            RuntimeFilterBindingRole::Producer(_) => None,
+        })
+        .expect("sealed consumer");
+    assert_eq!(
+        sealed_consumer.activation,
+        ConsumerActivation::BlockingSnapshot
+    );
 }
 
 #[test]
@@ -3449,7 +3850,7 @@ fn join_progress_proof_catalog_partitions_fragment_inputs() {
     let build_bindings = vec![test_build_binding(10, 1, 7)];
     let probe_bindings = vec![test_probe_binding(40, 2, 7)];
 
-    let mut graph = RuntimeFilterGraph::default();
+    let mut graph = DraftRuntimeFilterGraph::default();
     populate_runtime_filter_graph(
         &mut fragments,
         &mut graph,

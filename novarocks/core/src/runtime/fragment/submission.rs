@@ -2183,18 +2183,18 @@ mod tests {
             query,
             finst,
             BTreeMap::new(),
-            BTreeMap::from([(exchange_id, 1)]),
+            BTreeMap::new(),
             FragmentSinkAssignment::None,
             BTreeMap::new(),
-            BTreeMap::from([(13, 0)]),
+            BTreeMap::new(),
         );
 
         assert_runtime_state_absent(query, finst, exchange_key, rf_key);
         let before = Arc::strong_count(&program);
         assert_error(
             FragmentSubmission::try_new(Arc::clone(&program), instance),
-            FragmentBindingTarget::RuntimeFilter(13),
-            FragmentBindingErrorKind::InvalidAssignment,
+            FragmentBindingTarget::ExchangeNode(exchange_id.get()),
+            FragmentBindingErrorKind::MissingAssignment,
         );
         assert_eq!(Arc::strong_count(&program), before);
         assert_runtime_state_absent(query, finst, exchange_key, rf_key);
