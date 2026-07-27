@@ -16,11 +16,11 @@
 // under the License.
 
 use novarocks::engine::view::{
-    CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
+    CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewSqlDialect, ViewStatementResult,
+    ViewTarget,
 };
 use novarocks_catalog::identifier::normalize_identifier;
 use sqlparser::ast::{CreateView, ObjectName, ObjectNamePart};
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 
@@ -197,7 +197,7 @@ pub(super) fn show_create_view(
 }
 
 fn parse_show_create_view(sql: &str) -> Result<ObjectName, String> {
-    let mut parser = Parser::new(&MySqlDialect {})
+    let mut parser = Parser::new(&ViewSqlDialect)
         .try_with_sql(sql)
         .map_err(|error| format!("parse SHOW CREATE VIEW: {error}"))?;
     parser
@@ -215,7 +215,7 @@ fn parse_show_create_view(sql: &str) -> Result<ObjectName, String> {
 }
 
 pub(super) fn parse_show_views(sql: &str) -> Result<Option<String>, String> {
-    let mut parser = Parser::new(&MySqlDialect {})
+    let mut parser = Parser::new(&ViewSqlDialect)
         .try_with_sql(sql)
         .map_err(|error| format!("parse SHOW VIEWS: {error}"))?;
     parser

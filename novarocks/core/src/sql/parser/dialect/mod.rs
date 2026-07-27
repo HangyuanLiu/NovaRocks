@@ -33,7 +33,7 @@ use novarocks_catalog::schema::SqlType;
 
 /// Custom StarRocks dialect for sqlparser.
 #[derive(Debug)]
-pub(crate) struct StarRocksDialect;
+pub struct StarRocksDialect;
 
 impl sqlparser::dialect::Dialect for StarRocksDialect {
     fn is_delimited_identifier_start(&self, ch: char) -> bool {

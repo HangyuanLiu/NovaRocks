@@ -20,6 +20,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use novarocks::engine::view::ViewSqlDialect;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, Value,
@@ -30,7 +31,6 @@ use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlparser::ast::Statement;
-use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 use uuid::Uuid;
@@ -362,7 +362,7 @@ fn parse_query(sql: &str) -> Result<(), String> {
 }
 
 fn canonical_query(sql: &str) -> Result<String, String> {
-    let statements = Parser::parse_sql(&GenericDialect, sql)
+    let statements = Parser::parse_sql(&ViewSqlDialect, sql)
         .map_err(|error| format!("query parse failed: {error}"))?;
     match statements.as_slice() {
         [Statement::Query(query)] => Ok(query.to_string()),

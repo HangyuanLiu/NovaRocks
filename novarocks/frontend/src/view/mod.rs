@@ -25,13 +25,14 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks::common::ids::SlotId;
-use novarocks::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
+use novarocks::engine::view::{
+    ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult,
+};
 use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::state_store::StateStore;
 use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Statement};
-use sqlparser::dialect::{GenericDialect, MySqlDialect};
 use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 
@@ -205,7 +206,7 @@ impl FrontendViewService {
         sql: &str,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, String> {
-        let mut parser = Parser::new(&MySqlDialect {})
+        let mut parser = Parser::new(&ViewSqlDialect)
             .try_with_sql(sql)
             .map_err(|error| format!("CREATE VIEW parse error: {error}"))?;
         let statement = parser
@@ -229,7 +230,7 @@ impl FrontendViewService {
         sql: &str,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, String> {
-        let mut parser = Parser::new(&MySqlDialect {})
+        let mut parser = Parser::new(&ViewSqlDialect)
             .try_with_sql(sql)
             .map_err(|error| format!("DROP VIEW parse error: {error}"))?;
         let statement = parser
@@ -390,7 +391,7 @@ fn append_record_views(
 }
 
 fn parse_query(sql: &str) -> Result<Box<Query>, String> {
-    let statements = Parser::parse_sql(&GenericDialect, sql)
+    let statements = Parser::parse_sql(&ViewSqlDialect, sql)
         .map_err(|error| format!("query parse failed: {error}"))?;
     match statements.as_slice() {
         [Statement::Query(query)] => Ok(query.clone()),

@@ -35,7 +35,8 @@ use sqlparser::parser::Parser;
 use crate::engine::iceberg_view;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::sql::parser::dialect::StarRocksDialect;
+/// Shared StarRocks SQL parser contract for view DDL, storage, and rewrite.
+pub use crate::sql::parser::dialect::StarRocksDialect as ViewSqlDialect;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewRequestContext<'a> {
@@ -392,7 +393,7 @@ fn handle_create_view(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
-    let dialect = StarRocksDialect;
+    let dialect = ViewSqlDialect;
     let mut parser = Parser::new(&dialect)
         .try_with_sql(trimmed)
         .map_err(|e| format!("CREATE VIEW parse error: {e}"))?;
@@ -434,7 +435,7 @@ fn handle_drop_view(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
-    let dialect = StarRocksDialect;
+    let dialect = ViewSqlDialect;
     let mut parser = Parser::new(&dialect)
         .try_with_sql(trimmed)
         .map_err(|e| format!("DROP VIEW parse error: {e}"))?;

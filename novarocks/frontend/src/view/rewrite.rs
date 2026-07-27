@@ -17,9 +17,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use novarocks::engine::view::{ResolvedExternalView, ViewEngine, ViewRequestContext, ViewTarget};
+use novarocks::engine::view::{
+    ResolvedExternalView, ViewEngine, ViewRequestContext, ViewSqlDialect, ViewTarget,
+};
 use sqlparser::ast as sqlast;
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use super::iceberg::resolve_external_target_parts;
@@ -43,18 +44,25 @@ fn expand_session_query(
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
 ) {
+    let mut cte_names = HashSet::new();
+    if let Some(with_clause) = query.with.as_ref() {
+        for cte in &with_clause.cte_tables {
+            cte_names.insert(cte.alias.name.value.to_ascii_lowercase());
+        }
+    }
     if let Some(with_clause) = query.with.as_mut() {
         for cte in &mut with_clause.cte_tables {
             expand_session_query(cte.query.as_mut(), registry, current_database);
         }
     }
-    expand_session_set_expr(query.body.as_mut(), registry, current_database);
+    expand_session_set_expr(query.body.as_mut(), registry, current_database, &cte_names);
 }
 
 fn expand_session_set_expr(
     expression: &mut sqlast::SetExpr,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
+    cte_names: &HashSet<String>,
 ) {
     match expression {
         sqlast::SetExpr::Select(select) => {
@@ -63,9 +71,15 @@ fn expand_session_set_expr(
                     &mut table_with_joins.relation,
                     registry,
                     current_database,
+                    cte_names,
                 );
                 for join in &mut table_with_joins.joins {
-                    expand_session_table_factor(&mut join.relation, registry, current_database);
+                    expand_session_table_factor(
+                        &mut join.relation,
+                        registry,
+                        current_database,
+                        cte_names,
+                    );
                 }
             }
         }
@@ -73,8 +87,8 @@ fn expand_session_set_expr(
             expand_session_query(query.as_mut(), registry, current_database)
         }
         sqlast::SetExpr::SetOperation { left, right, .. } => {
-            expand_session_set_expr(left.as_mut(), registry, current_database);
-            expand_session_set_expr(right.as_mut(), registry, current_database);
+            expand_session_set_expr(left.as_mut(), registry, current_database, cte_names);
+            expand_session_set_expr(right.as_mut(), registry, current_database, cte_names);
         }
         _ => {}
     }
@@ -84,10 +98,14 @@ fn expand_session_table_factor(
     factor: &mut sqlast::TableFactor,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
+    cte_names: &HashSet<String>,
 ) {
     match factor {
         sqlast::TableFactor::Table { name, alias, .. } => {
             let parts = object_name_parts(name);
+            if parts.len() == 1 && cte_names.contains(&parts[0].to_ascii_lowercase()) {
+                return;
+            }
             let key = match parts.as_slice() {
                 [view] => session_key(DEFAULT_CATALOG, current_database, view),
                 [database, view] => session_key(DEFAULT_CATALOG, database, view),
@@ -117,9 +135,19 @@ fn expand_session_table_factor(
         sqlast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            expand_session_table_factor(&mut table_with_joins.relation, registry, current_database);
+            expand_session_table_factor(
+                &mut table_with_joins.relation,
+                registry,
+                current_database,
+                cte_names,
+            );
             for join in &mut table_with_joins.joins {
-                expand_session_table_factor(&mut join.relation, registry, current_database);
+                expand_session_table_factor(
+                    &mut join.relation,
+                    registry,
+                    current_database,
+                    cte_names,
+                );
             }
         }
         _ => {}
@@ -309,7 +337,7 @@ fn parse_external_view_sql(
     view: &ResolvedExternalView,
     key: &ExternalViewKey,
 ) -> Result<sqlast::Query, String> {
-    let mut parser = Parser::new(&MySqlDialect {})
+    let mut parser = Parser::new(&ViewSqlDialect)
         .try_with_sql(&view.sql)
         .map_err(|error| external_view_parse_error(key, &view.dialect, &error.to_string()))?;
     let statement = parser

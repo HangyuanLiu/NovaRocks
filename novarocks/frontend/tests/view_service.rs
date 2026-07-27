@@ -23,7 +23,7 @@ use arrow::array::{Array, StringArray};
 use bytes::Bytes;
 use novarocks::engine::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
-    ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
+    ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };
 use novarocks_frontend::FrontendViewService;
 use novarocks_spi::state_store::StateStore;
@@ -32,7 +32,6 @@ use novarocks_state_store::{
     StateStoreRuntime, open_state_store,
 };
 use sqlparser::ast::{DataType, Query, Statement};
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use tempfile::TempDir;
 
@@ -183,7 +182,7 @@ fn context<'a>(catalog: Option<&'a str>, database: &'a str) -> ViewRequestContex
 }
 
 fn parse_query(sql: &str) -> Query {
-    let mut parser = Parser::new(&MySqlDialect {}).try_with_sql(sql).unwrap();
+    let mut parser = Parser::new(&ViewSqlDialect).try_with_sql(sql).unwrap();
     let Statement::Query(query) = parser.parse_statement().unwrap() else {
         panic!("expected query");
     };
@@ -541,6 +540,30 @@ async fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_cte_shadows_a_same_named_session_view() {
+    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let engine = FakeViewEngine::default();
+    service
+        .try_handle_statement(
+            &engine,
+            "CREATE VIEW nested AS SELECT 7 AS a",
+            context(None, "db"),
+        )
+        .unwrap();
+
+    let mut query = parse_query("WITH nested AS (SELECT 3 AS a) SELECT * FROM nested");
+    service
+        .rewrite_query(&engine, &mut query, context(None, "db"))
+        .unwrap();
+    assert_eq!(
+        query.to_string(),
+        "WITH nested AS (SELECT 3 AS a) SELECT * FROM nested"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rewrite_keeps_tables_and_table_probe_failures_and_reports_view_cycles() {
     let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
         .await
@@ -676,4 +699,58 @@ async fn configured_service_restores_durable_views_and_never_publishes_failed_re
         .rewrite_query(&engine, &mut restored, context(None, "db"))
         .unwrap();
     assert_eq!(restored.to_string(), "SELECT * FROM (SELECT 1 AS a) v");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starrocks_view_sql_uses_the_same_parser_before_and_after_restart() {
+    let temp = TempDir::new().unwrap();
+    let store = open_sqlite_store(&temp.path().join("state.sqlite")).await;
+    let service = FrontendViewService::open(
+        Some(std::sync::Arc::clone(&store)),
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
+    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    service
+        .try_handle_statement(
+            &engine,
+            "CREATE VIEW dialect_view AS \
+             SELECT first_value(a IGNORE NULLS) OVER () AS x FROM t",
+            context(None, "db"),
+        )
+        .unwrap();
+    drop(service);
+
+    let reopened = FrontendViewService::open(Some(store), tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let mut query = parse_query("SELECT * FROM dialect_view");
+    reopened
+        .rewrite_query(&engine, &mut query, context(None, "db"))
+        .unwrap();
+    let rendered = query.to_string();
+    assert!(
+        rendered.contains("first_value(a IGNORE NULLS) OVER ()"),
+        "got: {rendered}"
+    );
+
+    engine.insert_view(
+        ViewTarget {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            view: "dialect_view".to_string(),
+        },
+        "SELECT first_value(a IGNORE NULLS) OVER () AS x FROM t",
+        "db",
+    );
+    let mut external = parse_query("SELECT * FROM dialect_view");
+    reopened
+        .rewrite_query(&engine, &mut external, context(Some("ice"), "db"))
+        .unwrap();
+    let rendered = external.to_string();
+    assert!(
+        rendered.contains("first_value(a IGNORE NULLS) OVER ()"),
+        "got: {rendered}"
+    );
 }
