@@ -406,7 +406,12 @@ mod tests {
             .install_runtime_filter_deployment(
                 query_id,
                 deployment_lifecycle,
-                crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install(),
+                crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install_with_expected_producer_instances(
+                    BTreeSet::from([
+                        UniqueId { hi: 70, lo: 30 },
+                        UniqueId { hi: 70, lo: 31 },
+                    ]),
+                ),
             )
             .expect("install query-owned runtime-filter Service");
         for _ in 0..2 {
@@ -571,9 +576,9 @@ mod tests {
             .snapshot(query_key)
             .expect("producer shares the query lifecycle event sink");
         assert_eq!(producer_lifecycle.filters.len(), installed_filter_count);
-        assert_eq!(
-            producer_lifecycle.channel_events.len(),
-            installed_channel_event_count
+        assert!(
+            producer_lifecycle.channel_events.len() >= installed_channel_event_count,
+            "producer activity may add structured channel events without creating legacy records"
         );
 
         let consumer_schema = Arc::new(Schema::new(vec![Field::new(
@@ -665,9 +670,9 @@ mod tests {
             .snapshot(query_key)
             .expect("consumer shares the query lifecycle event sink");
         assert_eq!(consumer_lifecycle.filters.len(), installed_filter_count);
-        assert_eq!(
-            consumer_lifecycle.channel_events.len(),
-            installed_channel_event_count
+        assert!(
+            consumer_lifecycle.channel_events.len() >= installed_channel_event_count,
+            "consumer fail-open may add structured channel events without creating legacy records"
         );
         context_manager.cancel_query(query_id, "test cleanup".to_string());
         context_manager.finish_fragment(query_id);

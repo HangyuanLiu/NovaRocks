@@ -2689,6 +2689,54 @@ impl QueryContextManager {
         guard.incremental_change_op_slots.remove(&finst_id);
     }
 
+    /// Undo the registration performed before a native worker reports readiness.
+    ///
+    /// A synchronous pre-ready failure has not exposed a runnable fragment to the
+    /// coordinator, so an otherwise empty query context must not be retained as a
+    /// cancelled runtime-filter query. Deployments are deliberately excluded: once
+    /// one exists, the regular query-cancellation path owns its terminal state.
+    pub(crate) fn rollback_pre_ready_native_fragment(
+        &self,
+        query_id: QueryId,
+        finst_id: UniqueId,
+    ) -> bool {
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            if guard.finst_to_query.get(&finst_id) != Some(&QueryExecutionKey::native(query_id)) {
+                return false;
+            }
+            let Some(context) = guard.active.get(&query_id) else {
+                return false;
+            };
+            if !context.matches_execution(QueryExecutionKey::native(query_id))
+                || context.num_fragments != 1
+                || context.num_active_fragments != 1
+                || context.runtime_filter_deployment.is_some()
+            {
+                return false;
+            }
+
+            guard.finst_to_query.remove(&finst_id);
+            guard.fragment_completions.remove(&finst_id);
+            let mut context = guard
+                .active
+                .remove(&query_id)
+                .expect("checked active context");
+            context.rollback_inc_fragments();
+            debug_assert_eq!(context.num_fragments, 0);
+            debug_assert_eq!(context.num_active_fragments, 0);
+            Some(context)
+        };
+        if let Some(context) = removed {
+            context.runtime_filter_service().shutdown();
+            drop(context);
+            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn unregister_finst_execution(
         &self,
         finst_id: UniqueId,
@@ -3575,6 +3623,7 @@ mod runtime_filter_lifecycle_cleanup_tests {
         FragmentFinishReportDecision, QueryContext, QueryContextManager, QueryContextManagerInner,
         QueryId,
     };
+    use crate::common::types::UniqueId;
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
     fn test_manager() -> QueryContextManager {
@@ -3615,6 +3664,42 @@ mod runtime_filter_lifecycle_cleanup_tests {
         mgr.finish_fragment(query_id);
 
         assert!(registry.snapshot(query_key).is_none());
+    }
+
+    #[test]
+    fn pre_ready_rollback_preserves_multi_fragment_context_for_normal_cleanup() {
+        let mgr = test_manager();
+        let query_id = QueryId {
+            hi: 4_131,
+            lo: 4_132,
+        };
+        let first = UniqueId { hi: 4_133, lo: 1 };
+        let second = UniqueId { hi: 4_133, lo: 2 };
+
+        mgr.ensure_native_context(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("create native context");
+        for finst_id in [first, second] {
+            mgr.get_or_register_native(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("register native fragment");
+            mgr.register_finst(finst_id, query_id);
+        }
+
+        assert!(!mgr.rollback_pre_ready_native_fragment(query_id, second));
+        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((2, 2)));
+        assert_eq!(mgr.query_id_by_finst(first), Some(query_id));
+        assert_eq!(mgr.query_id_by_finst(second), Some(query_id));
+        RuntimeFilterLifecycleRegistry::global()
+            .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
     }
 
     #[test]
@@ -3920,15 +4005,38 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     }
 
     pub(crate) fn participant_install() -> RuntimeFilterParticipantInstall {
-        participant_install_with_consumer(
+        participant_install_with_consumer_and_producer_instances(
             ConsumerActivation::BlockingSnapshot,
             BTreeSet::from([ArtifactCapability::Membership]),
+            BTreeSet::from([uid(30)]),
+        )
+    }
+
+    pub(crate) fn participant_install_with_expected_producer_instances(
+        expected_fragment_instances: BTreeSet<UniqueId>,
+    ) -> RuntimeFilterParticipantInstall {
+        participant_install_with_consumer_and_producer_instances(
+            ConsumerActivation::BlockingSnapshot,
+            BTreeSet::from([ArtifactCapability::Membership]),
+            expected_fragment_instances,
         )
     }
 
     pub(crate) fn participant_install_with_consumer(
         activation: ConsumerActivation,
         capabilities: BTreeSet<ArtifactCapability>,
+    ) -> RuntimeFilterParticipantInstall {
+        participant_install_with_consumer_and_producer_instances(
+            activation,
+            capabilities,
+            BTreeSet::from([uid(30)]),
+        )
+    }
+
+    fn participant_install_with_consumer_and_producer_instances(
+        activation: ConsumerActivation,
+        capabilities: BTreeSet<ArtifactCapability>,
+        expected_fragment_instances: BTreeSet<UniqueId>,
     ) -> RuntimeFilterParticipantInstall {
         let channel_id = ChannelId::new(1);
         let witness_id = CoverageWitnessId::new(2);
@@ -3978,7 +4086,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
             crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(3),
-                ProducerDeployment::new(witness_id, BTreeSet::from([uid(30)])),
+                ProducerDeployment::new(witness_id, expected_fragment_instances),
             )]),
             BTreeMap::from([(
                 BindingId::new(4),

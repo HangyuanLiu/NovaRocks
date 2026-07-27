@@ -3123,7 +3123,7 @@ mod native_ordered_live_consumer_tests {
     }
 
     #[test]
-    fn native_join_consumer_remains_blocking_membership_only() {
+    fn native_join_consumer_rejects_ordered_contract_even_when_batch_live() {
         let order = contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
         let mut arena = ExprArena::default();
         let ordered = ordered_spec(
@@ -3138,7 +3138,7 @@ mod native_ordered_live_consumer_tests {
             NativeRuntimeFilterConsumerSet::from_plan(&[ordered], Arc::new(arena))
                 .err()
                 .expect("ordered live spec must not enter Join consumer")
-                .contains("BlockingSnapshot")
+                .contains("unsupported artifact capability profile")
         );
     }
 }
