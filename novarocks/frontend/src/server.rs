@@ -62,6 +62,8 @@ where
 {
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
+    let view_service: Arc<dyn novarocks::engine::view::ViewService> =
+        Arc::new(novarocks::engine::view::EmptyViewService);
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
@@ -73,6 +75,7 @@ where
                 config.port_override,
                 config.local_exchange,
                 system_catalog,
+                view_service,
                 shutdown,
             )
             .await
@@ -95,6 +98,8 @@ where
 {
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
+    let view_service: Arc<dyn novarocks::engine::view::ViewService> =
+        Arc::new(novarocks::engine::view::EmptyViewService);
     run_frontend_server_with_signal_and_ports(
         config,
         signal,
@@ -106,6 +111,7 @@ where
                 config.port_override,
                 config.local_exchange,
                 system_catalog,
+                view_service,
                 shutdown,
             )
             .await
