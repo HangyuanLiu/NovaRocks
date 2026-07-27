@@ -37,7 +37,9 @@ use crate::runtime_filter::model::contract::{
     BindingId, ChannelId, CompletionRequirement, CoverageWitnessId,
 };
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
-use crate::runtime_filter::model::refined_wait_graph::project_consumer_waits;
+use crate::runtime_filter::model::refined_wait_graph::{
+    ConsumerWaitBehavior, project_consumer_waits,
+};
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
 use crate::sql::planner::distributed::{FragmentEdge, FragmentId, JoinBuildProgressCatalog};
 
@@ -183,8 +185,15 @@ pub(crate) fn compile_with_join_progress(
         .iter()
         .map(FragmentEdge::as_refined_runtime_filter_edge)
         .collect::<Vec<_>>();
-    let consumer_waits = project_consumer_waits(graph);
-    validate_wait_for(&refined_edges, &consumer_waits, join_progress, graph)?;
+    let consumer_waits = project_consumer_waits(graph, |activation| match activation {
+        crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+            ConsumerWaitBehavior::BlocksUntilComplete
+        }
+        crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. } => {
+            ConsumerWaitBehavior::NeverBlocks
+        }
+    });
+    validate_wait_for(&refined_edges, &consumer_waits, join_progress)?;
 
     // 4. Role graph per channel + the per-channel projection spec the shard
     // projector needs. The completion requirement is precomputed here from

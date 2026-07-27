@@ -52,6 +52,24 @@ impl ActivationContract for ActivationConstraint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_filter::model::contract::ConsumerActivation;
+    use crate::runtime_filter::model::refined_wait_graph::ConsumerWaitBehavior;
+
+    fn draft_wait(activation: &ActivationConstraint) -> ConsumerWaitBehavior {
+        match activation {
+            ActivationConstraint::LiveOnly { .. } => ConsumerWaitBehavior::NeverBlocks,
+            ActivationConstraint::BlockingOrBatchLive { .. } => {
+                ConsumerWaitBehavior::BlocksUntilComplete
+            }
+        }
+    }
+
+    fn sealed_wait(activation: ConsumerActivation) -> ConsumerWaitBehavior {
+        match activation {
+            ConsumerActivation::BlockingSnapshot => ConsumerWaitBehavior::BlocksUntilComplete,
+            ConsumerActivation::NonBlockingLive { .. } => ConsumerWaitBehavior::NeverBlocks,
+        }
+    }
 
     #[test]
     fn activation_constraints_preserve_required_live_contract() {
@@ -76,5 +94,26 @@ mod tests {
     fn draft_graph_type_is_a_generic_graph_specialization() {
         let draft = DraftRuntimeFilterGraph::default();
         assert!(draft.is_empty());
+    }
+
+    #[test]
+    fn draft_and_sealed_activation_project_to_the_same_wait_behavior() {
+        assert_eq!(
+            draft_wait(&ActivationConstraint::BlockingOrBatchLive {
+                fallback: ActivationFallback::BlockingSnapshot,
+            }),
+            ConsumerWaitBehavior::BlocksUntilComplete
+        );
+        assert_eq!(
+            sealed_wait(ConsumerActivation::BlockingSnapshot),
+            ConsumerWaitBehavior::BlocksUntilComplete
+        );
+        assert_eq!(
+            draft_wait(&ActivationConstraint::LiveOnly {
+                late_apply: LateApplyGranularity::Batch,
+                reason: RequiredLiveReason::OrderedBoundContract,
+            }),
+            ConsumerWaitBehavior::NeverBlocks
+        );
     }
 }

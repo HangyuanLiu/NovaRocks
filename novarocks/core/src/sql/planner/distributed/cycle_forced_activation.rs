@@ -25,8 +25,8 @@ use crate::runtime_filter::model::contract::{
 use crate::runtime_filter::model::graph::{ConsumerActivationUpdateError, RuntimeFilterGraph};
 use crate::runtime_filter::model::join_progress::JoinBuildProgressCatalog;
 use crate::runtime_filter::model::refined_wait_graph::{
-    CycleStep, RefinedFragmentEdge, RefinedWaitGraphBuildError, build_refined_wait_graph,
-    project_consumer_waits,
+    ConsumerWaitBehavior, CycleStep, RefinedFragmentEdge, RefinedWaitGraphBuildError,
+    build_refined_wait_graph, project_consumer_waits,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,7 +78,10 @@ pub(crate) fn decide_cycle_forced_activations(
     graph: &RuntimeFilterGraph,
     join_progress: &JoinBuildProgressCatalog,
 ) -> Result<Vec<CycleForcedActivation>, CycleForcedActivationError> {
-    let consumers = project_consumer_waits(graph);
+    let consumers = project_consumer_waits(graph, |activation| match activation {
+        ConsumerActivation::BlockingSnapshot => ConsumerWaitBehavior::BlocksUntilComplete,
+        ConsumerActivation::NonBlockingLive { .. } => ConsumerWaitBehavior::NeverBlocks,
+    });
     let consumer_fragments: BTreeMap<(ChannelId, BindingId), u32> = consumers
         .iter()
         .map(|consumer| {
@@ -88,7 +91,7 @@ pub(crate) fn decide_cycle_forced_activations(
             )
         })
         .collect();
-    let refined = build_refined_wait_graph(edges, &consumers, join_progress, graph)
+    let refined = build_refined_wait_graph(edges, &consumers, join_progress)
         .map_err(CycleForcedActivationError::RefinedGraph)?;
     let mut decisions: BTreeMap<
         (ChannelId, BindingId, u32),

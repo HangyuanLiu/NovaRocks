@@ -30,7 +30,7 @@ use std::fmt;
 use crate::runtime_filter::model::contract::{
     BindingId, PlanFragmentId, PlanNodeId, RuntimeFilterLogicalDomain,
 };
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+use crate::runtime_filter::model::graph::RuntimeFilterGraphData;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -116,8 +116,8 @@ impl fmt::Display for RuntimeFilterPlanValidationError {
     }
 }
 
-pub(in crate::sql::planner::distributed) fn validate_runtime_filter_graph_against_plan(
-    graph: &RuntimeFilterGraph,
+pub(in crate::sql::planner::distributed) fn validate_runtime_filter_graph_against_plan<A>(
+    graph: &RuntimeFilterGraphData<A>,
     fragments: &[PlanFragment],
 ) -> Result<(), RuntimeFilterPlanValidationError> {
     let fragments_by_id = fragments
