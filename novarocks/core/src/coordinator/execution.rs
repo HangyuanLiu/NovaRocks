@@ -1658,8 +1658,8 @@ fn submit_and_fetch_loop_with_deployment_lease(
             });
         }
         observer.fragment_scheduled();
-        if let Some(registry) = crate::coordinator::cluster::backend_registry() {
-            registry.record_scheduled_fragment(backend_idx as crate::coordinator::cluster::BeId);
+        if let Some(membership) = crate::coordinator::cluster::cluster_membership() {
+            membership.record_scheduled_fragment(backend_idx as crate::coordinator::cluster::BeId);
         }
         if crate::runtime::query_state::in_flight_table().state(runtime_query_id)
             == Some(QueryState::Failed)

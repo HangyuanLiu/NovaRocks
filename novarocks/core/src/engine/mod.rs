@@ -2461,8 +2461,8 @@ fn ensure_mainline_distributed_execution(
 /// floor (never panics). NOT a standalone-specific branch: all-in-one is a
 /// test shell that registers one loopback BE; goldens pin SET to the real N.
 fn live_effective_backend_count() -> f64 {
-    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
-        let entries = registry.live_endpoints();
+    if let Some(membership) = crate::coordinator::cluster::cluster_membership() {
+        let entries = membership.live_endpoints();
         if !entries.is_empty() {
             return (entries.len() as f64).max(1.0);
         }
@@ -6053,7 +6053,7 @@ mysql_port = 47892
     fn explain_analyze_runs_distributed_plan_and_renders_actuals() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(3,300)");
+        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(4,400)");
 
         let result = session
             .execute_in_context(
@@ -8555,6 +8555,21 @@ path = "meta/operations.sqlite"
         registry.restore_backend(2, "127.0.0.1:19081".parse().unwrap(), BackendState::Live);
         registry.restore_backend(3, "127.0.0.1:19082".parse().unwrap(), BackendState::Live);
         crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
+
+        assert_eq!(super::live_effective_backend_count(), 2.0);
+    }
+
+    #[test]
+    fn live_effective_backend_count_reads_injected_membership() {
+        let _standalone = super::acquire_standalone_test_guard();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+        let ep1: std::net::SocketAddr = "127.0.0.1:19081".parse().unwrap();
+        let ep2: std::net::SocketAddr = "127.0.0.1:19082".parse().unwrap();
+        crate::coordinator::cluster::replace_cluster_membership_for_test(Some(
+            std::sync::Arc::new(crate::coordinator::cluster::FakeClusterMembership::new(
+                vec![(0, ep1), (1, ep2)],
+            )),
+        ));
 
         assert_eq!(super::live_effective_backend_count(), 2.0);
     }
