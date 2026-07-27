@@ -86,3 +86,4 @@ code-anchors:
 丢失、过期 ownership 与进程失败，使分布式生命周期可测试、可观察并可独立演进。
 
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
+- ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（active）
