@@ -56,6 +56,13 @@ test -x "$NOVA_FDB_FDBCLI"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
+cargo test -p novarocks-spi
+cargo check -p novarocks-spi --no-default-features
+if cargo tree -p novarocks-spi -e normal --no-default-features | \
+    rg -q 'novarocks-(state-store|frontend|server)|(^|\s)novarocks v'; then
+  echo "novarocks-spi must not depend on provider, host, server, or core crates" >&2
+  exit 1
+fi
 cargo test -p novarocks-state-store --lib
 cargo test -p novarocks-state-store --test state_store_contract
 cargo test -p novarocks-state-store --test state_store_sqlite -- --test-threads=1

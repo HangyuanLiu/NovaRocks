@@ -19,6 +19,27 @@ under the License.
 
 # StateStore Tests
 
+## Contract and Conformance Ownership
+
+The canonical StateStore contract is `novarocks_spi::state_store`, and the
+shared provider conformance suite is
+`novarocks_spi::state_store::conformance`. The `state-store-conformance`
+feature is provider-test-only: ordinary provider crates depend on
+`novarocks-spi` normally and enable that feature only in dev-dependencies.
+
+Focused contract checks:
+
+```bash
+cargo test -p novarocks-spi
+cargo test -p novarocks-state-store --test state_store_sqlite -- --test-threads=1
+cargo test -p novarocks-state-store \
+  --features mysql-state-store-provider,state-store-test-hooks \
+  --test state_store_mysql mysql_suite -- --exact --test-threads=1
+cargo test -p novarocks-state-store \
+  --features foundationdb-provider,state-store-test-hooks \
+  --test state_store_foundationdb foundationdb_suite -- --exact --test-threads=1
+```
+
 ## FoundationDB State Store
 
 The FoundationDB provider is feature-gated and uses the official 7.3.69 native
@@ -43,7 +64,7 @@ for macOS arm64 developer use, and
 for Linux x86_64 production CI. macOS is auxiliary evidence only.
 
 `state_store_foundationdb` runs all provider-specific scenarios and, through
-`foundationdb_suite`, both the generic StateStore conformance and the
+`foundationdb_suite`, both the shared SPI StateStore conformance suite and the
 provider-neutral coordination conformance in one explicit runtime lifecycle.
 `state_store_foundationdb_cross_process` starts two independent helper
 processes against the same generated cluster and keyspace. Those helpers are
@@ -89,9 +110,8 @@ coverage in this gate is feature-off and non-live, so it does not require
 and proves only additive/no-fallback behavior, not a two-FE failover.
 
 `state_store_mysql` runs the provider scenarios and, through `mysql_suite`, both
-the generic StateStore conformance and the provider-neutral coordination
-conformance without changing
-`novarocks/state-store/tests/common/state_store_conformance.rs`. Each
+the shared SPI StateStore conformance suite and the provider-neutral
+coordination conformance. Each
 conformance factory invocation uses a separately provisioned database while
 sharing one explicit MySQL runtime. `state_store_mysql_cross_process` starts
 two independent exec helper clients against an ordinary-provider credential and
@@ -100,23 +120,18 @@ environments contain no provisioner credential or compose runtime material.
 These helpers are MySQL clients, not FEs, so this test is not a real two-FE
 deployment.
 
+Run the MySQL cross-process suite with the pinned production fixture:
+
+```bash
+cargo test -p novarocks-state-store \
+  --features mysql-state-store-provider,state-store-test-hooks \
+  --test state_store_mysql_cross_process mysql_cross_process_suite \
+  -- --exact --test-threads=1
+```
+
 The helper uses a strict, ordered JSONL protocol containing only
 `Open`, `Begin`, `Get`, `Range`, `Put`, `Delete`, `Commit`, `Resolve`, `Poll`,
 and `Shutdown`. Protocol errors are flushed before a deterministic nonzero
 exit. Normal `Shutdown` aborts active transactions and waits for explicit
 runtime disconnect. Diagnostics must never contain credentials, a DSN, a raw
 database or cluster identifier, or logical keys and values.
-
-Focused contract checks:
-
-```bash
-cargo test -p novarocks-state-store --test state_store_contract mysql_
-cargo test -p novarocks-state-store --lib state_store::limits::tests::mysql_
-cargo test -p novarocks-state-store \
-  --features mysql-state-store-provider,state-store-test-hooks \
-  --test state_store_mysql mysql_suite -- --exact --test-threads=1
-cargo test -p novarocks-state-store \
-  --features mysql-state-store-provider,state-store-test-hooks \
-  --test state_store_mysql_cross_process mysql_cross_process_suite \
-  -- --exact --test-threads=1
-```
