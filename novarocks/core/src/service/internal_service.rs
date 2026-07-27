@@ -1526,7 +1526,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
     }
 
@@ -1579,7 +1578,6 @@ mod tests {
             types::TUniqueId::new(finst.hi, finst.lo),
             BTreeMap::new(),
             BTreeMap::new(),
-            None,
             None,
             None,
             None,
