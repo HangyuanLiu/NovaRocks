@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub use novarocks_spi::state_store::{
+use novarocks_spi::state_store::{
     STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetricsSnapshot,
     StateStoreOperation, StateStoreOutcome,
 };

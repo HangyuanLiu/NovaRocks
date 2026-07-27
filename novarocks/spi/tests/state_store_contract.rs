@@ -77,7 +77,11 @@ fn continuation_is_bound_to_range_and_direction() {
         range: KeyRange::new(key(b"a"), key(b"y")).expect("different valid range"),
         direction: Direction::Forward,
         page_size: 10,
-        continuation: Some(request.continuation_after(&key(b"m")).expect("continuation")),
+        continuation: Some(
+            request
+                .continuation_after(&key(b"m"))
+                .expect("continuation"),
+        ),
     };
     assert_eq!(
         wrong_range

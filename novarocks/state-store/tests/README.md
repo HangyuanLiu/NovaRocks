@@ -26,11 +26,18 @@ shared provider conformance suite is
 `novarocks_spi::state_store::conformance`. The `state-store-conformance`
 feature is provider-test-only: ordinary provider crates depend on
 `novarocks-spi` normally and enable that feature only in dev-dependencies.
+Both production provider gates run
+`tools/ci/check-spi-dependency-boundary.py`. The check reads Cargo metadata and
+the resolved default dependency DAG: required normal dependencies must be
+exactly `async-trait`, `bytes`, `sha2`, and `uuid`; Tokio must remain the sole
+optional normal dependency, owned only by `state-store-conformance`, and absent
+from the default graph.
 
 Focused contract checks:
 
 ```bash
 cargo test -p novarocks-spi
+tools/ci/check-spi-dependency-boundary.py --manifest-path Cargo.toml
 cargo test -p novarocks-state-store --test state_store_sqlite -- --test-threads=1
 cargo test -p novarocks-state-store \
   --features mysql-state-store-provider,state-store-test-hooks \
