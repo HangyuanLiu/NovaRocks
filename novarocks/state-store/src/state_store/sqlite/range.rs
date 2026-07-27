@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::ops::Bound::{Excluded, Included};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -302,7 +302,7 @@ pub(super) async fn poll_changes(
 }
 
 fn poll_changes_blocking(
-    path: &PathBuf,
+    path: &Path,
     identity: &StoreIdentity,
     request: &ChangePollRequest,
     decoded_after: Option<(u64, u32)>,

@@ -359,7 +359,7 @@ mod conformance {
         path: &std::path::Path,
         iteration: u8,
     ) {
-        let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+        let fault = FaultInjectingStateStore::new(Arc::clone(store));
         let transaction_id = transaction_id();
         let keys = [
             key(vec![b'c', iteration, b'a']),
@@ -376,7 +376,7 @@ mod conformance {
                 .expect("stage cancelled real commit row");
         }
 
-        let blocker = hold_sqlite_writer_lock(&path);
+        let blocker = hold_sqlite_writer_lock(path);
         let gate = FaultGate::new();
         fault.pause_next_post_dispatch(gate.clone());
         let waiter = tokio::spawn(async move { transaction.commit().await });
@@ -400,14 +400,14 @@ mod conformance {
                 "a cancelled waiter must not publish NotCommitted while its worker is blocked"
             );
         }
-        assert_eq!(durable_counts(&path), (0, 0, 0));
+        assert_eq!(durable_counts(path), (0, 0, 0));
 
         gate.release().await;
         gate.wait_inner_dropped().await;
-        wait_for_resolution(&store, &transaction_id, CommitResolution::NotCommitted).await;
-        assert_eq!(durable_counts(&path), (0, 0, 0));
+        wait_for_resolution(store, &transaction_id, CommitResolution::NotCommitted).await;
+        assert_eq!(durable_counts(path), (0, 0, 0));
         for item in keys {
-            assert!(read_state_record(&store, &item).await.is_none());
+            assert!(read_state_record(store, &item).await.is_none());
         }
         blocker
             .execute_batch("ROLLBACK")

@@ -323,7 +323,7 @@ fn database_path_bytes(path: &Path) -> Result<Vec<u8>, StateStoreError> {
         let mut encoded = Vec::with_capacity(b"unix\0".len() + native_path.len());
         encoded.extend_from_slice(b"unix\0");
         encoded.extend_from_slice(native_path);
-        return Ok(encoded);
+        Ok(encoded)
     }
 
     #[cfg(windows)]
@@ -334,7 +334,7 @@ fn database_path_bytes(path: &Path) -> Result<Vec<u8>, StateStoreError> {
         for code_unit in path.as_os_str().encode_wide() {
             encoded.extend_from_slice(&code_unit.to_le_bytes());
         }
-        return Ok(encoded);
+        Ok(encoded)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -352,6 +352,7 @@ fn acquire_owner_lock(path: &Path) -> Result<File, StateStoreError> {
     lock_path.push(".owner.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(PathBuf::from(lock_path))
