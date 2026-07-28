@@ -31,7 +31,7 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::operators::{AggregateFinalDomainSessionBuilder, AggregateProcessorFactory};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::query_execution::backend_registry::LiveBackendSnapshot;
+use crate::query_execution::backend::LiveBackendSnapshot;
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::runtime_state::RuntimeState;

@@ -19,26 +19,28 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.resilience_series (
-  id BIGINT
+CREATE TABLE ${case_db}.fragment_report_failure (
+  id BIGINT,
+  delay_s BIGINT
 )
 TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.resilience_series
-SELECT generate_series FROM TABLE(generate_series(1, 1000000));
 
 -- query 2
--- @kill_be_after_fragment_start=1
--- @expect_error=BE[1]
-SELECT COUNT(*) FROM ${case_db}.resilience_series;
+-- @skip_result_check=true
+INSERT INTO ${case_db}.fragment_report_failure VALUES (1, 5);
 
 -- query 3
--- @heartbeat_delay_ms=3000
--- @result_contains=1000000
-SELECT COUNT(*) FROM TABLE(generate_series(1, 1000000));
+-- @skip_result_check=true
+INSERT INTO ${case_db}.fragment_report_failure VALUES (2, 5);
 
 -- query 4
--- @kill_be_index=1
--- @restart_be_delay_ms=0
--- @heartbeat_delay_ms=3000
 -- @skip_result_check=true
-SELECT 1;
+INSERT INTO ${case_db}.fragment_report_failure VALUES (3, 5);
+
+-- query 5
+-- @fail_fragment_after_start_be_index=1
+-- @expect_error=fragment executor failure injected after start
+-- @be_log_exact_fragment_cancellation=3
+SELECT COUNT(*)
+FROM ${case_db}.fragment_report_failure
+WHERE sleep(delay_s);

@@ -642,7 +642,10 @@ mod pr3_tests {
                 let item = listener.accept().await.map(|(stream, _)| stream);
                 Some((item, listener))
             });
-            let service = GrpcService::with_fragment_execution(report_handler);
+            let service = GrpcService::with_fragment_execution(
+                crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+                report_handler,
+            );
             tokio::spawn(
                 tonic::transport::Server::builder()
                     .add_service(
@@ -995,9 +998,11 @@ mod lookup_tests {
                 tonic::transport::Server::builder()
                     .add_service(
                         proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                            GrpcService::with_fragment_execution(Arc::new(
-                                super::pr3_tests::DelayedReportHandler(Duration::ZERO),
-                            )),
+                            GrpcService::with_fragment_execution(
+                                crate::service::grpc_server::rejecting_test_native_fragment_ingress(
+                                ),
+                                Arc::new(super::pr3_tests::DelayedReportHandler(Duration::ZERO)),
+                            ),
                         ),
                     )
                     .serve_with_incoming(incoming),

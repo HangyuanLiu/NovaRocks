@@ -33,6 +33,7 @@ use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSour
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::statistics::FrontendStatisticsService;
 use crate::table_maintenance::FrontendTableMaintenanceService;
+use crate::topology::FrontendTopologyController;
 use crate::view::FrontendViewService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,6 +98,7 @@ pub struct FrontendApplicationHost {
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
+    topology: Arc<FrontendTopologyController>,
 }
 
 #[derive(Clone)]
@@ -134,6 +136,7 @@ impl FrontendApplicationHost {
             state_store_host: None,
             query_execution: None,
             coordinator: None,
+            topology: Arc::new(FrontendTopologyController::new_unconfigured()),
         };
 
         if let Some(config) = config {
@@ -317,6 +320,44 @@ impl FrontendApplicationHost {
             .report_endpoint_sink()
     }
 
+    pub(crate) fn backend_topology_port(
+        &self,
+    ) -> novarocks::query_execution::backend::BackendTopologyService {
+        Arc::clone(&self.topology) as novarocks::query_execution::backend::BackendTopologyService
+    }
+
+    pub(crate) fn configure_backend_topology(
+        &self,
+        config: &novarocks::common::app_config::NovaRocksConfig,
+    ) -> Result<(), FrontendApplicationError> {
+        let configured_seed_endpoints = config
+            .cluster
+            .backends
+            .iter()
+            .map(|backend| {
+                backend.parse().map_err(|error| {
+                    FrontendApplicationError::server(format!(
+                        "parse configured backend endpoint '{backend}' failed: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.topology
+            .configure_lifecycle(
+                config.cluster.heartbeat_timeout_retries,
+                Duration::from_secs(config.cluster.decommission_timeout_secs),
+                configured_seed_endpoints,
+            )
+            .map_err(FrontendApplicationError::server)?;
+        self.topology
+            .start_heartbeat_manager(Duration::from_millis(config.cluster.heartbeat_interval_ms))
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "start frontend backend heartbeat manager failed: {error}"
+                ))
+            })
+    }
+
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
         self.release_resources().await.map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
@@ -363,7 +404,10 @@ impl FrontendApplicationHost {
             execution.advertised_report_host,
             execution.configured_report_port,
             execution.runtime_filter_worker_count,
+            self.backend_topology_port(),
         ));
+        self.topology
+            .attach_query_events(Arc::new(coordinator.backend_query_activity()));
         self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
         self.coordinator = Some(coordinator);
         Ok(())
@@ -380,13 +424,23 @@ impl FrontendApplicationHost {
     }
 
     async fn release_resources(&mut self) -> Result<(), String> {
+        let heartbeat_result = self.topology.stop_heartbeat_manager();
+        self.topology.detach_query_events();
         self.query_execution.take();
         self.coordinator.take();
-        let mut primary_error = self
+        let table_maintenance_error = self
             .table_maintenance_service
             .as_ref()
             .and_then(|service| service.shutdown().err())
             .map(|error| format!("shutdown frontend table-maintenance service failed: {error}"));
+        let mut primary_error = heartbeat_result.err();
+        if let Some(table_maintenance_error) = table_maintenance_error {
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {table_maintenance_error}"));
+            } else {
+                primary_error = Some(table_maintenance_error);
+            }
+        }
         self.table_maintenance_service.take();
         self.statistics_service.take();
         self.view_service.take();

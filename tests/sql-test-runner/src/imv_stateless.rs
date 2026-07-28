@@ -154,7 +154,7 @@ pub(crate) fn run_imv_stateless_l2_case(
     // -----------------------------------------------------------------
     // Phase A: cluster A owns the lake, creates the MV, and refreshes it.
     // -----------------------------------------------------------------
-    let cluster_a = CrossProcessServerHandle::launch(
+    let cluster_a = CrossProcessServerHandle::launch_inheriting_base_metadata(
         case.cluster_size,
         repo_root,
         runner_config,

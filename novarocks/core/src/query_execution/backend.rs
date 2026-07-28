@@ -18,16 +18,158 @@
 //! Neutral frontend-facing backend topology and lifecycle boundary.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use crate::runtime::endpoint::RuntimeEndpoint;
 
-pub fn record_successful_fragment_submission(backend_idx: usize) {
-    crate::service::metrics_http::observe_fragment_scheduled();
-    if let Some(membership) = crate::query_execution::backend_registry::cluster_membership() {
-        membership.record_scheduled_fragment(
-            backend_idx as crate::query_execution::backend_registry::BeId,
-        );
+/// Frontend-owned topology and backend-management boundary consumed by core.
+///
+/// Core intentionally has no registry singleton, heartbeat loop, or role-aware
+/// backend-management implementation. Composition roots inject this port.
+pub trait BackendTopologyPort: Send + Sync + 'static {
+    fn live_backends(&self) -> Vec<LiveBackendTarget>;
+
+    fn record_successful_fragment_submission(&self, backend_idx: usize);
+
+    fn install_metadata_store(
+        &self,
+        store: Arc<dyn BackendTopologyMetadataStore>,
+    ) -> Result<(), String>;
+
+    fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
+
+    fn drop_backend(&self, endpoint: SocketAddr, force: bool) -> Result<(), String>;
+
+    fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String>;
+}
+
+pub type BackendTopologyService = Arc<dyn BackendTopologyPort>;
+pub type BeId = u32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendLifecycleState {
+    Registering,
+    Live,
+    Lost,
+    Decommissioning,
+}
+
+impl BackendLifecycleState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registering => "Registering",
+            Self::Live => "Live",
+            Self::Lost => "Lost",
+            Self::Decommissioning => "Decommissioning",
+        }
     }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "Registering" => Ok(Self::Registering),
+            "Live" => Ok(Self::Live),
+            "Lost" => Ok(Self::Lost),
+            "Decommissioning" => Ok(Self::Decommissioning),
+            other => Err(format!("invalid persisted backend state '{other}'")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedBackendTopology {
+    backend_idx: usize,
+    endpoint: SocketAddr,
+    state: BackendLifecycleState,
+}
+
+impl PersistedBackendTopology {
+    pub const fn new(
+        backend_idx: usize,
+        endpoint: SocketAddr,
+        state: BackendLifecycleState,
+    ) -> Self {
+        Self {
+            backend_idx,
+            endpoint,
+            state,
+        }
+    }
+
+    pub const fn backend_idx(&self) -> usize {
+        self.backend_idx
+    }
+
+    pub const fn endpoint(&self) -> SocketAddr {
+        self.endpoint
+    }
+
+    pub const fn state(&self) -> BackendLifecycleState {
+        self.state
+    }
+}
+
+/// Synchronous metadata boundary used by the frontend topology owner.
+///
+/// Core supplies the adapter over its existing metadata repository; frontend
+/// owns lifecycle policy and never imports the repository implementation.
+pub trait BackendTopologyMetadataStore: Send + Sync + 'static {
+    fn load_backends(&self) -> Result<Vec<PersistedBackendTopology>, String>;
+
+    fn upsert_backend(&self, backend: PersistedBackendTopology) -> Result<(), String>;
+
+    fn delete_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BackendTopologyMetricsSnapshot {
+    pub registering: usize,
+    pub live: usize,
+    pub lost: usize,
+    pub decommissioning: usize,
+}
+
+/// Publishes the latest frontend-owned topology counts to the shared process
+/// metrics endpoint. A scrape reads this snapshot and never resets it.
+pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot) {
+    crate::service::metrics_http::publish_backend_topology_metrics(snapshot);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveBackendSnapshot {
+    entries: Vec<(usize, SocketAddr)>,
+}
+
+impl LiveBackendSnapshot {
+    pub(crate) fn new(entries: Vec<(usize, SocketAddr)>) -> Self {
+        Self { entries }
+    }
+
+    pub(crate) fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
+        Self::new(backends.into_iter().enumerate().collect())
+    }
+
+    pub(crate) fn entries(&self) -> &[(usize, SocketAddr)] {
+        &self.entries
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum HeartbeatOutcome {
+    Ok {
+        start_epoch: u64,
+        version: String,
+        num_cores: u32,
+        now_ms: i64,
+    },
+    Failed {
+        err: String,
+    },
+}
+
+/// Core-local scheduling metric. Topology accounting is performed by the
+/// frontend-owned port at the composition boundary.
+pub fn record_successful_fragment_submission(_backend_idx: usize) {
+    crate::service::metrics_http::observe_fragment_scheduled();
 }
 
 /// Resolves the report endpoint after the coordinator gRPC listener has bound.
@@ -134,6 +276,37 @@ pub(crate) struct NoopCoordinatorReportEndpointSink;
 #[cfg(test)]
 impl CoordinatorReportEndpointSink for NoopCoordinatorReportEndpointSink {
     fn set_bound_port(&self, _port: u16) {}
+}
+
+#[cfg(test)]
+pub(crate) struct NoopBackendTopologyPort;
+
+#[cfg(test)]
+impl BackendTopologyPort for NoopBackendTopologyPort {
+    fn live_backends(&self) -> Vec<LiveBackendTarget> {
+        Vec::new()
+    }
+
+    fn record_successful_fragment_submission(&self, _backend_idx: usize) {}
+
+    fn install_metadata_store(
+        &self,
+        _store: Arc<dyn BackendTopologyMetadataStore>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn add_backend(&self, _endpoint: SocketAddr) -> Result<(), String> {
+        Err("backend topology port is not installed".to_string())
+    }
+
+    fn drop_backend(&self, _endpoint: SocketAddr, _force: bool) -> Result<(), String> {
+        Err("backend topology port is not installed".to_string())
+    }
+
+    fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String> {
+        Err("backend topology port is not installed".to_string())
+    }
 }
 
 #[cfg(test)]

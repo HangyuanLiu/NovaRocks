@@ -60,6 +60,7 @@ use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 pub(crate) mod aggregate;
+#[cfg(test)]
 pub(crate) mod backend_ops;
 pub(crate) mod backend_resolver;
 pub(crate) mod dml_change_stream;
@@ -381,15 +382,13 @@ pub(crate) struct StandaloneState {
     /// constructs a coordinator concrete.
     pub(crate) query_execution: crate::query_execution::service::QueryExecutionService,
     /// Frontend-owned query activity used by backend lifecycle management.
-    /// Core forwards events through this boundary and performs no query-wide
-    /// or BE-local cleanup itself.
     pub(crate) backend_query_events:
         std::sync::Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
+    /// Frontend-owned topology and management controller. Core consumes this
+    /// explicit port and never locates a process-global registry.
+    pub(crate) backend_topology: crate::query_execution::backend::BackendTopologyService,
     pub(crate) coordinator_report_endpoint:
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
-    #[cfg(not(test))]
-    pub(crate) backend_heartbeat_manager:
-        std::sync::Mutex<Option<crate::query_execution::backend_registry::HeartbeatManagerHandle>>,
     #[cfg(test)]
     pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
@@ -425,6 +424,9 @@ impl Default for StandaloneState {
             query_execution: test_query_execution_service(),
             backend_query_events: std::sync::Arc::new(
                 crate::query_execution::backend::NoopBackendQueryEventSink,
+            ),
+            backend_topology: std::sync::Arc::new(
+                crate::query_execution::backend::NoopBackendTopologyPort,
             ),
             coordinator_report_endpoint: std::sync::Arc::new(
                 crate::query_execution::backend::NoopCoordinatorReportEndpointSink,
@@ -543,10 +545,14 @@ pub struct StandaloneOpenServices {
     pub query_execution: crate::query_execution::service::QueryExecutionService,
     pub backend_query_events:
         std::sync::Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
+    pub backend_topology: crate::query_execution::backend::BackendTopologyService,
     pub coordinator_report_endpoint:
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
     pub native_report_handler:
         std::sync::Arc<dyn crate::query_execution::report::NativeReportHandler>,
+    /// Bound by the server composition root before engine open. Zero means no
+    /// local fragment endpoint is available to this engine instance.
+    pub exchange_port: u16,
 }
 
 impl StandaloneOpenServices {
@@ -563,12 +569,14 @@ impl StandaloneOpenServices {
         backend_query_events: std::sync::Arc<
             dyn crate::query_execution::backend::BackendQueryEventSink,
         >,
+        backend_topology: crate::query_execution::backend::BackendTopologyService,
         coordinator_report_endpoint: std::sync::Arc<
             dyn crate::query_execution::backend::CoordinatorReportEndpointSink,
         >,
         native_report_handler: std::sync::Arc<
             dyn crate::query_execution::report::NativeReportHandler,
         >,
+        exchange_port: u16,
     ) -> Self {
         Self {
             system_catalog,
@@ -579,9 +587,94 @@ impl StandaloneOpenServices {
             mv_application_service,
             query_execution,
             backend_query_events,
+            backend_topology,
             coordinator_report_endpoint,
             native_report_handler,
+            exchange_port,
         }
+    }
+}
+
+struct EngineBackendTopologyMetadataStore {
+    provider: Arc<dyn crate::meta::MetaStoreProvider>,
+}
+
+impl crate::query_execution::backend::BackendTopologyMetadataStore
+    for EngineBackendTopologyMetadataStore
+{
+    fn load_backends(
+        &self,
+    ) -> Result<Vec<crate::query_execution::backend::PersistedBackendTopology>, String> {
+        let read = self
+            .provider
+            .begin_read()
+            .map_err(|error| format!("open backend metadata read transaction failed: {error}"))?;
+        BackendMetaRepository
+            .list_backends(read.as_ref())
+            .map_err(|error| format!("load backend metadata failed: {error}"))?
+            .into_iter()
+            .map(|stored| {
+                let backend_idx = usize::try_from(stored.be_id)
+                    .map_err(|_| format!("invalid persisted backend id {}", stored.be_id))?;
+                let endpoint = stored.endpoint.parse().map_err(|error| {
+                    format!(
+                        "invalid persisted backend endpoint '{}': {error}",
+                        stored.endpoint
+                    )
+                })?;
+                let state =
+                    crate::query_execution::backend::BackendLifecycleState::parse(&stored.state)?;
+                Ok(
+                    crate::query_execution::backend::PersistedBackendTopology::new(
+                        backend_idx,
+                        endpoint,
+                        state,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn upsert_backend(
+        &self,
+        backend: crate::query_execution::backend::PersistedBackendTopology,
+    ) -> Result<(), String> {
+        let backend_idx = i64::try_from(backend.backend_idx()).map_err(|_| {
+            format!(
+                "backend id {} exceeds metadata range",
+                backend.backend_idx()
+            )
+        })?;
+        let mut txn = self
+            .provider
+            .begin_write("persist backend metadata")
+            .map_err(|error| format!("open backend metadata write transaction failed: {error}"))?;
+        BackendMetaRepository
+            .upsert_backend(
+                txn.as_mut(),
+                &crate::meta::repository::backend::StoredBackend {
+                    be_id: backend_idx,
+                    endpoint: backend.endpoint().to_string(),
+                    state: backend.state().as_str().to_string(),
+                },
+            )
+            .map_err(|error| format!("persist backend metadata failed: {error}"))?;
+        txn.commit()
+            .map(|_| ())
+            .map_err(|error| format!("commit backend metadata failed: {error}"))
+    }
+
+    fn delete_backend(&self, endpoint: std::net::SocketAddr) -> Result<(), String> {
+        let mut txn = self
+            .provider
+            .begin_write("delete backend metadata")
+            .map_err(|error| format!("open backend metadata delete transaction failed: {error}"))?;
+        BackendMetaRepository
+            .delete_backend(txn.as_mut(), &endpoint.to_string())
+            .map_err(|error| format!("delete backend metadata failed: {error}"))?;
+        txn.commit()
+            .map(|_| ())
+            .map_err(|error| format!("commit backend metadata delete failed: {error}"))
     }
 }
 
@@ -589,8 +682,6 @@ impl StandaloneNovaRocks {
     pub fn open(opts: StandaloneOptions, services: StandaloneOpenServices) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
-        #[cfg(test)]
-        crate::query_execution::backend_registry::replace_backend_registry_for_test(None);
         match opts.config_path.as_deref() {
             Some(path) => {
                 novarocks_config::init_from_path(path)
@@ -627,8 +718,6 @@ impl StandaloneNovaRocks {
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
-        #[cfg(test)]
-        crate::query_execution::backend_registry::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
         return Self::open_body(opts, services, _test_guard);
@@ -643,40 +732,8 @@ impl StandaloneNovaRocks {
         services: StandaloneOpenServices,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
-        // role=fe dispatches all fragments to registered BEs and must not
-        // start a local gRPC/exchange server. All-in-one binds the local
-        // exchange server and registers it as a loopback BE.
         let cfg =
             crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-        let role = cfg.cluster.role;
-        #[cfg(test)]
-        let native_report_handler = Arc::clone(&services.native_report_handler);
-        let exchange_port = match role {
-            crate::common::app_config::ClusterRole::Fe => {
-                // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
-                u16::MAX
-            }
-            crate::common::app_config::ClusterRole::Be
-            | crate::common::app_config::ClusterRole::AllInOne => {
-                #[cfg(test)]
-                {
-                    ensure_standalone_exchange_server(native_report_handler)?
-                }
-                #[cfg(not(test))]
-                {
-                    cfg.server.grpc_port
-                }
-            }
-        };
-        if role == crate::common::app_config::ClusterRole::AllInOne {
-            let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
-                .parse()
-                .map_err(|e| format!("parse all-in-one loopback backend endpoint failed: {e}"))?;
-            backend_ops::install_all_in_one_backend_registry(
-                endpoint,
-                cfg.cluster.heartbeat_timeout_retries,
-            )?;
-        }
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
             .as_ref()
@@ -699,9 +756,20 @@ impl StandaloneNovaRocks {
             mv_application_service,
             query_execution,
             backend_query_events,
+            backend_topology,
             coordinator_report_endpoint,
             native_report_handler: _,
+            exchange_port,
         } = services;
+        if cfg.cluster.role == crate::common::app_config::ClusterRole::Fe {
+            if let Some(provider) = metadata_provider.as_ref() {
+                backend_topology.install_metadata_store(Arc::new(
+                    EngineBackendTopologyMetadataStore {
+                        provider: Arc::clone(provider),
+                    },
+                ))?;
+            }
+        }
         let inner = Arc::new_cyclic(|self_weak| StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
@@ -725,9 +793,8 @@ impl StandaloneNovaRocks {
             self_weak: self_weak.clone(),
             query_execution,
             backend_query_events,
+            backend_topology,
             coordinator_report_endpoint,
-            #[cfg(not(test))]
-            backend_heartbeat_manager: std::sync::Mutex::new(None),
             #[cfg(test)]
             _test_guard,
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
@@ -737,13 +804,6 @@ impl StandaloneNovaRocks {
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
-        if role == crate::common::app_config::ClusterRole::Fe {
-            backend_ops::ensure_backend_registry(&inner)?;
-            backend_ops::wait_for_configured_backends_live(&inner)?;
-        }
-        if role == crate::common::app_config::ClusterRole::AllInOne {
-            backend_ops::publish_live_backends(&inner)?;
-        }
         let engine = Self { inner };
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
@@ -2097,11 +2157,53 @@ pub(crate) fn dispatch_statement(
                 current_database,
             )
         }
-        Statement::AddBackend(stmt) => crate::engine::backend_ops::execute_add_backend(state, stmt),
-        Statement::DropBackend(stmt) => {
-            crate::engine::backend_ops::execute_drop_backend(state, stmt)
+        Statement::AddBackend(stmt) => {
+            require_backend_management_role("ADD BACKEND")?;
+            let endpoint = stmt
+                .addr
+                .parse()
+                .map_err(|error| format!("invalid backend address '{}': {error}", stmt.addr))?;
+            state.backend_topology.add_backend(endpoint)?;
+            Ok(StatementResult::Ok)
         }
-        Statement::ShowBackends(_) => crate::engine::backend_ops::execute_show_backends(state),
+        Statement::DropBackend(stmt) => {
+            require_backend_management_role("DROP BACKEND")?;
+            let endpoint = stmt
+                .addr
+                .parse()
+                .map_err(|error| format!("invalid backend address '{}': {error}", stmt.addr))?;
+            state.backend_topology.drop_backend(endpoint, stmt.force)?;
+            Ok(StatementResult::Ok)
+        }
+        Statement::ShowBackends(_) => {
+            let role = crate::novarocks_config::config()
+                .map_err(|error| format!("read config failed: {error}"))?
+                .cluster
+                .role;
+            if role == crate::common::app_config::ClusterRole::Be {
+                return Err("SHOW BACKENDS is not available in role=be".to_string());
+            }
+            state
+                .backend_topology
+                .show_backends()
+                .map(StatementResult::Query)
+        }
+    }
+}
+
+fn require_backend_management_role(statement: &str) -> Result<(), String> {
+    match crate::novarocks_config::config()
+        .map_err(|error| format!("read config failed: {error}"))?
+        .cluster
+        .role
+    {
+        crate::common::app_config::ClusterRole::Fe => Ok(()),
+        crate::common::app_config::ClusterRole::Be => Err(format!(
+            "{statement} is not available in role=be; backend management is owned by StarRocks FE"
+        )),
+        crate::common::app_config::ClusterRole::AllInOne => {
+            Err(format!("{statement} requires role=fe"))
+        }
     }
 }
 
@@ -2314,18 +2416,9 @@ fn ensure_mainline_distributed_execution(
     Ok(())
 }
 
-/// Live BE count for broadcast fanout (1 FE + N BE distributed baseline).
-/// Precedence: live BE registry > [runtime] config (>0) > defensive 1.0.
-/// Err / empty registry / misconfig collapse to the config tier or the 1.0
-/// floor (never panics). NOT a standalone-specific branch: all-in-one is a
-/// test shell that registers one loopback BE; goldens pin SET to the real N.
+/// Configured BE count for broadcast fanout. The frontend scheduler owns live
+/// topology; core never lazily locates a process-global registry.
 fn live_effective_backend_count() -> f64 {
-    if let Some(membership) = crate::query_execution::backend_registry::cluster_membership() {
-        let entries = membership.live_endpoints();
-        if !entries.is_empty() {
-            return (entries.len() as f64).max(1.0);
-        }
-    }
     let configured = crate::common::config::optimizer_effective_backend_count();
     if configured > 0 {
         return configured as f64;
@@ -4162,6 +4255,10 @@ mod tests {
         MvEngine, MvRequestContext, UnavailableMvApplicationService,
     };
     use crate::mv::repository::{MvTarget, UnavailableMvRepository};
+    use crate::query_execution::backend::{
+        BackendLifecycleState, BackendTopologyMetadataStore, BackendTopologyPort,
+        LiveBackendTarget, PersistedBackendTopology,
+    };
     use crate::query_execution::contract::{
         DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
         DistributedQueryRequest,
@@ -4172,6 +4269,8 @@ mod tests {
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -4327,6 +4426,198 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct TestBackendTopologyEntry {
+        endpoint: SocketAddr,
+        state: BackendLifecycleState,
+        scheduled_fragments: u64,
+    }
+
+    #[derive(Default)]
+    struct TestBackendTopologyState {
+        entries: BTreeMap<usize, TestBackendTopologyEntry>,
+        next_backend_idx: usize,
+        metadata_store: Option<Arc<dyn BackendTopologyMetadataStore>>,
+    }
+
+    #[derive(Default)]
+    struct TestBackendTopologyPort {
+        state: Mutex<TestBackendTopologyState>,
+    }
+
+    impl TestBackendTopologyPort {
+        fn with_live_backend(endpoint: SocketAddr) -> Self {
+            let mut entries = BTreeMap::new();
+            entries.insert(
+                0,
+                TestBackendTopologyEntry {
+                    endpoint,
+                    state: BackendLifecycleState::Live,
+                    scheduled_fragments: 0,
+                },
+            );
+            Self {
+                state: Mutex::new(TestBackendTopologyState {
+                    entries,
+                    next_backend_idx: 1,
+                    metadata_store: None,
+                }),
+            }
+        }
+    }
+
+    impl BackendTopologyPort for TestBackendTopologyPort {
+        fn live_backends(&self) -> Vec<LiveBackendTarget> {
+            self.state
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .filter_map(|(backend_idx, entry)| {
+                    (entry.state == BackendLifecycleState::Live).then_some(LiveBackendTarget::new(
+                        *backend_idx,
+                        entry.endpoint,
+                        1,
+                    ))
+                })
+                .collect()
+        }
+
+        fn record_successful_fragment_submission(&self, backend_idx: usize) {
+            if let Some(entry) = self.state.lock().unwrap().entries.get_mut(&backend_idx) {
+                entry.scheduled_fragments = entry.scheduled_fragments.saturating_add(1);
+            }
+        }
+
+        fn install_metadata_store(
+            &self,
+            store: Arc<dyn BackendTopologyMetadataStore>,
+        ) -> Result<(), String> {
+            let persisted = store.load_backends()?;
+            let mut entries = BTreeMap::new();
+            let mut next_backend_idx = 0;
+            for backend in persisted {
+                next_backend_idx = next_backend_idx.max(
+                    backend
+                        .backend_idx()
+                        .checked_add(1)
+                        .ok_or_else(|| "test backend id overflow".to_string())?,
+                );
+                let state = match backend.state() {
+                    BackendLifecycleState::Decommissioning => {
+                        BackendLifecycleState::Decommissioning
+                    }
+                    BackendLifecycleState::Registering
+                    | BackendLifecycleState::Live
+                    | BackendLifecycleState::Lost => BackendLifecycleState::Registering,
+                };
+                entries.insert(
+                    backend.backend_idx(),
+                    TestBackendTopologyEntry {
+                        endpoint: backend.endpoint(),
+                        state,
+                        scheduled_fragments: 0,
+                    },
+                );
+            }
+            *self.state.lock().unwrap() = TestBackendTopologyState {
+                entries,
+                next_backend_idx,
+                metadata_store: Some(store),
+            };
+            Ok(())
+        }
+
+        fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            if state
+                .entries
+                .values()
+                .any(|entry| entry.endpoint == endpoint)
+            {
+                return Ok(());
+            }
+            let backend_idx = state.next_backend_idx;
+            state.next_backend_idx = state
+                .next_backend_idx
+                .checked_add(1)
+                .ok_or_else(|| "test backend id overflow".to_string())?;
+            if let Some(store) = state.metadata_store.as_ref() {
+                store.upsert_backend(PersistedBackendTopology::new(
+                    backend_idx,
+                    endpoint,
+                    BackendLifecycleState::Registering,
+                ))?;
+            }
+            state.entries.insert(
+                backend_idx,
+                TestBackendTopologyEntry {
+                    endpoint,
+                    state: BackendLifecycleState::Registering,
+                    scheduled_fragments: 0,
+                },
+            );
+            Ok(())
+        }
+
+        fn drop_backend(&self, endpoint: SocketAddr, _force: bool) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            let backend_idx = state
+                .entries
+                .iter()
+                .find_map(|(backend_idx, entry)| {
+                    (entry.endpoint == endpoint).then_some(*backend_idx)
+                })
+                .ok_or_else(|| format!("backend {endpoint} not found"))?;
+            if let Some(store) = state.metadata_store.as_ref() {
+                store.delete_backend(endpoint)?;
+            }
+            state.entries.remove(&backend_idx);
+            Ok(())
+        }
+
+        fn show_backends(&self) -> Result<QueryResult, String> {
+            let column_names = [
+                "BackendId",
+                "Host",
+                "GrpcPort",
+                "State",
+                "ScheduledFragments",
+            ];
+            let mut columns = vec![Vec::<String>::new(); column_names.len()];
+            for (backend_idx, entry) in &self.state.lock().unwrap().entries {
+                columns[0].push(backend_idx.to_string());
+                columns[1].push(entry.endpoint.ip().to_string());
+                columns[2].push(entry.endpoint.port().to_string());
+                columns[3].push(entry.state.as_str().to_string());
+                columns[4].push(entry.scheduled_fragments.to_string());
+            }
+            let fields = column_names
+                .iter()
+                .map(|name| Field::new(*name, DataType::Utf8, false))
+                .collect::<Vec<_>>();
+            let arrays = columns
+                .into_iter()
+                .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
+                .collect::<Vec<_>>();
+            let batch =
+                arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                    .map_err(|error| format!("build test SHOW BACKENDS result failed: {error}"))?;
+            Ok(QueryResult {
+                columns: column_names
+                    .iter()
+                    .map(|name| crate::runtime::query_result::QueryResultColumn {
+                        name: (*name).to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                        logical_type: None,
+                    })
+                    .collect(),
+                chunks: vec![crate::runtime::query_result::record_batch_to_chunk(batch)?],
+            })
+        }
+    }
+
     fn test_open_services() -> StandaloneOpenServices {
         test_open_services_with(
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
@@ -4350,6 +4641,33 @@ mod tests {
         view_service: Arc<dyn ViewService>,
         statistics_service: Arc<dyn StatisticsService>,
     ) -> StandaloneOpenServices {
+        test_open_services_with_statistics_and_topology(
+            system_catalog,
+            view_service,
+            statistics_service,
+            Arc::new(TestBackendTopologyPort::default()),
+        )
+    }
+
+    fn test_open_services_with_topology(
+        system_catalog: Arc<dyn SystemCatalog>,
+        view_service: Arc<dyn ViewService>,
+        backend_topology: Arc<dyn BackendTopologyPort>,
+    ) -> StandaloneOpenServices {
+        test_open_services_with_statistics_and_topology(
+            system_catalog,
+            view_service,
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
+            backend_topology,
+        )
+    }
+
+    fn test_open_services_with_statistics_and_topology(
+        system_catalog: Arc<dyn SystemCatalog>,
+        view_service: Arc<dyn ViewService>,
+        statistics_service: Arc<dyn StatisticsService>,
+        backend_topology: Arc<dyn BackendTopologyPort>,
+    ) -> StandaloneOpenServices {
         StandaloneOpenServices::new(
             system_catalog,
             view_service,
@@ -4359,8 +4677,10 @@ mod tests {
             Arc::new(UnavailableMvApplicationService),
             super::test_query_execution_service(),
             Arc::new(crate::query_execution::backend::NoopBackendQueryEventSink),
+            backend_topology,
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             Arc::new(super::TestNativeReportHandler),
+            0,
         )
     }
 
@@ -4718,6 +5038,23 @@ path = "{metadata_path}"
         config_path
     }
 
+    fn assert_backend_topology_column_contract(result: &QueryResult) {
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "BackendId",
+                "Host",
+                "GrpcPort",
+                "State",
+                "ScheduledFragments",
+            ]
+        );
+    }
+
     #[cfg(not(feature = "compat"))]
     fn lock_runtime_test_state() -> super::TestSerializationGuard {
         super::acquire_standalone_test_guard()
@@ -4756,6 +5093,7 @@ path = "{metadata_path}"
             .execute("ADD BACKEND '127.0.0.1:19170'")
             .expect("ADD BACKEND");
         let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_backend_topology_column_contract(&result);
         assert_eq!(result.row_count(), 1);
         assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
         assert_eq!(string_cell(&result, 0, 2), "19170");
@@ -4802,6 +5140,7 @@ path = "{metadata_path}"
             .session()
             .query("SHOW BACKENDS")
             .expect("SHOW BACKENDS");
+        assert_backend_topology_column_contract(&result);
         assert_eq!(result.row_count(), 1);
         assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
         assert_eq!(string_cell(&result, 0, 2), "19172");
@@ -4811,12 +5150,16 @@ path = "{metadata_path}"
     fn add_backend_requires_fe_role_but_show_backends_works_in_all_in_one() {
         let mut cfg = crate::common::app_config::NovaRocksConfig::default();
         cfg.cluster.role = crate::common::app_config::ClusterRole::AllInOne;
-        let engine = StandaloneNovaRocks::open_with_config(
-            StandaloneOptions::default(),
-            cfg,
-            test_open_services(),
-        )
-        .expect("open all-in-one engine");
+        let services = test_open_services_with_topology(
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
+            Arc::new(TestBackendTopologyPort::with_live_backend(
+                "127.0.0.1:0".parse().unwrap(),
+            )),
+        );
+        let engine =
+            StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg, services)
+                .expect("open all-in-one engine");
         let session = engine.session();
 
         let err = session
@@ -4825,6 +5168,7 @@ path = "{metadata_path}"
         assert!(err.contains("requires role=fe"), "{err}");
 
         let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_backend_topology_column_contract(&result);
         assert_eq!(result.row_count(), 1);
         assert_eq!(string_cell(&result, 0, 0), "0");
         assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
@@ -4833,11 +5177,7 @@ path = "{metadata_path}"
             engine.inner.exchange_port.to_string()
         );
         assert_eq!(string_cell(&result, 0, 3), "Live");
-        assert_eq!(string_cell(&result, 0, 7), env!("CARGO_PKG_VERSION"));
-        assert!(
-            string_cell(&result, 0, 8).parse::<u32>().unwrap() > 0,
-            "NumCores must be populated"
-        );
+        assert_eq!(string_cell(&result, 0, 4), "0");
     }
 
     #[test]

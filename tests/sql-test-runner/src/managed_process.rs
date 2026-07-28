@@ -843,6 +843,12 @@ impl ManagedProcess {
         Ok(log.match_indices(needle).count())
     }
 
+    pub(crate) fn log_contents(&self) -> Result<String> {
+        self.ensure_output_io_ok("read durable log contents")?;
+        fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read durable process log {}", self.log_path.display()))
+    }
+
     pub(crate) fn restart(
         &mut self,
         command: Command,

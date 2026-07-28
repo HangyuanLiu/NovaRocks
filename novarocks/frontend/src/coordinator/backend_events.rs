@@ -112,6 +112,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingDispatcher {
         cancellations: Mutex<Vec<(usize, Vec<UniqueId>)>>,
+        cancellation_query_ids: Mutex<Vec<QueryId>>,
     }
 
     impl FragmentDispatcher for RecordingDispatcher {
@@ -135,7 +136,8 @@ mod tests {
             panic!("backend-event test must not fetch results")
         }
 
-        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
+        fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]) {
+            self.cancellation_query_ids.lock().unwrap().push(query_id);
             self.cancellations
                 .lock()
                 .unwrap()
@@ -237,6 +239,10 @@ mod tests {
             *affected_dispatcher.cancellations.lock().unwrap(),
             vec![(7, vec![finst_id(11)]), (8, vec![finst_id(12)])]
         );
+        assert_eq!(
+            *affected_dispatcher.cancellation_query_ids.lock().unwrap(),
+            vec![affected_query, affected_query]
+        );
         assert!(
             unaffected_dispatcher
                 .cancellations
@@ -247,6 +253,13 @@ mod tests {
         assert_eq!(
             *second_affected_dispatcher.cancellations.lock().unwrap(),
             vec![(7, vec![finst_id(31)]), (10, vec![finst_id(32)])]
+        );
+        assert_eq!(
+            *second_affected_dispatcher
+                .cancellation_query_ids
+                .lock()
+                .unwrap(),
+            vec![second_affected_query, second_affected_query]
         );
 
         assert!(activity.backend_lost(7).is_empty());

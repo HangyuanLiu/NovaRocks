@@ -1008,6 +1008,26 @@ fn run_compat_directives_for_successful_step(
     }
 }
 
+fn execute_target_query_with_fault(
+    meta: &QueryMeta,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    session: &mut MysqlSession,
+    query_timeout: u64,
+    sql: &str,
+    db: Option<&str>,
+) -> (bool, Option<QueryExecution>, String) {
+    fault_injection::execute_with_post_fragment_start_fault(meta, server_handle, || {
+        session.execute_query(query_timeout, sql, db)
+    })
+    .unwrap_or_else(|error| {
+        (
+            false,
+            None,
+            format!("FAIL (runner fault injection): {error:#}"),
+        )
+    })
+}
+
 fn finish_expected_error_step(
     step: &SqlStep,
     matched_expected_error: bool,
@@ -1397,6 +1417,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 break;
             }
         }
+        let _fragment_failure_guard = fault_injection::fragment_failure_step_guard(
+            &step.meta,
+            Arc::clone(&ctx.server_handle),
+        );
 
         let compat_snapshot = match ctx.server_handle.lock() {
             Ok(server_handle) => compat_directive::snapshot(&step.meta, server_handle.as_ref()),
@@ -1435,7 +1459,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let exec = shell::execute_shell_command(cmd);
                         (true, Some(exec), String::new())
                     } else {
-                        target_session.execute_query(
+                        execute_target_query_with_fault(
+                            &step.meta,
+                            &ctx.server_handle,
+                            &mut target_session,
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
@@ -1727,7 +1754,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             let exec = shell::execute_shell_command(cmd);
                             (true, Some(exec), String::new())
                         } else {
-                            target_session.execute_query(
+                            execute_target_query_with_fault(
+                                &step.meta,
+                                &ctx.server_handle,
+                                &mut target_session,
                                 ctx.query_timeout,
                                 &step.sql,
                                 step.meta.db.as_deref(),
@@ -1928,7 +1958,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let exec = shell::execute_shell_command(cmd);
                         (true, Some(exec), String::new())
                     } else {
-                        target_session.execute_query(
+                        execute_target_query_with_fault(
+                            &step.meta,
+                            &ctx.server_handle,
+                            &mut target_session,
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
@@ -1985,7 +2018,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let exec = shell::execute_shell_command(cmd);
                         (true, Some(exec), String::new())
                     } else {
-                        target_session.execute_query(
+                        execute_target_query_with_fault(
+                            &step.meta,
+                            &ctx.server_handle,
+                            &mut target_session,
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
@@ -2037,7 +2073,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let exec = shell::execute_shell_command(cmd);
                         (true, Some(exec), String::new())
                     } else {
-                        target_session.execute_query(
+                        execute_target_query_with_fault(
+                            &step.meta,
+                            &ctx.server_handle,
+                            &mut target_session,
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),

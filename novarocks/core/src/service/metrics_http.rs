@@ -27,8 +27,6 @@ use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, register_int_gauge_vec,
 };
 
-use crate::query_execution::backend_registry::{BackendState, backend_registry};
-
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "novarocks_fragment_scheduled_total",
@@ -80,6 +78,22 @@ pub(crate) fn observe_exchange_shuffle_bytes(bytes: usize) {
 
 pub(crate) fn observe_heartbeat_rtt(duration: Duration) {
     Lazy::force(&HEARTBEAT_RTT_SECONDS).observe(duration.as_secs_f64());
+}
+
+pub(crate) fn publish_backend_topology_metrics(
+    snapshot: crate::query_execution::backend::BackendTopologyMetricsSnapshot,
+) {
+    Lazy::force(&LIVE_BACKENDS).set(snapshot.live as i64);
+    for (state_name, count) in [
+        ("registering", snapshot.registering),
+        ("live", snapshot.live),
+        ("lost", snapshot.lost),
+        ("decommissioning", snapshot.decommissioning),
+    ] {
+        BACKENDS_BY_STATE
+            .with_label_values(&[state_name])
+            .set(count as i64);
+    }
 }
 
 pub(crate) async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
@@ -173,38 +187,6 @@ fn refresh_backend_gauges() {
     Lazy::force(&HEARTBEAT_RTT_SECONDS);
     Lazy::force(&LIVE_BACKENDS);
     Lazy::force(&BACKENDS_BY_STATE);
-
-    let entries = backend_registry()
-        .map(|registry| registry.snapshot())
-        .unwrap_or_default();
-    LIVE_BACKENDS.set(
-        entries
-            .iter()
-            .filter(|entry| entry.state == BackendState::Live)
-            .count() as i64,
-    );
-
-    for state in [
-        BackendState::Registering,
-        BackendState::Live,
-        BackendState::Lost,
-        BackendState::Decommissioning,
-    ] {
-        let state_name = backend_state_label(state);
-        let count = entries.iter().filter(|entry| entry.state == state).count() as i64;
-        BACKENDS_BY_STATE
-            .with_label_values(&[state_name])
-            .set(count);
-    }
-}
-
-fn backend_state_label(state: BackendState) -> &'static str {
-    match state {
-        BackendState::Registering => "registering",
-        BackendState::Live => "live",
-        BackendState::Lost => "lost",
-        BackendState::Decommissioning => "decommissioning",
-    }
 }
 
 #[cfg(test)]
@@ -223,6 +205,41 @@ mod tests {
         assert!(body.contains("novarocks_heartbeat_rtt_seconds"));
         assert!(body.contains("novarocks_live_backends"));
         assert!(body.contains("novarocks_backends"));
+    }
+
+    #[test]
+    fn backend_topology_gauges_preserve_the_last_nonzero_frontend_snapshot() {
+        publish_backend_topology_metrics(
+            crate::query_execution::backend::BackendTopologyMetricsSnapshot {
+                registering: 1,
+                live: 2,
+                lost: 3,
+                decommissioning: 4,
+            },
+        );
+
+        let first = render_metrics().expect("render first metrics snapshot");
+        let second = render_metrics().expect("render second metrics snapshot");
+
+        for body in [&first, &second] {
+            assert!(body.contains("novarocks_live_backends 2"), "{body}");
+            assert!(
+                body.contains("novarocks_backends{state=\"registering\"} 1"),
+                "{body}"
+            );
+            assert!(
+                body.contains("novarocks_backends{state=\"live\"} 2"),
+                "{body}"
+            );
+            assert!(
+                body.contains("novarocks_backends{state=\"lost\"} 3"),
+                "{body}"
+            );
+            assert!(
+                body.contains("novarocks_backends{state=\"decommissioning\"} 4"),
+                "{body}"
+            );
+        }
     }
 
     #[test]

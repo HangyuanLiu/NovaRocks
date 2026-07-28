@@ -45,6 +45,7 @@ use crate::protocol::native::{
     RuntimeFilterQueryLifecycleOptions, encode_abort_runtime_filter_deployment,
     encode_participant_install,
 };
+use crate::query_execution::contract::QueryId;
 use crate::query_execution::fragment_transport::{
     FetchOutcome, FetchedQueryBatch, FragmentDispatcher, NativeFragmentEnvelope,
 };
@@ -518,12 +519,16 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
     }
 
-    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
+    fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]) {
         if self.check_idx(backend_idx).is_err() {
             return;
         }
         let addr = self.addrs[&backend_idx];
         let req = CancelFragmentRequest {
+            query_id: Some(ProtoUniqueId {
+                hi: query_id.high(),
+                lo: query_id.low(),
+            }),
             finst_ids: finst_ids
                 .iter()
                 .map(|id| ProtoUniqueId {
@@ -594,6 +599,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
     use crate::proto;
+    use crate::query_execution::contract::QueryId;
     use arrow::array::Int32Array;
     use proto::filter::{LookupRequest, LookupResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
@@ -744,6 +750,7 @@ mod tests {
         fetch_eos: AtomicBool,
         fetch_arrow: Mutex<Vec<u8>>,
         cancel_count: AtomicUsize,
+        cancel_request: Mutex<Option<CancelFragmentRequest>>,
         cancel_delay_ms: AtomicU64,
         report_status_code: AtomicI32,
         report_message: Mutex<String>,
@@ -757,6 +764,7 @@ mod tests {
                 fetch_eos: AtomicBool::new(false),
                 fetch_arrow: Mutex::new(Vec::new()),
                 cancel_count: AtomicUsize::new(0),
+                cancel_request: Mutex::new(None),
                 cancel_delay_ms: AtomicU64::new(0),
                 report_status_code: AtomicI32::new(0),
                 report_message: Mutex::new(String::new()),
@@ -843,12 +851,14 @@ mod tests {
 
         async fn cancel_fragment(
             &self,
-            _request: Request<CancelFragmentRequest>,
+            request: Request<CancelFragmentRequest>,
         ) -> Result<Response<proto::novarocks::CancelFragmentResponse>, Status> {
             let delay_ms = self.0.cancel_delay_ms.load(Ordering::SeqCst);
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
+            *self.0.cancel_request.lock().expect("cancel request lock") =
+                Some(request.into_inner());
             self.0.cancel_count.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(proto::novarocks::CancelFragmentResponse {
                 status_code: 0,
@@ -1059,8 +1069,9 @@ mod tests {
         let state = Arc::new(MockState::default());
         let addr = spawn_mock_server(Arc::clone(&state));
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
+        let query_id = QueryId::new(11, 12);
 
-        dispatcher.cancel_fragments(0, &[make_finst_id(1, 2)]);
+        dispatcher.cancel_fragments(0, query_id, &[make_finst_id(1, 2)]);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while state.cancel_count.load(Ordering::SeqCst) == 0 {
@@ -1070,6 +1081,13 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let request = state
+            .cancel_request
+            .lock()
+            .expect("cancel request lock")
+            .clone()
+            .expect("cancel request");
+        assert_eq!(request.query_id, Some(ProtoUniqueId { hi: 11, lo: 12 }));
     }
 
     #[test]
@@ -1080,7 +1098,7 @@ mod tests {
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let start = std::time::Instant::now();
-        dispatcher.cancel_fragments(0, &[make_finst_id(7, 8)]);
+        dispatcher.cancel_fragments(0, QueryId::new(21, 22), &[make_finst_id(7, 8)]);
         let elapsed = start.elapsed();
 
         assert!(

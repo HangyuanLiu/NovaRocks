@@ -24,6 +24,7 @@ mod server;
 pub mod statistics;
 pub mod system_catalog;
 pub mod table_maintenance;
+mod topology;
 pub mod view;
 
 pub use application::{

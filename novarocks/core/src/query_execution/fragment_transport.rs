@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::query_execution::contract::QueryId;
 
 /// Opaque data-plane batch returned by a fragment dispatcher.
 ///
@@ -92,8 +93,8 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
         expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
     ) -> Result<FetchOutcome, String>;
 
-    /// Cancel all listed fragment instances on the given backend. Idempotent.
-    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]);
+    /// Cancel all listed fragment instances owned by the given query on the backend. Idempotent.
+    fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]);
 
     /// Number of backends this dispatcher can route to.
     fn backend_count(&self) -> usize;

@@ -29,6 +29,7 @@ use novarocks::query_execution::write::NativeExecutionReport;
 type QueryKey = (i64, i64);
 
 struct ActiveQuery {
+    query_id: QueryId,
     intent: DistributedQueryIntent,
     dispatcher: Arc<dyn FragmentDispatcher>,
     scheduled_backends: BTreeMap<usize, u64>,
@@ -71,6 +72,7 @@ impl FrontendQueryRegistry {
         match active.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(ActiveQuery {
+                    query_id,
                     intent,
                     dispatcher,
                     scheduled_backends: BTreeMap::new(),
@@ -473,9 +475,9 @@ impl FrontendQueryRegistry {
             (affected, cancellations)
         };
 
-        for (dispatcher, attempted) in cancellations {
+        for (dispatcher, query_id, attempted) in cancellations {
             for (backend_idx, finst_ids) in attempted {
-                dispatcher.cancel_fragments(backend_idx, &finst_ids);
+                dispatcher.cancel_fragments(backend_idx, query_id, &finst_ids);
             }
         }
         affected
@@ -508,9 +510,9 @@ impl FrontendQueryRegistry {
             (affected, cancellations)
         };
 
-        for (dispatcher, attempted) in cancellations {
+        for (dispatcher, query_id, attempted) in cancellations {
             for (backend_idx, finst_ids) in attempted {
-                dispatcher.cancel_fragments(backend_idx, &finst_ids);
+                dispatcher.cancel_fragments(backend_idx, query_id, &finst_ids);
             }
         }
         affected
@@ -545,7 +547,11 @@ impl Drop for ActiveQueryGuard {
     }
 }
 
-type DispatcherCancellation = (Arc<dyn FragmentDispatcher>, Vec<(usize, Vec<UniqueId>)>);
+type DispatcherCancellation = (
+    Arc<dyn FragmentDispatcher>,
+    QueryId,
+    Vec<(usize, Vec<UniqueId>)>,
+);
 
 fn request_cancellation(query: &mut ActiveQuery) -> Option<DispatcherCancellation> {
     query.cancellation_requested = true;
@@ -562,6 +568,7 @@ fn cancellation_if_ready(query: &mut ActiveQuery) -> Option<DispatcherCancellati
     query.cancellation_dispatched = true;
     Some((
         Arc::clone(&query.dispatcher),
+        query.query_id,
         query
             .attempted
             .iter()
@@ -571,9 +578,9 @@ fn cancellation_if_ready(query: &mut ActiveQuery) -> Option<DispatcherCancellati
 }
 
 fn dispatch_cancellation(cancellation: Option<DispatcherCancellation>) {
-    if let Some((dispatcher, attempted)) = cancellation {
+    if let Some((dispatcher, query_id, attempted)) = cancellation {
         for (backend_idx, finst_ids) in attempted {
-            dispatcher.cancel_fragments(backend_idx, &finst_ids);
+            dispatcher.cancel_fragments(backend_idx, query_id, &finst_ids);
         }
     }
 }

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
-use crate::query_execution::backend_registry::LiveBackendSnapshot;
+use crate::query_execution::backend::LiveBackendSnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, QueryId, RuntimeFilterLifecycleView,
 };

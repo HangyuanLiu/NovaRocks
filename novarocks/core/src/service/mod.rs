@@ -16,7 +16,7 @@
 // under the License.
 #[cfg(feature = "compat")]
 pub mod backend_service;
-pub(crate) mod cluster_heartbeat;
+pub mod cluster_heartbeat;
 #[cfg(feature = "compat")]
 pub mod disk_report;
 #[cfg(feature = "compat")]

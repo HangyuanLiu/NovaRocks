@@ -407,7 +407,7 @@ mod tests {
 
     use super::*;
     use crate::common::types::UniqueId;
-    use crate::query_execution::backend_registry::LiveBackendSnapshot;
+    use crate::query_execution::backend::LiveBackendSnapshot;
     use crate::runtime_filter::deployment::role_graph::*;
     use crate::runtime_filter::deployment::routing_shard::project_routing_shards;
     use crate::runtime_filter::model::contract::*;

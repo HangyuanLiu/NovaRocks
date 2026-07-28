@@ -46,6 +46,7 @@ mod tests {
     use crate::coordinator::FrontendDistributedQueryCoordinator;
     use crate::coordinator::query_registry::FrontendQueryRegistry;
     use crate::coordinator::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+    use crate::topology::FrontendTopologyController;
 
     fn report_endpoint() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19040)
@@ -268,6 +269,7 @@ mod tests {
         submission_reporting: Mutex<Vec<(bool, bool)>>,
         fetches: Mutex<Vec<(usize, UniqueId)>>,
         cancellations: Mutex<Vec<(usize, Vec<UniqueId>)>>,
+        cancellation_query_ids: Mutex<Vec<QueryId>>,
         outcomes: Mutex<VecDeque<FetchOutcome>>,
         fail_on_submit: Option<usize>,
         cancel_on_submit: Mutex<Option<(usize, Arc<AtomicBool>)>>,
@@ -540,10 +542,11 @@ mod tests {
                 .unwrap_or(FetchOutcome::Eof))
         }
 
-        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
+        fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]) {
             if let Some(events) = &self.events {
                 events.lock().unwrap().push("cancel");
             }
+            self.cancellation_query_ids.lock().unwrap().push(query_id);
             self.cancellations
                 .lock()
                 .unwrap()
@@ -601,6 +604,51 @@ mod tests {
             1
         );
         assert!(!dispatcher.fetches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn successful_fragment_submission_updates_frontend_topology_telemetry() {
+        let fixture = non_empty_result_contract_fixture();
+        let backends = fixture.backends().to_vec();
+        let batch = fixture.result_batch();
+        let request = fixture.into_request();
+        let topology = Arc::new(FrontendTopologyController::new(1));
+        for (_, endpoint) in &backends {
+            novarocks::query_execution::backend::BackendTopologyPort::add_backend(
+                topology.as_ref(),
+                *endpoint,
+            )
+            .unwrap();
+        }
+        let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
+        let scheduler =
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+        let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
+            QueryId::new(41, 73),
+            report_endpoint(),
+            scheduler,
+            dispatcher.clone(),
+            NonZeroUsize::new(1).unwrap(),
+            Arc::new(NoopRuntimeFilterDispatcher),
+            topology.clone(),
+        );
+
+        coordinator
+            .execute(request)
+            .expect("frontend executes fixture");
+
+        let submissions = dispatcher.submissions.lock().unwrap().clone();
+        for backend_idx in 0..topology.backend_count_for_test() {
+            let expected = submissions
+                .iter()
+                .filter(|(submitted_backend_idx, _)| *submitted_backend_idx == backend_idx)
+                .count() as u64;
+            assert_eq!(
+                topology.scheduled_fragment_count_for_test(backend_idx),
+                expected,
+                "frontend topology telemetry must count successful submissions per backend"
+            );
+        }
     }
 
     #[test]

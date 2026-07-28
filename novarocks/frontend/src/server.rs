@@ -63,7 +63,10 @@ pub struct FrontendServerConfig {
 fn standalone_open_services(
     system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog>,
     host: &FrontendApplicationHost,
+    config: &NovaRocksConfig,
 ) -> novarocks::engine::StandaloneOpenServices {
+    host.configure_backend_topology(config)
+        .expect("frontend topology configuration is validated before server open");
     novarocks::engine::StandaloneOpenServices::new(
         system_catalog,
         host.view_service(),
@@ -73,8 +76,10 @@ fn standalone_open_services(
         host.mv_application_service(),
         host.query_execution_service(),
         host.backend_query_event_sink(),
+        host.backend_topology_port(),
         host.coordinator_report_endpoint_sink(),
         host.native_report_handler(),
+        0,
     )
 }
 
@@ -105,11 +110,12 @@ where
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let execution = resolve_frontend_execution_config(&config)?;
+    let topology_config = config.config.clone();
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
         |state_store| async move { FrontendApplicationHost::open(state_store, execution).await },
-        move |host| standalone_open_services(system_catalog, host),
+        move |host| standalone_open_services(system_catalog, host, &topology_config),
         move |config, services, shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
@@ -140,11 +146,12 @@ where
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let execution = resolve_frontend_execution_config(&config)?;
+    let topology_config = config.config.clone();
     run_frontend_server_with_signal_and_ports(
         config,
         signal,
         |state_store| async move { FrontendApplicationHost::open(state_store, execution).await },
-        move |host| standalone_open_services(system_catalog, host),
+        move |host| standalone_open_services(system_catalog, host, &topology_config),
         move |config, services, shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
@@ -410,6 +417,34 @@ mod tests {
         }
     }
 
+    struct RejectingNativeFragmentIngress;
+
+    impl novarocks::service::native_fragment_ingress::NativeFragmentIngress
+        for RejectingNativeFragmentIngress
+    {
+        fn submit(
+            &self,
+            _request: novarocks::service::native_fragment_ingress::NativeFragmentRequest,
+        ) -> Result<
+            novarocks::service::native_fragment_ingress::NativeFragmentAccepted,
+            novarocks::service::native_fragment_ingress::NativeFragmentIngressError,
+        > {
+            Err(
+                novarocks::service::native_fragment_ingress::NativeFragmentIngressError::new(
+                    "test native fragment ingress rejects submissions",
+                ),
+            )
+        }
+
+        fn cancel(
+            &self,
+            _request: novarocks::service::native_fragment_ingress::NativeFragmentCancelRequest,
+        ) -> Result<(), novarocks::service::native_fragment_ingress::NativeFragmentIngressError>
+        {
+            Ok(())
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_in_one_production_composition_uses_frontend_reports_and_loopback_grpc() {
         let _grpc_guard = GrpcServerTestGuard;
@@ -420,15 +455,47 @@ mod tests {
         .await
         .expect("open frontend application host");
         let report_endpoint = host.coordinator_report_endpoint_sink();
-        let services = standalone_open_services(
-            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
-            &host,
-        );
         let mut config = novarocks::common::app_config::NovaRocksConfig::default();
         config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
         config.cluster.advertise_host = "127.0.0.1".to_string();
         config.server.host = "127.0.0.1".to_string();
         config.server.grpc_port = 0;
+        let mut services = standalone_open_services(
+            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            &host,
+            &config,
+        );
+        novarocks::server::configure_standalone_internal_rpc_transport();
+        novarocks::service::grpc_server::start_grpc_exchange_server(
+            &config.server.host,
+            config.server.grpc_port,
+            Arc::new(RejectingNativeFragmentIngress),
+            Arc::clone(&services.native_report_handler),
+        )
+        .expect("start production-composed all-in-one gRPC endpoint");
+        let grpc_port = novarocks::service::grpc_server::grpc_server_bound_port()
+            .expect("all-in-one combined gRPC endpoint bound port");
+        services.exchange_port = grpc_port;
+        let loopback_endpoint = format!("127.0.0.1:{grpc_port}")
+            .parse()
+            .expect("all-in-one loopback endpoint");
+        services
+            .backend_topology
+            .add_backend(loopback_endpoint)
+            .expect("register all-in-one loopback backend");
+        let live_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !services
+            .backend_topology
+            .live_backends()
+            .iter()
+            .any(|backend| backend.endpoint() == loopback_endpoint)
+        {
+            assert!(
+                tokio::time::Instant::now() < live_deadline,
+                "all-in-one loopback backend did not become Live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
             novarocks::engine::StandaloneOptions::default(),
@@ -436,8 +503,6 @@ mod tests {
             services,
         )
         .expect("open production-composed all-in-one engine");
-        let grpc_port = novarocks::service::grpc_server::grpc_server_bound_port()
-            .expect("all-in-one combined gRPC endpoint bound port");
         report_endpoint.set_bound_port(grpc_port);
 
         let backends = engine

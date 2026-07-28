@@ -36,6 +36,25 @@ use crate::query_execution::backend_registry::{
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::ast::{AddBackendStmt, DropBackendStmt};
 
+fn legacy_grpc_heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
+    match crate::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint) {
+        crate::query_execution::backend::HeartbeatOutcome::Ok {
+            start_epoch,
+            version,
+            num_cores,
+            now_ms,
+        } => HeartbeatOutcome::Ok {
+            start_epoch,
+            version,
+            num_cores,
+            now_ms,
+        },
+        crate::query_execution::backend::HeartbeatOutcome::Failed { err } => {
+            HeartbeatOutcome::Failed { err }
+        }
+    }
+}
+
 struct FrontendBackendEventAdapter {
     sink: Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
 }
@@ -100,7 +119,7 @@ pub(crate) fn ensure_backend_registry(
             *manager = Some(spawn_heartbeat_manager(
                 Arc::clone(&registry),
                 Duration::from_millis(cfg.cluster.heartbeat_interval_ms),
-                crate::service::cluster_heartbeat::grpc_heartbeat,
+                legacy_grpc_heartbeat,
                 Arc::new(FrontendBackendEventAdapter {
                     sink: Arc::clone(&state.backend_query_events),
                 }),
@@ -131,7 +150,7 @@ pub(crate) fn wait_for_configured_backends_live(
         &configured,
         Duration::from_secs(5),
         Duration::from_millis(cfg.cluster.heartbeat_interval_ms.max(10).min(200)),
-        crate::service::cluster_heartbeat::grpc_heartbeat,
+        legacy_grpc_heartbeat,
         Some(state.backend_query_events.as_ref()),
     )
 }

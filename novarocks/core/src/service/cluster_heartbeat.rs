@@ -18,10 +18,10 @@
 use std::net::SocketAddr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::query_execution::backend_registry::{BeId, HeartbeatOutcome};
+use crate::query_execution::backend::{BeId, HeartbeatOutcome};
 use crate::service::grpc_client::{NovaRocksGrpcRemoteClient, proto};
 
-pub(crate) fn grpc_heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
+pub fn grpc_heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
     let start = Instant::now();
     let outcome = match NovaRocksGrpcRemoteClient::connect_blocking(endpoint) {
         Ok(client) => {

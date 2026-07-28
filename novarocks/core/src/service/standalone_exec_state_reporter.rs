@@ -366,7 +366,29 @@ fn send_once(task: &StandaloneExecStateReportTask) -> Result<(), String> {
     let resp = client.blocking_report_exec_status(proto::novarocks::ReportExecStatusRequest {
         report: Some(task.report.clone()),
     })?;
-    interpret_report_exec_status_response(resp)
+    let emit_failed_report_ack = should_emit_failed_report_ack(task, &resp);
+    interpret_report_exec_status_response(resp)?;
+    if crate::common::config::sql_test_fragment_failure_harness_enabled() && emit_failed_report_ack
+    {
+        eprintln!(
+            "NOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi={} query_lo={} finst_hi={} finst_lo={}",
+            task.query_id.hi, task.query_id.lo, task.finst_id.hi, task.finst_id.lo
+        );
+    }
+    Ok(())
+}
+
+fn should_emit_failed_report_ack(
+    task: &StandaloneExecStateReportTask,
+    resp: &proto::novarocks::ReportExecStatusResponse,
+) -> bool {
+    resp.status_code == crate::service::grpc_server::REPORT_EXEC_STATUS_OK
+        && task.report.done
+        && task
+            .report
+            .status
+            .as_ref()
+            .is_some_and(|status| status.code != 0)
 }
 
 fn interpret_report_exec_status_response(
@@ -567,6 +589,46 @@ mod tests {
         assert!(
             err.contains("expected error_code=WriteCoordinatorGone"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_report_ack_evidence_requires_explicit_frontend_ok() {
+        let mut task = test_task();
+        task.report.status = Some(proto::common::Status {
+            code: 1,
+            message: "fragment failed".to_string(),
+        });
+        let accepted = proto::novarocks::ReportExecStatusResponse {
+            status_code: crate::service::grpc_server::REPORT_EXEC_STATUS_OK,
+            message: String::new(),
+            error_code: String::new(),
+        };
+        let query_gone = proto::novarocks::ReportExecStatusResponse {
+            status_code: crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
+            message: "query is gone".to_string(),
+            error_code: "WriteCoordinatorGone".to_string(),
+        };
+
+        assert!(should_emit_failed_report_ack(&task, &accepted));
+        assert!(
+            !should_emit_failed_report_ack(&task, &query_gone),
+            "QUERY_GONE is terminal for retries but must not prove that FE accepted the report"
+        );
+
+        task.report.done = false;
+        assert!(
+            !should_emit_failed_report_ack(&task, &accepted),
+            "a non-final failed report cannot prove final failure acceptance"
+        );
+        task.report.done = true;
+        task.report.status = Some(proto::common::Status {
+            code: 0,
+            message: String::new(),
+        });
+        assert!(
+            !should_emit_failed_report_ack(&task, &accepted),
+            "a successful final report is not failed-fragment ACK evidence"
         );
     }
 

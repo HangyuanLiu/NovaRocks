@@ -18,6 +18,7 @@
 pub mod artifact;
 pub(crate) mod assembly;
 pub mod backend;
+#[cfg(test)]
 pub(crate) mod backend_registry;
 pub mod cancellation;
 pub mod contract;

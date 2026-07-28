@@ -281,6 +281,7 @@ message CancelFragmentRequest {
   repeated novarocks.common.UniqueId finst_ids = 1;  // instances to cancel
   string reason = 2;                                // cancellation reason for logging
   uint64 start_epoch = 3;                           // guard: ignore if BE restarted past epoch
+  novarocks.common.UniqueId query_id = 4;           // coordinator query owning the instances
 }
 
 // Cancellation result returned after local cancellation handling.

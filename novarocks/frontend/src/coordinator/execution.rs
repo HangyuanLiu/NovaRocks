@@ -245,6 +245,7 @@ impl BackendServicesSource {
 pub struct FrontendDistributedQueryCoordinator {
     report_endpoint: Arc<FrontendReportEndpointBinding>,
     live_topology: Arc<FrontendLiveBackendTopology>,
+    backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     backend_services: BackendServicesSource,
     runtime_filter_worker_count: NonZeroUsize,
     next_runtime_filter_epoch: AtomicU64,
@@ -259,6 +260,7 @@ impl FrontendDistributedQueryCoordinator {
         advertised_report_host: String,
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
+        backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     ) -> Self {
         let live_topology = Arc::new(FrontendLiveBackendTopology::new());
         Self {
@@ -267,6 +269,7 @@ impl FrontendDistributedQueryCoordinator {
                 configured_report_port,
             )),
             live_topology: Arc::clone(&live_topology),
+            backend_topology,
             backend_services: BackendServicesSource::Live(live_topology),
             runtime_filter_worker_count,
             next_runtime_filter_epoch: AtomicU64::new(1),
@@ -286,12 +289,34 @@ impl FrontendDistributedQueryCoordinator {
         runtime_filter_worker_count: NonZeroUsize,
         runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
     ) -> Self {
+        Self::new_for_test_with_topology(
+            query_id,
+            report_endpoint,
+            scheduler,
+            dispatcher,
+            runtime_filter_worker_count,
+            runtime_filter_dispatcher,
+            Arc::new(crate::topology::FrontendTopologyController::new(1)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_topology(
+        query_id: QueryId,
+        report_endpoint: SocketAddr,
+        scheduler: FrontendFragmentScheduler,
+        dispatcher: Arc<dyn FragmentDispatcher>,
+        runtime_filter_worker_count: NonZeroUsize,
+        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        backend_topology: novarocks::query_execution::backend::BackendTopologyService,
+    ) -> Self {
         let live_topology = Arc::new(FrontendLiveBackendTopology::new());
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
             )),
             live_topology,
+            backend_topology,
             backend_services: BackendServicesSource::Fixed {
                 scheduler,
                 dispatcher,
@@ -320,6 +345,7 @@ impl FrontendDistributedQueryCoordinator {
                 report_endpoint,
             )),
             live_topology,
+            backend_topology: Arc::new(crate::topology::FrontendTopologyController::new(1)),
             backend_services: BackendServicesSource::Sequence {
                 schedulers: Mutex::new(schedulers.into()),
                 dispatcher,
@@ -495,7 +521,8 @@ impl FrontendDistributedQueryCoordinator {
                 }
                 return Err(error);
             }
-            novarocks::query_execution::backend::record_successful_fragment_submission(backend_idx);
+            self.backend_topology
+                .record_successful_fragment_submission(backend_idx);
             submitted += 1;
             if let Some(message) = self.registry.first_failure(query_id) {
                 if intent != DistributedQueryIntent::Write {

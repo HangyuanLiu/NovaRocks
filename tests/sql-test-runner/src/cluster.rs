@@ -24,9 +24,11 @@ use clap::ValueEnum;
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use std::fs;
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
@@ -64,6 +66,63 @@ struct BackendTopologyRow {
     grpc_port: u16,
     state: String,
     alive: bool,
+    scheduled_fragments: u64,
+}
+
+fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopologyRow> {
+    let grpc_port = values
+        .get(2)
+        .context("SHOW BACKENDS row missing GrpcPort")?
+        .parse::<u16>()
+        .context("parse SHOW BACKENDS GrpcPort")?;
+    let state = values
+        .get(3)
+        .context("SHOW BACKENDS row missing State")?
+        .clone();
+    let alive = state.eq_ignore_ascii_case("Live");
+    let scheduled_fragments = values
+        .get(4)
+        .context("SHOW BACKENDS row missing ScheduledFragments")?
+        .parse::<u64>()
+        .context("parse SHOW BACKENDS ScheduledFragments")?;
+    Ok(BackendTopologyRow {
+        grpc_port,
+        state,
+        alive,
+        scheduled_fragments,
+    })
+}
+
+fn query_frontend_backend_topology(
+    mysql_user: &str,
+    host: &str,
+    port: u16,
+    io_timeout: Duration,
+) -> Result<Vec<BackendTopologyRow>> {
+    let builder = OptsBuilder::new()
+        .ip_or_hostname(Some(host))
+        .tcp_port(port)
+        .prefer_socket(false)
+        .user(Some(mysql_user))
+        .tcp_connect_timeout(Some(io_timeout))
+        .read_timeout(Some(io_timeout))
+        .write_timeout(Some(io_timeout));
+    let mut conn = MysqlConn::new(builder)
+        .with_context(|| format!("connect to cross-process FE MySQL at {host}:{port}"))?;
+    let rows: Vec<mysql::Row> = conn
+        .query("SHOW BACKENDS")
+        .context("query SHOW BACKENDS from cross-process FE")?;
+    rows.into_iter()
+        .map(|row| {
+            let values = (0..5)
+                .map(|index| {
+                    row.get::<String, usize>(index)
+                        .with_context(|| format!("SHOW BACKENDS row missing column {index}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            parse_frontend_show_backends_values(&values)
+        })
+        .collect()
 }
 
 const BACKEND_TOPOLOGY_TIMEOUT_CAP: Duration = Duration::from_secs(120);
@@ -132,9 +191,8 @@ where
     let expected = expected_ports.len();
     let deadline = backend_topology_deadline(Instant::now(), timeout);
     loop {
-        process_health().context(
-            "cross-process FE/BE exited before SHOW BACKENDS topology became ready",
-        )?;
+        process_health()
+            .context("cross-process FE/BE exited before SHOW BACKENDS topology became ready")?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         let io_timeout = topology_mysql_io_timeout(remaining);
         let last_observation = match query(io_timeout) {
@@ -146,9 +204,8 @@ where
         };
 
         if Instant::now() >= deadline {
-            let process_diagnostics = process_health().context(
-                "cross-process FE/BE exited during the bounded SHOW BACKENDS query",
-            )?;
+            let process_diagnostics = process_health()
+                .context("cross-process FE/BE exited during the bounded SHOW BACKENDS query")?;
             bail!(
                 "timed out waiting for SHOW BACKENDS {expected}/{expected} Live; last_observation={last_observation}; {}",
                 process_diagnostics
@@ -186,42 +243,7 @@ fn wait_for_live_backend_topology(
                 runtime,
             )
         },
-        |io_timeout| {
-            let builder = OptsBuilder::new()
-                .ip_or_hostname(Some(host))
-                .tcp_port(port)
-                .prefer_socket(false)
-                .user(Some(mysql_user))
-                .tcp_connect_timeout(Some(io_timeout))
-                .read_timeout(Some(io_timeout))
-                .write_timeout(Some(io_timeout));
-            let mut conn = MysqlConn::new(builder)
-                .with_context(|| format!("connect to cross-process FE MySQL at {host}:{port}"))?;
-            let rows: Vec<mysql::Row> = conn
-                .query("SHOW BACKENDS")
-                .context("query SHOW BACKENDS from cross-process FE")?;
-            rows.into_iter()
-                .map(|row| {
-                    let grpc_port = row
-                        .get::<String, usize>(2)
-                        .context("SHOW BACKENDS row missing GrpcPort")?
-                        .parse::<u16>()
-                        .context("parse SHOW BACKENDS GrpcPort")?;
-                    let state = row
-                        .get::<String, usize>(3)
-                        .context("SHOW BACKENDS row missing State")?;
-                    let alive = row
-                        .get::<String, usize>(4)
-                        .context("SHOW BACKENDS row missing Alive")?
-                        .eq_ignore_ascii_case("true");
-                    Ok(BackendTopologyRow {
-                        grpc_port,
-                        state,
-                        alive,
-                    })
-                })
-                .collect()
-        },
+        |io_timeout| query_frontend_backend_topology(mysql_user, host, port, io_timeout),
         thread::sleep,
     )?;
     let diagnostics = process_runtime_diagnostics(
@@ -252,6 +274,25 @@ pub(crate) trait ServerHandle: Send {
     fn restart_be(&mut self, index: usize) -> Result<()> {
         bail!("BE restart is unsupported by this server mode (index={index})")
     }
+    fn be_count(&self) -> usize {
+        self.be_endpoints().len()
+    }
+    fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
+        bail!("scheduled fragment telemetry is unsupported by this server mode (index={index})")
+    }
+    fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
+        bail!(
+            "fragment executor failure injection is unsupported by this server mode (index={index})"
+        )
+    }
+    fn disarm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
+        bail!(
+            "fragment executor failure cleanup is unsupported by this server mode (index={index})"
+        )
+    }
+    fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
+        bail!("fragment failure token is unsupported by this server mode (index={index})")
+    }
     #[allow(dead_code)]
     fn be_endpoints(&self) -> &[CompatBeEndpoint] {
         &[]
@@ -265,6 +306,10 @@ pub(crate) trait ServerHandle: Send {
         bail!(
             "BE log counting is unsupported by this server mode (index={index}, pattern={needle:?})"
         )
+    }
+    #[allow(dead_code)]
+    fn be_log_contents(&self, index: usize) -> Result<String> {
+        bail!("BE log reading is unsupported by this server mode (index={index})")
     }
     #[allow(dead_code)]
     fn run_compat_probe(&self, probe: &str, _endpoint: &CompatBeEndpoint) -> Result<()> {
@@ -518,6 +563,43 @@ pub(crate) fn render_cross_process_config_with_metadata_db_override(
     toml::to_string(&value).context("serialize cross-process config with metadata db override")
 }
 
+fn render_cross_process_launch_config(
+    base_config: &str,
+    role: ClusterProcessRole,
+    be_index: usize,
+    runtime: &CrossProcessRuntime,
+    runtime_dir: &Path,
+    metadata_mode: CrossProcessMetadataMode<'_>,
+) -> Result<String> {
+    match metadata_mode {
+        CrossProcessMetadataMode::Isolated => {
+            let metadata_path = runtime_dir.join("metadata.sqlite");
+            let metadata_path = metadata_path
+                .to_str()
+                .context("cross-process runtime metadata path must be valid UTF-8")?;
+            render_cross_process_config_with_metadata_db_override(
+                base_config,
+                role,
+                be_index,
+                runtime,
+                metadata_path,
+            )
+        }
+        CrossProcessMetadataMode::InheritBase => {
+            render_cross_process_config(base_config, role, be_index, runtime)
+        }
+        CrossProcessMetadataMode::Explicit(metadata_path) => {
+            render_cross_process_config_with_metadata_db_override(
+                base_config,
+                role,
+                be_index,
+                runtime,
+                metadata_path,
+            )
+        }
+    }
+}
+
 struct NoopServerHandle;
 
 impl ServerHandle for NoopServerHandle {
@@ -533,11 +615,26 @@ impl ServerHandle for NoopServerHandle {
 pub(crate) struct CrossProcessServerHandle {
     target_host: String,
     target_port: u16,
+    mysql_user: String,
+    be_grpc_ports: Vec<u16>,
+    fragment_failure_trigger_paths: Vec<PathBuf>,
+    fragment_failure_tokens: Vec<Option<String>>,
     runtime_dir: PathBuf,
     novarocks_bin: PathBuf,
     be_config_paths: Vec<PathBuf>,
     be_processes: Vec<ManagedProcess>,
     fe_process: ManagedProcess,
+}
+
+#[derive(Clone, Copy)]
+enum CrossProcessMetadataMode<'a> {
+    /// Normal ephemeral SQL-test clusters must never restore backend rows from
+    /// another launch whose dynamically reserved endpoints are already stale.
+    Isolated,
+    /// The IMV statelessness cluster-A fixture intentionally reuses the base
+    /// metadata store before cluster B proves a fresh-metadata rebuild.
+    InheritBase,
+    Explicit(&'a str),
 }
 
 struct RuntimeDirGuard {
@@ -569,17 +666,38 @@ impl Drop for RuntimeDirGuard {
 }
 
 impl CrossProcessServerHandle {
-    /// Launch cluster A of the L2 statelessness harness, or the normal
-    /// cross-process cluster used by every other sql-test suite; both share
-    /// this entry point via `launch_server`. `pub(crate)` (rather than
-    /// module-private) so `crate::imv_stateless` can also call it directly
-    /// for the harness's first cluster launch.
+    /// Launch the normal ephemeral cross-process cluster used by sql-test
+    /// suites through `launch_server`.
     pub(crate) fn launch(
         cluster_size: usize,
         repo_root: &Path,
         runner_config: &RunnerConfig,
     ) -> Result<Self> {
-        Self::launch_impl(cluster_size, repo_root, runner_config, None)
+        Self::launch_impl(
+            cluster_size,
+            repo_root,
+            runner_config,
+            CrossProcessMetadataMode::Isolated,
+        )
+    }
+
+    /// Launch a cluster against the base config's metadata store.
+    ///
+    /// This is intentionally narrower than [`Self::launch`]: ordinary
+    /// cross-process test clusters use dynamically reserved BE endpoints and
+    /// therefore require isolated metadata. Only the IMV L2 cluster-A fixture
+    /// needs to inherit the base metadata store.
+    pub(crate) fn launch_inheriting_base_metadata(
+        cluster_size: usize,
+        repo_root: &Path,
+        runner_config: &RunnerConfig,
+    ) -> Result<Self> {
+        Self::launch_impl(
+            cluster_size,
+            repo_root,
+            runner_config,
+            CrossProcessMetadataMode::InheritBase,
+        )
     }
 
     /// Same as [`Self::launch`], but every rendered process config (FE and
@@ -603,7 +721,7 @@ impl CrossProcessServerHandle {
             cluster_size,
             repo_root,
             runner_config,
-            Some(metadata_db_path),
+            CrossProcessMetadataMode::Explicit(metadata_db_path),
         )
     }
 
@@ -611,7 +729,7 @@ impl CrossProcessServerHandle {
         cluster_size: usize,
         repo_root: &Path,
         runner_config: &RunnerConfig,
-        metadata_db_override: Option<&str>,
+        metadata_mode: CrossProcessMetadataMode<'_>,
     ) -> Result<Self> {
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(repo_root)?);
         let reserved = ReservedRuntimePorts::new(cluster_size)?;
@@ -652,20 +770,25 @@ impl CrossProcessServerHandle {
             .unwrap_or_else(|| "root".to_string());
 
         let render = |role: ClusterProcessRole, be_index: usize| -> Result<String> {
-            match metadata_db_override {
-                Some(metadata_db_path) => render_cross_process_config_with_metadata_db_override(
-                    &base_config,
-                    role,
-                    be_index,
-                    &runtime,
-                    metadata_db_path,
-                ),
-                None => render_cross_process_config(&base_config, role, be_index, &runtime),
-            }
+            render_cross_process_launch_config(
+                &base_config,
+                role,
+                be_index,
+                &runtime,
+                runtime_dir.path(),
+                metadata_mode,
+            )
         };
 
         // Write per-BE configs.
         let mut be_config_paths: Vec<PathBuf> = Vec::with_capacity(cluster_size);
+        let fragment_failure_trigger_paths = (0..cluster_size)
+            .map(|index| {
+                runtime_dir
+                    .path()
+                    .join(format!("be_{index}.fragment_failure_trigger"))
+            })
+            .collect::<Vec<_>>();
         for i in 0..cluster_size {
             let be_config_path = runtime_dir.path().join(format!("be_{i}.toml"));
             fs::write(&be_config_path, render(ClusterProcessRole::Be, i)?)
@@ -695,6 +818,7 @@ impl CrossProcessServerHandle {
                 be_config_path,
                 "NOVAROCKS_READY role=be",
                 runtime_dir.path().join(format!("be_{i}.log")),
+                Some(&fragment_failure_trigger_paths[i]),
             )?;
             println!(
                 "started cross-process BE[{i}] pid={} grpc_port={} config={}",
@@ -715,6 +839,7 @@ impl CrossProcessServerHandle {
             &fe_config_path,
             "NOVAROCKS_READY mysql_port=",
             runtime_dir.path().join("fe.log"),
+            None,
         )?;
         println!(
             "started cross-process FE pid={} mysql_port={} config={}",
@@ -735,6 +860,10 @@ impl CrossProcessServerHandle {
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
             target_port: runtime.fe_mysql_port,
+            mysql_user,
+            be_grpc_ports: runtime.be.iter().map(|be| be.grpc).collect(),
+            fragment_failure_trigger_paths,
+            fragment_failure_tokens: vec![None; cluster_size],
             runtime_dir: runtime_dir.into_path(),
             novarocks_bin,
             be_config_paths,
@@ -766,6 +895,86 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn supports_fault_injection(&self) -> bool {
         true
+    }
+
+    fn be_count(&self) -> usize {
+        self.be_processes.len()
+    }
+
+    fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
+        self.ensure_be_index(index)?;
+        let grpc_port = self.be_grpc_ports[index];
+        let rows = query_frontend_backend_topology(
+            &self.mysql_user,
+            &self.target_host,
+            self.target_port,
+            TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+        )?;
+        rows.into_iter()
+            .find(|row| row.grpc_port == grpc_port)
+            .map(|row| row.scheduled_fragments)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
+                )
+            })
+    }
+
+    fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let trigger_path = &self.fragment_failure_trigger_paths[index];
+        let token = next_fragment_failure_token(index);
+        publish_fragment_failure_token(trigger_path, &token).with_context(|| {
+            format!(
+                "arm fragment executor failure for cross-process BE[{index}] at {}",
+                trigger_path.display()
+            )
+        })?;
+        self.fragment_failure_tokens[index] = Some(token.clone());
+        println!(
+            "armed fragment executor failure for cross-process BE[{index}] trigger={} token={token}",
+            trigger_path.display(),
+        );
+        Ok(())
+    }
+
+    fn disarm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let trigger_path = &self.fragment_failure_trigger_paths[index];
+        match fs::remove_file(trigger_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "disarm fragment executor failure for cross-process BE[{index}] at {}",
+                        trigger_path.display()
+                    )
+                });
+            }
+        }
+        self.fragment_failure_tokens[index] = None;
+        Ok(())
+    }
+
+    fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
+        self.ensure_be_index(index)?;
+        Ok(self.fragment_failure_tokens[index].clone())
+    }
+
+    fn assert_be_log(&self, index: usize, needle: &str) -> Result<()> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index].assert_log_contains(needle)
+    }
+
+    fn be_log_count(&self, index: usize, needle: &str) -> Result<usize> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index].log_count(needle)
+    }
+
+    fn be_log_contents(&self, index: usize) -> Result<String> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index].log_contents()
     }
 
     fn kill_be(&mut self, index: usize) -> Result<()> {
@@ -801,7 +1010,11 @@ impl ServerHandle for CrossProcessServerHandle {
             })?
             .clone();
         let marker = "NOVAROCKS_READY role=be";
-        let command = build_novarocks_command(&self.novarocks_bin, "be", &config_path);
+        let mut command = build_novarocks_command(&self.novarocks_bin, "be", &config_path);
+        command.env(
+            "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
+            &self.fragment_failure_trigger_paths[index],
+        );
         let log_path = self.runtime_dir.join(format!("be_{index}.log"));
         let be_process = self
             .be_processes
@@ -910,10 +1123,18 @@ fn spawn_novarocks_process(
     config_path: &Path,
     marker: &str,
     log_path: PathBuf,
+    fragment_failure_trigger: Option<&Path>,
 ) -> Result<ManagedProcess> {
+    let mut command = build_novarocks_command(binary, role, config_path);
+    if let Some(trigger_path) = fragment_failure_trigger {
+        command.env(
+            "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
+            trigger_path,
+        );
+    }
     let result = ManagedProcess::spawn(
         "novarocks".to_string(),
-        build_novarocks_command(binary, role, config_path),
+        command,
         ReadyMarker::StdoutContains(marker.to_string()),
         startup_timeout(),
         log_path,
@@ -922,6 +1143,52 @@ fn spawn_novarocks_process(
         Ok(process) => Ok(process),
         Err(error) => Err(map_novarocks_process_error(binary, role, marker, error)),
     }
+}
+
+fn next_fragment_failure_token(index: usize) -> String {
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{index}-{nanos}-{sequence}", std::process::id())
+}
+
+fn publish_fragment_failure_token(trigger_path: &Path, token: &str) -> Result<()> {
+    let staging_path = trigger_path.with_extension(format!("arming-{token}"));
+    let mut staging = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging_path)
+        .with_context(|| {
+            format!(
+                "create fragment executor failure staging file {}",
+                staging_path.display()
+            )
+        })?;
+    if let Err(error) = staging.write_all(token.as_bytes()) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error).with_context(|| {
+            format!(
+                "write fragment executor failure token to staging file {}",
+                staging_path.display()
+            )
+        });
+    }
+    drop(staging);
+
+    if let Err(error) = fs::hard_link(&staging_path, trigger_path) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error).with_context(|| {
+            format!(
+                "publish fragment executor failure trigger {}",
+                trigger_path.display()
+            )
+        });
+    }
+    let _ = fs::remove_file(staging_path);
+    Ok(())
 }
 
 fn map_novarocks_process_error(
@@ -1068,7 +1335,25 @@ mod tests {
             grpc_port,
             state: state.to_string(),
             alive,
+            scheduled_fragments: 0,
         }
+    }
+
+    #[test]
+    fn frontend_five_column_show_backends_derives_alive_from_state() {
+        let row = parse_frontend_show_backends_values(&[
+            "0".to_string(),
+            "127.0.0.1".to_string(),
+            "19070".to_string(),
+            "Live".to_string(),
+            "41".to_string(),
+        ])
+        .expect("parse frontend SHOW BACKENDS row");
+
+        assert_eq!(row.grpc_port, 19070);
+        assert_eq!(row.state, "Live");
+        assert!(row.alive);
+        assert_eq!(row.scheduled_fragments, 41);
     }
 
     #[test]
@@ -1160,7 +1445,10 @@ mod tests {
         .expect_err("incomplete topology must time out");
 
         let message = format!("{err:#}");
-        assert!(message.contains("timed out waiting for SHOW BACKENDS 3/3 Live"), "{message}");
+        assert!(
+            message.contains("timed out waiting for SHOW BACKENDS 3/3 Live"),
+            "{message}"
+        );
         assert!(message.contains("registered=1 expected=3"), "{message}");
         assert!(message.contains("fe_pid=11"), "{message}");
         assert!(message.contains("be_pids=[21,22,23]"), "{message}");
@@ -1189,7 +1477,10 @@ mod tests {
 
         assert_eq!(queries, 0, "SHOW BACKENDS must not run after process exit");
         let message = format!("{err:#}");
-        assert!(message.contains("FE exited status=exit status: 9"), "{message}");
+        assert!(
+            message.contains("FE exited status=exit status: 9"),
+            "{message}"
+        );
         assert!(message.contains("config=/tmp/fe.toml"), "{message}");
         assert!(message.contains("stderr_tail=fatal"), "{message}");
     }
@@ -1215,9 +1506,15 @@ mod tests {
         )
         .expect_err("timeout must refresh process health after the bounded query");
 
-        assert_eq!(health_checks, 2, "health must be sampled before and after query");
+        assert_eq!(
+            health_checks, 2,
+            "health must be sampled before and after query"
+        );
         let message = format!("{err:#}");
-        assert!(message.contains("FE exited post-query status=exit status: 7"), "{message}");
+        assert!(
+            message.contains("FE exited post-query status=exit status: 7"),
+            "{message}"
+        );
         assert!(message.contains("post-query-fatal"), "{message}");
     }
 
@@ -1323,20 +1620,10 @@ exec_node_output = true
     fn render_cross_process_config_patches_fe_and_be_independently() {
         let runtime = make_runtime_1be();
 
-        let fe = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-        )
-        .expect("render fe config");
-        let be = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-        )
-        .expect("render be config");
+        let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
@@ -1431,20 +1718,10 @@ exec_node_output = true
     fn render_cross_process_config_does_not_add_runtime_selector() {
         let runtime = make_runtime_1be();
 
-        let fe = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-        )
-        .expect("render fe config");
-        let be = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-        )
-        .expect("render be config");
+        let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
@@ -1465,31 +1742,25 @@ exec_node_output = true
         let retired_key = ["plan", "wire", "format"].join("_");
         let base_config = format!("{}\n[runtime]\n{retired_key} = \"thrift\"\n", BASE_CONFIG);
 
-        let fe = render_cross_process_config(
-            &base_config,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-        )
-        .expect("render fe config");
-        let be = render_cross_process_config(
-            &base_config,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-        )
-        .expect("render be config");
+        let fe = render_cross_process_config(&base_config, ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config(&base_config, ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
 
         assert_eq!(
-            fe_value["runtime"].get(&retired_key).and_then(Value::as_str),
+            fe_value["runtime"]
+                .get(&retired_key)
+                .and_then(Value::as_str),
             Some("thrift"),
             "renderer must leave retired base keys for the product loader to reject"
         );
         assert_eq!(
-            be_value["runtime"].get(&retired_key).and_then(Value::as_str),
+            be_value["runtime"]
+                .get(&retired_key)
+                .and_then(Value::as_str),
             Some("thrift"),
             "renderer must leave retired base keys for the product loader to reject"
         );
@@ -1534,13 +1805,9 @@ exec_node_output = true
         );
 
         // Every other section must be untouched relative to a normal render.
-        let plain_fe = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-        )
-        .expect("render plain fe config");
+        let plain_fe =
+            render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
+                .expect("render plain fe config");
         let plain_fe_value: toml::Value = plain_fe.parse().expect("parse plain fe toml");
 
         assert_eq!(fe_value["server"], plain_fe_value["server"]);
@@ -1572,6 +1839,65 @@ exec_node_output = true
         assert_eq!(
             be_value["metadata"]["path"].as_str(),
             Some("/new/empty.sqlite")
+        );
+    }
+
+    #[test]
+    fn ordinary_cross_process_launches_do_not_share_persisted_backend_rows() {
+        let runtime = make_runtime_1be();
+        let first_runtime = Path::new("/tmp/novarocks-cross-process-run-a");
+        let second_runtime = Path::new("/tmp/novarocks-cross-process-run-b");
+
+        let first = render_cross_process_launch_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            first_runtime,
+            CrossProcessMetadataMode::Isolated,
+        )
+        .unwrap()
+        .parse::<Value>()
+        .unwrap();
+        let second = render_cross_process_launch_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            second_runtime,
+            CrossProcessMetadataMode::Isolated,
+        )
+        .unwrap()
+        .parse::<Value>()
+        .unwrap();
+
+        assert_eq!(
+            first["metadata"]["path"].as_str(),
+            first_runtime.join("metadata.sqlite").to_str()
+        );
+        assert_eq!(
+            second["metadata"]["path"].as_str(),
+            second_runtime.join("metadata.sqlite").to_str()
+        );
+        assert_ne!(
+            first["metadata"]["path"], second["metadata"]["path"],
+            "ephemeral clusters must not restore stale backend rows from another launch"
+        );
+
+        let inherited = render_cross_process_launch_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            first_runtime,
+            CrossProcessMetadataMode::InheritBase,
+        )
+        .unwrap()
+        .parse::<Value>()
+        .unwrap();
+        assert_eq!(
+            inherited["metadata"]["path"],
+            BASE_CONFIG.parse::<Value>().unwrap()["metadata"]["path"]
         );
     }
 
@@ -1615,20 +1941,10 @@ exec_node_output = true
     fn render_cross_process_config_empty_base_patches_fe_heartbeat_only() {
         let runtime = make_runtime_1be();
 
-        let fe = render_cross_process_config(
-            "",
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-        )
-        .expect("render fe config");
-        let be = render_cross_process_config(
-            "",
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-        )
-        .expect("render be config");
+        let fe = render_cross_process_config("", ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config("", ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
@@ -1667,13 +1983,8 @@ exec_node_output = true
     fn render_cross_process_config_2be_fe_has_both_backends() {
         let runtime = make_runtime_2be();
 
-        let fe = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-        )
-        .expect("render fe config");
+        let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
 
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
@@ -1697,20 +2008,10 @@ exec_node_output = true
     fn render_cross_process_config_2be_each_be_has_own_ports() {
         let runtime = make_runtime_2be();
 
-        let be0 = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-        )
-        .expect("render be0 config");
-        let be1 = render_cross_process_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Be,
-            1,
-            &runtime,
-        )
-        .expect("render be1 config");
+        let be0 = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be0 config");
+        let be1 = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 1, &runtime)
+            .expect("render be1 config");
 
         let be0_value: toml::Value = be0.parse().expect("parse be0 toml");
         let be1_value: toml::Value = be1.parse().expect("parse be1 toml");
@@ -1857,5 +2158,41 @@ exec_node_output = true
         );
 
         fs::remove_dir_all(&dir).expect("cleanup runtime dir");
+    }
+
+    #[test]
+    fn fragment_failure_token_publish_is_complete_and_does_not_clobber_an_existing_arm() {
+        let repo_root = std::env::current_dir().expect("current dir");
+        let runtime_root = repo_root.join("tests/sql-test-runner/.test-runtime");
+        fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let dir = runtime_root.join(format!(
+            "fragment_failure_publish_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create fragment failure test dir");
+        let trigger = dir.join("be_1.fragment_failure_trigger");
+
+        publish_fragment_failure_token(&trigger, "step-token-17")
+            .expect("publish complete fragment failure token");
+        assert_eq!(
+            fs::read_to_string(&trigger).expect("read published trigger"),
+            "step-token-17"
+        );
+
+        let error = publish_fragment_failure_token(&trigger, "replacement-token")
+            .expect_err("a second arm must not replace the active trigger");
+        assert!(
+            format!("{error:#}").contains("publish fragment executor failure trigger"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&trigger).expect("read original trigger"),
+            "step-token-17"
+        );
+        fs::remove_dir_all(dir).expect("cleanup fragment failure test dir");
     }
 }

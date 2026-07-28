@@ -86,6 +86,8 @@ pub struct QueryMeta {
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
     pub kill_be_index: Option<usize>,
+    pub kill_be_after_fragment_start: Option<usize>,
+    pub fail_fragment_after_start_be_index: Option<usize>,
     pub network_partition_be: Option<usize>,
     pub heartbeat_delay_ms: Option<u64>,
     pub restart_be_delay_ms: Option<u64>,
@@ -115,16 +117,25 @@ pub struct QueryMeta {
     pub be_log_count_at_least: Vec<(String, usize)>,
     /// Require a substring to appear in at least this many distinct BE logs.
     pub be_log_be_count_at_least: Vec<(String, usize)>,
+    /// Prove exact accepted/cancelled fragment identity equality for the injected query.
+    ///
+    /// The value is the exact number of runner-owned BE logs that must contribute
+    /// at least one accepted fragment for that query.
+    pub be_log_exact_fragment_cancellation: Option<usize>,
     /// Run a fresh external BRPC negative compatibility fixture after the SQL step.
     pub compat_probes: Vec<String>,
 }
 
 impl QueryMeta {
-    pub fn has_compat_directives(&self) -> bool {
+    pub fn has_be_log_directives(&self) -> bool {
         !self.be_log_contains.is_empty()
             || !self.be_log_count_at_least.is_empty()
             || !self.be_log_be_count_at_least.is_empty()
-            || !self.compat_probes.is_empty()
+            || self.be_log_exact_fragment_cancellation.is_some()
+    }
+
+    pub fn has_compat_directives(&self) -> bool {
+        self.has_be_log_directives() || !self.compat_probes.is_empty()
     }
 }
 
