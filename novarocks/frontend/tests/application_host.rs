@@ -24,7 +24,8 @@ use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::{FrontendApplicationErrorKind, FrontendApplicationHost};
 use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
 use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+    SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig,
 };
 use sqlparser::ast::{Query, Statement};
 use sqlparser::parser::Parser;
@@ -94,17 +95,20 @@ fn parse_query(sql: &str) -> Box<Query> {
     }
 }
 
-fn sqlite_config(temp: &TempDir) -> StateStoreAppConfig {
-    StateStoreAppConfig {
-        store: StateStoreConfig {
-            cluster_id: "frontend-cluster".to_owned(),
-            limits: StateStoreLimitOverrides::default(),
-            provider: StateStoreProviderConfig::Sqlite {
-                path: temp.path().join("state-store.sqlite"),
-                deployment_owner: "frontend-fe".to_owned(),
+fn sqlite_config(temp: &TempDir) -> StateStoreHostConfig {
+    StateStoreHostConfig {
+        state_store: StateStoreAppConfig {
+            store: StateStoreConfig {
+                cluster_id: "frontend-cluster".to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Sqlite {
+                    path: temp.path().join("state-store.sqlite"),
+                    deployment_owner: "frontend-fe".to_owned(),
+                },
             },
+            mysql_client: None,
         },
-        mysql_client: None,
+        foundationdb_client: None,
     }
 }
 
@@ -115,6 +119,7 @@ async fn absent_config_opens_disabled_host() {
         .expect("absent state store configuration must open a disabled host");
 
     assert!(host.state_store().is_none());
+    assert_eq!(host.state_store_provider_id(), None);
     assert!(
         host.view_service()
             .try_handle_statement(
@@ -139,10 +144,15 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
     let store = host
         .state_store()
         .expect("configured SQLite host must expose its state store");
+    assert_eq!(
+        host.state_store_provider_id(),
+        Some(SQLITE_STATE_STORE_PROVIDER_ID)
+    );
     assert!(
         store.identity().await.is_ok(),
         "single-FE deployment view must allow SQLite store access"
     );
+    drop(store);
 
     host.shutdown()
         .await
@@ -151,26 +161,32 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_provider_fails_before_store_open() {
-    let mysql_config = StateStoreAppConfig {
-        store: StateStoreConfig {
-            cluster_id: "frontend-cluster".to_owned(),
-            limits: StateStoreLimitOverrides::default(),
-            provider: StateStoreProviderConfig::Mysql {
-                database: "frontend_control_plane".to_owned(),
+    let mysql_config = StateStoreHostConfig {
+        state_store: StateStoreAppConfig {
+            store: StateStoreConfig {
+                cluster_id: "frontend-cluster".to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Mysql {
+                    database: "frontend_control_plane".to_owned(),
+                },
             },
+            mysql_client: None,
         },
-        mysql_client: None,
+        foundationdb_client: None,
     };
-    let foundationdb_config = StateStoreAppConfig {
-        store: StateStoreConfig {
-            cluster_id: "frontend-cluster".to_owned(),
-            limits: StateStoreLimitOverrides::default(),
-            provider: StateStoreProviderConfig::Foundationdb {
-                cluster_file: "/definitely/not/an/fdb/cluster-file".into(),
-                keyspace_id: Uuid::nil(),
+    let foundationdb_config = StateStoreHostConfig {
+        state_store: StateStoreAppConfig {
+            store: StateStoreConfig {
+                cluster_id: "frontend-cluster".to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Foundationdb {
+                    cluster_file: "/definitely/not/an/fdb/cluster-file".into(),
+                    keyspace_id: Uuid::nil(),
+                },
             },
+            mysql_client: None,
         },
-        mysql_client: None,
+        foundationdb_client: None,
     };
 
     for config in [mysql_config, foundationdb_config] {
@@ -190,23 +206,26 @@ async fn failed_open_releases_partial_resources() {
     let non_directory_parent = temp.path().join("not-a-directory");
     std::fs::write(&non_directory_parent, b"not a directory")
         .expect("create regular file for SQLite parent failure");
-    let config = StateStoreAppConfig {
-        store: StateStoreConfig {
-            cluster_id: "frontend-cluster".to_owned(),
-            limits: StateStoreLimitOverrides::default(),
-            provider: StateStoreProviderConfig::Sqlite {
-                path: non_directory_parent.join("state-store.sqlite"),
-                deployment_owner: "frontend-fe".to_owned(),
+    let config = StateStoreHostConfig {
+        state_store: StateStoreAppConfig {
+            store: StateStoreConfig {
+                cluster_id: "frontend-cluster".to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Sqlite {
+                    path: non_directory_parent.join("state-store.sqlite"),
+                    deployment_owner: "frontend-fe".to_owned(),
+                },
             },
+            mysql_client: None,
         },
-        mysql_client: None,
+        foundationdb_client: None,
     };
 
     let error = match FrontendApplicationHost::open(Some(config.clone())).await {
         Ok(_) => panic!("unopenable SQLite path must fail host initialization"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::StoreOpen);
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::StateStoreHost);
 
     let host = FrontendApplicationHost::open(Some(sqlite_config(&temp)))
         .await
@@ -248,7 +267,7 @@ async fn shutdown_is_required_to_reopen_same_deployment() {
         Ok(_) => panic!("second live SQLite host must be rejected"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::StoreOpen);
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::StateStoreHost);
 
     host.shutdown()
         .await

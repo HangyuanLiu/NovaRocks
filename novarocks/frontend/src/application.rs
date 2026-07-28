@@ -17,18 +17,24 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use novarocks_spi::state_store::{StateStore, StateStoreError};
-use novarocks_state_store::{StateStoreAppConfig, StateStoreRuntime, open_state_store};
+use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
+use novarocks_state_store::{
+    StateStoreHost, StateStoreHostConfig, StateStoreHostError,
+    builtin_state_store_provider_registry,
+};
 
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::view::FrontendViewService;
 
+const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
-    RuntimeOpen,
-    StoreOpen,
+    StateStoreHost,
     ViewServiceOpen,
     Server,
     Shutdown,
@@ -73,18 +79,16 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
-    state_store: Option<Arc<dyn StateStore>>,
-    runtime: Option<StateStoreRuntime>,
+    state_store_host: Option<StateStoreHost>,
 }
 
 impl FrontendApplicationHost {
     pub async fn open(
-        config: Option<StateStoreAppConfig>,
+        config: Option<StateStoreHostConfig>,
     ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
             view_service: None,
-            state_store: None,
-            runtime: None,
+            state_store_host: None,
         };
 
         if let Some(config) = config {
@@ -92,8 +96,7 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
-        match FrontendViewService::open(host.state_store.clone(), tokio::runtime::Handle::current())
-            .await
+        match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
         {
             Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
             Err(error) => {
@@ -117,7 +120,15 @@ impl FrontendApplicationHost {
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
-        self.state_store.clone()
+        self.state_store_host
+            .as_ref()
+            .and_then(StateStoreHost::state_store)
+    }
+
+    pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
+        self.state_store_host
+            .as_ref()
+            .map(StateStoreHost::provider_id)
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
@@ -128,29 +139,35 @@ impl FrontendApplicationHost {
 
     async fn open_configured(
         &mut self,
-        config: StateStoreAppConfig,
+        config: StateStoreHostConfig,
     ) -> Result<(), FrontendApplicationError> {
-        let source = SqliteSingleFeDeploymentViewSource::try_from_state_store_config(&config.store)
-            .map_err(|error| {
-                FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
-            })?;
+        let source = SqliteSingleFeDeploymentViewSource::try_from_state_store_config(
+            &config.state_store.store,
+        )
+        .map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
+        })?;
         let deployment = source.snapshot().await.map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
         })?;
-
-        self.runtime = Some(StateStoreRuntime::local().map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::RuntimeOpen, error)
-        })?);
-        let runtime = self
-            .runtime
-            .as_ref()
-            .expect("runtime is installed before store open");
-        self.state_store = Some(
-            open_state_store(runtime, config.store, deployment)
-                .await
-                .map_err(|error| {
-                    FrontendApplicationError::new(FrontendApplicationErrorKind::StoreOpen, error)
-                })?,
+        let deployment = novarocks_state_store::FeDeploymentView {
+            active_fe_count: deployment.active_fe_count,
+            topology_revision: deployment.topology_revision,
+        };
+        let registry = builtin_state_store_provider_registry().map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, error)
+        })?;
+        self.state_store_host = Some(
+            StateStoreHost::open(
+                &registry,
+                config,
+                deployment,
+                Instant::now() + STATE_STORE_OPEN_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, error)
+            })?,
         );
 
         Ok(())
@@ -166,11 +183,13 @@ impl FrontendApplicationHost {
         }
     }
 
-    async fn release_resources(&mut self) -> Result<(), StateStoreError> {
+    async fn release_resources(&mut self) -> Result<(), StateStoreHostError> {
         self.view_service.take();
-        self.state_store.take();
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.shutdown().await
+        if let Some(host) = self.state_store_host.as_mut() {
+            host.shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+                .await?;
+            self.state_store_host.take();
+            Ok(())
         } else {
             Ok(())
         }

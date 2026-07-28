@@ -17,12 +17,14 @@
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks::common::app_config::NovaRocksConfig;
-use novarocks_spi::state_store::StateStoreErrorKind;
 use novarocks_state_store::{
-    FeDeploymentView, MySqlTlsMode, StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, FeDeploymentView, MySqlTlsMode, StateStoreHost,
+    StateStoreHostConfig, StateStoreHostErrorKind, StateStoreProviderConfig,
+    builtin_state_store_provider_registry,
 };
 use uuid::Uuid;
 
@@ -413,14 +415,18 @@ disable_multi_version_client = true
     .expect("write config");
     let loaded = NovaRocksConfig::load_from_file(config_path.path())
         .expect("load FoundationDB config from TOML");
-    let runtime = StateStoreRuntime::local().expect("create feature-off local runtime");
-    let error = match open_state_store(
-        &runtime,
-        loaded.state_store.expect("state store config").store,
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    let error = match StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: loaded.state_store.expect("state store config"),
+            foundationdb_client: loaded.foundationdb_client,
+        },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
             topology_revision: Bytes::from_static(b"topology-r1"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
     {
@@ -428,9 +434,9 @@ disable_multi_version_client = true
         Err(error) => error,
     };
 
-    assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert_eq!(error.kind(), StateStoreHostErrorKind::ProviderNotCompiled);
     assert_eq!(
-        error.to_string(),
-        "InvalidConfiguration: FoundationDB provider is not compiled in"
+        error.provider_id(),
+        Some(FOUNDATIONDB_STATE_STORE_PROVIDER_ID)
     );
 }
