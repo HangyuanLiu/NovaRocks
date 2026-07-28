@@ -10,6 +10,7 @@ provenance:
   - "discussion: 2026-07-28 table maintenance ownership extraction"
 code-anchors:
   - "novarocks/core/src/engine/table_maintenance.rs (TableMaintenanceEngine, TableMaintenanceService)"
+  - "novarocks/frontend/src/table_maintenance/mod.rs (FrontendTableMaintenanceService)"
 ---
 
 ## 问题

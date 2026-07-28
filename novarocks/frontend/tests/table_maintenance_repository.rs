@@ -17,8 +17,8 @@
 
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,8 +28,8 @@ use novarocks_frontend::table_maintenance::repository::{
     OptimizeJobRepository, RepositoryErrorKind,
 };
 use novarocks_spi::state_store::{
-    ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange,
-    Precondition, RangePage, RangeRequest, ReadTransaction, StateStore, StateStoreError,
+    ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction, Key,
+    KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateStore, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
     Value, WriteTransaction,
 };
@@ -361,6 +361,74 @@ async fn restart_reconcile_fails_running_jobs_and_leaves_pending_jobs_claimable(
 }
 
 #[tokio::test]
+async fn restart_reconcile_finishes_running_job_with_durable_outcome_and_clears_indexes() {
+    let temp = TempDir::new().expect("create temp directory");
+    let path = temp.path().join("state.sqlite");
+    let store = open_sqlite(&path).await;
+    let repository = OptimizeJobRepository::open(Arc::clone(&store))
+        .await
+        .expect("open optimize job repository");
+    let created = repository
+        .create(create_request(
+            "ice",
+            "db",
+            "finished-after-restart",
+            10,
+            100,
+        ))
+        .await
+        .expect("create optimize job");
+    repository
+        .claim(created.job_id, 200)
+        .await
+        .expect("claim optimize job")
+        .expect("pending job is claimable");
+    let expected_outcome = outcome(11);
+    repository
+        .record_outcome(created.job_id, expected_outcome.clone())
+        .await
+        .expect("persist optimize outcome before restart");
+    assert!(raw_key_exists(store.as_ref(), &raw_key("state/running/0000000000000001")).await);
+    assert!(raw_key_exists(store.as_ref(), &active_key(&created.target)).await);
+    drop(repository);
+    drop(store);
+
+    let restarted_store = open_sqlite(&path).await;
+    let restarted = OptimizeJobRepository::open(Arc::clone(&restarted_store))
+        .await
+        .expect("reopen optimize job repository");
+    assert_eq!(
+        restarted.reconcile_startup(300).await.unwrap(),
+        1,
+        "one durable running job must be reconciled"
+    );
+
+    let finished = restarted.list().await.unwrap().remove(0);
+    assert_eq!(finished.state, OptimizeJobState::Finished);
+    assert_eq!(finished.outcome, Some(expected_outcome));
+    assert_eq!(finished.finished_at_ms, Some(300));
+    assert_eq!(finished.error_message, None);
+    assert!(
+        !raw_key_exists(
+            restarted_store.as_ref(),
+            &raw_key("state/running/0000000000000001")
+        )
+        .await
+    );
+    assert!(!raw_key_exists(restarted_store.as_ref(), &active_key(&created.target)).await);
+    restarted
+        .create(create_request(
+            "ice",
+            "db",
+            "finished-after-restart",
+            11,
+            301,
+        ))
+        .await
+        .expect("reconciled target may be optimized again");
+}
+
+#[tokio::test]
 async fn encoded_target_keys_do_not_collide_for_slashes_spaces_or_non_ascii() {
     let (_temp, _store, repository) = fixture().await;
     let first = repository
@@ -376,10 +444,21 @@ async fn encoded_target_keys_do_not_collide_for_slashes_spaces_or_non_ascii() {
     assert_eq!(repository.list().await.unwrap(), vec![first, second]);
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ScriptedCommitResolution {
+    Committed,
+    NotCommitted,
+    Unresolved,
+}
+
 struct CommitUnknownStore {
     inner: Arc<dyn StateStore>,
     apply_before_unknown: bool,
+    resolution: ScriptedCommitResolution,
     begin_write_count: Arc<AtomicUsize>,
+    committed_receipt: Arc<Mutex<Option<CommitReceipt>>>,
+    started_transaction_ids: Arc<Mutex<Vec<TransactionId>>>,
+    resolved_transaction_ids: Arc<Mutex<Vec<TransactionId>>>,
     recovery_gate: Option<Arc<RecoveryGate>>,
 }
 
@@ -410,9 +489,14 @@ impl StateStore for CommitUnknownStore {
         purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
         self.begin_write_count.fetch_add(1, Ordering::SeqCst);
+        self.started_transaction_ids
+            .lock()
+            .expect("started transaction ids lock")
+            .push(transaction_id);
         Ok(Box::new(CommitUnknownTransaction {
             inner: self.inner.begin_write(transaction_id, purpose).await?,
             apply_before_unknown: self.apply_before_unknown,
+            committed_receipt: Arc::clone(&self.committed_receipt),
             recovery_gate: self.recovery_gate.clone(),
         }))
     }
@@ -432,13 +516,28 @@ impl StateStore for CommitUnknownStore {
         &self,
         transaction_id: &TransactionId,
     ) -> Result<CommitResolution, StateStoreError> {
-        self.inner.resolve_commit(transaction_id).await
+        self.resolved_transaction_ids
+            .lock()
+            .expect("resolved transaction ids lock")
+            .push(*transaction_id);
+        match self.resolution {
+            ScriptedCommitResolution::Committed => Ok(CommitResolution::Committed(
+                self.committed_receipt
+                    .lock()
+                    .expect("committed receipt lock")
+                    .clone()
+                    .expect("scripted committed transaction receipt"),
+            )),
+            ScriptedCommitResolution::NotCommitted => Ok(CommitResolution::NotCommitted),
+            ScriptedCommitResolution::Unresolved => Ok(CommitResolution::Unresolved),
+        }
     }
 }
 
 struct CommitUnknownTransaction {
     inner: Box<dyn WriteTransaction>,
     apply_before_unknown: bool,
+    committed_receipt: Arc<Mutex<Option<CommitReceipt>>>,
     recovery_gate: Option<Arc<RecoveryGate>>,
 }
 
@@ -485,10 +584,13 @@ impl WriteTransaction for CommitUnknownTransaction {
 
     async fn commit(self: Box<Self>) -> CommitOutcome {
         if self.apply_before_unknown {
-            assert!(matches!(
-                self.inner.commit().await,
-                CommitOutcome::Committed(_)
-            ));
+            let CommitOutcome::Committed(receipt) = self.inner.commit().await else {
+                panic!("scripted inner commit must succeed");
+            };
+            *self
+                .committed_receipt
+                .lock()
+                .expect("committed receipt lock") = Some(receipt);
             if let Some(gate) = &self.recovery_gate {
                 gate.arm();
             }
@@ -528,55 +630,145 @@ impl RecoveryGate {
     }
 }
 
-#[tokio::test]
-async fn commit_unknown_uses_authoritative_operation_marker_without_blind_retry() {
-    let committed_temp = TempDir::new().unwrap();
-    let committed_inner = open_sqlite(&committed_temp.path().join("state.sqlite")).await;
-    let committed_writes = Arc::new(AtomicUsize::new(0));
-    let committed_store: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
-        inner: committed_inner,
-        apply_before_unknown: true,
-        begin_write_count: Arc::clone(&committed_writes),
+struct CommitUnknownFixture {
+    repository: OptimizeJobRepository,
+    store: Arc<dyn StateStore>,
+    begin_write_count: Arc<AtomicUsize>,
+    started_transaction_ids: Arc<Mutex<Vec<TransactionId>>>,
+    resolved_transaction_ids: Arc<Mutex<Vec<TransactionId>>>,
+}
+
+async fn commit_unknown_fixture(
+    resolution: ScriptedCommitResolution,
+    apply_before_unknown: bool,
+) -> (TempDir, CommitUnknownFixture) {
+    let temp = TempDir::new().unwrap();
+    let inner = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let begin_write_count = Arc::new(AtomicUsize::new(0));
+    let started_transaction_ids = Arc::new(Mutex::new(Vec::new()));
+    let resolved_transaction_ids = Arc::new(Mutex::new(Vec::new()));
+    let store: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
+        inner,
+        apply_before_unknown,
+        resolution,
+        begin_write_count: Arc::clone(&begin_write_count),
+        committed_receipt: Arc::new(Mutex::new(None)),
+        started_transaction_ids: Arc::clone(&started_transaction_ids),
+        resolved_transaction_ids: Arc::clone(&resolved_transaction_ids),
         recovery_gate: None,
     });
-    let committed = OptimizeJobRepository::open(Arc::clone(&committed_store))
+    let repository = OptimizeJobRepository::open(Arc::clone(&store))
         .await
         .unwrap();
-    let created = committed
+    (
+        temp,
+        CommitUnknownFixture {
+            repository,
+            store,
+            begin_write_count,
+            started_transaction_ids,
+            resolved_transaction_ids,
+        },
+    )
+}
+
+fn assert_single_transaction_was_resolved(fixture: &CommitUnknownFixture) -> TransactionId {
+    assert_eq!(fixture.begin_write_count.load(Ordering::SeqCst), 1);
+    let started = fixture
+        .started_transaction_ids
+        .lock()
+        .expect("started transaction ids lock");
+    let resolved = fixture
+        .resolved_transaction_ids
+        .lock()
+        .expect("resolved transaction ids lock");
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        *resolved, *started,
+        "commit recovery must resolve the exact attempted transaction"
+    );
+    started[0]
+}
+
+#[tokio::test]
+async fn commit_unknown_committed_resolution_recovers_without_blind_retry() {
+    let (_temp, fixture) = commit_unknown_fixture(ScriptedCommitResolution::Committed, true).await;
+    let created = fixture
+        .repository
         .create(create_request("ice", "db", "t", 10, 100))
         .await
-        .expect("authoritative marker proves commit");
+        .expect("authoritative commit resolution proves commit");
     assert_eq!(created.job_id, 1);
-    assert_eq!(committed.list().await.unwrap().len(), 1);
-    assert_eq!(committed_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.repository.list().await.unwrap().len(), 1);
     assert_eq!(
-        raw_prefix_count(committed_store.as_ref(), "operations/").await,
+        raw_prefix_count(fixture.store.as_ref(), "operations/").await,
         1
     );
+    assert_single_transaction_was_resolved(&fixture);
+}
 
-    let unresolved_temp = TempDir::new().unwrap();
-    let unresolved_inner = open_sqlite(&unresolved_temp.path().join("state.sqlite")).await;
-    let unresolved_writes = Arc::new(AtomicUsize::new(0));
-    let unresolved_store: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
-        inner: unresolved_inner,
-        apply_before_unknown: false,
-        begin_write_count: Arc::clone(&unresolved_writes),
-        recovery_gate: None,
-    });
-    let unresolved = OptimizeJobRepository::open(Arc::clone(&unresolved_store))
+#[tokio::test]
+async fn commit_unknown_not_committed_resolution_returns_definite_failure_without_retry() {
+    let (_temp, fixture) =
+        commit_unknown_fixture(ScriptedCommitResolution::NotCommitted, false).await;
+    let error = fixture
+        .repository
+        .create(create_request("ice", "db", "t", 10, 100))
         .await
-        .unwrap();
-    let error = unresolved
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::Store);
+    assert!(error.to_string().contains("not committed"));
+    assert!(fixture.repository.list().await.unwrap().is_empty());
+    assert_eq!(
+        raw_prefix_count(fixture.store.as_ref(), "operations/").await,
+        0
+    );
+    let transaction_id = assert_single_transaction_was_resolved(&fixture);
+    assert!(
+        error
+            .to_string()
+            .contains(&transaction_id.as_uuid().to_string())
+    );
+}
+
+#[tokio::test]
+async fn commit_unknown_unresolved_resolution_uses_marker_as_supplementary_evidence() {
+    let (_temp, fixture) = commit_unknown_fixture(ScriptedCommitResolution::Unresolved, true).await;
+    let created = fixture
+        .repository
+        .create(create_request("ice", "db", "t", 10, 100))
+        .await
+        .expect("atomic operation marker supplements unresolved commit resolution");
+    assert_eq!(created.job_id, 1);
+    assert_eq!(fixture.repository.list().await.unwrap().len(), 1);
+    assert_eq!(
+        raw_prefix_count(fixture.store.as_ref(), "operations/").await,
+        1
+    );
+    assert_single_transaction_was_resolved(&fixture);
+}
+
+#[tokio::test]
+async fn commit_unknown_unresolved_resolution_without_marker_remains_uncertain() {
+    let (_temp, fixture) =
+        commit_unknown_fixture(ScriptedCommitResolution::Unresolved, false).await;
+    let error = fixture
+        .repository
         .create(create_request("ice", "db", "t", 10, 100))
         .await
         .unwrap_err();
     assert_eq!(error.kind(), RepositoryErrorKind::CommitUnknown);
     assert!(error.to_string().contains("unresolved"));
-    assert!(unresolved.list().await.unwrap().is_empty());
-    assert_eq!(unresolved_writes.load(Ordering::SeqCst), 1);
+    assert!(fixture.repository.list().await.unwrap().is_empty());
     assert_eq!(
-        raw_prefix_count(unresolved_store.as_ref(), "operations/").await,
+        raw_prefix_count(fixture.store.as_ref(), "operations/").await,
         0
+    );
+    let transaction_id = assert_single_transaction_was_resolved(&fixture);
+    assert!(
+        error
+            .to_string()
+            .contains(&transaction_id.as_uuid().to_string())
     );
 }
 
@@ -597,7 +789,11 @@ async fn commit_unknown_recovery_accepts_legal_successor_without_mutation_retry(
     let recovering_store: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
         inner: Arc::clone(&inner),
         apply_before_unknown: true,
+        resolution: ScriptedCommitResolution::Committed,
         begin_write_count: Arc::clone(&recovering_writes),
+        committed_receipt: Arc::new(Mutex::new(None)),
+        started_transaction_ids: Arc::new(Mutex::new(Vec::new())),
+        resolved_transaction_ids: Arc::new(Mutex::new(Vec::new())),
         recovery_gate: Some(Arc::clone(&recovery_gate)),
     });
     let recovering = OptimizeJobRepository::open(recovering_store).await.unwrap();

@@ -22,8 +22,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
 use novarocks_spi::state_store::{
-    Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, StateStoreError,
-    StateStoreErrorKind, Value, VersionToken, WriteTransaction,
+    CommitResolution, Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord,
+    StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
+    WriteTransaction,
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
@@ -138,8 +139,12 @@ impl OptimizeJobRepository {
 
         match result {
             Ok(success) => success.value,
-            Err(RunFailure::CommitUnknown { error, .. }) => {
-                self.recover_operation(
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                self.resolve_commit_unknown(
+                    transaction_id,
                     operation_id,
                     StoredOptimizeOperationActionV1::Create,
                     None,
@@ -222,9 +227,13 @@ impl OptimizeJobRepository {
 
         match result {
             Ok(success) => success.value,
-            Err(RunFailure::CommitUnknown { error, .. }) => {
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
                 let recovered = self
-                    .recover_operation(
+                    .resolve_commit_unknown(
+                        transaction_id,
                         operation_id,
                         StoredOptimizeOperationActionV1::Claim,
                         Some(job_id),
@@ -333,12 +342,16 @@ impl OptimizeJobRepository {
             .await?;
         let mut reconciled = 0;
         for job in running {
-            self.fail(
-                job.job_id,
-                now_ms,
-                "optimize job failed during frontend restart reconciliation".to_string(),
-            )
-            .await?;
+            if job.outcome.is_some() {
+                self.finish(job.job_id, now_ms).await?;
+            } else {
+                self.fail(
+                    job.job_id,
+                    now_ms,
+                    "optimize job failed during frontend restart reconciliation".to_string(),
+                )
+                .await?;
+            }
             reconciled += 1;
         }
         Ok(reconciled)
@@ -438,8 +451,12 @@ impl OptimizeJobRepository {
     ) -> RepositoryResult<()> {
         match result {
             Ok(success) => success.value,
-            Err(RunFailure::CommitUnknown { error, .. }) => {
-                self.recover_operation(
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                self.resolve_commit_unknown(
+                    transaction_id,
                     operation_id,
                     action,
                     Some(job_id),
@@ -456,8 +473,62 @@ impl OptimizeJobRepository {
         }
     }
 
+    async fn resolve_commit_unknown(
+        &self,
+        transaction_id: TransactionId,
+        operation_id: OperationId,
+        expected_action: StoredOptimizeOperationActionV1,
+        expected_job_id: Option<i64>,
+        context: &str,
+        commit_error: StateStoreError,
+    ) -> RepositoryResult<OptimizeJob> {
+        let resolution = self
+            .store
+            .resolve_commit(&transaction_id)
+            .await
+            .map_err(|error| {
+                commit_unknown_error(
+                    context,
+                    transaction_id,
+                    &commit_error,
+                    &format!("commit resolution failed: {error}"),
+                )
+            })?;
+        let certainty = match resolution {
+            CommitResolution::Committed(receipt) => {
+                if receipt.transaction_id != transaction_id {
+                    return Err(RepositoryError::corruption(format!(
+                        "{context} commit resolution returned receipt for transaction {}, expected {}",
+                        receipt.transaction_id.as_uuid(),
+                        transaction_id.as_uuid()
+                    )));
+                }
+                CommitCertainty::Committed
+            }
+            CommitResolution::NotCommitted => {
+                return Err(RepositoryError::store(format!(
+                    "{context} transaction {} was not committed after commit-unknown: {commit_error}",
+                    transaction_id.as_uuid()
+                )));
+            }
+            CommitResolution::Unresolved => CommitCertainty::Unresolved,
+        };
+        self.recover_operation(
+            transaction_id,
+            certainty,
+            operation_id,
+            expected_action,
+            expected_job_id,
+            context,
+            commit_error,
+        )
+        .await
+    }
+
     async fn recover_operation(
         &self,
+        transaction_id: TransactionId,
+        certainty: CommitCertainty,
         operation_id: OperationId,
         expected_action: StoredOptimizeOperationActionV1,
         expected_job_id: Option<i64>,
@@ -466,32 +537,45 @@ impl OptimizeJobRepository {
     ) -> RepositoryResult<OptimizeJob> {
         let key = operation_key(operation_id)?;
         let mut transaction = self.store.begin_read().await.map_err(|error| {
-            commit_unknown_error(
+            commit_recovery_error(
+                certainty,
                 context,
+                transaction_id,
                 &commit_error,
                 &format!("authoritative read begin failed: {error}"),
             )
         })?;
         let operation_record = transaction.get(&key).await.map_err(|error| {
-            commit_unknown_error(
+            commit_recovery_error(
+                certainty,
                 context,
+                transaction_id,
                 &commit_error,
                 &format!("authoritative operation read failed: {error}"),
             )
         })?;
         let Some(operation_record) = operation_record else {
             transaction.abort().await.map_err(|error| {
-                commit_unknown_error(
+                commit_recovery_error(
+                    certainty,
                     context,
+                    transaction_id,
                     &commit_error,
                     &format!("authoritative read finish failed: {error}"),
                 )
             })?;
-            return Err(commit_unknown_error(
-                context,
-                &commit_error,
-                "operation marker is absent",
-            ));
+            return Err(match certainty {
+                CommitCertainty::Committed => RepositoryError::corruption(format!(
+                    "{context} transaction {} is committed but its atomic operation marker is absent",
+                    transaction_id.as_uuid()
+                )),
+                CommitCertainty::Unresolved => commit_unknown_error(
+                    context,
+                    transaction_id,
+                    &commit_error,
+                    "operation marker is absent",
+                ),
+            });
         };
         let marker_context = format!(
             "{context} authoritative operation {} ({expected_action:?})",
@@ -514,8 +598,10 @@ impl OptimizeJobRepository {
         let current = load_job_from_transaction(transaction.as_mut(), marker.job_id)
             .await
             .map_err(|error| {
-                commit_unknown_error(
+                commit_recovery_error(
+                    certainty,
                     context,
+                    transaction_id,
                     &commit_error,
                     &format!("authoritative job read failed: {error}"),
                 )
@@ -528,8 +614,10 @@ impl OptimizeJobRepository {
             })?
             .stored;
         transaction.abort().await.map_err(|error| {
-            commit_unknown_error(
+            commit_recovery_error(
+                certainty,
                 context,
+                transaction_id,
                 &commit_error,
                 &format!("authoritative read finish failed: {error}"),
             )
@@ -538,6 +626,12 @@ impl OptimizeJobRepository {
             .map_err(|error| error.with_context(&marker_context))?;
         Ok(OptimizeJob::from(&marker.post_job))
     }
+}
+
+#[derive(Clone, Copy)]
+enum CommitCertainty {
+    Committed,
+    Unresolved,
 }
 
 struct VersionedStoredJob {
@@ -1326,15 +1420,35 @@ fn target_context(target: &MaintenanceTarget) -> String {
 
 fn commit_unknown_error(
     context: &str,
+    transaction_id: TransactionId,
     commit_error: &StateStoreError,
     reason: &str,
 ) -> RepositoryError {
     RepositoryError::new(
         RepositoryErrorKind::CommitUnknown,
         format!(
-            "{context} commit outcome is unresolved: {commit_error}; authoritative reread: {reason}"
+            "{context} transaction {} commit outcome is unresolved: {commit_error}; authoritative reread: {reason}",
+            transaction_id.as_uuid()
         ),
     )
+}
+
+fn commit_recovery_error(
+    certainty: CommitCertainty,
+    context: &str,
+    transaction_id: TransactionId,
+    commit_error: &StateStoreError,
+    reason: &str,
+) -> RepositoryError {
+    match certainty {
+        CommitCertainty::Committed => RepositoryError::store(format!(
+            "{context} transaction {} is committed but its result could not be read: {reason}",
+            transaction_id.as_uuid()
+        )),
+        CommitCertainty::Unresolved => {
+            commit_unknown_error(context, transaction_id, commit_error, reason)
+        }
+    }
 }
 
 fn format_run_failure(context: &str, failure: RunFailure) -> RepositoryError {

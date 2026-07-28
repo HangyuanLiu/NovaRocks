@@ -55,7 +55,7 @@ enum WorkerLifecycle {
     Stopped(Result<(), String>),
 }
 
-// Design: ADR-0009
+// Design: ADR-0009 (docs/adr/ADR-0009-frontend-table-maintenance-owner.md)
 pub struct FrontendTableMaintenanceService {
     repository: Option<Arc<OptimizeJobRepository>>,
     worker: Mutex<WorkerLifecycle>,
