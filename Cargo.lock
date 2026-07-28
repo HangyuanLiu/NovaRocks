@@ -3317,6 +3317,7 @@ dependencies = [
  "novarocks-frontend",
  "reqwest",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 

@@ -43,7 +43,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 | --- | --- | --- |
 | `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | `[standalone_server].mysql_port`；同时使用 `[server].grpc_port` 提供 coordinator report gRPC |
 | `be` | 执行 FE 下发的 fragment，处理 exchange 和结果回传 | `[server].grpc_port` |
-| `all-in-one` | 默认单进程模式，适合 standalone 单机部署 | `[standalone_server].mysql_port` |
+| `all-in-one` | 默认单进程模式，适合 standalone 单机部署；进程内仍由独立 FE/BE application host 通过 NovaRocksGrpc 通信，不走 direct-call shortcut | `[standalone_server].mysql_port`；`[server].grpc_port` |
 
 ## 前提条件
 

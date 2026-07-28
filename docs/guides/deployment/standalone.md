@@ -101,7 +101,7 @@ enable_path_style_access = true
 说明：
 
 - `mysql_port` 是客户端连接 NovaRocks 的端口。
-- `[server].grpc_port` 是 standalone 进程内部 NovaRocksGrpc 端口，用于本地多 fragment exchange、写入状态上报、metrics 和 load 相关 HTTP 路由。默认值为 `9080`。
+- `[server].grpc_port` 是 NovaRocksGrpc 端口。`role=be` 和 `role=all-in-one` 由 BE host 提供完整 fragment/exchange 服务；`role=fe` 只提供 coordinator report 服务。`all-in-one` 仍通过该 gRPC 边界调度本机 BE，不使用 direct-call shortcut。默认值为 `9080`。
 - `user` 当前只支持 `root`。
 - `[metadata].path` 用于保存 standalone catalog、managed-lake 和部分管理状态。
 - `warehouse_uri` 是 managed-lake 表和写入数据的默认仓库路径。

@@ -28,12 +28,35 @@ use crate::{FrontendApplicationError, FrontendApplicationHost};
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontendGrpcEndpointOwnership {
+    HostedReportOnly,
+    ExternallyHosted,
+}
+
+impl FrontendGrpcEndpointOwnership {
+    pub const fn hosts_report_endpoint(self) -> bool {
+        matches!(self, Self::HostedReportOnly)
+    }
+
+    const fn core_ownership(self) -> novarocks::server::StandaloneGrpcEndpointOwnership {
+        match self {
+            Self::HostedReportOnly => {
+                novarocks::server::StandaloneGrpcEndpointOwnership::HostedReportOnly
+            }
+            Self::ExternallyHosted => {
+                novarocks::server::StandaloneGrpcEndpointOwnership::ExternallyHosted
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FrontendServerConfig {
     pub config: NovaRocksConfig,
     pub config_path: Option<PathBuf>,
     pub port_override: Option<u16>,
-    pub local_exchange: bool,
+    pub grpc_endpoint: FrontendGrpcEndpointOwnership,
 }
 
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
@@ -72,7 +95,7 @@ where
                 config.config,
                 config.config_path,
                 config.port_override,
-                config.local_exchange,
+                config.grpc_endpoint.core_ownership(),
                 system_catalog,
                 view_service,
                 shutdown,
@@ -107,7 +130,7 @@ where
                 config.config,
                 config.config_path,
                 config.port_override,
-                config.local_exchange,
+                config.grpc_endpoint.core_ownership(),
                 system_catalog,
                 view_service,
                 shutdown,
@@ -290,8 +313,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown,
-        run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
+        FrontendGrpcEndpointOwnership, FrontendServerConfig, run_frontend_server,
+        run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
+        run_frontend_server_with_signal_and_ports,
     };
     use crate::{FrontendApplicationError, FrontendApplicationErrorKind};
 
@@ -318,8 +342,14 @@ mod tests {
             config: novarocks::common::app_config::NovaRocksConfig::default(),
             config_path: None,
             port_override: None,
-            local_exchange: false,
+            grpc_endpoint: FrontendGrpcEndpointOwnership::HostedReportOnly,
         }
+    }
+
+    #[test]
+    fn frontend_endpoint_ownership_has_no_full_execution_state() {
+        assert!(FrontendGrpcEndpointOwnership::HostedReportOnly.hosts_report_endpoint());
+        assert!(!FrontendGrpcEndpointOwnership::ExternallyHosted.hosts_report_endpoint());
     }
 
     #[test]
