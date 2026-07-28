@@ -53,6 +53,9 @@ pub struct OperationFact {
 pub struct WriteTransactionSpec {
     pub target: OperationTarget,
     pub operation_kind: OperationKind,
+    /// Iceberg commit operation used to decide whether fileless output is a
+    /// genuine append no-op or must still be committed.
+    pub commit_op_kind: CommitOpKind,
     pub attempt_id: String,
     pub base_snapshot_id: Option<i64>,
     pub base_snapshot_map: BTreeMap<String, i64>,

@@ -77,8 +77,8 @@ mod tests {
     use super::DmlService;
     use crate::dml::journal::testing::InMemoryOperationJournal;
     use crate::dml::model::{
-        CommitOutcome, CommitServiceError, OperationKind, OperationState, OperationTarget,
-        WriteTransactionSpec,
+        CommitOpKind, CommitOutcome, CommitServiceError, OperationKind, OperationState,
+        OperationTarget, WriteTransactionSpec,
     };
     use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
 
@@ -119,6 +119,7 @@ mod tests {
                 ref_name: None,
             },
             operation_kind: OperationKind::InsertAppend,
+            commit_op_kind: CommitOpKind::FastAppend,
             attempt_id: "a".to_string(),
             base_snapshot_id: None,
             base_snapshot_map: BTreeMap::new(),

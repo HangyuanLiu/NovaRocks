@@ -18,8 +18,8 @@
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
-    CleanupAttempt, CommitOutcome, CommitServiceError, CreatePreparingRequest, OperationState,
-    WriteTransactionOutcome, WriteTransactionSpec,
+    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
+    OperationFact, OperationState, WriteTransactionOutcome, WriteTransactionSpec,
 };
 use crate::dml::now_unix_millis;
 use crate::dml::reconcile;
@@ -31,8 +31,9 @@ use crate::dml::reconcile;
 pub enum CoordinatedWriteReport<H> {
     /// Writer aborted before commit; `has_staged` drives cleanup next-action.
     Aborted { reason: String, has_staged: bool },
-    /// Nothing to commit (append no-op). Runner records Aborting -> Aborted.
-    NoOp,
+    /// Fileless writer output. Fast append may short-circuit; other commit
+    /// operations still pass the handle to `commit`.
+    NoOp(H),
     /// Committable output; the handle is passed back to `commit`.
     Committable(H),
 }
@@ -146,7 +147,9 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                     "iceberg write operation {operation_id} aborted before commit: {reason}"
                 )));
             }
-            CoordinatedWriteReport::NoOp => {
+            CoordinatedWriteReport::NoOp(_)
+                if matches!(spec.commit_op_kind, CommitOpKind::FastAppend) =>
+            {
                 self.journal
                     .transition(operation_id, OperationState::Aborting)?;
                 self.journal
@@ -156,6 +159,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                     committed_snapshot_id: None,
                 });
             }
+            CoordinatedWriteReport::NoOp(handle) => handle,
             CoordinatedWriteReport::Committable(handle) => handle,
         };
 
@@ -193,10 +197,25 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                 }
             }
             Err(commit_error) => {
-                self.journal.record_fact(
-                    operation_id,
-                    reconcile::operation_fact_from_commit_result(Err(&commit_error)),
-                )?;
+                let fact = reconcile::operation_fact_from_commit_result(Err(&commit_error));
+                if matches!(
+                    commit_error,
+                    CommitServiceError::FinalizeFailedKnownCommitted { .. }
+                ) {
+                    self.journal.record_fact(
+                        operation_id,
+                        OperationFact {
+                            state: OperationState::Committed,
+                            commit_outcome: fact.commit_outcome.clone(),
+                            cleanup_outcome: None,
+                            recovery_evidence: None,
+                            failure: None,
+                        },
+                    )?;
+                    self.journal
+                        .transition(operation_id, OperationState::Finalizing)?;
+                }
+                self.journal.record_fact(operation_id, fact)?;
                 Err(DmlError::commit(commit_error.message().to_string()))
             }
         }
@@ -210,7 +229,9 @@ mod tests {
     use super::*;
     use crate::dml::error::DmlErrorKind;
     use crate::dml::journal::testing::InMemoryOperationJournal;
-    use crate::dml::model::{CommitOpKind, OperationKind, OperationTarget, RecoveryEvidence};
+    use crate::dml::model::{
+        CommitOpKind, OperationKind, OperationTarget, RecoveryEvidence, StoredOperation,
+    };
 
     struct FakeExecutor {
         write: Result<CoordinatedWriteReport<()>, String>,
@@ -254,6 +275,36 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailCommittedFactJournal {
+        inner: InMemoryOperationJournal,
+    }
+
+    impl OperationJournal for FailCommittedFactJournal {
+        fn create_preparing(&self, request: CreatePreparingRequest) -> Result<i64, DmlError> {
+            self.inner.create_preparing(request)
+        }
+
+        fn transition(&self, operation_id: i64, to: OperationState) -> Result<(), DmlError> {
+            self.inner.transition(operation_id, to)
+        }
+
+        fn record_fact(&self, operation_id: i64, fact: OperationFact) -> Result<(), DmlError> {
+            if fact.state == OperationState::Committed {
+                return Err(DmlError::journal("committed fact persistence failed"));
+            }
+            self.inner.record_fact(operation_id, fact)
+        }
+
+        fn load(&self, operation_id: i64) -> Result<Option<StoredOperation>, DmlError> {
+            self.inner.load(operation_id)
+        }
+
+        fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {
+            self.inner.list_unfinished()
+        }
+    }
+
     struct DenyAdmission;
     impl WriteAdmission for DenyAdmission {
         fn admit(&self) -> Result<(), DmlError> {
@@ -270,6 +321,7 @@ mod tests {
                 ref_name: None,
             },
             operation_kind: OperationKind::InsertAppend,
+            commit_op_kind: CommitOpKind::FastAppend,
             attempt_id: "attempt-1".to_string(),
             base_snapshot_id: None,
             base_snapshot_map: BTreeMap::new(),
@@ -313,10 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_write_aborts_as_noop() {
+    fn empty_fast_append_aborts_as_noop() {
         let journal = InMemoryOperationJournal::default();
         let executor = FakeExecutor {
-            write: Ok(CoordinatedWriteReport::NoOp),
+            write: Ok(CoordinatedWriteReport::NoOp(())),
             ..FakeExecutor::default()
         };
         let admit = AlwaysAdmit;
@@ -327,6 +379,28 @@ mod tests {
         assert_eq!(
             journal.load(1).unwrap().unwrap().state,
             OperationState::Aborted
+        );
+    }
+
+    #[test]
+    fn fileless_overwrite_still_commits() {
+        let journal = InMemoryOperationJournal::default();
+        let executor = FakeExecutor {
+            write: Ok(CoordinatedWriteReport::NoOp(())),
+            ..FakeExecutor::default()
+        };
+        let admit = AlwaysAdmit;
+        let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
+        let mut overwrite = spec();
+        overwrite.operation_kind = OperationKind::InsertOverwrite;
+        overwrite.commit_op_kind = CommitOpKind::Overwrite;
+
+        let outcome = runner.run(overwrite).unwrap();
+        assert_eq!(outcome.operation_id, Some(1));
+        assert_eq!(outcome.committed_snapshot_id, Some(42));
+        assert_eq!(
+            journal.load(1).unwrap().unwrap().state,
+            OperationState::Finalized
         );
     }
 
@@ -412,6 +486,36 @@ mod tests {
         assert_eq!(
             journal.load(1).unwrap().unwrap().state,
             OperationState::FailedKnownUncommitted
+        );
+    }
+
+    #[test]
+    fn journal_error_precedes_known_committed_commit_error() {
+        let journal = FailCommittedFactJournal::default();
+        let executor = FakeExecutor {
+            commit: Err(CommitServiceError::finalize_failed_known_committed(
+                Some(CommitOutcome {
+                    new_snapshot_id: 42,
+                    written_manifest_paths: vec![],
+                }),
+                "finalize failed".to_string(),
+                evidence(),
+            )),
+            ..FakeExecutor::default()
+        };
+        let admit = AlwaysAdmit;
+        let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
+
+        let error = runner.run(spec()).unwrap_err();
+        assert_eq!(error.kind(), DmlErrorKind::Journal);
+        assert!(
+            error
+                .to_string()
+                .contains("committed fact persistence failed")
+        );
+        assert_eq!(
+            journal.load(1).unwrap().unwrap().state,
+            OperationState::Committing
         );
     }
 

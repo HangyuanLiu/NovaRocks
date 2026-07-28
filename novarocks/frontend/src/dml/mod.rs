@@ -30,10 +30,6 @@ pub mod reconcile;
 pub mod runner;
 pub mod service;
 
-// The curated `pub use` surface below is built up incrementally as each
-// submodule's items land (Tasks 1-7). Until then, lines that reference
-// not-yet-implemented items stay commented out so the module tree keeps
-// compiling after every task's commit.
 pub use error::{DmlError, DmlErrorKind};
 pub use journal::{MetaStoreOperationJournal, OperationJournal};
 pub use model::{

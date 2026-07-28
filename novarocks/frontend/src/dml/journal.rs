@@ -285,7 +285,7 @@ mod meta_store_tests {
     use novarocks::meta::SqliteMetaStoreProvider;
 
     use super::*;
-    use crate::dml::model::{OperationKind, OperationTarget};
+    use crate::dml::model::{CleanupAttempt, CommitServiceError, OperationKind, OperationTarget};
 
     fn request() -> CreatePreparingRequest {
         CreatePreparingRequest {
@@ -332,5 +332,100 @@ mod meta_store_tests {
         let stored = journal.load(id).unwrap().unwrap();
         assert_eq!(stored.state, OperationState::Committed);
         assert_eq!(stored.commit_outcome.unwrap().snapshot_id, 100);
+    }
+
+    fn create_committing(journal: &MetaStoreOperationJournal) -> i64 {
+        let id = journal.create_preparing(request()).unwrap();
+        journal.transition(id, OperationState::Committing).unwrap();
+        id
+    }
+
+    fn known_uncommitted_fact(
+        message: &str,
+        cleanup: CleanupAttempt,
+    ) -> crate::dml::model::OperationFact {
+        crate::dml::reconcile::operation_fact_from_commit_result(Err(
+            &CommitServiceError::known_uncommitted(message.to_string(), cleanup),
+        ))
+    }
+
+    #[test]
+    fn identical_fact_replay_succeeds_over_real_sqlite_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider: Arc<dyn MetaStoreProvider> = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite")).expect("provider"),
+        );
+        let journal = MetaStoreOperationJournal::new(provider);
+        let id = create_committing(&journal);
+        let fact = known_uncommitted_fact("conflict", CleanupAttempt::not_attempted());
+
+        journal.record_fact(id, fact.clone()).unwrap();
+        journal.record_fact(id, fact).unwrap();
+
+        let stored = journal.load(id).unwrap().unwrap();
+        assert_eq!(stored.state, OperationState::FailedKnownUncommitted);
+        assert!(!stored.cleanup_outcome.unwrap().attempted);
+    }
+
+    #[test]
+    fn cleanup_fact_refinement_succeeds_over_real_sqlite_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider: Arc<dyn MetaStoreProvider> = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite")).expect("provider"),
+        );
+        let journal = MetaStoreOperationJournal::new(provider);
+        let id = create_committing(&journal);
+
+        journal
+            .record_fact(
+                id,
+                known_uncommitted_fact("conflict", CleanupAttempt::not_attempted()),
+            )
+            .unwrap();
+        journal
+            .record_fact(
+                id,
+                known_uncommitted_fact("conflict", CleanupAttempt::completed(Vec::new())),
+            )
+            .unwrap();
+
+        let stored = journal.load(id).unwrap().unwrap();
+        let cleanup = stored.cleanup_outcome.unwrap();
+        assert!(cleanup.attempted);
+        assert_eq!(cleanup.error_count, 0);
+        assert_eq!(
+            stored.failure.unwrap().next_action,
+            crate::dml::model::IcebergOperationNextAction::None
+        );
+    }
+
+    #[test]
+    fn conflicting_fact_replay_fails_over_real_sqlite_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider: Arc<dyn MetaStoreProvider> = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite")).expect("provider"),
+        );
+        let journal = MetaStoreOperationJournal::new(provider);
+        let id = create_committing(&journal);
+
+        journal
+            .record_fact(
+                id,
+                known_uncommitted_fact("conflict", CleanupAttempt::not_attempted()),
+            )
+            .unwrap();
+        let error = journal
+            .record_fact(
+                id,
+                known_uncommitted_fact("different conflict", CleanupAttempt::not_attempted()),
+            )
+            .expect_err("conflicting replay must be rejected");
+
+        assert_eq!(error.kind(), crate::dml::error::DmlErrorKind::Journal);
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting Iceberg operation fact replay")
+        );
     }
 }
