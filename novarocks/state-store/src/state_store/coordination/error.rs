@@ -137,7 +137,7 @@ impl CoordinationError {
         self.transaction_id
     }
 
-    pub(crate) const fn from_state_store(error: StateStoreError) -> Self {
+    pub(crate) fn from_state_store(error: StateStoreError) -> Self {
         let kind = match error.kind() {
             StateStoreErrorKind::InvalidRequest | StateStoreErrorKind::InvalidConfiguration => {
                 CoordinationErrorKind::InvalidRequest

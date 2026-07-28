@@ -19,6 +19,7 @@ mod contract;
 mod error;
 mod limits;
 mod metrics;
+mod provider;
 mod range;
 
 #[cfg(feature = "state-store-conformance")]
@@ -37,5 +38,10 @@ pub use limits::{
 pub use metrics::{
     STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetricsSnapshot,
     StateStoreOperation, StateStoreOutcome,
+};
+pub use provider::{
+    FeDeploymentView, StateStoreOpenRequest, StateStoreProviderDescriptor,
+    StateStoreProviderFactory, StateStoreProviderId, StateStoreProviderIdError,
+    StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};

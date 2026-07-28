@@ -37,21 +37,39 @@ pub enum StateStoreErrorKind {
 pub struct StateStoreError {
     kind: StateStoreErrorKind,
     message: &'static str,
+    cleanup: Option<Box<StateStoreError>>,
 }
 
 impl StateStoreError {
     pub const fn new(kind: StateStoreErrorKind, message: &'static str) -> Self {
-        Self { kind, message }
+        Self {
+            kind,
+            message,
+            cleanup: None,
+        }
     }
 
     pub const fn kind(&self) -> StateStoreErrorKind {
         self.kind
     }
+
+    pub fn with_cleanup_context(mut self, cleanup: StateStoreError) -> Self {
+        self.cleanup = Some(Box::new(cleanup));
+        self
+    }
+
+    pub fn cleanup_context(&self) -> Option<&StateStoreError> {
+        self.cleanup.as_deref()
+    }
 }
 
 impl fmt::Display for StateStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}: {}", self.kind, self.message)
+        write!(formatter, "{:?}: {}", self.kind, self.message)?;
+        if let Some(cleanup) = &self.cleanup {
+            write!(formatter, "; cleanup failed: {cleanup}")?;
+        }
+        Ok(())
     }
 }
 
