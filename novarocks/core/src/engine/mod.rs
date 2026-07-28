@@ -76,7 +76,7 @@ pub(crate) mod mv_scheduler;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
-pub(crate) mod statistics;
+pub mod statistics;
 pub mod system_catalog;
 pub mod view;
 pub(crate) mod virtual_table;
@@ -345,7 +345,7 @@ pub(crate) struct StandaloneState {
     pub(crate) catalog_service: Arc<StandaloneCatalogService>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
-    pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
+    pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
     pub(crate) mv_refresh_pruning_limits: MvRefreshPruningLimits,
@@ -378,7 +378,7 @@ impl Default for StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
-            statistics: RwLock::new(statistics::StandaloneStatistics::default()),
+            statistics_service: Arc::new(statistics::EmptyStatisticsService),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             starrocks_table_config: None,
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
@@ -460,6 +460,7 @@ impl StandaloneNovaRocks {
             opts,
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
+            std::sync::Arc::new(statistics::EmptyStatisticsService),
             _test_guard,
         );
         #[cfg(not(test))]
@@ -467,6 +468,7 @@ impl StandaloneNovaRocks {
             opts,
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
+            std::sync::Arc::new(statistics::EmptyStatisticsService),
         )
     }
 
@@ -481,6 +483,7 @@ impl StandaloneNovaRocks {
         cfg: novarocks_config::NovaRocksConfig,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+        statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -488,9 +491,15 @@ impl StandaloneNovaRocks {
         crate::coordinator::cluster::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
-        return Self::open_body(opts, system_catalog, view_service, _test_guard);
+        return Self::open_body(
+            opts,
+            system_catalog,
+            view_service,
+            statistics_service,
+            _test_guard,
+        );
         #[cfg(not(test))]
-        Self::open_body(opts, system_catalog, view_service)
+        Self::open_body(opts, system_catalog, view_service, statistics_service)
     }
 
     /// Common engine-open body.  Called after the process-wide config has
@@ -499,6 +508,7 @@ impl StandaloneNovaRocks {
         opts: StandaloneOptions,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+        statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -556,6 +566,7 @@ impl StandaloneNovaRocks {
             exchange_port,
             system_catalog,
             view_service,
+            statistics_service,
             #[cfg(test)]
             _test_guard,
             ..Default::default()
@@ -772,13 +783,20 @@ impl StandaloneSession {
                 }
             });
         }
-        if let Some(result) = self::statistics::try_handle_statement(
+        if let Some(result) = self.inner.statistics_service.try_handle_statement(
             &self.inner,
             &normalized,
-            current_catalog,
-            current_database,
+            statistics::StatisticsRequestContext {
+                current_catalog,
+                current_database,
+            },
         )? {
-            return Ok(result);
+            return Ok(match result {
+                statistics::StatisticsStatementResult::Ok => StatementResult::Ok,
+                statistics::StatisticsStatementResult::Query(result) => {
+                    StatementResult::Query(result)
+                }
+            });
         }
         if let Some((target, source)) = parse_create_table_like(&normalized)? {
             return self.handle_create_table_like(
@@ -1088,9 +1106,14 @@ impl StandaloneSession {
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Query(ref query) => {
-                if let Some(result) =
-                    self::statistics::try_query(&self.inner, &normalized, query, current_database)?
-                {
+                if let Some(result) = self.inner.statistics_service.try_query(
+                    &normalized,
+                    query,
+                    statistics::StatisticsRequestContext {
+                        current_catalog,
+                        current_database,
+                    },
+                )? {
                     return Ok(StatementResult::Query(result));
                 }
                 if let Some(result) =
@@ -1149,7 +1172,9 @@ impl StandaloneSession {
                     &connectors_snapshot,
                     TableLookupMode::SchemaOnly,
                 );
-                self::statistics::observe_query(&self.inner, &prepared, current_database)?;
+                self.inner
+                    .statistics_service
+                    .observe_query(&prepared, current_database)?;
                 let result = execute_query_with_catalog_provider(
                     &prepared,
                     &analyzer_provider,
@@ -1190,7 +1215,9 @@ impl StandaloneSession {
                     current_catalog,
                     current_database,
                 )?;
-                self::statistics::observe_update(&self.inner, &normalized, current_database)?;
+                self.inner
+                    .statistics_service
+                    .observe_update(&normalized, current_database)?;
                 Ok(result)
             }
             ref merge_stmt @ sqlast::Statement::Merge(_) => {
@@ -1749,7 +1776,7 @@ impl StandaloneSession {
                     self.inner
                         .view_service
                         .drop_database("default_catalog", &database)?;
-                    self::statistics::drop_database(&self.inner, &database);
+                    self.inner.statistics_service.drop_database(&database);
                     return Ok(StatementResult::Ok);
                 }
                 let target = crate::engine::backend_resolver::resolve_namespace_target(
@@ -1767,7 +1794,9 @@ impl StandaloneSession {
                 self.inner
                     .view_service
                     .drop_database(&target.catalog, &target.namespace)?;
-                self::statistics::drop_database(&self.inner, &target.namespace);
+                self.inner
+                    .statistics_service
+                    .drop_database(&target.namespace);
                 Ok(result)
             }
             DropResult::Table(stmt) => {
@@ -1780,10 +1809,13 @@ impl StandaloneSession {
                     stmt.force,
                 )?;
                 match stmt.name.parts.as_slice() {
-                    [table] => self::statistics::drop_table(&self.inner, current_database, table),
-                    [database, table] => self::statistics::drop_table(&self.inner, database, table),
+                    [table] => self
+                        .inner
+                        .statistics_service
+                        .drop_table(current_database, table),
+                    [database, table] => self.inner.statistics_service.drop_table(database, table),
                     [_, database, table] => {
-                        self::statistics::drop_table(&self.inner, database, table)
+                        self.inner.statistics_service.drop_table(database, table)
                     }
                     _ => {}
                 }
@@ -4242,6 +4274,11 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
+    use crate::engine::statistics::{
+        CatalogColumnStatistics, CatalogTableStatistics, StatisticsEngine,
+        StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
+        StatisticsStatementResult,
+    };
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
@@ -4256,6 +4293,157 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct FixedCatalogStatisticsService {
+        tables: std::collections::HashMap<(String, String), CatalogTableStatistics>,
+    }
+
+    impl StatisticsService for FixedCatalogStatisticsService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _sql: &str,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<StatisticsStatementResult>, String> {
+            Ok(None)
+        }
+
+        fn try_query(
+            &self,
+            _sql: &str,
+            _query: &sqlparser::ast::Query,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<QueryResult>, String> {
+            Ok(None)
+        }
+
+        fn observe_query(
+            &self,
+            _query: &sqlparser::ast::Query,
+            _current_database: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_insert(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _observation: StatisticsInsertObservation<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_update(&self, _sql: &str, _current_database: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_table(&self, _database: &str, _table: &str) {}
+
+        fn drop_database(&self, _database: &str) {}
+
+        fn catalog_table_statistics(
+            &self,
+            database: &str,
+            table: &str,
+        ) -> Result<Option<CatalogTableStatistics>, String> {
+            Ok(self
+                .tables
+                .get(&(database.to_string(), table.to_string()))
+                .cloned())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingStatisticsService {
+        statements: Mutex<Vec<String>>,
+    }
+
+    impl RecordingStatisticsService {
+        fn statements(&self) -> Vec<String> {
+            self.statements
+                .lock()
+                .expect("statistics statements")
+                .clone()
+        }
+    }
+
+    impl StatisticsService for RecordingStatisticsService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            sql: &str,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<StatisticsStatementResult>, String> {
+            if sql.to_ascii_lowercase().starts_with("analyze ") {
+                self.statements
+                    .lock()
+                    .expect("statistics statements")
+                    .push(sql.to_string());
+                return Ok(Some(StatisticsStatementResult::Ok));
+            }
+            Ok(None)
+        }
+
+        fn try_query(
+            &self,
+            _sql: &str,
+            _query: &sqlparser::ast::Query,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<QueryResult>, String> {
+            Ok(None)
+        }
+
+        fn observe_query(
+            &self,
+            _query: &sqlparser::ast::Query,
+            _current_database: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_insert(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _observation: StatisticsInsertObservation<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_update(&self, _sql: &str, _current_database: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_table(&self, _database: &str, _table: &str) {}
+
+        fn drop_database(&self, _database: &str) {}
+
+        fn catalog_table_statistics(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<CatalogTableStatistics>, String> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn open_with_config_uses_injected_statistics_service() {
+        let service = Arc::new(RecordingStatisticsService::default());
+        let engine = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions::default(),
+            crate::common::app_config::NovaRocksConfig::default(),
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
+            Arc::clone(&service) as Arc<dyn StatisticsService>,
+        )
+        .expect("open");
+        engine
+            .session()
+            .execute_in_database("ANALYZE TABLE t1", "db1")
+            .expect("injected service handles statement");
+        assert_eq!(service.statements(), vec!["ANALYZE TABLE t1"]);
+    }
 
     #[test]
     fn standalone_state_default_has_empty_system_catalog() {
@@ -4321,6 +4509,7 @@ mod tests {
             crate::common::app_config::NovaRocksConfig::default(),
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
             Arc::clone(&service) as Arc<dyn ViewService>,
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
         )
         .expect("open engine with recording view service");
         let session = engine.session();
@@ -4452,6 +4641,7 @@ mod tests {
             cfg,
             Arc::new(TestSchemataCatalog),
             Arc::new(crate::engine::view::EmptyViewService),
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
         )
         .expect("open engine with injected system catalog");
 
@@ -4579,6 +4769,7 @@ path = "{metadata_path}"
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
             Arc::new(crate::engine::view::EmptyViewService),
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
         )
         .expect("open FE engine");
         let session = engine.session();
@@ -4616,6 +4807,7 @@ path = "{metadata_path}"
             cfg.clone(),
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
             Arc::new(crate::engine::view::EmptyViewService),
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
         )
         .expect("open FE engine");
         engine
@@ -4629,6 +4821,7 @@ path = "{metadata_path}"
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
             Arc::new(crate::engine::view::EmptyViewService),
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
         )
         .expect("reopen FE engine");
         let result = reopened
@@ -4649,6 +4842,7 @@ path = "{metadata_path}"
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
             Arc::new(crate::engine::view::EmptyViewService),
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
         )
         .expect("open all-in-one engine");
         let session = engine.session();
@@ -5025,6 +5219,7 @@ mysql_port = 47892
             cfg,
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
             Arc::new(crate::engine::view::EmptyViewService),
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
         );
         assert!(
             result.is_ok(),
@@ -5371,23 +5566,35 @@ mysql_port = 47892
                 &mut scalar_arena,
             )
             .expect("logical to opt expr");
-        let stats_state = Arc::new(super::StandaloneState::default());
-        super::statistics::replace_catalog_stats_for_test(
-            &stats_state,
-            "default",
-            "tbl",
-            &[("id", 100_000, "1", "100000", "100000")],
-        )
-        .expect("install tbl stats");
-        super::statistics::replace_catalog_stats_for_test(
-            &stats_state,
-            "default",
-            "date_dim",
-            &[("id", 100, "1", "100", "100")],
-        )
-        .expect("install date_dim stats");
-        let providers =
-            super::query_stats::QueryStatsProviders::from_standalone_state(&stats_state);
+        let service: Arc<dyn StatisticsService> = Arc::new(FixedCatalogStatisticsService {
+            tables: std::collections::HashMap::from([
+                (
+                    ("default".to_string(), "tbl".to_string()),
+                    CatalogTableStatistics {
+                        columns: vec![CatalogColumnStatistics {
+                            column_name: "id".to_string(),
+                            row_count: 100_000,
+                            min: "1".to_string(),
+                            max: "100000".to_string(),
+                            ndv: "100000".to_string(),
+                        }],
+                    },
+                ),
+                (
+                    ("default".to_string(), "date_dim".to_string()),
+                    CatalogTableStatistics {
+                        columns: vec![CatalogColumnStatistics {
+                            column_name: "id".to_string(),
+                            row_count: 100,
+                            min: "1".to_string(),
+                            max: "100".to_string(),
+                            ndv: "100".to_string(),
+                        }],
+                    },
+                ),
+            ]),
+        });
+        let providers = super::query_stats::QueryStatsProviders::from_parts(None, Some(service));
         let query_stats =
             super::query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
         let optimized_tree = crate::sql::optimizer::optimize(

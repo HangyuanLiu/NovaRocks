@@ -21,17 +21,20 @@ use std::sync::Arc;
 use crate::connector::stats::{
     ScanSourceIdentity, TableSnapshotRef, TableStatsProvider, TableStatsRequest,
 };
+use crate::engine::statistics::{CatalogTableStatistics, StatisticsService};
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::statistics::Confidence;
 use crate::sql::optimizer::stats_input::{
-    BaseTableStatistics, QueryStatsSnapshot, StatsMissingReason, StatsRef,
+    BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsMissingReason,
+    StatsRef, StatsSource,
 };
 use crate::sql::planner::table::ScanSource;
 
 #[derive(Clone, Default)]
 pub(crate) struct QueryStatsProviders {
     iceberg: Option<Arc<dyn TableStatsProvider>>,
-    standalone_state: Option<Arc<super::StandaloneState>>,
+    catalog_statistics: Option<Arc<dyn StatisticsService>>,
 }
 
 impl QueryStatsProviders {
@@ -46,18 +49,36 @@ impl QueryStatsProviders {
             .and_then(|source| source.stats_provider());
         Self {
             iceberg,
-            standalone_state: None,
+            catalog_statistics: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        iceberg: Option<Arc<dyn TableStatsProvider>>,
+        catalog_statistics: Option<Arc<dyn StatisticsService>>,
+    ) -> Self {
+        Self {
+            iceberg,
+            catalog_statistics,
         }
     }
 
     pub(crate) fn from_standalone_state(state: &Arc<super::StandaloneState>) -> Self {
-        let connectors = state
-            .connectors
-            .read()
-            .expect("standalone connectors read lock");
-        let mut providers = Self::from_connectors(&connectors);
-        providers.standalone_state = Some(Arc::clone(state));
-        providers
+        let iceberg = {
+            let connectors = state
+                .connectors
+                .read()
+                .expect("standalone connectors read lock");
+            connectors
+                .table_source("iceberg")
+                .ok()
+                .and_then(|source| source.stats_provider())
+        };
+        Self {
+            iceberg,
+            catalog_statistics: Some(Arc::clone(&state.statistics_service)),
+        }
     }
 
     pub(crate) fn from_optional_state(state: Option<&Arc<super::StandaloneState>>) -> Self {
@@ -191,12 +212,11 @@ fn collect_standalone_catalog_stats(
     ) {
         return None;
     }
-    let state = providers.standalone_state.as_ref()?;
-    match crate::engine::statistics::catalog_base_table_statistics(
-        state,
+    let service = providers.catalog_statistics.as_deref()?;
+    match catalog_base_table_statistics(
+        service,
         database,
-        &table_def.name,
-        &table_def.columns,
+        table_def,
         standalone_stats_source(&table_def.source),
     ) {
         Ok(Some(stats)) => Some(stats),
@@ -207,7 +227,96 @@ fn collect_standalone_catalog_stats(
     }
 }
 
-fn standalone_stats_source(source: &ScanSource) -> crate::sql::optimizer::stats_input::StatsSource {
+fn catalog_base_table_statistics(
+    service: &dyn StatisticsService,
+    database: &str,
+    table_def: &crate::sql::planner::table::TableDef,
+    source: StatsSource,
+) -> Result<Option<BaseTableStatistics>, String> {
+    let Some(snapshot) = service.catalog_table_statistics(database, &table_def.name)? else {
+        return Ok(None);
+    };
+    build_base_table_statistics(snapshot, &table_def.columns, source).map(Some)
+}
+
+fn build_base_table_statistics(
+    snapshot: CatalogTableStatistics,
+    columns: &[novarocks_catalog::schema::ColumnDef],
+    source: StatsSource,
+) -> Result<BaseTableStatistics, String> {
+    let row_count = snapshot
+        .columns
+        .iter()
+        .map(|column| column.row_count.max(0) as u64)
+        .max()
+        .unwrap_or(0);
+    let mut base_columns = std::collections::HashMap::new();
+    for column in columns {
+        let column_name = normalize_catalog_name(&column.name)?;
+        let matching = snapshot
+            .columns
+            .iter()
+            .filter(|row| row.column_name.eq_ignore_ascii_case(&column_name));
+        let missing_reason = StatsMissingReason::ColumnNotReported(column_name.clone());
+        let min_value = aggregate_numeric_stat(matching.clone(), |row| &row.min, f64::min)
+            .map(|value| StatValue::known(value, Confidence::Exact, source))
+            .unwrap_or_else(|| StatValue::missing(missing_reason.clone()));
+        let max_value = aggregate_numeric_stat(matching.clone(), |row| &row.max, f64::max)
+            .map(|value| StatValue::known(value, Confidence::Exact, source))
+            .unwrap_or_else(|| StatValue::missing(missing_reason.clone()));
+        let ndv = aggregate_positive_numeric_stat(matching, |row| &row.ndv, f64::max)
+            .map(|value| StatValue::known(value, Confidence::Exact, source))
+            .unwrap_or_else(|| StatValue::missing(missing_reason.clone()));
+        base_columns.insert(
+            column_name,
+            BaseColumnStatistics {
+                nulls_fraction: StatValue::missing(missing_reason.clone()),
+                average_row_size: StatValue::missing(missing_reason.clone()),
+                min_value,
+                max_value,
+                ndv,
+            },
+        );
+    }
+    Ok(BaseTableStatistics {
+        row_count: StatValue::known(row_count, Confidence::Exact, source),
+        columns: base_columns,
+        source,
+    })
+}
+
+fn aggregate_numeric_stat<'a>(
+    rows: impl Iterator<Item = &'a crate::engine::statistics::CatalogColumnStatistics>,
+    value: fn(&crate::engine::statistics::CatalogColumnStatistics) -> &str,
+    combine: fn(f64, f64) -> f64,
+) -> Option<f64> {
+    rows.filter_map(|row| parse_finite_f64(value(row)))
+        .reduce(combine)
+}
+
+fn aggregate_positive_numeric_stat<'a>(
+    rows: impl Iterator<Item = &'a crate::engine::statistics::CatalogColumnStatistics>,
+    value: fn(&crate::engine::statistics::CatalogColumnStatistics) -> &str,
+    combine: fn(f64, f64) -> f64,
+) -> Option<f64> {
+    rows.filter_map(|row| parse_finite_f64(value(row)))
+        .filter(|value| *value > 0.0)
+        .reduce(combine)
+}
+
+fn parse_finite_f64(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn normalize_catalog_name(name: &str) -> Result<String, String> {
+    novarocks_catalog::identifier::normalize_identifier(name.trim().trim_matches('`'))
+}
+
+fn standalone_stats_source(source: &ScanSource) -> StatsSource {
     match source {
         ScanSource::StarRocks { .. } => {
             crate::sql::optimizer::stats_input::StatsSource::StarRocksTableMetadata
@@ -287,6 +396,12 @@ mod tests {
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
     use crate::connector::stats::StatsProviderError;
+    use crate::engine::statistics::{
+        CatalogColumnStatistics, CatalogTableStatistics, StatisticsEngine,
+        StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
+        StatisticsStatementResult,
+    };
+    use crate::runtime::query_result::QueryResult;
     use crate::sql::column_id::ColumnId;
     use crate::sql::column_id::ColumnRefFactory;
     use crate::sql::common::{JoinKind, OutputColumn};
@@ -295,6 +410,184 @@ mod tests {
     use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
     use crate::sql::planner::table::{ScanSource, TableDef};
     use novarocks_catalog::schema::ColumnDef;
+
+    #[derive(Clone)]
+    struct FakeStatisticsService {
+        response: Result<Option<CatalogTableStatistics>, String>,
+    }
+
+    impl FakeStatisticsService {
+        fn with_table(table: CatalogTableStatistics) -> Self {
+            Self {
+                response: Ok(Some(table)),
+            }
+        }
+
+        fn failing(message: &str) -> Self {
+            Self {
+                response: Err(message.to_string()),
+            }
+        }
+    }
+
+    impl StatisticsService for FakeStatisticsService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _sql: &str,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<StatisticsStatementResult>, String> {
+            Ok(None)
+        }
+
+        fn try_query(
+            &self,
+            _sql: &str,
+            _query: &sqlparser::ast::Query,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<QueryResult>, String> {
+            Ok(None)
+        }
+
+        fn observe_query(
+            &self,
+            _query: &sqlparser::ast::Query,
+            _current_database: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_insert(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _observation: StatisticsInsertObservation<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_update(&self, _sql: &str, _current_database: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_table(&self, _database: &str, _table: &str) {}
+
+        fn drop_database(&self, _database: &str) {}
+
+        fn catalog_table_statistics(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<CatalogTableStatistics>, String> {
+            self.response.clone()
+        }
+    }
+
+    #[test]
+    fn catalog_service_stats_flow_through_snapshot_without_state() {
+        let service: Arc<dyn StatisticsService> =
+            Arc::new(FakeStatisticsService::with_table(CatalogTableStatistics {
+                columns: vec![CatalogColumnStatistics {
+                    column_name: "k".to_string(),
+                    row_count: 3,
+                    min: "1".to_string(),
+                    max: "3".to_string(),
+                    ndv: "3".to_string(),
+                }],
+            }));
+        let providers = QueryStatsProviders::from_parts(None, Some(service));
+        let mut opt_expr = test_scan("misleading_sales_fact_dim_lineitem", 1);
+
+        let plan = QueryStatsCollector::new(providers).collect(&mut opt_expr);
+
+        let stats_ref = collect_scan_refs_for_test(&opt_expr)[0].expect("bound stats ref");
+        let stats = plan.snapshot.get(stats_ref).expect("snapshot entry");
+        assert_eq!(stats.row_count.known_value(), Some(&3u64));
+        assert_eq!(stats.columns["k"].ndv.known_value().copied(), Some(3.0));
+    }
+
+    #[test]
+    fn catalog_service_error_becomes_missing_instead_of_query_error() {
+        let service: Arc<dyn StatisticsService> =
+            Arc::new(FakeStatisticsService::failing("catalog stats unavailable"));
+        let providers = QueryStatsProviders::from_parts(None, Some(service));
+        let mut opt_expr = test_scan("t1", 1);
+
+        let plan = QueryStatsCollector::new(providers).collect(&mut opt_expr);
+
+        let stats_ref = collect_scan_refs_for_test(&opt_expr)[0].expect("bound stats ref");
+        let stats = plan.snapshot.get(stats_ref).expect("snapshot entry");
+        assert!(matches!(
+            stats.row_count,
+            StatValue::Missing {
+                reason: StatsMissingReason::CatalogLoadError(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn catalog_service_mapping_preserves_finite_and_positive_ndv_semantics() {
+        let table = CatalogTableStatistics {
+            columns: vec![
+                CatalogColumnStatistics {
+                    column_name: "id".to_string(),
+                    row_count: 3,
+                    min: "1".to_string(),
+                    max: "3".to_string(),
+                    ndv: "3".to_string(),
+                },
+                CatalogColumnStatistics {
+                    column_name: "payload".to_string(),
+                    row_count: 3,
+                    min: "ten".to_string(),
+                    max: "thirty".to_string(),
+                    ndv: String::new(),
+                },
+                CatalogColumnStatistics {
+                    column_name: "zero_ndv".to_string(),
+                    row_count: 0,
+                    min: "-1".to_string(),
+                    max: "0".to_string(),
+                    ndv: "0".to_string(),
+                },
+                CatalogColumnStatistics {
+                    column_name: "negative_ndv".to_string(),
+                    row_count: 0,
+                    min: "-1".to_string(),
+                    max: "0".to_string(),
+                    ndv: "-2".to_string(),
+                },
+            ],
+        };
+        let columns = ["id", "payload", "zero_ndv", "negative_ndv"]
+            .into_iter()
+            .map(|name| ColumnDef {
+                name: name.to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect::<Vec<_>>();
+
+        let stats =
+            build_base_table_statistics(table, &columns, StatsSource::StarRocksTableMetadata)
+                .expect("map catalog statistics");
+
+        assert_eq!(stats.row_count.known_value(), Some(&3));
+        assert_eq!(stats.columns["id"].ndv.known_value().copied(), Some(3.0));
+        assert!(matches!(
+            stats.columns["payload"].min_value,
+            StatValue::Missing { .. }
+        ));
+        assert!(matches!(
+            stats.columns["zero_ndv"].ndv,
+            StatValue::Missing { .. }
+        ));
+        assert!(matches!(
+            stats.columns["negative_ndv"].ndv,
+            StatValue::Missing { .. }
+        ));
+    }
 
     #[test]
     fn collector_binds_each_scan_in_the_same_opt_expr_traversal() {
@@ -372,7 +665,7 @@ mod tests {
         let provider = Arc::new(FailingStatsProvider::default());
         let providers = QueryStatsProviders {
             iceberg: Some(provider.clone()),
-            standalone_state: None,
+            catalog_statistics: None,
         };
         let mut expr = test_iceberg_scan(ScanSource::IcebergDataFiles {
             table: iceberg_info("cat", "db", "tbl"),
@@ -396,17 +689,19 @@ mod tests {
     }
 
     #[test]
-    fn standalone_catalog_stats_flow_through_snapshot_and_optimizer() {
-        let state = Arc::new(crate::engine::StandaloneState::default());
+    fn catalog_service_stats_flow_through_snapshot_and_optimizer() {
         let table_name = "misleading_sales_fact_dim_lineitem";
-        crate::engine::statistics::replace_catalog_stats_for_test(
-            &state,
-            "db",
-            table_name,
-            &[("k", 3, "1", "3", "3")],
-        )
-        .expect("install catalog stats");
-        let providers = QueryStatsProviders::from_standalone_state(&state);
+        let service: Arc<dyn StatisticsService> =
+            Arc::new(FakeStatisticsService::with_table(CatalogTableStatistics {
+                columns: vec![CatalogColumnStatistics {
+                    column_name: "k".to_string(),
+                    row_count: 3,
+                    min: "1".to_string(),
+                    max: "3".to_string(),
+                    ndv: "3".to_string(),
+                }],
+            }));
+        let providers = QueryStatsProviders::from_parts(None, Some(service));
         let mut opt_expr = test_scan(table_name, 1);
 
         let plan = QueryStatsCollector::new(providers).collect(&mut opt_expr);

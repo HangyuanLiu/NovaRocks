@@ -19,6 +19,7 @@ pub mod application;
 pub mod deployment;
 pub mod dml;
 mod server;
+pub mod statistics;
 pub mod system_catalog;
 pub mod view;
 
@@ -29,5 +30,6 @@ pub use server::{
     FrontendGrpcEndpointOwnership, FrontendServerConfig, run_frontend_server,
     run_frontend_server_until_shutdown,
 };
+pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;
 pub use view::FrontendViewService;

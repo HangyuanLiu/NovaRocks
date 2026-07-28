@@ -189,6 +189,7 @@ pub async fn run_standalone_server_with_config_until_shutdown<F>(
     grpc_endpoint: StandaloneGrpcEndpointOwnership,
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
     view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+    statistics_service: std::sync::Arc<dyn crate::engine::statistics::StatisticsService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -201,7 +202,14 @@ where
         grpc_endpoint,
         ..resolved
     };
-    run_with_resolved_options_until_shutdown(resolved, system_catalog, view_service, shutdown).await
+    run_with_resolved_options_until_shutdown(
+        resolved,
+        system_catalog,
+        view_service,
+        statistics_service,
+        shutdown,
+    )
+    .await
 }
 
 /// Run the standalone server for `role=fe`.
@@ -239,6 +247,7 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         resolved,
         std::sync::Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
         std::sync::Arc::new(crate::engine::view::EmptyViewService),
+        std::sync::Arc::new(crate::engine::statistics::EmptyStatisticsService),
         std::future::pending(),
     ))
 }
@@ -247,6 +256,7 @@ async fn run_with_resolved_options_until_shutdown<F>(
     resolved: ResolvedStandaloneServerOptions,
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
     view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+    statistics_service: std::sync::Arc<dyn crate::engine::statistics::StatisticsService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -258,9 +268,13 @@ where
         config_path: resolved.config_path.clone(),
     };
     let engine = match resolved.preloaded_config {
-        Some(cfg) => {
-            StandaloneNovaRocks::open_with_config(opts, cfg, system_catalog, view_service)?
-        }
+        Some(cfg) => StandaloneNovaRocks::open_with_config(
+            opts,
+            cfg,
+            system_catalog,
+            view_service,
+            statistics_service,
+        )?,
         None => StandaloneNovaRocks::open(opts)?,
     };
     let coordinator_handles = (
