@@ -90,7 +90,11 @@ impl StateStoreProviderInstance for SqliteStateStoreProviderInstance {
     }
 
     fn state_store(&self) -> Option<Arc<dyn StateStore>> {
-        self.state_store.clone()
+        if self.lifecycle == StateStoreProviderLifecycle::Ready {
+            self.state_store.clone()
+        } else {
+            None
+        }
     }
 
     async fn shutdown(&mut self, deadline: Instant) -> Result<(), StateStoreError> {
@@ -98,18 +102,22 @@ impl StateStoreProviderInstance for SqliteStateStoreProviderInstance {
             return Ok(());
         }
         self.lifecycle = StateStoreProviderLifecycle::Draining;
-        let Some(store) = self.state_store.take() else {
+        if self.state_store.is_none() {
             self.lifecycle = StateStoreProviderLifecycle::Stopped;
             return Ok(());
-        };
+        }
         loop {
-            if Arc::strong_count(&store) == 1 {
-                drop(store);
+            if Arc::strong_count(
+                self.state_store
+                    .as_ref()
+                    .expect("draining SQLite provider owns its store"),
+            ) == 1
+            {
+                self.state_store.take();
                 self.lifecycle = StateStoreProviderLifecycle::Stopped;
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                self.state_store = Some(store);
                 return Err(deadline_error());
             }
             tokio::task::yield_now().await;
@@ -122,4 +130,94 @@ fn deadline_error() -> StateStoreError {
         StateStoreErrorKind::DeadlineExceeded,
         "SQLite state store provider deadline exceeded",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{Future, poll_fn};
+    use std::num::NonZeroUsize;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn request(deadline: Instant) -> StateStoreOpenRequest {
+        StateStoreOpenRequest {
+            cluster_id: "cluster-a".to_owned(),
+            limits: novarocks_spi::state_store::StateStoreLimits::default(),
+            deployment: novarocks_spi::state_store::FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).unwrap(),
+                topology_revision: Bytes::from_static(b"topology-r1"),
+            },
+            deadline,
+        }
+    }
+
+    async fn open_instance(
+        temp: &TempDir,
+        deadline: Instant,
+    ) -> Box<dyn StateStoreProviderInstance> {
+        Box::new(SqliteStateStoreProviderFactory::new(
+            temp.path().join("state-store.sqlite"),
+            "fe-a".to_owned(),
+        ))
+        .open(request(deadline))
+        .await
+        .expect("open SQLite provider instance")
+    }
+
+    #[tokio::test]
+    async fn draining_instance_does_not_expose_store_after_deadline() {
+        let temp = TempDir::new().unwrap();
+        let mut instance = open_instance(&temp, Instant::now() + Duration::from_secs(5)).await;
+        let held_store = instance.state_store().unwrap();
+
+        let error = instance.shutdown(Instant::now()).await.unwrap_err();
+
+        assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded);
+        assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Draining);
+        assert!(instance.state_store().is_none());
+        drop(held_store);
+        instance
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_retains_owner_for_retry_and_reopen() {
+        let temp = TempDir::new().unwrap();
+        let mut instance = open_instance(&temp, Instant::now() + Duration::from_secs(5)).await;
+        let held_store = instance.state_store().unwrap();
+        let mut shutdown = Box::pin(instance.shutdown(Instant::now() + Duration::from_secs(5)));
+        poll_fn(|context| match shutdown.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("shutdown must wait for the external store handle: {result:?}")
+            }
+        })
+        .await;
+        drop(shutdown);
+
+        assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Draining);
+        assert!(instance.state_store().is_none());
+        let error = instance.shutdown(Instant::now()).await.unwrap_err();
+        assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded);
+
+        drop(held_store);
+        instance
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Stopped);
+
+        let mut reopened = open_instance(&temp, Instant::now() + Duration::from_secs(5)).await;
+        reopened
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
 }
