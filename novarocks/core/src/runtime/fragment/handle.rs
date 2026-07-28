@@ -30,8 +30,8 @@ use crate::runtime::fragment::error::{
 use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter, NoopFragmentEventSink,
-    ResultPresentation, ResultWriteSpec,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+    NoopFragmentEventSink, ResultPresentation, ResultWriteSpec, UnavailableFragmentLookupClient,
 };
 use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaults};
 use crate::runtime::fragment::runtime_state::{
@@ -50,6 +50,7 @@ pub struct FragmentPrepareContext {
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+    lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
     result_spec: Option<ResultWriteSpec>,
@@ -72,6 +73,7 @@ impl Default for FragmentPrepareContext {
             runtime_filter: None,
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            lookup_client: Arc::new(UnavailableFragmentLookupClient),
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
             result_spec: None,
@@ -93,6 +95,7 @@ impl FragmentPrepareContext {
         mem_tracker: Option<Arc<MemTracker>>,
         runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
@@ -101,6 +104,7 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter,
             exchange_transmitter,
+            lookup_client,
             result_writer,
             event_sink,
             result_spec: None,
@@ -122,6 +126,7 @@ impl FragmentPrepareContext {
         root_sink_dop: Option<i32>,
         group_execution_scan_dop: Option<i32>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
@@ -130,6 +135,7 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter: None,
             exchange_transmitter,
+            lookup_client,
             result_writer,
             event_sink,
             result_spec,
@@ -449,6 +455,7 @@ pub fn prepare_fragment(
             context.root_sink_dop,
             context.runtime_filter.clone(),
             Arc::clone(&context.event_sink),
+            Arc::clone(&context.lookup_client),
         )
         .map_err(|error| {
             FragmentLaunchError::new(

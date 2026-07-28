@@ -35,7 +35,7 @@ use novarocks::protocol::starrocks::decode::{
 };
 use novarocks::runtime::exchange;
 use novarocks::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
@@ -62,6 +62,7 @@ pub struct CompatFragmentService {
     queries: StarRocksFragmentQueryRuntime,
     controls: Arc<CompatFragmentControls>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+    lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
 }
@@ -70,6 +71,7 @@ impl CompatFragmentService {
     pub fn new(
         queries: StarRocksFragmentQueryRuntime,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
@@ -77,6 +79,7 @@ impl CompatFragmentService {
             queries,
             controls: Arc::new(CompatFragmentControls::default()),
             exchange_transmitter,
+            lookup_client,
             result_writer,
             event_sink,
         }
@@ -893,6 +896,7 @@ fn launch_prepared_fragments(
             profiler.clone(),
             Some(Arc::clone(&fragment_mem_tracker)),
             Arc::clone(&service.exchange_transmitter),
+            Arc::clone(&service.lookup_client),
             Arc::clone(&service.result_writer),
             Arc::clone(&service.event_sink),
             finst_id,
@@ -1852,6 +1856,7 @@ fn execute_plan_fragment_sync_with(
         None,
         Some(Arc::clone(&fragment_mem_tracker)),
         Arc::clone(&service.exchange_transmitter),
+        Arc::clone(&service.lookup_client),
         Arc::clone(&service.result_writer),
         Arc::clone(&service.event_sink),
         finst_id,
@@ -1984,6 +1989,7 @@ mod tests {
         CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
+            crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
             crate::fragment::compat_fragment_event_sink(),
         )
@@ -2267,6 +2273,7 @@ mod tests {
         let service = Arc::new(CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
+            crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
             crate::fragment::compat_fragment_event_sink(),
         ));
@@ -2316,6 +2323,7 @@ mod tests {
         let service = Arc::new(CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
+            crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
             crate::fragment::compat_fragment_event_sink(),
         ));

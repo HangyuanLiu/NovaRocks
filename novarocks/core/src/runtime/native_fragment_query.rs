@@ -28,7 +28,7 @@ use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::runtime::fragment::FragmentPrepareContext;
 use crate::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -171,6 +171,7 @@ impl NativeFragmentAdmissionResources {
         self,
         profiler: Option<Profiler>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> FragmentPrepareContext {
@@ -179,6 +180,7 @@ impl NativeFragmentAdmissionResources {
             Some(self.fragment_mem_tracker),
             self.runtime_filter,
             exchange_transmitter,
+            lookup_client,
             result_writer,
             event_sink,
         )

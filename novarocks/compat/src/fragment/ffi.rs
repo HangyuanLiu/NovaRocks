@@ -116,6 +116,7 @@ mod tests {
         let service = CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
+            crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
             crate::fragment::compat_fragment_event_sink(),
         );

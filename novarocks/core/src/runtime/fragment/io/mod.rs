@@ -15,6 +15,7 @@ pub use events::{
 pub use exchange::{ExchangeFrame, ExchangeFrameTransmitter};
 pub use lookup::{
     FragmentLookupClient, LookupBatch, LookupColumn, LookupKind, LookupRequest, LookupTarget,
+    UnavailableFragmentLookupClient,
 };
 pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,

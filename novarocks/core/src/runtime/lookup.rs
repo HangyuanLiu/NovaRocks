@@ -122,7 +122,7 @@ pub fn decode_column_ipc(data: &[u8]) -> Result<ArrayRef, String> {
     Ok(batch.column(0).clone())
 }
 
-pub(crate) fn execute_lookup_request(
+pub fn execute_lookup_request(
     query_id: QueryId,
     tuple_id: i32,
     request_columns: HashMap<SlotId, ArrayRef>,
@@ -424,7 +424,7 @@ mod position_lookup_dispatch_tests {
 ///
 /// This function re-scans the relevant tablet ranges and filters to the requested rows,
 /// then returns the lazy columns that were deferred by the FETCH_NODE.
-pub(crate) fn execute_lake_lookup_request(
+pub fn execute_lake_lookup_request(
     query_id: QueryId,
     tuple_id: i32,
     request_columns: HashMap<SlotId, ArrayRef>,

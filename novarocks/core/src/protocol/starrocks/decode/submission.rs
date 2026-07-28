@@ -231,6 +231,7 @@ impl StarRocksSubmissionMetadata {
         exchange_transmitter: std::sync::Arc<
             dyn crate::runtime::fragment::io::ExchangeFrameTransmitter,
         >,
+        lookup_client: std::sync::Arc<dyn crate::runtime::fragment::io::FragmentLookupClient>,
         result_writer: std::sync::Arc<dyn FragmentResultWriter>,
         event_sink: std::sync::Arc<dyn FragmentEventSink>,
         fragment_instance_id: crate::common::types::UniqueId,
@@ -242,6 +243,7 @@ impl StarRocksSubmissionMetadata {
             self.root_sink_dop,
             self.group_execution_scan_dop,
             exchange_transmitter,
+            lookup_client,
             result_writer,
             event_sink,
         )

@@ -28,6 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int32Array, UInt32Array};
 use arrow::compute::{concat, take};
@@ -37,11 +38,11 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::proto;
+use crate::runtime::descriptor_snapshot::LookupNodesInfo;
 use crate::runtime::descriptor_snapshot::is_lake_row_position;
-use crate::runtime::descriptor_snapshot::{LookupNodeInfo, LookupNodesInfo};
-use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
-use crate::runtime::query_context::QueryId;
+use crate::runtime::fragment::io::{
+    FragmentLookupClient, LookupColumn, LookupKind, LookupRequest, LookupTarget,
+};
 use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
@@ -53,6 +54,7 @@ pub struct FetchProcessorFactory {
     output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
     nodes_info: Option<LookupNodesInfo>,
     output_chunk_schema: ChunkSchemaRef,
+    lookup_client: Arc<dyn FragmentLookupClient>,
 }
 
 impl FetchProcessorFactory {
@@ -63,6 +65,7 @@ impl FetchProcessorFactory {
         output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
         nodes_info: Option<LookupNodesInfo>,
         output_chunk_schema: ChunkSchemaRef,
+        lookup_client: Arc<dyn FragmentLookupClient>,
     ) -> Self {
         Self {
             name: format!("FETCH (id={})", node_id),
@@ -72,6 +75,7 @@ impl FetchProcessorFactory {
             output_slots_by_tuple,
             nodes_info,
             output_chunk_schema,
+            lookup_client,
         }
     }
 }
@@ -90,6 +94,7 @@ impl OperatorFactory for FetchProcessorFactory {
             output_slots_by_tuple: self.output_slots_by_tuple.clone(),
             nodes_info: self.nodes_info.clone(),
             output_chunk_schema: self.output_chunk_schema.clone(),
+            lookup_client: Arc::clone(&self.lookup_client),
             pending_output: None,
             finishing: false,
         })
@@ -104,6 +109,7 @@ struct FetchProcessor {
     output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
     nodes_info: Option<LookupNodesInfo>,
     output_chunk_schema: ChunkSchemaRef,
+    lookup_client: Arc<dyn FragmentLookupClient>,
     pending_output: Option<Chunk>,
     finishing: bool,
 }
@@ -202,15 +208,29 @@ impl FetchProcessor {
                     request_columns.insert(*slot_id, taken);
                 }
 
-                let local_backend_id = self.local_backend_id()?;
-                let response_columns = self.dispatch_lookup(
+                let request = LookupRequest::new(
                     query_id,
+                    self.target_node_id,
                     *tuple_id,
-                    request_columns,
-                    is_lake,
-                    *backend_id,
-                    local_backend_id,
-                )?;
+                    if is_lake {
+                        LookupKind::Lake
+                    } else {
+                        LookupKind::PrimaryKey
+                    },
+                    LookupTarget::new(*backend_id, self.lookup_endpoint(*backend_id)?),
+                    request_columns
+                        .into_iter()
+                        .map(|(slot_id, values)| LookupColumn::new(slot_id, values))
+                        .collect(),
+                );
+                let response_columns = self
+                    .lookup_client
+                    .lookup(request)
+                    .map_err(|error| error.to_string())?
+                    .columns()
+                    .iter()
+                    .map(|column| (column.slot_id(), column.values().clone()))
+                    .collect::<Vec<_>>();
 
                 let mut response_map = HashMap::new();
                 for (slot, array) in response_columns {
@@ -257,91 +277,20 @@ impl FetchProcessor {
         Chunk::try_new_with_columns(output_chunk_schema, output_columns)
     }
 
-    fn local_backend_id(&self) -> Result<i32, String> {
-        let local = crate::runtime::backend_id::backend_id()
-            .ok_or_else(|| "backend_id is not initialized".to_string())?;
-        i32::try_from(local).map_err(|_| format!("backend_id {} does not fit in int32", local))
-    }
-
-    fn dispatch_lookup(
+    fn lookup_endpoint(
         &self,
-        query_id: QueryId,
-        tuple_id: i32,
-        request_columns: HashMap<SlotId, ArrayRef>,
-        is_lake: bool,
         backend_id: i32,
-        local_backend_id: i32,
-    ) -> Result<Vec<(SlotId, ArrayRef)>, String> {
-        if local_backend_id == backend_id {
-            if is_lake {
-                execute_lake_lookup(query_id, tuple_id, request_columns)
-            } else {
-                execute_lookup_request(query_id, tuple_id, request_columns)
-            }
-        } else {
-            self.lookup_remote(query_id, tuple_id, &request_columns, backend_id)
-        }
-    }
-
-    fn lookup_remote(
-        &self,
-        query_id: QueryId,
-        tuple_id: i32,
-        request_columns: &HashMap<SlotId, ArrayRef>,
-        backend_id: i32,
-    ) -> Result<Vec<(SlotId, ArrayRef)>, String> {
-        #[allow(unused_variables)] // used when feature = "compat" is enabled
-        let node_info = self
-            .nodes_info
+    ) -> Result<Option<crate::runtime::endpoint::RuntimeEndpoint>, String> {
+        self.nodes_info
             .as_ref()
-            .and_then(|info| find_node(info, backend_id))
-            .ok_or_else(|| format!("node info not found for backend_id {}", backend_id))?;
-        let mut req = proto::filter::LookupRequest {
-            query_id: Some(proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-            lookup_node_id: self.target_node_id,
-            request_tuple_id: tuple_id,
-            request_columns: Vec::with_capacity(request_columns.len()),
-        };
-        for (slot_id, array) in request_columns {
-            let data = encode_column_ipc(array)?;
-            req.request_columns.push(proto::filter::Column {
-                slot_id: slot_id.as_u32() as i32,
-                data_size: data.len() as i64,
-                data,
-            });
-        }
-        let port = lookup_async_internal_port(node_info)?;
-
-        let resp =
-            match crate::service::internal_rpc_transport::internal_rpc_transport_for_current_process(
-            ) {
-                #[cfg(feature = "compat")]
-                crate::service::internal_rpc_transport::InternalRpcTransport::BrpcCompat => {
-                    crate::service::internal_rpc_client::lookup(&node_info.host, port, req)?
-                }
-                crate::service::internal_rpc_transport::InternalRpcTransport::Grpc => {
-                    crate::service::grpc_client::lookup(&node_info.host, port, req)?
-                }
-            };
-
-        if let Some(status) = resp.status.as_ref()
-            && status.code != 0
-        {
-            return Err(format!("lookup failed: {}", status.message));
-        }
-        let mut out = Vec::new();
-        for col in resp.columns {
-            let slot_id = SlotId::try_from(col.slot_id)?;
-            if col.data.is_empty() {
-                return Err("lookup response column missing data".to_string());
-            }
-            let array = decode_column_ipc(&col.data)?;
-            out.push((slot_id, array));
-        }
-        Ok(out)
+            .and_then(|info| info.nodes.iter().find(|node| node.id == backend_id as i64))
+            .map(|node| {
+                crate::runtime::endpoint::RuntimeEndpoint::new(
+                    &node.host,
+                    i32::from(node.async_internal_port),
+                )
+            })
+            .transpose()
     }
 }
 
@@ -377,32 +326,4 @@ fn build_scatter_indices(groups: &[(i32, Vec<usize>)], total_rows: usize) -> Vec
         offset = offset.saturating_add(positions.len() as u32);
     }
     out
-}
-
-fn execute_lake_lookup(
-    query_id: QueryId,
-    tuple_id: i32,
-    request_columns: HashMap<SlotId, ArrayRef>,
-) -> Result<Vec<(SlotId, ArrayRef)>, String> {
-    #[cfg(feature = "compat")]
-    {
-        crate::runtime::lookup::execute_lake_lookup_request(query_id, tuple_id, request_columns)
-    }
-
-    #[cfg(not(feature = "compat"))]
-    {
-        let _ = (query_id, tuple_id, request_columns);
-        Err("lake lookup is only available with the compat feature".to_string())
-    }
-}
-
-fn find_node(nodes_info: &LookupNodesInfo, backend_id: i32) -> Option<&LookupNodeInfo> {
-    nodes_info
-        .nodes
-        .iter()
-        .find(|node| node.id == backend_id as i64)
-}
-
-fn lookup_async_internal_port(node_info: &LookupNodeInfo) -> Result<u16, String> {
-    Ok(node_info.async_internal_port)
 }

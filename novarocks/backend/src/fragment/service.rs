@@ -22,7 +22,7 @@ use std::sync::{Arc, mpsc};
 use novarocks::common::app_config;
 use novarocks::novarocks_logging::{error, info, warn};
 use novarocks::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
 use novarocks::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
@@ -51,6 +51,7 @@ pub struct NativeFragmentService {
     pub(super) controls: Arc<FragmentControlRegistry>,
     queries: NativeFragmentQueryRuntime,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+    lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
     lifecycle_observer: Option<LifecycleObserver>,
@@ -71,6 +72,7 @@ impl std::fmt::Debug for NativeFragmentService {
 impl NativeFragmentService {
     pub fn new(
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
@@ -78,6 +80,7 @@ impl NativeFragmentService {
             controls: Arc::new(FragmentControlRegistry::default()),
             queries: NativeFragmentQueryRuntime::global(),
             exchange_transmitter,
+            lookup_client,
             result_writer,
             event_sink,
             lifecycle_observer: None,
@@ -96,6 +99,7 @@ impl NativeFragmentService {
             lifecycle_observer: Some(Arc::new(observer)),
             ..Self::new(
                 crate::fragment::grpc_exchange_transmitter(),
+                crate::fragment::grpc_fragment_lookup_client(),
                 crate::fragment::native_result_writer(),
                 crate::fragment::native_fragment_event_sink(),
             )
@@ -112,6 +116,7 @@ impl NativeFragmentService {
             fail_worker_spawn_on_submission: Some(fail_worker_spawn_on_submission),
             ..Self::new(
                 crate::fragment::grpc_exchange_transmitter(),
+                crate::fragment::grpc_fragment_lookup_client(),
                 crate::fragment::native_result_writer(),
                 crate::fragment::native_fragment_event_sink(),
             )
@@ -161,6 +166,7 @@ impl NativeFragmentIngress for NativeFragmentService {
             admission.into_prepare_context(
                 profiler.clone(),
                 Arc::clone(&self.exchange_transmitter),
+                Arc::clone(&self.lookup_client),
                 Arc::clone(&self.result_writer),
                 Arc::clone(&self.event_sink),
             ),
@@ -442,6 +448,7 @@ mod tests {
     fn registration_failure_drops_dormant_resources_before_retry() {
         let service = NativeFragmentService::new(
             crate::fragment::grpc_exchange_transmitter(),
+            crate::fragment::grpc_fragment_lookup_client(),
             crate::fragment::native_result_writer(),
             crate::fragment::native_fragment_event_sink(),
         );

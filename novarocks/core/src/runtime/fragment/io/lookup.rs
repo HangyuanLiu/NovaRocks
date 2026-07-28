@@ -127,3 +127,18 @@ impl LookupBatch {
 pub trait FragmentLookupClient: Send + Sync + 'static {
     fn lookup(&self, request: LookupRequest) -> Result<LookupBatch, FragmentIoError>;
 }
+
+/// Explicit failure used by pipeline-only callers that cannot execute a
+/// protocol lookup. Real fragment admission must inject a role adapter.
+#[derive(Debug, Default)]
+pub struct UnavailableFragmentLookupClient;
+
+impl FragmentLookupClient for UnavailableFragmentLookupClient {
+    fn lookup(&self, _request: LookupRequest) -> Result<LookupBatch, FragmentIoError> {
+        Err(FragmentIoError::new(
+            super::FragmentIoOperation::Lookup,
+            super::FragmentIoErrorKind::Unavailable,
+            "fragment lookup client is not configured",
+        ))
+    }
+}

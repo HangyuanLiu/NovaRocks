@@ -12,8 +12,8 @@ use novarocks::service::{
 
 use crate::brpc;
 use crate::fragment::{
-    CompatFragmentService, brpc_exchange_transmitter, compat_fragment_event_sink,
-    compat_result_writer,
+    CompatFragmentService, brpc_exchange_transmitter, brpc_fragment_lookup_client,
+    compat_fragment_event_sink, compat_result_writer,
 };
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -209,6 +209,7 @@ impl CompatApplicationHost {
         let fragment_service = Arc::new(CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             brpc_exchange_transmitter(),
+            brpc_fragment_lookup_client(),
             compat_result_writer(),
             compat_fragment_event_sink(),
         ));

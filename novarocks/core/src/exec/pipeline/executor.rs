@@ -37,14 +37,16 @@ use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::novarocks_logging::info;
 use crate::runtime::runtime_state::RuntimeState;
 
-use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context;
+use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client;
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
 use super::global_driver_executor::{DriverTask, FragmentCompletion, global_driver_executor};
 use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime::fragment::io::FragmentEventSink;
+use crate::runtime::fragment::io::{
+    FragmentEventSink, FragmentLookupClient, UnavailableFragmentLookupClient,
+};
 
 use crate::runtime::profile::{Profiler, ScopedTimer};
 
@@ -325,6 +327,7 @@ pub(crate) fn prepare_pipeline_execution(
         root_sink_dop,
         runtime_filter_context,
         event_sink,
+        Arc::new(UnavailableFragmentLookupClient),
         false,
     )
 }
@@ -346,6 +349,7 @@ pub(crate) fn prepare_report_neutral_pipeline_execution(
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     >,
     event_sink: Arc<dyn FragmentEventSink>,
+    lookup_client: Arc<dyn FragmentLookupClient>,
 ) -> Result<PreparedPipelineExecution, String> {
     prepare_pipeline_execution_inner(
         plan,
@@ -364,6 +368,7 @@ pub(crate) fn prepare_report_neutral_pipeline_execution(
         root_sink_dop,
         runtime_filter_context,
         event_sink,
+        lookup_client,
         true,
     )
 }
@@ -388,13 +393,14 @@ fn prepare_pipeline_execution_inner(
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     >,
     event_sink: Arc<dyn FragmentEventSink>,
+    lookup_client: Arc<dyn FragmentLookupClient>,
     report_neutral: bool,
 ) -> Result<PreparedPipelineExecution, String> {
     let dep_manager = DependencyManager::new();
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
     let graph =
-        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
+        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client(
             &plan,
             debug,
             dep_manager.clone(),
@@ -404,6 +410,7 @@ fn prepare_pipeline_execution_inner(
             pipeline_dop,
             root_sink_dop,
             runtime_filter_context,
+            lookup_client,
         )?;
 
     let ctx = Arc::new(if report_neutral {
