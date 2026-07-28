@@ -339,6 +339,7 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
 /// Compat-only Statistic row encoding. The caller owns the presentation
 /// decision; this remains a temporary shared codec while the generated Thrift
 /// model is still hosted by the Core crate.
+#[cfg(feature = "compat")]
 pub fn build_statistic_result_batch_for_chunk(
     chunk: &Chunk,
     projections: &[ResultProjection],

@@ -757,6 +757,7 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
         )
         .expect("prepare pipeline without submitting drivers");
 
