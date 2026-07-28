@@ -145,7 +145,7 @@ impl StatisticsEngine for Arc<super::StandaloneState> {
             &target.current_database,
             &name,
         )?;
-        table_columns_from_local_catalog(self, &target.current_database, name.leaf())
+        table_columns_for_materialized_target(self, &target.current_database, &name)
     }
 
     fn resolve_local_table_columns(
@@ -1420,6 +1420,15 @@ fn table_columns_from_local_catalog(
             data_type: column.data_type.clone(),
         })
         .collect())
+}
+
+fn table_columns_for_materialized_target(
+    state: &Arc<StandaloneState>,
+    current_database: &str,
+    name: &ObjectName,
+) -> Result<Vec<StatisticsColumn>, String> {
+    let key = table_key(name, current_database)?;
+    table_columns_from_local_catalog(state, &key.db, &key.table)
 }
 
 fn optional_table_columns_from_local_catalog(
@@ -2740,6 +2749,57 @@ mod tests {
         accept_service(Arc::new(EmptyStatisticsService));
         let engine = FakeStatisticsEngine::default();
         accept_engine(&engine);
+    }
+
+    #[test]
+    fn statistics_engine_resolves_qualified_table_columns_outside_current_database() {
+        use novarocks_catalog::schema::ColumnDef;
+
+        let state = Arc::new(StandaloneState::default());
+        {
+            let mut catalog = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("standalone catalog write lock");
+            catalog
+                .create_database("other_db")
+                .expect("create database");
+            catalog
+                .register(
+                    "other_db",
+                    crate::sql::planner::table::TableDef {
+                        name: "t".to_string(),
+                        columns: vec![ColumnDef {
+                            name: "k".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: crate::sql::planner::table::ScanSource::StarRocks {
+                            db_id: 1,
+                            table_id: 2,
+                        },
+                    },
+                )
+                .expect("register table");
+        }
+
+        for name_parts in [
+            vec!["other_db".to_string(), "t".to_string()],
+            vec![
+                "default_catalog".to_string(),
+                "other_db".to_string(),
+                "t".to_string(),
+            ],
+        ] {
+            let name = object_name_from_parts(&name_parts).expect("qualified object name");
+            let columns = table_columns_for_materialized_target(&state, "current_db", &name)
+                .expect("resolve qualified table");
+            assert_eq!(columns[0].name, "k");
+        }
     }
 
     #[test]
