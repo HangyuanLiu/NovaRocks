@@ -43,10 +43,9 @@ use crate::connector::starrocks::object_store_profile::ObjectStoreProfile;
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource};
+use crate::exec::node::scan::ScanSource;
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::starlet_shard_registry;
@@ -303,10 +302,9 @@ impl ConnectorRead for StarRocksConnectorInstance {
         let mut config = self.config.clone();
         config.ranges = vec![range];
         config.limit = None;
-        let context = StarRocksExecutionContext::from_scan_config(&config)
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
         Ok(Box::new(StarRocksBatchReader {
-            iter: StarRocksScanIter::new(config, context, None),
+            iter: open_starrocks_scan_iter(config)
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?,
             context: request.context,
             closed: false,
         }))
@@ -506,157 +504,18 @@ impl StarRocksExecutionContext {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct StarRocksScanOp {
-    cfg: StarRocksScanConfig,
+fn open_starrocks_scan_iter(config: StarRocksScanConfig) -> Result<StarRocksScanIter, String> {
+    let context = StarRocksExecutionContext::from_scan_config(&config)?;
+    Ok(StarRocksScanIter::new(config, context))
 }
 
-impl StarRocksScanOp {
-    pub fn new(cfg: StarRocksScanConfig) -> Self {
-        Self { cfg }
-    }
-}
-
-/// Static [`ScanSource`] for StarRocks lake/tablet scans (compat only).
-///
-/// Holds everything the decoder built for a [`StarRocksScanConfig`] except the
-/// per-instance `ranges` / `has_more`, which arrive via
-/// [`BoundScanRanges::StarRocksTablet`] at bind time (mirrors the HDFS funnel).
-/// `deferred_lake_resolution` is carried as-is: the decoder fully builds it and
-/// `bind` never re-derives its tablets.
-pub(crate) struct StarRocksScanSource {
-    pub(crate) db_name: Option<String>,
-    pub(crate) table_name: Option<String>,
-    pub(crate) properties: BTreeMap<String, String>,
-    pub(crate) required_chunk_schema: ChunkSchemaRef,
-    pub(crate) output_chunk_schema: ChunkSchemaRef,
-    pub(crate) query_global_dicts: QueryGlobalDictEncodeMap,
-    pub(crate) limit: Option<usize>,
-    pub(crate) batch_size: Option<i32>,
-    pub(crate) query_timeout: Option<i32>,
-    pub(crate) mem_limit: Option<i64>,
-    pub(crate) profile_label: Option<String>,
-    pub(crate) min_max_predicates: Vec<MinMaxPredicate>,
-    pub(crate) lake_schema_meta: Option<LakeScanSchemaMeta>,
-    pub(crate) deferred_lake_resolution: Option<DeferredLakeScanResolution>,
-    pub(crate) topn_filter_column_map: HashMap<i32, String>,
-}
-
-impl ScanSource for StarRocksScanSource {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
-        let BoundScanRanges::StarRocksTablet { ranges, has_more } = ranges else {
-            return Err("starrocks scan source requires StarRocksTablet scan ranges".to_string());
-        };
-        let cfg = StarRocksScanConfig {
-            db_name: self.db_name.clone(),
-            table_name: self.table_name.clone(),
-            properties: self.properties.clone(),
-            ranges,
-            has_more,
-            required_chunk_schema: self.required_chunk_schema.clone(),
-            output_chunk_schema: self.output_chunk_schema.clone(),
-            query_global_dicts: self.query_global_dicts.clone(),
-            limit: self.limit,
-            batch_size: self.batch_size,
-            query_timeout: self.query_timeout,
-            mem_limit: self.mem_limit,
-            profile_label: self.profile_label.clone(),
-            min_max_predicates: self.min_max_predicates.clone(),
-            lake_schema_meta: self.lake_schema_meta.clone(),
-            deferred_lake_resolution: self.deferred_lake_resolution.clone(),
-            topn_filter_column_map: self.topn_filter_column_map.clone(),
-        };
-        Ok(Arc::new(StarRocksScanOp::new(cfg)))
-    }
-}
-
-impl ScanOp for StarRocksScanOp {
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        let ScanMorsel::StarRocksRange { index, .. } = morsel else {
-            return Err("starrocks scan received unexpected morsel".to_string());
-        };
-
-        let range = self
-            .cfg
-            .ranges
-            .get(index)
-            .cloned()
-            .ok_or_else(|| format!("starrocks scan range index out of bounds: {index}"))?;
-        let mut cfg = self.cfg.clone();
-        cfg.ranges = vec![range];
-        cfg.limit = None;
-
-        // Apply MinMax runtime filters from TopN as storage-level predicates.
-        if let Some(rf_ctx) = runtime_filters {
-            let mm_filters = rf_ctx.min_max_filters();
-            for (filter_id, filter) in mm_filters {
-                if let Some(column_name) = cfg.topn_filter_column_map.get(&filter_id) {
-                    match filter.to_min_max_predicates(column_name) {
-                        Ok(preds) => cfg.min_max_predicates.extend(preds),
-                        Err(e) => {
-                            warn!(
-                                "failed to convert runtime min/max filter {} to predicates: {}",
-                                filter_id, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        let ctx = StarRocksExecutionContext::from_scan_config(&cfg)?;
-
-        if let Some(profile) = profile.as_ref() {
-            profile.add_info_string("DataSourceType", "StarRocks");
-            profile.add_info_string("RangeCount", format!("{}", cfg.ranges.len()));
-            profile.add_info_string("ReaderBackend", "rust_native");
-        }
-
-        let iter = StarRocksScanIter::new(cfg, ctx, profile);
-        Ok(Box::new(iter))
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        let morsels = self
-            .cfg
-            .ranges
-            .iter()
-            .enumerate()
-            .map(|(index, range)| ScanMorsel::StarRocksRange {
-                index,
-                tablet_id: range.tablet_id,
-            })
-            .collect();
-        Ok(ScanMorsels::new(morsels, self.cfg.has_more))
-    }
-
-    fn profile_name(&self) -> Option<String> {
-        let label = self.cfg.profile_label.as_deref()?;
-        if let Some(id) = label
-            .strip_prefix("starrocks_scan_node_id=")
-            .and_then(|s| s.parse::<i32>().ok())
-        {
-            return Some(format!("STARROCKS_SCAN (id={id})"));
-        }
-        if let Some(id) = label
-            .strip_prefix("lake_scan_node_id=")
-            .and_then(|s| s.parse::<i32>().ok())
-        {
-            return Some(format!("LAKE_SCAN (id={id})"));
-        }
-        Some("STARROCKS_SCAN".to_string())
-    }
+pub(crate) fn read_starrocks_batches(config: StarRocksScanConfig) -> Result<BoxedExecIter, String> {
+    Ok(Box::new(open_starrocks_scan_iter(config)?))
 }
 
 struct StarRocksScanIter {
     cfg: StarRocksScanConfig,
     ctx: StarRocksExecutionContext,
-    profile: Option<RuntimeProfile>,
     range_idx: usize,
     scanner: Option<StarRocksScanner>,
     finished: bool,
@@ -664,15 +523,10 @@ struct StarRocksScanIter {
 }
 
 impl StarRocksScanIter {
-    fn new(
-        cfg: StarRocksScanConfig,
-        ctx: StarRocksExecutionContext,
-        profile: Option<RuntimeProfile>,
-    ) -> Self {
+    fn new(cfg: StarRocksScanConfig, ctx: StarRocksExecutionContext) -> Self {
         Self {
             cfg,
             ctx,
-            profile,
             range_idx: 0,
             scanner: None,
             finished: false,
@@ -695,16 +549,8 @@ impl StarRocksScanIter {
             return Err("no more starrocks scan ranges".to_string());
         }
         let range = self.cfg.ranges[self.range_idx].clone();
-        let open_start = Instant::now();
         let scanner = StarRocksScanner::open(&self.cfg, &self.ctx, range)?;
         self.scanner = Some(scanner);
-        if let Some(profile) = self.profile.as_ref() {
-            profile.counter_add(
-                "ScannerOpenTime",
-                ProfileUnit::TimeNs,
-                open_start.elapsed().as_nanos() as i64,
-            );
-        }
         Ok(())
     }
 
@@ -747,24 +593,13 @@ impl Iterator for StarRocksScanIter {
                 return None;
             };
 
-            let batch_start = Instant::now();
             match scanner.get_next() {
                 Ok(ScanBatch::Eos) => {
                     self.close_scanner();
                     self.range_idx += 1;
                     continue;
                 }
-                Ok(ScanBatch::Chunk(chunk, rows, bytes)) => {
-                    if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add("ExternalRowsRead", ProfileUnit::Unit, rows as i64);
-                        profile.counter_add("ExternalBytesRead", ProfileUnit::Bytes, bytes as i64);
-                        profile.counter_add(
-                            "ScannerGetNextTime",
-                            ProfileUnit::TimeNs,
-                            batch_start.elapsed().as_nanos() as i64,
-                        );
-                    }
-
+                Ok(ScanBatch::Chunk(chunk, rows, _bytes)) => {
                     let mut out_chunk = chunk;
                     let chunk_rows = rows;
                     let remaining = self.remaining_limit();
@@ -1008,77 +843,9 @@ fn resolve_object_store_profile<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::{DeferredLakeScanResolution, StarRocksScanRange, StarRocksScanSource};
+    use super::DeferredLakeScanResolution;
     use crate::connector::starrocks::fe_v2_meta::{LakeScanTabletRef, LakeTableIdentity};
-    use crate::exec::chunk::ChunkSchema;
-    use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
     use crate::runtime::query_context::QueryId;
-
-    fn source_for_test() -> StarRocksScanSource {
-        StarRocksScanSource {
-            db_name: None,
-            table_name: None,
-            properties: Default::default(),
-            required_chunk_schema: Arc::new(ChunkSchema::empty()),
-            output_chunk_schema: Arc::new(ChunkSchema::empty()),
-            query_global_dicts: Default::default(),
-            limit: None,
-            batch_size: None,
-            query_timeout: None,
-            mem_limit: None,
-            profile_label: None,
-            min_max_predicates: Vec::new(),
-            lake_schema_meta: None,
-            deferred_lake_resolution: None,
-            topn_filter_column_map: Default::default(),
-        }
-    }
-
-    #[test]
-    fn starrocks_scan_source_bind_tablet_ranges_yields_range_morsels() {
-        let source = source_for_test();
-        let op = source
-            .bind(BoundScanRanges::StarRocksTablet {
-                ranges: vec![
-                    StarRocksScanRange::new(300, 100, 7),
-                    StarRocksScanRange::new(301, 100, 7),
-                ],
-                has_more: false,
-            })
-            .expect("starrocks scan source bind should succeed");
-
-        let morsels = op.build_morsels().expect("build morsels");
-        assert!(!morsels.has_more);
-        assert_eq!(morsels.morsels.len(), 2);
-        match &morsels.morsels[0] {
-            ScanMorsel::StarRocksRange { index, tablet_id } => {
-                assert_eq!(*index, 0);
-                assert_eq!(*tablet_id, 300);
-            }
-            other => panic!("expected StarRocksRange morsel, got {other:?}"),
-        }
-        match &morsels.morsels[1] {
-            ScanMorsel::StarRocksRange { index, tablet_id } => {
-                assert_eq!(*index, 1);
-                assert_eq!(*tablet_id, 301);
-            }
-            other => panic!("expected StarRocksRange morsel, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn starrocks_scan_source_bind_rejects_wrong_variant() {
-        let source = source_for_test();
-        let Err(err) = source.bind(BoundScanRanges::None) else {
-            panic!("non-StarRocksTablet scan ranges must be rejected");
-        };
-        assert!(
-            err.contains("starrocks scan source requires StarRocksTablet scan ranges"),
-            "err={err}"
-        );
-    }
 
     #[test]
     fn deferred_lake_scan_resolution_keeps_protocol_neutral_identity_and_tablets() {

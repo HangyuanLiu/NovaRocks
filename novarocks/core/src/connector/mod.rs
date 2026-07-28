@@ -65,7 +65,7 @@ pub use hdfs::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 pub use iceberg::IcebergMetadataScanConfig;
 pub use jdbc::JdbcScanConfig;
 #[cfg(feature = "compat")]
-pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange};
+pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
 
 #[cfg(test)]
 mod backend_test;
@@ -352,8 +352,6 @@ mod scan_planning_registry_tests {
 pub enum ScanConfig {
     Jdbc(JdbcScanConfig),
     IcebergMetadata(IcebergMetadataScanConfig),
-    #[cfg(feature = "compat")]
-    StarRocks(Box<StarRocksScanConfig>),
 }
 
 pub trait ScanConnector: Send + Sync {
@@ -563,10 +561,6 @@ impl Default for ConnectorRegistry {
         reg.register_scan_connector(jdbc);
         reg.register_scan_connector(mysql);
         reg.register_scan_connector(iceberg);
-        #[cfg(feature = "compat")]
-        let starrocks = Arc::new(StarRocksConnector { name: "starrocks" });
-        #[cfg(feature = "compat")]
-        reg.register_scan_connector(starrocks);
         reg
     }
 }
@@ -662,76 +656,6 @@ impl ScanConnector for IcebergConnector {
                         profile_label,
                     ));
                 Ok((source, BoundScanRanges::IcebergMetadata { ranges }))
-            }
-            _ => Err(format!(
-                "unsupported scan config for connector {}",
-                self.name
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-#[cfg(feature = "compat")]
-struct StarRocksConnector {
-    name: &'static str,
-}
-
-#[cfg(feature = "compat")]
-impl ScanConnector for StarRocksConnector {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn create_scan_node(
-        &self,
-        cfg: ScanConfig,
-    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
-        match cfg {
-            ScanConfig::StarRocks(cfg) => {
-                // Split the decoder-built config into a static source plus its
-                // tablet ranges. `deferred_lake_resolution` is carried through
-                // as-is; `bind` (at materialize time) never re-derives tablets.
-                let StarRocksScanConfig {
-                    db_name,
-                    table_name,
-                    properties,
-                    ranges,
-                    has_more,
-                    required_chunk_schema,
-                    output_chunk_schema,
-                    query_global_dicts,
-                    limit,
-                    batch_size,
-                    query_timeout,
-                    mem_limit,
-                    profile_label,
-                    min_max_predicates,
-                    lake_schema_meta,
-                    deferred_lake_resolution,
-                    topn_filter_column_map,
-                } = *cfg;
-                let source: Arc<dyn ScanSource> = Arc::new(starrocks::StarRocksScanSource {
-                    db_name,
-                    table_name,
-                    properties,
-                    required_chunk_schema,
-                    output_chunk_schema,
-                    query_global_dicts,
-                    limit,
-                    batch_size,
-                    query_timeout,
-                    mem_limit,
-                    profile_label,
-                    min_max_predicates,
-                    lake_schema_meta,
-                    deferred_lake_resolution,
-                    topn_filter_column_map,
-                });
-                Ok((
-                    source,
-                    BoundScanRanges::StarRocksTablet { ranges, has_more },
-                ))
             }
             _ => Err(format!(
                 "unsupported scan config for connector {}",

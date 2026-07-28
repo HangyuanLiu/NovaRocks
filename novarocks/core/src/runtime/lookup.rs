@@ -26,10 +26,10 @@ use arrow::record_batch::RecordBatch;
 
 use crate::cache::DataCacheManager;
 use crate::common::ids::SlotId;
+#[cfg(feature = "compat")]
+use crate::connector::starrocks::scan::read_starrocks_batches;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
-#[cfg(feature = "compat")]
-use crate::exec::node::scan::ScanMorsel;
 use crate::exec::row_position::RowPositionType;
 use crate::formats::{
     build_format_iter, parquet::ParquetReadCachePolicy, parquet::ParquetScanConfig,
@@ -37,7 +37,7 @@ use crate::formats::{
 };
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 #[cfg(feature = "compat")]
-use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
+use crate::novarocks_connectors::StarRocksScanConfig;
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
 use crate::runtime::descriptor_snapshot::{
     is_iceberg_v3_row_position, is_lake_row_position, lookup_file_format_config,
@@ -570,13 +570,7 @@ pub fn execute_lake_lookup_request(
                 topn_filter_column_map: std::collections::HashMap::new(),
             };
 
-            use crate::exec::node::scan::ScanOp;
-            let op = StarRocksScanOp::new(lookup_cfg);
-            let morsel = ScanMorsel::StarRocksRange {
-                index: range_idx,
-                tablet_id: range.tablet_id,
-            };
-            let iter = op.execute_iter(morsel, None, None)?;
+            let iter = read_starrocks_batches(lookup_cfg)?;
 
             let mut row_offset: i64 = 0;
             for next in iter {
