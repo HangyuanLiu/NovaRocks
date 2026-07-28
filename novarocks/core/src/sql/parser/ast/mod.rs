@@ -17,7 +17,7 @@
 // under the License.
 
 pub mod iceberg_ref;
-pub use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
+pub(crate) use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 
 use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::schema::SqlType;
@@ -78,7 +78,7 @@ pub(crate) enum CreateTableKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IcebergPartitionFieldExpr {
+pub(crate) enum IcebergPartitionFieldExpr {
     Identity { column: String },
     Year { column: String },
     Month { column: String },
@@ -109,13 +109,13 @@ pub(crate) struct DropTableStmt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaterializedViewDistribution {
+pub(crate) struct MaterializedViewDistribution {
     pub hash_columns: Vec<String>,
     pub bucket_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MaterializedViewRefreshPolicy {
+pub(crate) enum MaterializedViewRefreshPolicy {
     Manual,
     AsyncOnChange,
     AsyncInterval { interval_ms: i64 },
@@ -128,7 +128,7 @@ impl Default for MaterializedViewRefreshPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateMaterializedViewStmt {
+pub(crate) struct CreateMaterializedViewStmt {
     pub name: ObjectName,
     pub if_not_exists: bool,
     /// Iceberg-style MV partition spec. Semantic validation ensures source
@@ -153,13 +153,13 @@ pub struct CreateMaterializedViewStmt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropMaterializedViewStmt {
+pub(crate) struct DropMaterializedViewStmt {
     pub name: ObjectName,
     pub if_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AlterMaterializedViewAction {
+pub(crate) enum AlterMaterializedViewAction {
     SetRefresh(MaterializedViewRefreshPolicy),
     SetProperties(Vec<(String, String)>),
     PauseRefresh,
@@ -168,13 +168,13 @@ pub enum AlterMaterializedViewAction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AlterMaterializedViewStmt {
+pub(crate) struct AlterMaterializedViewStmt {
     pub name: ObjectName,
     pub action: AlterMaterializedViewAction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RefreshMaterializedViewStmt {
+pub(crate) struct RefreshMaterializedViewStmt {
     pub name: ObjectName,
     /// `true` when `REFRESH MATERIALIZED VIEW <name> FULL` was parsed.
     /// Full rebuild drops the existing target, deletes the MV definition, then
@@ -183,29 +183,29 @@ pub struct RefreshMaterializedViewStmt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShowMaterializedViewsStmt {
+pub(crate) struct ShowMaterializedViewsStmt {
     pub database: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AddBackendStmt {
+pub(crate) struct AddBackendStmt {
     pub addr: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropBackendStmt {
+pub(crate) struct DropBackendStmt {
     pub addr: String,
     pub force: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShowBackendsStmt;
+pub(crate) struct ShowBackendsStmt;
 
 /// Top-level statement variants produced by the custom dialect `parse_sql`
 /// entry point. Phase 1 only covers materialized-view DDL; other statements
 /// still flow through the legacy `parse_sql_raw` path.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Statement {
+pub(crate) enum Statement {
     CreateMaterializedView(CreateMaterializedViewStmt),
     DropMaterializedView(DropMaterializedViewStmt),
     AlterMaterializedView(AlterMaterializedViewStmt),
@@ -392,12 +392,12 @@ pub(crate) enum DefaultLiteral {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObjectName {
+pub(crate) struct ObjectName {
     pub parts: Vec<String>,
 }
 
 impl ObjectName {
-    pub fn leaf(&self) -> &str {
+    pub(crate) fn leaf(&self) -> &str {
         self.parts
             .last()
             .map(String::as_str)

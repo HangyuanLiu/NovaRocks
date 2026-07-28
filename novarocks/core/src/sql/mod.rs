@@ -23,7 +23,7 @@ pub(crate) mod catalog;
 pub(crate) mod column_id;
 pub(crate) mod functions;
 pub(crate) mod literal;
-pub mod parser;
+pub(crate) mod parser;
 
 pub(crate) mod optimizer;
 

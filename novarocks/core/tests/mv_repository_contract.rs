@@ -21,8 +21,9 @@ use novarocks::meta::keys::NS_MV;
 use novarocks::meta::repository::mv::MvMetaRepository;
 use novarocks::meta::{MetaKeyPrefix, MetaStoreProvider, SqliteMetaStoreProvider};
 use novarocks::mv::application::{
-    CreatedMvTarget, MvApplicationErrorKind, MvApplicationService, MvEngine, MvEngineError,
-    MvRequestContext, PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
+    CreatedMvTarget, MvApplicationErrorKind, MvApplicationService, MvApplicationStatement,
+    MvCreateRefreshPolicy, MvCreateStatement, MvEngine, MvEngineError, MvRequestContext,
+    PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
     UnavailableMvApplicationService,
 };
 use novarocks::mv::dependency::model::{
@@ -48,15 +49,21 @@ use novarocks::mv::persistence::schema::{
     TargetContract, TargetVisibleColumn,
 };
 use novarocks::mv::repository::{
-    CreateMvDependencyRequest, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
-    UnavailableMvRepository,
-};
-use novarocks::sql::parser::ast::{
-    CreateMaterializedViewStmt, MaterializedViewRefreshPolicy, ObjectName, Statement,
+    CreateMvDependencyRequest, CreateMvRepositoryRequest, FinalizeMvRefreshWithPartitionsRequest,
+    InitialMvRefreshConfiguration, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
+    MvTarget,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use uuid::Uuid;
+
+#[path = "support/domain_only_mv_repository.rs"]
+mod domain_only_mv_repository;
+#[path = "support/legacy_mv_repository_adapter.rs"]
+mod legacy_mv_repository_adapter;
+
+use domain_only_mv_repository::DomainOnlyMvRepository;
+use legacy_mv_repository_adapter::LegacyMvRepositoryAdapter;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1221,7 +1228,11 @@ impl MvEngine for ProviderNeutralFakeEngine {
 #[test]
 fn core_ports_are_provider_neutral_and_unavailable_create_has_stable_error() {
     fn accepts_repository(_repository: &dyn MvRepository) {}
-    accepts_repository(&UnavailableMvRepository);
+    accepts_repository(&DomainOnlyMvRepository);
+    assert_eq!(
+        DomainOnlyMvRepository.availability(),
+        novarocks::mv::repository::MvRepositoryAvailability::Available
+    );
 
     let query = Parser::parse_sql(&GenericDialect, "SELECT id FROM orders")
         .expect("query")
@@ -1231,14 +1242,12 @@ fn core_ports_are_provider_neutral_and_unavailable_create_has_stable_error() {
             _ => None,
         })
         .expect("SELECT query");
-    let statement = Statement::CreateMaterializedView(CreateMaterializedViewStmt {
-        name: ObjectName {
-            parts: vec!["orders_mv".to_string()],
-        },
+    let statement = MvApplicationStatement::Create(MvCreateStatement {
+        name_parts: vec!["orders_mv".to_string()],
         if_not_exists: false,
         partition_by: None,
         distribution: None,
-        refresh_policy: MaterializedViewRefreshPolicy::Manual,
+        refresh_policy: MvCreateRefreshPolicy::Manual,
         select_sql: "SELECT id FROM orders".to_string(),
         select_query: query,
         properties: vec![("storage_engine".to_string(), "iceberg".to_string())],
@@ -1278,4 +1287,109 @@ fn core_ports_are_provider_neutral_and_unavailable_create_has_stable_error() {
     let canonical_partition: Option<StoredMvPartitionState> = None;
     assert!(canonical_refresh.is_none());
     assert!(canonical_partition.is_none());
+}
+
+#[test]
+fn legacy_adapter_runs_compound_repository_ledger_through_port() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let adapter = LegacyMvRepositoryAdapter::open(dir.path().join("meta.sqlite"))?;
+    let repository: &dyn MvRepository = &adapter;
+    let dependency = iceberg_table("sales", "orders");
+
+    let definition = repository.create(
+        Uuid::from_u128(1),
+        CreateMvRepositoryRequest {
+            definition: request("orders_mv"),
+            refresh: InitialMvRefreshConfiguration {
+                policy: StoredMvRefreshPolicy::AsyncInterval,
+                paused: false,
+                interval_ms: Some(60_000),
+                max_staleness_ms: Some(120_000),
+                next_refresh_after_ms: Some(1_700_000_060_000),
+            },
+            dependencies: vec![CreateMvDependencyRequest {
+                upstream: dependency.clone(),
+                created_at_ms: 1_700_000_000_000,
+            }],
+        },
+    )?;
+    assert_eq!(
+        definition.refresh_policy,
+        StoredMvRefreshPolicy::AsyncInterval
+    );
+    assert_eq!(
+        repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "orders_mv".to_string(),
+            })?
+            .expect("target lookup")
+            .mv_id,
+        definition.mv_id
+    );
+    assert_eq!(
+        repository
+            .list_dependencies_by_downstream(definition.mv_id)?
+            .len(),
+        1
+    );
+
+    let refresh = repository.begin_refresh_intent(
+        definition.mv_id,
+        BTreeMap::from([("ice.sales.orders".to_string(), 10)]),
+    )?;
+    repository.record_external_commit_outcome(
+        refresh.refresh_id,
+        RefreshExternalOutcome {
+            target_snapshot_id: Some(20),
+            commit_id: "commit-20".to_string(),
+        },
+    )?;
+    repository.finalize_refresh_with_partitions(FinalizeMvRefreshWithPartitionsRequest {
+        refresh: MvRefreshFinalizeRequest {
+            refresh_id: refresh.refresh_id,
+            rows: 5,
+            base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 10)]),
+            base_table_uuids: BTreeMap::from([(
+                "ice.sales.orders".to_string(),
+                "uuid-orders".to_string(),
+            )]),
+            target_snapshot_id: Some(20),
+        },
+        partitions: Some(ReplaceMvPartitionStatesRequest {
+            mv_id: definition.mv_id,
+            partition_keys: BTreeSet::from(["region=east".to_string()]),
+            last_refresh_ms: 1_700_000_120_000,
+            base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 10)]),
+            target_snapshot_id: Some(20),
+            last_refresh_id: refresh.refresh_id,
+            max_entries: 10,
+        }),
+    })?;
+
+    assert_eq!(
+        repository
+            .load_refresh(refresh.refresh_id)?
+            .expect("refresh")
+            .state,
+        MvRefreshState::Finalized
+    );
+    assert_eq!(
+        repository.list_partition_states(definition.mv_id)?,
+        vec![StoredMvPartitionState {
+            mv_id: definition.mv_id,
+            partition_key: "region=east".to_string(),
+            status: MvPartitionRefreshStatus::Fresh,
+            last_refresh_ms: Some(1_700_000_120_000),
+            base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 10)]),
+            target_snapshot_id: Some(20),
+            last_refresh_id: Some(refresh.refresh_id),
+            failure_message: None,
+        }]
+    );
+    repository.ensure_no_downstream_dependencies(&iceberg_table("sales", "customers"))?;
+    assert!(repository.drop_by_id(definition.mv_id)?);
+    assert!(repository.list_definitions()?.is_empty());
+    Ok(())
 }

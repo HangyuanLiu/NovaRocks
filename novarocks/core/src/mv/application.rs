@@ -25,7 +25,138 @@ use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
 use crate::runtime::query_result::QueryResult;
-use crate::sql::parser::ast::{CreateMaterializedViewStmt, Statement};
+use crate::sql::parser::ast::{
+    CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MvCreatePartitionField {
+    Identity { column: String },
+    Year { column: String },
+    Month { column: String },
+    Day { column: String },
+    Hour { column: String },
+    Bucket { column: String, num_buckets: u32 },
+    Truncate { column: String, width: u32 },
+    Void { column: String },
+}
+
+impl From<&IcebergPartitionFieldExpr> for MvCreatePartitionField {
+    fn from(value: &IcebergPartitionFieldExpr) -> Self {
+        match value {
+            IcebergPartitionFieldExpr::Identity { column } => Self::Identity {
+                column: column.clone(),
+            },
+            IcebergPartitionFieldExpr::Year { column } => Self::Year {
+                column: column.clone(),
+            },
+            IcebergPartitionFieldExpr::Month { column } => Self::Month {
+                column: column.clone(),
+            },
+            IcebergPartitionFieldExpr::Day { column } => Self::Day {
+                column: column.clone(),
+            },
+            IcebergPartitionFieldExpr::Hour { column } => Self::Hour {
+                column: column.clone(),
+            },
+            IcebergPartitionFieldExpr::Bucket {
+                column,
+                num_buckets,
+            } => Self::Bucket {
+                column: column.clone(),
+                num_buckets: *num_buckets,
+            },
+            IcebergPartitionFieldExpr::Truncate { column, width } => Self::Truncate {
+                column: column.clone(),
+                width: *width,
+            },
+            IcebergPartitionFieldExpr::Void { column } => Self::Void {
+                column: column.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvCreateDistribution {
+    pub hash_columns: Vec<String>,
+    pub bucket_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MvCreateRefreshPolicy {
+    #[default]
+    Manual,
+    AsyncOnChange,
+    AsyncInterval {
+        interval_ms: i64,
+    },
+}
+
+impl From<&MaterializedViewRefreshPolicy> for MvCreateRefreshPolicy {
+    fn from(value: &MaterializedViewRefreshPolicy) -> Self {
+        match value {
+            MaterializedViewRefreshPolicy::Manual => Self::Manual,
+            MaterializedViewRefreshPolicy::AsyncOnChange => Self::AsyncOnChange,
+            MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => Self::AsyncInterval {
+                interval_ms: *interval_ms,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MvCreateStatement {
+    pub name_parts: Vec<String>,
+    pub if_not_exists: bool,
+    pub partition_by: Option<Vec<MvCreatePartitionField>>,
+    pub distribution: Option<MvCreateDistribution>,
+    pub refresh_policy: MvCreateRefreshPolicy,
+    pub select_sql: String,
+    pub select_query: sqlparser::ast::Query,
+    pub properties: Vec<(String, String)>,
+    pub primary_key: Option<Vec<String>>,
+}
+
+impl From<&CreateMaterializedViewStmt> for MvCreateStatement {
+    fn from(value: &CreateMaterializedViewStmt) -> Self {
+        Self {
+            name_parts: value.name.parts.clone(),
+            if_not_exists: value.if_not_exists,
+            partition_by: value
+                .partition_by
+                .as_ref()
+                .map(|fields| fields.iter().map(MvCreatePartitionField::from).collect()),
+            distribution: value
+                .distribution
+                .as_ref()
+                .map(|distribution| MvCreateDistribution {
+                    hash_columns: distribution.hash_columns.clone(),
+                    bucket_count: distribution.bucket_count,
+                }),
+            refresh_policy: MvCreateRefreshPolicy::from(&value.refresh_policy),
+            select_sql: value.select_sql.clone(),
+            select_query: value.select_query.clone(),
+            properties: value.properties.clone(),
+            primary_key: value.primary_key.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MvApplicationStatement {
+    Create(MvCreateStatement),
+    Unhandled,
+}
+
+pub(crate) fn project_statement(statement: &Statement) -> MvApplicationStatement {
+    match statement {
+        Statement::CreateMaterializedView(statement) => {
+            MvApplicationStatement::Create(MvCreateStatement::from(statement))
+        }
+        _ => MvApplicationStatement::Unhandled,
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MvRequestContext<'a> {
@@ -122,7 +253,7 @@ impl std::error::Error for MvEngineError {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PrepareMvCreateRequest<'a> {
-    pub statement: &'a CreateMaterializedViewStmt,
+    pub statement: &'a MvCreateStatement,
     pub context: MvRequestContext<'a>,
 }
 
@@ -147,7 +278,7 @@ pub trait MvApplicationService: Send + Sync {
     fn try_handle_statement(
         &self,
         engine: &dyn MvEngine,
-        statement: &Statement,
+        statement: &MvApplicationStatement,
         context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError>;
 }
@@ -189,10 +320,10 @@ impl MvApplicationService for UnavailableMvApplicationService {
     fn try_handle_statement(
         &self,
         _engine: &dyn MvEngine,
-        statement: &Statement,
+        statement: &MvApplicationStatement,
         _context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError> {
-        if matches!(statement, Statement::CreateMaterializedView(_)) {
+        if matches!(statement, MvApplicationStatement::Create(_)) {
             return Err(MvApplicationError::new(
                 MvApplicationErrorKind::Unavailable,
                 MV_REPOSITORY_UNAVAILABLE_MESSAGE,
