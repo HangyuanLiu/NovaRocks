@@ -263,6 +263,15 @@ pub struct PreparedMvCreate {
     pub repository_request: CreateMvRepositoryRequest,
 }
 
+impl PreparedMvCreate {
+    pub fn new(target: MvTarget, repository_request: CreateMvRepositoryRequest) -> Self {
+        Self {
+            target,
+            repository_request,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedMvTarget {
     pub target: MvTarget,

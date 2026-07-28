@@ -19,8 +19,8 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
 use iceberg::Catalog;
@@ -77,6 +77,10 @@ use crate::mv::analysis::refresh_property::{
 use crate::mv::analysis::{
     MvAnalysis, canonicalize_iceberg_mv_select_query, output_column_to_table_column,
     resolve_mv_name, validate_mv_partition_columns,
+};
+use crate::mv::application::{
+    CreatedMvTarget, MvCreateStatement, MvEngine, MvEngineError, MvEngineErrorKind,
+    PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
 };
 use crate::mv::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
@@ -146,6 +150,7 @@ use crate::mv::refresh::target_apply::{
     expose_physical_apply_key_for_locator_registration, find_apply_key_field_id_by_column,
     iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
+use crate::mv::repository::CreateMvRepositoryRequest;
 use crate::mv::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
 };
@@ -156,10 +161,10 @@ use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
-    DropMaterializedViewStmt, ObjectName, RefreshMaterializedViewStmt,
+    DropMaterializedViewStmt, IcebergPartitionFieldExpr, ObjectName, RefreshMaterializedViewStmt,
 };
 use mv_schema::MvPartitionContract;
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 
 pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
      its previous behavior (drop target + delete definition + recreate empty target) \
@@ -247,7 +252,689 @@ impl From<String> for IcebergMvRefreshExecutionError {
     }
 }
 
+/// Core adapter used by the frontend-owned MV application service. It keeps
+/// connector/analyzer state in core while exposing CREATE as auditable,
+/// side-effect-sized primitives.
+pub(crate) struct StandaloneMvEngine {
+    state: Arc<StandaloneState>,
+    preparations: Mutex<HashMap<String, Arc<IcebergMvCreatePreparation>>>,
+}
+
+struct IcebergMvCreatePreparation {
+    target: IcebergMvTarget,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    canonical_select_query: sqlparser::ast::Query,
+    analysis: MvAnalysis,
+    refresh_contract: ImvRefreshContract,
+    property: RefreshFragmentProperty,
+    base_refs: Vec<TableIdentity>,
+    dependencies: Vec<CreateMvDependencyRequest>,
+    loaded_bases: Vec<(
+        TableIdentity,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    )>,
+    expected_apply_key_field_id: i32,
+    created_at_ms: i64,
+    columns: Vec<crate::sql::parser::ast::TableColumnDef>,
+    partition_fields: Vec<IcebergPartitionFieldExpr>,
+    target_properties: Vec<(String, String)>,
+}
+
+impl StandaloneMvEngine {
+    pub(crate) fn new(state: Arc<StandaloneState>) -> Self {
+        Self {
+            state,
+            preparations: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn preparation_key(target: &MvTarget) -> String {
+        format!(
+            "{}.{}.{}",
+            target.catalog.as_deref().unwrap_or_default(),
+            target.database,
+            target.name
+        )
+    }
+
+    fn preparation(
+        &self,
+        plan: &PreparedMvCreate,
+    ) -> Result<Arc<IcebergMvCreatePreparation>, MvEngineError> {
+        self.preparation_for_target(&plan.target)
+    }
+
+    fn preparation_for_target(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Arc<IcebergMvCreatePreparation>, MvEngineError> {
+        self.preparations
+            .lock()
+            .map_err(|error| {
+                MvEngineError::new(
+                    MvEngineErrorKind::TargetOperation,
+                    format!("MV CREATE preparation lock poisoned: {error}"),
+                )
+            })?
+            .get(&Self::preparation_key(target))
+            .cloned()
+            .ok_or_else(|| {
+                MvEngineError::new(
+                    MvEngineErrorKind::InvalidRequest,
+                    "MV CREATE plan was not prepared by this engine",
+                )
+            })
+    }
+}
+
+impl MvEngine for StandaloneMvEngine {
+    fn prepare_create(
+        &self,
+        request: PrepareMvCreateRequest<'_>,
+        repository: &dyn crate::mv::repository::MvRepository,
+    ) -> Result<PreparedMvCreate, MvEngineError> {
+        let prepared = prepare_iceberg_mv_create(
+            &self.state,
+            request.context.current_catalog,
+            request.context.current_database,
+            request.statement,
+            repository,
+        )
+        .map_err(engine_prepare_error)?;
+        let target = MvTarget {
+            catalog: Some(prepared.target.catalog.clone()),
+            database: prepared.target.namespace.clone(),
+            name: prepared.target.table.clone(),
+        };
+        let repository_request = CreateMvRepositoryRequest {
+            definition: CreateMvDefinitionRequest {
+                select_sql: prepared.canonical_select_query.to_string(),
+                base_table_refs: prepared.base_refs.iter().map(TableIdentity::fqn).collect(),
+                primary_key_columns: request.statement.primary_key.clone().unwrap_or_default(),
+                storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
+                target_catalog: Some(prepared.target.catalog.clone()),
+                target_namespace: Some(prepared.target.namespace.clone()),
+                target_table: Some(prepared.target.table.clone()),
+                schema_contract: None,
+                partition_spec: None,
+                created_at_ms: prepared.created_at_ms,
+            },
+            refresh: initial_refresh_configuration_for_create(&request.statement.refresh_policy),
+            dependencies: prepared.dependencies.clone(),
+        };
+        self.preparations
+            .lock()
+            .map_err(|error| {
+                MvEngineError::new(
+                    MvEngineErrorKind::TargetOperation,
+                    format!("MV CREATE preparation lock poisoned: {error}"),
+                )
+            })?
+            .insert(Self::preparation_key(&target), Arc::new(prepared));
+        Ok(PreparedMvCreate::new(target, repository_request))
+    }
+
+    fn create_target(
+        &self,
+        plan: &PreparedMvCreate,
+        _operation_id: uuid::Uuid,
+    ) -> Result<CreatedMvTarget, MvEngineError> {
+        let prepared = self.preparation(plan)?;
+        crate::connector::iceberg::catalog::registry::create_table(
+            &prepared.entry,
+            &prepared.target.namespace,
+            &prepared.target.table,
+            &prepared.columns,
+            None,
+            &prepared.partition_fields,
+            &prepared.target_properties,
+        )
+        .map_err(engine_target_error)?;
+        prepared
+            .entry
+            .invalidate_table_cache(&prepared.target.namespace, &prepared.target.table);
+        let created = crate::connector::iceberg::catalog::load_table(
+            &prepared.entry,
+            &prepared.target.namespace,
+            &prepared.target.table,
+        )
+        .map_err(engine_target_error)?;
+        #[cfg(test)]
+        run_after_create_target_hook();
+        Ok(CreatedMvTarget {
+            target: plan.target.clone(),
+            table_uuid: created.table.metadata().uuid().to_string(),
+        })
+    }
+
+    fn inspect_created_target(
+        &self,
+        plan: &PreparedMvCreate,
+        _target: &CreatedMvTarget,
+    ) -> Result<PreparedMvDefinition, MvEngineError> {
+        let prepared = self.preparation(plan)?;
+        prepared
+            .entry
+            .invalidate_table_cache(&prepared.target.namespace, &prepared.target.table);
+        let target_loaded = crate::connector::iceberg::catalog::load_table(
+            &prepared.entry,
+            &prepared.target.namespace,
+            &prepared.target.table,
+        )
+        .map_err(engine_target_error)?;
+        let actual_apply_key_field_id = find_apply_key_field_id_by_column(
+            &target_loaded.table,
+            prepared.refresh_contract.apply_key.column_name,
+        )
+        .map_err(engine_target_error)?;
+        if actual_apply_key_field_id != prepared.expected_apply_key_field_id {
+            return Err(MvEngineError::new(
+                MvEngineErrorKind::TargetOperation,
+                format!(
+                    "Iceberg MV target apply-key field id mismatch: expected {}, got {actual_apply_key_field_id}",
+                    prepared.expected_apply_key_field_id
+                ),
+            ));
+        }
+        let schema_contract = build_iceberg_mv_schema_contract(
+            &prepared.refresh_contract,
+            &prepared.property,
+            &prepared.canonical_select_query,
+            &prepared.analysis,
+            &prepared.loaded_bases,
+            &prepared.target,
+            &target_loaded,
+            actual_apply_key_field_id,
+        )
+        .map_err(engine_target_error)?;
+        let mut repository_request = plan.repository_request.clone();
+        repository_request.definition.schema_contract = Some(schema_contract.clone());
+        repository_request.definition.partition_spec = schema_contract.target.partition.clone();
+        Ok(PreparedMvDefinition { repository_request })
+    }
+
+    fn sync_target_descriptor(
+        &self,
+        target: &CreatedMvTarget,
+        _definition: &StoredMvDefinition,
+    ) -> Result<(), MvEngineError> {
+        let target = IcebergMvTarget {
+            catalog: target.target.catalog.clone().ok_or_else(|| {
+                MvEngineError::new(
+                    MvEngineErrorKind::DescriptorSync,
+                    "Iceberg MV target has no catalog",
+                )
+            })?,
+            namespace: target.target.database.clone(),
+            table: target.target.name.clone(),
+        };
+        sync_iceberg_mv_descriptor_for_target(&self.state, &target)
+            .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
+    }
+
+    fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
+        let preparation_key = Self::preparation_key(&target.target);
+        let target = IcebergMvTarget {
+            catalog: target.target.catalog.clone().ok_or_else(|| {
+                MvEngineError::new(
+                    MvEngineErrorKind::CatalogRegistration,
+                    "Iceberg MV target has no catalog",
+                )
+            })?,
+            namespace: target.target.database.clone(),
+            table: target.target.name.clone(),
+        };
+        register_iceberg_mv_target_in_catalog(&self.state, &target)
+            .map_err(|error| MvEngineError::new(MvEngineErrorKind::CatalogRegistration, error))?;
+        self.preparations
+            .lock()
+            .map_err(|error| {
+                MvEngineError::new(
+                    MvEngineErrorKind::CatalogRegistration,
+                    format!("MV CREATE preparation lock poisoned: {error}"),
+                )
+            })?
+            .remove(&preparation_key);
+        Ok(())
+    }
+
+    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
+        let prepared = self.preparation_for_target(&target.target)?;
+        crate::connector::iceberg::catalog::registry::drop_table(
+            &prepared.entry,
+            &prepared.target.namespace,
+            &prepared.target.table,
+        )
+        .map_err(engine_target_error)?;
+        self.preparations
+            .lock()
+            .map_err(|error| {
+                MvEngineError::new(
+                    MvEngineErrorKind::TargetOperation,
+                    format!("MV CREATE preparation lock poisoned: {error}"),
+                )
+            })?
+            .remove(&Self::preparation_key(&target.target));
+        Ok(())
+    }
+}
+
+fn engine_prepare_error(error: String) -> MvEngineError {
+    MvEngineError::new(MvEngineErrorKind::Analysis, error)
+}
+
+fn engine_target_error(error: String) -> MvEngineError {
+    MvEngineError::new(MvEngineErrorKind::TargetOperation, error)
+}
+
+fn initial_refresh_configuration_for_create(
+    policy: &crate::mv::application::MvCreateRefreshPolicy,
+) -> crate::mv::repository::InitialMvRefreshConfiguration {
+    let (policy, interval_ms) = match policy {
+        crate::mv::application::MvCreateRefreshPolicy::Manual => {
+            (StoredMvRefreshPolicy::Manual, None)
+        }
+        crate::mv::application::MvCreateRefreshPolicy::AsyncOnChange => {
+            (StoredMvRefreshPolicy::AsyncOnChange, None)
+        }
+        crate::mv::application::MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
+            (StoredMvRefreshPolicy::AsyncInterval, Some(*interval_ms))
+        }
+    };
+    crate::mv::repository::InitialMvRefreshConfiguration {
+        policy,
+        paused: false,
+        interval_ms,
+        max_staleness_ms: None,
+        next_refresh_after_ms: None,
+    }
+}
+
+fn refresh_policy_descriptor_json_for_create(
+    policy: &crate::mv::application::MvCreateRefreshPolicy,
+) -> serde_json::Value {
+    match policy {
+        crate::mv::application::MvCreateRefreshPolicy::Manual => serde_json::json!({
+            "policy": "DEFERRED_MANUAL", "interval_ms": null, "paused": false,
+        }),
+        crate::mv::application::MvCreateRefreshPolicy::AsyncOnChange => serde_json::json!({
+            "policy": "ASYNC_ON_CHANGE", "interval_ms": null, "paused": false,
+        }),
+        crate::mv::application::MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
+            serde_json::json!({
+                "policy": "ASYNC_INTERVAL", "interval_ms": interval_ms, "paused": false,
+            })
+        }
+    }
+}
+
+fn partition_fields_for_create(
+    fields: Option<&Vec<crate::mv::application::MvCreatePartitionField>>,
+) -> Vec<IcebergPartitionFieldExpr> {
+    fields
+        .into_iter()
+        .flatten()
+        .map(|field| match field {
+            crate::mv::application::MvCreatePartitionField::Identity { column } => {
+                IcebergPartitionFieldExpr::Identity {
+                    column: column.clone(),
+                }
+            }
+            crate::mv::application::MvCreatePartitionField::Year { column } => {
+                IcebergPartitionFieldExpr::Year {
+                    column: column.clone(),
+                }
+            }
+            crate::mv::application::MvCreatePartitionField::Month { column } => {
+                IcebergPartitionFieldExpr::Month {
+                    column: column.clone(),
+                }
+            }
+            crate::mv::application::MvCreatePartitionField::Day { column } => {
+                IcebergPartitionFieldExpr::Day {
+                    column: column.clone(),
+                }
+            }
+            crate::mv::application::MvCreatePartitionField::Hour { column } => {
+                IcebergPartitionFieldExpr::Hour {
+                    column: column.clone(),
+                }
+            }
+            crate::mv::application::MvCreatePartitionField::Bucket {
+                column,
+                num_buckets,
+            } => IcebergPartitionFieldExpr::Bucket {
+                column: column.clone(),
+                num_buckets: *num_buckets,
+            },
+            crate::mv::application::MvCreatePartitionField::Truncate { column, width } => {
+                IcebergPartitionFieldExpr::Truncate {
+                    column: column.clone(),
+                    width: *width,
+                }
+            }
+            crate::mv::application::MvCreatePartitionField::Void { column } => {
+                IcebergPartitionFieldExpr::Void {
+                    column: column.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn prepare_iceberg_mv_create(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &MvCreateStatement,
+    repository: &dyn crate::mv::repository::MvRepository,
+) -> Result<IcebergMvCreatePreparation, String> {
+    let storage_engine = stmt
+        .properties
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("storage_engine"))
+        .map(|(_, value)| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "iceberg".to_string());
+    match storage_engine.as_str() {
+        "iceberg" => {}
+        "starrocks" => return Err(
+            "storage_engine='starrocks' is no longer supported for standalone materialized views; use storage_engine='iceberg'".to_string(),
+        ),
+        _ => return Err(format!("unknown materialized view storage_engine `{storage_engine}`")),
+    }
+    let current_catalog = current_catalog.ok_or_else(|| {
+        "storage_engine='iceberg' requires current catalog to be an Iceberg catalog".to_string()
+    })?;
+    let (namespace, table) = match stmt.name_parts.as_slice() {
+        [table] => (
+            normalize_identifier(current_database)?,
+            normalize_identifier(table)?,
+        ),
+        [namespace, table] => (
+            normalize_identifier(namespace)?,
+            normalize_identifier(table)?,
+        ),
+        [catalog, namespace, table] if normalize_identifier(catalog)? == "default_catalog" => (
+            normalize_identifier(namespace)?,
+            normalize_identifier(table)?,
+        ),
+        [catalog, ..] => {
+            return Err(format!(
+                "materialized view name catalog must be `default_catalog`, got {}",
+                normalize_identifier(catalog)?
+            ));
+        }
+        _ => return Err("materialized view name must have one, two, or three parts".to_string()),
+    };
+    let target = IcebergMvTarget {
+        catalog: normalize_identifier(current_catalog)?,
+        namespace,
+        table,
+    };
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        if !catalogs.contains_catalog(current_catalog)? {
+            return Err(
+                "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
+                    .to_string(),
+            );
+        }
+        catalogs.get(&target.catalog)?
+    };
+    if iceberg_mv_target_exists(&entry, &target.namespace, &target.table)? {
+        return Err(format!(
+            "Iceberg MV target table {}.{}.{} already exists",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &stmt.select_query,
+        Some(current_catalog),
+        current_database,
+    );
+    let analysis = analyze_mv_select(
+        state,
+        Some(current_catalog),
+        current_database,
+        &canonical_select_query,
+    )?;
+    let refresh_contract = derive_imv_refresh_contract(&analysis)?;
+    let partition_fields = partition_fields_for_create(stmt.partition_by.as_ref());
+    validate_mv_partition_columns(Some(&partition_fields), &analysis.output_columns)?;
+    let created_at_ms = now_ms();
+    let resolved_dependencies =
+        crate::engine::mv::dependency::resolve_create_mv_dependencies_with_repository(
+            state,
+            repository,
+            &analysis.resolved_refs,
+            created_at_ms,
+        )?;
+    let dependency_target = crate::mv::dependency::model::iceberg_mv_dependency_ref(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    );
+    crate::engine::mv::dependency::validate_no_create_cycle_with_repository(
+        state,
+        repository,
+        &dependency_target,
+        &resolved_dependencies.dependencies,
+    )
+    .map_err(|e| {
+        format!(
+            "cannot create materialized view {}.{}.{}: {e}",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    let property = derive_fragment_property(&analysis.resolved_query)?;
+    let loaded_bases = load_all_bases_with_row_lineage(state, &resolved_dependencies.base_refs)?;
+    if let Some(pk_cols) = stmt.primary_key.as_deref() {
+        match &property.identity {
+            TargetIdentity::BaseRowId => validate_ivm_primary_key(pk_cols, &descriptor_from_loaded(&loaded_bases[0].1)).map_err(|e| e.to_string())?,
+            TargetIdentity::JoinRowKey(_, _) => return Err("iceberg-backed join materialized views do not support PRIMARY KEY in this phase".to_string()),
+            TargetIdentity::BranchScoped(_) => return Err("iceberg-backed UNION ALL materialized views do not support PRIMARY KEY in this phase".to_string()),
+            TargetIdentity::GroupRowId(_) => return Err("iceberg-backed aggregate materialized views do not support PRIMARY KEY".to_string()),
+        }
+    }
+    if !partition_fields.is_empty() && property.is_composed_aggregate_schema_contract_fallback() {
+        return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
+    }
+    let apply_key_column_name = refresh_contract.apply_key.column_name;
+    if analysis
+        .output_columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
+    {
+        return Err(format!(
+            "Iceberg MV output column name {apply_key_column_name} is reserved for internal apply key"
+        ));
+    }
+    if identity_needs_branch_id_column(&property.identity)
+        && analysis
+            .output_columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
+    {
+        return Err(format!(
+            "Iceberg MV output column name {BRANCH_ID_COLUMN_NAME} is reserved for internal branch id"
+        ));
+    }
+    let mut columns =
+        create_target_columns_from_property(&property, &canonical_select_query, &analysis)?;
+    if identity_needs_physical_apply_key_column(&property.identity) {
+        columns.push(create_apply_key_table_column(&refresh_contract.apply_key)?);
+    }
+    if identity_needs_branch_id_column(&property.identity) {
+        columns.push(branch_id_table_column());
+    }
+    let expected_apply_key_field_id = columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
+        .and_then(|idx| i32::try_from(idx + 1).ok())
+        .ok_or_else(|| {
+            format!(
+                "Iceberg MV target columns are missing apply-key column {apply_key_column_name}"
+            )
+        })?;
+    let aggregate_state_hidden_columns = aggregate_state_hidden_columns_from_property(
+        &property,
+        &canonical_select_query,
+        &analysis,
+    )?;
+    let mut descriptor_hidden_columns = Vec::new();
+    if identity_needs_physical_apply_key_column(&property.identity) {
+        descriptor_hidden_columns.push(apply_key_column_name.to_string());
+    }
+    if identity_needs_branch_id_column(&property.identity) {
+        descriptor_hidden_columns.push(BRANCH_ID_COLUMN_NAME.to_string());
+    }
+    descriptor_hidden_columns.extend(aggregate_state_hidden_columns.iter().cloned());
+    let descriptor = MvDescriptorV1 {
+        descriptor_version: MV_DESCRIPTOR_VERSION,
+        package_id: format!("{}.{}", target.namespace, target.table),
+        logical_sql: canonical_select_query.to_string(),
+        dialect: "starrocks".to_string(),
+        visible_columns: analysis
+            .output_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        hidden_columns: descriptor_hidden_columns,
+        base_dependencies: resolved_dependencies
+            .dependencies
+            .iter()
+            .map(descriptor_dependency_from_request)
+            .collect(),
+        schema_contract: None,
+        refresh_contract: Some(refresh_policy_descriptor_json_for_create(
+            &stmt.refresh_policy,
+        )),
+        created_at_ms,
+    };
+    let mut target_properties = vec![
+        ("format-version".to_string(), "3".to_string()),
+        ("write.row-lineage".to_string(), "true".to_string()),
+        (
+            APPLY_KEY_COLUMN_PROPERTY.to_string(),
+            apply_key_column_name.to_string(),
+        ),
+        (
+            APPLY_KEY_SOURCE_PROPERTY.to_string(),
+            create_apply_key_source_property(&refresh_contract.apply_key).to_string(),
+        ),
+        (
+            APPLY_KEY_FIELD_ID_PROPERTY.to_string(),
+            expected_apply_key_field_id.to_string(),
+        ),
+    ];
+    if !aggregate_state_hidden_columns.is_empty() {
+        target_properties.push((
+            HIDDEN_COLUMNS_PROPERTY.to_string(),
+            aggregate_state_hidden_columns.join(","),
+        ));
+    }
+    target_properties.extend(descriptor.to_storage_properties()?);
+    Ok(IcebergMvCreatePreparation {
+        target,
+        entry,
+        canonical_select_query,
+        analysis,
+        refresh_contract,
+        property,
+        base_refs: resolved_dependencies.base_refs,
+        dependencies: resolved_dependencies.dependencies,
+        loaded_bases,
+        expected_apply_key_field_id,
+        columns,
+        partition_fields,
+        target_properties,
+        created_at_ms,
+    })
+}
+
+/// Temporary core entrypoint retained until Task 9 installs the frontend
+/// application service at statement dispatch. It deliberately delegates every
+/// side-effect-sized step to `StandaloneMvEngine`; sequencing ownership moves
+/// to frontend as soon as the host wiring is enabled.
 pub(crate) fn create_iceberg_mv(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &CreateMaterializedViewStmt,
+) -> Result<StatementResult, String> {
+    let statement = MvCreateStatement::from(stmt);
+    let engine = StandaloneMvEngine::new(Arc::clone(state));
+    let plan = engine
+        .prepare_create(
+            PrepareMvCreateRequest {
+                statement: &statement,
+                context: crate::mv::application::MvRequestContext {
+                    current_catalog,
+                    current_database,
+                },
+            },
+            state.mv_repository.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+    let operation_id = uuid::Uuid::now_v7();
+    let target = engine
+        .create_target(&plan, operation_id)
+        .map_err(|error| error.to_string())?;
+    let definition = match engine.inspect_created_target(&plan, &target) {
+        Ok(definition) => definition,
+        Err(error) => {
+            return Err(legacy_cleanup_created_target(
+                &engine,
+                &target,
+                error.to_string(),
+            ));
+        }
+    };
+    let definition = match state
+        .mv_repository
+        .create(operation_id, definition.repository_request)
+    {
+        Ok(definition) => definition,
+        Err(error)
+            if error.kind() == crate::mv::repository::MvRepositoryErrorKind::CommitUnknown =>
+        {
+            return Err(error.to_string());
+        }
+        Err(error) => {
+            return Err(legacy_cleanup_created_target(
+                &engine,
+                &target,
+                format!("create iceberg MV repository metadata failed: {error}"),
+            ));
+        }
+    };
+    if let Err(error) = engine.sync_target_descriptor(&target, &definition) {
+        return Err(legacy_cleanup_created_target(
+            &engine,
+            &target,
+            error.to_string(),
+        ));
+    }
+    engine
+        .register_target(&target)
+        .map_err(|error| error.to_string())?;
+    Ok(StatementResult::Ok)
+}
+
+fn legacy_cleanup_created_target(
+    engine: &dyn MvEngine,
+    target: &CreatedMvTarget,
+    primary: String,
+) -> String {
+    let cleanup = engine.drop_created_target(target);
+    format!("{primary}; target cleanup={cleanup:?}")
+}
+
+#[cfg(test)]
+fn create_iceberg_mv_legacy_inline(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,

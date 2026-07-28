@@ -28,6 +28,7 @@ pub mod view;
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
 };
+pub use mv::FrontendMvService;
 pub use server::{
     FrontendGrpcEndpointOwnership, FrontendServerConfig, run_frontend_server,
     run_frontend_server_until_shutdown,

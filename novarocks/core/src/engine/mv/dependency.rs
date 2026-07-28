@@ -73,6 +73,20 @@ pub(crate) fn resolve_create_mv_dependencies(
     resolved_refs: &[ResolvedTableRef],
     created_at_ms: i64,
 ) -> Result<ResolvedCreateMvDependencies, String> {
+    resolve_create_mv_dependencies_with_repository(
+        state,
+        state.mv_repository.as_ref(),
+        resolved_refs,
+        created_at_ms,
+    )
+}
+
+pub(crate) fn resolve_create_mv_dependencies_with_repository(
+    state: &Arc<StandaloneState>,
+    repository: &dyn MvRepository,
+    resolved_refs: &[ResolvedTableRef],
+    created_at_ms: i64,
+) -> Result<ResolvedCreateMvDependencies, String> {
     let mut base_refs = Vec::new();
     let mut dependencies = Vec::new();
     for table_ref in resolved_refs {
@@ -82,8 +96,7 @@ pub(crate) fn resolve_create_mv_dependencies(
                 namespace,
                 table,
             } => {
-                let is_mv_dependency = state
-                    .mv_repository
+                let is_mv_dependency = repository
                     .find_by_target(&crate::mv::model::MvTarget {
                         catalog: Some(catalog.clone()),
                         database: namespace.clone(),
@@ -229,15 +242,27 @@ pub(crate) fn validate_no_create_cycle(
     new_target: &MvDependencyObjectRef,
     new_dependencies: &[CreateMvDependencyRequest],
 ) -> Result<(), String> {
-    let definitions = state
-        .mv_repository
+    validate_no_create_cycle_with_repository(
+        state,
+        state.mv_repository.as_ref(),
+        new_target,
+        new_dependencies,
+    )
+}
+
+pub(crate) fn validate_no_create_cycle_with_repository(
+    _state: &Arc<StandaloneState>,
+    repository: &dyn MvRepository,
+    new_target: &MvDependencyObjectRef,
+    new_dependencies: &[CreateMvDependencyRequest],
+) -> Result<(), String> {
+    let definitions = repository
         .list_definitions()
         .map_err(|e| format!("load MV definitions for dependency cycle check failed: {e}"))?;
     let mut edges = Vec::new();
     for definition in definitions {
-        let target = stored_definition_dependency_ref_from_state(state, &definition)?;
-        let dependencies = state
-            .mv_repository
+        let target = stored_definition_dependency_ref_from_state(_state, &definition)?;
+        let dependencies = repository
             .list_dependencies_by_downstream(definition.mv_id)
             .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?
             .into_iter()
