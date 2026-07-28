@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCancellation, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorNamespaceIdentity, ConnectorReadSelector,
-    ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
-    ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorListTablesRequest, ConnectorNamespaceIdentity, ConnectorOpenReaderRequest,
+    ConnectorReadSelector, ConnectorRequestContext, ConnectorSplitPlanningRequest,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
 };
 
 use super::iceberg::catalog::registry::{create_table, insert_rows};
@@ -163,4 +163,25 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     assert_eq!(splits.len(), 1);
     assert_eq!(splits[0].owner(), &instance_id);
     assert!(splits[0].estimated_bytes().is_some_and(|bytes| bytes > 0));
+    let mut reader = instance
+        .read()
+        .open_reader(
+            &splits[0],
+            ConnectorOpenReaderRequest {
+                expected_schema: resolved.schema,
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+                },
+                context: context(),
+            },
+        )
+        .expect("open reader");
+    let batch = reader
+        .next_batch()
+        .expect("read batch")
+        .expect("expected one batch");
+    assert_eq!(batch.num_rows(), 1);
+    assert!(reader.next_batch().expect("read EOS").is_none());
+    reader.close().expect("close reader");
 }

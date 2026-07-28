@@ -20,10 +20,12 @@
 //! contain only catalog/table identity and a snapshot pin; core code transports
 //! them as opaque bytes and never downcasts into Iceberg objects.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
@@ -39,6 +41,16 @@ use super::catalog::IcebergCatalogEntry;
 use super::catalog::registry::{
     IcebergCatalogRegistry, extract_data_files_with_stats_at, list_tables, load_table,
 };
+use super::scan_range::plan_iceberg_file_ranges;
+use crate::cache::{CacheOptions, DataCacheContext};
+use crate::common::ids::SlotId;
+use crate::connector::HdfsScanConfig;
+use crate::connector::hdfs::HdfsScanOp;
+use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+use crate::exec::node::BoxedExecIter;
+use crate::exec::node::scan::ScanOp;
+use crate::formats::FileFormatConfig;
+use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
 
 const PROVIDER_ID: &str = "iceberg";
 
@@ -163,6 +175,31 @@ impl IcebergConnectorInstance {
                     )
                 }),
         }
+    }
+
+    fn chunk_schema_for(&self, schema: &SchemaRef) -> Result<Arc<ChunkSchema>, ConnectorError> {
+        let slots = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let slot_id = u32::try_from(index + 1).map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "Iceberg projection has too many columns",
+                    )
+                })?;
+                Ok(ChunkSlotSchema::new_with_field(
+                    SlotId::new(slot_id),
+                    field.as_ref().clone(),
+                    None,
+                    None,
+                ))
+            })
+            .collect::<Result<Vec<_>, ConnectorError>>()?;
+        ChunkSchema::try_new(slots)
+            .map(Arc::new)
+            .map_err(|error| internal(format!("build Iceberg chunk schema: {error}")))
     }
 }
 
@@ -317,6 +354,8 @@ impl ConnectorRead for IcebergConnectorInstance {
                     table: scan.table.clone(),
                     snapshot_id,
                     path: file.path,
+                    projection: scan.projection.clone(),
+                    limit: scan.limit,
                 };
                 Ok(Some(ConnectorSplit::try_new(
                     self.instance_id.clone(),
@@ -351,11 +390,80 @@ impl ConnectorRead for IcebergConnectorInstance {
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
         self.validate_context(&request.context)?;
         ensure_owner(split.owner(), &self.instance_id)?;
-        let _: SplitPayload = decode_payload(split.payload(), "split")?;
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg SPI readers are enabled with the generic connector runtime",
-        ))
+        let split: SplitPayload = decode_payload(split.payload(), "split")?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        let output_schema = self.schema_for(&entry, &split.table, &split.projection)?;
+        if output_schema.as_ref() != request.expected_schema.as_ref() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg reader expected schema does not match its scan projection",
+            ));
+        }
+        let loaded = load_table(&entry, &split.table.namespace, &split.table.table)
+            .map_err(map_iceberg_error)?;
+        let file = extract_data_files_with_stats_at(&loaded.table, split.snapshot_id)
+            .map_err(map_iceberg_error)?
+            .into_iter()
+            .find(|file| file.path == split.path)
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "Iceberg split data file is absent from its pinned snapshot",
+                )
+            })?;
+        let ranges = plan_iceberg_file_ranges(
+            &super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(file),
+        )
+        .map_err(map_iceberg_error)?;
+        let chunk_schema = self.chunk_schema_for(&output_schema)?;
+        let columns = output_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>();
+        let batch_size = request.batch.max_rows.get();
+        let parquet = ParquetScanConfig {
+            columns,
+            chunk_schema: Arc::clone(&chunk_schema),
+            slot_kinds: vec![ParquetSlotKind::Regular; chunk_schema.slots().len()],
+            case_sensitive: true,
+            enable_page_index: false,
+            min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: Default::default(),
+            variant_path_predicates: Vec::new(),
+            batch_size: Some(batch_size),
+            datacache: DataCacheContext::external(
+                CacheOptions::from_query_options(None)
+                    .map_err(|error| internal(format!("default cache options: {error}")))?,
+            ),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: Some("spi_iceberg_reader".to_string()),
+            iceberg_output_schema: Some(Arc::clone(&output_schema)),
+            variant_path_columns: Vec::new(),
+            query_global_dicts: Default::default(),
+        };
+        let op = Arc::new(HdfsScanOp::new(HdfsScanConfig {
+            original_range_count: ranges.len(),
+            ranges,
+            has_more: false,
+            limit: split.limit.and_then(|limit| usize::try_from(limit).ok()),
+            profile_label: Some("spi_iceberg_reader".to_string()),
+            format: Some(FileFormatConfig::Parquet(parquet)),
+            object_store_config: loaded.object_store_config,
+            iceberg_table_locations: Default::default(),
+            query_global_dicts: Default::default(),
+            iceberg_runtime_pruning: None,
+        }));
+        let morsels = op.build_morsels().map_err(map_iceberg_error)?.morsels;
+        Ok(Box::new(IcebergBatchReader {
+            op,
+            morsels: VecDeque::from(morsels),
+            current: None,
+            context: request.context,
+            max_rows: request.batch.max_rows.get(),
+            max_bytes: request.batch.max_bytes.get(),
+            closed: false,
+        }))
     }
 }
 
@@ -378,6 +486,81 @@ struct SplitPayload {
     table: TablePayload,
     snapshot_id: i64,
     path: String,
+    projection: Vec<usize>,
+    limit: Option<u64>,
+}
+
+struct IcebergBatchReader {
+    op: Arc<HdfsScanOp>,
+    morsels: VecDeque<crate::exec::node::scan::ScanMorsel>,
+    current: Option<BoxedExecIter>,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    max_rows: usize,
+    max_bytes: usize,
+    closed: bool,
+}
+
+impl IcebergBatchReader {
+    fn validate_context(&self) -> Result<(), ConnectorError> {
+        if self.context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= self.context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ConnectorBatchReader for IcebergBatchReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        self.validate_context()?;
+        if self.closed {
+            return Ok(None);
+        }
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                match current.next() {
+                    Some(Ok(chunk)) => {
+                        let batch = chunk.batch;
+                        if batch.num_rows() > self.max_rows
+                            || batch.get_array_memory_size() > self.max_bytes
+                        {
+                            return Err(ConnectorError::new(
+                                ConnectorErrorKind::ResourceExhausted,
+                                "Iceberg reader exceeded its batch budget",
+                            ));
+                        }
+                        return Ok(Some(batch));
+                    }
+                    Some(Err(error)) => return Err(map_iceberg_error(error)),
+                    None => self.current = None,
+                }
+            }
+            let Some(morsel) = self.morsels.pop_front() else {
+                self.closed = true;
+                return Ok(None);
+            };
+            self.current = Some(
+                self.op
+                    .execute_iter(morsel, None, None)
+                    .map_err(map_iceberg_error)?,
+            );
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.current = None;
+        self.morsels.clear();
+        self.closed = true;
+        Ok(())
+    }
 }
 
 fn ensure_owner(

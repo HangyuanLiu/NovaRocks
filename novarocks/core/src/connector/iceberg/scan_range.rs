@@ -20,6 +20,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use arrow::datatypes::DataType;
 
 use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::connector::iceberg::delete_file::{
+    IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+};
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     IcebergTableInfo,
@@ -28,6 +31,7 @@ use crate::connector::iceberg::scan_planner::{
     IcebergScanHandle, iceberg_scan_handle, iceberg_split,
 };
 use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
+use crate::fs::scan_context::FileScanRange;
 use crate::runtime::scan_range;
 use novarocks_catalog::schema::ColumnDef;
 
@@ -166,6 +170,59 @@ pub(crate) fn plan_iceberg_scan_ranges(
     let scan = iceberg_scan_handle(scan)?;
     let scan_ranges = build_iceberg_native_scan_ranges(scan, splits, &ctx)?;
     Ok(PlannedIcebergScanRanges { scan_ranges })
+}
+
+/// Convert one provider-owned Iceberg data file into the core-owned file
+/// ranges consumed by the parquet/HDFS reader.  The caller deliberately does
+/// not receive an Iceberg scan handle: snapshot and split payloads stay
+/// opaque outside the provider.
+pub(crate) fn plan_iceberg_file_ranges(
+    file: &IcebergDataFileInfo,
+) -> Result<Vec<FileScanRange>, String> {
+    validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
+    let delete_files = file
+        .delete_files
+        .iter()
+        .map(|delete| IcebergDeleteFileSpec {
+            path: delete.path.clone(),
+            file_format: match delete.file_format {
+                IcebergDeleteFileFormat::Parquet => IcebergFileFormat::Parquet,
+                IcebergDeleteFileFormat::Puffin => IcebergFileFormat::Puffin,
+            },
+            file_content: match delete.file_content {
+                IcebergDeleteFileContent::Position => IcebergFileContent::PositionDeletes,
+                IcebergDeleteFileContent::Equality => IcebergFileContent::EqualityDeletes,
+            },
+            length: delete.length.and_then(|length| u64::try_from(length).ok()),
+            content_offset: delete.content_offset,
+            content_size_in_bytes: delete.content_size_in_bytes,
+        })
+        .collect::<Vec<_>>();
+    plan_hdfs_file_splits(file)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (offset, length))| {
+            let scan_range_id = i32::try_from(index)
+                .map_err(|_| "Iceberg file range index overflow".to_string())?;
+            Ok(FileScanRange {
+                path: file.path.clone(),
+                file_len: u64::try_from(file.size)
+                    .map_err(|_| format!("Iceberg file {} has negative size", file.path))?,
+                offset: u64::try_from(offset)
+                    .map_err(|_| format!("Iceberg file {} has negative offset", file.path))?,
+                length: u64::try_from(length)
+                    .map_err(|_| format!("Iceberg file {} has negative range length", file.path))?,
+                scan_range_id,
+                first_row_id: file.first_row_id,
+                data_sequence_number: file.data_sequence_number,
+                ivm_change_op: file.ivm_change_op,
+                included_positions: file.included_positions.clone(),
+                external_datacache: None,
+                delete_files: delete_files.clone(),
+                iceberg_file_pruning: None,
+            })
+        })
+        .collect()
 }
 
 fn build_iceberg_native_scan_ranges(
