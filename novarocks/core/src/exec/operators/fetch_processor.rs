@@ -41,7 +41,7 @@ use crate::proto;
 use crate::runtime::descriptor_snapshot::is_lake_row_position;
 use crate::runtime::descriptor_snapshot::{LookupNodeInfo, LookupNodesInfo};
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
-use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
@@ -50,6 +50,7 @@ pub struct FetchProcessorFactory {
     node_id: i32,
     target_node_id: i32,
     row_pos_descs: HashMap<i32, RowPositionDescriptor>,
+    output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
     nodes_info: Option<LookupNodesInfo>,
     output_chunk_schema: ChunkSchemaRef,
 }
@@ -59,6 +60,7 @@ impl FetchProcessorFactory {
         node_id: i32,
         target_node_id: i32,
         row_pos_descs: HashMap<i32, RowPositionDescriptor>,
+        output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
         nodes_info: Option<LookupNodesInfo>,
         output_chunk_schema: ChunkSchemaRef,
     ) -> Self {
@@ -67,6 +69,7 @@ impl FetchProcessorFactory {
             node_id,
             target_node_id,
             row_pos_descs,
+            output_slots_by_tuple,
             nodes_info,
             output_chunk_schema,
         }
@@ -84,6 +87,7 @@ impl OperatorFactory for FetchProcessorFactory {
             node_id: self.node_id,
             target_node_id: self.target_node_id,
             row_pos_descs: self.row_pos_descs.clone(),
+            output_slots_by_tuple: self.output_slots_by_tuple.clone(),
             nodes_info: self.nodes_info.clone(),
             output_chunk_schema: self.output_chunk_schema.clone(),
             pending_output: None,
@@ -97,6 +101,7 @@ struct FetchProcessor {
     node_id: i32,
     target_node_id: i32,
     row_pos_descs: HashMap<i32, RowPositionDescriptor>,
+    output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
     nodes_info: Option<LookupNodesInfo>,
     output_chunk_schema: ChunkSchemaRef,
     pending_output: Option<Chunk>,
@@ -151,14 +156,15 @@ impl FetchProcessor {
         let Some(query_id) = state.query_id() else {
             return Err("FETCH_NODE requires query_id".to_string());
         };
-        let snapshot = query_context_manager()
-            .descriptor_snapshot(query_id)
-            .ok_or_else(|| "descriptor snapshot missing for fetch".to_string())?;
         let output_chunk_schema = self.output_chunk_schema.clone();
 
         let mut fetched_columns: HashMap<SlotId, ArrayRef> = HashMap::new();
         for (tuple_id, row_pos_desc) in &self.row_pos_descs {
-            let output_slots = snapshot.lookup_output_slots(*tuple_id, row_pos_desc);
+            let output_slots = self
+                .output_slots_by_tuple
+                .get(tuple_id)
+                .cloned()
+                .unwrap_or_default();
             if output_slots.is_empty() {
                 continue;
             }

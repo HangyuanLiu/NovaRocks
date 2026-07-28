@@ -16,6 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 
+use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
 use crate::exec::row_position::RowPositionDescriptor;
@@ -27,6 +28,7 @@ pub struct FetchNode {
     pub node_id: i32,
     pub target_node_id: i32,
     pub row_pos_descs: HashMap<i32, RowPositionDescriptor>,
+    pub output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
     pub nodes_info: Option<LookupNodesInfo>,
     pub output_chunk_schema: ChunkSchemaRef,
 }

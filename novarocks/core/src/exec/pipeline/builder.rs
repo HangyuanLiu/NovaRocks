@@ -2071,6 +2071,7 @@ fn build_pipeline_for_node(
                     fetch.node_id,
                     fetch.target_node_id,
                     fetch.row_pos_descs.clone(),
+                    fetch.output_slots_by_tuple.clone(),
                     fetch.nodes_info.clone(),
                     fetch.output_chunk_schema.clone(),
                 )));

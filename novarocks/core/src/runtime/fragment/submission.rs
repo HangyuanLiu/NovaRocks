@@ -2123,6 +2123,7 @@ mod tests {
                     node_id: 30,
                     target_node_id: 10,
                     row_pos_descs: HashMap::new(),
+                    output_slots_by_tuple: HashMap::new(),
                     nodes_info: None,
                     output_chunk_schema: output_schema,
                 }),
