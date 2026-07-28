@@ -22,14 +22,21 @@ use novarocks::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
     MvMetaRepository, MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState,
     RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
-    RefreshExternalOutcome, ReplaceMvPartitionStatesRequest, UpdateMvRefreshMetadataRequest,
-    UpdateStarRocksMvRefreshSummaryRequest,
+    RefreshExternalOutcome, ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
+    UpdateMvRefreshMetadataRequest, UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::meta::{MetaKeyPrefix, MetaStoreProvider, SqliteMetaStoreProvider};
 use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks::mv::persistence::definition::StoredMvRefreshPolicy;
+use novarocks::mv::persistence::dependency::StoredMvDependency;
+use novarocks::mv::persistence::schema::{
+    ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+    ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+    MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
+    TargetContract, TargetVisibleColumn,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -55,6 +62,78 @@ fn iceberg_table(namespace: &str, table: &str) -> MvDependencyObjectRef {
         name: table.to_string(),
         object_type: MvDependencyObjectType::Table,
         storage_engine: MvDependencyStorageEngine::Iceberg,
+    }
+}
+
+fn sample_partition_contract(spec_id: i32) -> MvPartitionContract {
+    MvPartitionContract {
+        target_spec_id: spec_id,
+        fields: vec![MvPartitionFieldContract {
+            partition_field_id: 1000 + spec_id,
+            partition_field_name: if spec_id == 3 {
+                "id_bucket_16".to_string()
+            } else {
+                "id".to_string()
+            },
+            source_target_field_id: 10,
+            source_column_name: "id".to_string(),
+            transform: if spec_id == 3 {
+                MvPartitionTransformContract::Bucket { num_buckets: 16 }
+            } else {
+                MvPartitionTransformContract::Identity
+            },
+        }],
+    }
+}
+
+fn sample_schema_contract(partition: MvPartitionContract) -> MvSchemaContract {
+    MvSchemaContract {
+        contract_version: 1,
+        base: BaseContract {
+            table_fqn: "ice.sales.orders".to_string(),
+            table_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+            alias_at_create: Some("orders".to_string()),
+            schema_id_at_create: 7,
+            schema_at_create: BaseSchemaSnapshot {
+                fields: vec![BaseFieldRecord {
+                    field_id: 1,
+                    name_at_create: "id".to_string(),
+                    type_signature: "long".to_string(),
+                    required: true,
+                }],
+            },
+        },
+        bases: vec![],
+        output: OutputContract {
+            columns: vec![OutputColumnLineage {
+                expression: ExpressionLineage {
+                    kind: ExpressionKind::Column,
+                    referenced_base_field_ids: vec![1],
+                    referenced_base_fields: vec![],
+                },
+            }],
+            filter: None,
+        },
+        join: None,
+        aggregate: None,
+        branch: None,
+        target: TargetContract {
+            table_fqn: "ice.analytics.orders_mv".to_string(),
+            table_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
+            schema_id_at_create: 11,
+            visible_columns: vec![TargetVisibleColumn {
+                output_name: "id".to_string(),
+                target_field_id: 10,
+                type_signature: "long".to_string(),
+                nullable: false,
+            }],
+            hidden_apply_key: HiddenApplyKeyContract {
+                column_name: "__nova_base_row_id".to_string(),
+                target_field_id: 99,
+                source: ApplyKeySource::BaseRowId,
+            },
+            partition: Some(partition),
+        },
     }
 }
 
@@ -108,6 +187,26 @@ fn definition_ledger_freezes_compound_records_and_public_reads() -> TestResult {
             ),
         ]
     );
+    {
+        let read = provider.begin_read()?;
+        let definition = repository
+            .load_by_id(read.as_ref(), first_id)?
+            .expect("created definition");
+        assert_eq!(definition.select_sql, "SELECT id FROM ice.sales.orders_mv");
+        assert_eq!(definition.base_table_refs, vec!["ice.sales.orders_mv"]);
+        assert_eq!(definition.primary_key_columns, vec!["id"]);
+        assert_eq!(definition.storage_engine, "iceberg");
+        assert_eq!(definition.target_catalog.as_deref(), Some("ice"));
+        assert_eq!(definition.target_namespace.as_deref(), Some("analytics"));
+        assert_eq!(definition.target_table.as_deref(), Some("orders_mv"));
+        assert_eq!(definition.created_at_ms, 1_700_000_000_000);
+        assert_eq!(
+            repository
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("target index"),
+            definition
+        );
+    }
 
     {
         let mut txn = provider.begin_write("reserve and create explicit MV")?;
@@ -117,6 +216,34 @@ fn definition_ledger_freezes_compound_records_and_public_reads() -> TestResult {
     }
     let fourth_id = create_definition(&provider, &repository, "customer_mv")?;
     assert_eq!(fourth_id, 4, "reserved IDs advance the shared allocator");
+    {
+        let read = provider.begin_read()?;
+        let definitions = repository.list_definitions(read.as_ref())?;
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| (definition.mv_id, definition.target_table.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some("orders_mv")),
+                (3, Some("lineitem_mv")),
+                (4, Some("customer_mv")),
+            ]
+        );
+        for definition in definitions {
+            assert_eq!(
+                repository
+                    .find_by_target(
+                        read.as_ref(),
+                        definition.target_catalog.as_deref().unwrap(),
+                        definition.target_namespace.as_deref().unwrap(),
+                        definition.target_table.as_deref().unwrap(),
+                    )?
+                    .expect("companion target index"),
+                definition
+            );
+        }
+    }
 
     {
         let mut txn = provider.begin_write("update MV metadata")?;
@@ -136,6 +263,27 @@ fn definition_ledger_freezes_compound_records_and_public_reads() -> TestResult {
         txn.commit()?;
     }
     {
+        let read = provider.begin_read()?;
+        let updated = repository
+            .load_by_id(read.as_ref(), first_id)?
+            .expect("updated definition");
+        assert_eq!(updated.refresh_policy, StoredMvRefreshPolicy::AsyncInterval);
+        assert!(updated.refresh_paused);
+        assert_eq!(updated.refresh_interval_ms, Some(60_000));
+        assert_eq!(updated.max_staleness_ms, Some(120_000));
+        assert_eq!(
+            updated.last_scheduler_error.as_deref(),
+            Some("scheduler paused")
+        );
+        assert_eq!(updated.next_refresh_after_ms, Some(1_700_000_060_000));
+        assert_eq!(
+            repository
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("target index after metadata update"),
+            updated
+        );
+    }
+    {
         let mut txn = provider.begin_write("set rebuilt MV watermark")?;
         repository.set_rebuilt_refresh_watermark(
             txn.as_mut(),
@@ -153,6 +301,10 @@ fn definition_ledger_freezes_compound_records_and_public_reads() -> TestResult {
             .expect("definition by id");
         assert_eq!(loaded.last_refresh_snapshots["ice.sales.orders"], 7);
         assert_eq!(
+            loaded.last_refresh_table_uuids["ice.sales.orders"],
+            "uuid-7"
+        );
+        assert_eq!(
             repository
                 .load_versioned_by_id(read.as_ref(), first_id)?
                 .expect("versioned definition")
@@ -162,9 +314,8 @@ fn definition_ledger_freezes_compound_records_and_public_reads() -> TestResult {
         assert_eq!(
             repository
                 .find_by_target(read.as_ref(), "ICE", "ANALYTICS", "ORDERS_MV")?
-                .expect("case-normalized target")
-                .mv_id,
-            first_id
+                .expect("case-normalized target"),
+            loaded
         );
         assert_eq!(
             repository
@@ -215,6 +366,25 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
             ("refresh/1".to_string(), "mv.refresh".to_string()),
         ]
     );
+    {
+        let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), simple_refresh_id)?
+            .expect("simple refresh intent");
+        assert_eq!(refresh.mv_id, mv_id);
+        assert_eq!(refresh.state, MvRefreshState::IntentCreated);
+        assert_eq!(refresh.target_snapshots["ice.sales.orders"], 10);
+        assert_eq!(refresh.external_outcome, None);
+        let definition = repository
+            .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+            .expect("target index while refresh is active");
+        assert!(definition.refresh_in_progress);
+        assert_eq!(definition.active_refresh_id, Some(simple_refresh_id));
+        assert_eq!(
+            definition.refresh_target_snapshots,
+            refresh.target_snapshots
+        );
+    }
 
     {
         let mut txn = provider.begin_write("record external outcome")?;
@@ -227,6 +397,25 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
             },
         )?;
         txn.commit()?;
+    }
+    {
+        let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), simple_refresh_id)?
+            .expect("refresh after external outcome");
+        assert_eq!(refresh.state, MvRefreshState::PublishCommitted);
+        assert_eq!(
+            refresh.external_outcome,
+            Some(RefreshExternalOutcome {
+                target_snapshot_id: Some(20),
+                commit_id: "commit-20".to_string(),
+            })
+        );
+        let definition = repository
+            .load_by_id(read.as_ref(), mv_id)?
+            .expect("definition after external outcome");
+        assert!(definition.refresh_in_progress);
+        assert_eq!(definition.active_refresh_id, Some(simple_refresh_id));
     }
     {
         let mut txn = provider.begin_write("finalize simple refresh")?;
@@ -251,6 +440,16 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
             .load_refresh(read.as_ref(), simple_refresh_id)?
             .expect("simple refresh");
         assert_eq!(refresh.state, MvRefreshState::Finalized);
+        assert_eq!(refresh.rows, None);
+        assert_eq!(refresh.target_snapshots["ice.sales.orders"], 10);
+        assert!(refresh.base_table_uuids.is_empty());
+        assert_eq!(
+            refresh
+                .external_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.target_snapshot_id),
+            Some(20)
+        );
         let definition = repository
             .load_by_id(read.as_ref(), mv_id)?
             .expect("definition");
@@ -281,6 +480,26 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
         )?);
         txn.commit()?;
     }
+    {
+        let read = provider.begin_read()?;
+        let definition = repository
+            .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+            .expect("definition after summary update");
+        assert_eq!(definition.last_refresh_ms, Some(200));
+        assert_eq!(definition.last_refresh_rows, Some(7));
+        assert_eq!(definition.last_refresh_snapshots["ice.sales.orders"], 12);
+        assert_eq!(
+            definition.last_refresh_table_uuids["ice.sales.orders"],
+            "uuid-orders"
+        );
+        assert_eq!(
+            repository
+                .load_refresh(read.as_ref(), simple_refresh_id)?
+                .expect("finalized refresh remains unchanged")
+                .state,
+            MvRefreshState::Finalized
+        );
+    }
 
     let staged_refresh_id = {
         let mut txn = provider.begin_write("begin branch-staged refresh")?;
@@ -303,6 +522,22 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
     };
     {
         let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), staged_refresh_id)?
+            .expect("branch-staged refresh intent");
+        assert_eq!(refresh.mv_id, mv_id);
+        assert_eq!(refresh.operation_id, Some(91));
+        assert_eq!(refresh.state, MvRefreshState::IntentCreated);
+        assert_eq!(refresh.target_catalog.as_deref(), Some("ice"));
+        assert_eq!(refresh.target_namespace.as_deref(), Some("analytics"));
+        assert_eq!(refresh.target_table.as_deref(), Some("orders_mv"));
+        assert_eq!(refresh.staging_branch.as_deref(), Some("nr_refresh_91"));
+        assert_eq!(refresh.expected_main_snapshot_id, Some(20));
+        assert_eq!(
+            refresh.marker.as_ref().map(|marker| marker.token.as_str()),
+            Some("marker-91")
+        );
+        assert_eq!(refresh.target_snapshots["ice.sales.orders"], 11);
         assert_eq!(
             repository
                 .list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())?
@@ -329,6 +564,21 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
         txn.commit()?;
     }
     {
+        let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), staged_refresh_id)?
+            .expect("staging commit");
+        assert_eq!(refresh.state, MvRefreshState::StagingCommitted);
+        assert_eq!(refresh.staging_snapshot_id, Some(21));
+        assert_eq!(refresh.rows, Some(6));
+        assert_eq!(refresh.base_table_uuids["ice.sales.orders"], "uuid-orders");
+        let definition = repository
+            .load_by_id(read.as_ref(), mv_id)?
+            .expect("definition after staging commit");
+        assert!(definition.refresh_in_progress);
+        assert_eq!(definition.active_refresh_id, Some(staged_refresh_id));
+    }
+    {
         let mut txn = provider.begin_write("record publish commit")?;
         repository.record_publish_commit(
             txn.as_mut(),
@@ -338,6 +588,28 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
             },
         )?;
         txn.commit()?;
+    }
+    {
+        let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), staged_refresh_id)?
+            .expect("publish commit");
+        assert_eq!(refresh.state, MvRefreshState::PublishCommitted);
+        assert_eq!(refresh.published_snapshot_id, Some(22));
+        assert_eq!(
+            refresh
+                .external_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.target_snapshot_id),
+            Some(22)
+        );
+        assert_eq!(
+            repository
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("definition after publish commit")
+                .active_refresh_id,
+            Some(staged_refresh_id)
+        );
     }
     {
         let mut txn = provider.begin_write("finalize branch-staged refresh")?;
@@ -355,6 +627,22 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
             },
         )?;
         txn.commit()?;
+    }
+    {
+        let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), staged_refresh_id)?
+            .expect("finalized staged refresh");
+        assert_eq!(refresh.state, MvRefreshState::Finalized);
+        assert_eq!(refresh.rows, Some(6));
+        assert_eq!(refresh.published_snapshot_id, Some(22));
+        let definition = repository
+            .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+            .expect("definition after finalization");
+        assert!(!definition.refresh_in_progress);
+        assert_eq!(definition.active_refresh_id, None);
+        assert_eq!(definition.last_refresh_rows, Some(6));
+        assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(22));
     }
 
     let aborted_refresh_id = {
@@ -377,6 +665,13 @@ fn refresh_ledger_freezes_state_transitions_and_compound_definition_updates() ->
             repository
                 .load_by_id(read.as_ref(), mv_id)?
                 .expect("definition")
+                .active_refresh_id,
+            None
+        );
+        assert_eq!(
+            repository
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("target index after clear")
                 .active_refresh_id,
             None
         );
@@ -420,7 +715,85 @@ fn partition_ledger_freezes_replace_fail_clear_and_snapshot_adoption() -> TestRe
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
     let repository = MvMetaRepository;
-    let mv_id = create_definition(&provider, &repository, "orders_mv")?;
+    let old_partition = sample_partition_contract(3);
+    let new_partition = sample_partition_contract(4);
+    let mv_id = {
+        let mut txn = provider.begin_write("create partitioned MV definition")?;
+        let mut create = request("orders_mv");
+        create.partition_spec = Some(old_partition.clone());
+        create.schema_contract = Some(sample_schema_contract(old_partition));
+        let definition = repository.create_definition(txn.as_mut(), create)?;
+        txn.commit()?;
+        definition.mv_id
+    };
+    let revision_before_partition_update = {
+        let read = provider.begin_read()?;
+        repository
+            .load_versioned_by_id(read.as_ref(), mv_id)?
+            .expect("versioned definition before partition update")
+            .record_revision
+    };
+    {
+        let mut txn = provider.begin_write("update partition contract")?;
+        let updated = repository.update_partition_contract(
+            txn.as_mut(),
+            UpdateMvPartitionContractRequest {
+                mv_id,
+                partition_spec: new_partition.clone(),
+            },
+        )?;
+        assert_eq!(updated.partition_spec.as_ref(), Some(&new_partition));
+        assert_eq!(
+            updated
+                .schema_contract
+                .as_ref()
+                .and_then(|contract| contract.target.partition.as_ref()),
+            Some(&new_partition)
+        );
+        assert!(!updated.partition_state_complete);
+        txn.commit()?;
+    }
+    {
+        let read = provider.begin_read()?;
+        let versioned = repository
+            .load_versioned_by_id(read.as_ref(), mv_id)?
+            .expect("versioned definition after partition update");
+        assert_ne!(
+            versioned.record_revision, revision_before_partition_update,
+            "partition contract update must persist a new definition revision"
+        );
+        assert_eq!(
+            versioned.value.partition_spec.as_ref(),
+            Some(&new_partition)
+        );
+        assert_eq!(
+            versioned
+                .value
+                .schema_contract
+                .as_ref()
+                .and_then(|contract| contract.target.partition.as_ref()),
+            Some(&new_partition)
+        );
+        assert!(!versioned.value.partition_state_complete);
+        assert_eq!(
+            repository
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("target lookup after partition update"),
+            versioned.value,
+            "target lookup must resolve the updated persisted definition"
+        );
+        assert_eq!(
+            mv_records(&provider)?,
+            vec![
+                ("by-id/1".to_string(), "mv.definition".to_string()),
+                (
+                    "by-target/ice/analytics/orders_mv".to_string(),
+                    "mv.target_lookup".to_string(),
+                ),
+            ],
+            "updating the definition must leave the target index intact"
+        );
+    }
 
     let refresh_id = {
         let mut txn = provider.begin_write("seed refresh baseline")?;
@@ -485,6 +858,31 @@ fn partition_ledger_freezes_replace_fail_clear_and_snapshot_adoption() -> TestRe
             ("refresh/1".to_string(), "mv.refresh".to_string()),
         ]
     );
+    {
+        let read = provider.begin_read()?;
+        let states = repository.list_partition_states(read.as_ref(), mv_id)?;
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| state.partition_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["region=east", "region=west/slash"]
+        );
+        for state in &states {
+            assert_eq!(state.mv_id, mv_id);
+            assert_eq!(state.status, MvPartitionRefreshStatus::Fresh);
+            assert_eq!(state.last_refresh_ms, Some(100));
+            assert_eq!(state.base_snapshots["ice.sales.orders"], 7);
+            assert_eq!(state.target_snapshot_id, Some(10));
+            assert_eq!(state.last_refresh_id, Some(refresh_id));
+            assert_eq!(state.failure_message, None);
+        }
+        let definition = repository
+            .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+            .expect("definition after partition replacement");
+        assert!(definition.partition_state_complete);
+        assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(10));
+    }
 
     {
         let mut txn = provider.begin_write("replace with failed partition state")?;
@@ -507,8 +905,19 @@ fn partition_ledger_freezes_replace_fail_clear_and_snapshot_adoption() -> TestRe
         let read = provider.begin_read()?;
         let states = repository.list_partition_states(read.as_ref(), mv_id)?;
         assert_eq!(states.len(), 1);
+        assert_eq!(states[0].mv_id, mv_id);
+        assert_eq!(states[0].partition_key, "region=east");
         assert_eq!(states[0].status, MvPartitionRefreshStatus::Failed);
         assert_eq!(states[0].failure_message.as_deref(), Some("writer failed"));
+        assert_eq!(states[0].last_refresh_ms, Some(101));
+        assert_eq!(states[0].base_snapshots["ice.sales.orders"], 8);
+        assert_eq!(states[0].target_snapshot_id, Some(10));
+        assert_eq!(states[0].last_refresh_id, Some(refresh_id + 1));
+        let definition = repository
+            .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+            .expect("definition after failed partition write");
+        assert!(definition.partition_state_complete);
+        assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(10));
     }
 
     {
@@ -531,6 +940,20 @@ fn partition_ledger_freezes_replace_fail_clear_and_snapshot_adoption() -> TestRe
                 .expect("definition")
                 .last_refreshed_iceberg_snapshot_id,
             Some(11)
+        );
+        assert_eq!(
+            repository
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("target index after compaction adoption")
+                .last_refreshed_iceberg_snapshot_id,
+            Some(11)
+        );
+        let states = repository.list_partition_states(read.as_ref(), mv_id)?;
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0].target_snapshot_id,
+            Some(10),
+            "compaction adoption updates the definition watermark, not partition-state DTOs"
         );
     }
 
@@ -555,6 +978,13 @@ fn partition_ledger_freezes_replace_fail_clear_and_snapshot_adoption() -> TestRe
             .load_by_id(read.as_ref(), mv_id)?
             .expect("definition")
             .partition_state_complete
+    );
+    assert_eq!(
+        repository
+            .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+            .expect("target index after partition clear")
+            .partition_state_complete,
+        false
     );
     Ok(())
 }
@@ -611,20 +1041,48 @@ fn dependency_ledger_freezes_both_indexes_replace_delete_guard_and_drop_cleanup(
     {
         let read = provider.begin_read()?;
         assert_eq!(
-            repository
-                .list_dependencies_by_downstream(read.as_ref(), first_mv_id)?
-                .into_iter()
-                .map(|dependency| dependency.upstream.name)
-                .collect::<Vec<_>>(),
-            vec!["customers", "orders"]
+            repository.list_dependencies_by_downstream(read.as_ref(), first_mv_id)?,
+            vec![
+                StoredMvDependency {
+                    downstream_mv_id: first_mv_id,
+                    upstream: customers.clone(),
+                    created_at_ms: 11,
+                },
+                StoredMvDependency {
+                    downstream_mv_id: first_mv_id,
+                    upstream: orders.clone(),
+                    created_at_ms: 10,
+                },
+            ]
+        );
+        assert_eq!(
+            repository.list_downstream_dependencies(read.as_ref(), &orders)?,
+            vec![
+                StoredMvDependency {
+                    downstream_mv_id: first_mv_id,
+                    upstream: orders.clone(),
+                    created_at_ms: 10,
+                },
+                StoredMvDependency {
+                    downstream_mv_id: second_mv_id,
+                    upstream: orders.clone(),
+                    created_at_ms: 12,
+                },
+            ]
         );
         assert_eq!(
             repository
-                .list_downstream_dependencies(read.as_ref(), &orders)?
-                .into_iter()
-                .map(|dependency| dependency.downstream_mv_id)
-                .collect::<Vec<_>>(),
-            vec![first_mv_id, second_mv_id]
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("first target index")
+                .mv_id,
+            first_mv_id
+        );
+        assert_eq!(
+            repository
+                .find_by_target(read.as_ref(), "ice", "analytics", "lineitem_mv")?
+                .expect("second target index")
+                .mv_id,
+            second_mv_id
         );
         let err = repository
             .ensure_no_downstream_dependencies(read.as_ref(), &orders)
@@ -650,20 +1108,35 @@ fn dependency_ledger_freezes_both_indexes_replace_delete_guard_and_drop_cleanup(
     {
         let read = provider.begin_read()?;
         assert_eq!(
-            repository
-                .list_downstream_dependencies(read.as_ref(), &orders)?
-                .into_iter()
-                .map(|dependency| dependency.downstream_mv_id)
-                .collect::<Vec<_>>(),
-            vec![second_mv_id]
+            repository.list_downstream_dependencies(read.as_ref(), &orders)?,
+            vec![StoredMvDependency {
+                downstream_mv_id: second_mv_id,
+                upstream: orders.clone(),
+                created_at_ms: 12,
+            }]
+        );
+        assert_eq!(
+            repository.list_downstream_dependencies(read.as_ref(), &customers)?,
+            vec![StoredMvDependency {
+                downstream_mv_id: first_mv_id,
+                upstream: customers.clone(),
+                created_at_ms: 20,
+            }]
+        );
+        assert_eq!(
+            repository.list_dependencies_by_downstream(read.as_ref(), first_mv_id)?,
+            vec![StoredMvDependency {
+                downstream_mv_id: first_mv_id,
+                upstream: customers.clone(),
+                created_at_ms: 20,
+            }]
         );
         assert_eq!(
             repository
-                .list_downstream_dependencies(read.as_ref(), &customers)?
-                .into_iter()
-                .map(|dependency| dependency.downstream_mv_id)
-                .collect::<Vec<_>>(),
-            vec![first_mv_id]
+                .find_by_target(read.as_ref(), "ice", "analytics", "orders_mv")?
+                .expect("first target index after dependency replacement")
+                .mv_id,
+            first_mv_id
         );
     }
 

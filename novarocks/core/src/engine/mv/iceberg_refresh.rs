@@ -14134,6 +14134,11 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::{
+        ExpectedRevision, IdScope, MetaCommitOutcome, MetaError, MetaErrorKind, MetaKey,
+        MetaReadTxn, MetaRecord, MetaRecordPut, MetaStoreCapabilities, MetaStoreProvider,
+        MetaWriteTxn,
+    };
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::PartitionPruningPolicy;
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -16761,6 +16766,196 @@ mod tests {
         _metadata_dir: TempDir,
         _warehouse_dir: TempDir,
         _loopback_backend: crate::engine::StandaloneLoopbackTestBackend,
+    }
+
+    struct TestMetaStoreProvider {
+        inner: Arc<crate::meta::SqliteMetaStoreProvider>,
+        reject_write_message: Option<&'static str>,
+        fail_reads: Option<(Arc<std::sync::atomic::AtomicBool>, &'static str)>,
+        after_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl TestMetaStoreProvider {
+        fn reject_writes(
+            inner: Arc<crate::meta::SqliteMetaStoreProvider>,
+            message: &'static str,
+        ) -> Self {
+            Self {
+                inner,
+                reject_write_message: Some(message),
+                fail_reads: None,
+                after_commit: None,
+            }
+        }
+
+        fn fail_reads_after_commit(
+            inner: Arc<crate::meta::SqliteMetaStoreProvider>,
+            fail_reads: Arc<std::sync::atomic::AtomicBool>,
+            message: &'static str,
+        ) -> Self {
+            let flag = Arc::clone(&fail_reads);
+            Self {
+                inner,
+                reject_write_message: None,
+                fail_reads: Some((fail_reads, message)),
+                after_commit: Some(Arc::new(move || {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                })),
+            }
+        }
+
+        fn after_commit(
+            inner: Arc<crate::meta::SqliteMetaStoreProvider>,
+            after_commit: Arc<dyn Fn() + Send + Sync>,
+        ) -> Self {
+            Self {
+                inner,
+                reject_write_message: None,
+                fail_reads: None,
+                after_commit: Some(after_commit),
+            }
+        }
+    }
+
+    impl MetaStoreProvider for TestMetaStoreProvider {
+        fn provider_name(&self) -> &'static str {
+            "test-instrumented-sqlite"
+        }
+
+        fn capabilities(&self) -> MetaStoreCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn begin_read(&self) -> Result<Box<dyn MetaReadTxn>, MetaError> {
+            if let Some((flag, message)) = &self.fail_reads
+                && flag.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(MetaError::new(MetaErrorKind::Transient, *message));
+            }
+            self.inner.begin_read()
+        }
+
+        fn begin_write(&self, purpose: &str) -> Result<Box<dyn MetaWriteTxn>, MetaError> {
+            if let Some(message) = self.reject_write_message {
+                return Err(MetaError::new(
+                    MetaErrorKind::DefiniteCommitFailure,
+                    message,
+                ));
+            }
+            Ok(Box::new(TestMetaWriteTxn {
+                inner: Some(self.inner.begin_write(purpose)?),
+                after_commit: self.after_commit.clone(),
+            }))
+        }
+    }
+
+    struct TestMetaWriteTxn {
+        inner: Option<Box<dyn MetaWriteTxn>>,
+        after_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl TestMetaWriteTxn {
+        fn inner(&self) -> &dyn MetaWriteTxn {
+            self.inner.as_deref().expect("test write transaction")
+        }
+
+        fn inner_mut(&mut self) -> &mut dyn MetaWriteTxn {
+            self.inner.as_deref_mut().expect("test write transaction")
+        }
+    }
+
+    impl MetaReadTxn for TestMetaWriteTxn {
+        fn get(&self, key: &MetaKey) -> Result<Option<MetaRecord>, MetaError> {
+            self.inner().get(key)
+        }
+
+        fn scan(
+            &self,
+            prefix: &crate::meta::MetaKeyPrefix,
+            limit: Option<usize>,
+        ) -> Result<Vec<MetaRecord>, MetaError> {
+            self.inner().scan(prefix, limit)
+        }
+    }
+
+    impl MetaWriteTxn for TestMetaWriteTxn {
+        fn put(&mut self, record: MetaRecordPut) -> Result<(), MetaError> {
+            self.inner_mut().put(record)
+        }
+
+        fn delete(&mut self, key: &MetaKey, expected: ExpectedRevision) -> Result<(), MetaError> {
+            self.inner_mut().delete(key, expected)
+        }
+
+        fn allocate_id(&mut self, scope: IdScope) -> Result<i64, MetaError> {
+            self.inner_mut().allocate_id(scope)
+        }
+
+        fn commit(mut self: Box<Self>) -> Result<MetaCommitOutcome, MetaError> {
+            let outcome = self
+                .inner
+                .take()
+                .expect("test write transaction")
+                .commit()?;
+            if let Some(after_commit) = &self.after_commit {
+                after_commit();
+            }
+            Ok(outcome)
+        }
+
+        fn abort(mut self: Box<Self>) -> Result<(), MetaError> {
+            self.inner.take().expect("test write transaction").abort()
+        }
+    }
+
+    fn open_test_state_with_custom_metadata_provider(
+        catalog: &str,
+        current_db: &str,
+        metadata_dir: TempDir,
+        metadata_provider: Arc<dyn MetaStoreProvider>,
+    ) -> IcebergMvTestState {
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+            .expect("install all-in-one loopback backend");
+        let warehouse_dir = TempDir::new().expect("warehouse tempdir");
+        let state = Arc::new(StandaloneState {
+            metadata_provider: Some(metadata_provider),
+            exchange_port: loopback_backend.exchange_port,
+            ..StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+        {
+            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
+            catalogs
+                .create_catalog(
+                    catalog,
+                    &[
+                        ("type".to_string(), "iceberg".to_string()),
+                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                        (
+                            "iceberg.catalog.warehouse".to_string(),
+                            warehouse_dir.path().display().to_string(),
+                        ),
+                    ],
+                )
+                .expect("create iceberg catalog");
+        }
+        {
+            let connectors = state.connectors.read().expect("connector registry");
+            state
+                .catalog_service
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                    catalog,
+                    connectors.catalog_backend("iceberg").expect("backend"),
+                    connectors.table_source("iceberg").expect("source"),
+                ));
+        }
+        IcebergMvTestState {
+            state,
+            current_db: current_db.to_string(),
+            _metadata_dir: metadata_dir,
+            _warehouse_dir: warehouse_dir,
+            _loopback_backend: loopback_backend,
+        }
     }
 
     fn parse_create_mv(sql: &str) -> CreateMaterializedViewStmt {
@@ -21661,6 +21856,261 @@ mod tests {
             crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
                 .is_err(),
             "target table should never have been created"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_characterizes_successful_boundary_artifacts() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let definition_loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _definition_load_guard =
+            DefinitionLoadCounterGuard::install(Arc::clone(&definition_loads));
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg MV");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let target =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("created and inspected target");
+        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("repository definition");
+        assert!(definition.schema_contract.is_some());
+        assert_eq!(
+            definition_loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "descriptor sync must reload the committed repository definition exactly once"
+        );
+        let descriptor =
+            MvDescriptorV1::from_storage_properties(target.table.metadata().properties())
+                .expect("synced descriptor");
+        assert_eq!(
+            descriptor.schema_contract_typed().expect("typed contract"),
+            definition.schema_contract
+        );
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("repository read");
+        let dependencies = env
+            .state
+            .mv_repo
+            .list_dependencies_by_downstream(read.as_ref(), definition.mv_id)
+            .expect("repository dependencies");
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].upstream.display_name(), "ice.sales.orders");
+        let registered = env
+            .state
+            .catalog_service
+            .local()
+            .read()
+            .expect("local catalog")
+            .get("analytics", "mv_orders")
+            .expect("registered planner table");
+        assert_eq!(registered.name, "mv_orders");
+    }
+
+    #[test]
+    fn create_iceberg_mv_repository_open_failure_cleans_created_target() {
+        let metadata_dir = TempDir::new().expect("metadata tempdir");
+        let sqlite = Arc::new(
+            crate::meta::SqliteMetaStoreProvider::open(
+                metadata_dir.path().join("standalone.sqlite"),
+            )
+            .expect("open meta provider"),
+        );
+        let provider = Arc::new(TestMetaStoreProvider::reject_writes(
+            Arc::clone(&sqlite),
+            "injected repository write failure",
+        ));
+        let env = open_test_state_with_custom_metadata_provider(
+            "ice",
+            "analytics",
+            metadata_dir,
+            provider,
+        );
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("repository write open must fail");
+        assert_eq!(
+            err,
+            "open iceberg mv definition transaction failed: DefiniteCommitFailure: injected repository write failure; target cleanup=Ok(())"
+        );
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        assert!(
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
+                .is_err(),
+            "known repository failure must clean the created target"
+        );
+        let read = sqlite.begin_read().expect("underlying repository read");
+        assert!(
+            env.state
+                .mv_repo
+                .list_definitions(read.as_ref())
+                .expect("definitions")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_descriptor_sync_failure_cleans_target_but_keeps_committed_metadata() {
+        let metadata_dir = TempDir::new().expect("metadata tempdir");
+        let sqlite = Arc::new(
+            crate::meta::SqliteMetaStoreProvider::open(
+                metadata_dir.path().join("standalone.sqlite"),
+            )
+            .expect("open meta provider"),
+        );
+        let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(TestMetaStoreProvider::fail_reads_after_commit(
+            Arc::clone(&sqlite),
+            Arc::clone(&fail_reads),
+            "injected descriptor read failure",
+        ));
+        let env = open_test_state_with_custom_metadata_provider(
+            "ice",
+            "analytics",
+            metadata_dir,
+            provider,
+        );
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("descriptor definition reload must fail");
+        assert_eq!(
+            err,
+            "open iceberg mv definition read transaction failed: Transient: injected descriptor read failure; target cleanup=Ok(())"
+        );
+        assert!(fail_reads.load(std::sync::atomic::Ordering::SeqCst));
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        assert!(
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
+                .is_err(),
+            "descriptor sync failure must clean the target"
+        );
+        let read = sqlite.begin_read().expect("underlying repository read");
+        let definitions = env
+            .state
+            .mv_repo
+            .list_definitions(read.as_ref())
+            .expect("definitions");
+        assert_eq!(
+            definitions.len(),
+            1,
+            "repository commit precedes descriptor sync"
+        );
+        assert_eq!(definitions[0].target_table.as_deref(), Some("mv_orders"));
+        assert_eq!(
+            env.state
+                .mv_repo
+                .list_dependencies_by_downstream(read.as_ref(), definitions[0].mv_id)
+                .expect("dependencies")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_catalog_register_failure_keeps_target_and_committed_metadata() {
+        let metadata_dir = TempDir::new().expect("metadata tempdir");
+        let sqlite = Arc::new(
+            crate::meta::SqliteMetaStoreProvider::open(
+                metadata_dir.path().join("standalone.sqlite"),
+            )
+            .expect("open meta provider"),
+        );
+        let state_slot = Arc::new(std::sync::Mutex::new(None::<Arc<StandaloneState>>));
+        let hook_slot = Arc::clone(&state_slot);
+        let provider = Arc::new(TestMetaStoreProvider::after_commit(
+            Arc::clone(&sqlite),
+            Arc::new(move || {
+                let state = hook_slot
+                    .lock()
+                    .expect("state slot")
+                    .as_ref()
+                    .expect("test state installed")
+                    .clone();
+                let local = Arc::clone(state.catalog_service.local());
+                let _ = std::thread::spawn(move || {
+                    let _guard = local.write().expect("local catalog write");
+                    panic!("injected catalog register failure");
+                })
+                .join();
+            }),
+        ));
+        let env = open_test_state_with_custom_metadata_provider(
+            "ice",
+            "analytics",
+            metadata_dir,
+            provider,
+        );
+        *state_slot.lock().expect("state slot") = Some(Arc::clone(&env.state));
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("catalog register must fail");
+        assert!(
+            err.starts_with("standalone catalog write lock: "),
+            "unexpected error: {err}"
+        );
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+            .expect("register failure occurs after target create and descriptor sync");
+        let read = sqlite.begin_read().expect("underlying repository read");
+        let definition = env
+            .state
+            .mv_repo
+            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .expect("definition lookup")
+            .expect("committed definition");
+        assert!(definition.schema_contract.is_some());
+        assert_eq!(
+            env.state
+                .mv_repo
+                .list_dependencies_by_downstream(read.as_ref(), definition.mv_id)
+                .expect("dependencies")
+                .len(),
+            1
         );
     }
 
