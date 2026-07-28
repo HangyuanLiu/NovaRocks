@@ -36,6 +36,7 @@ pub(crate) mod operation_lifecycle;
 pub(crate) mod partition_spec;
 pub mod position_delete;
 pub(crate) mod position_delete_descriptor;
+pub(crate) mod provider;
 pub(crate) mod read;
 pub(crate) mod report;
 pub(crate) mod row_lineage_synth;
