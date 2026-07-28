@@ -107,15 +107,16 @@ impl fmt::Debug for OptimizeJobRepository {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OptimizeJobRepository")
-            .field("provider", &self.store.provider_name())
+            .field("provider", &self.metrics.provider())
             .finish_non_exhaustive()
     }
 }
 
 impl OptimizeJobRepository {
     pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, RepositoryError> {
+        let provider_id = store.metrics_snapshot().provider;
         let repository = Self {
-            metrics: Arc::new(StateStoreMetrics::new(store.provider_name())),
+            metrics: Arc::new(StateStoreMetrics::new(provider_id)),
             store,
         };
         repository.list().await?;

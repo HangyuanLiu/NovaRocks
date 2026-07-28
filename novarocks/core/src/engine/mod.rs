@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use arrow::array::StringArray;
@@ -45,9 +45,7 @@ use crate::connector::{
 use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
-use crate::meta::repository::job::{
-    IcebergOptimizeJobState, JobMetaRepository, StoredIcebergOptimizeJob,
-};
+use crate::meta::repository::job::JobMetaRepository;
 use crate::meta::repository::mv::MvMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
@@ -92,14 +90,8 @@ use self::statement::{
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
     looks_like_add_legacy_range_partition, looks_like_alter_iceberg_properties,
     looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
-    looks_like_alter_table_expire_snapshots, looks_like_alter_table_optimize,
-    looks_like_alter_table_remove_orphan_files, looks_like_alter_table_rewrite_manifests,
-    looks_like_show_alter_table_optimize, looks_like_show_create_table,
-    parse_add_legacy_range_partition_sql, parse_alter_iceberg_properties_sql,
-    parse_alter_partition_column_sql, parse_alter_table_expire_snapshots_sql,
-    parse_alter_table_optimize_sql, parse_alter_table_remove_orphan_files_sql,
-    parse_alter_table_rewrite_manifests_sql, parse_show_alter_table_optimize_sql,
-    parse_show_create_table,
+    looks_like_show_create_table, parse_add_legacy_range_partition_sql,
+    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql, parse_show_create_table,
 };
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 #[cfg(test)]
@@ -1298,154 +1290,6 @@ impl StandaloneSession {
         Ok(StatementResult::Ok)
     }
 
-    fn handle_alter_table_optimize(
-        &self,
-        stmt: crate::engine::statement::AlterTableOptimizeStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        if self.inner.metadata_provider.is_none() {
-            return Err("ALTER TABLE OPTIMIZE requires metadata provider".to_string());
-        }
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "ALTER TABLE OPTIMIZE only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest {
-            source: crate::engine::iceberg_maintenance::MaintenanceActionSource::LegacyAlter,
-            kind: crate::engine::iceberg_maintenance::MaintenanceActionKind::RewriteDataFiles,
-            catalog: target.catalog,
-            namespace: target.namespace,
-            table: target.table,
-            options: crate::engine::iceberg_maintenance::MaintenanceActionOptions::default(),
-            older_than_ms: None,
-            retain_last: None,
-            use_caching: None,
-            spec_id: None,
-            branch: None,
-            where_clause: None,
-        };
-        crate::engine::iceberg_maintenance::execute_maintenance_action(&self.inner, request)
-    }
-
-    fn handle_alter_table_rewrite_manifests(
-        &self,
-        stmt: crate::engine::statement::AlterTableRewriteManifestsStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "REWRITE MANIFESTS only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        crate::engine::iceberg_rewrite_manifests::execute_iceberg_rewrite_manifests(
-            &self.inner,
-            &target,
-        )
-    }
-
-    fn handle_alter_table_expire_snapshots(
-        &self,
-        stmt: crate::engine::statement::AlterTableExpireSnapshotsStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "EXPIRE SNAPSHOTS only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        crate::engine::iceberg_expire_snapshots::execute_iceberg_expire_snapshots(
-            &self.inner,
-            &target,
-            &stmt,
-        )
-    }
-
-    fn handle_alter_table_remove_orphan_files(
-        &self,
-        stmt: crate::engine::statement::AlterTableRemoveOrphanFilesStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "REMOVE ORPHAN FILES only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        crate::engine::iceberg_remove_orphan_files::execute_iceberg_remove_orphan_files(
-            &self.inner,
-            &target,
-            &stmt,
-        )
-    }
-
-    fn handle_show_alter_table_optimize(
-        &self,
-        stmt: crate::engine::statement::ShowAlterTableOptimizeStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let Some(provider) = self.inner.metadata_provider.as_ref() else {
-            return Err("SHOW ALTER TABLE OPTIMIZE requires metadata provider".to_string());
-        };
-        let read = provider
-            .begin_read()
-            .map_err(|e| format!("open iceberg optimize job read transaction failed: {e}"))?;
-        let mut jobs = self
-            .inner
-            .job_repo
-            .show_iceberg_optimize_jobs(read.as_ref())
-            .map_err(|e| format!("show iceberg optimize jobs failed: {e}"))?;
-        let catalog_filter = stmt.catalog.as_deref().or(current_catalog);
-        let database_filter = stmt.database.as_deref().unwrap_or(current_database);
-        if let Some(catalog) = catalog_filter {
-            jobs.retain(|job| job.catalog == catalog);
-        }
-        jobs.retain(|job| job.namespace == database_filter);
-        if let Some(table_name) = stmt.table_name.as_deref() {
-            jobs.retain(|job| job.table == table_name);
-        }
-        jobs.sort_by_key(|job| (job.created_at_ms, job.id));
-        if stmt.order_by_create_time_desc {
-            jobs.reverse();
-        }
-        if let Some(limit) = stmt.limit {
-            jobs.truncate(limit);
-        }
-        build_show_alter_table_optimize_result(jobs).map(StatementResult::Query)
-    }
-
     fn handle_show_create_table(
         &self,
         sql: &str,
@@ -1941,109 +1785,6 @@ fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::Obje
     Ok(crate::sql::parser::ast::ObjectName { parts })
 }
 
-fn build_show_alter_table_optimize_result(
-    jobs: Vec<StoredIcebergOptimizeJob>,
-) -> Result<QueryResult, String> {
-    let column_names = [
-        "JobId",
-        "TableName",
-        "State",
-        "CreateTime",
-        "FinishTime",
-        "Msg",
-        "BaseSnapshotId",
-        "TargetSnapshotId",
-        "InputDataFiles",
-        "OutputDataFiles",
-        "InputDeleteFiles",
-        "OutputDeleteFiles",
-    ];
-    let mut columns = column_names
-        .iter()
-        .map(|_| Vec::with_capacity(jobs.len()))
-        .collect::<Vec<Vec<String>>>();
-    for job in jobs {
-        let outcome = job.outcome.as_ref();
-        columns[0].push(job.id.to_string());
-        columns[1].push(job.table);
-        columns[2].push(iceberg_optimize_state_name(job.state).to_string());
-        columns[3].push(job.created_at_ms.to_string());
-        columns[4].push(
-            job.finished_at_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-        columns[5].push(job.error_message.unwrap_or_else(|| {
-            outcome
-                .map(|value| {
-                    format!(
-                        "rewrote {} data files and {} delete files into {} data files ({} rows)",
-                        value.rewritten_data_files,
-                        value.deleted_data_files,
-                        value.added_data_files,
-                        value.output_record_count
-                    )
-                })
-                .unwrap_or_default()
-        }));
-        columns[6].push(job.base_snapshot_id.to_string());
-        columns[7].push(
-            outcome
-                .and_then(|value| value.target_snapshot_id)
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-        columns[8].push(
-            outcome
-                .map(|value| value.rewritten_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        columns[9].push(
-            outcome
-                .map(|value| value.added_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        columns[10].push(
-            outcome
-                .map(|value| value.deleted_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        columns[11].push(outcome.map(|_| "0".to_string()).unwrap_or_default());
-    }
-
-    let fields = column_names
-        .iter()
-        .map(|name| Field::new(*name, DataType::Utf8, false))
-        .collect::<Vec<_>>();
-    let arrays = columns
-        .into_iter()
-        .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| format!("build SHOW ALTER TABLE OPTIMIZE result failed: {e}"))?;
-    Ok(QueryResult {
-        columns: column_names
-            .iter()
-            .map(|name| QueryResultColumn {
-                name: (*name).to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                logical_type: None,
-            })
-            .collect(),
-        chunks: vec![record_batch_to_chunk(batch)?],
-    })
-}
-
-fn iceberg_optimize_state_name(state: IcebergOptimizeJobState) -> &'static str {
-    match state {
-        IcebergOptimizeJobState::Pending => "PENDING",
-        IcebergOptimizeJobState::Running => "RUNNING",
-        IcebergOptimizeJobState::Finished => "FINISHED",
-        IcebergOptimizeJobState::Failed => "FAILED",
-    }
-}
-
 /// Generate a `CREATE TABLE` DDL string from a loaded Iceberg table's current
 /// schema.  Column doc strings are emitted as `COMMENT '...'` clauses.
 fn build_iceberg_create_table_ddl(
@@ -2140,9 +1881,6 @@ fn build_iceberg_create_table_ddl(
 pub(crate) mod delete_flow;
 pub(crate) mod delete_predicate_translate;
 pub(crate) mod equality_delete_flow;
-pub(crate) mod iceberg_expire_snapshots;
-pub(crate) mod iceberg_remove_orphan_files;
-pub(crate) mod iceberg_rewrite_manifests;
 pub(crate) mod iceberg_truncate;
 pub(crate) mod iceberg_writer;
 

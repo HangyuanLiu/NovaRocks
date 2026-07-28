@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow::array::StringArray;
 use bytes::Bytes;
@@ -30,10 +31,10 @@ use novarocks::engine::table_maintenance::{
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
 use novarocks_frontend::table_maintenance::model::OptimizeJobOutcome;
 use novarocks_frontend::table_maintenance::repository::OptimizeJobRepository;
-use novarocks_spi::state_store::StateStore;
+use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::{
-    FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    StateStoreRuntime, open_state_store,
+    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
 
@@ -173,34 +174,44 @@ fn sqlite_config(path: &Path) -> StateStoreConfig {
     }
 }
 
-async fn open_sqlite(path: &Path) -> Arc<dyn StateStore> {
-    let runtime = StateStoreRuntime::local().expect("local state-store runtime");
-    open_state_store(
-        &runtime,
-        sqlite_config(path),
+async fn open_sqlite(path: &Path) -> (StateStoreHost, Arc<dyn StateStore>) {
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    let host = StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: sqlite_config(path),
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).unwrap(),
             topology_revision: Bytes::from_static(b"table-maintenance-service-topology"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
-    .expect("open SQLite state store")
+    .expect("open SQLite state store host");
+    let store = host.state_store().expect("SQLite state store exposure");
+    (host, store)
 }
 
 async fn durable_service() -> (
     TempDir,
+    StateStoreHost,
     Arc<dyn StateStore>,
     FrontendTableMaintenanceService,
 ) {
     let temp = TempDir::new().expect("create temp directory");
-    let store = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let (host, store) = open_sqlite(&temp.path().join("state.sqlite")).await;
     let service = FrontendTableMaintenanceService::open(
         Some(Arc::clone(&store)),
         tokio::runtime::Handle::current(),
     )
     .await
     .expect("open table-maintenance service");
-    (temp, store, service)
+    (temp, host, store, service)
 }
 
 fn expect_ok(result: Option<MaintenanceStatementResult>) {
@@ -243,7 +254,7 @@ async fn non_maintenance_sql_is_not_claimed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_alter_statements_dispatch_typed_actions_and_optimize_only_enqueues() {
-    let (_temp, _store, service) = durable_service().await;
+    let (_temp, _host, _store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
 
     expect_ok(
@@ -331,7 +342,7 @@ async fn legacy_alter_statements_dispatch_typed_actions_and_optimize_only_enqueu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn show_uses_repository_snapshot_and_preserves_legacy_wire_shape() {
-    let (_temp, store, service) = durable_service().await;
+    let (_temp, _host, store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
     expect_ok(
         service
@@ -566,7 +577,7 @@ async fn user_actions_are_rejected_by_mv_guard_before_dispatch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn automatic_calls_bypass_sql_parser_but_use_typed_engine_and_duplicate_result() {
-    let (_temp, _store, service) = durable_service().await;
+    let (_temp, _host, _store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
     let mv_target = target("ice", "db", "mv_table");
     let request = MaintenanceActionRequest::RewriteManifests {
@@ -656,7 +667,7 @@ async fn missing_state_store_only_blocks_repository_backed_operations() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn user_duplicate_optimize_remains_a_compatible_string_error() {
-    let (_temp, _store, service) = durable_service().await;
+    let (_temp, _host, _store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
     expect_ok(
         service
