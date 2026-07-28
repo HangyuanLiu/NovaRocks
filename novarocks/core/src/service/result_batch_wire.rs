@@ -24,6 +24,7 @@ use crate::common::util::{
     mysql_text_row_from_arrays_with_primitives,
 };
 use crate::exec::chunk::Chunk;
+use crate::runtime::fragment::io::ResultProjection;
 use novarocks_types::PrimitiveType;
 use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 
@@ -75,13 +76,6 @@ impl ResultSinkConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResultProjection {
-    pub(crate) slot_id: SlotId,
-    pub(crate) primitive: PrimitiveType,
-    pub(crate) field_schema: FieldRenderSchema,
-}
-
 const STATISTIC_DATA_VERSION_V1: i32 = 1;
 
 fn columns_for_projections(
@@ -90,7 +84,7 @@ fn columns_for_projections(
 ) -> Result<Vec<ArrayRef>, String> {
     let mut out = Vec::with_capacity(projections.len());
     for projection in projections {
-        out.push(chunk.column_by_slot_id(projection.slot_id)?);
+        out.push(chunk.column_by_slot_id(projection.slot_id())?);
     }
     Ok(out)
 }
@@ -98,7 +92,7 @@ fn columns_for_projections(
 fn primitives_for_projections(projections: &[ResultProjection]) -> Vec<PrimitiveType> {
     projections
         .iter()
-        .map(|projection| projection.primitive)
+        .map(ResultProjection::primitive)
         .collect()
 }
 
@@ -114,7 +108,7 @@ fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<PrimitiveType> {
 fn field_schemas_for_projections(projections: &[ResultProjection]) -> Vec<FieldRenderSchema> {
     projections
         .iter()
-        .map(|projection| projection.field_schema.clone())
+        .map(|projection| projection.field_schema().clone())
         .collect()
 }
 
@@ -342,6 +336,24 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
     Ok(batch)
 }
 
+/// Compat-only Statistic row encoding. The caller owns the presentation
+/// decision; this remains a temporary shared codec while the generated Thrift
+/// model is still hosted by the Core crate.
+pub fn build_statistic_result_batch_for_chunk(
+    chunk: &Chunk,
+    projections: &[ResultProjection],
+) -> Result<ResultBatch, String> {
+    build_fetch_result_batch_for_chunk(
+        chunk,
+        Some(projections),
+        ResultSinkConfig::statistic(|version, fields| {
+            crate::protocol::starrocks::decode::sink::fragment::thrift_statistic_row_encoder(
+                version, fields,
+            )
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -443,13 +455,11 @@ mod tests {
             ],
         )
         .expect("chunk");
-        let projections = vec![ResultProjection {
-            slot_id: SlotId::new(2),
-            primitive: PrimitiveType::Invalid,
-            field_schema: FieldRenderSchema::complex(vec![FieldRenderSchema::scalar(Some(
-                PrimitiveType::Json,
-            ))]),
-        }];
+        let projections = vec![ResultProjection::new(
+            SlotId::new(2),
+            PrimitiveType::Invalid,
+            FieldRenderSchema::complex(vec![FieldRenderSchema::scalar(Some(PrimitiveType::Json))]),
+        )];
 
         let batch = build_fetch_result_batch_for_chunk(
             &chunk,

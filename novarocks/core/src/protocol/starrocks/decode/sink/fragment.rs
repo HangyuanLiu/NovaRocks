@@ -43,7 +43,7 @@ use crate::protocol::starrocks::decode::{
 };
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::fragment::instance::FragmentSinkAssignment;
-use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
+use crate::runtime::fragment::io::{ResultPresentation, ResultProjection};
 use crate::thrift::{data, data_sinks, descriptors, planner};
 use novarocks_types::PrimitiveType;
 
@@ -290,7 +290,7 @@ pub(crate) fn iceberg_router_input_from_compat(
 pub(crate) struct DecodedStarRocksFragmentSink {
     pub(crate) spec: FragmentSinkSpec,
     pub(crate) assignment: FragmentSinkAssignment,
-    pub(crate) result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+    pub(crate) result_override: Option<(ResultPresentation, Option<Vec<ResultProjection>>)>,
     pub(crate) root_sink_dop: Option<i32>,
 }
 
@@ -777,12 +777,12 @@ fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
 fn result_sink_config_from_thrift(
     result_sink: &data_sinks::TResultSink,
     result_sink_path: FieldPath,
-) -> Result<ResultSinkConfig, StarRocksFragmentDecodeError> {
+) -> Result<ResultPresentation, StarRocksFragmentDecodeError> {
     let sink_type = result_sink
         .type_
         .unwrap_or(data_sinks::TResultSinkType::MYSQL_PROTOCAL);
     match sink_type {
-        t if t == data_sinks::TResultSinkType::MYSQL_PROTOCAL => Ok(ResultSinkConfig::mysql()),
+        t if t == data_sinks::TResultSinkType::MYSQL_PROTOCAL => Ok(ResultPresentation::MysqlText),
         t if t == data_sinks::TResultSinkType::HTTP_PROTOCAL => {
             let format = result_sink
                 .format
@@ -796,11 +796,9 @@ fn result_sink_config_from_thrift(
                     ),
                 ));
             }
-            Ok(ResultSinkConfig::http_json())
+            Ok(ResultPresentation::HttpJson)
         }
-        t if t == data_sinks::TResultSinkType::STATISTIC => {
-            Ok(ResultSinkConfig::statistic(thrift_statistic_row_encoder))
-        }
+        t if t == data_sinks::TResultSinkType::STATISTIC => Ok(ResultPresentation::Statistic),
         other => Err(StarRocksFragmentDecodeError::invalid_enum(
             result_sink_path.field("type"),
             format!("unsupported RESULT_SINK type {:?}", other),
@@ -1159,7 +1157,7 @@ fn rows_to_statistic_data(
     Ok(out)
 }
 
-fn thrift_statistic_row_encoder(
+pub fn thrift_statistic_row_encoder(
     version: i32,
     fields: &[Option<Vec<u8>>],
 ) -> Result<Vec<u8>, String> {
@@ -1193,18 +1191,18 @@ fn result_projection_from_thrift_expr(
             "RESULT_SINK output expression missing slot_ref payload",
         )
     })?;
-    Ok(ResultProjection {
-        slot_id: SlotId::try_from(slot.slot_id).map_err(|detail| {
+    Ok(ResultProjection::new(
+        SlotId::try_from(slot.slot_id).map_err(|detail| {
             StarRocksFragmentDecodeError::invalid_value(
                 root_path.clone().field("slot_ref").field("slot_id"),
                 detail,
             )
         })?,
-        primitive: native_primitive_type_from_desc(&root.type_).unwrap_or(PrimitiveType::Invalid),
-        field_schema: render_schema_from_type_desc(&root.type_).map_err(|detail| {
+        native_primitive_type_from_desc(&root.type_).unwrap_or(PrimitiveType::Invalid),
+        render_schema_from_type_desc(&root.type_).map_err(|detail| {
             StarRocksFragmentDecodeError::invalid_value(root_path.field("type"), detail)
         })?,
-    })
+    ))
 }
 
 fn result_projections_from_thrift_exprs(

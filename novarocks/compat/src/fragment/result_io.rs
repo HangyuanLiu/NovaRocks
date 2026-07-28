@@ -20,13 +20,6 @@ impl FragmentResultWriter for CompatFragmentResultWriter {
         &self,
         spec: ResultWriteSpec,
     ) -> Result<Arc<dyn FragmentResultSession>, FragmentIoError> {
-        if spec.presentation() == ResultPresentation::Statistic {
-            return Err(FragmentIoError::new(
-                FragmentIoOperation::ResultOpen,
-                FragmentIoErrorKind::RemoteRejected,
-                "STATISTIC result presentation has not been moved to the Compat adapter yet",
-            ));
-        }
         let handle =
             ResultBufferWriteHandle::open(spec.fragment_instance_id(), spec.is_typed(), None)
                 .map_err(|error| {
@@ -73,8 +66,23 @@ impl FragmentResultSession for CompatFragmentResultSession {
                 )
             });
         }
-        let batch = build_result_batch(&chunk, self.spec.projections(), self.spec.presentation())
-            .map_err(|error| {
+        let batch = match self.spec.presentation() {
+            ResultPresentation::Statistic => {
+                let projections = self.spec.projections().ok_or_else(|| {
+                    FragmentIoError::new(
+                        FragmentIoOperation::ResultWrite,
+                        FragmentIoErrorKind::InvalidResponse,
+                        "STATISTIC result session requires output projections",
+                    )
+                })?;
+                novarocks::service::result_batch_wire::build_statistic_result_batch_for_chunk(
+                    &chunk,
+                    projections,
+                )
+            }
+            presentation => build_result_batch(&chunk, self.spec.projections(), presentation),
+        }
+        .map_err(|error| {
             FragmentIoError::new(
                 FragmentIoOperation::ResultWrite,
                 FragmentIoErrorKind::Internal,
