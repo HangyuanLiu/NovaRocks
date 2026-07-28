@@ -3202,7 +3202,11 @@ mod pr3_tests {
             .await
         });
 
-        ingress.wait_until_entered().await;
+        tokio::time::timeout(Duration::from_secs(1), ingress.wait_until_entered())
+            .await
+            .expect(
+                "submit_fragment must reach the injected ingress before asserting the ACK gate",
+            );
         let rpc_still_pending = tokio::time::timeout(Duration::from_millis(100), &mut rpc)
             .await
             .is_err();
