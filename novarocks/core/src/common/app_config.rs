@@ -294,6 +294,9 @@ pub struct NovaRocksConfig {
     pub standalone_server: Option<StandaloneServerConfig>,
 
     #[serde(default)]
+    pub connector: ConnectorConfig,
+
+    #[serde(default)]
     pub spill: SpillStorageConfig,
 
     #[serde(default)]
@@ -351,6 +354,7 @@ impl Default for NovaRocksConfig {
             state_store: None,
             foundationdb_client: None,
             standalone_server: None,
+            connector: ConnectorConfig::default(),
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
             cluster: ClusterConfig::default(),
@@ -468,6 +472,50 @@ pub struct StandaloneObjectStoreConfig {
     pub region: Option<String>,
     #[serde(default)]
     pub enable_path_style_access: Option<bool>,
+}
+
+/// Shared object-store credentials loaded independently by every backend at
+/// startup. Native plans may reference this binding but must never carry its
+/// values.
+#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
+pub struct ConnectorObjectStoreConfig {
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub access_key_secret: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub enable_path_style_access: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConnectorConfig {
+    pub object_store: Option<ConnectorObjectStoreConfig>,
+}
+
+impl ConnectorConfig {
+    pub fn object_store_config(
+        &self,
+    ) -> std::result::Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
+        let Some(object_store) = self.object_store.as_ref() else {
+            return Ok(None);
+        };
+        let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::ConnectorStartupConfig,
+            object_store.endpoint.as_deref().unwrap_or_default(),
+            object_store.access_key_id.as_deref().unwrap_or_default(),
+            object_store.access_key_secret.as_deref().unwrap_or_default(),
+            object_store.region.as_deref(),
+            object_store.enable_path_style_access,
+        )?;
+        let mut config = credentials.to_object_store_config();
+        crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
+        Ok(Some(config))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1595,9 +1643,33 @@ mod tests {
     use novarocks_state_store::config::StateStoreProviderConfig;
 
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
-        StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
+        ConnectorConfig, ConnectorObjectStoreConfig, DEFAULT_MEM_LIMIT_SPEC,
+        MetadataProviderConfig, NovaRocksConfig, RuntimeConfig, StandaloneObjectStoreConfig,
+        StandaloneServerConfig, StandaloneStarRocksTableConfig,
     };
+
+    #[test]
+    fn connector_startup_object_store_config_builds_local_credentials() {
+        let config = ConnectorConfig {
+            object_store: Some(ConnectorObjectStoreConfig {
+                endpoint: Some(" http://127.0.0.1:9000 ".to_string()),
+                access_key_id: Some(" access ".to_string()),
+                access_key_secret: Some(" secret ".to_string()),
+                region: Some(" us-east-1 ".to_string()),
+                enable_path_style_access: Some(true),
+            }),
+        };
+
+        let object_store = config
+            .object_store_config()
+            .expect("startup config is valid")
+            .expect("object store configured");
+        assert_eq!(object_store.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(object_store.access_key_id, "access");
+        assert_eq!(object_store.access_key_secret, "secret");
+        assert_eq!(object_store.region.as_deref(), Some("us-east-1"));
+        assert_eq!(object_store.enable_path_style_access, Some(true));
+    }
 
     #[test]
     fn state_store_config_loads_explicit_sqlite_provider() -> anyhow::Result<()> {

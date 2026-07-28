@@ -28,10 +28,11 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
 };
 
-use crate::connector::runtime::ConnectorReadScanSource;
+use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::fs::scan_context::FileScanRange;
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};
@@ -114,16 +115,16 @@ pub(super) fn lower_connector_read_scan(
     })?;
     let mut total_payload_bytes = source.scan_payload.len();
     let mut split_ids = BTreeSet::new();
-    let splits = source
+    let scheduled = source
         .splits
         .iter()
         .enumerate()
-        .map(|(index, split)| {
+        .map(|(index, wire_split)| {
             let split = ConnectorSplit::try_new(
                 instance_id.clone(),
-                split.split_id.clone(),
-                Bytes::copy_from_slice(&split.split_payload),
-                split.estimated_bytes,
+                wire_split.split_id.clone(),
+                Bytes::copy_from_slice(&wire_split.split_payload),
+                wire_split.estimated_bytes,
             )
             .map_err(|error| {
                 NativeFragmentLeafDecodeError::at_field(
@@ -150,7 +151,15 @@ pub(super) fn lower_connector_read_scan(
                 .append_index(index));
             }
             total_payload_bytes = total_payload_bytes.saturating_add(split.payload().len());
-            Ok(split)
+            let file_range = wire_split
+                .file_execution
+                .as_ref()
+                .map(|sidecar| decode_file_execution_sidecar(sidecar, index))
+                .transpose()?;
+            Ok(match file_range {
+                Some(file_range) => ConnectorScheduledSplit::file(split, file_range),
+                None => ConnectorScheduledSplit::plain(split),
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     if source.scan_payload.len() > request_context.max_handle_payload_bytes() {
@@ -176,9 +185,9 @@ pub(super) fn lower_connector_read_scan(
         context: request_context,
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    let source = Arc::new(ConnectorReadScanSource::new(
+    let source = Arc::new(ConnectorReadScanSource::new_scheduled(
         instance,
-        splits,
+        scheduled,
         request,
         output_schema.clone(),
     ));
@@ -195,6 +204,76 @@ pub(super) fn lower_connector_read_scan(
         },
         layout,
         output_schema,
+    })
+}
+
+fn decode_file_execution_sidecar(
+    sidecar: &plan::FileExecutionSidecar,
+    split_index: usize,
+) -> Result<FileScanRange, NativeFragmentLeafDecodeError> {
+    let error = |field: &'static str, detail: String| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "splits", detail)
+            .append_index(split_index)
+            .append_field("file_execution")
+            .append_field(field)
+    };
+    if sidecar.version != 1 {
+        return Err(error(
+            "version",
+            format!(
+                "unsupported core file execution sidecar version {}",
+                sidecar.version
+            ),
+        ));
+    }
+    if sidecar.path.is_empty() {
+        return Err(error(
+            "path",
+            "file execution sidecar path is empty".to_string(),
+        ));
+    }
+    if !matches!(
+        plan::FileExecutionFormat::try_from(sidecar.file_format),
+        Ok(plan::FileExecutionFormat::Parquet) | Ok(plan::FileExecutionFormat::Orc)
+    ) {
+        return Err(error(
+            "file_format",
+            "unsupported file execution format".to_string(),
+        ));
+    }
+    if !sidecar.delete_files.is_empty()
+        || sidecar.deletion_vector.is_some()
+        || !sidecar.file_pruning_min_max_values.is_empty()
+    {
+        return Err(error(
+            "file_execution",
+            "delete, deletion-vector, and pruning sidecars require an authenticated connector binding".to_string(),
+        ));
+    }
+    if sidecar.offset > sidecar.file_length {
+        return Err(error("offset", "offset exceeds file length".to_string()));
+    }
+    let ivm_change_op = sidecar
+        .change_op
+        .map(|value| {
+            i8::try_from(value).map_err(|_| error("change_op", "change op exceeds i8".to_string()))
+        })
+        .transpose()?;
+    Ok(FileScanRange {
+        path: sidecar.path.clone(),
+        file_len: sidecar.file_length,
+        offset: sidecar.offset,
+        length: sidecar.length,
+        scan_range_id: i32::try_from(split_index)
+            .map_err(|_| error("split_id", "split index exceeds i32".to_string()))?,
+        first_row_id: sidecar.first_row_id,
+        data_sequence_number: sidecar.data_sequence_number,
+        ivm_change_op,
+        included_positions: (!sidecar.included_positions.is_empty())
+            .then(|| sidecar.included_positions.clone()),
+        external_datacache: None,
+        delete_files: Vec::new(),
+        iceberg_file_pruning: None,
     })
 }
 
