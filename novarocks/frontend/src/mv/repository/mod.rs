@@ -25,16 +25,18 @@ use std::future::Future;
 use std::sync::Arc;
 
 use novarocks::mv::dependency::model::MvDependencyObjectRef;
-use novarocks::mv::persistence::definition::{StoredMvDefinition, UpdateMvRefreshMetadataRequest};
+use novarocks::mv::persistence::definition::{
+    StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
 use novarocks::mv::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
 use novarocks::mv::persistence::partition::{
-    RecordFailedMvPartitionStatesRequest, ReplaceMvPartitionStatesRequest, StoredMvPartitionState,
-    UpdateMvPartitionContractRequest,
+    MvPartitionRefreshStatus, RecordFailedMvPartitionStatesRequest,
+    ReplaceMvPartitionStatesRequest, StoredMvPartitionState, UpdateMvPartitionContractRequest,
 };
 use novarocks::mv::persistence::refresh::{
-    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvRefresh,
-    UpdateStarRocksMvRefreshSummaryRequest,
+    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
+    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
+    RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::mv::repository::{
     CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
@@ -55,7 +57,8 @@ use self::codec::{
 use self::key::{
     definition_by_id_key, definition_prefix, dependency_by_downstream_key,
     dependency_by_downstream_prefix, dependency_by_upstream_key, dependency_by_upstream_prefix,
-    mv_prefix, sequence_key, target_lookup_key,
+    mv_prefix, partition_by_mv_key, partition_by_mv_prefix, refresh_by_id_key, refresh_prefix,
+    sequence_key, target_lookup_key,
 };
 
 /// The sole MV StateStore repository. It keeps provider transactions private
@@ -101,6 +104,8 @@ impl StateStoreMvRepository {
         let mut target_records = BTreeMap::new();
         let mut downstream = BTreeMap::new();
         let mut upstream = BTreeMap::new();
+        let mut refreshes = Vec::new();
+        let mut partitions = Vec::new();
         for record in records {
             match key::decode_key(&record.key).map_err(corruption)?.kind {
                 key::MvKeyKind::Sequence => {
@@ -157,8 +162,28 @@ impl StateStoreMvRepository {
                     }
                     upstream.insert(record.key, dependency.value);
                 }
-                key::MvKeyKind::Refresh | key::MvKeyKind::Partition => {
-                    // Task 6 owns the operational validation for these record kinds.
+                key::MvKeyKind::Refresh => {
+                    let refresh: DecodedMvRecord<StoredMvRefresh> =
+                        decode_record(&record.key, &record.value).map_err(corruption)?;
+                    if refresh_by_id_key(refresh.value.refresh_id).map_err(corruption)?
+                        != record.key
+                    {
+                        return Err(corruption("MV refresh key does not match its stored ID"));
+                    }
+                    refreshes.push(refresh.value);
+                }
+                key::MvKeyKind::Partition => {
+                    let partition: DecodedMvRecord<StoredMvPartitionState> =
+                        decode_record(&record.key, &record.value).map_err(corruption)?;
+                    if partition_by_mv_key(partition.value.mv_id, &partition.value.partition_key)
+                        .map_err(corruption)?
+                        != record.key
+                    {
+                        return Err(corruption(
+                            "MV partition key does not match its stored identity",
+                        ));
+                    }
+                    partitions.push(partition.value);
                 }
             }
         }
@@ -196,6 +221,30 @@ impl StateStoreMvRepository {
             {
                 return Err(corruption(
                     "MV definition target has no matching target lookup record",
+                ));
+            }
+        }
+        for refresh in refreshes {
+            let definition = definitions
+                .get(&refresh.mv_id)
+                .ok_or_else(|| corruption("MV refresh references a missing definition"))?;
+            if refresh.state == MvRefreshState::Finalized
+                && definition.active_refresh_id == Some(refresh.refresh_id)
+            {
+                return Err(corruption(
+                    "finalized MV refresh remains active on its definition",
+                ));
+            }
+            if definition.active_refresh_id == Some(refresh.refresh_id)
+                && !definition.refresh_in_progress
+            {
+                return Err(corruption("active MV refresh is not marked in progress"));
+            }
+        }
+        for partition in partitions {
+            if !definitions.contains_key(&partition.mv_id) {
+                return Err(corruption(
+                    "MV partition state references a missing definition",
                 ));
             }
         }
@@ -683,6 +732,7 @@ impl StateStoreMvRepository {
             return Err(invalid("mv definition id must be positive"));
         }
         let operation_id = Uuid::now_v7();
+        let page_size = self.store.limits().max_page_size;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -694,7 +744,7 @@ impl StateStoreMvRepository {
                 Box::pin(async move {
                     let prefix =
                         dependency_by_downstream_prefix(mv_id).map_err(invalid_state_store)?;
-                    let existing = range_transaction(transaction, prefix).await?;
+                    let existing = range_transaction(transaction, prefix, page_size).await?;
                     let desired =
                         deduplicate_dependencies(mv_id, &requests).map_err(invalid_state_store)?;
                     let desired_by_key = desired
@@ -774,6 +824,7 @@ impl StateStoreMvRepository {
             return Err(invalid("mv definition id must be positive"));
         }
         let operation_id = Uuid::now_v7();
+        let page_size = self.store.limits().max_page_size;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -814,7 +865,9 @@ impl StateStoreMvRepository {
                     }
                     let prefix =
                         dependency_by_downstream_prefix(mv_id).map_err(invalid_state_store)?;
-                    for dependency_record in range_transaction(transaction, prefix).await? {
+                    for dependency_record in
+                        range_transaction(transaction, prefix, page_size).await?
+                    {
                         let dependency: DecodedMvRecord<StoredMvDependency> =
                             decode_record(&dependency_record.key, &dependency_record.value)
                                 .map_err(invalid_state_store)?;
@@ -838,6 +891,807 @@ impl StateStoreMvRepository {
                     transaction
                         .delete(definition_key, Precondition::Version(record.version))
                         .await?;
+                    Ok(true)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn update_partition_contract_async(
+        &self,
+        request: UpdateMvPartitionContractRequest,
+    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "update MV partition contract",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (definition_record, mut definition) =
+                        load_definition_transaction(transaction, request.mv_id).await?;
+                    let schema = definition.schema_contract.as_mut().ok_or_else(|| {
+                        invalid_state_store("MV definition has no schema contract")
+                    })?;
+                    schema.target.partition = Some(request.partition_spec.clone());
+                    definition.partition_spec = Some(request.partition_spec);
+                    definition.partition_state_complete = false;
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(definition_record.version),
+                    )
+                    .await?;
+                    delete_partition_states_transaction(transaction, request.mv_id).await?;
+                    Ok(definition)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn set_rebuilt_refresh_watermark_async(
+        &self,
+        mv_id: i64,
+        base_snapshots: BTreeMap<String, i64>,
+        base_table_uuids: BTreeMap<String, String>,
+    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "set rebuilt MV refresh watermark",
+            move |transaction| {
+                let base_snapshots = base_snapshots.clone();
+                let base_table_uuids = base_table_uuids.clone();
+                Box::pin(async move {
+                    let (record, mut definition) =
+                        load_definition_transaction(transaction, mv_id).await?;
+                    definition.last_refresh_snapshots = base_snapshots;
+                    definition.last_refresh_table_uuids = base_table_uuids;
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(record.version),
+                    )
+                    .await?;
+                    Ok(definition)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn update_refresh_metadata_async(
+        &self,
+        request: UpdateMvRefreshMetadataRequest,
+    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+        validate_refresh_metadata_request(&request)?;
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "update MV refresh metadata",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (record, mut definition) =
+                        load_definition_transaction(transaction, request.mv_id).await?;
+                    definition.refresh_policy = request.refresh_policy;
+                    definition.refresh_paused = request.refresh_paused;
+                    definition.refresh_interval_ms = request.refresh_interval_ms;
+                    definition.max_staleness_ms = request.max_staleness_ms;
+                    definition.last_scheduler_error = request.last_scheduler_error;
+                    definition.next_refresh_after_ms = request.next_refresh_after_ms;
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(record.version),
+                    )
+                    .await?;
+                    Ok(definition)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn begin_refresh_intent_async(
+        &self,
+        mv_id: i64,
+        target_snapshots: BTreeMap<String, i64>,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let page_size = self.store.limits().max_page_size;
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "begin MV refresh",
+            move |transaction| {
+                let target_snapshots = target_snapshots.clone();
+                Box::pin(async move {
+                    let (definition_record, mut definition) =
+                        load_definition_transaction(transaction, mv_id).await?;
+                    if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
+                        return Err(conflict_state_store(format!(
+                            "mv definition {mv_id} already has refresh in progress"
+                        )));
+                    }
+                    let refresh_id = allocate_refresh_id(transaction, page_size).await?;
+                    definition.refresh_in_progress = true;
+                    definition.active_refresh_id = Some(refresh_id);
+                    definition.refresh_target_snapshots = target_snapshots.clone();
+                    let refresh = new_refresh(refresh_id, mv_id, None, target_snapshots);
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(definition_record.version),
+                    )
+                    .await?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Absent,
+                    )
+                    .await?;
+                    Ok(refresh)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn begin_iceberg_refresh_intent_async(
+        &self,
+        request: BeginIcebergMvRefreshRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        validate_iceberg_refresh_request(&request)?;
+        let operation_id = Uuid::now_v7();
+        let page_size = self.store.limits().max_page_size;
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "begin Iceberg MV refresh",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (definition_record, mut definition) =
+                        load_definition_transaction(transaction, request.mv_id).await?;
+                    if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
+                        return Err(conflict_state_store(format!(
+                            "mv definition {} already has refresh in progress",
+                            request.mv_id
+                        )));
+                    }
+                    let refresh_id = allocate_refresh_id(transaction, page_size).await?;
+                    definition.refresh_in_progress = true;
+                    definition.active_refresh_id = Some(refresh_id);
+                    definition.refresh_target_snapshots = request.base_snapshots.clone();
+                    let refresh = StoredMvRefresh {
+                        refresh_id,
+                        mv_id: request.mv_id,
+                        operation_id: request.operation_id,
+                        state: MvRefreshState::IntentCreated,
+                        target_catalog: Some(request.target_catalog),
+                        target_namespace: Some(request.target_namespace),
+                        target_table: Some(request.target_table),
+                        staging_branch: Some(request.staging_branch),
+                        expected_main_snapshot_id: request.expected_main_snapshot_id,
+                        staging_snapshot_id: None,
+                        published_snapshot_id: None,
+                        target_snapshots: request.base_snapshots,
+                        base_table_uuids: BTreeMap::new(),
+                        rows: None,
+                        marker: Some(RefreshCommitMarker {
+                            refresh_id,
+                            mv_id: request.mv_id,
+                            token: request.marker_token,
+                        }),
+                        external_outcome: None,
+                    };
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(definition_record.version),
+                    )
+                    .await?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Absent,
+                    )
+                    .await?;
+                    Ok(refresh)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_staging_commit_async(
+        &self,
+        request: RecordStagingCommitRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record MV staging commit",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, request.refresh_id).await?;
+                    if refresh.state == MvRefreshState::StagingCommitted {
+                        if refresh.staging_snapshot_id == Some(request.staging_snapshot_id)
+                            && refresh.rows == Some(request.rows)
+                            && refresh.base_table_uuids == request.base_table_uuids
+                        {
+                            return Ok(());
+                        }
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {} staging commit differs from recorded value",
+                            request.refresh_id
+                        )));
+                    }
+                    expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
+                    refresh.state = MvRefreshState::StagingCommitted;
+                    refresh.staging_snapshot_id = Some(request.staging_snapshot_id);
+                    refresh.rows = Some(request.rows);
+                    refresh.base_table_uuids = request.base_table_uuids;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_publish_commit_async(
+        &self,
+        request: RecordPublishCommitRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record MV publish commit",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, request.refresh_id).await?;
+                    if refresh.state == MvRefreshState::PublishCommitted {
+                        if refresh.published_snapshot_id == Some(request.published_snapshot_id)
+                            && persisted_publish_target_snapshot(&refresh)
+                                == Some(request.published_snapshot_id)
+                        {
+                            return Ok(());
+                        }
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {} publish commit differs from recorded value",
+                            request.refresh_id
+                        )));
+                    }
+                    expect_refresh_state(&refresh, MvRefreshState::StagingCommitted)?;
+                    refresh.state = MvRefreshState::PublishCommitted;
+                    refresh.published_snapshot_id = Some(request.published_snapshot_id);
+                    refresh.external_outcome = Some(RefreshExternalOutcome {
+                        target_snapshot_id: Some(request.published_snapshot_id),
+                        commit_id: format!("iceberg-snapshot-{}", request.published_snapshot_id),
+                    });
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_external_commit_outcome_async(
+        &self,
+        refresh_id: i64,
+        outcome: RefreshExternalOutcome,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record MV external commit",
+            move |transaction| {
+                let outcome = outcome.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, refresh_id).await?;
+                    expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
+                    refresh.state = MvRefreshState::PublishCommitted;
+                    refresh.published_snapshot_id = outcome.target_snapshot_id;
+                    refresh.external_outcome = Some(outcome);
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn mark_refresh_commit_unknown_async(
+        &self,
+        refresh_id: i64,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "mark MV refresh commit unknown",
+            move |transaction| {
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, refresh_id).await?;
+                    if matches!(
+                        refresh.state,
+                        MvRefreshState::Finalized | MvRefreshState::Aborted
+                    ) {
+                        return Ok(());
+                    }
+                    refresh.state = MvRefreshState::CommitUnknown;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn finalize_refresh_async(
+        &self,
+        request: MvRefreshFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "finalize MV refresh",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    finalize_refresh_transaction(transaction, operation_id, request).await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn finalize_refresh_with_partitions_async(
+        &self,
+        request: FinalizeMvRefreshWithPartitionsRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "finalize MV refresh with partitions",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    finalize_refresh_transaction(transaction, operation_id, request.refresh)
+                        .await?;
+                    if let Some(partitions) = request.partitions {
+                        replace_partition_states_transaction(transaction, operation_id, partitions)
+                            .await?;
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_external_commit_and_finalize_async(
+        &self,
+        request: RecordExternalCommitAndFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record MV external commit and finalize",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, request.refresh_id).await?;
+                    expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
+                    refresh.state = MvRefreshState::PublishCommitted;
+                    refresh.published_snapshot_id = request.external_outcome.target_snapshot_id;
+                    refresh.external_outcome = Some(request.external_outcome);
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await?;
+                    finalize_refresh_transaction(transaction, operation_id, request.finalize).await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn clear_refresh_progress_async(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "clear MV refresh progress",
+            move |transaction| {
+                Box::pin(async move {
+                    let definition_key =
+                        definition_by_id_key(mv_id).map_err(invalid_state_store)?;
+                    let Some(definition_record) = transaction.get(&definition_key).await? else {
+                        return Ok(false);
+                    };
+                    let mut definition =
+                        decode_definition(&definition_key, &definition_record.value)
+                            .map_err(invalid_state_store)?
+                            .value;
+                    if !definition.refresh_in_progress && definition.active_refresh_id.is_none() {
+                        return Ok(true);
+                    }
+                    if let Some(refresh_id) = definition.active_refresh_id {
+                        let (refresh_record, mut refresh) =
+                            load_refresh_transaction(transaction, refresh_id).await?;
+                        if refresh.state == MvRefreshState::CommitUnknown {
+                            return Err(conflict_state_store(format!(
+                                "mv definition {} active refresh {} is commit-unknown",
+                                definition.mv_id, refresh_id
+                            )));
+                        }
+                        if !matches!(
+                            refresh.state,
+                            MvRefreshState::Finalized | MvRefreshState::Aborted
+                        ) {
+                            refresh.state = MvRefreshState::Aborted;
+                            put_refresh_transaction(
+                                transaction,
+                                operation_id,
+                                &refresh,
+                                Precondition::Version(refresh_record.version),
+                            )
+                            .await?;
+                        }
+                    }
+                    definition.refresh_in_progress = false;
+                    definition.active_refresh_id = None;
+                    definition.refresh_target_snapshots.clear();
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(definition_record.version),
+                    )
+                    .await?;
+                    Ok(true)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn load_refresh_async(
+        &self,
+        refresh_id: i64,
+    ) -> Result<Option<StoredMvRefresh>, MvRepositoryError> {
+        if refresh_id <= 0 {
+            return Err(invalid("mv refresh id must be positive"));
+        }
+        let key = refresh_by_id_key(refresh_id).map_err(invalid)?;
+        self.read_record(&key)
+            .await?
+            .map(|record| {
+                decode_record(&key, &record.value)
+                    .map(|decoded: DecodedMvRecord<StoredMvRefresh>| decoded.value)
+                    .map_err(corruption)
+            })
+            .transpose()
+    }
+
+    async fn list_unfinished_refreshes_async(
+        &self,
+    ) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        let mut refreshes = self
+            .scan_prefix(refresh_prefix().map_err(corruption)?)
+            .await?
+            .into_iter()
+            .map(|record| {
+                decode_record(&record.key, &record.value)
+                    .map(|decoded: DecodedMvRecord<StoredMvRefresh>| decoded.value)
+                    .map_err(corruption)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        refreshes.retain(|refresh| {
+            !matches!(
+                refresh.state,
+                MvRefreshState::Finalized | MvRefreshState::Aborted
+            )
+        });
+        refreshes.sort_by_key(|refresh| refresh.refresh_id);
+        Ok(refreshes)
+    }
+
+    async fn update_starrocks_refresh_summary_if_present_async(
+        &self,
+        request: UpdateStarRocksMvRefreshSummaryRequest,
+    ) -> Result<bool, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "update StarRocks MV refresh summary",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let key = definition_by_id_key(request.mv_id).map_err(invalid_state_store)?;
+                    let Some(record) = transaction.get(&key).await? else {
+                        return Ok(false);
+                    };
+                    let mut definition = decode_definition(&key, &record.value)
+                        .map_err(invalid_state_store)?
+                        .value;
+                    if let Some(refresh_id) = definition.active_refresh_id {
+                        let (refresh_record, mut refresh) =
+                            load_refresh_transaction(transaction, refresh_id).await?;
+                        if refresh.state == MvRefreshState::CommitUnknown {
+                            return Err(conflict_state_store(format!(
+                                "mv definition {} active refresh {} is commit-unknown",
+                                definition.mv_id, refresh_id
+                            )));
+                        }
+                        refresh.state = MvRefreshState::Finalized;
+                        put_refresh_transaction(
+                            transaction,
+                            operation_id,
+                            &refresh,
+                            Precondition::Version(refresh_record.version),
+                        )
+                        .await?;
+                    }
+                    definition.last_refresh_ms = Some(request.last_refresh_ms);
+                    definition.last_refresh_rows = Some(request.last_refresh_rows);
+                    definition.last_refresh_snapshots = request.base_snapshots;
+                    definition.last_refresh_table_uuids = request.base_table_uuids;
+                    definition.refresh_in_progress = false;
+                    definition.active_refresh_id = None;
+                    definition.refresh_target_snapshots.clear();
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(record.version),
+                    )
+                    .await?;
+                    Ok(true)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn replace_partition_states_async(
+        &self,
+        request: ReplaceMvPartitionStatesRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "replace MV partition states",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    replace_partition_states_transaction(transaction, operation_id, request).await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_failed_partition_states_async(
+        &self,
+        request: RecordFailedMvPartitionStatesRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record failed MV partition states",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    record_failed_partition_states_transaction(transaction, operation_id, request)
+                        .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn clear_partition_states_async(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "clear MV partition states",
+            move |transaction| {
+                Box::pin(async move {
+                    let key = definition_by_id_key(mv_id).map_err(invalid_state_store)?;
+                    let Some(record) = transaction.get(&key).await? else {
+                        return Ok(false);
+                    };
+                    let mut definition = decode_definition(&key, &record.value)
+                        .map_err(invalid_state_store)?
+                        .value;
+                    delete_partition_states_transaction(transaction, mv_id).await?;
+                    if definition.partition_state_complete {
+                        definition.partition_state_complete = false;
+                        put_definition_transaction(
+                            transaction,
+                            operation_id,
+                            &definition,
+                            Precondition::Version(record.version),
+                        )
+                        .await?;
+                    }
+                    Ok(true)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn list_partition_states_async(
+        &self,
+        mv_id: i64,
+    ) -> Result<Vec<StoredMvPartitionState>, MvRepositoryError> {
+        if mv_id <= 0 {
+            return Err(invalid("mv definition id must be positive"));
+        }
+        let mut states = self
+            .scan_prefix(partition_by_mv_prefix(mv_id).map_err(invalid)?)
+            .await?
+            .into_iter()
+            .map(|record| {
+                decode_record(&record.key, &record.value)
+                    .map(|decoded: DecodedMvRecord<StoredMvPartitionState>| decoded.value)
+                    .map_err(corruption)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        states.sort_by(|left, right| left.partition_key.cmp(&right.partition_key));
+        Ok(states)
+    }
+
+    async fn adopt_target_compaction_snapshot_async(
+        &self,
+        target: &MvTarget,
+        expected_snapshot_id: i64,
+        adopted_snapshot_id: i64,
+    ) -> Result<bool, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        let target = target.clone();
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "adopt MV target compaction snapshot",
+            move |transaction| {
+                let target = target.clone();
+                Box::pin(async move {
+                    let target_key = target_lookup_key(
+                        &target.catalog.clone().unwrap_or_default(),
+                        &target.database,
+                        &target.name,
+                    )
+                    .map_err(invalid_state_store)?;
+                    let Some(lookup_record) = transaction.get(&target_key).await? else {
+                        return Ok(false);
+                    };
+                    let lookup: DecodedMvRecord<MvTargetLookup> =
+                        decode_record(&target_key, &lookup_record.value)
+                            .map_err(invalid_state_store)?;
+                    let (definition_record, mut definition) =
+                        load_definition_transaction(transaction, lookup.value.mv_id).await?;
+                    if definition_target(&definition)
+                        .map_err(|_| invalid_state_store("invalid MV target"))?
+                        .as_ref()
+                        != Some(&target)
+                    {
+                        return Err(invalid_state_store(
+                            "MV target lookup does not match its definition",
+                        ));
+                    }
+                    if definition.refresh_in_progress
+                        || definition.active_refresh_id.is_some()
+                        || definition.last_refreshed_iceberg_snapshot_id
+                            != Some(expected_snapshot_id)
+                    {
+                        return Ok(false);
+                    }
+                    if definition.last_refreshed_iceberg_snapshot_id == Some(adopted_snapshot_id) {
+                        return Ok(true);
+                    }
+                    definition.last_refreshed_iceberg_snapshot_id = Some(adopted_snapshot_id);
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(definition_record.version),
+                    )
+                    .await?;
                     Ok(true)
                 })
             },
@@ -952,125 +1806,143 @@ impl MvRepository for StateStoreMvRepository {
     }
     fn set_rebuilt_refresh_watermark(
         &self,
-        _mv_id: i64,
-        _base_snapshots: BTreeMap<String, i64>,
-        _base_table_uuids: BTreeMap<String, String>,
+        mv_id: i64,
+        base_snapshots: BTreeMap<String, i64>,
+        base_table_uuids: BTreeMap<String, String>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        task_six()
+        self.blocking(self.set_rebuilt_refresh_watermark_async(
+            mv_id,
+            base_snapshots,
+            base_table_uuids,
+        ))
     }
     fn update_refresh_metadata(
         &self,
-        _request: UpdateMvRefreshMetadataRequest,
+        request: UpdateMvRefreshMetadataRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        task_six()
+        self.blocking(self.update_refresh_metadata_async(request))
     }
     fn update_partition_contract(
         &self,
-        _request: UpdateMvPartitionContractRequest,
+        request: UpdateMvPartitionContractRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        task_six()
+        self.blocking(self.update_partition_contract_async(request))
     }
     fn begin_refresh_intent(
         &self,
-        _mv_id: i64,
-        _target_snapshots: BTreeMap<String, i64>,
+        mv_id: i64,
+        target_snapshots: BTreeMap<String, i64>,
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
-        task_six()
+        self.blocking(self.begin_refresh_intent_async(mv_id, target_snapshots))
     }
     fn begin_iceberg_refresh_intent(
         &self,
-        _request: BeginIcebergMvRefreshRequest,
+        request: BeginIcebergMvRefreshRequest,
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
-        task_six()
+        self.blocking(self.begin_iceberg_refresh_intent_async(request))
     }
     fn record_staging_commit(
         &self,
-        _request: RecordStagingCommitRequest,
+        request: RecordStagingCommitRequest,
     ) -> Result<(), MvRepositoryError> {
-        task_six()
+        self.blocking(self.record_staging_commit_async(request))
     }
     fn record_publish_commit(
         &self,
-        _request: RecordPublishCommitRequest,
+        request: RecordPublishCommitRequest,
     ) -> Result<(), MvRepositoryError> {
-        task_six()
+        self.blocking(self.record_publish_commit_async(request))
     }
-    fn mark_refresh_commit_unknown(&self, _refresh_id: i64) -> Result<(), MvRepositoryError> {
-        task_six()
+    fn mark_refresh_commit_unknown(&self, refresh_id: i64) -> Result<(), MvRepositoryError> {
+        self.blocking(self.mark_refresh_commit_unknown_async(refresh_id))
     }
     fn record_external_commit_outcome(
         &self,
-        _refresh_id: i64,
-        _outcome: RefreshExternalOutcome,
+        refresh_id: i64,
+        outcome: RefreshExternalOutcome,
     ) -> Result<(), MvRepositoryError> {
-        task_six()
+        self.blocking(self.record_external_commit_outcome_async(refresh_id, outcome))
     }
-    fn finalize_refresh(
-        &self,
-        _request: MvRefreshFinalizeRequest,
-    ) -> Result<(), MvRepositoryError> {
-        task_six()
+    fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError> {
+        self.blocking(self.finalize_refresh_async(request))
     }
     fn finalize_refresh_with_partitions(
         &self,
-        _request: FinalizeMvRefreshWithPartitionsRequest,
+        request: FinalizeMvRefreshWithPartitionsRequest,
     ) -> Result<(), MvRepositoryError> {
-        task_six()
+        self.blocking(self.finalize_refresh_with_partitions_async(request))
     }
     fn record_external_commit_and_finalize(
         &self,
-        _request: RecordExternalCommitAndFinalizeRequest,
+        request: RecordExternalCommitAndFinalizeRequest,
     ) -> Result<(), MvRepositoryError> {
-        task_six()
+        self.blocking(self.record_external_commit_and_finalize_async(request))
     }
-    fn clear_refresh_progress(&self, _mv_id: i64) -> Result<bool, MvRepositoryError> {
-        task_six()
+    fn clear_refresh_progress(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
+        self.blocking(self.clear_refresh_progress_async(mv_id))
     }
-    fn load_refresh(&self, _refresh_id: i64) -> Result<Option<StoredMvRefresh>, MvRepositoryError> {
-        task_six()
+    fn load_refresh(&self, refresh_id: i64) -> Result<Option<StoredMvRefresh>, MvRepositoryError> {
+        self.blocking(self.load_refresh_async(refresh_id))
     }
     fn list_unfinished_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
-        task_six()
+        self.blocking(self.list_unfinished_refreshes_async())
     }
     fn list_unfinished_branch_staged_iceberg_refreshes(
         &self,
     ) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
-        task_six()
+        self.blocking(async {
+            Ok(self
+                .list_unfinished_refreshes_async()
+                .await?
+                .into_iter()
+                .filter(|refresh| {
+                    refresh.target_catalog.is_some()
+                        && refresh.target_namespace.is_some()
+                        && refresh.target_table.is_some()
+                        && refresh.staging_branch.is_some()
+                        && refresh.marker.is_some()
+                })
+                .collect())
+        })
     }
     fn update_starrocks_refresh_summary_if_present(
         &self,
-        _request: UpdateStarRocksMvRefreshSummaryRequest,
+        request: UpdateStarRocksMvRefreshSummaryRequest,
     ) -> Result<bool, MvRepositoryError> {
-        task_six()
+        self.blocking(self.update_starrocks_refresh_summary_if_present_async(request))
     }
     fn replace_partition_states(
         &self,
-        _request: ReplaceMvPartitionStatesRequest,
+        request: ReplaceMvPartitionStatesRequest,
     ) -> Result<(), MvRepositoryError> {
-        task_six()
+        self.blocking(self.replace_partition_states_async(request))
     }
     fn record_failed_partition_states(
         &self,
-        _request: RecordFailedMvPartitionStatesRequest,
+        request: RecordFailedMvPartitionStatesRequest,
     ) -> Result<(), MvRepositoryError> {
-        task_six()
+        self.blocking(self.record_failed_partition_states_async(request))
     }
-    fn clear_partition_states(&self, _mv_id: i64) -> Result<bool, MvRepositoryError> {
-        task_six()
+    fn clear_partition_states(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
+        self.blocking(self.clear_partition_states_async(mv_id))
     }
     fn list_partition_states(
         &self,
-        _mv_id: i64,
+        mv_id: i64,
     ) -> Result<Vec<StoredMvPartitionState>, MvRepositoryError> {
-        task_six()
+        self.blocking(self.list_partition_states_async(mv_id))
     }
     fn adopt_target_compaction_snapshot(
         &self,
-        _target: &MvTarget,
-        _expected_snapshot_id: i64,
-        _adopted_snapshot_id: i64,
+        target: &MvTarget,
+        expected_snapshot_id: i64,
+        adopted_snapshot_id: i64,
     ) -> Result<bool, MvRepositoryError> {
-        task_six()
+        self.blocking(self.adopt_target_compaction_snapshot_async(
+            target,
+            expected_snapshot_id,
+            adopted_snapshot_id,
+        ))
     }
 }
 
@@ -1249,9 +2121,9 @@ async fn put_dependency(
 async fn range_transaction(
     transaction: &mut dyn WriteTransaction,
     prefix: Key,
+    page_size: usize,
 ) -> Result<Vec<StateRecord>, novarocks_spi::state_store::StateStoreError> {
     let range = KeyRange::for_prefix(prefix)?;
-    let page_size = 256;
     let mut continuation = None;
     let mut records = Vec::new();
     loop {
@@ -1269,6 +2141,390 @@ async fn range_transaction(
             return Ok(records);
         }
     }
+}
+
+async fn load_definition_transaction(
+    transaction: &mut dyn WriteTransaction,
+    mv_id: i64,
+) -> Result<(StateRecord, StoredMvDefinition), novarocks_spi::state_store::StateStoreError> {
+    let key = definition_by_id_key(mv_id).map_err(invalid_state_store)?;
+    let record = transaction
+        .get(&key)
+        .await?
+        .ok_or_else(|| invalid_state_store(format!("mv definition {mv_id} not found")))?;
+    let definition = decode_definition(&key, &record.value)
+        .map_err(invalid_state_store)?
+        .value;
+    Ok((record, definition))
+}
+
+async fn load_refresh_transaction(
+    transaction: &mut dyn WriteTransaction,
+    refresh_id: i64,
+) -> Result<(StateRecord, StoredMvRefresh), novarocks_spi::state_store::StateStoreError> {
+    let key = refresh_by_id_key(refresh_id).map_err(invalid_state_store)?;
+    let record = transaction
+        .get(&key)
+        .await?
+        .ok_or_else(|| invalid_state_store(format!("mv refresh {refresh_id} not found")))?;
+    let refresh = decode_record(&key, &record.value)
+        .map_err(invalid_state_store)?
+        .value;
+    Ok((record, refresh))
+}
+
+async fn put_definition_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    definition: &StoredMvDefinition,
+    precondition: Precondition,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    transaction
+        .put(
+            definition_by_id_key(definition.mv_id).map_err(invalid_state_store)?,
+            encode_definition(operation_id, definition).map_err(invalid_state_store)?,
+            precondition,
+        )
+        .await
+}
+
+async fn put_refresh_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    refresh: &StoredMvRefresh,
+    precondition: Precondition,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    transaction
+        .put(
+            refresh_by_id_key(refresh.refresh_id).map_err(invalid_state_store)?,
+            encode_record(MvRecordKind::Refresh, operation_id, refresh)
+                .map_err(invalid_state_store)?,
+            precondition,
+        )
+        .await
+}
+
+async fn put_partition_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    state: &StoredMvPartitionState,
+    precondition: Precondition,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    transaction
+        .put(
+            partition_by_mv_key(state.mv_id, &state.partition_key).map_err(invalid_state_store)?,
+            encode_record(MvRecordKind::Partition, operation_id, state)
+                .map_err(invalid_state_store)?,
+            precondition,
+        )
+        .await
+}
+
+async fn allocate_refresh_id(
+    transaction: &mut dyn WriteTransaction,
+    page_size: usize,
+) -> Result<i64, novarocks_spi::state_store::StateStoreError> {
+    let records = range_transaction_with_page_size(
+        transaction,
+        refresh_prefix().map_err(invalid_state_store)?,
+        page_size,
+    )
+    .await?;
+    records
+        .into_iter()
+        .map(|record| {
+            decode_record::<StoredMvRefresh>(&record.key, &record.value)
+                .map(|decoded| decoded.value.refresh_id)
+                .map_err(invalid_state_store)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid_state_store("MV refresh ID sequence overflow"))
+}
+
+async fn range_transaction_with_page_size(
+    transaction: &mut dyn WriteTransaction,
+    prefix: Key,
+    page_size: usize,
+) -> Result<Vec<StateRecord>, novarocks_spi::state_store::StateStoreError> {
+    let range = KeyRange::for_prefix(prefix)?;
+    let mut continuation = None;
+    let mut records = Vec::new();
+    loop {
+        let page = transaction
+            .range(&RangeRequest {
+                range: range.clone(),
+                direction: Direction::Forward,
+                page_size,
+                continuation: continuation.clone(),
+            })
+            .await?;
+        continuation = page.continuation;
+        records.extend(page.records);
+        if continuation.is_none() {
+            return Ok(records);
+        }
+    }
+}
+
+async fn delete_partition_states_transaction(
+    transaction: &mut dyn WriteTransaction,
+    mv_id: i64,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    let records = range_transaction(
+        transaction,
+        partition_by_mv_prefix(mv_id).map_err(invalid_state_store)?,
+        256,
+    )
+    .await?;
+    for record in records {
+        transaction
+            .delete(record.key, Precondition::Version(record.version))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_partition_states_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    request: ReplaceMvPartitionStatesRequest,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    validate_partition_state_limit(request.max_entries)?;
+    let (definition_record, mut definition) =
+        load_definition_transaction(transaction, request.mv_id).await?;
+    delete_partition_states_transaction(transaction, request.mv_id).await?;
+    if request.partition_keys.len() > request.max_entries {
+        definition.partition_state_complete = false;
+        return put_definition_transaction(
+            transaction,
+            operation_id,
+            &definition,
+            Precondition::Version(definition_record.version),
+        )
+        .await;
+    }
+    for partition_key in request.partition_keys {
+        let state = StoredMvPartitionState {
+            mv_id: request.mv_id,
+            partition_key,
+            status: MvPartitionRefreshStatus::Fresh,
+            last_refresh_ms: Some(request.last_refresh_ms),
+            base_snapshots: request.base_snapshots.clone(),
+            target_snapshot_id: request.target_snapshot_id,
+            last_refresh_id: Some(request.last_refresh_id),
+            failure_message: None,
+        };
+        put_partition_transaction(transaction, operation_id, &state, Precondition::Absent).await?;
+    }
+    definition.partition_state_complete = true;
+    put_definition_transaction(
+        transaction,
+        operation_id,
+        &definition,
+        Precondition::Version(definition_record.version),
+    )
+    .await
+}
+
+async fn record_failed_partition_states_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    request: RecordFailedMvPartitionStatesRequest,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    validate_partition_state_limit(request.max_entries)?;
+    let (definition_record, mut definition) =
+        load_definition_transaction(transaction, request.mv_id).await?;
+    delete_partition_states_transaction(transaction, request.mv_id).await?;
+    if request.partition_keys.len() > request.max_entries {
+        definition.partition_state_complete = false;
+        return put_definition_transaction(
+            transaction,
+            operation_id,
+            &definition,
+            Precondition::Version(definition_record.version),
+        )
+        .await;
+    }
+    for partition_key in request.partition_keys {
+        let state = StoredMvPartitionState {
+            mv_id: request.mv_id,
+            partition_key,
+            status: MvPartitionRefreshStatus::Failed,
+            last_refresh_ms: Some(request.last_refresh_ms),
+            base_snapshots: request.base_snapshots.clone(),
+            target_snapshot_id: request.target_snapshot_id,
+            last_refresh_id: Some(request.last_refresh_id),
+            failure_message: Some(request.failure_message.clone()),
+        };
+        put_partition_transaction(transaction, operation_id, &state, Precondition::Absent).await?;
+    }
+    definition.partition_state_complete = true;
+    put_definition_transaction(
+        transaction,
+        operation_id,
+        &definition,
+        Precondition::Version(definition_record.version),
+    )
+    .await
+}
+
+async fn finalize_refresh_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    request: MvRefreshFinalizeRequest,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    let (refresh_record, mut refresh) =
+        load_refresh_transaction(transaction, request.refresh_id).await?;
+    if refresh.state == MvRefreshState::Finalized {
+        return Ok(());
+    }
+    expect_refresh_state(&refresh, MvRefreshState::PublishCommitted)?;
+    let persisted_snapshot = persisted_publish_target_snapshot(&refresh);
+    if persisted_snapshot != request.target_snapshot_id {
+        return Err(conflict_state_store(format!(
+            "mv refresh {} target snapshot is {:?}, expected published snapshot {:?}",
+            request.refresh_id, request.target_snapshot_id, persisted_snapshot
+        )));
+    }
+    let (definition_record, mut definition) =
+        load_definition_transaction(transaction, refresh.mv_id).await?;
+    if definition.active_refresh_id != Some(request.refresh_id) {
+        return Err(conflict_state_store(format!(
+            "mv definition {} active refresh is {:?}, expected {}",
+            refresh.mv_id, definition.active_refresh_id, request.refresh_id
+        )));
+    }
+    definition.last_refresh_rows = Some(request.rows);
+    definition.last_refresh_snapshots = request.base_snapshots;
+    definition.last_refresh_table_uuids = request.base_table_uuids;
+    definition.last_refreshed_iceberg_snapshot_id = request.target_snapshot_id;
+    definition.refresh_in_progress = false;
+    definition.active_refresh_id = None;
+    definition.refresh_target_snapshots.clear();
+    refresh.state = MvRefreshState::Finalized;
+    put_definition_transaction(
+        transaction,
+        operation_id,
+        &definition,
+        Precondition::Version(definition_record.version),
+    )
+    .await?;
+    put_refresh_transaction(
+        transaction,
+        operation_id,
+        &refresh,
+        Precondition::Version(refresh_record.version),
+    )
+    .await
+}
+
+fn new_refresh(
+    refresh_id: i64,
+    mv_id: i64,
+    operation_id: Option<i64>,
+    target_snapshots: BTreeMap<String, i64>,
+) -> StoredMvRefresh {
+    StoredMvRefresh {
+        refresh_id,
+        mv_id,
+        operation_id,
+        state: MvRefreshState::IntentCreated,
+        target_catalog: None,
+        target_namespace: None,
+        target_table: None,
+        staging_branch: None,
+        expected_main_snapshot_id: None,
+        staging_snapshot_id: None,
+        published_snapshot_id: None,
+        target_snapshots,
+        base_table_uuids: BTreeMap::new(),
+        rows: None,
+        marker: None,
+        external_outcome: None,
+    }
+}
+
+fn expect_refresh_state(
+    refresh: &StoredMvRefresh,
+    expected: MvRefreshState,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    if refresh.state == expected {
+        return Ok(());
+    }
+    Err(conflict_state_store(format!(
+        "mv refresh {} is {}, expected {}",
+        refresh.refresh_id,
+        refresh.state.as_str(),
+        expected.as_str()
+    )))
+}
+
+fn persisted_publish_target_snapshot(refresh: &StoredMvRefresh) -> Option<i64> {
+    refresh.published_snapshot_id.or_else(|| {
+        refresh
+            .external_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.target_snapshot_id)
+    })
+}
+
+fn validate_iceberg_refresh_request(
+    request: &BeginIcebergMvRefreshRequest,
+) -> Result<(), MvRepositoryError> {
+    if request.mv_id <= 0
+        || request.target_catalog.is_empty()
+        || request.target_namespace.is_empty()
+        || request.target_table.is_empty()
+        || request.staging_branch.is_empty()
+        || request.marker_token.is_empty()
+    {
+        return Err(invalid(
+            "Iceberg MV refresh request requires non-empty identifiers and a positive MV ID",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_refresh_metadata_request(
+    request: &UpdateMvRefreshMetadataRequest,
+) -> Result<(), MvRepositoryError> {
+    if matches!(request.refresh_policy, StoredMvRefreshPolicy::AsyncInterval) {
+        if request.refresh_interval_ms.is_none_or(|value| value <= 0) {
+            return Err(invalid(
+                "ASYNC_INTERVAL refresh policy requires positive refresh_interval_ms",
+            ));
+        }
+    } else if request.refresh_interval_ms.is_some() {
+        return Err(invalid(format!(
+            "{} refresh policy cannot set refresh_interval_ms",
+            request.refresh_policy.as_sql_str()
+        )));
+    }
+    if request.max_staleness_ms.is_some_and(|value| value <= 0) {
+        return Err(invalid("max_staleness_ms must be positive when set"));
+    }
+    if request.next_refresh_after_ms.is_some_and(|value| value < 0) {
+        return Err(invalid(
+            "next_refresh_after_ms must be non-negative when set",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_partition_state_limit(
+    max_entries: usize,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    if max_entries == 0 {
+        return Err(invalid_state_store(
+            "mv partition state max_entries must be positive",
+        ));
+    }
+    Ok(())
 }
 
 fn dependency_sort_key(
@@ -1307,10 +2563,4 @@ fn conflict_state_store(
         novarocks_spi::state_store::StateStoreErrorKind::Conflict,
         "MV StateStore transaction conflict",
     )
-}
-fn task_six<T>() -> Result<T, MvRepositoryError> {
-    Err(MvRepositoryError::new(
-        MvRepositoryErrorKind::Unavailable,
-        "MV refresh and partition repository commands are not available until Task 6",
-    ))
 }

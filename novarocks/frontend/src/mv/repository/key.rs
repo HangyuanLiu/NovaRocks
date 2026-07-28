@@ -90,6 +90,10 @@ pub fn refresh_by_id_key(refresh_id: i64) -> Result<Key, String> {
     ))
 }
 
+pub(crate) fn refresh_prefix() -> Result<Key, String> {
+    key_from_path("refresh/by-id/")
+}
+
 pub fn partition_by_mv_key(mv_id: i64, partition_key: &str) -> Result<Key, String> {
     if partition_key.is_empty() {
         return Err("mv partition key must not be empty".to_string());
@@ -99,6 +103,10 @@ pub fn partition_by_mv_key(mv_id: i64, partition_key: &str) -> Result<Key, Strin
         encode_positive_id(mv_id)?,
         hex::encode(partition_key.as_bytes())
     ))
+}
+
+pub(crate) fn partition_by_mv_prefix(mv_id: i64) -> Result<Key, String> {
+    key_from_path(&format!("partition/by-mv/{}/", encode_positive_id(mv_id)?))
 }
 
 pub fn dependency_by_downstream_key(
