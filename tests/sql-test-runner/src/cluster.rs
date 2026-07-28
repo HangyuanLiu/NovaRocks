@@ -585,9 +585,6 @@ fn render_cross_process_launch_config(
                 metadata_path,
             )
         }
-        CrossProcessMetadataMode::InheritBase => {
-            render_cross_process_config(base_config, role, be_index, runtime)
-        }
         CrossProcessMetadataMode::Explicit(metadata_path) => {
             render_cross_process_config_with_metadata_db_override(
                 base_config,
@@ -628,12 +625,10 @@ pub(crate) struct CrossProcessServerHandle {
 
 #[derive(Clone, Copy)]
 enum CrossProcessMetadataMode<'a> {
-    /// Normal ephemeral SQL-test clusters must never restore backend rows from
-    /// another launch whose dynamically reserved endpoints are already stale.
+    /// Ephemeral SQL-test clusters, including IMV L2 cluster A, must never
+    /// restore backend rows from another launch whose dynamically reserved
+    /// endpoints are already stale.
     Isolated,
-    /// The IMV statelessness cluster-A fixture intentionally reuses the base
-    /// metadata store before cluster B proves a fresh-metadata rebuild.
-    InheritBase,
     Explicit(&'a str),
 }
 
@@ -678,25 +673,6 @@ impl CrossProcessServerHandle {
             repo_root,
             runner_config,
             CrossProcessMetadataMode::Isolated,
-        )
-    }
-
-    /// Launch a cluster against the base config's metadata store.
-    ///
-    /// This is intentionally narrower than [`Self::launch`]: ordinary
-    /// cross-process test clusters use dynamically reserved BE endpoints and
-    /// therefore require isolated metadata. Only the IMV L2 cluster-A fixture
-    /// needs to inherit the base metadata store.
-    pub(crate) fn launch_inheriting_base_metadata(
-        cluster_size: usize,
-        repo_root: &Path,
-        runner_config: &RunnerConfig,
-    ) -> Result<Self> {
-        Self::launch_impl(
-            cluster_size,
-            repo_root,
-            runner_config,
-            CrossProcessMetadataMode::InheritBase,
         )
     }
 
@@ -1883,21 +1859,65 @@ exec_node_output = true
             first["metadata"]["path"], second["metadata"]["path"],
             "ephemeral clusters must not restore stale backend rows from another launch"
         );
+    }
 
-        let inherited = render_cross_process_launch_config(
+    #[test]
+    fn imv_l2_metadata_isolation_preserves_shared_lake_fixture() {
+        let runtime = make_runtime_1be();
+        let cluster_a_runtime = Path::new("/tmp/novarocks-imv-l2-cluster-a");
+        let cluster_b_metadata = "/tmp/novarocks-imv-l2-cluster-b.sqlite";
+        let base = BASE_CONFIG.parse::<Value>().unwrap();
+
+        let cluster_a = render_cross_process_launch_config(
             BASE_CONFIG,
             ClusterProcessRole::Fe,
             0,
             &runtime,
-            first_runtime,
-            CrossProcessMetadataMode::InheritBase,
+            cluster_a_runtime,
+            CrossProcessMetadataMode::Isolated,
         )
         .unwrap()
         .parse::<Value>()
         .unwrap();
+        let cluster_b = render_cross_process_launch_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Fe,
+            0,
+            &runtime,
+            Path::new("/tmp/novarocks-imv-l2-cluster-b"),
+            CrossProcessMetadataMode::Explicit(cluster_b_metadata),
+        )
+        .unwrap()
+        .parse::<Value>()
+        .unwrap();
+
         assert_eq!(
-            inherited["metadata"]["path"],
-            BASE_CONFIG.parse::<Value>().unwrap()["metadata"]["path"]
+            cluster_a["metadata"]["path"].as_str(),
+            cluster_a_runtime.join("metadata.sqlite").to_str(),
+            "cluster A must not inherit backend topology rows from the base metadata database"
+        );
+        assert_eq!(
+            cluster_b["metadata"]["path"].as_str(),
+            Some(cluster_b_metadata)
+        );
+        assert_ne!(cluster_a["metadata"]["path"], base["metadata"]["path"]);
+        assert_ne!(cluster_b["metadata"]["path"], base["metadata"]["path"]);
+        assert_ne!(cluster_a["metadata"]["path"], cluster_b["metadata"]["path"]);
+        assert_eq!(
+            cluster_a["standalone_server"]["warehouse_uri"],
+            base["standalone_server"]["warehouse_uri"]
+        );
+        assert_eq!(
+            cluster_b["standalone_server"]["warehouse_uri"],
+            base["standalone_server"]["warehouse_uri"]
+        );
+        assert_eq!(
+            cluster_a["standalone_server"]["object_store"],
+            base["standalone_server"]["object_store"]
+        );
+        assert_eq!(
+            cluster_b["standalone_server"]["object_store"],
+            base["standalone_server"]["object_store"]
         );
     }
 
