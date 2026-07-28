@@ -846,8 +846,33 @@ impl StateStoreMvRepository {
             return Err(invalid("mv definition id must be positive"));
         }
         let operation_id = Uuid::now_v7();
-        let page_size = self.store.limits().max_page_size;
-        let existing_partitions = self.list_partition_states_async(mv_id).await?;
+        let existing_partitions = self.list_partition_state_records_async(mv_id).await?;
+        let dependency_records = self
+            .scan_prefix(dependency_by_downstream_prefix(mv_id).map_err(corruption)?)
+            .await?;
+        let mut existing_dependencies = Vec::with_capacity(dependency_records.len());
+        for downstream in dependency_records {
+            let dependency: DecodedMvRecord<StoredMvDependency> =
+                decode_record(&downstream.key, &downstream.value).map_err(corruption)?;
+            let upstream_key = dependency_by_upstream_key(&dependency.value.upstream, mv_id)
+                .map_err(corruption)?;
+            let upstream = self
+                .read_record(&upstream_key)
+                .await?
+                .ok_or_else(|| corruption("MV dependency index is asymmetric before MV drop"))?;
+            existing_dependencies.push((downstream, upstream));
+        }
+        let existing_refreshes = self
+            .scan_prefix(refresh_prefix().map_err(corruption)?)
+            .await?
+            .into_iter()
+            .filter_map(|record| {
+                decode_record::<StoredMvRefresh>(&record.key, &record.value)
+                    .map(|refresh| (refresh.value.mv_id == mv_id).then_some(record))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(corruption)?;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -856,6 +881,8 @@ impl StateStoreMvRepository {
             "drop materialized view definition",
             move |transaction| {
                 let existing_partitions = existing_partitions.clone();
+                let existing_dependencies = existing_dependencies.clone();
+                let existing_refreshes = existing_refreshes.clone();
                 Box::pin(async move {
                     let definition_key =
                         definition_by_id_key(mv_id).map_err(invalid_state_store)?;
@@ -887,49 +914,51 @@ impl StateStoreMvRepository {
                             .delete(target_key, Precondition::Version(target_record.version))
                             .await?;
                     }
-                    let prefix =
-                        dependency_by_downstream_prefix(mv_id).map_err(invalid_state_store)?;
-                    for dependency_record in
-                        range_transaction(transaction, prefix, page_size).await?
-                    {
-                        let dependency: DecodedMvRecord<StoredMvDependency> =
-                            decode_record(&dependency_record.key, &dependency_record.value)
-                                .map_err(invalid_state_store)?;
-                        let upstream_key =
-                            dependency_by_upstream_key(&dependency.value.upstream, mv_id)
-                                .map_err(invalid_state_store)?;
-                        let upstream_record =
-                            transaction.get(&upstream_key).await?.ok_or_else(|| {
-                                invalid_state_store("MV dependency index is asymmetric")
+                    for (dependency_record, upstream_record) in &existing_dependencies {
+                        let current_dependency = transaction
+                            .get(&dependency_record.key)
+                            .await?
+                            .ok_or_else(|| {
+                                conflict_state_store("MV dependency changed before drop")
                             })?;
+                        let current_upstream = transaction
+                            .get(&upstream_record.key)
+                            .await?
+                            .ok_or_else(|| {
+                                conflict_state_store("MV dependency changed before drop")
+                            })?;
+                        if current_dependency.version != dependency_record.version
+                            || current_upstream.version != upstream_record.version
+                        {
+                            return Err(conflict_state_store("MV dependency changed before drop"));
+                        }
                         transaction
                             .delete(
-                                dependency_record.key,
-                                Precondition::Version(dependency_record.version),
+                                dependency_record.key.clone(),
+                                Precondition::Version(dependency_record.version.clone()),
                             )
                             .await?;
                         transaction
-                            .delete(upstream_key, Precondition::Version(upstream_record.version))
+                            .delete(
+                                upstream_record.key.clone(),
+                                Precondition::Version(upstream_record.version.clone()),
+                            )
                             .await?;
                     }
-                    for refresh_record in range_transaction(
-                        transaction,
-                        refresh_prefix().map_err(invalid_state_store)?,
-                        page_size,
-                    )
-                    .await?
-                    {
-                        let refresh: DecodedMvRecord<StoredMvRefresh> =
-                            decode_record(&refresh_record.key, &refresh_record.value)
-                                .map_err(invalid_state_store)?;
-                        if refresh.value.mv_id == mv_id {
-                            transaction
-                                .delete(
-                                    refresh_record.key,
-                                    Precondition::Version(refresh_record.version),
-                                )
-                                .await?;
+                    for refresh_record in &existing_refreshes {
+                        let current_refresh =
+                            transaction.get(&refresh_record.key).await?.ok_or_else(|| {
+                                conflict_state_store("MV refresh changed before drop")
+                            })?;
+                        if current_refresh.version != refresh_record.version {
+                            return Err(conflict_state_store("MV refresh changed before drop"));
                         }
+                        transaction
+                            .delete(
+                                refresh_record.key.clone(),
+                                Precondition::Version(refresh_record.version.clone()),
+                            )
+                            .await?;
                     }
                     delete_partition_states_transaction(transaction, &existing_partitions).await?;
                     transaction
@@ -948,7 +977,9 @@ impl StateStoreMvRepository {
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         self.require_definition_async(request.mv_id).await?;
         let operation_id = Uuid::now_v7();
-        let existing_partitions = self.list_partition_states_async(request.mv_id).await?;
+        let existing_partitions = self
+            .list_partition_state_records_async(request.mv_id)
+            .await?;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1373,9 +1404,15 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         self.require_refresh_async(request.refresh.refresh_id)
             .await?;
+        if let Some(partitions) = &request.partitions {
+            self.require_definition_async(partitions.mv_id).await?;
+        }
         let operation_id = Uuid::now_v7();
         let existing_partitions = match request.partitions.as_ref() {
-            Some(partitions) => self.list_partition_states_async(partitions.mv_id).await?,
+            Some(partitions) => {
+                self.list_partition_state_records_async(partitions.mv_id)
+                    .await?
+            }
             None => Vec::new(),
         };
         let store = Arc::clone(&self.store);
@@ -1610,7 +1647,9 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         self.require_definition_async(request.mv_id).await?;
         let operation_id = Uuid::now_v7();
-        let existing_partitions = self.list_partition_states_async(request.mv_id).await?;
+        let existing_partitions = self
+            .list_partition_state_records_async(request.mv_id)
+            .await?;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1640,7 +1679,9 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         self.require_definition_async(request.mv_id).await?;
         let operation_id = Uuid::now_v7();
-        let existing_partitions = self.list_partition_states_async(request.mv_id).await?;
+        let existing_partitions = self
+            .list_partition_state_records_async(request.mv_id)
+            .await?;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1666,7 +1707,7 @@ impl StateStoreMvRepository {
 
     async fn clear_partition_states_async(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
         let operation_id = Uuid::now_v7();
-        let existing_partitions = self.list_partition_states_async(mv_id).await?;
+        let existing_partitions = self.list_partition_state_records_async(mv_id).await?;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1705,11 +1746,8 @@ impl StateStoreMvRepository {
         &self,
         mv_id: i64,
     ) -> Result<Vec<StoredMvPartitionState>, MvRepositoryError> {
-        if mv_id <= 0 {
-            return Err(invalid("mv definition id must be positive"));
-        }
         let mut states = self
-            .scan_prefix(partition_by_mv_prefix(mv_id).map_err(invalid)?)
+            .list_partition_state_records_async(mv_id)
             .await?
             .into_iter()
             .map(|record| {
@@ -1720,6 +1758,17 @@ impl StateStoreMvRepository {
             .collect::<Result<Vec<_>, _>>()?;
         states.sort_by(|left, right| left.partition_key.cmp(&right.partition_key));
         Ok(states)
+    }
+
+    async fn list_partition_state_records_async(
+        &self,
+        mv_id: i64,
+    ) -> Result<Vec<StateRecord>, MvRepositoryError> {
+        if mv_id <= 0 {
+            return Err(invalid("mv definition id must be positive"));
+        }
+        self.scan_prefix(partition_by_mv_prefix(mv_id).map_err(invalid)?)
+            .await
     }
 
     async fn adopt_target_compaction_snapshot_async(
@@ -2361,16 +2410,24 @@ async fn range_transaction_with_page_size(
 
 async fn delete_partition_states_transaction(
     transaction: &mut dyn WriteTransaction,
-    states: &[StoredMvPartitionState],
+    records: &[StateRecord],
 ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
-    for state in states {
-        let key =
-            partition_by_mv_key(state.mv_id, &state.partition_key).map_err(invalid_state_store)?;
-        if let Some(record) = transaction.get(&key).await? {
-            transaction
-                .delete(key, Precondition::Version(record.version))
-                .await?;
+    for record in records {
+        let current = transaction
+            .get(&record.key)
+            .await?
+            .ok_or_else(|| conflict_state_store("MV partition state changed before mutation"))?;
+        if current.version != record.version {
+            return Err(conflict_state_store(
+                "MV partition state changed before mutation",
+            ));
         }
+        transaction
+            .delete(
+                record.key.clone(),
+                Precondition::Version(record.version.clone()),
+            )
+            .await?;
     }
     Ok(())
 }
@@ -2379,7 +2436,7 @@ async fn replace_partition_states_transaction(
     transaction: &mut dyn WriteTransaction,
     operation_id: Uuid,
     request: ReplaceMvPartitionStatesRequest,
-    existing: &[StoredMvPartitionState],
+    existing: &[StateRecord],
 ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
     validate_partition_state_limit(request.max_entries)?;
     let (definition_record, mut definition) =
@@ -2422,7 +2479,7 @@ async fn record_failed_partition_states_transaction(
     transaction: &mut dyn WriteTransaction,
     operation_id: Uuid,
     request: RecordFailedMvPartitionStatesRequest,
-    existing: &[StoredMvPartitionState],
+    existing: &[StateRecord],
 ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
     validate_partition_state_limit(request.max_entries)?;
     let (definition_record, mut definition) =
