@@ -40,6 +40,7 @@ pub(super) fn prepare_scan_bindings(
     connectors: &ConnectorRegistry,
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<ScanExecutionBindings, String> {
+    let context = crate::connector::query_request_context(None)?;
     let mut bindings = ScanExecutionBindings::default();
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     for fragment in plan.fragments() {
@@ -47,6 +48,7 @@ pub(super) fn prepare_scan_bindings(
             fragment.fragment_id,
             &fragment.root,
             connectors,
+            &context,
             resolver,
             &mut seen_scan_node_ids,
             &mut bindings,
@@ -59,6 +61,7 @@ fn collect_scan_bindings(
     fragment_id: FragmentId,
     node: &DistributedNode,
     connectors: &ConnectorRegistry,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
     bindings: &mut ScanExecutionBindings,
@@ -72,6 +75,7 @@ fn collect_scan_bindings(
             node.node_id,
             scan,
             connectors,
+            context,
             resolver,
             bindings,
         )?;
@@ -82,6 +86,7 @@ fn collect_scan_bindings(
                 fragment_id,
                 child,
                 connectors,
+                context,
                 resolver,
                 seen_scan_node_ids,
                 bindings,
@@ -96,6 +101,7 @@ fn prepare_scan_node(
     node_id: i32,
     scan: &PlanScanNode,
     connectors: &ConnectorRegistry,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
@@ -123,7 +129,7 @@ fn prepare_scan_node(
             {
                 let planned =
                     crate::connector::starrocks::table::scan_adapter::plan_native_starrocks_scan_with_compat(
-                    node_id, scan, connectors,
+                    node_id, scan, connectors, context.clone(),
                 )?;
                 return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
             }
@@ -163,7 +169,7 @@ fn prepare_scan_node(
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required) = match &execution {
         ResolvedScanExecution::IcebergFiles(_) => {
-            plan_iceberg_file_ranges(connectors, scan, &execution)
+            plan_iceberg_file_ranges(connectors, context.clone(), scan, &execution)
                 .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?
         }
         ResolvedScanExecution::IcebergDelta(_) => {

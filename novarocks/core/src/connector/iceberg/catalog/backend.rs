@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::{
-    CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, ResolvedView, TableSink,
+    CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, TableSink,
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::connector::iceberg::scan_model::{
@@ -36,10 +36,9 @@ use novarocks_catalog::schema::ColumnDef;
 
 use super::registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, create_namespace as reg_create_namespace,
-    create_table as reg_create_table, current_schema_id as reg_current_schema_id,
-    drop_namespace as reg_drop_namespace, drop_table as reg_drop_table,
-    insert_rows as reg_insert_rows, list_tables as reg_list_tables, load_table as reg_load_table,
-    namespace_exists as reg_namespace_exists,
+    create_table as reg_create_table, drop_namespace as reg_drop_namespace,
+    drop_table as reg_drop_table, insert_rows as reg_insert_rows, list_tables as reg_list_tables,
+    load_table as reg_load_table,
 };
 use super::views;
 
@@ -59,29 +58,11 @@ impl IcebergCatalogBackend {
         let guard = self.registry.read().expect("iceberg catalog read lock");
         guard.get(catalog)
     }
-
-    fn resolved_table(
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        loaded: IcebergLoadedTable,
-    ) -> ResolvedTable {
-        ResolvedTable {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
-            columns: loaded.columns,
-        }
-    }
 }
 
 impl CatalogBackend for IcebergCatalogBackend {
     fn name(&self) -> &'static str {
         "iceberg"
-    }
-
-    fn namespace_exists(&self, catalog: &str, namespace: &str) -> Result<bool, String> {
-        reg_namespace_exists(&self.entry(catalog)?, namespace)
     }
 
     fn create_namespace(&self, catalog: &str, namespace: &str) -> Result<(), String> {
@@ -111,13 +92,6 @@ impl CatalogBackend for IcebergCatalogBackend {
         )
     }
 
-    fn table_exists(&self, catalog: &str, namespace: &str, table: &str) -> Result<bool, String> {
-        let entry = self.entry(catalog)?;
-        let normalized = novarocks_catalog::identifier::normalize_identifier(table)?;
-        let tables = reg_list_tables(&entry, namespace)?;
-        Ok(tables.iter().any(|t| t.eq_ignore_ascii_case(&normalized)))
-    }
-
     fn alter_iceberg_partition_spec(
         &self,
         catalog: &str,
@@ -139,44 +113,6 @@ impl CatalogBackend for IcebergCatalogBackend {
         reg_drop_table(&self.entry(catalog)?, namespace, table)
     }
 
-    fn load_table(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<ResolvedTable, String> {
-        let loaded = reg_load_table(&self.entry(catalog)?, namespace, table)?;
-        Ok(Self::resolved_table(catalog, namespace, table, loaded))
-    }
-
-    fn load_table_for_read(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<ResolvedTable, String> {
-        self.load_table(catalog, namespace, table)
-    }
-
-    fn current_schema_id(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<Option<i32>, String> {
-        reg_current_schema_id(&self.entry(catalog)?, namespace, table).map(Some)
-    }
-
-    fn current_schema_id_for_read(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<(String, Option<i32>), String> {
-        self.current_schema_id(catalog, namespace, table)
-            .map(|schema_id| (table.to_string(), schema_id))
-    }
-
     fn create_view(&self, req: CreateViewRequest) -> Result<(), String> {
         let entry = self.entry(&req.catalog)?;
         views::create_view(
@@ -194,131 +130,12 @@ impl CatalogBackend for IcebergCatalogBackend {
     fn drop_view(&self, catalog: &str, namespace: &str, view: &str) -> Result<(), String> {
         views::drop_view(&self.entry(catalog)?, namespace, view)
     }
-
-    fn load_view(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        view: &str,
-    ) -> Result<ResolvedView, String> {
-        let loaded = views::load_view(&self.entry(catalog)?, namespace, view)?;
-        Ok(ResolvedView {
-            sql: loaded.sql,
-            dialect: loaded.dialect,
-            default_namespace: loaded.default_namespace,
-            column_names: loaded.column_names,
-            comment: loaded.comment,
-            properties: loaded.properties,
-        })
-    }
-
-    fn view_exists(&self, catalog: &str, namespace: &str, view: &str) -> Result<bool, String> {
-        views::view_exists(&self.entry(catalog)?, namespace, view)
-    }
-
-    fn list_views(&self, catalog: &str, namespace: &str) -> Result<Vec<String>, String> {
-        views::list_views(&self.entry(catalog)?, namespace)
-    }
 }
 
 pub(crate) fn iceberg_table_stats_provider(
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
 ) -> Arc<dyn crate::connector::stats::TableStatsProvider> {
     Arc::new(crate::connector::iceberg::stats::IcebergTableStatsProvider::new(registry))
-}
-
-pub(crate) fn resolve_iceberg_schema_table_def(
-    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
-    table: &ResolvedTable,
-) -> Result<TableDef, String> {
-    let guard = registry.read().expect("iceberg catalog read lock");
-    let entry = guard.get(&table.catalog)?;
-    let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
-    build_iceberg_schema_table_def_from_loaded(
-        &entry,
-        &table.catalog,
-        &table.namespace,
-        &table.table,
-        loaded,
-    )
-}
-
-pub(crate) fn resolve_iceberg_metadata_rows_table_def(
-    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
-    resolved: &ResolvedTable,
-    metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-) -> Result<TableDef, String> {
-    let guard = registry.read().expect("iceberg catalog read lock");
-    let entry = guard.get(&resolved.catalog)?;
-    let loaded = reg_load_table(&entry, &resolved.namespace, &resolved.table)?;
-    // The iceberg-rust `Table` is `Clone`; capture it (and its `FileIO`)
-    // before `build_iceberg_schema_table_def` consumes `loaded`.
-    let iceberg_table = loaded.table.clone();
-    let file_io = iceberg_table.file_io().clone();
-    let mut def = build_iceberg_schema_table_def_from_loaded(
-        &entry,
-        &resolved.catalog,
-        &resolved.namespace,
-        &resolved.table,
-        loaded,
-    )?;
-    drop(guard);
-    let rows = super::registry::block_on_iceberg(async {
-        crate::connector::iceberg::metadata_read::read_metadata_table_rows(
-            &iceberg_table,
-            &file_io,
-            metadata_table_type,
-        )
-        .await
-    })??;
-    if let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } = &mut def.source
-    {
-        table.serialized_metadata_rows = Some(rows);
-    }
-    Ok(def)
-}
-
-pub(crate) fn resolve_iceberg_table_def_at(
-    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
-    table: &ResolvedTable,
-    snapshot_id: Option<i64>,
-) -> Result<TableDef, String> {
-    let guard = registry.read().expect("iceberg catalog read lock");
-    let entry = guard.get(&table.catalog)?;
-    let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
-    let effective_snapshot_id =
-        snapshot_id.or_else(|| loaded.table.metadata().current_snapshot_id());
-    let data_files = if let Some(id) = effective_snapshot_id {
-        if let Some(cached) = entry.cached_data_files(&table.namespace, &table.table, Some(id))? {
-            cached
-        } else {
-            let extracted = super::registry::extract_data_files_with_stats_at(&loaded.table, id)?;
-            entry.cache_data_files(&table.namespace, &table.table, Some(id), extracted.clone())?;
-            extracted
-        }
-    } else {
-        Vec::new()
-    };
-    build_iceberg_table_def_with_data_files(
-        &entry,
-        &table.catalog,
-        &table.namespace,
-        &table.table,
-        loaded,
-        data_files,
-        if snapshot_id.is_some() {
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-        } else {
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot
-        },
-    )
-}
-
-pub(crate) fn resolve_iceberg_table_def(
-    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
-    table: &ResolvedTable,
-) -> Result<TableDef, String> {
-    resolve_iceberg_table_def_at(registry, table, None)
 }
 
 pub(crate) fn build_iceberg_table_def_with_files(
@@ -459,7 +276,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     })
 }
 
-fn build_iceberg_schema_table_def_from_loaded(
+pub(crate) fn build_iceberg_schema_table_def_from_loaded(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,
     namespace: &str,
@@ -1201,7 +1018,7 @@ mod tests {
                 )
                 .expect("create catalog");
         }
-        let backend = IcebergCatalogBackend::new(registry);
+        let backend = IcebergCatalogBackend::new(Arc::clone(&registry));
         backend
             .create_namespace("ice", "db")
             .expect("create namespace");
@@ -1224,11 +1041,15 @@ mod tests {
             })
             .expect("create table");
 
-        let cached = backend.load_table("ice", "db", "t").expect("seed cache");
-        let initial = backend
-            .current_schema_id("ice", "db", "t")
-            .expect("schema id")
-            .expect("tracked schema id");
+        let entry = registry
+            .read()
+            .expect("registry")
+            .get("ice")
+            .expect("entry");
+        let cached = reg_load_table(&entry, "db", "t").expect("seed cache");
+        let initial =
+            crate::connector::iceberg::catalog::registry::current_schema_id(&entry, "db", "t")
+                .expect("tracked schema id");
         let metadata_path = latest_local_metadata_json_path(&warehouse, "db", "t");
         let mut metadata_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata json"))
@@ -1248,10 +1069,9 @@ mod tests {
         )
         .expect("write metadata json");
 
-        let probed = backend
-            .current_schema_id("ice", "db", "t")
-            .expect("schema id")
-            .expect("tracked schema id");
+        let probed =
+            crate::connector::iceberg::catalog::registry::current_schema_id(&entry, "db", "t")
+                .expect("tracked schema id");
         assert_eq!(probed, changed);
     }
 
@@ -1366,16 +1186,15 @@ mod tests {
             })
             .expect("create v3 row-lineage table");
 
-        let table_def = resolve_iceberg_schema_table_def(
-            &registry,
-            &ResolvedTable {
-                catalog: "ice".to_string(),
-                namespace: "db".to_string(),
-                table: "t".to_string(),
-                columns: vec![],
-            },
-        )
-        .expect("schema-only table def through connector metadata adapter");
+        let entry = registry
+            .read()
+            .expect("registry")
+            .get("ice")
+            .expect("entry");
+        let loaded = reg_load_table(&entry, "db", "t").expect("load table");
+        let table_def =
+            build_iceberg_schema_table_def_from_loaded(&entry, "ice", "db", "t", loaded)
+                .expect("schema-only table def through connector metadata adapter");
 
         assert_row_lineage_metadata_columns(&table_def);
         let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {

@@ -392,8 +392,15 @@ fn drive_data_write(
     // ResolvedTable that execute_iceberg_insert_or_overwrite expects.
     let resolved = {
         let reg = state.connectors.read().expect("connector registry read");
-        let catalog_backend = reg.catalog_backend(target.backend_name)?;
-        catalog_backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &reg,
+            crate::connector::query_request_context(None)?,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
 
     crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(

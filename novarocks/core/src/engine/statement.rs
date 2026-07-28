@@ -842,7 +842,14 @@ pub(crate) fn execute_create_database_statement(
         .expect("connector registry read")
         .catalog_backend(target.backend_name)?;
     // When IF NOT EXISTS is specified, skip creation if the namespace already exists.
-    if if_not_exists && backend.namespace_exists(&target.catalog, &target.namespace)? {
+    if if_not_exists
+        && crate::connector::metadata_namespace_exists(
+            &state.connectors.read().expect("connector registry read"),
+            crate::connector::query_request_context(None)?,
+            &target.catalog,
+            &target.namespace,
+        )?
+    {
         return Ok(StatementResult::Ok);
     }
     backend.create_namespace(&target.catalog, &target.namespace)?;
@@ -919,7 +926,13 @@ pub(crate) fn execute_create_table_statement(
             // Honour `IF NOT EXISTS`: skip creation when the table already
             // exists. CTAS has its own existence check in `iceberg_ctas`.
             if stmt.if_not_exists
-                && backend.table_exists(&target.catalog, &target.namespace, &target.table)?
+                && crate::connector::metadata_table_exists(
+                    &state.connectors.read().expect("connector registry read"),
+                    crate::connector::query_request_context(None)?,
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
+                )?
             {
                 return Ok(StatementResult::Ok);
             }
@@ -992,7 +1005,12 @@ pub(crate) fn execute_drop_database_statement(
         .expect("connector registry read")
         .catalog_backend(target.backend_name)?;
     if target.backend_name == "iceberg"
-        && !backend.namespace_exists(&target.catalog, &target.namespace)?
+        && !crate::connector::metadata_namespace_exists(
+            &state.connectors.read().expect("connector registry read"),
+            crate::connector::query_request_context(None)?,
+            &target.catalog,
+            &target.namespace,
+        )?
     {
         return if if_exists {
             Ok(StatementResult::Ok)
@@ -1102,8 +1120,18 @@ pub(crate) fn execute_drop_table_statement(
             // A DROP TABLE aimed at a view must say so instead of "unknown
             // table" — views and tables are separate REST resources.
             if target.backend_name == "iceberg"
-                && backend
-                    .view_exists(&target.catalog, &target.namespace, &target.table)
+                && state
+                    .iceberg_catalogs
+                    .read()
+                    .expect("iceberg catalog registry read")
+                    .get(&target.catalog)
+                    .and_then(|entry| {
+                        crate::connector::iceberg::catalog::views::view_exists(
+                            &entry,
+                            &target.namespace,
+                            &target.table,
+                        )
+                    })
                     .unwrap_or(false)
             {
                 return Err(format!(
@@ -1179,11 +1207,18 @@ pub(crate) fn execute_truncate_table_statement(
             target.namespace, target.table
         ));
     }
-    let catalog = {
+    let resolved_table = {
         let reg = state.connectors.read().expect("connector registry read");
-        reg.catalog_backend(target.backend_name)?
+        crate::connector::metadata_load_table(
+            &reg,
+            crate::connector::query_request_context(None)?,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
-    let resolved_table = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
     crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
         state,
         &target,

@@ -764,7 +764,7 @@ pub(crate) fn analyze_visible_query(
         None,
         &catalog_service,
         &connectors,
-        &state.iceberg_catalogs,
+        crate::connector::query_request_context(None)?,
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let (resolved, _cte_registry, _factory) =

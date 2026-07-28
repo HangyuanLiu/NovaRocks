@@ -52,6 +52,7 @@ pub(crate) fn build_iceberg_metadata_scan_range_params()
 
 pub(super) fn plan_iceberg_file_ranges(
     connectors: &ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
 ) -> Result<
@@ -66,7 +67,8 @@ pub(super) fn plan_iceberg_file_ranges(
     };
     let base_column_names = effective_scan_column_names(scan);
     let mut effective_column_names = base_column_names.clone();
-    let mut planned_files = plan_files(connectors, files, &effective_column_names)?;
+    let mut planned_files =
+        plan_files(connectors, context.clone(), files, &effective_column_names)?;
     let equality_required =
         crate::connector::iceberg::scan_range::equality_delete_required_columns(
             &files.table,
@@ -75,7 +77,7 @@ pub(super) fn plan_iceberg_file_ranges(
     effective_column_names =
         merge_effective_column_names(base_column_names.clone(), &equality_required);
     if effective_column_names != base_column_names {
-        planned_files = plan_files(connectors, files, &effective_column_names)?;
+        planned_files = plan_files(connectors, context, files, &effective_column_names)?;
     }
     let plan = crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(
         &files.table,
@@ -104,6 +106,7 @@ fn merge_effective_column_names(existing: Vec<String>, additional: &[String]) ->
 
 fn plan_files(
     connectors: &ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
     files: &ResolvedIcebergFileScan,
     column_names: &[String],
 ) -> Result<Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>, String> {
@@ -120,6 +123,7 @@ fn plan_files(
         .collect::<Vec<_>>();
     crate::connector::iceberg::provider::plan_scan_files(
         connectors,
+        context,
         &files.table,
         files.binding,
         &files.files,

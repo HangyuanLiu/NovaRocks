@@ -60,7 +60,7 @@ pub(crate) struct StarRocksTabletSchemaDescriptor {
     pub(crate) columns: Vec<StarRocksColumnSchemaDescriptor>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StarRocksScanSourceDescriptor {
     pub(crate) catalog_name: String,
     pub(crate) db_id: i64,

@@ -52,7 +52,7 @@ fn parse_table_metadata(serialized: &str) -> Result<TableMetadata, String> {
         .map_err(|e| format!("parse iceberg table metadata for metadata-scan failed: {e}"))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergMetadataTableType {
     Files,
     Manifests,

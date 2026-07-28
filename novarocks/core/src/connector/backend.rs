@@ -25,7 +25,6 @@
 //! connector fulfils the request.
 
 use arrow::record_batch::RecordBatch;
-use std::collections::HashMap;
 
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
@@ -66,18 +65,7 @@ pub(crate) struct CreateViewRequest {
     pub properties: Vec<(String, String)>,
 }
 
-/// A view loaded through a catalog backend.
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedView {
-    pub sql: String,
-    pub dialect: String,
-    pub default_namespace: String,
-    pub column_names: Vec<String>,
-    pub comment: Option<String>,
-    pub properties: HashMap<String, String>,
-}
-
-/// Resolved table metadata returned by `CatalogBackend::load_table`. This is
+/// Resolved table metadata returned by the connector metadata SPI. This is
 /// the subset of table shape the engine layer needs in order to plan INSERTs
 /// and to register the table with the in-memory logical catalog.
 #[derive(Clone, Debug)]
@@ -88,17 +76,15 @@ pub(crate) struct ResolvedTable {
     pub columns: Vec<ColumnDef>,
 }
 
-/// Catalog-plane operations: create/drop namespace and create/drop/load
-/// tables. Implemented once per catalog type (iceberg, StarRocks table, ...).
+/// Catalog mutation/admin operations. Read-only metadata is owned exclusively
+/// by the connector metadata SPI.
 pub(crate) trait CatalogBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
-    fn namespace_exists(&self, catalog: &str, namespace: &str) -> Result<bool, String>;
     fn create_namespace(&self, catalog: &str, namespace: &str) -> Result<(), String>;
     fn drop_namespace(&self, catalog: &str, namespace: &str, force: bool) -> Result<(), String>;
 
     fn create_table(&self, req: CreateTableRequest) -> Result<(), String>;
-    fn table_exists(&self, catalog: &str, namespace: &str, table: &str) -> Result<bool, String>;
     fn alter_iceberg_partition_spec(
         &self,
         _catalog: &str,
@@ -118,74 +104,11 @@ pub(crate) trait CatalogBackend: Send + Sync {
         table: &str,
         if_exists: bool,
     ) -> Result<(), String>;
-    fn load_table(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<ResolvedTable, String>;
-
-    /// Resolve a table for read/query planning. Backends may expose synthetic
-    /// read aliases here without changing strict catalog-plane `load_table`
-    /// semantics used by DDL and write paths.
-    fn load_table_for_read(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<ResolvedTable, String> {
-        self.load_table(catalog, namespace, table)
-    }
-
-    fn current_schema_id(
-        &self,
-        _catalog: &str,
-        _namespace: &str,
-        _table: &str,
-    ) -> Result<Option<i32>, String> {
-        Ok(None)
-    }
-
-    /// Resolve the physical table name and schema id for read/query planning.
-    /// The returned table name may differ from the requested name for validated
-    /// read aliases, while strict catalog-plane operations keep using
-    /// `current_schema_id`.
-    fn current_schema_id_for_read(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<(String, Option<i32>), String> {
-        Ok((
-            table.to_string(),
-            self.current_schema_id(catalog, namespace, table)?,
-        ))
-    }
-
     fn create_view(&self, _req: CreateViewRequest) -> Result<(), String> {
         Err(format!("{} backend does not support views", self.name()))
     }
 
     fn drop_view(&self, _catalog: &str, _namespace: &str, _view: &str) -> Result<(), String> {
-        Err(format!("{} backend does not support views", self.name()))
-    }
-
-    fn load_view(
-        &self,
-        _catalog: &str,
-        _namespace: &str,
-        _view: &str,
-    ) -> Result<ResolvedView, String> {
-        Err(format!("{} backend does not support views", self.name()))
-    }
-
-    /// Whether a view with this name exists. Backends without view support
-    /// report `false` so strict DROP-type checks degrade gracefully.
-    fn view_exists(&self, _catalog: &str, _namespace: &str, _view: &str) -> Result<bool, String> {
-        Ok(false)
-    }
-
-    fn list_views(&self, _catalog: &str, _namespace: &str) -> Result<Vec<String>, String> {
         Err(format!("{} backend does not support views", self.name()))
     }
 }

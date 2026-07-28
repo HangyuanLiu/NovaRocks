@@ -20,8 +20,9 @@
 //! contain only catalog/table identity and a snapshot pin; core code transports
 //! them as opaque bytes and never downcasts into Iceberg objects.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
@@ -31,7 +32,7 @@ use novarocks_spi::connector::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest, ConnectorRead,
     ConnectorReadSelector, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
     ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
-    ConnectorTableRequest,
+    ConnectorTableRequest, ConnectorTableResolution,
 };
 use serde::{Deserialize, Serialize};
 
@@ -250,13 +251,11 @@ impl ConnectorMetadata for IcebergConnectorInstance {
         self.validate_context(&request.context)?;
         ensure_owner(&request.table.instance_id, &self.instance_id)?;
         let entry = self.entry(self.instance_id.as_str())?;
-        let table = TablePayload {
-            namespace: request.table.namespace.to_string(),
-            table: request.table.table.to_string(),
-            explicit_files: None,
-        };
+        let requested_table = request.table.table.to_string();
+        let (table_name, metadata_table_type) =
+            resolve_table_request(&requested_table, request.resolution)?;
         let loaded =
-            load_table(&entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+            load_table(&entry, &request.table.namespace, &table_name).map_err(map_iceberg_error)?;
         let schema = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(loaded.table.metadata().current_schema())
                 .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?,
@@ -264,8 +263,20 @@ impl ConnectorMetadata for IcebergConnectorInstance {
         let version = Some(Bytes::copy_from_slice(
             &loaded.table.metadata().current_schema_id().to_le_bytes(),
         ));
+        let table = build_table_payload(
+            &entry,
+            self.instance_id.as_str(),
+            &request.table.namespace,
+            &table_name,
+            loaded,
+            metadata_table_type,
+        )?;
         Ok(ConnectorTableMetadata {
-            identity: request.table,
+            identity: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: self.instance_id.clone(),
+                namespace: request.table.namespace,
+                table: Arc::from(table_name),
+            },
             schema,
             version,
             table: ConnectorTableHandle::try_new(
@@ -471,10 +482,139 @@ impl ConnectorRead for IcebergConnectorInstance {
     }
 }
 
+fn resolve_table_request(
+    requested_table: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<(String, Option<super::IcebergMetadataTableType>), ConnectorError> {
+    let alias = requested_table
+        .rsplit_once('$')
+        .and_then(|(table, suffix)| {
+            super::IcebergMetadataTableType::parse(suffix)
+                .ok()
+                .map(|metadata_type| (table.to_string(), metadata_type))
+        });
+    match (resolution, alias) {
+        (ConnectorTableResolution::StrictBaseTable, Some(_)) => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "strict Iceberg table resolution does not accept metadata aliases",
+        )),
+        (ConnectorTableResolution::StrictBaseTable, None) => {
+            Ok((requested_table.to_string(), None))
+        }
+        (ConnectorTableResolution::ProviderReadAlias, Some((table, metadata_type))) => {
+            Ok((table, Some(metadata_type)))
+        }
+        (ConnectorTableResolution::ProviderReadAlias, None) => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg provider read alias must use `<table>$<metadata-type>`",
+        )),
+    }
+}
+
+fn build_table_payload(
+    entry: &IcebergCatalogEntry,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    loaded: super::catalog::IcebergLoadedTable,
+    metadata_table_type: Option<super::IcebergMetadataTableType>,
+) -> Result<TablePayload, ConnectorError> {
+    let mut prepared_files = Vec::new();
+    let metadata_table = loaded.table.clone();
+    let metadata_file_io = metadata_table.file_io().clone();
+    let mut table_def = if matches!(
+        metadata_table_type,
+        Some(super::IcebergMetadataTableType::Partitions)
+    ) {
+        let snapshot_id = loaded.table.metadata().current_snapshot_id();
+        let data_files = match snapshot_id {
+            Some(snapshot_id) => extract_data_files_with_stats_at(&loaded.table, snapshot_id)
+                .map_err(map_iceberg_error)?,
+            None => Vec::new(),
+        };
+        prepared_files = data_files
+            .iter()
+            .cloned()
+            .map(super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+            .collect();
+        super::catalog::backend::build_iceberg_table_def_with_files(
+            entry, catalog, namespace, table, loaded, data_files,
+        )
+        .map_err(map_iceberg_error)?
+    } else {
+        super::catalog::backend::build_iceberg_schema_table_def_from_loaded(
+            entry, catalog, namespace, table, loaded,
+        )
+        .map_err(map_iceberg_error)?
+    };
+    if matches!(
+        metadata_table_type,
+        Some(
+            super::IcebergMetadataTableType::Files
+                | super::IcebergMetadataTableType::Manifests
+                | super::IcebergMetadataTableType::LogicalIcebergMetadata
+        )
+    ) {
+        let rows = super::catalog::registry::block_on_iceberg(async {
+            crate::connector::iceberg::metadata_read::read_metadata_table_rows(
+                &metadata_table,
+                &metadata_file_io,
+                metadata_table_type
+                    .clone()
+                    .expect("metadata table type is present"),
+            )
+            .await
+        })
+        .map_err(map_iceberg_error)?
+        .map_err(map_iceberg_error)?;
+        if let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } =
+            &mut table_def.source
+        {
+            table.serialized_metadata_rows = Some(rows);
+        }
+    }
+    let metadata_columns = table_def
+        .iceberg_row_lineage_metadata_columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let (table_info, cloud_properties, source_files) = match table_def.source {
+        crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table,
+            files,
+            cloud_properties,
+            ..
+        } => (table, cloud_properties, files),
+        _ => {
+            return Err(internal(
+                "Iceberg metadata capability produced a non-Iceberg table source".to_string(),
+            ));
+        }
+    };
+    if prepared_files.is_empty() {
+        prepared_files = source_files;
+    }
+    Ok(TablePayload {
+        namespace: namespace.to_string(),
+        table: table.to_string(),
+        table_info: Some(table_info),
+        cloud_properties,
+        metadata_columns,
+        metadata_table_type,
+        prepared_files,
+        explicit_files: None,
+    })
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct TablePayload {
     namespace: String,
     table: String,
+    table_info: Option<super::scan_model::IcebergTableInfo>,
+    cloud_properties: BTreeMap<String, String>,
+    metadata_columns: Vec<String>,
+    metadata_table_type: Option<super::IcebergMetadataTableType>,
+    prepared_files: Vec<IcebergDataFileInfo>,
     explicit_files: Option<Vec<IcebergDataFileInfo>>,
 }
 
@@ -495,37 +635,19 @@ struct SplitPayload {
     limit: Option<u64>,
 }
 
-struct NeverCancelled;
-
-impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
-fn metadata_context() -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-    novarocks_spi::connector::ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(60),
-        Arc::new(NeverCancelled),
-        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-    .map_err(|error| error.to_string())
-}
-
 pub(crate) fn load_schema_table_def(
     connectors: &crate::connector::ConnectorRegistry,
-    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> Result<(crate::sql::planner::table::TableDef, Option<i32>), String> {
-    load_table_def_at(connectors, registry, catalog, namespace, table, None, true)
+    load_table_def_at(connectors, context, catalog, namespace, table, None, true)
 }
 
 pub(crate) fn load_table_def_at(
     connectors: &crate::connector::ConnectorRegistry,
-    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
@@ -550,15 +672,105 @@ pub(crate) fn load_table_def_at(
                 table: Arc::from(table),
             },
             resolution: ConnectorTableResolution::StrictBaseTable,
-            context: metadata_context()?,
+            context: context.clone(),
         })
         .map_err(|error| error.to_string())?;
     let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
         .map_err(|error| error.to_string())?;
-    let resolved = crate::connector::backend::ResolvedTable {
-        catalog: catalog.to_string(),
-        namespace: payload.namespace,
-        table: payload.table,
+    let schema_id = metadata.version.as_ref().and_then(|version| {
+        <[u8; 4]>::try_from(version.as_ref())
+            .ok()
+            .map(i32::from_le_bytes)
+    });
+    let mut table_info = payload
+        .table_info
+        .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
+    let binding = if snapshot_id.is_some() {
+        table_info.current_snapshot_id = snapshot_id;
+        super::scan_model::IcebergDataFileBinding::ExplicitFiles
+    } else {
+        super::scan_model::IcebergDataFileBinding::CurrentSnapshot
+    };
+    let files = if schema_only {
+        Vec::new()
+    } else {
+        plan_scan_files(
+            connectors,
+            context,
+            &table_info,
+            binding,
+            &payload.prepared_files,
+            &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
+        )?
+    };
+    let columns = metadata
+        .schema
+        .fields()
+        .iter()
+        .map(|field| novarocks_catalog::schema::ColumnDef {
+            name: field.name().to_string(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect();
+    let table_def = crate::sql::planner::table::TableDef {
+        name: payload.table,
+        columns,
+        iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
+        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table: table_info,
+            files,
+            cloud_properties: payload.cloud_properties,
+            binding,
+        },
+    };
+    Ok((table_def, schema_id))
+}
+
+pub(crate) fn load_metadata_table_def(
+    connectors: &crate::connector::ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    metadata_table_type: super::IcebergMetadataTableType,
+) -> Result<crate::sql::planner::table::TableDef, String> {
+    use novarocks_spi::connector::{
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    };
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let instance = connectors
+        .connector_instance(&instance_id)
+        .map_err(|error| error.to_string())?;
+    let alias = format!("{table}${}", metadata_table_name(&metadata_table_type));
+    let metadata = instance
+        .metadata()
+        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(alias),
+            },
+            resolution: ConnectorTableResolution::ProviderReadAlias,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    table_def_from_metadata(metadata)
+}
+
+fn table_def_from_metadata(
+    metadata: ConnectorTableMetadata,
+) -> Result<crate::sql::planner::table::TableDef, String> {
+    let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
+        .map_err(|error| error.to_string())?;
+    let table_info = payload
+        .table_info
+        .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
+    Ok(crate::sql::planner::table::TableDef {
+        name: payload.table,
         columns: metadata
             .schema
             .fields()
@@ -571,57 +783,55 @@ pub(crate) fn load_table_def_at(
                 logical_type: None,
             })
             .collect(),
-    };
-    let schema_id = metadata.version.as_ref().and_then(|version| {
-        <[u8; 4]>::try_from(version.as_ref())
-            .ok()
-            .map(i32::from_le_bytes)
-    });
-    let table_def = if schema_only {
-        super::catalog::resolve_iceberg_schema_table_def(registry, &resolved)
-    } else {
-        super::catalog::resolve_iceberg_table_def_at(registry, &resolved, snapshot_id)
-    }?;
-    Ok((table_def, schema_id))
+        iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
+        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table: table_info,
+            files: payload.prepared_files,
+            cloud_properties: payload.cloud_properties,
+            binding: super::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+        },
+    })
 }
 
-pub(crate) fn load_metadata_table_def(
-    connectors: &crate::connector::ConnectorRegistry,
-    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-    metadata_table_type: super::IcebergMetadataTableType,
-) -> Result<crate::sql::planner::table::TableDef, String> {
-    let (base, _) =
-        load_table_def_at(connectors, registry, catalog, namespace, table, None, false)?;
-    if metadata_table_type == super::IcebergMetadataTableType::Partitions {
-        return Ok(base);
+fn iceberg_metadata_columns(
+    names: &[String],
+) -> Result<Vec<novarocks_catalog::schema::ColumnDef>, String> {
+    names
+        .iter()
+        .map(|name| {
+            let (data_type, nullable) = match name.as_str() {
+                "_file" => (arrow::datatypes::DataType::Utf8, false),
+                "_pos" | "_row_id" | "_last_updated_sequence_number" => {
+                    (arrow::datatypes::DataType::Int64, false)
+                }
+                other => return Err(format!("unknown Iceberg metadata column `{other}`")),
+            };
+            Ok(novarocks_catalog::schema::ColumnDef {
+                name: name.clone(),
+                data_type,
+                nullable,
+                write_default: None,
+                logical_type: None,
+            })
+        })
+        .collect()
+}
+
+fn metadata_table_name(metadata_type: &super::IcebergMetadataTableType) -> &'static str {
+    match metadata_type {
+        super::IcebergMetadataTableType::Files => "FILES",
+        super::IcebergMetadataTableType::Manifests => "MANIFESTS",
+        super::IcebergMetadataTableType::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
+        super::IcebergMetadataTableType::Snapshots => "SNAPSHOTS",
+        super::IcebergMetadataTableType::History => "HISTORY",
+        super::IcebergMetadataTableType::Refs => "REFS",
+        super::IcebergMetadataTableType::Partitions => "PARTITIONS",
     }
-    if matches!(
-        metadata_table_type,
-        super::IcebergMetadataTableType::Files
-            | super::IcebergMetadataTableType::Manifests
-            | super::IcebergMetadataTableType::LogicalIcebergMetadata
-    ) {
-        let resolved = crate::connector::backend::ResolvedTable {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
-            columns: base.columns,
-        };
-        return super::catalog::resolve_iceberg_metadata_rows_table_def(
-            registry,
-            &resolved,
-            metadata_table_type,
-        );
-    }
-    load_schema_table_def(connectors, registry, catalog, namespace, table)
-        .map(|(table_def, _)| table_def)
 }
 
 pub(crate) fn plan_scan_files(
     connectors: &crate::connector::ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,
     explicit_files: &[IcebergDataFileInfo],
@@ -634,19 +844,17 @@ pub(crate) fn plan_scan_files(
     let instance = connectors
         .connector_instance(&instance_id)
         .map_err(|error| error.to_string())?;
-    let context = novarocks_spi::connector::ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(60),
-        Arc::new(NeverCancelled),
-        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-    .map_err(|error| error.to_string())?;
     let table_handle = ConnectorTableHandle::try_new(
         instance_id,
         encode_payload(
             &TablePayload {
                 namespace: table.namespace.clone(),
                 table: table.table.clone(),
+                table_info: Some(table.clone()),
+                cloud_properties: BTreeMap::new(),
+                metadata_columns: Vec::new(),
+                metadata_table_type: None,
+                prepared_files: Vec::new(),
                 explicit_files: matches!(
                     binding,
                     super::scan_model::IcebergDataFileBinding::ExplicitFiles

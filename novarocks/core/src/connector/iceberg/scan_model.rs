@@ -88,11 +88,13 @@ pub struct IcebergDeleteFileInfo {
     pub equality_field_ids: Vec<i32>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergSchemaFieldDef {
     pub field_id: i32,
     pub name: String,
+    #[serde(skip)]
     pub initial_default: Option<iceberg::spec::Literal>,
+    #[serde(skip)]
     pub write_default: Option<iceberg::spec::Literal>,
     /// Spec-compliant JSON encoding of `initial_default` precomputed at the
     /// point of construction where the iceberg `Type` is still available.
@@ -107,12 +109,12 @@ pub struct IcebergSchemaFieldDef {
     pub children: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergSchemaDef {
     pub fields: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergTableInfo {
     pub catalog: String,
     pub namespace: String,

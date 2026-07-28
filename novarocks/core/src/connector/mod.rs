@@ -47,10 +47,142 @@ pub(crate) use starrocks_table_stub::{
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use novarocks_spi::connector::{ConnectorInstance, ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{
+    ConnectorCancellation, ConnectorInstance, ConnectorInstanceId, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
+};
 
 use self::host::{ConnectorHost, ConnectorHostError, ConnectorInstanceLease};
+
+struct QueryConnectorCancellation;
+
+impl ConnectorCancellation for QueryConnectorCancellation {
+    fn is_cancelled(&self) -> bool {
+        crate::runtime::query_cancel::client_disconnected()
+    }
+}
+
+pub(crate) fn query_request_context(
+    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+) -> Result<ConnectorRequestContext, String> {
+    let (_, query_expire) = crate::runtime::query_options::query_expire_durations(query_options);
+    ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(QueryConnectorCancellation),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn metadata_instance(
+    connectors: &ConnectorRegistry,
+    catalog: &str,
+) -> Result<Arc<ConnectorInstance>, String> {
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    connectors
+        .connector_instance(&instance_id)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn metadata_namespace_exists(
+    connectors: &ConnectorRegistry,
+    context: ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+) -> Result<bool, String> {
+    let instance = metadata_instance(connectors, catalog)?;
+    let instance_id = instance.descriptor().instance_id.clone();
+    instance
+        .metadata()
+        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
+        .namespace_exists(novarocks_spi::connector::ConnectorNamespaceRequest {
+            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+            },
+            context,
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn metadata_table_exists(
+    connectors: &ConnectorRegistry,
+    context: ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, String> {
+    let instance = metadata_instance(connectors, catalog)?;
+    let instance_id = instance.descriptor().instance_id.clone();
+    instance
+        .metadata()
+        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
+        .table_exists(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn metadata_load_table(
+    connectors: &ConnectorRegistry,
+    context: ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<(backend::ResolvedTable, Option<i32>), String> {
+    let instance = metadata_instance(connectors, catalog)?;
+    let instance_id = instance.descriptor().instance_id.clone();
+    let metadata = instance
+        .metadata()
+        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    let columns = metadata
+        .schema
+        .fields()
+        .iter()
+        .map(|field| novarocks_catalog::schema::ColumnDef {
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect();
+    let schema_id = metadata.version.as_ref().and_then(|version| {
+        <[u8; 4]>::try_from(version.as_ref())
+            .ok()
+            .map(i32::from_le_bytes)
+    });
+    Ok((
+        backend::ResolvedTable {
+            catalog: metadata.identity.instance_id.as_str().to_string(),
+            namespace: metadata.identity.namespace.to_string(),
+            table: metadata.identity.table.to_string(),
+            columns,
+        },
+        schema_id,
+    ))
+}
 
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 

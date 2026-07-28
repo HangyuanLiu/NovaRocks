@@ -76,11 +76,13 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let registry = registry(vec![data_file("s3://bucket/explicit.parquet")]);
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
+    let context = crate::connector::query_request_context(None).expect("request context");
 
     collect_scan_bindings(
         0,
         &root,
         &registry,
+        &context,
         None,
         &mut seen_scan_node_ids,
         &mut bindings,
@@ -90,6 +92,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         0,
         &root,
         &registry,
+        &context,
         None,
         &mut seen_scan_node_ids,
         &mut bindings,

@@ -169,19 +169,25 @@ impl ViewEngine for StandaloneState {
     }
 
     fn table_exists(&self, target: &ViewTarget) -> Result<bool, String> {
-        self.connectors
-            .read()
-            .expect("connector registry read")
-            .catalog_backend("iceberg")?
-            .table_exists(&target.catalog, &target.database, &target.view)
+        crate::connector::metadata_table_exists(
+            &self.connectors.read().expect("connector registry read"),
+            crate::connector::query_request_context(None)?,
+            &target.catalog,
+            &target.database,
+            &target.view,
+        )
     }
 
     fn view_exists(&self, target: &ViewTarget) -> Result<bool, String> {
-        self.connectors
+        let registry = self
+            .iceberg_catalogs
             .read()
-            .expect("connector registry read")
-            .catalog_backend("iceberg")?
-            .view_exists(&target.catalog, &target.database, &target.view)
+            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
+        crate::connector::iceberg::catalog::views::view_exists(
+            &registry.get(&target.catalog)?,
+            &target.database,
+            &target.view,
+        )
     }
 
     fn create_external_view(&self, request: CreateExternalViewRequest) -> Result<(), String> {
@@ -226,12 +232,15 @@ impl ViewEngine for StandaloneState {
         &self,
         target: &ViewTarget,
     ) -> Result<Option<ResolvedExternalView>, String> {
-        let result = self
-            .connectors
+        let registry = self
+            .iceberg_catalogs
             .read()
-            .expect("connector registry read")
-            .catalog_backend("iceberg")?
-            .load_view(&target.catalog, &target.database, &target.view);
+            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
+        let result = crate::connector::iceberg::catalog::views::load_view(
+            &registry.get(&target.catalog)?,
+            &target.database,
+            &target.view,
+        );
         match result {
             Ok(view) => Ok(Some(ResolvedExternalView {
                 sql: view.sql,
@@ -247,11 +256,11 @@ impl ViewEngine for StandaloneState {
     }
 
     fn list_external_views(&self, catalog: &str, database: &str) -> Result<Vec<String>, String> {
-        self.connectors
+        let registry = self
+            .iceberg_catalogs
             .read()
-            .expect("connector registry read")
-            .catalog_backend("iceberg")?
-            .list_views(catalog, database)
+            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
+        crate::connector::iceberg::catalog::views::list_views(&registry.get(catalog)?, database)
     }
 
     fn analyze_external_view(
@@ -273,7 +282,7 @@ impl ViewEngine for StandaloneState {
             Some(catalog),
             &catalog_service_snapshot,
             &connectors_snapshot,
-            &self.iceberg_catalogs,
+            crate::connector::query_request_context(None)?,
             crate::sql::catalog::TableLookupMode::SchemaOnly,
         );
         let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, database)

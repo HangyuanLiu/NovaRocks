@@ -353,7 +353,7 @@ fn rewrite_time_travel_in_factor(
                     .clone();
                 let (table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
                     &connectors,
-                    &state.iceberg_catalogs,
+                    crate::connector::query_request_context(None)?,
                     &target.catalog,
                     &target.namespace,
                     &target.table,
@@ -458,7 +458,7 @@ pub(crate) fn materialize_external_schema_table_for_statement(
 
     let (mut table_def, _) = crate::connector::iceberg::provider::load_schema_table_def(
         &connectors,
-        &state.iceberg_catalogs,
+        crate::connector::query_request_context(None)?,
         &target.catalog,
         &target.namespace,
         &target.table,

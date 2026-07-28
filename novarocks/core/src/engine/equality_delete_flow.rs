@@ -182,8 +182,15 @@ fn run_equality_delete_distributed_transaction(
 ) -> Result<(), String> {
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &registry,
+            crate::connector::query_request_context(None)?,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
     let mut sink_spec = crate::engine::iceberg_writer::build_equality_delete_sink_spec(
         target,

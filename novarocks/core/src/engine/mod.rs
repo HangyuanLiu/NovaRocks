@@ -303,16 +303,14 @@ pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a StandaloneCatalogService,
     connectors: &'a crate::connector::ConnectorRegistry,
-    iceberg_catalogs: &'a Arc<
-        RwLock<crate::connector::iceberg::catalog::registry::IcebergCatalogRegistry>,
-    >,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
     lookup_mode: TableLookupMode,
 ) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
     crate::sql::catalog::provider::CatalogServiceProvider::new(
         current_catalog,
         catalog_service,
         connectors,
-        iceberg_catalogs,
+        connector_context,
         lookup_mode,
     )
 }
@@ -1756,7 +1754,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
-                    &self.inner.iceberg_catalogs,
+                    crate::connector::query_request_context(query_opts.as_ref())?,
                     TableLookupMode::ExplainStats,
                 );
                 let result = if force_logical_explain {
@@ -1800,7 +1798,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
-                    &self.inner.iceberg_catalogs,
+                    crate::connector::query_request_context(query_opts.as_ref())?,
                     TableLookupMode::ExplainStats,
                 );
                 let result = explain_analyze_query(
@@ -1881,7 +1879,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
-                    &self.inner.iceberg_catalogs,
+                    crate::connector::query_request_context(query_opts.as_ref())?,
                     TableLookupMode::SchemaOnly,
                 );
                 self.inner
@@ -2276,9 +2274,7 @@ impl StandaloneSession {
         self.inner
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                &stmt.name,
-                connectors,
-                Arc::clone(&self.inner.iceberg_catalogs),
+                &stmt.name, connectors,
             ));
         if let Err(error) = persist_catalog_attachment_if_needed(
             &self.inner,
@@ -2314,17 +2310,20 @@ impl StandaloneSession {
             current_catalog,
             current_database,
         )?;
-        let backend = self
+        let connectors = self
             .inner
             .connectors
             .read()
-            .expect("connector registry read")
-            .catalog_backend(source_target.backend_name)?;
-        let source_table = backend.load_table(
+            .expect("connector registry read");
+        let source_table = crate::connector::metadata_load_table(
+            &connectors,
+            crate::connector::query_request_context(None)?,
             &source_target.catalog,
             &source_target.namespace,
             &source_target.table,
-        )?;
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0;
         let columns = source_table
             .columns
             .iter()
@@ -2912,7 +2911,6 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                 &catalog.catalog,
                 connectors.clone(),
-                Arc::clone(&state.iceberg_catalogs),
             ));
     }
 
@@ -3403,7 +3401,7 @@ pub(crate) fn execute_query_with_catalog_service(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
-        &state.iceberg_catalogs,
+        crate::connector::query_request_context(query_opts.as_ref())?,
         TableLookupMode::SchemaOnly,
     );
     execute_query_with_catalog_provider(
@@ -3514,7 +3512,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
-        &state.iceberg_catalogs,
+        crate::connector::query_request_context(query_opts.as_ref())?,
         TableLookupMode::SchemaOnly,
     );
 

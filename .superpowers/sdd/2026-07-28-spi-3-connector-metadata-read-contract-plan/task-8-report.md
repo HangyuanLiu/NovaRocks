@@ -67,3 +67,68 @@ The complete gate sequence was rerun after the final live-test fixture migration
   does not depend on Tokio.
 - Distributed 1FE+3BE acceptance was not part of the Task 8 gate set and was
   not run here.
+
+## Code-review fix follow-up
+
+### Changed files/behavior
+
+- Fixed the compat-only StarRocks connector descriptor serialization and
+  supplied the complete `ConnectorSplitPlanningRequest` contract in
+  `connector/scan_model/starrocks.rs` and
+  `connector/starrocks/table/scan_adapter.rs`.
+- Made Iceberg metadata load return one provider-owned opaque descriptor that
+  contains the schema/read information needed by core. SQL catalog, analyzer,
+  query prep, coordinator split planning, metadata-table planning, and MV
+  callers now consume that SPI result without a second registry lookup.
+- Removed the Iceberg registry field from `sql/catalog/iceberg.rs`, removed the
+  registry argument from `build_iceberg_catalog`, and deleted the exported
+  `resolve_iceberg_*` facade helpers.
+- Removed namespace/table/schema/view read methods from `CatalogBackend`.
+  Namespace/table/schema consumers now call `ConnectorMetadata`; Iceberg view
+  reads use the existing provider-owned view service. `CatalogBackend` retains
+  only mutation/admin operations.
+- Added query-derived `ConnectorRequestContext` construction with client
+  disconnect cancellation and query-option deadlines. Statement/query,
+  catalog-provider, coordinator, Iceberg, and StarRocks planning callers pass
+  this real context; the production `NeverCancelled` plus fixed 60-second
+  contexts were removed.
+- Updated all affected engine write/mutation flows, schema evolution,
+  maintenance, view/MV code, coordinator tests, and backend fixtures to use the
+  canonical metadata path.
+
+### Additional RED evidence
+
+- `cargo check -p novarocks --features compat --lib --profile dev-opt`
+  initially exited 101 with five errors: four missing Serde implementations
+  for `StarRocksScanSourceDescriptor` and one incomplete
+  `ConnectorSplitPlanningRequest`.
+- After deleting the remaining `CatalogBackend` read surface,
+  `cargo check -p novarocks --lib --profile dev-opt` exposed 23 production
+  consumer errors. The subsequent all-target check exposed 17 stale
+  test/fixture consumers. All were migrated without restoring a read facade.
+- The first opaque Iceberg descriptor compile exposed six errors because
+  `iceberg::spec::Literal` is not Serde-enabled. Literal fields are excluded
+  from the transport representation while their already canonical
+  type-aware JSON defaults remain preserved.
+
+### Final GREEN evidence
+
+- `cargo fmt --all -- --check`: PASS
+- `cargo check -p novarocks --all-targets --profile dev-opt`: PASS
+- `cargo check -p novarocks --features compat --lib --profile dev-opt`: PASS
+- `cargo check -p novarocks-server --all-targets --profile dev-opt`: PASS
+- `cargo test -p novarocks-spi --features connector-conformance --profile dev-opt`:
+  PASS (6 connector conformance, 8 connector contract, 8 state-store contract)
+- `cargo test -p novarocks --lib connector --profile dev-opt`:
+  PASS (838 passed, 0 failed, 6761 filtered)
+- `git diff --check`: PASS
+
+### Follow-up audit
+
+- No `resolve_iceberg_*` metadata/read facade remains.
+- No Iceberg SQL catalog or catalog-service provider retains an Iceberg
+  registry field or performs a second registry-based table resolution.
+- Remaining `catalog_backend` calls are mutation/admin operations, registry
+  declarations, or registry tests.
+- No `NeverCancelled` or fixed 60-second production request context remains in
+  the Iceberg or StarRocks metadata/read adapters.

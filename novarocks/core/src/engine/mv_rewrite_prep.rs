@@ -234,7 +234,7 @@ fn build_candidate(
         .clone();
     let (target_table, _) = crate::connector::iceberg::provider::load_schema_table_def(
         &connectors,
-        &state.iceberg_catalogs,
+        crate::connector::query_request_context(None)?,
         cat,
         ns,
         tbl,

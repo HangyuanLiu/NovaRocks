@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use crate::connector::ConnectorRegistry;
-use crate::connector::iceberg::catalog::registry::IcebergCatalogRegistry;
 use crate::sql::catalog::CatalogRuntimeMetadata;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_catalog::registry::Catalog;
@@ -27,20 +24,14 @@ use novarocks_catalog::schema_cache::SchemaCache;
 pub(super) struct IcebergCatalog {
     name: String,
     connectors: ConnectorRegistry,
-    registry: Arc<std::sync::RwLock<IcebergCatalogRegistry>>,
     cache: SchemaCache<CatalogRuntimeMetadata>,
 }
 
 impl IcebergCatalog {
-    pub(super) fn new(
-        name: &str,
-        connectors: ConnectorRegistry,
-        registry: Arc<std::sync::RwLock<IcebergCatalogRegistry>>,
-    ) -> Self {
+    pub(super) fn new(name: &str, connectors: ConnectorRegistry) -> Self {
         Self {
             name: name.to_string(),
             connectors,
-            registry,
             cache: SchemaCache::new(),
         }
     }
@@ -65,7 +56,7 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
         let (table_def, current_schema_id) =
             crate::connector::iceberg::provider::load_schema_table_def(
                 &self.connectors,
-                &self.registry,
+                crate::connector::query_request_context(None)?,
                 &self.name,
                 namespace,
                 table,

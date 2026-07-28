@@ -17,8 +17,6 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::starrocks::{
@@ -33,22 +31,15 @@ use crate::runtime::scan_range;
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCancellation, ConnectorReadSelector,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorReadSelector,
     ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableHandle,
 };
-
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
 
 pub(crate) fn plan_native_starrocks_scan_with_compat(
     scan_node_id: i32,
     scan: &PlanScanNode,
     connectors: &ConnectorRegistry,
+    context: ConnectorRequestContext,
 ) -> Result<PlannedNativeStarRocksScan, String> {
     let ScanSource::StarRocks { db_id, table_id } = &scan.table.source else {
         return Err(format!(
@@ -67,13 +58,6 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
     let instance = connectors
         .connector_instance(&instance_id)
         .map_err(|error| error.to_string())?;
-    let context = ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(60),
-        Arc::new(NeverCancelled),
-        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-    .map_err(|error| error.to_string())?;
     let table_handle = ConnectorTableHandle::try_new(
         instance_id,
         serde_json::to_vec(&super::provider::TablePayload {
@@ -120,7 +104,11 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
         .read()
         .plan_splits(
             &planned_scan.handle,
-            ConnectorSplitPlanningRequest { context },
+            ConnectorSplitPlanningRequest {
+                target_parallelism: NonZeroUsize::new(1).expect("parallelism is nonzero"),
+                max_split_bytes: None,
+                context,
+            },
         )
         .map_err(|error| error.to_string())?;
     if splits.is_empty() {

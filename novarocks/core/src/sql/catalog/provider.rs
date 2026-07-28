@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::connector::ConnectorRegistry;
-use crate::connector::IcebergCatalogRegistry;
 use crate::sql::catalog::{
     CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
     ResolvedAnalyzerTable, TableLookupMode,
@@ -31,7 +30,7 @@ pub(crate) struct CatalogServiceProvider<'a> {
     current_catalog: Option<&'a str>,
     service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
     connectors: &'a ConnectorRegistry,
-    iceberg_catalogs: &'a std::sync::Arc<std::sync::RwLock<IcebergCatalogRegistry>>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
     lookup_mode: TableLookupMode,
 }
 
@@ -40,14 +39,14 @@ impl<'a> CatalogServiceProvider<'a> {
         current_catalog: Option<&'a str>,
         service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
         connectors: &'a ConnectorRegistry,
-        iceberg_catalogs: &'a std::sync::Arc<std::sync::RwLock<IcebergCatalogRegistry>>,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
         lookup_mode: TableLookupMode,
     ) -> Self {
         Self {
             current_catalog,
             service,
             connectors,
-            iceberg_catalogs,
+            connector_context,
             lookup_mode,
         }
     }
@@ -78,22 +77,23 @@ impl<'a> CatalogServiceProvider<'a> {
             }
             Some(catalog) => match self.lookup_mode {
                 TableLookupMode::SchemaOnly => {
-                    let metadata = self
-                        .service
-                        .registry()
-                        .read()
-                        .expect("catalog service registry read lock")
-                        .resolve(catalog, database, table)?;
-                    let planner = metadata.to_table_def();
-                    Ok(ResolvedAnalyzerTable {
-                        catalog: metadata.table,
+                    let (planner, _) = crate::connector::iceberg::provider::load_schema_table_def(
+                        self.connectors,
+                        self.connector_context.clone(),
+                        catalog,
+                        database,
+                        table,
+                    )?;
+                    Ok(ResolvedAnalyzerTable::from_planner(
+                        Some(catalog),
+                        database,
                         planner,
-                    })
+                    ))
                 }
                 TableLookupMode::ExplainStats => {
                     let (planner, _) = crate::connector::iceberg::provider::load_schema_table_def(
                         self.connectors,
-                        self.iceberg_catalogs,
+                        self.connector_context.clone(),
                         catalog,
                         database,
                         table,
@@ -124,7 +124,7 @@ impl<'a> CatalogServiceProvider<'a> {
                 .get(database, table),
             Some(catalog) => crate::connector::iceberg::provider::load_metadata_table_def(
                 self.connectors,
-                self.iceberg_catalogs,
+                self.connector_context.clone(),
                 catalog,
                 database,
                 table,

@@ -13421,9 +13421,15 @@ fn execute_imv_change_stream_writer(
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let resolved = connectors_snapshot
-        .catalog_backend(target.backend_name)?
-        .load_table(&target.catalog, &target.namespace, &target.table)?;
+    let resolved = crate::connector::metadata_load_table(
+        &connectors_snapshot,
+        crate::connector::query_request_context(None)?,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?
+    .0;
     let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
         target,
         &resolved,
@@ -17704,7 +17710,6 @@ mod tests {
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
                     connectors.clone(),
-                    Arc::clone(&state.iceberg_catalogs),
                 ));
         }
         IcebergMvTestState {
@@ -17753,7 +17758,6 @@ mod tests {
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
                     connectors.clone(),
-                    Arc::clone(&state.iceberg_catalogs),
                 ));
         }
         IcebergMvTestState {
@@ -17807,7 +17811,6 @@ mod tests {
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
                     connectors.clone(),
-                    Arc::clone(&state.iceberg_catalogs),
                 ));
         }
         IcebergMvTestState {
@@ -19028,35 +19031,55 @@ mod tests {
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
 
-        let backend = {
-            let connectors = env.state.connectors.read().expect("connector registry");
-            connectors
-                .catalog_backend("iceberg")
-                .expect("iceberg backend")
-        };
-        let resolved = backend
-            .load_table_for_read("ice", "analytics", "mv_orders")
-            .expect("read MV table by public name");
+        let connectors = env.state.connectors.read().expect("connector registry");
+        let resolved = crate::connector::metadata_load_table(
+            &connectors,
+            crate::connector::query_request_context(None).expect("request context"),
+            "ice",
+            "analytics",
+            "mv_orders",
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .expect("read MV table by public name")
+        .0;
         assert_eq!(resolved.table, "mv_orders");
 
-        let (schema_table, schema_id) = backend
-            .current_schema_id_for_read("ice", "analytics", "mv_orders")
-            .expect("read MV schema id by public name");
-        assert_eq!(schema_table, "mv_orders");
+        let (schema_table, schema_id) = crate::connector::metadata_load_table(
+            &connectors,
+            crate::connector::query_request_context(None).expect("request context"),
+            "ice",
+            "analytics",
+            "mv_orders",
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .expect("read MV schema id by public name");
+        assert_eq!(schema_table.table, "mv_orders");
         assert!(schema_id.is_some());
 
         let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
-        let missing_schema_err = backend
-            .current_schema_id_for_read("ice", "analytics", &legacy_alias_name)
-            .expect_err("legacy alias schema id must not resolve");
+        let missing_schema_err = crate::connector::metadata_load_table(
+            &connectors,
+            crate::connector::query_request_context(None).expect("request context"),
+            "ice",
+            "analytics",
+            &legacy_alias_name,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .expect_err("legacy alias schema id must not resolve");
         assert!(
             missing_schema_err.contains(&legacy_alias_name) || missing_schema_err.contains("not"),
             "{missing_schema_err}"
         );
 
-        let missing_target_err = backend
-            .load_table_for_read("ice", "analytics", &legacy_alias_name)
-            .expect_err("legacy alias target must not resolve");
+        let missing_target_err = crate::connector::metadata_load_table(
+            &connectors,
+            crate::connector::query_request_context(None).expect("request context"),
+            "ice",
+            "analytics",
+            &legacy_alias_name,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .expect_err("legacy alias target must not resolve");
         assert!(
             missing_target_err.contains(&legacy_alias_name) || missing_target_err.contains("not"),
             "{missing_target_err}"

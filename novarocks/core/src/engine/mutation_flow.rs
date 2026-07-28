@@ -320,7 +320,7 @@ fn build_update_mor_change_stream_write_plan(
         Some(&target.catalog),
         &catalog_service_snapshot,
         &connectors_snapshot,
-        &state.iceberg_catalogs,
+        crate::connector::query_request_context(None)?,
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -1516,8 +1516,15 @@ fn build_cow_update_distributed_write(
         base_snapshot_id.ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &registry,
+            crate::connector::query_request_context(None)?,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
     let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
         target, &resolved, table, entry,
@@ -2560,8 +2567,15 @@ pub(crate) fn execute_merge_statement(
             )?;
             let resolved = {
                 let registry = state.connectors.read().expect("connector registry read");
-                let backend = registry.catalog_backend("iceberg")?;
-                backend.load_table(&target.catalog, &target.namespace, &target.table)?
+                crate::connector::metadata_load_table(
+                    &registry,
+                    crate::connector::query_request_context(None)?,
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
+                    novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                )?
+                .0
             };
             let plan = crate::engine::iceberg_writer::build_insert_write_plan(
                 &target,
@@ -3162,7 +3176,7 @@ fn build_merge_mor_change_stream_write_plan(
         Some(&target.catalog),
         &catalog_service_snapshot,
         &connectors_snapshot,
-        &state.iceberg_catalogs,
+        crate::connector::query_request_context(None)?,
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
