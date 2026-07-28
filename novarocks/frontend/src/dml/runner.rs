@@ -520,6 +520,50 @@ mod tests {
     }
 
     #[test]
+    fn known_committed_commit_error_persists_retry_finalize_fact() {
+        let journal = InMemoryOperationJournal::default();
+        let executor = FakeExecutor {
+            commit: Err(CommitServiceError::finalize_failed_known_committed(
+                Some(CommitOutcome {
+                    new_snapshot_id: 43,
+                    written_manifest_paths: vec!["manifest.avro".to_string()],
+                }),
+                "commit-service finalize failed".to_string(),
+                evidence(),
+            )),
+            ..FakeExecutor::default()
+        };
+        let admit = AlwaysAdmit;
+        let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
+
+        let error = runner.run(spec()).unwrap_err();
+        assert_eq!(error.kind(), DmlErrorKind::Commit);
+        assert!(error.to_string().contains("commit-service finalize failed"));
+
+        let stored = journal.load(1).unwrap().unwrap();
+        assert_eq!(stored.state, OperationState::FinalizeFailedKnownCommitted);
+        let outcome = stored.commit_outcome.unwrap();
+        assert_eq!(outcome.snapshot_id, 43);
+        assert_eq!(outcome.written_manifest_paths, vec!["manifest.avro"]);
+        let recovery = stored.recovery_evidence.unwrap();
+        assert_eq!(recovery.table_ident, "cat.ns.tbl");
+        assert_eq!(recovery.commit_op_kind, "fast_append");
+        assert_eq!(recovery.base_snapshot_id, None);
+        assert_eq!(recovery.base_sequence_number, Some(0));
+        assert_eq!(recovery.staging_dir, "/w/s");
+        let failure = stored.failure.unwrap();
+        assert_eq!(
+            failure.kind,
+            crate::dml::model::IcebergOperationFailureKind::FinalizeKnownCommitted
+        );
+        assert_eq!(failure.message, "commit-service finalize failed");
+        assert_eq!(
+            failure.next_action,
+            crate::dml::model::IcebergOperationNextAction::RetryFinalize
+        );
+    }
+
+    #[test]
     fn finalize_failure_is_known_committed_no_retry() {
         let journal = InMemoryOperationJournal::default();
         let executor = FakeExecutor {
