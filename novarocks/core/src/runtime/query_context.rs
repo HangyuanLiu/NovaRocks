@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,6 @@ use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::node::scan::ScanOp;
 #[cfg(feature = "compat")]
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
-use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
@@ -720,7 +719,6 @@ struct QueryContextManagerInner {
     active: HashMap<QueryId, QueryContext>,
     second_chance: HashMap<QueryId, QueryContext>,
     finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
-    fragment_completions: HashMap<UniqueId, FragmentCompletionEntry>,
     runtime_filter_deployment_terminals: HashMap<QueryId, RuntimeFilterDeploymentTerminalRecord>,
     runtime_filter_query_cancellations: HashMap<QueryId, RuntimeFilterQueryCancellationRecord>,
     runtime_filter_query_cancellation_errors: HashMap<QueryId, String>,
@@ -744,11 +742,6 @@ struct QueryContextManagerInner {
     pending_incremental_scan_ranges: HashMap<UniqueId, HashMap<i32, Vec<IncrementalScanRange>>>,
     #[cfg(feature = "compat")]
     incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
-}
-
-struct FragmentCompletionEntry {
-    execution: QueryExecutionKey,
-    completion: Weak<FragmentCompletion>,
 }
 
 pub(crate) struct QueryContextManager {
@@ -2756,7 +2749,6 @@ impl QueryContextManager {
     pub(crate) fn unregister_finst(&self, finst_id: UniqueId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
-        guard.fragment_completions.remove(&finst_id);
         #[cfg(feature = "compat")]
         guard.incremental_scan_nodes.remove(&finst_id);
         #[cfg(feature = "compat")]
@@ -2792,7 +2784,6 @@ impl QueryContextManager {
             }
 
             guard.finst_to_query.remove(&finst_id);
-            guard.fragment_completions.remove(&finst_id);
             let remove_empty_context = {
                 let context = guard
                     .active
@@ -2828,13 +2819,6 @@ impl QueryContextManager {
             return;
         }
         guard.finst_to_query.remove(&finst_id);
-        if guard
-            .fragment_completions
-            .get(&finst_id)
-            .is_some_and(|entry| entry.execution == execution)
-        {
-            guard.fragment_completions.remove(&finst_id);
-        }
         #[cfg(feature = "compat")]
         guard.incremental_scan_nodes.remove(&finst_id);
         #[cfg(feature = "compat")]
@@ -2876,7 +2860,6 @@ impl QueryContextManager {
 
             for finst_id in fragment_instance_ids.iter().rev() {
                 guard.finst_to_query.remove(finst_id);
-                guard.fragment_completions.remove(finst_id);
                 guard.incremental_scan_nodes.remove(finst_id);
                 guard.pending_incremental_scan_ranges.remove(finst_id);
                 guard.incremental_change_op_slots.remove(finst_id);
@@ -2891,43 +2874,6 @@ impl QueryContextManager {
             true
         } else {
             false
-        }
-    }
-
-    pub(crate) fn register_fragment_completion(
-        &self,
-        finst_id: UniqueId,
-        completion: Arc<FragmentCompletion>,
-    ) -> Option<QueryExecutionKey> {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let execution = guard.finst_to_query.get(&finst_id).copied()?;
-        guard.fragment_completions.insert(
-            finst_id,
-            FragmentCompletionEntry {
-                execution,
-                completion: Arc::downgrade(&completion),
-            },
-        );
-        Some(execution)
-    }
-
-    pub(crate) fn unregister_fragment_completion(&self, finst_id: UniqueId) {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard.fragment_completions.remove(&finst_id);
-    }
-
-    pub(crate) fn unregister_fragment_completion_execution(
-        &self,
-        finst_id: UniqueId,
-        execution: QueryExecutionKey,
-    ) {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if guard
-            .fragment_completions
-            .get(&finst_id)
-            .is_some_and(|entry| entry.execution == execution)
-        {
-            guard.fragment_completions.remove(&finst_id);
         }
     }
 
@@ -3125,7 +3071,7 @@ impl QueryContextManager {
     }
 
     pub(crate) fn cancel_query(&self, query_id: QueryId, err: String) -> Vec<UniqueId> {
-        let (cancellation, finsts, completions) = {
+        let (cancellation, finsts) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
                 &mut guard,
@@ -3134,33 +3080,18 @@ impl QueryContextManager {
                 Some(&err),
             );
 
-            let mut finsts = Vec::new();
-            let mut completions = Vec::new();
-            let mut stale = Vec::new();
-            for (finst_id, execution) in guard.finst_to_query.iter() {
-                if execution.query_id() != query_id {
-                    continue;
-                }
-                finsts.push(*finst_id);
-                if let Some(entry) = guard.fragment_completions.get(finst_id) {
-                    if let Some(completion) = entry.completion.upgrade() {
-                        completions.push(completion);
-                    } else {
-                        stale.push(*finst_id);
-                    }
-                }
-            }
-            for finst_id in stale {
-                guard.fragment_completions.remove(&finst_id);
-            }
-            (cancellation, finsts, completions)
+            let finsts = guard
+                .finst_to_query
+                .iter()
+                .filter_map(|(finst_id, execution)| {
+                    (execution.query_id() == query_id).then_some(*finst_id)
+                })
+                .collect();
+            (cancellation, finsts)
         };
 
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(query_id, cancellation);
-        for completion in completions {
-            completion.abort_from_query(err.clone());
-        }
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
@@ -3172,7 +3103,7 @@ impl QueryContextManager {
         execution: QueryExecutionKey,
         err: String,
     ) -> Vec<UniqueId> {
-        let (cancellation, finsts, completions) = {
+        let (cancellation, finsts) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let query_id = execution.query_id();
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
@@ -3186,19 +3117,10 @@ impl QueryContextManager {
                 .iter()
                 .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
                 .collect::<Vec<_>>();
-            let completions = finsts
-                .iter()
-                .filter_map(|finst_id| guard.fragment_completions.get(finst_id))
-                .filter(|entry| entry.execution == execution)
-                .filter_map(|entry| entry.completion.upgrade())
-                .collect::<Vec<_>>();
-            (cancellation, finsts, completions)
+            (cancellation, finsts)
         };
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(execution.query_id(), cancellation);
-        for completion in completions {
-            completion.abort_from_query(err.clone());
-        }
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
@@ -3239,20 +3161,11 @@ impl QueryContextManager {
                 .iter()
                 .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
                 .collect::<Vec<_>>();
-            let completions = finsts
-                .iter()
-                .filter_map(|finst_id| guard.fragment_completions.get(finst_id))
-                .filter(|entry| entry.execution == execution)
-                .filter_map(|entry| entry.completion.upgrade())
-                .collect::<Vec<_>>();
-            (query_id, cancellation, finsts, completions)
+            (query_id, cancellation, finsts)
         };
-        let (query_id, cancellation, finsts, completions) = collected;
+        let (query_id, cancellation, finsts) = collected;
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(query_id, cancellation);
-        for completion in completions {
-            completion.abort_from_query(err.clone());
-        }
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
@@ -3427,6 +3340,37 @@ fn map_runtime_filter_install_error(
         _ => RuntimeFilterDeploymentInstallErrorKind::Internal,
     };
     RuntimeFilterDeploymentInstallError::new(kind, detail)
+}
+
+#[cfg(test)]
+mod fragment_cancellation_boundary_tests {
+    use crate::common::types::UniqueId;
+    use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
+
+    use super::{QueryContextManager, QueryId};
+
+    #[test]
+    fn query_cancellation_returns_routes_without_aborting_fragment_local_completion() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = QueryId::new(86_101, 86_102);
+        let finst_id = UniqueId {
+            hi: 86_103,
+            lo: 86_104,
+        };
+        let completion = FragmentCompletion::new(1);
+        manager.register_finst(finst_id, query_id);
+
+        assert_eq!(
+            manager.cancel_query(query_id, "query owner cancellation".to_string()),
+            vec![finst_id]
+        );
+        assert!(
+            !completion.should_abort(),
+            "query owners must route cancellation through the role adapter instead of mutating fragment completion"
+        );
+        assert!(completion.driver_finished());
+        assert_eq!(completion.wait(), Ok(()));
+    }
 }
 
 #[cfg(all(test, feature = "compat"))]

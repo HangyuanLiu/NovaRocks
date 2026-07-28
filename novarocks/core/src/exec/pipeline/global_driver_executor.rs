@@ -85,12 +85,6 @@ impl FragmentCompletion {
         true
     }
 
-    /// Compatibility hook for query-side owners that still retain a completion reference.
-    /// The completion itself records only the local fragment result.
-    pub(crate) fn abort_from_query(&self, err: String) {
-        let _ = self.fail(err);
-    }
-
     pub fn driver_finished(&self) -> bool {
         let mut st = self.mu.lock().expect("fragment completion lock");
         if st.remaining == 0 {
