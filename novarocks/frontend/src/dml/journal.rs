@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
+use novarocks::meta::MetaStoreProvider;
 use novarocks::meta::repository::iceberg_operation::{
     IcebergOperationFactUpdate, IcebergOperationRepository,
 };
-use novarocks::meta::MetaStoreProvider;
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{CreatePreparingRequest, OperationFact, OperationState, StoredOperation};
@@ -251,7 +251,10 @@ pub(crate) mod testing {
         fn create_then_load_starts_in_preparing() {
             let journal = InMemoryOperationJournal::default();
             let id = journal.create_preparing(request()).unwrap();
-            assert_eq!(journal.load(id).unwrap().unwrap().state, OperationState::Preparing);
+            assert_eq!(
+                journal.load(id).unwrap().unwrap().state,
+                OperationState::Preparing
+            );
         }
 
         #[test]

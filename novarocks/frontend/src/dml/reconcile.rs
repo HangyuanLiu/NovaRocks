@@ -316,10 +316,22 @@ mod tests {
     // `commit_op_kind_record_names_are_stable`).
     #[test]
     fn commit_op_kind_record_names_are_stable() {
-        assert_eq!(commit_op_kind_record_name(CommitOpKind::FastAppend), "fast_append");
-        assert_eq!(commit_op_kind_record_name(CommitOpKind::Overwrite), "overwrite");
-        assert_eq!(commit_op_kind_record_name(CommitOpKind::RowDelta), "row_delta");
-        assert_eq!(commit_op_kind_record_name(CommitOpKind::RowDeltaDv), "row_delta_dv");
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::FastAppend),
+            "fast_append"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::Overwrite),
+            "overwrite"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RowDelta),
+            "row_delta"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RowDeltaDv),
+            "row_delta_dv"
+        );
         assert_eq!(
             commit_op_kind_record_name(CommitOpKind::RowDeltaDvFromFiles),
             "row_delta_dv_from_files"
@@ -328,8 +340,14 @@ mod tests {
             commit_op_kind_record_name(CommitOpKind::RewriteDataFiles),
             "rewrite_data_files"
         );
-        assert_eq!(commit_op_kind_record_name(CommitOpKind::CowUpdate), "cow_update");
-        assert_eq!(commit_op_kind_record_name(CommitOpKind::Truncate), "truncate");
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::CowUpdate),
+            "cow_update"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::Truncate),
+            "truncate"
+        );
         assert_eq!(
             commit_op_kind_record_name(CommitOpKind::OverwritePartitions),
             "overwrite_partitions"

@@ -21,8 +21,8 @@ use crate::dml::model::{
     CleanupAttempt, CommitOutcome, CommitServiceError, CreatePreparingRequest, OperationState,
     WriteTransactionOutcome, WriteTransactionSpec,
 };
-use crate::dml::reconcile;
 use crate::dml::now_unix_millis;
+use crate::dml::reconcile;
 
 /// The outcome shape of a coordinated write, as reported by the executor. `H` is
 /// the executor's commit handle carried from the write step into the commit step
@@ -106,10 +106,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         }
     }
 
-    pub fn run(
-        &self,
-        spec: WriteTransactionSpec,
-    ) -> Result<WriteTransactionOutcome, DmlError> {
+    pub fn run(&self, spec: WriteTransactionSpec) -> Result<WriteTransactionOutcome, DmlError> {
         self.admission.admit()?;
 
         let request = CreatePreparingRequest {
@@ -150,8 +147,10 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                 )));
             }
             CoordinatedWriteReport::NoOp => {
-                self.journal.transition(operation_id, OperationState::Aborting)?;
-                self.journal.transition(operation_id, OperationState::Aborted)?;
+                self.journal
+                    .transition(operation_id, OperationState::Aborting)?;
+                self.journal
+                    .transition(operation_id, OperationState::Aborted)?;
                 return Ok(WriteTransactionOutcome {
                     operation_id: None,
                     committed_snapshot_id: None,
@@ -211,9 +210,7 @@ mod tests {
     use super::*;
     use crate::dml::error::DmlErrorKind;
     use crate::dml::journal::testing::InMemoryOperationJournal;
-    use crate::dml::model::{
-        CommitOpKind, OperationKind, OperationTarget, RecoveryEvidence,
-    };
+    use crate::dml::model::{CommitOpKind, OperationKind, OperationTarget, RecoveryEvidence};
 
     struct FakeExecutor {
         write: Result<CoordinatedWriteReport<()>, String>,
@@ -304,7 +301,13 @@ mod tests {
             OperationState::Finalized
         );
         assert_eq!(
-            journal.load(1).unwrap().unwrap().commit_outcome.unwrap().snapshot_id,
+            journal
+                .load(1)
+                .unwrap()
+                .unwrap()
+                .commit_outcome
+                .unwrap()
+                .snapshot_id,
             42
         );
     }
