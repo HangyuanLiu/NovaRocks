@@ -89,8 +89,8 @@ where
         config,
         shutdown,
         |state_store| async move { FrontendApplicationHost::open(state_store).await },
-        FrontendApplicationHost::view_service,
-        move |config, view_service, shutdown| async move {
+        |host| (host.view_service(), host.statistics_service()),
+        move |config, (view_service, statistics_service), shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
@@ -98,6 +98,7 @@ where
                 config.grpc_endpoint.core_ownership(),
                 system_catalog,
                 view_service,
+                statistics_service,
                 shutdown,
             )
             .await
@@ -124,8 +125,8 @@ where
         config,
         signal,
         FrontendApplicationHost::open,
-        FrontendApplicationHost::view_service,
-        move |config, view_service, shutdown| async move {
+        |host| (host.view_service(), host.statistics_service()),
+        move |config, (view_service, statistics_service), shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
@@ -133,6 +134,7 @@ where
                 config.grpc_endpoint.core_ownership(),
                 system_catalog,
                 view_service,
+                statistics_service,
                 shutdown,
             )
             .await

@@ -27,6 +27,9 @@ use arrow::record_batch::RecordBatch;
 use crate::connector::backend::ResolvedTable;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::insert::reorder_insert_rows;
+use crate::engine::statistics::{
+    StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
+};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::expr::cast_with_special_rules;
 use crate::runtime::query_options::QueryOptions;
@@ -196,15 +199,65 @@ pub(crate) fn run_insert(
     if target.backend_name == "iceberg" {
         crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
     }
-    crate::engine::statistics::observe_insert(
+    let statistics_source = statistics_insert_source(source);
+    let statistics_overwrite_mode = match overwrite_mode {
+        OverwriteMode::None => StatisticsOverwriteMode::Append,
+        OverwriteMode::FullTable => StatisticsOverwriteMode::FullTable,
+        OverwriteMode::DynamicPartitions => StatisticsOverwriteMode::DynamicPartitions,
+    };
+    state.statistics_service.observe_insert(
         state,
-        &target.namespace,
-        &target.table,
-        columns,
-        source,
-        overwrite_mode,
+        StatisticsInsertObservation {
+            database: &target.namespace,
+            table: &target.table,
+            insert_columns: columns,
+            source: &statistics_source,
+            overwrite_mode: statistics_overwrite_mode,
+        },
     )?;
     Ok(StatementResult::Ok)
+}
+
+fn statistics_insert_source(source: &InsertSource) -> StatisticsInsertSource {
+    match source {
+        InsertSource::Values(rows) => StatisticsInsertSource::Values(
+            rows.iter()
+                .map(|row| row.iter().map(statistics_literal).collect())
+                .collect(),
+        ),
+        InsertSource::SelectLiteralRow(row) => {
+            StatisticsInsertSource::SelectLiteralRow(row.iter().map(statistics_literal).collect())
+        }
+        InsertSource::UnionAll(sources) => {
+            StatisticsInsertSource::UnionAll(sources.iter().map(statistics_insert_source).collect())
+        }
+        InsertSource::FromQuery(query) => StatisticsInsertSource::FromQuery(query.clone()),
+    }
+}
+
+fn statistics_literal(literal: &crate::sql::parser::ast::Literal) -> StatisticsLiteral {
+    use crate::sql::parser::ast::Literal;
+
+    match literal {
+        Literal::Null => StatisticsLiteral::Null,
+        Literal::Bool(value) => StatisticsLiteral::Bool(*value),
+        Literal::Int(value) => StatisticsLiteral::Int(*value),
+        Literal::Float(value) => StatisticsLiteral::Float(*value),
+        Literal::String(value) => StatisticsLiteral::String(value.clone()),
+        Literal::Date(value) => StatisticsLiteral::Date(value.clone()),
+        Literal::Array(values) => {
+            StatisticsLiteral::Array(values.iter().map(statistics_literal).collect())
+        }
+        Literal::Map(values) => StatisticsLiteral::Map(
+            values
+                .iter()
+                .map(|(key, value)| (statistics_literal(key), statistics_literal(value)))
+                .collect(),
+        ),
+        Literal::Struct(values) => {
+            StatisticsLiteral::Struct(values.iter().map(statistics_literal).collect())
+        }
+    }
 }
 
 pub(crate) fn execute_insert_from_query_on_pipeline(

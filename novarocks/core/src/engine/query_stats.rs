@@ -65,11 +65,20 @@ impl QueryStatsProviders {
     }
 
     pub(crate) fn from_standalone_state(state: &Arc<super::StandaloneState>) -> Self {
-        let connectors = state
-            .connectors
-            .read()
-            .expect("standalone connectors read lock");
-        Self::from_connectors(&connectors)
+        let iceberg = {
+            let connectors = state
+                .connectors
+                .read()
+                .expect("standalone connectors read lock");
+            connectors
+                .table_source("iceberg")
+                .ok()
+                .and_then(|source| source.stats_provider())
+        };
+        Self {
+            iceberg,
+            catalog_statistics: Some(Arc::clone(&state.statistics_service)),
+        }
     }
 
     pub(crate) fn from_optional_state(state: Option<&Arc<super::StandaloneState>>) -> Self {

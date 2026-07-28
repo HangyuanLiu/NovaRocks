@@ -26,6 +26,7 @@ use novarocks_state_store::{
 };
 
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
+use crate::statistics::FrontendStatisticsService;
 use crate::view::FrontendViewService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,6 +79,7 @@ impl fmt::Display for FrontendApplicationError {
 impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
+    statistics_service: Option<Arc<FrontendStatisticsService>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     state_store_host: Option<StateStoreHost>,
 }
@@ -87,6 +89,7 @@ impl FrontendApplicationHost {
         config: Option<StateStoreHostConfig>,
     ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
+            statistics_service: None,
             view_service: None,
             state_store_host: None,
         };
@@ -96,6 +99,7 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
+        host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
         match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
         {
             Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
@@ -117,6 +121,13 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .expect("frontend view service is installed before host open returns"),
         )
+    }
+
+    pub fn statistics_service(&self) -> Arc<dyn novarocks::engine::statistics::StatisticsService> {
+        self.statistics_service
+            .as_ref()
+            .expect("frontend statistics service is installed before host open returns")
+            .clone()
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -180,6 +191,7 @@ impl FrontendApplicationHost {
     }
 
     async fn release_resources(&mut self) -> Result<(), StateStoreHostError> {
+        self.statistics_service.take();
         self.view_service.take();
         if let Some(host) = self.state_store_host.as_mut() {
             host.shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)

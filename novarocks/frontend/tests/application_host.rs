@@ -29,6 +29,7 @@ use novarocks_state_store::{
 };
 use sqlparser::ast::{Query, Statement};
 use sqlparser::parser::Parser;
+use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -110,6 +111,15 @@ fn sqlite_config(temp: &TempDir) -> StateStoreHostConfig {
         },
         foundationdb_client: None,
     }
+}
+
+#[tokio::test]
+async fn host_exposes_one_statistics_service_identity() {
+    let host = FrontendApplicationHost::open(None).await.expect("host");
+    let first = host.statistics_service();
+    let second = host.statistics_service();
+    assert!(Arc::ptr_eq(&first, &second));
+    host.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
