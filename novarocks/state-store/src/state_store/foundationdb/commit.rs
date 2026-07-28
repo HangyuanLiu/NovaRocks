@@ -27,8 +27,10 @@ use uuid::Uuid;
 
 use super::codec::{DurableCommitState, KeyspaceCodec, REVISION_BYTES};
 use super::txn::create_raw_transaction_with_observer;
+use crate::state_store::foundationdb::runtime::OperationHandle;
 use crate::state_store::metrics::StateStoreMetrics;
-use crate::state_store::runtime::OperationHandle;
+#[cfg(test)]
+use crate::state_store::provider::FOUNDATIONDB_STATE_STORE_PROVIDER_ID;
 use novarocks_spi::state_store::{
     CommitOutcome, CommitReceipt, CommitResolution, StateStoreError, StateStoreErrorKind,
     StateStoreLimits, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId,
@@ -1527,7 +1529,7 @@ mod tests {
     #[test]
     fn auxiliary_attempt_budget_allows_exactly_five_raw_transactions() {
         let mut budget = AuxiliaryAttemptBudget::new();
-        let metrics = StateStoreMetrics::new("foundationdb");
+        let metrics = StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID);
         let deadline = Instant::now() + Duration::from_secs(60);
         for attempt in 1..=AUXILIARY_MAX_ATTEMPTS {
             assert!(
@@ -1546,7 +1548,7 @@ mod tests {
     #[test]
     fn auxiliary_deadline_is_terminal_and_counted_once_before_creation() {
         let mut budget = AuxiliaryAttemptBudget::new();
-        let metrics = StateStoreMetrics::new("foundationdb");
+        let metrics = StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID);
         let error = begin_auxiliary_attempt(&mut budget, Instant::now(), &metrics)
             .expect_err("expired deadline must reject before raw transaction creation");
         assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded);
@@ -1613,7 +1615,7 @@ mod tests {
 
     #[test]
     fn auxiliary_metric_events_are_counted_without_public_commit_duplication() {
-        let metrics = StateStoreMetrics::new("foundationdb");
+        let metrics = StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID);
         record_auxiliary_metric(&metrics, AuxiliaryMetricEvent::Attempt);
         record_auxiliary_metric(&metrics, AuxiliaryMetricEvent::Attempt);
         record_auxiliary_metric(&metrics, AuxiliaryMetricEvent::Deadline);

@@ -18,30 +18,39 @@
 mod common;
 
 use std::collections::VecDeque;
+#[cfg(not(feature = "mysql-state-store-provider"))]
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(not(feature = "mysql-state-store-provider"))]
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+#[cfg(not(feature = "mysql-state-store-provider"))]
+use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     ContinuationToken, Direction, Key, KeyRange, Precondition, RangePage, RangeRequest,
     ReadTransaction, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreOperation, StateStoreOutcome, StoreIdentity, StoreRevision, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    StateStoreOperation, StateStoreOutcome, StateStoreProviderId, StoreIdentity, StoreRevision,
+    TransactionId, Value, VersionToken, WriteTransaction,
 };
 use novarocks_state_store::coordination::{
     AttemptId, ControlPlaneIncarnation, FencingToken, HolderId, ResourceEpoch, ResourceKey,
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, OperationId,
-    RunFailure, StateStoreAppConfig, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig, StateStoreRuntime, derive_transaction_id, open_state_store,
+    FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, OperationId, RunFailure,
+    StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreHostErrorKind,
+    StateStoreLimitOverrides, StateStoreProviderConfig, derive_transaction_id,
     run_side_effect_free,
+};
+#[cfg(not(feature = "mysql-state-store-provider"))]
+use novarocks_state_store::{
+    MYSQL_STATE_STORE_PROVIDER_ID, StateStoreHost, builtin_state_store_provider_registry,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -49,6 +58,9 @@ use uuid::Uuid;
 use novarocks_spi::state_store::conformance::{
     FaultGate, FaultInjectingStateStore, ScriptedCommitResult,
 };
+
+const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
+    StateStoreProviderId::new("scripted-test");
 
 #[test]
 fn coordination_contract_rejects_invalid_opaque_identities() {
@@ -100,6 +112,141 @@ fn mysql_app_config(client: MySqlClientConfig) -> StateStoreAppConfig {
             },
         },
         mysql_client: Some(client),
+    }
+}
+
+#[test]
+fn host_config_rejects_missing_and_cross_provider_clients_before_provider_io() {
+    let fixture_dir = tempfile::tempdir().expect("create host config fixture directory");
+    let cluster_file = fixture_dir.path().join("fdb.cluster");
+    std::fs::write(&cluster_file, b"test foundationdb cluster file")
+        .expect("write host config fixture");
+
+    let sqlite = StateStoreAppConfig {
+        store: StateStoreConfig {
+            cluster_id: "cluster-a".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Sqlite {
+                path: fixture_dir.path().join("state-store.sqlite"),
+                deployment_owner: "fe-a".to_owned(),
+            },
+        },
+        mysql_client: None,
+    };
+    let mysql = mysql_app_config(valid_mysql_client());
+    let foundationdb = StateStoreAppConfig {
+        store: StateStoreConfig {
+            cluster_id: "cluster-a".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Foundationdb {
+                cluster_file,
+                keyspace_id: Uuid::now_v7(),
+            },
+        },
+        mysql_client: None,
+    };
+    let foundationdb_client = FoundationDbClientConfig {
+        disable_multi_version_client: true,
+        tls_cert_path: None,
+        tls_key_path: None,
+        tls_ca_path: None,
+        tls_verify_peers: None,
+        tls_password_env: None,
+    };
+
+    let cases = [
+        (
+            "sqlite with mysql client",
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    mysql_client: Some(valid_mysql_client()),
+                    ..sqlite.clone()
+                },
+                foundationdb_client: None,
+            },
+            true,
+        ),
+        (
+            "sqlite with foundationdb client",
+            StateStoreHostConfig {
+                state_store: sqlite.clone(),
+                foundationdb_client: Some(foundationdb_client.clone()),
+            },
+            true,
+        ),
+        (
+            "mysql without mysql client",
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    mysql_client: None,
+                    ..mysql.clone()
+                },
+                foundationdb_client: None,
+            },
+            true,
+        ),
+        (
+            "mysql with foundationdb client",
+            StateStoreHostConfig {
+                state_store: mysql.clone(),
+                foundationdb_client: Some(foundationdb_client.clone()),
+            },
+            true,
+        ),
+        (
+            "foundationdb without client",
+            StateStoreHostConfig {
+                state_store: foundationdb.clone(),
+                foundationdb_client: None,
+            },
+            true,
+        ),
+        (
+            "foundationdb with mysql client",
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    mysql_client: Some(valid_mysql_client()),
+                    ..foundationdb.clone()
+                },
+                foundationdb_client: Some(foundationdb_client.clone()),
+            },
+            true,
+        ),
+        (
+            "sqlite without provider clients",
+            StateStoreHostConfig {
+                state_store: sqlite,
+                foundationdb_client: None,
+            },
+            false,
+        ),
+        (
+            "mysql with mysql client",
+            StateStoreHostConfig {
+                state_store: mysql,
+                foundationdb_client: None,
+            },
+            false,
+        ),
+        (
+            "foundationdb with foundationdb client",
+            StateStoreHostConfig {
+                state_store: foundationdb,
+                foundationdb_client: Some(foundationdb_client),
+            },
+            false,
+        ),
+    ];
+
+    for (name, config, must_fail) in cases {
+        match config.validate() {
+            Ok(()) if !must_fail => {}
+            Err(error) if must_fail => {
+                assert_eq!(error.kind(), StateStoreHostErrorKind::InvalidConfiguration)
+            }
+            Ok(()) => panic!("{name} must reject before provider I/O"),
+            Err(error) => panic!("{name} must be valid: {error}"),
+        }
     }
 }
 
@@ -234,14 +381,18 @@ fn mysql_client_config_debug_redacts_connection_material() {
 async fn mysql_config_feature_off_open_fails_without_fallback() {
     let app = mysql_app_config(valid_mysql_client());
     app.validate().expect("valid static MySQL configuration");
-    let runtime = StateStoreRuntime::local().expect("create feature-off local runtime");
-    let error = match open_state_store(
-        &runtime,
-        app.store,
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    let error = match StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: app,
+            foundationdb_client: None,
+        },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
             topology_revision: Bytes::from_static(b"topology-r1"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
     {
@@ -249,10 +400,11 @@ async fn mysql_config_feature_off_open_fails_without_fallback() {
         Err(error) => error,
     };
 
-    assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert_eq!(error.kind(), StateStoreHostErrorKind::ProviderNotCompiled);
+    assert_eq!(error.provider_id(), Some(MYSQL_STATE_STORE_PROVIDER_ID));
     assert_eq!(
         error.to_string(),
-        "InvalidConfiguration: MySQL provider is not compiled in"
+        "ProviderNotCompiled (mysql): MySQL provider is not compiled in"
     );
 }
 
@@ -441,7 +593,7 @@ impl ScriptedStore {
     fn new(commits: impl IntoIterator<Item = ScriptedCommit>) -> Self {
         Self {
             limits: StateStoreLimits::default(),
-            metrics: Arc::new(StateStoreMetrics::new("scripted")),
+            metrics: Arc::new(StateStoreMetrics::new(TEST_STATE_STORE_PROVIDER_ID)),
             commits: Mutex::new(commits.into_iter().collect()),
             transaction_ids: Mutex::new(Vec::new()),
         }
@@ -453,7 +605,7 @@ impl ScriptedStore {
     ) -> Self {
         Self {
             limits,
-            metrics: Arc::new(StateStoreMetrics::new("scripted")),
+            metrics: Arc::new(StateStoreMetrics::new(TEST_STATE_STORE_PROVIDER_ID)),
             commits: Mutex::new(commits.into_iter().collect()),
             transaction_ids: Mutex::new(Vec::new()),
         }
@@ -551,10 +703,6 @@ impl WriteTransaction for ScriptedWriteTransaction {
 
 #[async_trait]
 impl StateStore for ScriptedStore {
-    fn provider_name(&self) -> &'static str {
-        "scripted"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }

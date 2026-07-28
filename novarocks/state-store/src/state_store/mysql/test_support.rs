@@ -18,19 +18,22 @@
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,
-    StateRecord, StateStore, StoreRevision, TransactionId, Value,
+    StateRecord, StoreRevision, TransactionId, Value,
 };
-use novarocks_spi::state_store::{Precondition, StateStoreError, StateStoreErrorKind};
+use novarocks_spi::state_store::{
+    FeDeploymentView, Precondition, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreOpenRequest,
+};
 
-use super::super::StateStoreRuntime;
+use super::super::{MySqlClientConfig, StateStoreConfig, StateStoreProviderConfig};
 use super::client::MysqlPoolConnection;
+use super::runtime::MysqlRuntime;
 #[cfg(feature = "state-store-test-hooks")]
 use bytes::Bytes;
 #[cfg(feature = "state-store-test-hooks")]
 use mysql_async::prelude::Queryable;
-#[cfg(feature = "state-store-test-hooks")]
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "state-store-test-hooks")]
 use uuid::Uuid;
 
@@ -97,6 +100,262 @@ pub struct MysqlWriteTestApi;
 pub struct MysqlOccTestApi;
 pub struct MysqlChangeTestApi;
 pub struct MysqlCommitTestApi;
+
+pub struct MysqlProviderTestHarness {
+    runtime: MysqlRuntime,
+}
+
+impl std::fmt::Debug for MysqlProviderTestHarness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MysqlProviderTestHarness::Mysql")
+    }
+}
+
+impl MysqlProviderTestHarness {
+    pub fn boot(config: MySqlClientConfig) -> Result<Self, StateStoreError> {
+        Ok(Self {
+            runtime: MysqlRuntime::boot(config)?,
+        })
+    }
+
+    pub async fn open_store(
+        &self,
+        config: StateStoreConfig,
+        deployment: FeDeploymentView,
+        deadline: Instant,
+    ) -> Result<Arc<dyn StateStore>, StateStoreError> {
+        config.validate().map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "MySQL state store configuration is invalid",
+            )
+        })?;
+        let StateStoreProviderConfig::Mysql { database } = config.provider else {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "operation requires a MySQL state store configuration",
+            ));
+        };
+        let limits = super::super::limits::resolve_state_store_limits(
+            &config.limits,
+            super::super::limits::MYSQL_MAX_KEY_BYTES,
+        )
+        .map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "MySQL state store limits are invalid",
+            )
+        })?;
+        self.runtime
+            .open_store(
+                database,
+                StateStoreOpenRequest {
+                    cluster_id: config.cluster_id,
+                    limits,
+                    deployment,
+                    deadline,
+                },
+            )
+            .await
+    }
+
+    pub async fn shutdown(&mut self, deadline: Instant) -> Result<(), StateStoreError> {
+        self.runtime.shutdown_until(deadline).await
+    }
+
+    pub(crate) fn mysql_test_owner(&self) -> Result<MysqlRuntimeOwner, StateStoreError> {
+        Ok(self.runtime.owner())
+    }
+
+    pub(crate) fn mysql_test_validate_owner(&self, pid: u32) -> Result<(), StateStoreError> {
+        self.runtime.validate_pid_owner(pid)
+    }
+
+    pub(crate) async fn mysql_test_prepare_pool(
+        &self,
+        database: &str,
+    ) -> Result<(), StateStoreError> {
+        self.runtime.prepare_pool(database).await
+    }
+
+    pub(crate) fn mysql_test_pool(
+        &self,
+        database: &str,
+    ) -> Result<Arc<dyn super::client::PoolLifecycle>, StateStoreError> {
+        self.runtime.get_or_create_pool(database)
+    }
+
+    pub(crate) fn mysql_test_pool_count(&self) -> Result<usize, StateStoreError> {
+        self.runtime.pool_count()
+    }
+
+    pub(crate) fn mysql_test_acquire_provider_handle(
+        &self,
+    ) -> Result<MysqlTestHandle, StateStoreError> {
+        let guard = self.runtime.acquire_provider_handle()?;
+        Ok(MysqlTestHandle::new(move || drop(guard)))
+    }
+
+    pub(crate) fn mysql_test_acquire_operation(&self) -> Result<MysqlTestHandle, StateStoreError> {
+        let guard = self.runtime.acquire_operation()?;
+        Ok(MysqlTestHandle::new(move || drop(guard)))
+    }
+
+    pub(crate) fn mysql_test_is_accepting(&self) -> Result<bool, StateStoreError> {
+        Ok(self.runtime.is_accepting())
+    }
+
+    pub(crate) fn mysql_test_begin_shutdown(&self) -> Result<(), StateStoreError> {
+        self.runtime.begin_shutdown()
+    }
+
+    pub(crate) async fn mysql_test_active_readiness(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlReadinessSnapshot, StateStoreError> {
+        self.runtime.active_readiness(database, deadline).await
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    pub(crate) async fn mysql_test_delayed_active_readiness(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlReadinessSnapshot, StateStoreError> {
+        self.runtime
+            .delayed_active_readiness(database, deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_pollute_session(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.runtime.pollute_session(database, deadline).await
+    }
+
+    pub(crate) async fn mysql_test_hold_connection(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlHeldConnection, StateStoreError> {
+        self.runtime.hold_connection(database, deadline).await
+    }
+
+    pub(crate) async fn mysql_test_schema_snapshot(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlSchemaSnapshot, StateStoreError> {
+        self.runtime.schema_snapshot(database, deadline).await
+    }
+
+    pub(crate) async fn mysql_test_apply_schema_mutation(
+        &self,
+        database: &str,
+        mutation: MysqlSchemaMutation,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.runtime
+            .apply_schema_mutation(database, mutation, deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_acquire_schema_advisory_lock(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlHeldAdvisoryLock, StateStoreError> {
+        self.runtime
+            .acquire_schema_advisory_lock(database, deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_is_schema_advisory_lock_free(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<bool, StateStoreError> {
+        self.runtime
+            .is_schema_advisory_lock_free(database, deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_store_readiness_snapshot(
+        &self,
+        database: &str,
+        cluster_id: &str,
+        deadline: Duration,
+    ) -> Result<MysqlStoreReadinessSnapshot, StateStoreError> {
+        self.runtime
+            .store_readiness_snapshot(database, cluster_id, deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_schema_timeout_connection_is_destroyed(
+        &self,
+        database: &str,
+        timeout_deadline: Duration,
+        checkout_deadline: Duration,
+    ) -> Result<bool, StateStoreError> {
+        self.runtime
+            .schema_timeout_connection_is_destroyed(database, timeout_deadline, checkout_deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_insert_malformed_kv_row(
+        &self,
+        database: &str,
+        key: &[u8],
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.runtime
+            .insert_malformed_kv_row(database, key, deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_deadlock_1213_maps_to_conflict(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.runtime
+            .deadlock_1213_maps_to_conflict(database, deadline)
+            .await
+    }
+
+    pub(crate) async fn mysql_test_lock_timeout_1205_rolls_back_before_conflict(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.runtime
+            .lock_timeout_1205_rolls_back_before_conflict(database, deadline)
+            .await
+    }
+
+    pub(in crate::state_store) async fn mysql_test_hold_kv_lock(
+        &self,
+        database: &str,
+        key: &[u8],
+        deadline: Duration,
+    ) -> Result<super::txn::MysqlHeldKvLock, StateStoreError> {
+        self.runtime.hold_kv_lock(database, key, deadline).await
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    pub(crate) async fn mysql_test_run_sleep_until_deadline(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.runtime
+            .run_sleep_until_deadline(database, deadline)
+            .await
+    }
+}
 #[cfg(feature = "state-store-test-hooks")]
 pub struct MysqlPollQueryTestControl {
     inner: super::changes::PollQueryHookControl,
@@ -161,7 +420,7 @@ impl MysqlOccTestApi {
     }
 
     pub async fn hold_kv_lock(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
         key: &[u8],
         deadline: Duration,
@@ -176,7 +435,7 @@ impl MysqlOccTestApi {
     }
 
     pub async fn deadlock_1213_maps_to_conflict(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
         deadline: Duration,
     ) -> Result<(), StateStoreError> {
@@ -186,7 +445,7 @@ impl MysqlOccTestApi {
     }
 
     pub async fn lock_timeout_1205_rolls_back_before_conflict(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
         deadline: Duration,
     ) -> Result<(), StateStoreError> {
@@ -197,7 +456,7 @@ impl MysqlOccTestApi {
 
     #[cfg(feature = "state-store-test-hooks")]
     pub async fn statement_deadline_destroys_undrained_connection(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
     ) -> Result<(), StateStoreError> {
         let before = active_readiness(runtime, database, Duration::from_secs(4))
@@ -231,7 +490,7 @@ impl MysqlChangeTestApi {
     }
 
     pub async fn run_scenario(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
         store: Arc<dyn StateStore>,
         scenario: &str,
@@ -506,7 +765,7 @@ impl MysqlCommitTestApi {
     }
 
     pub async fn auxiliary_statement_timeout_disposes(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
     ) -> Result<u64, StateStoreError> {
         super::commit::auxiliary_statement_timeout_disposes_for_test(
@@ -516,7 +775,7 @@ impl MysqlCommitTestApi {
     }
 
     pub async fn auxiliary_native_error_rolls_back(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
     ) -> Result<(), StateStoreError> {
         super::commit::auxiliary_native_error_rolls_back_for_test(
@@ -549,7 +808,7 @@ impl MysqlCommitTestApi {
     }
 
     pub async fn hold_ledger_lock(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
         transaction_id: TransactionId,
     ) -> Result<MysqlHeldCommitLedgerLock, StateStoreError> {
@@ -567,7 +826,7 @@ impl MysqlCommitTestApi {
     }
 
     pub async fn force_committed_ledger(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
         transaction_id: TransactionId,
         revision: u64,
@@ -596,7 +855,7 @@ impl MysqlCommitTestApi {
     }
 
     pub async fn run_scenario(
-        runtime: &mut StateStoreRuntime,
+        runtime: &mut MysqlProviderTestHarness,
         database: &str,
         store: Arc<dyn StateStore>,
         scenario: &str,
@@ -1062,7 +1321,7 @@ impl MysqlCommitTestApi {
                 }
                 drop(store);
                 let shutdown_error = runtime
-                    .shutdown_with_timeout(Duration::from_millis(100))
+                    .shutdown(Instant::now() + Duration::from_millis(100))
                     .await
                     .expect_err("cleanup operation guard must block runtime shutdown");
                 if shutdown_error.kind() != StateStoreErrorKind::DeadlineExceeded {
@@ -1292,7 +1551,7 @@ impl MysqlTransactionTestApi {
     }
 
     pub async fn insert_malformed_kv_row(
-        runtime: &StateStoreRuntime,
+        runtime: &MysqlProviderTestHarness,
         database: &str,
         key: &[u8],
         deadline: Duration,
@@ -1303,45 +1562,49 @@ impl MysqlTransactionTestApi {
     }
 }
 
-pub fn runtime_owner(runtime: &StateStoreRuntime) -> Result<MysqlRuntimeOwner, StateStoreError> {
+pub fn runtime_owner(
+    runtime: &MysqlProviderTestHarness,
+) -> Result<MysqlRuntimeOwner, StateStoreError> {
     runtime.mysql_test_owner()
 }
 
-pub fn validate_owner(runtime: &StateStoreRuntime, pid: u32) -> Result<(), StateStoreError> {
+pub fn validate_owner(runtime: &MysqlProviderTestHarness, pid: u32) -> Result<(), StateStoreError> {
     runtime.mysql_test_validate_owner(pid)
 }
 
 pub async fn prepare_pool(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
 ) -> Result<(), StateStoreError> {
     runtime.mysql_test_prepare_pool(database).await
 }
 
-pub fn pool_count(runtime: &StateStoreRuntime) -> Result<usize, StateStoreError> {
+pub fn pool_count(runtime: &MysqlProviderTestHarness) -> Result<usize, StateStoreError> {
     runtime.mysql_test_pool_count()
 }
 
 pub fn acquire_provider_handle(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
 ) -> Result<MysqlTestHandle, StateStoreError> {
     runtime.mysql_test_acquire_provider_handle()
 }
 
-pub fn acquire_operation(runtime: &StateStoreRuntime) -> Result<MysqlTestHandle, StateStoreError> {
+pub fn acquire_operation(
+    runtime: &MysqlProviderTestHarness,
+) -> Result<MysqlTestHandle, StateStoreError> {
     runtime.mysql_test_acquire_operation()
 }
 
-pub fn is_accepting(runtime: &StateStoreRuntime) -> Result<bool, StateStoreError> {
+pub fn is_accepting(runtime: &MysqlProviderTestHarness) -> Result<bool, StateStoreError> {
     runtime.mysql_test_is_accepting()
 }
 
-pub fn begin_shutdown(runtime: &StateStoreRuntime) -> Result<(), StateStoreError> {
+pub fn begin_shutdown(runtime: &MysqlProviderTestHarness) -> Result<(), StateStoreError> {
     runtime.mysql_test_begin_shutdown()
 }
 
 pub async fn active_readiness(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<MysqlReadinessSnapshot, StateStoreError> {
@@ -1352,7 +1615,7 @@ pub async fn active_readiness(
 
 #[cfg(feature = "state-store-test-hooks")]
 pub async fn delayed_active_readiness(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<MysqlReadinessSnapshot, StateStoreError> {
@@ -1362,7 +1625,7 @@ pub async fn delayed_active_readiness(
 }
 
 pub async fn pollute_session(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<(), StateStoreError> {
@@ -1370,7 +1633,7 @@ pub async fn pollute_session(
 }
 
 pub async fn hold_connection(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<MysqlHeldConnection, StateStoreError> {
@@ -1435,7 +1698,7 @@ pub fn advisory_lock_name(database: &str) -> String {
 }
 
 pub async fn schema_snapshot(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<MysqlSchemaSnapshot, StateStoreError> {
@@ -1443,7 +1706,7 @@ pub async fn schema_snapshot(
 }
 
 pub async fn apply_schema_mutation(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     mutation: MysqlSchemaMutation,
     deadline: Duration,
@@ -1454,7 +1717,7 @@ pub async fn apply_schema_mutation(
 }
 
 pub async fn acquire_schema_advisory_lock(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<MysqlHeldAdvisoryLock, StateStoreError> {
@@ -1464,7 +1727,7 @@ pub async fn acquire_schema_advisory_lock(
 }
 
 pub async fn is_schema_advisory_lock_free(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<bool, StateStoreError> {
@@ -1474,7 +1737,7 @@ pub async fn is_schema_advisory_lock_free(
 }
 
 pub async fn store_readiness_snapshot(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     cluster_id: &str,
     deadline: Duration,
@@ -1485,7 +1748,7 @@ pub async fn store_readiness_snapshot(
 }
 
 pub async fn schema_timeout_connection_is_destroyed(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     timeout_deadline: Duration,
     checkout_deadline: Duration,
@@ -1501,7 +1764,7 @@ pub async fn schema_timeout_connection_is_destroyed(
 
 #[cfg(feature = "state-store-test-hooks")]
 pub async fn run_sleep_until_deadline(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     deadline: Duration,
 ) -> Result<(), StateStoreError> {

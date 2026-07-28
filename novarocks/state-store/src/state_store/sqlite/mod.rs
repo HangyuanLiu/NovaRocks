@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod provider;
 mod range;
 mod schema;
 mod txn;
@@ -30,14 +31,15 @@ use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags};
 
 use novarocks_spi::state_store::{
-    ChangePage, ChangePollRequest, CommitResolution, MAX_KEY_BYTES, ReadTransaction, StateStore,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
     StoreIdentity, TransactionId, WriteTransaction,
 };
 
-use crate::state_store::limits::resolve_state_store_limits;
 use crate::state_store::metrics::StateStoreMetrics;
-use crate::state_store::{FeDeploymentView, StateStoreConfig, StateStoreProviderConfig};
+use crate::state_store::provider::SQLITE_STATE_STORE_PROVIDER_ID;
+
+pub(crate) use provider::SqliteStateStoreProviderFactory;
 
 pub(super) struct SqliteStateStore {
     pub(super) path: PathBuf,
@@ -52,10 +54,6 @@ pub(super) struct SqliteStateStore {
 
 #[async_trait]
 impl StateStore for SqliteStateStore {
-    fn provider_name(&self) -> &'static str {
-        "sqlite"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }
@@ -117,58 +115,34 @@ impl StateStore for SqliteStateStore {
 
 impl SqliteStateStore {
     pub(super) async fn open(
-        config: StateStoreConfig,
-        deployment: FeDeploymentView,
+        path: PathBuf,
+        deployment_owner: String,
+        request: StateStoreOpenRequest,
     ) -> Result<Self, StateStoreError> {
-        if deployment.active_fe_count.get() != 1 {
+        if request.deployment.active_fe_count.get() != 1 {
             return Err(StateStoreError::new(
                 StateStoreErrorKind::UnsupportedDeployment,
                 "sqlite state store requires exactly one active FE",
             ));
         }
 
-        config.validate().map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "SQLite state store configuration is invalid",
-            )
-        })?;
-        let path = match &config.provider {
-            StateStoreProviderConfig::Sqlite { path, .. } => path,
-            StateStoreProviderConfig::Foundationdb { .. } => {
-                return Err(StateStoreError::new(
-                    StateStoreErrorKind::InvalidConfiguration,
-                    "SQLite state store requires sqlite provider configuration",
-                ));
-            }
-            StateStoreProviderConfig::Mysql { .. } => {
-                return Err(StateStoreError::new(
-                    StateStoreErrorKind::InvalidConfiguration,
-                    "SQLite state store requires sqlite provider configuration",
-                ));
-            }
-        };
-        if is_memory_path(path) {
+        if is_memory_path(&path) {
             return Err(StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "SQLite state store requires a persistent file path",
             ));
         }
-        let limits = resolve_state_store_limits(&config.limits, MAX_KEY_BYTES).map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "SQLite state store limits are invalid",
-            )
-        })?;
 
-        tokio::task::spawn_blocking(move || open_blocking(config, limits))
-            .await
-            .map_err(|_| {
-                StateStoreError::new(
-                    StateStoreErrorKind::Internal,
-                    "SQLite state store open worker failed",
-                )
-            })?
+        tokio::task::spawn_blocking(move || {
+            open_blocking(path, deployment_owner, request.cluster_id, request.limits)
+        })
+        .await
+        .map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::Internal,
+                "SQLite state store open worker failed",
+            )
+        })?
     }
 
     #[cfg(test)]
@@ -178,24 +152,11 @@ impl SqliteStateStore {
 }
 
 fn open_blocking(
-    config: StateStoreConfig,
+    path: PathBuf,
+    deployment_owner: String,
+    cluster_id: String,
     limits: StateStoreLimits,
 ) -> Result<SqliteStateStore, StateStoreError> {
-    let StateStoreConfig {
-        cluster_id,
-        provider,
-        ..
-    } = config;
-    let StateStoreProviderConfig::Sqlite {
-        path,
-        deployment_owner,
-    } = provider
-    else {
-        return Err(StateStoreError::new(
-            StateStoreErrorKind::InvalidConfiguration,
-            "SQLite state store requires sqlite provider configuration",
-        ));
-    };
     let path = canonicalize_database_path(&path)?;
     let database_path = database_path_bytes(&path)?;
     let owner_lock = acquire_owner_lock(&path)?;
@@ -210,7 +171,7 @@ fn open_blocking(
     Ok(SqliteStateStore {
         path,
         limits,
-        metrics: Arc::new(StateStoreMetrics::new("sqlite")),
+        metrics: Arc::new(StateStoreMetrics::new(SQLITE_STATE_STORE_PROVIDER_ID)),
         commit_registry: txn::new_commit_registry(),
         #[cfg(test)]
         test_hooks: txn::new_test_hooks(),
@@ -445,9 +406,9 @@ mod tests {
 
     use super::*;
     use crate::state_store::{
-        FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+        StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
     };
-    use novarocks_spi::state_store::StateStoreErrorKind;
+    use novarocks_spi::state_store::{FeDeploymentView, StateStoreErrorKind};
 
     fn runtime() -> Runtime {
         Builder::new_multi_thread()
@@ -479,6 +440,42 @@ mod tests {
         }
     }
 
+    async fn open_test_store(
+        config: StateStoreConfig,
+        deployment: FeDeploymentView,
+    ) -> Result<SqliteStateStore, novarocks_spi::state_store::StateStoreError> {
+        let StateStoreConfig {
+            cluster_id,
+            limits,
+            provider,
+        } = config;
+        let StateStoreProviderConfig::Sqlite {
+            path,
+            deployment_owner,
+        } = provider
+        else {
+            panic!("SQLite unit test requires SQLite provider configuration");
+        };
+        SqliteStateStore::open(
+            path,
+            deployment_owner,
+            StateStoreOpenRequest {
+                cluster_id,
+                limits: crate::state_store::limits::resolve_state_store_limits(
+                    &limits,
+                    novarocks_spi::state_store::MAX_KEY_BYTES,
+                )
+                .expect("resolve SQLite unit-test limits"),
+                deployment: novarocks_spi::state_store::FeDeploymentView {
+                    active_fe_count: deployment.active_fe_count,
+                    topology_revision: deployment.topology_revision,
+                },
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            },
+        )
+        .await
+    }
+
     fn lock_path(path: &Path) -> PathBuf {
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".owner.lock");
@@ -491,7 +488,7 @@ mod tests {
         deployment: FeDeploymentView,
     ) -> novarocks_spi::state_store::StateStoreError {
         runtime.block_on(async {
-            match SqliteStateStore::open(config, deployment).await {
+            match open_test_store(config, deployment).await {
                 Ok(_) => panic!("SQLite open unexpectedly succeeded"),
                 Err(error) => error,
             }
@@ -535,7 +532,7 @@ mod tests {
         drop(legacy);
 
         let store = runtime()
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -634,7 +631,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -652,7 +649,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -661,7 +658,7 @@ mod tests {
         drop(first);
 
         let restarted = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -677,7 +674,7 @@ mod tests {
         let missing_temp = TempDir::new().expect("missing-table temp dir");
         let missing_path = missing_temp.path().join("state-store.sqlite");
         let initialized = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&missing_path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -718,7 +715,7 @@ mod tests {
         let extra_temp = TempDir::new().expect("extra-table temp dir");
         let extra_path = extra_temp.path().join("state-store.sqlite");
         let initialized = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&extra_path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -761,7 +758,7 @@ mod tests {
             let path = temp.path().join(format!("state-store-{case}.sqlite"));
             let runtime = runtime();
             let initialized = runtime
-                .block_on(SqliteStateStore::open(
+                .block_on(open_test_store(
                     config(&path, "cluster-a", "fe-a"),
                     deployment(1),
                 ))
@@ -787,7 +784,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let initialized = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -819,7 +816,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let initialized = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -877,7 +874,7 @@ mod tests {
 
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -896,7 +893,7 @@ mod tests {
         drop(first);
 
         let restarted = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -956,7 +953,7 @@ mod tests {
         let alternate_path = temp.path().join("alternate.sqlite");
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&primary_path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -986,7 +983,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -1030,7 +1027,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -1066,7 +1063,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))
@@ -1113,7 +1110,7 @@ mod tests {
             let path = temp.path().join("state-store.sqlite");
             let runtime = runtime();
             let first = runtime
-                .block_on(SqliteStateStore::open(
+                .block_on(open_test_store(
                     config(&path, "cluster-a", "fe-a"),
                     deployment(1),
                 ))
@@ -1191,7 +1188,7 @@ mod tests {
         let path = temp.path().join("state-store.sqlite");
         let runtime = runtime();
         let first = runtime
-            .block_on(SqliteStateStore::open(
+            .block_on(open_test_store(
                 config(&path, "cluster-a", "fe-a"),
                 deployment(1),
             ))

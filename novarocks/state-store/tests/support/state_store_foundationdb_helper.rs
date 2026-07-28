@@ -19,15 +19,17 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::state_store::{
-    CommitOutcome, CommitResolution, Key, KeyRange, Precondition as StorePrecondition,
-    RangeRequest, StateRecord, StateStore, TransactionId, Value, VersionToken, WriteTransaction,
+    CommitOutcome, CommitResolution, FeDeploymentView, Key, KeyRange,
+    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, TransactionId, Value,
+    VersionToken, WriteTransaction,
 };
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig, StateStoreRuntime, arm_next_foundationdb_commit, open_state_store,
+    FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, arm_next_foundationdb_commit,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -309,7 +311,7 @@ struct PendingCommit {
 
 #[derive(Default)]
 struct HelperState {
-    runtime: Option<StateStoreRuntime>,
+    runtime: Option<FoundationDbProviderTestHarness>,
     store: Option<Arc<dyn StateStore>>,
     transactions: HashMap<Uuid, Box<dyn WriteTransaction>>,
     pending: HashMap<Uuid, PendingCommit>,
@@ -368,25 +370,26 @@ impl HelperState {
         }
         let cluster_file = cluster_file()?;
         let mut runtime =
-            StateStoreRuntime::foundationdb(client_config()).map_err(display_error)?;
-        let store = match open_state_store(
-            &runtime,
-            StateStoreConfig {
-                cluster_id,
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Foundationdb {
-                    cluster_file,
-                    keyspace_id,
+            FoundationDbProviderTestHarness::boot(client_config()).map_err(display_error)?;
+        let store = match runtime
+            .open_store(
+                StateStoreConfig {
+                    cluster_id,
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Foundationdb {
+                        cluster_file,
+                        keyspace_id,
+                    },
                 },
-            },
-            deployment(),
-        )
-        .await
+                deployment(),
+                test_deadline(),
+            )
+            .await
         {
             Ok(store) => store,
             Err(error) => {
                 let open_error = display_error(error);
-                let shutdown_error = match runtime.shutdown().await {
+                let shutdown_error = match runtime.shutdown(test_deadline()).await {
                     Ok(()) => None,
                     Err(shutdown_error) => {
                         self.runtime = Some(runtime);
@@ -550,7 +553,11 @@ impl HelperState {
         }
         self.store.take();
         if let Some(mut runtime) = self.runtime.take() {
-            runtime.shutdown().await.map_err(display_error)?;
+            let result = runtime
+                .shutdown(test_deadline())
+                .await
+                .map_err(display_error);
+            restore_runtime_after_shutdown(&mut self.runtime, runtime, result)?;
         }
         Ok(Response::success("Shutdown"))
     }
@@ -568,6 +575,24 @@ impl HelperState {
         self.transactions
             .get_mut(&transaction_id)
             .ok_or_else(|| format!("transaction {transaction_id} is not active"))
+    }
+}
+
+fn test_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
+}
+
+fn restore_runtime_after_shutdown<R>(
+    slot: &mut Option<R>,
+    runtime: R,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            *slot = Some(runtime);
+            Err(error)
+        }
     }
 }
 
@@ -681,6 +706,21 @@ mod tests {
             helper_open_failure_error("open failed".to_owned(), Some("shutdown failed".to_owned())),
             "open failed; FoundationDB runtime shutdown after helper open failure also failed: shutdown failed"
         );
+    }
+
+    #[test]
+    fn failed_shutdown_restores_runtime_owner_for_retry() {
+        let mut slot = None;
+
+        let error = restore_runtime_after_shutdown(
+            &mut slot,
+            7_u8,
+            Err("injected shutdown failure".to_owned()),
+        )
+        .expect_err("shutdown failure must surface");
+
+        assert_eq!(error, "injected shutdown failure");
+        assert_eq!(slot, Some(7));
     }
 }
 

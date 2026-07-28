@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "mysql-state-store-provider")]
+#![cfg(all(
+    feature = "mysql-state-store-provider",
+    feature = "state-store-test-hooks"
+))]
 
 #[cfg(feature = "state-store-test-hooks")]
 use std::cell::RefCell;
@@ -23,15 +26,15 @@ use std::num::NonZeroUsize;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_spi::state_store::ContinuationToken;
 use novarocks_spi::state_store::{
-    CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, StateStore,
-    StateStoreErrorKind, TransactionId, Value,
+    CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, Precondition, RangeRequest,
+    StateStore, StateStoreErrorKind, TransactionId, Value,
 };
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store::mysql::test_support::{
@@ -39,14 +42,15 @@ use novarocks_state_store::mysql::test_support::{
     MysqlPrepareRollbackFailure, MysqlStatementTestApi, arm_mysql_open_gate, hold_connection,
 };
 use novarocks_state_store::mysql::test_support::{
-    MysqlOccTestApi, MysqlSchemaColumnSnapshot, MysqlSchemaMutation, MysqlSchemaTableSnapshot,
-    MysqlTransactionTestApi, MysqlWriteTestApi, acquire_schema_advisory_lock, active_readiness,
-    advisory_lock_name, apply_schema_mutation, is_schema_advisory_lock_free, schema_snapshot,
-    schema_timeout_connection_is_destroyed, store_readiness_snapshot,
+    MysqlOccTestApi, MysqlProviderTestHarness, MysqlSchemaColumnSnapshot, MysqlSchemaMutation,
+    MysqlSchemaTableSnapshot, MysqlTransactionTestApi, MysqlWriteTestApi,
+    acquire_schema_advisory_lock, active_readiness, advisory_lock_name, apply_schema_mutation,
+    is_schema_advisory_lock_free, schema_snapshot, schema_timeout_connection_is_destroyed,
+    store_readiness_snapshot,
 };
 use novarocks_state_store::{
-    FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+    MYSQL_STATE_STORE_PROVIDER_ID, MySqlClientConfig, MySqlTlsMode, StateStoreConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig,
 };
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Version};
@@ -156,13 +160,23 @@ fn deployment() -> FeDeploymentView {
     }
 }
 
+async fn open_mysql_store(
+    runtime: &MysqlProviderTestHarness,
+    config: StateStoreConfig,
+    deployment: FeDeploymentView,
+) -> Result<Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
+    runtime
+        .open_store(config, deployment, Instant::now() + Duration::from_secs(30))
+        .await
+}
+
 async fn open_store(
-    runtime: &StateStoreRuntime,
+    runtime: &MysqlProviderTestHarness,
     database: &str,
     cluster_id: &str,
     deadline_ms: u64,
 ) -> Result<std::sync::Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
-    open_state_store(
+    open_mysql_store(
         runtime,
         store_config(database, cluster_id, deadline_ms),
         deployment(),
@@ -295,7 +309,7 @@ fn mysql_conformance_limits() -> StateStoreLimitOverrides {
 
 #[cfg(feature = "state-store-test-hooks")]
 fn mysql_conformance_factory(
-    runtime: Rc<StateStoreRuntime>,
+    runtime: Rc<MysqlProviderTestHarness>,
     databases: Rc<RefCell<Vec<TestDatabase>>>,
 ) -> StateStoreFactory {
     Rc::new(move || {
@@ -304,7 +318,7 @@ fn mysql_conformance_factory(
         databases.borrow_mut().push(database);
         let runtime = Rc::clone(&runtime);
         Box::pin(async move {
-            let store = open_state_store(
+            let store = open_mysql_store(
                 runtime.as_ref(),
                 StateStoreConfig {
                     cluster_id: "mysql-conformance-cluster".to_owned(),
@@ -381,7 +395,11 @@ fn expected_tables() -> Vec<MysqlSchemaTableSnapshot> {
     ]
 }
 
-async fn assert_open_corruption(runtime: &StateStoreRuntime, database: &str, cluster_id: &str) {
+async fn assert_open_corruption(
+    runtime: &MysqlProviderTestHarness,
+    database: &str,
+    cluster_id: &str,
+) {
     let error = match open_store(runtime, database, cluster_id, 4_000).await {
         Ok(_) => panic!("schema drift must fail closed"),
         Err(error) => error,
@@ -396,12 +414,15 @@ async fn mysql_schema_bootstraps_exact_four_tables_and_meta() {
         "exact",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
 
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("bootstrap MySQL state store");
-    assert_eq!(store.provider_name(), "mysql");
+    assert_eq!(
+        store.metrics_snapshot().provider,
+        MYSQL_STATE_STORE_PROVIDER_ID
+    );
     assert_eq!(store.limits().max_key_bytes, 3072);
     let identity = store.identity().await.expect("store identity");
     assert_eq!(identity.cluster_id, CLUSTER_ID);
@@ -435,7 +456,10 @@ async fn mysql_schema_bootstraps_exact_four_tables_and_meta() {
     assert_eq!(snapshot.change_retention_floor, (0, u32::MAX));
 
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -445,9 +469,9 @@ async fn mysql_schema_concurrent_open_converges_on_one_identity() {
         "concurrent",
     );
     let mut first =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct first runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct first runtime");
     let mut second =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct second runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct second runtime");
 
     let (first_store, second_store) = tokio::join!(
         open_store(&first, &database.name, CLUSTER_ID, 4_000),
@@ -462,8 +486,14 @@ async fn mysql_schema_concurrent_open_converges_on_one_identity() {
 
     drop(first_store);
     drop(second_store);
-    first.shutdown().await.expect("shutdown first runtime");
-    second.shutdown().await.expect("shutdown second runtime");
+    first
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown first runtime");
+    second
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown second runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -471,7 +501,7 @@ async fn mysql_schema_rejects_cluster_identity_mismatch() {
     let database =
         TestDatabase::provision("mysql_schema_rejects_cluster_identity_mismatch", "cluster");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("initialize first cluster identity");
@@ -489,7 +519,10 @@ async fn mysql_schema_rejects_cluster_identity_mismatch() {
         Err(error) => error,
     };
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -498,7 +531,7 @@ async fn mysql_schema_rejects_partial_and_extra_objects() {
         TestDatabase::provision("mysql_schema_rejects_partial_and_extra_objects", "partial");
     let extra = TestDatabase::provision("mysql_schema_rejects_partial_and_extra_objects", "extra");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
 
     apply_schema_mutation(
         &runtime,
@@ -524,7 +557,10 @@ async fn mysql_schema_rejects_partial_and_extra_objects() {
     .expect("create extra object");
     assert_open_corruption(&runtime, &extra.name, CLUSTER_ID).await;
 
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -536,7 +572,7 @@ async fn mysql_schema_rejects_engine_row_format_column_and_index_drift() {
         ("index", MysqlSchemaMutation::DriftIndex),
     ];
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let mut databases = Vec::new();
 
     for (suffix, mutation) in cases {
@@ -555,7 +591,10 @@ async fn mysql_schema_rejects_engine_row_format_column_and_index_drift() {
         databases.push(database);
     }
 
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
     drop(databases);
 }
 
@@ -568,7 +607,7 @@ async fn mysql_schema_rejects_missing_malformed_older_and_newer_meta() {
         ("newer", MysqlSchemaMutation::NewerSchemaVersion),
     ];
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let mut databases = Vec::new();
 
     for (suffix, mutation) in cases {
@@ -587,7 +626,10 @@ async fn mysql_schema_rejects_missing_malformed_older_and_newer_meta() {
         databases.push(database);
     }
 
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
     drop(databases);
 }
 
@@ -616,7 +658,7 @@ async fn mysql_schema_advisory_lock_timeout_and_release_are_deterministic() {
         "lock",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let held = acquire_schema_advisory_lock(&runtime, &database.name, Duration::from_secs(4))
         .await
         .expect("hold schema advisory lock");
@@ -650,7 +692,10 @@ async fn mysql_schema_advisory_lock_timeout_and_release_are_deterministic() {
             .expect("lock free after validation failure")
     );
 
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -664,7 +709,7 @@ async fn mysql_schema_never_creates_database_alters_or_drops_objects() {
         "drift",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
 
     let missing_database = format!(
         "novarocks_ss3_missing_{}",
@@ -714,7 +759,10 @@ async fn mysql_schema_never_creates_database_alters_or_drops_objects() {
         .expect("drift snapshot after open");
     assert_eq!(drift_after, drift_before);
 
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -728,7 +776,7 @@ async fn mysql_schema_rejects_cluster_id_beyond_meta_limit_before_ddl() {
         "oversized",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
 
     let boundary_cluster_id = "c".repeat(4096);
     let store = open_store(&runtime, &boundary.name, &boundary_cluster_id, 4_000)
@@ -754,7 +802,10 @@ async fn mysql_schema_rejects_cluster_id_beyond_meta_limit_before_ddl() {
     assert!(snapshot.triggers.is_empty());
     assert!(snapshot.meta_keys.is_empty());
 
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -764,12 +815,15 @@ async fn mysql_store_readiness_validates_inventory_identity_and_transactions() {
         "ready",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
 
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open ready store");
-    assert_eq!(store.provider_name(), "mysql");
+    assert_eq!(
+        store.metrics_snapshot().provider,
+        MYSQL_STATE_STORE_PROVIDER_ID
+    );
     assert_eq!(
         store.identity().await.expect("ready identity").cluster_id,
         CLUSTER_ID
@@ -792,7 +846,10 @@ async fn mysql_store_readiness_validates_inventory_identity_and_transactions() {
     );
 
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -806,7 +863,7 @@ async fn mysql_store_readiness_rejects_schema_or_identity_drift_after_pool_check
         "identity",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
 
     active_readiness(&runtime, &schema_database.name, Duration::from_secs(4))
         .await
@@ -845,14 +902,17 @@ async fn mysql_store_readiness_rejects_schema_or_identity_drift_after_pool_check
     };
     assert_eq!(mismatch.kind(), StateStoreErrorKind::InvalidConfiguration);
 
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_shared_snapshot_repeatable_read() {
     let database = TestDatabase::provision("mysql_shared_snapshot_repeatable_read", "snapshot");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -861,7 +921,10 @@ async fn mysql_shared_snapshot_repeatable_read() {
     state_store_conformance::snapshot_repeatable_read(&factory).await;
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -869,7 +932,7 @@ async fn mysql_read_abort_uses_explicit_rollback() {
     let database = TestDatabase::provision("mysql_read_abort_uses_explicit_rollback", "rollback");
     let mut client = fixture_client_config();
     client.pool_max = 1;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -883,7 +946,10 @@ async fn mysql_read_abort_uses_explicit_rollback() {
         rollback_count + 1
     );
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -893,7 +959,7 @@ async fn mysql_read_get_preserves_arbitrary_binary_payload() {
         "binary",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -920,14 +986,17 @@ async fn mysql_read_get_preserves_arbitrary_binary_payload() {
     reader.abort().await.expect("abort binary read");
 
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_shared_forward_reverse_pages() {
     let database = TestDatabase::provision("mysql_shared_forward_reverse_pages", "pages");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -936,7 +1005,10 @@ async fn mysql_shared_forward_reverse_pages() {
     state_store_conformance::forward_reverse_pages(&factory).await;
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -946,7 +1018,7 @@ async fn mysql_range_continuation_stays_in_one_snapshot_and_binds_request() {
         "continuation",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1013,7 +1085,10 @@ async fn mysql_range_continuation_stays_in_one_snapshot_and_binds_request() {
     reader.abort().await.expect("abort paginated snapshot");
 
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1023,7 +1098,7 @@ async fn mysql_range_decodes_extra_row_before_forward_and_reverse_pagination() {
         "extra_row",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1106,7 +1181,10 @@ async fn mysql_range_decodes_extra_row_before_forward_and_reverse_pagination() {
     );
     reader.abort().await.expect("abort extra row reader");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -1121,7 +1199,7 @@ async fn mysql_read_continuation_rejects_cross_transaction_and_cross_store_befor
         "second",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let first_store = open_store(&runtime, &first_database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open first MySQL store");
@@ -1223,7 +1301,10 @@ async fn mysql_read_continuation_rejects_cross_transaction_and_cross_store_befor
     other_store.abort().await.expect("abort other store");
     drop(first_store);
     drop(second_store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -1238,7 +1319,7 @@ async fn mysql_write_continuation_rejects_cross_transaction_and_cross_store_befo
         "second",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let first_store = open_store(&runtime, &first_database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open first MySQL store");
@@ -1320,14 +1401,17 @@ async fn mysql_write_continuation_rejects_cross_transaction_and_cross_store_befo
     other_store.abort().await.expect("abort other store write");
     drop(first_store);
     drop(second_store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_shared_limits_before_io() {
     let database = TestDatabase::provision("mysql_shared_limits_before_io", "limits");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let max_transaction_bytes = MysqlWriteTestApi::transaction_envelope_bytes()
         + 4 * MysqlWriteTestApi::put_accounted_bytes(&[11, 0xfe, 1], &[0; 32], &Precondition::Any)
             .expect("physical conformance put budget");
@@ -1343,7 +1427,7 @@ async fn mysql_shared_limits_before_io() {
             runner_max_attempts: Some(2),
         },
     );
-    let store = open_state_store(&runtime, config, deployment())
+    let store = open_mysql_store(&runtime, config, deployment())
         .await
         .expect("open limited MySQL store");
     let factory = shared_factory(store);
@@ -1351,14 +1435,17 @@ async fn mysql_shared_limits_before_io() {
     state_store_conformance::limits_before_io(&factory).await;
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_shared_arbitrary_binary_payloads() {
     let database = TestDatabase::provision("mysql_shared_arbitrary_binary_payloads", "binary");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1367,7 +1454,10 @@ async fn mysql_shared_arbitrary_binary_payloads() {
     state_store_conformance::arbitrary_binary_payloads(&factory).await;
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1377,7 +1467,7 @@ async fn mysql_read_rejects_malformed_persisted_rows_as_corruption() {
         "corruption",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1403,7 +1493,10 @@ async fn mysql_read_rejects_malformed_persisted_rows_as_corruption() {
     reader.abort().await.expect("abort corruption read");
 
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1413,7 +1506,7 @@ async fn mysql_write_overlay_is_ordered_and_read_your_writes() {
         "overlay",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1601,7 +1694,10 @@ async fn mysql_write_overlay_is_ordered_and_read_your_writes() {
     );
     reader.abort().await.expect("abort persisted read");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1611,7 +1707,7 @@ async fn mysql_write_provisional_versions_are_stable_and_operation_specific() {
         "versions",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1659,7 +1755,10 @@ async fn mysql_write_provisional_versions_are_stable_and_operation_specific() {
     assert_ne!(first.version, second.version);
     writer.abort().await.expect("abort provisional versions");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1669,7 +1768,7 @@ async fn mysql_write_freezes_mutation_after_range_pagination() {
         "freeze",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1716,7 +1815,10 @@ async fn mysql_write_freezes_mutation_after_range_pagination() {
     );
     writer.abort().await.expect("abort frozen writer");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1726,7 +1828,7 @@ async fn mysql_write_abort_rolls_back_without_durable_artifacts() {
         "abort",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1748,7 +1850,10 @@ async fn mysql_write_abort_rolls_back_without_durable_artifacts() {
     assert!(reader.get(&item).await.expect("post-abort get").is_none());
     reader.abort().await.expect("abort post-abort read");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1758,8 +1863,8 @@ async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
         "budget",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
-    let store = open_state_store(
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_mysql_store(
         &runtime,
         transaction_store_config(
             &database.name,
@@ -1806,7 +1911,10 @@ async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
     );
     assert_committed(writer.commit().await);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -1817,9 +1925,9 @@ async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
         "envelope",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let envelope = MysqlWriteTestApi::transaction_envelope_bytes();
-    let under = open_state_store(
+    let under = open_mysql_store(
         &runtime,
         transaction_store_config(
             &database.name,
@@ -1846,7 +1954,7 @@ async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
     assert_eq!(MysqlStatementTestApi::statement_count(), before);
     drop(under);
 
-    let exact = open_state_store(
+    let exact = open_mysql_store(
         &runtime,
         transaction_store_config(
             &database.name,
@@ -1867,7 +1975,10 @@ async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
         .expect("exact fixed envelope begins");
     assert_committed(writer.commit().await);
     drop(exact);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -1878,7 +1989,7 @@ async fn mysql_write_budget_accepts_exact_mutation_and_rejects_plus_one_before_i
         "mutation_budget",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let item = b"exact-mutation";
     let exact_value = vec![0x41; 16];
     let exact_budget = MysqlWriteTestApi::transaction_envelope_bytes()
@@ -1886,7 +1997,7 @@ async fn mysql_write_budget_accepts_exact_mutation_and_rejects_plus_one_before_i
             .expect("exact put accounting");
 
     for (value_bytes, should_fit) in [(15_usize, true), (16, true), (17, false)] {
-        let store = open_state_store(
+        let store = open_mysql_store(
             &runtime,
             transaction_store_config(
                 &database.name,
@@ -1926,7 +2037,10 @@ async fn mysql_write_budget_accepts_exact_mutation_and_rejects_plus_one_before_i
         }
         drop(store);
     }
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1936,7 +2050,7 @@ async fn mysql_preconditions_stage_successfully_and_fail_only_at_commit() {
         "stage",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1981,14 +2095,17 @@ async fn mysql_preconditions_stage_successfully_and_fail_only_at_commit() {
         );
     }
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_shared_preconditions() {
     let database = TestDatabase::provision("mysql_shared_preconditions", "preconditions");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -1997,7 +2114,10 @@ async fn mysql_shared_preconditions() {
     state_store_conformance::preconditions(&factory).await;
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2007,7 +2127,7 @@ async fn mysql_shared_same_key_conflict_first_commit_does_not_wait_for_second_re
         "same_key",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2021,7 +2141,10 @@ async fn mysql_shared_same_key_conflict_first_commit_does_not_wait_for_second_re
     .expect("first same-key commit must not wait for second reader");
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2031,7 +2154,7 @@ async fn mysql_shared_write_skew_conflict_first_commit_does_not_wait_for_second_
         "write_skew",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2045,7 +2168,10 @@ async fn mysql_shared_write_skew_conflict_first_commit_does_not_wait_for_second_
     .expect("first write-skew commit must not wait for second reader");
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2055,7 +2181,7 @@ async fn mysql_shared_range_phantom_conflict_first_commit_does_not_wait_for_seco
         "phantom",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2069,7 +2195,10 @@ async fn mysql_shared_range_phantom_conflict_first_commit_does_not_wait_for_seco
     .expect("first phantom commit must not wait for second reader");
 
     drop(factory);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2079,7 +2208,7 @@ async fn mysql_point_occ_compares_presence_and_persisted_version_exactly() {
         "point_occ",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2149,7 +2278,10 @@ async fn mysql_point_occ_compares_presence_and_persisted_version_exactly() {
         CommitOutcome::Conflict(_)
     ));
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2159,7 +2291,7 @@ async fn mysql_range_observation_conflicts_on_any_revision_drift() {
         "range_drift",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2201,7 +2333,10 @@ async fn mysql_range_observation_conflicts_on_any_revision_drift() {
         CommitOutcome::Conflict(_)
     ));
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2211,7 +2346,7 @@ async fn mysql_range_observation_conflicts_on_unrelated_out_of_range_commit() {
         "unrelated",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2255,7 +2390,10 @@ async fn mysql_range_observation_conflicts_on_unrelated_out_of_range_commit() {
         CommitOutcome::Conflict(_)
     ));
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2263,7 +2401,7 @@ async fn mysql_touched_keys_lock_in_stable_byte_order() {
     let database =
         TestDatabase::provision("mysql_touched_keys_lock_in_stable_byte_order", "lock_order");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2324,7 +2462,10 @@ async fn mysql_touched_keys_lock_in_stable_byte_order() {
         expected_lock_order
     );
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2334,7 +2475,7 @@ async fn mysql_commit_replays_multiple_preconditions_in_call_order() {
         "replay",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2444,7 +2585,10 @@ async fn mysql_commit_replays_multiple_preconditions_in_call_order() {
         .await
         .expect("abort failed order verification");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2454,7 +2598,7 @@ async fn mysql_same_value_put_assigns_new_version_and_conflicts_stale_observer()
         "same_value",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2509,14 +2653,17 @@ async fn mysql_same_value_put_assigns_new_version_and_conflicts_stale_observer()
             if error.kind() == StateStoreErrorKind::Conflict
     ));
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_deadlock_1213_maps_to_conflict() {
     let database = TestDatabase::provision("mysql_deadlock_1213_maps_to_conflict", "deadlock");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2528,7 +2675,10 @@ async fn mysql_deadlock_1213_maps_to_conflict() {
     .await
     .expect("deadlock mapping");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2538,7 +2688,7 @@ async fn mysql_lock_timeout_1205_rolls_back_before_conflict() {
         "lock_timeout",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2583,7 +2733,10 @@ async fn mysql_lock_timeout_1205_rolls_back_before_conflict() {
     );
     reader.abort().await.expect("abort verification read");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -2595,7 +2748,7 @@ async fn mysql_statement_deadline_destroys_undrained_connection() {
     );
     let mut client = fixture_client_config();
     client.pool_max = 2;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 400)
         .await
         .expect("open MySQL transaction store");
@@ -2648,7 +2801,10 @@ async fn mysql_statement_deadline_destroys_undrained_connection() {
     );
     reader.abort().await.expect("abort verification read");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -2659,7 +2815,7 @@ async fn mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io() {
         "physical_boundary",
     );
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
@@ -2733,7 +2889,10 @@ async fn mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io() {
         .await
         .expect("abort oversized writer");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -2747,7 +2906,7 @@ async fn mysql_schema_cancellation_after_lock_is_safely_disposed() {
     client_config.pool_max = 1;
     let observer_client_config = client_config.clone();
     let runtime = std::sync::Arc::new(
-        StateStoreRuntime::mysql(client_config).expect("construct MySQL runtime"),
+        MysqlProviderTestHarness::boot(client_config).expect("construct MySQL runtime"),
     );
     let gate = arm_mysql_open_gate(&database.name, MysqlOpenGatePhase::AfterAdvisoryLock)
         .expect("arm advisory-lock cancellation gate");
@@ -2774,7 +2933,11 @@ async fn mysql_schema_cancellation_after_lock_is_safely_disposed() {
         "provider-owned open must remain alive after waiter cancellation"
     );
     let mut runtime = std::sync::Arc::try_unwrap(runtime).expect("sole runtime owner");
-    let mut shutdown = tokio::spawn(async move { runtime.shutdown().await });
+    let mut shutdown = tokio::spawn(async move {
+        runtime
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+    });
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
             .await
@@ -2791,7 +2954,7 @@ async fn mysql_schema_cancellation_after_lock_is_safely_disposed() {
         .expect("shutdown MySQL runtime");
 
     let mut observer =
-        StateStoreRuntime::mysql(observer_client_config).expect("construct observer runtime");
+        MysqlProviderTestHarness::boot(observer_client_config).expect("construct observer runtime");
     let replacement = active_readiness(&observer, &database.name, Duration::from_secs(4))
         .await
         .expect("readiness after cancelled advisory lock");
@@ -2802,7 +2965,7 @@ async fn mysql_schema_cancellation_after_lock_is_safely_disposed() {
             .expect("lock state after waiter cancellation")
     );
     observer
-        .shutdown()
+        .shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("shutdown observer runtime");
 }
@@ -2818,7 +2981,7 @@ async fn mysql_store_readiness_cancellation_after_start_is_safely_disposed() {
     client_config.pool_max = 1;
     let observer_client_config = client_config.clone();
     let runtime = std::sync::Arc::new(
-        StateStoreRuntime::mysql(client_config).expect("construct MySQL runtime"),
+        MysqlProviderTestHarness::boot(client_config).expect("construct MySQL runtime"),
     );
     let gate = arm_mysql_open_gate(&database.name, MysqlOpenGatePhase::AfterReadOnlyStart)
         .expect("arm transaction cancellation gate");
@@ -2845,7 +3008,11 @@ async fn mysql_store_readiness_cancellation_after_start_is_safely_disposed() {
         "provider-owned readiness must remain alive after waiter cancellation"
     );
     let mut runtime = std::sync::Arc::try_unwrap(runtime).expect("sole runtime owner");
-    let mut shutdown = tokio::spawn(async move { runtime.shutdown().await });
+    let mut shutdown = tokio::spawn(async move {
+        runtime
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+    });
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
             .await
@@ -2862,13 +3029,13 @@ async fn mysql_store_readiness_cancellation_after_start_is_safely_disposed() {
         .expect("shutdown MySQL runtime");
 
     let mut observer =
-        StateStoreRuntime::mysql(observer_client_config).expect("construct observer runtime");
+        MysqlProviderTestHarness::boot(observer_client_config).expect("construct observer runtime");
     let replacement = active_readiness(&observer, &database.name, Duration::from_secs(4))
         .await
         .expect("readiness after cancelled transaction");
     assert_ne!(replacement.connection_id, original_connection_id);
     observer
-        .shutdown()
+        .shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("shutdown observer runtime");
 }
@@ -2877,38 +3044,44 @@ async fn mysql_store_readiness_cancellation_after_start_is_safely_disposed() {
 async fn run_task6_change_case(test_name: &str, scenario: &str) {
     let database = TestDatabase::provision(test_name, scenario);
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
     MysqlChangeTestApi::run_scenario(&runtime, &database.name, store, scenario)
         .await
         .expect("run MySQL change scenario");
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
 async fn run_task6_commit_case(test_name: &str, scenario: &str) {
     let database = TestDatabase::provision(test_name, scenario);
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
     MysqlCommitTestApi::run_scenario(&mut runtime, &database.name, store, scenario)
         .await
         .expect("run MySQL commit scenario");
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
 async fn open_task6_shared_fixture(
     test_name: &str,
     suffix: &str,
-) -> (TestDatabase, StateStoreRuntime, Arc<dyn StateStore>) {
+) -> (TestDatabase, MysqlProviderTestHarness, Arc<dyn StateStore>) {
     let database = TestDatabase::provision(test_name, suffix);
     let runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -2925,7 +3098,7 @@ async fn mysql_commit_progresses_with_single_connection_pool() {
     let mut client = fixture_client_config();
     client.pool_min = 1;
     client.pool_max = 1;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -2961,7 +3134,10 @@ async fn mysql_commit_progresses_with_single_connection_pool() {
         .await
         .expect("abort single-connection verification read");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -2969,7 +3145,7 @@ async fn mysql_commit_progresses_with_single_connection_pool() {
 async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
     let database = TestDatabase::provision("task6_predispatch_deadline", "predispatch_deadline");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 600)
         .await
         .expect("open MySQL state store");
@@ -3013,7 +3189,10 @@ async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
         novarocks_spi::state_store::CommitResolution::NotCommitted
     );
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3025,7 +3204,7 @@ async fn assert_prepare_failure_terminalizes_after_rollback_failure(
     let mut client = fixture_client_config();
     client.pool_min = 1;
     client.pool_max = 2;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -3067,7 +3246,10 @@ async fn assert_prepare_failure_terminalizes_after_rollback_failure(
         .connection_id;
     assert_ne!(replacement, failed_connection);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3097,7 +3279,7 @@ async fn mysql_prepare_error_reports_unknown_when_terminalization_cannot_checkou
     let mut client = fixture_client_config();
     client.pool_min = 1;
     client.pool_max = 1;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -3136,7 +3318,10 @@ async fn mysql_prepare_error_reports_unknown_when_terminalization_cannot_checkou
         novarocks_spi::state_store::CommitResolution::Unresolved
     );
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3146,7 +3331,7 @@ async fn mysql_prepare_error_terminalization_timeout_destroys_locked_connection(
     let mut client = fixture_client_config();
     client.pool_min = 1;
     client.pool_max = 2;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -3226,7 +3411,10 @@ async fn mysql_prepare_error_terminalization_timeout_destroys_locked_connection(
         "timed-out terminalization connection must be explicitly destroyed"
     );
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3234,7 +3422,7 @@ async fn mysql_prepare_error_terminalization_timeout_destroys_locked_connection(
 async fn mysql_prepare_error_prefers_authoritative_committed_receipt() {
     let database = TestDatabase::provision("prepare_committed_precedence", "committed");
     let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -3277,7 +3465,10 @@ async fn mysql_prepare_error_prefers_authoritative_committed_receipt() {
         novarocks_spi::state_store::CommitResolution::Committed(_)
     ));
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3287,7 +3478,7 @@ async fn mysql_auxiliary_statement_timeout_destroys_connection() {
     let mut client = fixture_client_config();
     client.pool_min = 1;
     client.pool_max = 1;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -3301,7 +3492,10 @@ async fn mysql_auxiliary_statement_timeout_destroys_connection() {
         .connection_id;
     assert_ne!(replacement, timed_out_connection);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3311,7 +3505,7 @@ async fn mysql_auxiliary_native_error_rolls_back_active_transaction() {
     let mut client = fixture_client_config();
     client.pool_min = 1;
     client.pool_max = 1;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
@@ -3319,7 +3513,10 @@ async fn mysql_auxiliary_native_error_rolls_back_active_transaction() {
         .await
         .expect("rollback active auxiliary transaction after native error");
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3329,7 +3526,7 @@ async fn mysql_change_poll_cancellation_destroys_active_connection_and_holds_gua
     let mut client = fixture_client_config();
     client.pool_min = 1;
     client.pool_max = 1;
-    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(client).expect("construct MySQL runtime");
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 500)
         .await
         .expect("open MySQL state store");
@@ -3356,7 +3553,7 @@ async fn mysql_change_poll_cancellation_destroys_active_connection_and_holds_gua
     drop(store);
 
     let shutdown_error = runtime
-        .shutdown_with_timeout(Duration::from_millis(100))
+        .shutdown(Instant::now() + Duration::from_millis(100))
         .await
         .expect_err("provider-owned poll must keep shutdown waiting");
     assert_eq!(shutdown_error.kind(), StateStoreErrorKind::DeadlineExceeded);
@@ -3366,7 +3563,10 @@ async fn mysql_change_poll_cancellation_destroys_active_connection_and_holds_gua
         .expect("read replacement connection id")
         .connection_id;
     assert_ne!(replacement, original_connection);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3378,7 +3578,10 @@ async fn mysql_shared_same_revision_change_pages() {
     state_store_conformance::same_revision_change_pages(&factory).await;
     drop(factory);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3390,7 +3593,10 @@ async fn mysql_shared_atomic_commit() {
     state_store_conformance::atomic_commit(&factory).await;
     drop(factory);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3402,7 +3608,10 @@ async fn mysql_shared_notification_delivery_faults() {
     state_store_conformance::notification_delivery_faults(&factory).await;
     drop(factory);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3414,7 +3623,10 @@ async fn mysql_shared_post_dispatch_response_loss_reconciles() {
     state_store_conformance::post_dispatch_response_loss_reconciles(&factory).await;
     drop(factory);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -3426,14 +3638,17 @@ async fn mysql_shared_post_dispatch_cancel_waiter_reconciles() {
     state_store_conformance::post_dispatch_cancel_waiter_reconciles(&factory).await;
     drop(factory);
     drop(store);
-    runtime.shutdown().await.expect("shutdown MySQL runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_suite() {
     let runtime = Rc::new(
-        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime"),
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime"),
     );
     let databases = Rc::new(RefCell::new(Vec::new()));
     let factory = mysql_conformance_factory(Rc::clone(&runtime), Rc::clone(&databases));
@@ -3443,7 +3658,7 @@ async fn mysql_suite() {
     drop(factory);
     let mut runtime = Rc::try_unwrap(runtime).expect("all MySQL conformance handles drained");
     runtime
-        .shutdown()
+        .shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("shutdown MySQL conformance runtime");
     drop(databases);

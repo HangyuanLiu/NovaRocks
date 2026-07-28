@@ -27,10 +27,13 @@ pub mod helper_protocol;
 pub(crate) mod identity;
 #[cfg(feature = "state-store-test-hooks")]
 pub(crate) mod open_test_hooks;
+pub(crate) mod provider;
 pub(crate) mod range;
+pub(crate) mod runtime;
 pub(crate) mod schema;
 pub(crate) mod txn;
 
+#[cfg(feature = "state-store-test-hooks")]
 #[doc(hidden)]
 pub mod test_support;
 
@@ -47,8 +50,9 @@ use novarocks_spi::state_store::{
     WriteTransaction,
 };
 
+use self::runtime::MysqlProviderHandle;
 use super::metrics::StateStoreMetrics;
-use super::runtime::MysqlProviderHandle;
+use super::provider::MYSQL_STATE_STORE_PROVIDER_ID;
 
 pub(super) struct MysqlStateStore {
     lease: MysqlProviderHandle,
@@ -63,7 +67,7 @@ pub(super) struct MysqlOpenCancellation {
 }
 
 impl MysqlStateStore {
-    pub(super) async fn open(
+    async fn open(
         lease: MysqlProviderHandle,
         database: String,
         cluster_id: String,
@@ -93,7 +97,7 @@ impl MysqlStateStore {
             lease,
             identity,
             limits,
-            metrics: Arc::new(StateStoreMetrics::new("mysql")),
+            metrics: Arc::new(StateStoreMetrics::new(MYSQL_STATE_STORE_PROVIDER_ID)),
         })
     }
 }
@@ -122,10 +126,6 @@ impl MysqlOpenCancellation {
 
 #[async_trait]
 impl StateStore for MysqlStateStore {
-    fn provider_name(&self) -> &'static str {
-        "mysql"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }

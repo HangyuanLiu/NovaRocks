@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
 use bytes::Bytes;
@@ -26,10 +27,10 @@ use novarocks::engine::view::{
     ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };
 use novarocks_frontend::FrontendViewService;
-use novarocks_spi::state_store::StateStore;
+use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::{
-    FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    StateStoreRuntime, open_state_store,
+    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use sqlparser::ast::{DataType, Query, Statement};
 use sqlparser::parser::Parser;
@@ -237,25 +238,36 @@ fn query_rows_at(
         .collect()
 }
 
-async fn open_sqlite_store(path: &std::path::Path) -> std::sync::Arc<dyn StateStore> {
-    let runtime = StateStoreRuntime::local().unwrap();
-    open_state_store(
-        &runtime,
-        StateStoreConfig {
-            cluster_id: "view-service-test".to_string(),
-            limits: StateStoreLimitOverrides::default(),
-            provider: StateStoreProviderConfig::Sqlite {
-                path: path.to_path_buf(),
-                deployment_owner: "view-service-fe".to_string(),
+async fn open_sqlite_store(
+    path: &std::path::Path,
+) -> (StateStoreHost, std::sync::Arc<dyn StateStore>) {
+    let registry = builtin_state_store_provider_registry().unwrap();
+    let host = StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: StateStoreConfig {
+                    cluster_id: "view-service-test".to_string(),
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: path.to_path_buf(),
+                        deployment_owner: "view-service-fe".to_string(),
+                    },
+                },
+                mysql_client: None,
             },
+            foundationdb_client: None,
         },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).unwrap(),
             topology_revision: Bytes::from_static(b"view-service-topology"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
-    .unwrap()
+    .unwrap();
+    let store = host.state_store().unwrap();
+    (host, store)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -756,7 +768,7 @@ async fn dropping_external_database_does_not_remove_default_catalog_views() {
 #[tokio::test(flavor = "multi_thread")]
 async fn configured_service_restores_durable_views_and_never_publishes_failed_replace() {
     let temp = TempDir::new().unwrap();
-    let store = open_sqlite_store(&temp.path().join("state.sqlite")).await;
+    let (_host, store) = open_sqlite_store(&temp.path().join("state.sqlite")).await;
     let service = FrontendViewService::open(
         Some(std::sync::Arc::clone(&store)),
         tokio::runtime::Handle::current(),
@@ -802,7 +814,7 @@ async fn configured_service_restores_durable_views_and_never_publishes_failed_re
 #[tokio::test(flavor = "multi_thread")]
 async fn starrocks_view_sql_uses_the_same_parser_before_and_after_restart() {
     let temp = TempDir::new().unwrap();
-    let store = open_sqlite_store(&temp.path().join("state.sqlite")).await;
+    let (_host, store) = open_sqlite_store(&temp.path().join("state.sqlite")).await;
     let service = FrontendViewService::open(
         Some(std::sync::Arc::clone(&store)),
         tokio::runtime::Handle::current(),

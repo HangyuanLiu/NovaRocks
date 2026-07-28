@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 pub mod config;
 pub mod coordination;
-mod deployment;
+mod host;
+pub mod host_error;
 pub mod limits;
 pub mod metrics;
+pub mod provider;
 pub mod runner;
-mod runtime;
-
-use novarocks_spi::state_store::{StateStore, StateStoreError, StateStoreErrorKind};
 
 mod sqlite;
 
@@ -37,48 +34,23 @@ pub mod mysql;
 
 #[cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
 #[doc(hidden)]
+pub use foundationdb::provider::FoundationDbProviderTestHarness;
+#[cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
+#[doc(hidden)]
 pub use foundationdb::test_support::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
 
 pub use config::{
     FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
-    StateStoreConfig, StateStoreProviderConfig,
+    StateStoreConfig, StateStoreHostConfig, StateStoreProviderConfig,
 };
-pub use deployment::FeDeploymentView;
+pub use host::{StateStoreHost, StateStoreHostLifecycle};
+pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
 pub use limits::StateStoreLimitOverrides;
+pub use provider::{
+    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MYSQL_STATE_STORE_PROVIDER_ID,
+    SQLITE_STATE_STORE_PROVIDER_ID, StateStoreProviderRegistration, StateStoreProviderRegistry,
+    builtin_state_store_provider_registry,
+};
 pub use runner::{
     OperationId, RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free,
 };
-pub use runtime::StateStoreRuntime;
-
-pub async fn open_state_store(
-    runtime: &StateStoreRuntime,
-    config: StateStoreConfig,
-    deployment: FeDeploymentView,
-) -> Result<Arc<dyn StateStore>, StateStoreError> {
-    match &config.provider {
-        StateStoreProviderConfig::Sqlite { .. } => {
-            runtime.accepts_local()?;
-            Ok(Arc::new(
-                sqlite::SqliteStateStore::open(config, deployment).await?,
-            ))
-        }
-        StateStoreProviderConfig::Foundationdb { .. } => {
-            #[cfg(not(feature = "foundationdb-provider"))]
-            return Err(StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "FoundationDB provider is not compiled in",
-            ));
-            #[cfg(feature = "foundationdb-provider")]
-            return runtime.open_foundationdb_store(&config).await;
-        }
-        StateStoreProviderConfig::Mysql { .. } => {
-            #[cfg(not(feature = "mysql-state-store-provider"))]
-            return Err(StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "MySQL provider is not compiled in",
-            ));
-            #[cfg(feature = "mysql-state-store-provider")]
-            return runtime.open_mysql_store(&config, deployment).await;
-        }
-    }
-}

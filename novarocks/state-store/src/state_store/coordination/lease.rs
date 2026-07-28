@@ -1461,9 +1461,12 @@ mod tests {
     use novarocks_spi::state_store::{
         ChangePage, ChangePollRequest, CommitResolution, Key, RangePage, RangeRequest,
         ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
-        StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId, VersionToken,
-        WriteTransaction,
+        StateStoreLimits, StateStoreMetricsSnapshot, StateStoreProviderId, StoreIdentity,
+        TransactionId, VersionToken, WriteTransaction,
     };
+
+    const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
+        StateStoreProviderId::new("coordination-test");
 
     struct FixedClock {
         wall_readable: bool,
@@ -1557,17 +1560,13 @@ mod tests {
                 identity,
                 control,
                 begin_writes: AtomicUsize::new(0),
-                metrics: StateStoreMetrics::new("coordination-test"),
+                metrics: StateStoreMetrics::new(TEST_STATE_STORE_PROVIDER_ID),
             })
         }
     }
 
     #[async_trait]
     impl StateStore for CountingStore {
-        fn provider_name(&self) -> &'static str {
-            "coordination-test"
-        }
-
         fn limits(&self) -> &StateStoreLimits {
             &self.limits
         }

@@ -72,15 +72,16 @@ impl fmt::Debug for ViewRepository {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ViewRepository")
-            .field("provider", &self.store.provider_name())
+            .field("provider", &self.metrics.provider())
             .finish_non_exhaustive()
     }
 }
 
 impl ViewRepository {
     pub async fn open(store: Arc<dyn StateStore>, runtime: Handle) -> Result<Self, String> {
+        let provider_id = store.metrics_snapshot().provider;
         let repository = Self {
-            metrics: Arc::new(StateStoreMetrics::new(store.provider_name())),
+            metrics: Arc::new(StateStoreMetrics::new(provider_id)),
             store,
             runtime,
         };

@@ -20,7 +20,8 @@ use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use novarocks_state_store::{FeDeploymentView, StateStoreConfig, StateStoreProviderConfig};
+use novarocks_spi::state_store::FeDeploymentView;
+use novarocks_state_store::{StateStoreConfig, StateStoreProviderConfig};
 use sha2::{Digest, Sha256};
 
 const REVISION_DOMAIN: &[u8] = b"novarocks/fe-deployment-view/v1";

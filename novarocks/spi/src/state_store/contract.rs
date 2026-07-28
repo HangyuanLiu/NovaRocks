@@ -218,7 +218,6 @@ pub trait WriteTransaction: ReadTransaction {
 
 #[async_trait::async_trait]
 pub trait StateStore: Send + Sync {
-    fn provider_name(&self) -> &'static str;
     fn limits(&self) -> &StateStoreLimits;
     fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot;
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError>;

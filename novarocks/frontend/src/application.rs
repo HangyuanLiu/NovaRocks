@@ -17,18 +17,24 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use novarocks_spi::state_store::{StateStore, StateStoreError};
-use novarocks_state_store::{StateStoreAppConfig, StateStoreRuntime, open_state_store};
+use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
+use novarocks_state_store::{
+    StateStoreHost, StateStoreHostConfig, StateStoreHostError,
+    builtin_state_store_provider_registry,
+};
 
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::view::FrontendViewService;
 
+const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
-    RuntimeOpen,
-    StoreOpen,
+    StateStoreHost,
     ViewServiceOpen,
     Server,
     Shutdown,
@@ -73,18 +79,16 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
-    state_store: Option<Arc<dyn StateStore>>,
-    runtime: Option<StateStoreRuntime>,
+    state_store_host: Option<StateStoreHost>,
 }
 
 impl FrontendApplicationHost {
     pub async fn open(
-        config: Option<StateStoreAppConfig>,
+        config: Option<StateStoreHostConfig>,
     ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
             view_service: None,
-            state_store: None,
-            runtime: None,
+            state_store_host: None,
         };
 
         if let Some(config) = config {
@@ -92,8 +96,7 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
-        match FrontendViewService::open(host.state_store.clone(), tokio::runtime::Handle::current())
-            .await
+        match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
         {
             Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
             Err(error) => {
@@ -117,7 +120,15 @@ impl FrontendApplicationHost {
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
-        self.state_store.clone()
+        self.state_store_host
+            .as_ref()
+            .and_then(StateStoreHost::state_store)
+    }
+
+    pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
+        self.state_store_host
+            .as_ref()
+            .map(StateStoreHost::provider_id)
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
@@ -128,29 +139,31 @@ impl FrontendApplicationHost {
 
     async fn open_configured(
         &mut self,
-        config: StateStoreAppConfig,
+        config: StateStoreHostConfig,
     ) -> Result<(), FrontendApplicationError> {
-        let source = SqliteSingleFeDeploymentViewSource::try_from_state_store_config(&config.store)
-            .map_err(|error| {
-                FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
-            })?;
+        let source = SqliteSingleFeDeploymentViewSource::try_from_state_store_config(
+            &config.state_store.store,
+        )
+        .map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
+        })?;
         let deployment = source.snapshot().await.map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
         })?;
-
-        self.runtime = Some(StateStoreRuntime::local().map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::RuntimeOpen, error)
-        })?);
-        let runtime = self
-            .runtime
-            .as_ref()
-            .expect("runtime is installed before store open");
-        self.state_store = Some(
-            open_state_store(runtime, config.store, deployment)
-                .await
-                .map_err(|error| {
-                    FrontendApplicationError::new(FrontendApplicationErrorKind::StoreOpen, error)
-                })?,
+        let registry = builtin_state_store_provider_registry().map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, error)
+        })?;
+        self.state_store_host = Some(
+            StateStoreHost::open(
+                &registry,
+                config,
+                deployment,
+                Instant::now() + STATE_STORE_OPEN_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, error)
+            })?,
         );
 
         Ok(())
@@ -166,13 +179,116 @@ impl FrontendApplicationHost {
         }
     }
 
-    async fn release_resources(&mut self) -> Result<(), StateStoreError> {
+    async fn release_resources(&mut self) -> Result<(), StateStoreHostError> {
         self.view_service.take();
-        self.state_store.take();
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.shutdown().await
+        if let Some(host) = self.state_store_host.as_mut() {
+            host.shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+                .await?;
+            self.state_store_host.take();
+            Ok(())
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use novarocks_spi::state_store::{
+        FeDeploymentView, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
+        StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
+    };
+    use novarocks_state_store::{
+        SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
+        StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+        StateStoreProviderRegistration, StateStoreProviderRegistry,
+    };
+
+    use super::{FrontendApplicationError, FrontendApplicationErrorKind};
+
+    const SECRET_CONFIG_VALUE: &str = "client-secret-must-not-leak";
+    const DESCRIPTOR: StateStoreProviderDescriptor =
+        StateStoreProviderDescriptor::new(SQLITE_STATE_STORE_PROVIDER_ID);
+
+    struct FailingFactory;
+
+    #[async_trait]
+    impl StateStoreProviderFactory for FailingFactory {
+        fn descriptor(&self) -> &StateStoreProviderDescriptor {
+            &DESCRIPTOR
+        }
+
+        async fn open(
+            self: Box<Self>,
+            _request: StateStoreOpenRequest,
+        ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
+            Err(StateStoreError::new(
+                StateStoreErrorKind::Corruption,
+                "injected provider primary failure",
+            )
+            .with_cleanup_context(StateStoreError::new(
+                StateStoreErrorKind::DeadlineExceeded,
+                "injected provider cleanup failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn frontend_stringification_preserves_host_primary_and_cleanup_context() {
+        let temp = tempfile::tempdir().expect("temporary host diagnostics directory");
+        let mut registry = StateStoreProviderRegistry::new();
+        registry
+            .register(StateStoreProviderRegistration::available(
+                SQLITE_STATE_STORE_PROVIDER_ID,
+                novarocks_spi::state_store::MAX_KEY_BYTES,
+                |_| Ok(Box::new(FailingFactory)),
+            ))
+            .expect("register diagnostic provider");
+        let host_error = match StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "diagnostic-cluster".to_owned(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: temp.path().join("state-store.sqlite"),
+                            deployment_owner: SECRET_CONFIG_VALUE.to_owned(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).unwrap(),
+                topology_revision: Bytes::from_static(b"topology-r1"),
+            },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("injected provider failure must reject host open"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            host_error.primary().map(StateStoreError::kind),
+            Some(StateStoreErrorKind::Corruption)
+        );
+        let frontend_error =
+            FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, host_error);
+        let diagnostic = frontend_error.to_string();
+
+        assert!(diagnostic.contains("StateStoreHost"));
+        assert!(diagnostic.contains("Open (sqlite)"));
+        assert!(diagnostic.contains("injected provider primary failure"));
+        assert!(diagnostic.contains("injected provider cleanup failure"));
+        assert!(!diagnostic.contains(SECRET_CONFIG_VALUE));
     }
 }

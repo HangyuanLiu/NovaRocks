@@ -20,12 +20,12 @@ use std::time::Duration;
 
 use novarocks_spi::state_store::{
     STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetricsSnapshot,
-    StateStoreOperation, StateStoreOutcome,
+    StateStoreOperation, StateStoreOutcome, StateStoreProviderId,
 };
 
 #[derive(Debug)]
 pub struct StateStoreMetrics {
-    provider: &'static str,
+    provider: StateStoreProviderId,
     operation_outcomes: [[AtomicU64; STATE_STORE_OUTCOME_COUNT]; STATE_STORE_OPERATION_COUNT],
     operation_duration_micros: [AtomicU64; STATE_STORE_OPERATION_COUNT],
     operation_duration_observations: [AtomicU64; STATE_STORE_OPERATION_COUNT],
@@ -40,7 +40,7 @@ pub struct StateStoreMetrics {
 }
 
 impl StateStoreMetrics {
-    pub fn new(provider: &'static str) -> Self {
+    pub fn new(provider: StateStoreProviderId) -> Self {
         Self {
             provider,
             operation_outcomes: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
@@ -57,7 +57,7 @@ impl StateStoreMetrics {
         }
     }
 
-    pub const fn provider(&self) -> &'static str {
+    pub const fn provider(&self) -> StateStoreProviderId {
         self.provider
     }
 

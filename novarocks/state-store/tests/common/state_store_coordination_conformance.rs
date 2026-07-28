@@ -216,10 +216,6 @@ impl WriteTransaction for OneAcquireConflictTransaction {
 
 #[async_trait]
 impl StateStore for OneAcquireConflictStore {
-    fn provider_name(&self) -> &'static str {
-        self.inner.provider_name()
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         self.inner.limits()
     }
@@ -354,10 +350,6 @@ impl WriteTransaction for LeaseMutationRaceTransaction {
 
 #[async_trait]
 impl StateStore for LeaseMutationRaceStore {
-    fn provider_name(&self) -> &'static str {
-        self.inner.provider_name()
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         self.inner.limits()
     }
@@ -418,10 +410,6 @@ struct OpaqueProviderStore {
 
 #[async_trait]
 impl StateStore for OpaqueProviderStore {
-    fn provider_name(&self) -> &'static str {
-        "opaque-test-provider"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         self.inner.limits()
     }
@@ -3027,16 +3015,15 @@ pub async fn high_contention_is_monotonic(factory: &StateStoreFactory) {
     assert_eq!(second.token().resource_epoch().get(), 2);
 }
 
-pub async fn opaque_provider_name_has_no_branch(factory: &StateStoreFactory) {
+pub async fn provider_independent_coordination_has_no_identity_branch(factory: &StateStoreFactory) {
     let fixture = open_fixture(factory).await;
     let store: Arc<dyn StateStore> = Arc::new(OpaqueProviderStore {
         inner: Arc::clone(&fixture.store),
     });
-    assert_eq!(store.provider_name(), "opaque-test-provider");
     IncarnationGate::new(Arc::clone(&store))
         .bootstrap(OperationId::new_v7())
         .await
-        .expect("bootstrap through opaque provider name");
+        .expect("bootstrap without provider identity branch");
     let manager = LeaseManager::new(
         store,
         holder(b"opaque-provider-holder"),
@@ -3085,5 +3072,5 @@ pub async fn run_coordination_conformance(factory: StateStoreFactory) {
     restore_invalidates_old_tokens(&factory).await;
     overflow_and_corruption_fail_closed(&factory).await;
     high_contention_is_monotonic(&factory).await;
-    opaque_provider_name_has_no_branch(&factory).await;
+    provider_independent_coordination_has_no_identity_branch(&factory).await;
 }

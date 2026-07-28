@@ -24,6 +24,7 @@ use std::task::{Context, Poll, Waker};
 use novarocks_frontend::deployment::{
     FeDeploymentViewSource, FeDeploymentViewSourceErrorKind, SqliteSingleFeDeploymentViewSource,
 };
+use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig};
 
 const EXPECTED_REVISION_HEX: &str =
@@ -73,7 +74,8 @@ fn sqlite_source(cluster_id: &str, deployment_owner: &str) -> SqliteSingleFeDepl
 fn trait_object_source_is_callable() {
     let source: Arc<dyn FeDeploymentViewSource> = Arc::new(sqlite_source("cluster-a", "fe-a"));
 
-    let snapshot = ready(source.snapshot()).expect("trait object snapshot must succeed");
+    let snapshot: FeDeploymentView =
+        ready(source.snapshot()).expect("trait object snapshot must succeed");
 
     assert_eq!(snapshot.active_fe_count, NonZeroUsize::new(1).unwrap());
 }

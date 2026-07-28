@@ -1835,13 +1835,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::state_store::StateStoreLimitOverrides;
+    use crate::state_store::limits::resolve_state_store_limits;
     use crate::state_store::sqlite::SqliteStateStore;
-    use crate::state_store::{
-        FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    };
     use novarocks_spi::state_store::{
         CommitOutcome, CommitReceipt, CommitResolution, Direction, Key, KeyRange, Precondition,
-        RangeRequest, StateRecord, StateStoreErrorKind, TransactionId, Value, VersionToken,
+        RangeRequest, StateRecord, StateStoreErrorKind, StateStoreOpenRequest, TransactionId,
+        Value, VersionToken,
     };
 
     fn key(value: &'static [u8]) -> Key {
@@ -1866,17 +1866,20 @@ mod tests {
     ) -> Arc<SqliteStateStore> {
         Arc::new(
             SqliteStateStore::open(
-                StateStoreConfig {
+                temp.path().join("state-store.sqlite"),
+                "fe-a".to_owned(),
+                StateStoreOpenRequest {
                     cluster_id: "cluster-a".to_owned(),
-                    limits,
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path: temp.path().join("state-store.sqlite"),
-                        deployment_owner: "fe-a".to_owned(),
+                    limits: resolve_state_store_limits(
+                        &limits,
+                        novarocks_spi::state_store::MAX_KEY_BYTES,
+                    )
+                    .expect("resolve SQLite test limits"),
+                    deployment: novarocks_spi::state_store::FeDeploymentView {
+                        active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+                        topology_revision: Bytes::from_static(b"topology-r1"),
                     },
-                },
-                FeDeploymentView {
-                    active_fe_count: NonZeroUsize::new(1).expect("one FE"),
-                    topology_revision: Bytes::from_static(b"topology-r1"),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
                 },
             )
             .await

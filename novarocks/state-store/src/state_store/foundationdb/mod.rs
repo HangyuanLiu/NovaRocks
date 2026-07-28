@@ -20,7 +20,9 @@ mod changes;
 mod codec;
 mod commit;
 mod identity;
+pub(crate) mod provider;
 mod range;
+mod runtime;
 #[cfg(feature = "state-store-test-hooks")]
 pub(super) mod test_support;
 mod txn;
@@ -38,8 +40,9 @@ use novarocks_spi::state_store::{
     WriteTransaction,
 };
 
+use self::runtime::ProviderHandle;
 use super::metrics::StateStoreMetrics;
-use super::runtime::ProviderHandle;
+use super::provider::FOUNDATIONDB_STATE_STORE_PROVIDER_ID;
 
 pub(super) struct FoundationDbStateStore {
     lease: ProviderHandle,
@@ -88,7 +91,7 @@ fn classify_native_read_error(error: FdbError) -> StateStoreError {
 }
 
 impl FoundationDbStateStore {
-    pub async fn open(
+    async fn open(
         lease: ProviderHandle,
         limits: StateStoreLimits,
         cluster_id: String,
@@ -110,17 +113,13 @@ impl FoundationDbStateStore {
             codec,
             identity,
             limits,
-            metrics: Arc::new(StateStoreMetrics::new("foundationdb")),
+            metrics: Arc::new(StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID)),
         })
     }
 }
 
 #[async_trait]
 impl StateStore for FoundationDbStateStore {
-    fn provider_name(&self) -> &'static str {
-        "foundationdb"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }
@@ -220,7 +219,7 @@ mod tests {
             None
         );
 
-        let metrics = StateStoreMetrics::new("foundationdb");
+        let metrics = StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID);
         record_provider_error_metric(
             &metrics,
             &StateStoreError::new(StateStoreErrorKind::DeadlineExceeded, "deadline"),

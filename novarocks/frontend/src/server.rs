@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use novarocks::common::app_config::NovaRocksConfig;
-use novarocks_state_store::StateStoreAppConfig;
+use novarocks_state_store::StateStoreHostConfig;
 
 use crate::{FrontendApplicationError, FrontendApplicationHost};
 
@@ -166,7 +166,7 @@ async fn run_frontend_server_until_shutdown_with_ports<
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
-    OpenHost: FnOnce(Option<StateStoreAppConfig>) -> OpenHostFuture,
+    OpenHost: FnOnce(Option<StateStoreHostConfig>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
     Serve: FnOnce(FrontendServerConfig, Service, F) -> ServeFuture,
@@ -174,7 +174,8 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let host = open_host(config.config.state_store.clone()).await?;
+    let state_store_host_config = state_store_host_config(&config.config);
+    let host = open_host(state_store_host_config).await?;
     let service = extract_service(&host);
     let server_result = serve(config, service, shutdown).await;
     let shutdown_result = shutdown_host(host).await;
@@ -205,7 +206,7 @@ async fn run_frontend_server_with_signal_and_ports<
 where
     S: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    OpenHost: FnOnce(Option<StateStoreAppConfig>) -> OpenHostFuture,
+    OpenHost: FnOnce(Option<StateStoreHostConfig>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
     Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
@@ -213,12 +214,23 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let host = open_host(config.config.state_store.clone()).await?;
+    let state_store_host_config = state_store_host_config(&config.config);
+    let host = open_host(state_store_host_config).await?;
     let service = extract_service(&host);
     let server_result = run_server_until_signal(config, service, signal, serve).await;
     let shutdown_result = shutdown_host(host).await;
 
     combine_server_and_shutdown(server_result, shutdown_result)
+}
+
+fn state_store_host_config(config: &NovaRocksConfig) -> Option<StateStoreHostConfig> {
+    config
+        .state_store
+        .clone()
+        .map(|state_store| StateStoreHostConfig {
+            state_store,
+            foundationdb_client: config.foundationdb_client.clone(),
+        })
 }
 
 fn combine_server_and_shutdown(
@@ -318,6 +330,11 @@ mod tests {
         run_frontend_server_with_signal_and_ports,
     };
     use crate::{FrontendApplicationError, FrontendApplicationErrorKind};
+    use novarocks_state_store::{
+        FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
+        StateStoreLimitOverrides, StateStoreProviderConfig,
+    };
+    use uuid::Uuid;
 
     #[derive(Debug)]
     struct RecordingHostPort;
@@ -572,5 +589,62 @@ mod tests {
 
         assert_eq!(error.kind(), FrontendApplicationErrorKind::ViewServiceOpen);
         assert!(!server_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn full_process_config_pairs_foundationdb_client_with_state_store_for_host() {
+        let cluster_file = tempfile::NamedTempFile::new().expect("FoundationDB cluster file");
+        let mut config = frontend_config();
+        config.config.state_store = Some(StateStoreAppConfig {
+            store: StateStoreConfig {
+                cluster_id: "frontend-cluster".to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Foundationdb {
+                    cluster_file: cluster_file.path().to_path_buf(),
+                    keyspace_id: Uuid::nil(),
+                },
+            },
+            mysql_client: None,
+        });
+        let foundationdb_client = FoundationDbClientConfig {
+            disable_multi_version_client: true,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            tls_verify_peers: None,
+            tls_password_env: None,
+        };
+        config.config.foundationdb_client = Some(foundationdb_client.clone());
+        let captured = Arc::new(Mutex::new(None::<StateStoreHostConfig>));
+        let captured_in_port = Arc::clone(&captured);
+
+        run_frontend_server_until_shutdown_with_ports(
+            config,
+            async {},
+            move |host_config| {
+                *captured_in_port.lock().expect("captured config lock") = host_config;
+                async { Ok(RecordingHostPort) }
+            },
+            |_| (),
+            |_, (), shutdown| async move {
+                shutdown.await;
+                Ok(())
+            },
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("frontend orchestration should succeed");
+
+        let captured = captured
+            .lock()
+            .expect("captured config lock")
+            .clone()
+            .expect("state store host config");
+        assert!(matches!(
+            captured.state_store.store.provider,
+            StateStoreProviderConfig::Foundationdb { cluster_file: ref path, keyspace_id }
+                if path == cluster_file.path() && keyspace_id == Uuid::nil()
+        ));
+        assert_eq!(captured.foundationdb_client, Some(foundationdb_client));
     }
 }

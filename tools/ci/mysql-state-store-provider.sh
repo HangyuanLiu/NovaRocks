@@ -84,7 +84,7 @@ cleanup_probe_db
 export NOVAROCKS_MYSQL_DATABASE="$READINESS_DB"
 trap - EXIT
 
-cargo test -p novarocks-state-store --features mysql-state-store-provider --test state_store_mysql_runtime -- --nocapture --test-threads=1
+cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql_runtime -- --nocapture --test-threads=1
 cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | \
   awk '$1 == "mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io:" { n++ } END { exit(n != 1) }'
 cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks \
