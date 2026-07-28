@@ -596,3 +596,107 @@ fn histogram_multi_column_and_status_queries_preserve_compatibility_rows() {
         ]
     );
 }
+
+#[test]
+fn compatibility_overwrite_table_appends_one_row_after_initial_seed_and_reseeds_on_overwrite() {
+    let service = FrontendStatisticsService::new();
+    let engine = FakeStatisticsEngine::with_local_columns(vec![StatisticsColumn {
+        name: "k1".to_string(),
+        data_type: DataType::Int64,
+    }]);
+    let source = StatisticsInsertSource::Values(vec![vec![StatisticsLiteral::Int(123)]]);
+
+    for expected in [3, 4] {
+        service
+            .observe_insert(
+                &engine,
+                StatisticsInsertObservation {
+                    database: "db1",
+                    table: "test_overwrite_stats_table",
+                    insert_columns: &[],
+                    source: &source,
+                    overwrite_mode: StatisticsOverwriteMode::Append,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            compatibility_overwrite_row_count(&service),
+            expected,
+            "append must seed three compatibility rows only once"
+        );
+    }
+
+    service
+        .observe_insert(
+            &engine,
+            StatisticsInsertObservation {
+                database: "db1",
+                table: "test_overwrite_stats_table",
+                insert_columns: &[],
+                source: &source,
+                overwrite_mode: StatisticsOverwriteMode::FullTable,
+            },
+        )
+        .unwrap();
+    assert_eq!(compatibility_overwrite_row_count(&service), 3);
+}
+
+fn compatibility_overwrite_row_count(service: &FrontendStatisticsService) -> usize {
+    let sql = "SELECT count(*) FROM _statistics_.column_statistics \
+               WHERE table_name = 'db1.test_overwrite_stats_table'";
+    let result = service
+        .try_query(
+            sql,
+            &parse_query(sql),
+            StatisticsRequestContext {
+                current_catalog: None,
+                current_database: "db1",
+            },
+        )
+        .unwrap()
+        .unwrap();
+    string_rows(&result)[0][0].parse().unwrap()
+}
+
+#[test]
+fn cte_name_shadows_a_physical_table_in_outer_query_usage() {
+    let service = FrontendStatisticsService::new();
+    let query = parse_query(
+        "WITH shadowed AS (SELECT source.k FROM source WHERE source.k > 0) \
+         SELECT shadowed.k FROM shadowed \
+         JOIN physical ON shadowed.k = physical.k \
+         WHERE physical.v > 1",
+    );
+    service.observe_query(&query, "db1").unwrap();
+
+    let sql = "SELECT table_name, column_name, usage \
+               FROM information_schema.column_stats_usage \
+               WHERE table_database = 'db1' ORDER BY column_name";
+    let rows = service
+        .try_query(
+            sql,
+            &parse_query(sql),
+            StatisticsRequestContext {
+                current_catalog: None,
+                current_database: "db1",
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        string_rows(&rows),
+        vec![
+            vec!["physical".to_string(), "k".to_string(), "join".to_string()],
+            vec![
+                "source".to_string(),
+                "k".to_string(),
+                "predicate".to_string(),
+            ],
+            vec![
+                "physical".to_string(),
+                "v".to_string(),
+                "predicate".to_string(),
+            ],
+        ]
+    );
+}

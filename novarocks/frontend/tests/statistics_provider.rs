@@ -1,7 +1,8 @@
 use arrow::datatypes::DataType;
 use novarocks::engine::statistics::{
-    StatisticsColumn, StatisticsEngine, StatisticsInsertObservation, StatisticsInsertSource,
-    StatisticsLiteral, StatisticsOverwriteMode, StatisticsService, StatisticsTableTarget,
+    CollectedColumnStatistics, StatisticsColumn, StatisticsEngine, StatisticsInsertObservation,
+    StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode, StatisticsRequestContext,
+    StatisticsService, StatisticsTableTarget,
 };
 use novarocks_frontend::FrontendStatisticsService;
 
@@ -78,4 +79,92 @@ fn catalog_provider_returns_owned_rows_and_none_for_missing_table() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn catalog_provider_preserves_nonnumeric_bounds_and_invalid_ndv_rows() {
+    struct CollectedRowsEngine {
+        rows: Vec<CollectedColumnStatistics>,
+    }
+
+    impl StatisticsEngine for CollectedRowsEngine {
+        fn resolve_table_columns(
+            &self,
+            _target: &StatisticsTableTarget,
+        ) -> Result<Vec<StatisticsColumn>, String> {
+            Ok(self
+                .rows
+                .iter()
+                .map(|row| StatisticsColumn {
+                    name: row.column_name.clone(),
+                    data_type: DataType::Utf8,
+                })
+                .collect())
+        }
+
+        fn resolve_local_table_columns(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<Vec<StatisticsColumn>>, String> {
+            Ok(None)
+        }
+
+        fn collect_table_statistics(
+            &self,
+            _target: &StatisticsTableTarget,
+            _columns: &[String],
+        ) -> Result<Vec<CollectedColumnStatistics>, String> {
+            Ok(self.rows.clone())
+        }
+    }
+
+    let service = FrontendStatisticsService::new();
+    let engine = CollectedRowsEngine {
+        rows: vec![
+            CollectedColumnStatistics {
+                column_name: "payload".to_string(),
+                row_count: 3,
+                min: "ten".to_string(),
+                max: "thirty".to_string(),
+                ndv: String::new(),
+            },
+            CollectedColumnStatistics {
+                column_name: "zero_ndv".to_string(),
+                row_count: 0,
+                min: "-1".to_string(),
+                max: "0".to_string(),
+                ndv: "0".to_string(),
+            },
+            CollectedColumnStatistics {
+                column_name: "negative_ndv".to_string(),
+                row_count: 0,
+                min: "-1".to_string(),
+                max: "0".to_string(),
+                ndv: "-2".to_string(),
+            },
+        ],
+    };
+    service
+        .try_handle_statement(
+            &engine,
+            "ANALYZE TABLE db1.raw_stats",
+            StatisticsRequestContext {
+                current_catalog: None,
+                current_database: "db1",
+            },
+        )
+        .unwrap()
+        .expect("analyze handled");
+
+    let snapshot = service
+        .catalog_table_statistics("db1", "raw_stats")
+        .unwrap()
+        .expect("raw statistics");
+    assert_eq!(snapshot.columns.len(), 3);
+    assert_eq!(snapshot.columns[0].min, "ten");
+    assert_eq!(snapshot.columns[0].max, "thirty");
+    assert_eq!(snapshot.columns[0].ndv, "");
+    assert_eq!(snapshot.columns[1].ndv, "0");
+    assert_eq!(snapshot.columns[2].ndv, "-2");
 }
