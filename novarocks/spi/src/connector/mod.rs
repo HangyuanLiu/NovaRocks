@@ -19,6 +19,12 @@ mod context;
 mod error;
 mod handle;
 mod identity;
+mod instance;
+mod metadata;
+mod read;
+
+#[cfg(feature = "connector-conformance")]
+pub mod conformance;
 
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
 pub use error::{ConnectorError, ConnectorErrorKind};
@@ -27,3 +33,14 @@ pub use handle::{
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
+pub use instance::ConnectorInstance;
+pub use metadata::{
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
+    ConnectorNamespaceRequest, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableRequest, ConnectorTableResolution,
+};
+pub use read::{
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
+    ConnectorOpenReaderRequest, ConnectorRead, ConnectorReadSelector, ConnectorScan,
+    ConnectorSplitPlanningRequest,
+};
