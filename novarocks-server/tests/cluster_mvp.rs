@@ -1342,6 +1342,60 @@ fn cross_process_three_be_state_store_baseline() {
     eprintln!("NOVAROCKS_CLUSTER_BASELINE_RESULT fragments=multi rows=[1,2]");
 }
 
+#[test]
+fn cross_process_three_be_statistics_service() {
+    let _guard = lock_cluster_mvp();
+    let metadata_dir = tempfile::tempdir_in(runtime_dir()).expect("create statistics metadata dir");
+    let metadata_config = format!(
+        r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+"#,
+        metadata_dir.path().join("catalog.db").display()
+    );
+    let cluster = MultiBeClusterHarness::start_n_be(3, "", &metadata_config);
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create statistics warehouse");
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG feh5_stats_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create statistics catalog");
+    conn.query_drop("SET catalog feh5_stats_catalog")
+        .expect("use statistics catalog");
+    conn.query_drop("CREATE DATABASE feh5_stats")
+        .expect("create statistics database");
+    conn.query_drop("CREATE TABLE feh5_stats.t (k INT)")
+        .expect("create statistics table");
+    conn.query_drop("INSERT INTO feh5_stats.t VALUES (1), (2), (3)")
+        .expect("insert statistics rows");
+    conn.query_drop("ANALYZE TABLE feh5_stats.t")
+        .expect("analyze statistics table");
+
+    let stats: Vec<(i64, i64)> = conn
+        .query(
+            "SELECT row_count, hll_cardinality(ndv) \
+             FROM _statistics_.column_statistics \
+             WHERE table_name = 'feh5_stats.t' AND column_name = 'k'",
+        )
+        .expect("query collected statistics");
+    assert_eq!(stats, vec![(3, 3)]);
+
+    let explain: Vec<String> = conn
+        .query("EXPLAIN COSTS SELECT * FROM feh5_stats.t")
+        .expect("explain with collected statistics");
+    assert!(
+        explain
+            .iter()
+            .any(|line| line.contains("ndv=3") && line.contains("stats={rows=3")),
+        "EXPLAIN COSTS must consume frontend row-count and NDV statistics: {explain:?}"
+    );
+    assert_exact_live_backends(&mut conn, 3);
+}
+
 #[cfg(unix)]
 #[test]
 fn cross_process_three_be_sqlite_state_store_lifecycle() {
