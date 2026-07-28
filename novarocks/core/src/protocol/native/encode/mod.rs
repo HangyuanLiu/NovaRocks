@@ -29,11 +29,11 @@ pub(crate) mod instance;
 pub(crate) mod plan;
 
 #[cfg(test)]
+pub(crate) use bundle::{NativeBundleTestDrift, corrupt_native_fragment_bundle_for_execution_test};
 pub(crate) use bundle::{
-    NativeBundleTestDrift, corrupt_native_fragment_bundle_for_execution_test,
-    empty_native_fragment_bundle_for_test,
+    NativeFragmentBundle, empty_native_fragment_bundle_for_contract_test,
+    encode_native_fragment_bundle,
 };
-pub(crate) use bundle::{NativeFragmentBundle, encode_native_fragment_bundle};
 pub(crate) use instance::encode_instance_params;
 pub(crate) use plan::encode_data_partition;
 

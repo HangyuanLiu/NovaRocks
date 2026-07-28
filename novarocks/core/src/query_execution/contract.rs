@@ -89,25 +89,29 @@ impl DistributedQueryRequest {
         self.intent
     }
 
+    /// Consumes the sealed request and creates a successful result outcome.
+    /// The request intent is preserved, while the immutable execution
+    /// artifacts remain opaque to the frontend implementation.
+    pub fn into_success(self, query_result: QueryResult) -> DistributedQueryOutcome {
+        DistributedQueryOutcome::new(self.intent, query_result, None, None, Vec::new())
+    }
+
     pub(crate) fn into_parts(self) -> (DistributedQueryArtifacts, DistributedQueryIntent) {
         (self.artifacts, self.intent)
     }
 
-    #[cfg(test)]
-    fn for_test(intent: DistributedQueryIntent) -> Self {
-        // Test doubles exercise only the object-safe boundary, so they do not
-        // need to fabricate plan artifacts. Production construction always
-        // goes through `new` above.
+    /// Creates an opaque request for cross-crate contract conformance tests.
+    ///
+    /// Production request construction remains internal to core's sealed-plan
+    /// path. This fixture carries no executable fragments and exists solely
+    /// so a role crate can prove it implements the public execution port.
+    pub fn for_contract_test(intent: DistributedQueryIntent) -> Self {
         Self {
             artifacts: DistributedQueryArtifacts {
-                prepared: crate::query_execution::preparation::prepared_fragment_set_for_test(
-                    Vec::new(),
-                    Vec::new(),
-                    0,
-                    Vec::new(),
-                ),
+                prepared:
+                    crate::query_execution::preparation::empty_prepared_fragment_set_for_contract_test(),
                 native_bundle:
-                    crate::protocol::native::encode::empty_native_fragment_bundle_for_test(),
+                    crate::protocol::native::encode::empty_native_fragment_bundle_for_contract_test(),
                 query_options: None,
             },
             intent,
@@ -146,6 +150,12 @@ impl DistributedQueryOutcome {
         self.intent
     }
 
+    /// Returns the result value owned by this outcome without exposing its
+    /// sealed execution metadata.
+    pub fn into_query_result(self) -> QueryResult {
+        self.query_result
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -159,20 +169,6 @@ impl DistributedQueryOutcome {
             self.write_commit,
             self.write_abort,
             self.fragment_profiles,
-        )
-    }
-
-    #[cfg(test)]
-    fn for_test(intent: DistributedQueryIntent) -> Self {
-        Self::new(
-            intent,
-            QueryResult {
-                columns: Vec::new(),
-                chunks: Vec::new(),
-            },
-            None,
-            None,
-            Vec::new(),
         )
     }
 }
@@ -236,7 +232,10 @@ mod tests {
             &self,
             request: DistributedQueryRequest,
         ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-            Ok(DistributedQueryOutcome::for_test(request.intent()))
+            Ok(request.into_success(QueryResult {
+                columns: Vec::new(),
+                chunks: Vec::new(),
+            }))
         }
     }
 
@@ -244,7 +243,7 @@ mod tests {
     fn injected_coordinator_consumes_sealed_request_and_returns_engine_outcome() {
         let coordinator: &dyn DistributedQueryCoordinator = &FakeCoordinator;
         let outcome = coordinator
-            .execute(DistributedQueryRequest::for_test(
+            .execute(DistributedQueryRequest::for_contract_test(
                 DistributedQueryIntent::Profile,
             ))
             .expect("fake coordinator accepts the engine request");
