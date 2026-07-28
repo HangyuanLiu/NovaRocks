@@ -28,7 +28,7 @@ use crate::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
 use crate::runtime::{backend_id, sink_commit};
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::service::internal_service;
+use crate::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress;
 use crate::service::starrocks_sink_commit_wire;
 use crate::service::stream_load_registry::{
     register_stream_load_file, unregister_stream_load_file,
@@ -989,6 +989,7 @@ pub(crate) fn handle_stream_load(
     table: String,
     headers: HttpHeaders,
     body: Vec<u8>,
+    fragment_sync_ingress: &dyn StarRocksFragmentSyncIngress,
 ) -> Value {
     let started = Instant::now();
     let auth = match parse_basic_auth(&headers) {
@@ -1089,18 +1090,18 @@ pub(crate) fn handle_stream_load(
         })?;
 
         let execute_started = Instant::now();
-        let execute_result =
-            internal_service::execute_plan_fragment_sync(plan_params).map_err(|e| {
-                ApiError::new(
-                    TStatusCode::RUNTIME_ERROR,
-                    format!("execute plan fragment failed: {e}"),
-                )
-            })?;
+        let execute_result = fragment_sync_ingress.execute(plan_params).map_err(|e| {
+            ApiError::new(
+                TStatusCode::RUNTIME_ERROR,
+                format!("execute plan fragment failed: {e}"),
+            )
+        })?;
         stats.write_data_time_ms = execute_started.elapsed().as_millis() as i64;
-        finst_id = Some(execute_result.finst_id);
-        commit_infos = sink_commit::list_tablet_commit_infos(execute_result.finst_id);
-        fail_infos = sink_commit::list_tablet_fail_infos(execute_result.finst_id);
-        let (loaded_rows, _loaded_bytes) = sink_commit::get_load_counters(execute_result.finst_id);
+        let fragment_instance_id = execute_result.fragment_instance_id();
+        finst_id = Some(fragment_instance_id);
+        commit_infos = sink_commit::list_tablet_commit_infos(fragment_instance_id);
+        fail_infos = sink_commit::list_tablet_fail_infos(fragment_instance_id);
+        let (loaded_rows, _loaded_bytes) = sink_commit::get_load_counters(fragment_instance_id);
         let loaded_rows = loaded_rows.max(0);
         stats.number_loaded_rows = stats.number_loaded_rows.saturating_add(loaded_rows);
         stats.number_total_rows = stats.number_total_rows.saturating_add(loaded_rows);
@@ -1172,7 +1173,11 @@ pub(crate) fn handle_stream_load(
     )
 }
 
-pub(crate) fn handle_transaction_load(headers: HttpHeaders, body: Vec<u8>) -> Value {
+pub(crate) fn handle_transaction_load(
+    headers: HttpHeaders,
+    body: Vec<u8>,
+    fragment_sync_ingress: &dyn StarRocksFragmentSyncIngress,
+) -> Value {
     let options = match parse_load_headers(&headers).and_then(|opts| {
         ensure_txn_extensions_supported(&opts)?;
         Ok(opts)
@@ -1266,19 +1271,18 @@ pub(crate) fn handle_transaction_load(headers: HttpHeaders, body: Vec<u8>) -> Va
                 )
             })?;
             let execute_started = Instant::now();
-            let execute_result = internal_service::execute_plan_fragment_sync(plan_params)
-                .map_err(|e| {
-                    ApiError::new(
-                        TStatusCode::RUNTIME_ERROR,
-                        format!("execute plan fragment failed: {e}"),
-                    )
-                })?;
+            let execute_result = fragment_sync_ingress.execute(plan_params).map_err(|e| {
+                ApiError::new(
+                    TStatusCode::RUNTIME_ERROR,
+                    format!("execute plan fragment failed: {e}"),
+                )
+            })?;
             let write_ms = execute_started.elapsed().as_millis() as i64;
-            finst_id = Some(execute_result.finst_id);
-            let commit_infos = sink_commit::list_tablet_commit_infos(execute_result.finst_id);
-            let fail_infos = sink_commit::list_tablet_fail_infos(execute_result.finst_id);
-            let (loaded_rows, _loaded_bytes) =
-                sink_commit::get_load_counters(execute_result.finst_id);
+            let fragment_instance_id = execute_result.fragment_instance_id();
+            finst_id = Some(fragment_instance_id);
+            let commit_infos = sink_commit::list_tablet_commit_infos(fragment_instance_id);
+            let fail_infos = sink_commit::list_tablet_fail_infos(fragment_instance_id);
+            let (loaded_rows, _loaded_bytes) = sink_commit::get_load_counters(fragment_instance_id);
             dedup_extend_commit_infos(&mut ctx.commit_infos, commit_infos);
             dedup_extend_fail_infos(&mut ctx.fail_infos, fail_infos);
             let loaded_rows = loaded_rows.max(0);

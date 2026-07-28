@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod endpoint;
-pub(crate) mod options;
-pub mod request;
-pub(crate) mod sink;
+mod ffi;
+mod service;
+
+pub use service::{
+    CompatFragmentService, execute_plan_fragment_sync, submit_exec_batch_plan_fragments,
+    submit_exec_plan_fragment,
+};

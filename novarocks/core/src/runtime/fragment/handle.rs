@@ -34,17 +34,21 @@ use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
 use crate::runtime::fragment::scan::materialize_scan_bindings;
-use crate::runtime::fragment::sink::materialize_fragment_sink;
+use crate::runtime::fragment::sink::materialize_fragment_sink_components_with_result;
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
+use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
 
 pub struct FragmentPrepareContext {
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+    result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+    root_sink_dop: Option<i32>,
+    group_execution_scan_dop: Option<i32>,
     #[cfg(test)]
     prepare_failure: Option<PrepareFailurePoint>,
     #[cfg(test)]
@@ -59,6 +63,9 @@ impl Default for FragmentPrepareContext {
             profiler: None,
             mem_tracker: None,
             runtime_filter: None,
+            result_override: None,
+            root_sink_dop: None,
+            group_execution_scan_dop: None,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -79,6 +86,32 @@ impl FragmentPrepareContext {
             profiler,
             mem_tracker,
             runtime_filter,
+            result_override: None,
+            root_sink_dop: None,
+            group_execution_scan_dop: None,
+            #[cfg(test)]
+            prepare_failure: None,
+            #[cfg(test)]
+            cleanup_faults: ResourceCleanupFaults::default(),
+            #[cfg(test)]
+            start_failure: None,
+        }
+    }
+
+    pub(crate) fn new_with_execution_overrides(
+        profiler: Option<Profiler>,
+        mem_tracker: Option<Arc<MemTracker>>,
+        result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+        root_sink_dop: Option<i32>,
+        group_execution_scan_dop: Option<i32>,
+    ) -> Self {
+        Self {
+            profiler,
+            mem_tracker,
+            runtime_filter: None,
+            result_override,
+            root_sink_dop,
+            group_execution_scan_dop,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -252,6 +285,15 @@ impl RunningFragmentHandle {
         let result = self.inner.pipeline.join();
         self.inner.freeze_terminal(result)
     }
+
+    pub fn handoff_sink_commit(&self) {
+        self.inner
+            .state
+            .lock()
+            .expect("running fragment state lock")
+            .resources
+            .handoff_sink_commit();
+    }
 }
 
 impl RunningFragmentInner {
@@ -350,7 +392,15 @@ pub fn prepare_fragment(
                 error,
             )
         })?;
-        let sink = materialize_fragment_sink(program, instance)?;
+        let sink = materialize_fragment_sink_components_with_result(
+            program.sink(),
+            instance.sink_assignment(),
+            finst_id,
+            instance.runtime_options().typed_result_sink(),
+            program.root_plan_node_id().get(),
+            context.result_override.clone(),
+        )?;
+        let _group_execution_scan_dop = context.group_execution_scan_dop;
         let exchange_bindings = materialize_exchange_bindings(program, instance);
         let scan_bindings = materialize_scan_bindings(program, instance)?;
         prepare_report_neutral_pipeline_execution(
@@ -364,7 +414,7 @@ pub fn prepare_fragment(
             context.profiler.clone(),
             pipeline_dop,
             runtime_state,
-            None,
+            context.root_sink_dop,
             context.runtime_filter.clone(),
         )
         .map_err(|error| {

@@ -24,7 +24,7 @@ use crate::thrift::types::TNetworkAddress;
 
 use super::StarRocksFragmentDecodeError;
 
-pub(crate) fn decode_runtime_endpoint(
+pub fn decode_runtime_endpoint(
     address: &TNetworkAddress,
     path: FieldPath,
 ) -> Result<RuntimeEndpoint, StarRocksFragmentDecodeError> {

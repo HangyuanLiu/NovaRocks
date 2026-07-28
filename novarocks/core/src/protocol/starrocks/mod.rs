@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod compat;
-pub(crate) mod decode;
+pub mod compat;
+pub mod decode;
 pub(crate) mod type_mapping;
 
 #[cfg(test)]

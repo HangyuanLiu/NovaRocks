@@ -14,67 +14,178 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
-use crate::novarocks_logging::{error, info, warn};
+use novarocks::novarocks_logging::{error, info, warn};
 
-use crate::common::app_config;
-use crate::common::config::debug_exec_batch_plan_json;
-use crate::common::thrift::{thrift_binary_deserialize, thrift_named_json};
+use novarocks::common::app_config;
+use novarocks::common::config::debug_exec_batch_plan_json;
+use novarocks::common::thrift::{thrift_binary_deserialize, thrift_named_json};
 
-use crate::cache::CacheOptions;
-use crate::common::types::UniqueId;
-use crate::protocol::common::error::FieldPath;
-use crate::protocol::starrocks::compat::endpoint::destination_address;
-use crate::protocol::starrocks::compat::request::backfill_per_node_scan_ranges;
-use crate::protocol::starrocks::decode::node::lower_row_pos_descs;
-use crate::protocol::starrocks::decode::{
+use novarocks::cache::CacheOptions;
+use novarocks::common::types::UniqueId;
+use novarocks::protocol::FieldPath;
+use novarocks::protocol::starrocks::compat::endpoint::destination_address;
+use novarocks::protocol::starrocks::compat::request::backfill_per_node_scan_ranges;
+use novarocks::protocol::starrocks::decode::{
     StarRocksDecodeInput, StarRocksFragmentDraft, StarRocksReportDestination,
-    StarRocksSubmissionMetadata, decode_incremental_scan_ranges, decode_query_options,
-    decode_runtime_endpoint, finish_fragment_submission, prepare_fragment_submission,
+    StarRocksSubmissionMetadata, decode_incremental_scan_ranges, decode_runtime_endpoint,
+    finish_fragment_submission, prepare_fragment_submission,
 };
-use crate::runtime::exchange;
-use crate::runtime::fragment::starrocks_execution::{
-    StarRocksExecutionContext, StarRocksExecutionMetadata, execute_starrocks_submission,
-    uses_fetch_result_buffer,
+use novarocks::runtime::exchange;
+use novarocks::runtime::fragment::{
+    DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
+    prepare_fragment,
 };
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::{ProfileUnit, Profiler};
-use crate::runtime::query_context::{
-    LookupFetcherLifecycle, QueryContextManager, QueryExecutionKey, QueryId,
-    StarRocksQueryGeneration, StarRocksQueryHandoff, query_context_manager, query_expire_durations,
+use novarocks::runtime::mem_tracker::MemTracker;
+use novarocks::runtime::profile::{ProfileUnit, Profiler};
+use novarocks::runtime::query_context::{LookupFetcherLifecycle, QueryId};
+use novarocks::runtime::query_options::query_expire_durations;
+use novarocks::runtime::starrocks_fragment_query::{
+    StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentQueryRuntime,
 };
-use crate::runtime::result_buffer;
-use crate::service::fe_report;
-use crate::service::starrocks_fragment_dependency_resolver::resolve_dependencies;
-use crate::service::starrocks_fragment_transport::{
+use novarocks::service::fe_report;
+use novarocks::service::starrocks_fragment_dependency_resolver::resolve_dependencies;
+use novarocks::service::starrocks_fragment_transport::{
     StarRocksDescriptorPreparation, StarRocksPrelaunchCancellationToken, StarRocksPrelaunchGuard,
     commit_descriptor_handoff, prepare_batch_descriptor, prepare_descriptor, snapshot_decode_facts,
     starrocks_prelaunch_registry,
 };
-use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
+use novarocks::thrift::{data_sinks, descriptors, internal_service, planner, types};
+
+#[derive(Debug, Default)]
+pub struct CompatFragmentService;
+
+impl novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress
+    for CompatFragmentService
+{
+    fn execute(
+        &self,
+        request: internal_service::TExecPlanFragmentParams,
+    ) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String>
+    {
+        execute_plan_fragment_sync(request)
+    }
+}
 
 #[cfg(test)]
 static TEST_FRAGMENT_LAUNCH_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(test)]
-pub(crate) fn test_fragment_launch_count() -> usize {
-    TEST_FRAGMENT_LAUNCH_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdapterFailureStage {
+    Prepare,
+    ReportRegistration,
+    Start,
 }
 
-fn profile_name_for_fragment(fragment: &planner::TPlanFragment) -> String {
-    let plan_node_id = fragment
-        .plan
-        .as_ref()
-        .and_then(|plan| plan.nodes.first().map(|n| n.node_id))
-        .unwrap_or(-1);
-    if plan_node_id >= 0 {
-        format!("execute_fragment (plan_node_id={plan_node_id})")
-    } else {
-        "execute_fragment".to_string()
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct AdapterFailurePlan {
+    query_id: QueryId,
+    stage: AdapterFailureStage,
+    index: usize,
+}
+
+#[cfg(test)]
+static TEST_ADAPTER_FAILURE: Mutex<Option<AdapterFailurePlan>> = Mutex::new(None);
+
+#[cfg(test)]
+static TEST_FRAGMENT_LAUNCHES_BY_QUERY: OnceLock<Mutex<HashMap<QueryId, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+static TEST_REGISTERED_REPORTS: OnceLock<Mutex<HashMap<QueryId, Vec<UniqueId>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn set_adapter_failure(plan: Option<AdapterFailurePlan>) {
+    *TEST_ADAPTER_FAILURE
+        .lock()
+        .expect("adapter failure plan lock") = plan;
+}
+
+#[cfg(test)]
+fn injected_adapter_failure(query_id: QueryId, stage: AdapterFailureStage, index: usize) -> bool {
+    TEST_ADAPTER_FAILURE
+        .lock()
+        .expect("adapter failure plan lock")
+        .is_some_and(|plan| plan.query_id == query_id && plan.stage == stage && plan.index == index)
+}
+
+#[cfg(not(test))]
+fn injected_adapter_failure(
+    _query_id: QueryId,
+    _stage: AdapterFailureStage,
+    _index: usize,
+) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn record_fragment_launch(query_id: QueryId) {
+    TEST_FRAGMENT_LAUNCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *TEST_FRAGMENT_LAUNCHES_BY_QUERY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("fragment launch count lock")
+        .entry(query_id)
+        .or_default() += 1;
+}
+
+#[cfg(not(test))]
+fn record_fragment_launch(_query_id: QueryId) {}
+
+#[cfg(test)]
+fn fragment_launch_count_for_query(query_id: QueryId) -> usize {
+    TEST_FRAGMENT_LAUNCHES_BY_QUERY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("fragment launch count lock")
+        .get(&query_id)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_report_registration(query_id: QueryId, finst_id: UniqueId) {
+    TEST_REGISTERED_REPORTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("registered reports lock")
+        .entry(query_id)
+        .or_default()
+        .push(finst_id);
+}
+
+#[cfg(not(test))]
+fn record_report_registration(_query_id: QueryId, _finst_id: UniqueId) {}
+
+#[cfg(test)]
+fn record_report_unregistration(query_id: QueryId, finst_id: UniqueId) {
+    let mut reports = TEST_REGISTERED_REPORTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("registered reports lock");
+    if let Some(ids) = reports.get_mut(&query_id) {
+        ids.retain(|current| *current != finst_id);
+        if ids.is_empty() {
+            reports.remove(&query_id);
+        }
     }
+}
+
+#[cfg(not(test))]
+fn record_report_unregistration(_query_id: QueryId, _finst_id: UniqueId) {}
+
+#[cfg(test)]
+fn registered_reports_for_query(query_id: QueryId) -> Vec<UniqueId> {
+    TEST_REGISTERED_REPORTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("registered reports lock")
+        .get(&query_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn choose_nonempty_str<'a>(primary: Option<&'a str>, fallback: Option<&'a str>) -> Option<&'a str> {
@@ -196,19 +307,19 @@ fn append_incremental_scan_ranges(
         hi: exec_params.fragment_instance_id.hi,
         lo: exec_params.fragment_instance_id.lo,
     };
-    let mgr = query_context_manager();
+    let queries = StarRocksFragmentQueryRuntime::global();
     let mut decoded_updates = Vec::new();
     for (node_id, scan_ranges) in &exec_params.per_node_scan_ranges {
         if scan_ranges.is_empty() {
             continue;
         }
-        let change_op_slot = mgr.incremental_change_op_slot(finst_id, *node_id)?;
+        let change_op_slot = queries.incremental_change_op_slot(finst_id, *node_id)?;
         let decoded = decode_incremental_scan_ranges(*node_id, scan_ranges, change_op_slot)
             .map_err(|error| error.to_string())?;
         decoded_updates.push((*node_id, decoded));
     }
     for (node_id, scan_ranges) in decoded_updates {
-        mgr.append_incremental_scan_ranges(finst_id, node_id, scan_ranges)?;
+        queries.append_incremental_scan_ranges(finst_id, node_id, scan_ranges)?;
     }
     Ok(())
 }
@@ -287,151 +398,11 @@ fn collect_exchange_sender_counts(
     counts
 }
 
-fn collect_fragment_row_position_metadata(
-    fragment: &planner::TPlanFragment,
-) -> Result<HashMap<i32, crate::exec::row_position::RowPositionDescriptor>, String> {
-    let Some(plan) = fragment.plan.as_ref() else {
-        return Ok(HashMap::new());
-    };
-    let mut prepared: HashMap<i32, crate::exec::row_position::RowPositionDescriptor> =
-        HashMap::new();
-    for node in &plan.nodes {
-        let (node_name, thrift_descs) =
-            if node.node_type == crate::thrift::plan_nodes::TPlanNodeType::LOOKUP_NODE {
-                let lookup = node
-                    .look_up_node
-                    .as_ref()
-                    .ok_or_else(|| "LOOKUP_NODE missing look_up_node payload".to_string())?;
-                (
-                    "LOOKUP_NODE",
-                    lookup
-                        .row_pos_descs
-                        .as_ref()
-                        .ok_or_else(|| "LOOKUP_NODE missing row_pos_descs".to_string())?,
-                )
-            } else if node.node_type == crate::thrift::plan_nodes::TPlanNodeType::FETCH_NODE {
-                let fetch = node
-                    .fetch_node
-                    .as_ref()
-                    .ok_or_else(|| "FETCH_NODE missing fetch_node payload".to_string())?;
-                (
-                    "FETCH_NODE",
-                    fetch
-                        .row_pos_descs
-                        .as_ref()
-                        .ok_or_else(|| "FETCH_NODE missing row_pos_descs".to_string())?,
-                )
-            } else {
-                continue;
-            };
-        let descs = lower_row_pos_descs(thrift_descs)?;
-        if descs.is_empty() {
-            return Err(format!("{node_name} row_pos_descs is empty"));
-        }
-        for (tuple_id, incoming) in descs {
-            if let Some(existing) = prepared.get(&tuple_id) {
-                if existing.row_position_type != incoming.row_position_type
-                    || existing.row_source_slot != incoming.row_source_slot
-                    || existing.fetch_ref_slots != incoming.fetch_ref_slots
-                    || existing.lookup_ref_slots != incoming.lookup_ref_slots
-                {
-                    return Err(format!(
-                        "conflicting row position descriptor for tuple_id={tuple_id}"
-                    ));
-                }
-            } else {
-                prepared.insert(tuple_id, incoming);
-            }
-        }
-    }
-    Ok(prepared)
-}
-
-fn prepare_fragment_row_position_metadata(
-    mgr: &QueryContextManager,
-    query_id: QueryId,
-    fragment: &planner::TPlanFragment,
-) -> Result<(), String> {
-    let prepared = collect_fragment_row_position_metadata(fragment)?;
-    if !prepared.is_empty() {
-        // StarRocks prepares LOOKUP/FETCH metadata before acknowledging fragment ingress.
-        // Register it synchronously so a remote lookup cannot race async plan lowering.
-        mgr.register_row_pos_descs(query_id, prepared)?;
-    }
-    Ok(())
-}
-
-fn prepare_lookup_lifecycle(
-    mgr: &QueryContextManager,
-    query_id: QueryId,
-    fragment: &planner::TPlanFragment,
-    exec_params: &internal_service::TPlanFragmentExecParams,
-) -> Result<(), String> {
-    let Some(plan) = fragment.plan.as_ref() else {
-        return Ok(());
-    };
-    let lookup_node_ids = plan
-        .nodes
-        .iter()
-        .filter(|node| node.node_type == crate::thrift::plan_nodes::TPlanNodeType::LOOKUP_NODE)
-        .map(|node| node.node_id)
-        .collect::<Vec<_>>();
-    if lookup_node_ids.is_empty() {
-        return Ok(());
-    }
-
-    let mut lifecycles = HashMap::new();
-    for node_id in lookup_node_ids {
-        let lifecycle = match exec_params
-            .per_look_up_num_fetchers
-            .as_ref()
-            .and_then(|counts| counts.get(&node_id))
-        {
-            Some(count) => crate::runtime::query_context::LookupFetcherLifecycle::Exact(
-                usize::try_from(*count).map_err(|_| {
-                    format!("lookup node {node_id} has negative fetcher count {count}")
-                })?,
-            ),
-            None => crate::runtime::query_context::LookupFetcherLifecycle::Unknown,
-        };
-        lifecycles.insert(node_id, lifecycle);
-    }
-    mgr.register_lookup_fetchers(query_id, lifecycles)
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LookupCloseTarget {
     lookup_node_id: i32,
     host: String,
     port: i32,
-}
-
-fn collect_lookup_close_targets(fragment: &planner::TPlanFragment) -> Vec<LookupCloseTarget> {
-    let Some(plan) = fragment.plan.as_ref() else {
-        return Vec::new();
-    };
-    let mut targets = HashSet::new();
-    for node in &plan.nodes {
-        if node.node_type != crate::thrift::plan_nodes::TPlanNodeType::FETCH_NODE {
-            continue;
-        }
-        let Some(fetch) = node.fetch_node.as_ref() else {
-            continue;
-        };
-        let (Some(lookup_node_id), Some(nodes_info)) =
-            (fetch.target_node_id, fetch.nodes_info.as_ref())
-        else {
-            continue;
-        };
-        for target in &nodes_info.nodes {
-            targets.insert(LookupCloseTarget {
-                lookup_node_id,
-                host: target.host.clone(),
-                port: target.async_internal_port,
-            });
-        }
-    }
-    targets.into_iter().collect()
 }
 
 struct LookupCloseGuard {
@@ -509,7 +480,7 @@ fn lookup_close_worker(receiver: Arc<std::sync::Mutex<mpsc::Receiver<LookupClose
                 continue;
             }
         };
-        if let Err(err) = crate::service::internal_rpc_client::lookup_close(
+        if let Err(err) = novarocks::service::internal_rpc_client::lookup_close(
             &task.target.host,
             port,
             task.query_id,
@@ -565,7 +536,7 @@ impl Drop for LookupCloseGuard {
 }
 
 struct PreparedStarRocksFragment {
-    submission: crate::runtime::fragment::submission::FragmentSubmission,
+    submission: novarocks::runtime::fragment::FragmentSubmission,
     metadata: StarRocksSubmissionMetadata,
     total_fragments: Option<usize>,
 }
@@ -628,14 +599,14 @@ fn prepare_starrocks_draft(
 fn resolve_starrocks_draft(
     draft: &StarRocksFragmentDraftEnvelope,
     token: &StarRocksPrelaunchCancellationToken,
-) -> Result<crate::protocol::starrocks::decode::StarRocksResolvedDependencies, String> {
+) -> Result<novarocks::protocol::starrocks::decode::StarRocksResolvedDependencies, String> {
     resolve_dependencies(draft.draft.external_dependencies(), token)
         .map_err(|error| error.to_string())
 }
 
 fn finish_starrocks_draft(
     draft: StarRocksFragmentDraftEnvelope,
-    resolved: crate::protocol::starrocks::decode::StarRocksResolvedDependencies,
+    resolved: novarocks::protocol::starrocks::decode::StarRocksResolvedDependencies,
 ) -> Result<PreparedStarRocksFragment, String> {
     let decoded =
         finish_fragment_submission(draft.draft, resolved).map_err(|error| error.to_string())?;
@@ -649,16 +620,20 @@ fn finish_starrocks_draft(
 
 struct PreparedLaunchResources {
     finst_id: UniqueId,
-    execution: QueryExecutionKey,
     profiler: Option<Profiler>,
     query_mem_tracker: Arc<MemTracker>,
     fragment_mem_tracker: Arc<MemTracker>,
-    prepared: PreparedStarRocksFragment,
+    backend_num: i32,
+    enable_profile: bool,
+    report_interval_ns: Option<i64>,
+    report_destination: Option<StarRocksReportDestination>,
+    lookup_close_targets: Vec<LookupCloseTarget>,
+    dormant: DormantFragmentHandle,
 }
 
 fn same_row_position_descriptor(
-    left: &crate::exec::row_position::RowPositionDescriptor,
-    right: &crate::exec::row_position::RowPositionDescriptor,
+    left: &novarocks::exec::row_position::RowPositionDescriptor,
+    right: &novarocks::exec::row_position::RowPositionDescriptor,
 ) -> bool {
     left.row_position_type == right.row_position_type
         && left.row_source_slot == right.row_source_slot
@@ -669,18 +644,12 @@ fn same_row_position_descriptor(
 fn prepare_query_handoff(
     prepared: &[PreparedStarRocksFragment],
     generation: u64,
-) -> Result<StarRocksQueryHandoff, String> {
+) -> Result<StarRocksFragmentHandoff, String> {
     let first = prepared
         .first()
         .ok_or_else(|| "StarRocks handoff requires at least one fragment".to_string())?;
-    let query_id = first.submission.instance().query_id();
-    let generation = StarRocksQueryGeneration::new(generation)?;
-    let execution = QueryExecutionKey::starrocks(query_id, generation);
-    let query_options = first
-        .submission
-        .instance()
-        .runtime_options()
-        .query_options();
+    let query_id = first.submission.query_id();
+    let query_options = first.submission.query_options();
     let cache_options = CacheOptions::from_query_options(Some(query_options))?;
     let (delivery_expire, query_expire) = query_expire_durations(Some(query_options));
     let mut descriptor_snapshot = None;
@@ -690,12 +659,11 @@ fn prepare_query_handoff(
     let mut instances = Vec::with_capacity(prepared.len());
 
     for item in prepared {
-        let instance = item.submission.instance();
-        if instance.query_id() != query_id {
+        if item.submission.query_id() != query_id {
             return Err("mixed query_id in prepared StarRocks batch".to_string());
         }
         let incoming_cache =
-            CacheOptions::from_query_options(Some(instance.runtime_options().query_options()))?;
+            CacheOptions::from_query_options(Some(item.submission.query_options()))?;
         if incoming_cache != cache_options {
             return Err("cache options mismatch for query".to_string());
         }
@@ -744,34 +712,34 @@ fn prepare_query_handoff(
                 .or_insert(*incoming);
         }
         instances.push((
-            instance.fragment_instance_id().get(),
+            item.submission.fragment_instance_id(),
             item.submission.incremental_scan_contracts(),
         ));
     }
 
-    Ok(StarRocksQueryHandoff {
-        execution,
+    StarRocksFragmentHandoff::new(
+        query_id,
+        generation,
         delivery_expire,
         query_expire,
-        fragment_count: prepared.len(),
         cache_options,
         descriptor_snapshot,
         total_fragments,
         row_pos_descs,
         lookup_fetchers,
         instances,
-    })
+    )
 }
 
 fn profile_report_interval_ns(
     enable_profile: bool,
-    query_options: &crate::runtime::query_options::QueryOptions,
+    query_options: &novarocks::runtime::query_options::QueryOptions,
 ) -> Option<i64> {
     if !enable_profile {
         return None;
     }
     query_options
-        .runtime_profile_report_interval
+        .runtime_profile_report_interval()
         .filter(|value| *value > 0)
         .and_then(|value| value.checked_mul(1_000_000_000))
         .or_else(|| {
@@ -789,236 +757,474 @@ fn launch_prepared_fragments(
     if prepared.is_empty() {
         return Ok(0);
     }
-    let mgr = query_context_manager();
-    let query_id = prepared[0].submission.instance().query_id();
+    let query_id = prepared[0].submission.query_id();
     if prepared
         .iter()
-        .any(|item| item.submission.instance().query_id() != query_id)
+        .any(|item| item.submission.query_id() != query_id)
     {
         return Err("mixed query_id in prepared StarRocks batch".to_string());
     }
     let handoff = prepare_query_handoff(&prepared, descriptor_preparation.generation())?;
-    let execution = handoff.execution;
-    let query_mem_tracker = guard.handoff(|| {
-        commit_descriptor_handoff(&descriptor_preparation, |lease_factory| {
-            mgr.commit_starrocks_handoff(handoff, || {
-                lease_factory.map(|factory| factory.into_cleanup_lease())
-            })
-        })
-    })?;
-
+    let execution = handoff.execution();
+    let queries = StarRocksFragmentQueryRuntime::global();
+    let admission = queries.prepare_admission(
+        handoff.query_id(),
+        handoff.delivery_expire(),
+        handoff.query_expire(),
+        handoff.cache_options(),
+    )?;
     let mut launches = Vec::with_capacity(prepared.len());
-    for prepared in prepared {
-        let instance = prepared.submission.instance();
-        let finst_id = instance.fragment_instance_id().get();
-        let query_options = instance.runtime_options().query_options().clone();
-        let fragment_mem_tracker = MemTracker::new_child(
-            format!("fragment_{:x}_{:x}", finst_id.hi, finst_id.lo),
-            &query_mem_tracker,
-        );
-        let profiler = query_options.enable_profile.then(|| {
+    for (prepare_index, prepared) in prepared.into_iter().enumerate() {
+        let finst_id = prepared.submission.fragment_instance_id();
+        if injected_adapter_failure(query_id, AdapterFailureStage::Prepare, prepare_index + 1) {
+            for launch in launches.drain(..).rev() {
+                drop(launch);
+            }
+            return Err(format!(
+                "injected StarRocks fragment prepare failure at index {}",
+                prepare_index + 1
+            ));
+        }
+        let query_options = prepared.submission.query_options().clone();
+        let backend_num = prepared.submission.backend_num();
+        let fragment_mem_tracker = admission.fragment_mem_tracker(finst_id);
+        let query_mem_tracker = admission.query_mem_tracker();
+        let profiler = query_options.enable_profile().then(|| {
             Profiler::new(format!(
                 "execute_fragment (plan_node_id={})",
-                prepared.submission.program().root_plan_node_id().get()
+                prepared.submission.root_plan_node_id()
             ))
         });
+        let report_interval_ns =
+            profile_report_interval_ns(query_options.enable_profile(), &query_options);
+        let report_destination = prepared.metadata.report_destination().cloned();
+        let lookup_close_targets = prepared
+            .metadata
+            .lookup_close_targets()
+            .iter()
+            .map(|target| LookupCloseTarget {
+                lookup_node_id: target.lookup_node_id(),
+                host: target.host().to_string(),
+                port: i32::from(target.port()),
+            })
+            .collect();
+        if prepared.submission.uses_split_data_stream_sink() {
+            eprintln!("compat_fragment_sink sink=SPLIT_DATA_STREAM_SINK stage=materialized");
+        }
+        let prepare_context = prepared
+            .metadata
+            .into_prepare_context(profiler.clone(), Some(Arc::clone(&fragment_mem_tracker)));
+        let dormant = match prepare_fragment(prepared.submission, prepare_context) {
+            Ok(dormant) => dormant,
+            Err(error) => {
+                for launch in launches.drain(..).rev() {
+                    drop(launch);
+                }
+                return Err(error.to_string());
+            }
+        };
         launches.push(PreparedLaunchResources {
             finst_id,
-            execution,
             profiler,
-            query_mem_tracker: Arc::clone(&query_mem_tracker),
+            query_mem_tracker,
             fragment_mem_tracker,
-            prepared,
+            backend_num,
+            enable_profile: query_options.enable_profile(),
+            report_interval_ns,
+            report_destination,
+            lookup_close_targets,
+            dormant,
         });
     }
     let created = launches.len();
-    for launch in launches {
-        let instance = launch.prepared.submission.instance();
-        let query_options = instance.runtime_options().query_options();
-        let enable_profile = query_options.enable_profile;
-        let report_interval_ns = profile_report_interval_ns(enable_profile, query_options);
-        match launch.prepared.metadata.report_destination() {
-            Some(StarRocksReportDestination::NovaRocks(endpoint)) => {
-                fe_report::register_novarocks_instance(
-                    launch.finst_id,
-                    launch.execution.query_id(),
-                    endpoint.clone(),
-                    instance.backend_num().get(),
-                    enable_profile,
-                    launch.profiler.clone(),
-                    Some(Arc::clone(&launch.fragment_mem_tracker)),
-                    Some(Arc::clone(&launch.query_mem_tracker)),
-                    report_interval_ns,
-                );
-            }
-            Some(StarRocksReportDestination::Coordinator(endpoint)) => {
-                fe_report::register_instance(
-                    launch.finst_id,
-                    launch.execution.query_id(),
-                    types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port()),
-                    instance.backend_num().get(),
-                    enable_profile,
-                    launch.profiler.clone(),
-                    Some(Arc::clone(&launch.fragment_mem_tracker)),
-                    Some(Arc::clone(&launch.query_mem_tracker)),
-                    report_interval_ns,
-                );
-            }
-            None => warn!(
-                target: "novarocks::report",
-                finst_id = %launch.finst_id,
-                "missing report destination for reportExecStatus"
-            ),
+    let finst_ids = launches
+        .iter()
+        .map(|launch| launch.finst_id)
+        .collect::<Vec<_>>();
+    let start_gate = Arc::new(BatchStartGate::default());
+    let workers = spawn_dormant_workers(
+        launches,
+        execution,
+        queries.clone(),
+        Arc::clone(&start_gate),
+    )?;
+    let committed_query_mem_tracker = match guard.handoff(|| {
+        commit_descriptor_handoff(&descriptor_preparation, |lease_factory| {
+            queries.commit_handoff(handoff, || {
+                lease_factory.map(|factory| factory.into_cleanup_lease())
+            })
+        })
+    }) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            start_gate.abort();
+            abort_dormant_workers(workers);
+            return Err(error);
         }
-        spawn_exec_fragment(
-            launch.prepared,
-            launch.finst_id,
-            launch.execution,
-            launch.profiler,
-            Some(launch.fragment_mem_tracker),
-            Arc::clone(&mgr),
-        );
+    };
+    debug_assert!(Arc::ptr_eq(
+        &committed_query_mem_tracker,
+        &admission.query_mem_tracker()
+    ));
+    let registered_reports = match register_fragment_reports(&workers, execution) {
+        Ok(registered) => registered,
+        Err((error, registered)) => {
+            rollback_committed_launch(
+                workers,
+                &start_gate,
+                &queries,
+                execution,
+                &finst_ids,
+                &registered,
+            );
+            return Err(error);
+        }
+    };
+    for start_index in 1..=workers.len() {
+        if injected_adapter_failure(query_id, AdapterFailureStage::Start, start_index) {
+            rollback_committed_launch(
+                workers,
+                &start_gate,
+                &queries,
+                execution,
+                &finst_ids,
+                &registered_reports,
+            );
+            return Err(format!(
+                "injected StarRocks fragment start failure at index {start_index}"
+            ));
+        }
     }
+    start_gate.start();
+    for worker in workers {
+        worker.detach();
+    }
+    drop(admission);
     Ok(created)
 }
 
-fn spawn_exec_fragment(
-    prepared: PreparedStarRocksFragment,
-    finst_id: UniqueId,
-    execution: QueryExecutionKey,
-    profiler: Option<Profiler>,
-    mem_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
-    mgr: Arc<QueryContextManager>,
-) {
+fn register_fragment_reports(
+    workers: &[DormantWorker],
+    execution: StarRocksFragmentExecution,
+) -> Result<Vec<UniqueId>, (String, Vec<UniqueId>)> {
     let query_id = execution.query_id();
-    #[cfg(test)]
-    TEST_FRAGMENT_LAUNCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let uses_fetch_result_buffer = uses_fetch_result_buffer(&prepared.submission);
-    let lookup_close_targets = prepared
-        .metadata
-        .lookup_close_targets()
-        .iter()
-        .map(|target| LookupCloseTarget {
-            lookup_node_id: target.lookup_node_id(),
-            host: target.host().to_string(),
-            port: i32::from(target.port()),
-        })
-        .collect();
-    crate::runtime::sink_commit::register(finst_id);
-    if uses_fetch_result_buffer {
-        if prepared
-            .submission
-            .instance()
-            .runtime_options()
-            .typed_result_sink()
-        {
-            result_buffer::create_typed_sender(finst_id);
-        } else {
-            result_buffer::create_sender(finst_id);
+    let mut registered = Vec::new();
+    for (registration_index, worker) in workers.iter().enumerate() {
+        if injected_adapter_failure(
+            query_id,
+            AdapterFailureStage::ReportRegistration,
+            registration_index + 1,
+        ) {
+            return Err((
+                format!(
+                    "injected StarRocks report registration failure at index {}",
+                    registration_index + 1
+                ),
+                registered,
+            ));
         }
-        if let Some(root) = mem_tracker.as_ref() {
-            let label = format!("ResultBuffer: finst={}", finst_id);
-            let tracker = crate::runtime::mem_tracker::MemTracker::new_child(label, root);
-            result_buffer::set_mem_tracker(finst_id, tracker);
+        match worker.report_destination.as_ref() {
+            Some(StarRocksReportDestination::NovaRocks(endpoint)) => {
+                fe_report::register_novarocks_instance(
+                    worker.finst_id,
+                    query_id,
+                    endpoint.clone(),
+                    worker.backend_num,
+                    worker.enable_profile,
+                    worker.profiler.clone(),
+                    Some(Arc::clone(&worker.fragment_mem_tracker)),
+                    Some(Arc::clone(&worker.query_mem_tracker)),
+                    worker.report_interval_ns,
+                );
+                registered.push(worker.finst_id);
+                record_report_registration(query_id, worker.finst_id);
+            }
+            Some(StarRocksReportDestination::Coordinator(endpoint)) => {
+                fe_report::register_instance(
+                    worker.finst_id,
+                    query_id,
+                    types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port()),
+                    worker.backend_num,
+                    worker.enable_profile,
+                    worker.profiler.clone(),
+                    Some(Arc::clone(&worker.fragment_mem_tracker)),
+                    Some(Arc::clone(&worker.query_mem_tracker)),
+                    worker.report_interval_ns,
+                );
+                registered.push(worker.finst_id);
+                record_report_registration(query_id, worker.finst_id);
+            }
+            None => warn!(
+                target: "novarocks::report",
+                finst_id = %worker.finst_id,
+                "missing report destination for reportExecStatus"
+            ),
         }
     }
-    std::thread::spawn(move || {
-        let wall_start = std::time::Instant::now();
-        let profiler_for_wall = profiler.clone();
-        let runtime_metadata = StarRocksExecutionMetadata {
-            result_override: prepared.metadata.result_override().cloned(),
-            root_sink_dop: prepared.metadata.root_sink_dop(),
-            group_execution_scan_dop: prepared.metadata.group_execution_scan_dop(),
-        };
-        let out = {
-            // One guard per fragment instance, not per pipeline driver. Dropping it after the
-            // entire executor returns mirrors StarRocks FetchProcessorFactory::close_context.
-            let _lookup_close_guard = LookupCloseGuard {
-                query_id,
-                targets: lookup_close_targets,
-            };
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute_starrocks_submission(
-                    prepared.submission,
-                    runtime_metadata,
-                    StarRocksExecutionContext {
-                        profiler,
-                        mem_tracker,
-                    },
-                )
-                .map_err(|error| error.to_string())
-            }))
-            .unwrap_or_else(|payload| {
-                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic payload".to_string()
-                };
-                Err(format!("panic in fragment execution: {msg}"))
-            })
-        };
-        if let Some(p) = profiler_for_wall.as_ref() {
-            let elapsed_ns =
-                crate::runtime::profile::clamp_u128_to_i64(wall_start.elapsed().as_nanos());
-            p.counter_set("QueryExecutionWallTime", ProfileUnit::TimeNs, elapsed_ns);
+    Ok(registered)
+}
+
+fn unregister_fragment_reports(query_id: QueryId, registered: &[UniqueId]) {
+    for finst_id in registered.iter().rev() {
+        fe_report::unregister_instance(*finst_id);
+        record_report_unregistration(query_id, *finst_id);
+    }
+}
+
+fn rollback_committed_launch(
+    workers: Vec<DormantWorker>,
+    start_gate: &BatchStartGate,
+    queries: &StarRocksFragmentQueryRuntime,
+    execution: StarRocksFragmentExecution,
+    finst_ids: &[UniqueId],
+    registered_reports: &[UniqueId],
+) {
+    unregister_fragment_reports(execution.query_id(), registered_reports);
+    queries.rollback_handoff(execution, finst_ids);
+    start_gate.abort();
+    join_dormant_workers(workers);
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BatchStartState {
+    #[default]
+    Pending,
+    Started,
+    Aborted,
+}
+
+#[derive(Debug, Default)]
+struct BatchStartGate {
+    state: Mutex<BatchStartState>,
+    changed: Condvar,
+}
+
+impl BatchStartGate {
+    fn wait(&self) -> BatchStartState {
+        let mut state = self.state.lock().expect("batch start gate lock");
+        while *state == BatchStartState::Pending {
+            state = self
+                .changed
+                .wait(state)
+                .expect("batch start gate wait lock");
         }
-        let mut report_error: Option<String> = None;
-        if uses_fetch_result_buffer {
-            match out {
-                Ok(out) => {
-                    if let Some(json) = out.profile_json.as_deref() {
-                        info!(
-                            target: "novarocks::profile",
-                            finst_id = %finst_id,
-                            profile_bytes = json.len(),
-                            "fragment_profile"
-                        );
-                    }
+        *state
+    }
+
+    fn start(&self) {
+        *self.state.lock().expect("batch start gate lock") = BatchStartState::Started;
+        self.changed.notify_all();
+    }
+
+    fn abort(&self) {
+        *self.state.lock().expect("batch start gate lock") = BatchStartState::Aborted;
+        self.changed.notify_all();
+    }
+}
+
+struct DormantWorker {
+    finst_id: UniqueId,
+    profiler: Option<Profiler>,
+    query_mem_tracker: Arc<MemTracker>,
+    fragment_mem_tracker: Arc<MemTracker>,
+    backend_num: i32,
+    enable_profile: bool,
+    report_interval_ns: Option<i64>,
+    report_destination: Option<StarRocksReportDestination>,
+    join: std::thread::JoinHandle<()>,
+}
+
+impl DormantWorker {
+    fn detach(self) {
+        drop(self.join);
+    }
+}
+
+#[derive(Default)]
+struct CompatFragmentControls {
+    running: std::sync::Mutex<HashMap<UniqueId, (QueryId, RunningFragmentHandle)>>,
+}
+
+impl CompatFragmentControls {
+    fn publish(&self, query_id: QueryId, finst_id: UniqueId, handle: RunningFragmentHandle) {
+        self.running
+            .lock()
+            .expect("compat fragment controls lock")
+            .insert(finst_id, (query_id, handle));
+    }
+
+    fn remove(&self, finst_id: UniqueId) {
+        self.running
+            .lock()
+            .expect("compat fragment controls lock")
+            .remove(&finst_id);
+    }
+
+    fn cancel_query(&self, query_id: QueryId, reason: &str) {
+        let handles = self
+            .running
+            .lock()
+            .expect("compat fragment controls lock")
+            .values()
+            .filter_map(|(current, handle)| (*current == query_id).then(|| handle.clone()))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.cancel(FragmentCancelReason::new(reason));
+        }
+    }
+
+    fn cancel_fragment(&self, finst_id: UniqueId, reason: &str) {
+        let query_id = self
+            .running
+            .lock()
+            .expect("compat fragment controls lock")
+            .get(&finst_id)
+            .map(|(query_id, _)| *query_id);
+        if let Some(query_id) = query_id {
+            self.cancel_query(query_id, reason);
+        }
+    }
+}
+
+fn compat_fragment_controls() -> &'static CompatFragmentControls {
+    static CONTROLS: OnceLock<CompatFragmentControls> = OnceLock::new();
+    CONTROLS.get_or_init(CompatFragmentControls::default)
+}
+
+pub fn cancel_fragment(finst_id: UniqueId) {
+    compat_fragment_controls()
+        .cancel_fragment(finst_id, &format!("query canceled by FE: finst={finst_id}"));
+}
+
+fn spawn_dormant_workers(
+    launches: Vec<PreparedLaunchResources>,
+    execution: StarRocksFragmentExecution,
+    queries: StarRocksFragmentQueryRuntime,
+    start_gate: Arc<BatchStartGate>,
+) -> Result<Vec<DormantWorker>, String> {
+    let mut workers: Vec<DormantWorker> = Vec::with_capacity(launches.len());
+    for launch in launches {
+        let finst_id = launch.finst_id;
+        let query_id = execution.query_id();
+        let profiler_for_wall = launch.profiler.clone();
+        let queries = queries.clone();
+        let worker_start_gate = Arc::clone(&start_gate);
+        let join = match std::thread::Builder::new()
+            .name(format!(
+                "compat-fragment-{:x}-{:x}",
+                finst_id.hi, finst_id.lo
+            ))
+            .spawn(move || {
+                if worker_start_gate.wait() == BatchStartState::Aborted {
+                    return;
                 }
-                Err(e) => {
-                    report_error = Some(e.clone());
+                record_fragment_launch(query_id);
+                let wall_start = std::time::Instant::now();
+                let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _lookup_close_guard = LookupCloseGuard {
+                        query_id,
+                        targets: launch.lookup_close_targets,
+                    };
+                    let running = launch.dormant.start();
+                    compat_fragment_controls().publish(query_id, finst_id, running.clone());
+                    let fact = running.join();
+                    compat_fragment_controls().remove(finst_id);
+                    (running, fact)
+                }));
+                let (running, report_error) = match completion {
+                    Ok((running, fact)) => {
+                        let error = match fact.outcome() {
+                            FragmentOutcome::Succeeded => {
+                                running.handoff_sink_commit();
+                                None
+                            }
+                            FragmentOutcome::Failed(error) => Some(error.to_string()),
+                            FragmentOutcome::Cancelled { reason } => {
+                                Some(format!("fragment cancelled: {}", reason.detail()))
+                            }
+                        };
+                        (Some(running), error)
+                    }
+                    Err(payload) => {
+                        compat_fragment_controls().remove(finst_id);
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        (None, Some(format!("panic in fragment execution: {msg}")))
+                    }
+                };
+                if let Some(profiler) = profiler_for_wall.as_ref() {
+                    let elapsed_ns = novarocks::runtime::profile::clamp_u128_to_i64(
+                        wall_start.elapsed().as_nanos(),
+                    );
+                    profiler.counter_set("QueryExecutionWallTime", ProfileUnit::TimeNs, elapsed_ns);
+                }
+                if let Some(error_message) = report_error.as_ref() {
                     error!(
                         target: "novarocks::exec",
                         finst_id = %finst_id,
-                        error = %e,
+                        error = %error_message,
                         "exec_plan_fragment failed"
                     );
-                    result_buffer::close_error(finst_id, e);
                 }
-            }
-        } else if let Err(e) = out {
-            report_error = Some(e.clone());
-            error!(
-                target: "novarocks::exec",
-                finst_id = %finst_id,
-                error = %e,
-                "exec_plan_fragment failed"
-            );
-        }
-        run_async_cleanup_sequence(
-            report_error,
-            |err_msg| {
-                let finsts = mgr.cancel_query_execution(execution, err_msg.to_string());
-                for id in finsts {
-                    result_buffer::close_error(id, err_msg.to_string());
-                    exchange::cancel_fragment(id.hi, id.lo);
-                }
-            },
-            || mgr.finish_fragment_for_report_execution(execution),
-            |error, decision| {
-                fe_report::report_fragment_done(
-                    finst_id,
-                    error,
-                    decision.include_runtime_filter_profile,
+                run_async_cleanup_sequence(
+                    report_error,
+                    |error| {
+                        compat_fragment_controls().cancel_query(query_id, error);
+                        for id in queries.cancel_query(execution, error.to_string()) {
+                            exchange::cancel_fragment(id.hi, id.lo);
+                        }
+                    },
+                    || queries.finish_fragment_for_report(execution),
+                    |error, decision| {
+                        fe_report::report_fragment_done(
+                            finst_id,
+                            error,
+                            decision.include_runtime_filter_profile(),
+                        );
+                    },
+                    || exchange::remove_fragment(finst_id.hi, finst_id.lo),
+                    || queries.unregister_fragment(finst_id, execution),
+                    |decision| queries.cleanup_after_fragment_report(query_id, decision),
                 );
-            },
-            || exchange::remove_fragment(finst_id.hi, finst_id.lo),
-            || mgr.unregister_finst_execution(finst_id, execution),
-            |decision| mgr.cleanup_after_fragment_report(query_id, decision),
-        );
-    });
+                drop(running);
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                start_gate.abort();
+                join_dormant_workers(workers);
+                return Err(format!(
+                    "spawn StarRocks fragment adapter worker failed: {error}"
+                ));
+            }
+        };
+        workers.push(DormantWorker {
+            finst_id,
+            profiler: launch.profiler,
+            query_mem_tracker: launch.query_mem_tracker,
+            fragment_mem_tracker: launch.fragment_mem_tracker,
+            backend_num: launch.backend_num,
+            enable_profile: launch.enable_profile,
+            report_interval_ns: launch.report_interval_ns,
+            report_destination: launch.report_destination,
+            join,
+        });
+    }
+    Ok(workers)
+}
+
+fn abort_dormant_workers(workers: Vec<DormantWorker>) {
+    join_dormant_workers(workers);
+}
+
+fn join_dormant_workers(workers: Vec<DormantWorker>) {
+    for worker in workers.into_iter().rev() {
+        let _ = worker.join.join();
+    }
 }
 
 fn run_async_cleanup_sequence<T>(
@@ -1115,10 +1321,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             "missing fragment in exec_batch_plan_fragments unique instance".to_string()
         })?;
 
-        let query_id = QueryId {
-            hi: exec_params.query_id.hi,
-            lo: exec_params.query_id.lo,
-        };
+        let query_id = QueryId::new(exec_params.query_id.hi, exec_params.query_id.lo);
         if let Some(existing) = query_id_for_batch {
             if existing != query_id {
                 return Err("mixed query_id in exec_batch_plan_fragments".to_string());
@@ -1232,10 +1435,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         hi: params.fragment_instance_id.hi,
         lo: params.fragment_instance_id.lo,
     };
-    let query_id = QueryId {
-        hi: params.query_id.hi,
-        lo: params.query_id.lo,
-    };
+    let query_id = QueryId::new(params.query_id.hi, params.query_id.lo);
     let mut params = params.clone();
     backfill_per_node_scan_ranges(&mut params);
     let descriptor_preparation = prepare_descriptor(query_id, one.desc_tbl.as_ref(), None)?;
@@ -1278,14 +1478,9 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SyncExecPlanResult {
-    pub(crate) finst_id: UniqueId,
-}
-
-pub(crate) fn execute_plan_fragment_sync(
+pub fn execute_plan_fragment_sync(
     one: internal_service::TExecPlanFragmentParams,
-) -> Result<SyncExecPlanResult, String> {
+) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
     let Some(params) = one.params.as_ref() else {
         return Err("missing params in TExecPlanFragmentParams".to_string());
     };
@@ -1297,10 +1492,7 @@ pub(crate) fn execute_plan_fragment_sync(
         hi: params.fragment_instance_id.hi,
         lo: params.fragment_instance_id.lo,
     };
-    let query_id = QueryId {
-        hi: params.query_id.hi,
-        lo: params.query_id.lo,
-    };
+    let query_id = QueryId::new(params.query_id.hi, params.query_id.lo);
 
     let mut params = params.clone();
     backfill_per_node_scan_ranges(&mut params);
@@ -1341,11 +1533,6 @@ pub(crate) fn execute_plan_fragment_sync(
     let resolved = resolve_starrocks_draft(&draft, &token)?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
 
-    let runtime_metadata = StarRocksExecutionMetadata {
-        result_override: prepared.metadata.result_override().cloned(),
-        root_sink_dop: prepared.metadata.root_sink_dop(),
-        group_execution_scan_dop: prepared.metadata.group_execution_scan_dop(),
-    };
     let lookup_close_targets = prepared
         .metadata
         .lookup_close_targets()
@@ -1357,122 +1544,116 @@ pub(crate) fn execute_plan_fragment_sync(
         })
         .collect();
 
-    let mgr = query_context_manager();
     let handoff = prepare_query_handoff(
         std::slice::from_ref(&prepared),
         descriptor_preparation.generation(),
     )?;
-    let execution = handoff.execution;
+    let execution = handoff.execution();
+    let queries = StarRocksFragmentQueryRuntime::global();
+    let admission = queries.prepare_admission(
+        handoff.query_id(),
+        handoff.delivery_expire(),
+        handoff.query_expire(),
+        handoff.cache_options(),
+    )?;
+    let fragment_mem_tracker = admission.fragment_mem_tracker(finst_id);
+    let prepare_context = prepared
+        .metadata
+        .into_prepare_context(None, Some(Arc::clone(&fragment_mem_tracker)));
+    let dormant = prepare_fragment(prepared.submission, prepare_context)
+        .map_err(|error| error.to_string())?;
     let query_mem_tracker = guard.handoff(|| {
         commit_descriptor_handoff(&descriptor_preparation, |lease_factory| {
-            mgr.commit_starrocks_handoff(handoff, || {
+            queries.commit_handoff(handoff, || {
                 lease_factory.map(|factory| factory.into_cleanup_lease())
             })
         })
     })?;
-    let fragment_mem_tracker = MemTracker::new_child(
-        format!("fragment_{:x}_{:x}", finst_id.hi, finst_id.lo),
+    debug_assert!(Arc::ptr_eq(
         &query_mem_tracker,
-    );
-
-    crate::runtime::sink_commit::register(finst_id);
-    let exec_result = {
+        &admission.query_mem_tracker()
+    ));
+    let execution_result = {
         let _lookup_close_guard = LookupCloseGuard {
             query_id,
             targets: lookup_close_targets,
         };
-        execute_starrocks_submission(
-            prepared.submission,
-            runtime_metadata,
-            StarRocksExecutionContext {
-                profiler: None,
-                mem_tracker: Some(fragment_mem_tracker),
-            },
-        )
-        .map_err(|error| error.to_string())
+        let running = dormant.start();
+        let fact = running.join();
+        let result = match fact.outcome() {
+            FragmentOutcome::Succeeded => {
+                running.handoff_sink_commit();
+                Ok(())
+            }
+            FragmentOutcome::Failed(error) => Err(error.to_string()),
+            FragmentOutcome::Cancelled { reason } => {
+                Err(format!("fragment cancelled: {}", reason.detail()))
+            }
+        };
+        drop(running);
+        result
     };
     exchange::remove_fragment(finst_id.hi, finst_id.lo);
-    mgr.unregister_finst_execution(finst_id, execution);
-    mgr.finish_fragment_execution(execution);
+    queries.unregister_fragment(finst_id, execution);
+    queries.finish_fragment(execution);
+    drop(admission);
 
-    match exec_result {
-        Ok(_) => Ok(SyncExecPlanResult { finst_id }),
-        Err(err) => {
-            crate::runtime::sink_commit::unregister(finst_id);
-            Err(err)
-        }
+    match execution_result {
+        Ok(()) => Ok(
+            novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult::new(finst_id),
+        ),
+        Err(error) => Err(error),
     }
 }
 
 fn resolve_pipeline_dop(request: &internal_service::TExecPlanFragmentParams) -> i32 {
     // Align with StarRocks: pipeline_dop is a per-fragment-instance (unique request) parameter.
-    crate::runtime::exec_env::calc_pipeline_dop(request.pipeline_dop.unwrap_or(0))
+    novarocks::runtime::exec_env::calc_pipeline_dop(request.pipeline_dop.unwrap_or(0))
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    use crate::common::thrift::{thrift_binary_deserialize, thrift_binary_serialize};
-    use crate::common::types::UniqueId;
-    use crate::runtime::query_context::{QueryId, query_context_manager};
-    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
-    use crate::service::starrocks_fragment_transport::{
-        descriptor_cache_snapshot_count, starrocks_prelaunch_registry,
-    };
-    use crate::thrift::{data_sinks, internal_service, partitions, plan_nodes, planner, types};
+    use novarocks::common::thrift::{thrift_binary_deserialize, thrift_binary_serialize};
+    use novarocks::common::types::UniqueId;
+    use novarocks::runtime::query_context::QueryId;
+    use novarocks::thrift::{data_sinks, internal_service, partitions, plan_nodes, planner, types};
 
     use super::{
-        TEST_FRAGMENT_LAUNCH_COUNT, run_async_cleanup_sequence, submit_exec_batch_plan_fragments,
-        submit_exec_plan_fragment,
+        AdapterFailurePlan, AdapterFailureStage, TEST_FRAGMENT_LAUNCH_COUNT,
+        fragment_launch_count_for_query, registered_reports_for_query, run_async_cleanup_sequence,
+        set_adapter_failure, submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
     };
 
-    #[derive(Debug, Eq, PartialEq)]
-    struct RegistrationSnapshot {
-        query_context: bool,
-        finst_mapping: Option<QueryId>,
-        reporter: bool,
-        launch_count: usize,
-    }
+    static FAILURE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    #[derive(Debug, Eq, PartialEq)]
-    struct HandoffSnapshot {
-        prelaunch_count: usize,
-        descriptor_cache_count: usize,
-        fragment_counts: Option<(usize, usize)>,
-        finst_mappings: Vec<Option<QueryId>>,
-        runtime_filter_lifecycle: bool,
-        launch_count: usize,
-    }
+    struct AdapterFailureReset;
 
-    fn handoff_snapshot(query_id: QueryId, finst_ids: &[UniqueId]) -> HandoffSnapshot {
-        HandoffSnapshot {
-            prelaunch_count: starrocks_prelaunch_registry().snapshot_count(),
-            descriptor_cache_count: descriptor_cache_snapshot_count(),
-            fragment_counts: query_context_manager().fragment_counts_for_test(query_id),
-            finst_mappings: finst_ids
-                .iter()
-                .map(|finst_id| query_context_manager().query_id_by_finst(*finst_id))
-                .collect(),
-            runtime_filter_lifecycle: RuntimeFilterLifecycleRegistry::global()
-                .snapshot(QueryKey::from_hi_lo(query_id.hi, query_id.lo))
-                .is_some(),
-            launch_count: TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst),
+    impl Drop for AdapterFailureReset {
+        fn drop(&mut self) {
+            set_adapter_failure(None);
         }
     }
 
-    fn registration_snapshot(query_id: QueryId, finst_id: UniqueId) -> RegistrationSnapshot {
-        RegistrationSnapshot {
-            query_context: query_context_manager()
-                .with_context_mut(query_id, |_| Ok(()))
-                .is_ok(),
-            finst_mapping: query_context_manager().query_id_by_finst(finst_id),
-            reporter: crate::service::fe_report::list_report_instances()
-                .iter()
-                .any(|(registered, _)| *registered == finst_id),
-            launch_count: TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst),
-        }
+    fn inject_failure(
+        query: UniqueId,
+        stage: AdapterFailureStage,
+        index: usize,
+    ) -> AdapterFailureReset {
+        set_adapter_failure(Some(AdapterFailurePlan {
+            query_id: runtime_query_id(query),
+            stage,
+            index,
+        }));
+        AdapterFailureReset
+    }
+
+    fn runtime_query_id(query: UniqueId) -> QueryId {
+        QueryId::new(query.hi, query.lo)
     }
 
     fn empty_set_node() -> plan_nodes::TPlanNode {
@@ -1642,6 +1823,43 @@ mod tests {
         options
     }
 
+    fn valid_batch(
+        query: UniqueId,
+        finst_ids: &[UniqueId],
+        report_to_coordinator: bool,
+    ) -> internal_service::TExecBatchPlanFragmentsParams {
+        let requests = finst_ids
+            .iter()
+            .map(|finst_id| {
+                let mut request = request(
+                    query,
+                    *finst_id,
+                    fragment(Some(plan_nodes::TPlan::new(vec![empty_set_node()]))),
+                );
+                if report_to_coordinator {
+                    request.coord =
+                        Some(types::TNetworkAddress::new("127.0.0.1".to_string(), 65_000));
+                }
+                request
+            })
+            .collect();
+        internal_service::TExecBatchPlanFragmentsParams::new(None, Some(requests))
+    }
+
+    fn wait_for_query_launches(query_id: UniqueId, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fragment_launch_count_for_query(runtime_query_id(query_id)) < expected
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fragment_launch_count_for_query(runtime_query_id(query_id)),
+            expected,
+            "timed out waiting for fragment launches"
+        );
+    }
+
     #[test]
     fn malformed_fragment_fails_before_registration() {
         let query = UniqueId {
@@ -1653,30 +1871,18 @@ mod tests {
             lo: 85_004,
         };
         let request = request(query, finst, fragment(None));
-        let before = registration_snapshot(
-            QueryId {
-                hi: query.hi,
-                lo: query.lo,
-            },
-            finst,
-        );
+        let before = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
 
         let result = submit_exec_plan_fragment(
             &thrift_binary_serialize(&request).expect("serialize malformed request"),
         );
-        let after = registration_snapshot(
-            QueryId {
-                hi: query.hi,
-                lo: query.lo,
-            },
-            finst,
-        );
+        let after = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
 
         assert!(
             result.is_err(),
             "malformed fragment must fail synchronously"
         );
-        assert_eq!(after, before, "decode failure must not register or launch");
+        assert_eq!(after, before, "decode failure must not launch");
     }
 
     #[test]
@@ -1718,11 +1924,6 @@ mod tests {
             after, before,
             "batch must launch no fragment on decode failure"
         );
-        assert_eq!(query_context_manager().query_id_by_finst(first_finst), None);
-        assert_eq!(
-            query_context_manager().query_id_by_finst(second_finst),
-            None
-        );
     }
 
     #[test]
@@ -1730,10 +1931,6 @@ mod tests {
         let query = UniqueId {
             hi: 85_111,
             lo: 85_112,
-        };
-        let query_id = QueryId {
-            hi: query.hi,
-            lo: query.lo,
         };
         let first_finst = UniqueId {
             hi: 85_113,
@@ -1750,13 +1947,12 @@ mod tests {
         second.query_options = Some(query_options_with_cache_probability(20));
         let batch =
             internal_service::TExecBatchPlanFragmentsParams::new(None, Some(vec![first, second]));
-        let finst_ids = [first_finst, second_finst];
-        let before = handoff_snapshot(query_id, &finst_ids);
+        let before = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
 
         let result = submit_exec_batch_plan_fragments(
             &thrift_binary_serialize(&batch).expect("serialize cache-conflict batch"),
         );
-        let after = handoff_snapshot(query_id, &finst_ids);
+        let after = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
 
         assert!(
             result
@@ -1766,8 +1962,158 @@ mod tests {
         );
         assert_eq!(
             after, before,
-            "handoff validation failure must leave P/D/Q/RF/mapping/launch unchanged"
+            "handoff validation failure must not launch a driver"
         );
+    }
+
+    #[test]
+    fn nth_prepare_failure_compensates_batch_and_allows_retry() {
+        let _failure_lock = FAILURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let query = UniqueId {
+            hi: 85_201,
+            lo: 85_202,
+        };
+        let finst_ids = [
+            UniqueId {
+                hi: 85_203,
+                lo: 85_204,
+            },
+            UniqueId {
+                hi: 85_205,
+                lo: 85_206,
+            },
+        ];
+        let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, false))
+            .expect("serialize prepare failure batch");
+        let reset = inject_failure(query, AdapterFailureStage::Prepare, 2);
+
+        let result = submit_exec_batch_plan_fragments(&bytes);
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("prepare failure at index 2")),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(
+            fragment_launch_count_for_query(runtime_query_id(query)),
+            0,
+            "prepare failure must not launch any driver"
+        );
+        drop(reset);
+
+        assert_eq!(
+            submit_exec_batch_plan_fragments(&bytes),
+            Ok(2),
+            "compensated prepare failure must leave the batch retryable"
+        );
+        wait_for_query_launches(query, 2);
+    }
+
+    #[test]
+    fn nth_report_registration_failure_unregisters_reports_and_rolls_back_handoff() {
+        let _failure_lock = FAILURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let query = UniqueId {
+            hi: 85_211,
+            lo: 85_212,
+        };
+        let finst_ids = [
+            UniqueId {
+                hi: 85_213,
+                lo: 85_214,
+            },
+            UniqueId {
+                hi: 85_215,
+                lo: 85_216,
+            },
+        ];
+        let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, true))
+            .expect("serialize report registration failure batch");
+        let reset = inject_failure(query, AdapterFailureStage::ReportRegistration, 2);
+
+        let result = submit_exec_batch_plan_fragments(&bytes);
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("report registration failure at index 2")),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(
+            fragment_launch_count_for_query(runtime_query_id(query)),
+            0,
+            "report registration failure must not launch any driver"
+        );
+        assert!(
+            registered_reports_for_query(runtime_query_id(query)).is_empty(),
+            "partial report registration must be reversed"
+        );
+
+        drop(reset);
+        let reset = inject_failure(query, AdapterFailureStage::Start, 1);
+        let retry = submit_exec_batch_plan_fragments(&bytes);
+        assert!(
+            retry
+                .as_ref()
+                .is_err_and(|error| error.contains("start failure at index 1")),
+            "rollback must leave the same fragment IDs retryable: {retry:?}"
+        );
+        assert!(registered_reports_for_query(runtime_query_id(query)).is_empty());
+        drop(reset);
+    }
+
+    #[test]
+    fn nth_start_failure_releases_whole_batch_before_any_driver_starts() {
+        let _failure_lock = FAILURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let query = UniqueId {
+            hi: 85_221,
+            lo: 85_222,
+        };
+        let finst_ids = [
+            UniqueId {
+                hi: 85_223,
+                lo: 85_224,
+            },
+            UniqueId {
+                hi: 85_225,
+                lo: 85_226,
+            },
+            UniqueId {
+                hi: 85_227,
+                lo: 85_228,
+            },
+        ];
+        let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, false))
+            .expect("serialize start failure batch");
+        let reset = inject_failure(query, AdapterFailureStage::Start, 2);
+
+        let result = submit_exec_batch_plan_fragments(&bytes);
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("start failure at index 2")),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(
+            fragment_launch_count_for_query(runtime_query_id(query)),
+            0,
+            "shared start gate must keep all drivers dormant"
+        );
+        drop(reset);
+
+        assert_eq!(
+            submit_exec_batch_plan_fragments(&bytes),
+            Ok(3),
+            "full start compensation must leave the batch retryable"
+        );
+        wait_for_query_launches(query, 3);
     }
 
     #[test]

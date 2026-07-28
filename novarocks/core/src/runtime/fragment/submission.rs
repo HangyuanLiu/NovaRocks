@@ -76,10 +76,35 @@ impl FragmentSubmission {
     }
 
     #[cfg(feature = "compat")]
-    pub(crate) fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
+    pub fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
         let mut contracts = HashMap::new();
         collect_incremental_scan_contracts(&self.program.plan().root, &mut contracts);
         contracts
+    }
+
+    pub fn root_plan_node_id(&self) -> i32 {
+        self.program.root_plan_node_id().get()
+    }
+
+    pub const fn query_id(&self) -> crate::runtime::query_context::QueryId {
+        self.instance.query_id()
+    }
+
+    pub const fn fragment_instance_id(&self) -> crate::common::types::UniqueId {
+        self.instance.fragment_instance_id().get()
+    }
+
+    pub const fn backend_num(&self) -> i32 {
+        self.instance.backend_num().get()
+    }
+
+    pub fn query_options(&self) -> &crate::runtime::query_options::QueryOptions {
+        self.instance.runtime_options().query_options()
+    }
+
+    pub fn uses_split_data_stream_sink(&self) -> bool {
+        self.program.sink().kind()
+            == crate::exec::fragment::program::FragmentSinkKind::SplitDataStream
     }
 }
 

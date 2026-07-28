@@ -33,7 +33,7 @@ pub mod fs;
 pub mod lower;
 pub mod meta;
 pub mod mv;
-pub(crate) mod protocol;
+pub mod protocol;
 pub mod runtime;
 pub(crate) mod runtime_filter;
 pub mod server;
@@ -59,9 +59,6 @@ pub use service::grpc_server::start_grpc_exchange_server;
 pub use service::grpc_server::start_grpc_server;
 #[cfg(not(feature = "compat"))]
 pub use service::grpc_server::start_grpc_server_with_native_fragment_ingress;
-#[cfg(feature = "compat")]
-pub use service::internal_service::{submit_exec_batch_plan_fragments, submit_exec_plan_fragment};
-
 pub(crate) fn cancel_query_by_id(query_id: crate::runtime::query_context::QueryId, reason: String) {
     let finsts =
         crate::runtime::query_context::query_context_manager().cancel_query(query_id, reason);

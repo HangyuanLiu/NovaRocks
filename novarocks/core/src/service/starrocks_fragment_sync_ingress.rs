@@ -15,7 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod endpoint;
-pub(crate) mod options;
-pub mod request;
-pub(crate) mod sink;
+use crate::common::types::UniqueId;
+use crate::thrift::internal_service;
+
+#[derive(Clone, Debug)]
+pub struct SyncExecPlanResult {
+    fragment_instance_id: UniqueId,
+}
+
+impl SyncExecPlanResult {
+    pub const fn new(fragment_instance_id: UniqueId) -> Self {
+        Self {
+            fragment_instance_id,
+        }
+    }
+
+    pub const fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
+    }
+}
+
+pub trait StarRocksFragmentSyncIngress: Send + Sync + 'static {
+    fn execute(
+        &self,
+        request: internal_service::TExecPlanFragmentParams,
+    ) -> Result<SyncExecPlanResult, String>;
+}

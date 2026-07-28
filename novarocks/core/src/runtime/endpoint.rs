@@ -41,7 +41,7 @@ impl RuntimeEndpoint {
         Ok(Self { host, port })
     }
 
-    pub(crate) fn host(&self) -> &str {
+    pub fn host(&self) -> &str {
         &self.host
     }
 
@@ -49,7 +49,7 @@ impl RuntimeEndpoint {
         self.host.capacity()
     }
 
-    pub(crate) fn port(&self) -> i32 {
+    pub fn port(&self) -> i32 {
         self.port
     }
 

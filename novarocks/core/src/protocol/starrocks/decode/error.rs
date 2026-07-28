@@ -22,14 +22,14 @@ use crate::exec::fragment::error::{ExecPlanBuildError, FragmentBindingError};
 use crate::protocol::common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StarRocksDependencyContractError {
+pub struct StarRocksDependencyContractError {
     kind: StarRocksDependencyContractErrorKind,
     dependency_id: u64,
     detail: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StarRocksDependencyContractErrorKind {
+pub enum StarRocksDependencyContractErrorKind {
     Missing,
     Extra,
     WrongKind,
@@ -70,7 +70,8 @@ impl fmt::Display for StarRocksDependencyContractError {
 impl Error for StarRocksDependencyContractError {}
 
 #[derive(Debug)]
-pub(crate) enum StarRocksFragmentDecodeError {
+#[allow(private_interfaces)]
+pub enum StarRocksFragmentDecodeError {
     Protocol(ProtocolError),
     Plan(ExecPlanBuildError),
     DependencyContract(StarRocksDependencyContractError),

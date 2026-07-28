@@ -96,6 +96,11 @@ impl SinkCommitLease {
         }
         Ok(())
     }
+
+    fn handoff(&mut self) {
+        self.active = false;
+        self.cleanup_should_fail = false;
+    }
 }
 
 impl Drop for SinkCommitLease {
@@ -344,6 +349,12 @@ impl FragmentResources {
         }
         if let Some(mut result) = self.result.take() {
             result.finish_success();
+        }
+    }
+
+    pub(crate) fn handoff_sink_commit(&mut self) {
+        if let Some(mut sink_commit) = self.sink_commit.take() {
+            sink_commit.handoff();
         }
     }
 

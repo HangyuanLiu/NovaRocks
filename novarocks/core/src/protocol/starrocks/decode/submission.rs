@@ -59,25 +59,25 @@ use super::node::{
 };
 use super::sink::fragment::{DecodedStarRocksFragmentSink, decode_fragment_sink};
 
-pub(crate) struct StarRocksDecodeInput<'a> {
-    pub(crate) fragment: &'a planner::TPlanFragment,
-    pub(crate) descriptors: Option<&'a descriptors::TDescriptorTable>,
-    pub(crate) params: &'a internal_service::TPlanFragmentExecParams,
-    pub(crate) query_options: Option<&'a internal_service::TQueryOptions>,
-    pub(crate) query_globals: Option<&'a internal_service::TQueryGlobals>,
-    pub(crate) db_name: Option<&'a str>,
-    pub(crate) coord: Option<&'a types::TNetworkAddress>,
-    pub(crate) novarocks_report_endpoint: Option<&'a RuntimeEndpoint>,
-    pub(crate) backend_num: Option<i32>,
-    pub(crate) pipeline_dop: i32,
-    pub(crate) group_execution_scan_dop: Option<i32>,
-    pub(crate) batch_exchange_sender_counts: &'a HashMap<i32, usize>,
-    pub(crate) typed_result_sink: bool,
-    pub(crate) facts: &'a StarRocksDecodeFacts,
+pub struct StarRocksDecodeInput<'a> {
+    pub fragment: &'a planner::TPlanFragment,
+    pub descriptors: Option<&'a descriptors::TDescriptorTable>,
+    pub params: &'a internal_service::TPlanFragmentExecParams,
+    pub query_options: Option<&'a internal_service::TQueryOptions>,
+    pub query_globals: Option<&'a internal_service::TQueryGlobals>,
+    pub db_name: Option<&'a str>,
+    pub coord: Option<&'a types::TNetworkAddress>,
+    pub novarocks_report_endpoint: Option<&'a RuntimeEndpoint>,
+    pub backend_num: Option<i32>,
+    pub pipeline_dop: i32,
+    pub group_execution_scan_dop: Option<i32>,
+    pub batch_exchange_sender_counts: &'a HashMap<i32, usize>,
+    pub typed_result_sink: bool,
+    pub facts: &'a StarRocksDecodeFacts,
 }
 
 #[derive(Debug)]
-pub(crate) struct StarRocksFragmentDraft {
+pub struct StarRocksFragmentDraft {
     parts: DecodedDraftParts,
     external_dependencies: Vec<StarRocksExternalDependency>,
     query_profile_patches: Vec<QueryProfilePatch>,
@@ -86,7 +86,7 @@ pub(crate) struct StarRocksFragmentDraft {
 }
 
 impl StarRocksFragmentDraft {
-    pub(crate) fn external_dependencies(&self) -> &[StarRocksExternalDependency] {
+    pub fn external_dependencies(&self) -> &[StarRocksExternalDependency] {
         &self.external_dependencies
     }
 
@@ -97,19 +97,19 @@ impl StarRocksFragmentDraft {
 }
 
 #[derive(Debug)]
-pub(crate) struct DecodedStarRocksFragment {
+pub struct DecodedStarRocksFragment {
     submission: FragmentSubmission,
     metadata: StarRocksSubmissionMetadata,
 }
 
 impl DecodedStarRocksFragment {
-    pub(crate) fn into_parts(self) -> (FragmentSubmission, StarRocksSubmissionMetadata) {
+    pub fn into_parts(self) -> (FragmentSubmission, StarRocksSubmissionMetadata) {
         (self.submission, self.metadata)
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StarRocksSubmissionMetadata {
+pub struct StarRocksSubmissionMetadata {
     descriptor_snapshot: Option<DescriptorSnapshot>,
     row_position_descriptors: HashMap<i32, RowPositionDescriptor>,
     result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
@@ -121,38 +121,38 @@ pub(crate) struct StarRocksSubmissionMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum StarRocksReportDestination {
+pub enum StarRocksReportDestination {
     NovaRocks(RuntimeEndpoint),
     Coordinator(RuntimeEndpoint),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct StarRocksLookupCloseTarget {
+pub struct StarRocksLookupCloseTarget {
     lookup_node_id: i32,
     host: String,
     port: u16,
 }
 
 impl StarRocksLookupCloseTarget {
-    pub(crate) const fn lookup_node_id(&self) -> i32 {
+    pub const fn lookup_node_id(&self) -> i32 {
         self.lookup_node_id
     }
 
-    pub(crate) fn host(&self) -> &str {
+    pub fn host(&self) -> &str {
         &self.host
     }
 
-    pub(crate) const fn port(&self) -> u16 {
+    pub const fn port(&self) -> u16 {
         self.port
     }
 }
 
 impl StarRocksSubmissionMetadata {
-    pub(crate) fn descriptor_snapshot(&self) -> Option<&DescriptorSnapshot> {
+    pub fn descriptor_snapshot(&self) -> Option<&DescriptorSnapshot> {
         self.descriptor_snapshot.as_ref()
     }
 
-    pub(crate) fn row_position_descriptors(&self) -> &HashMap<i32, RowPositionDescriptor> {
+    pub fn row_position_descriptors(&self) -> &HashMap<i32, RowPositionDescriptor> {
         &self.row_position_descriptors
     }
 
@@ -162,24 +162,38 @@ impl StarRocksSubmissionMetadata {
         self.result_override.as_ref()
     }
 
-    pub(crate) const fn root_sink_dop(&self) -> Option<i32> {
+    pub const fn root_sink_dop(&self) -> Option<i32> {
         self.root_sink_dop
     }
 
-    pub(crate) const fn group_execution_scan_dop(&self) -> Option<i32> {
+    pub const fn group_execution_scan_dop(&self) -> Option<i32> {
         self.group_execution_scan_dop
     }
 
-    pub(crate) fn report_destination(&self) -> Option<&StarRocksReportDestination> {
+    pub fn report_destination(&self) -> Option<&StarRocksReportDestination> {
         self.report_destination.as_ref()
     }
 
-    pub(crate) fn lookup_fetcher_lifecycles(&self) -> &HashMap<i32, LookupFetcherLifecycle> {
+    pub fn lookup_fetcher_lifecycles(&self) -> &HashMap<i32, LookupFetcherLifecycle> {
         &self.lookup_fetcher_lifecycles
     }
 
-    pub(crate) fn lookup_close_targets(&self) -> &[StarRocksLookupCloseTarget] {
+    pub fn lookup_close_targets(&self) -> &[StarRocksLookupCloseTarget] {
         &self.lookup_close_targets
+    }
+
+    pub fn into_prepare_context(
+        &self,
+        profiler: Option<crate::runtime::profile::Profiler>,
+        mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
+    ) -> crate::runtime::fragment::FragmentPrepareContext {
+        crate::runtime::fragment::FragmentPrepareContext::new_with_execution_overrides(
+            profiler,
+            mem_tracker,
+            self.result_override.clone(),
+            self.root_sink_dop,
+            self.group_execution_scan_dop,
+        )
     }
 }
 
@@ -190,7 +204,7 @@ struct DecodedDraftParts {
     metadata: StarRocksSubmissionMetadata,
 }
 
-pub(crate) fn prepare_fragment_submission(
+pub fn prepare_fragment_submission(
     input: StarRocksDecodeInput<'_>,
 ) -> Result<StarRocksFragmentDraft, StarRocksFragmentDecodeError> {
     let instance = decode_input_instance(&input)?;
@@ -210,7 +224,7 @@ pub(crate) fn prepare_fragment_submission(
     })
 }
 
-pub(crate) fn finish_fragment_submission(
+pub fn finish_fragment_submission(
     mut draft: StarRocksFragmentDraft,
     resolved: StarRocksResolvedDependencies,
 ) -> Result<DecodedStarRocksFragment, StarRocksFragmentDecodeError> {

@@ -100,7 +100,7 @@ pub(crate) fn progress_report_call_count_for_test(finst_id: UniqueId) -> usize {
 }
 
 #[cfg(feature = "compat")]
-pub(crate) fn register_instance(
+pub fn register_instance(
     finst_id: UniqueId,
     query_id: QueryId,
     coord: types::TNetworkAddress,
@@ -122,6 +122,13 @@ pub(crate) fn register_instance(
         query_mem_tracker,
         report_interval_ns,
     );
+}
+
+pub fn unregister_instance(finst_id: UniqueId) {
+    registry()
+        .lock()
+        .expect("report registry lock")
+        .remove(&finst_id);
 }
 
 pub fn register_novarocks_instance(

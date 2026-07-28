@@ -134,7 +134,7 @@ enum QueryContextGeneration {
     StarRocks(StarRocksQueryGeneration),
 }
 
-pub(crate) struct QueryCleanupLease {
+pub struct QueryCleanupLease {
     release: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
@@ -193,6 +193,8 @@ pub(crate) struct QueryContext {
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
+    #[cfg(feature = "compat")]
+    starrocks_preparing_admissions: usize,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
 
@@ -338,7 +340,7 @@ impl fmt::Display for RuntimeFilterDeploymentInstallError {
 impl std::error::Error for RuntimeFilterDeploymentInstallError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LookupFetcherLifecycle {
+pub enum LookupFetcherLifecycle {
     Exact(usize),
     Unknown,
 }
@@ -391,6 +393,8 @@ impl QueryContext {
             lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
             mem_tracker,
+            #[cfg(feature = "compat")]
+            starrocks_preparing_admissions: 0,
             cleanup_leases: Vec::new(),
         }
     }
@@ -1916,6 +1920,64 @@ impl QueryContextManager {
         )
     }
 
+    #[cfg(feature = "compat")]
+    pub(crate) fn prepare_starrocks_admission(
+        &self,
+        query_id: QueryId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        cache_options: CacheOptions,
+    ) -> Result<Arc<MemTracker>, String> {
+        self.ensure_compat_context(query_id, false, delivery_expire, query_expire)?;
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let context = if guard.active.contains_key(&query_id) {
+            guard.active.get_mut(&query_id).expect("checked active")
+        } else {
+            guard
+                .second_chance
+                .get_mut(&query_id)
+                .ok_or_else(|| "QueryContext disappeared during StarRocks admission".to_string())?
+        };
+        context.set_cache_options(cache_options)?;
+        context.starrocks_preparing_admissions += 1;
+        Ok(context.mem_tracker())
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn release_starrocks_admission(&self, query_id: QueryId) {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let location = if guard.active.contains_key(&query_id) {
+            Some(true)
+        } else if guard.second_chance.contains_key(&query_id) {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(in_active) = location else {
+            return;
+        };
+        let context = if in_active {
+            guard.active.get_mut(&query_id).expect("checked active")
+        } else {
+            guard
+                .second_chance
+                .get_mut(&query_id)
+                .expect("checked second chance")
+        };
+        context.starrocks_preparing_admissions =
+            context.starrocks_preparing_admissions.saturating_sub(1);
+        let remove = context.starrocks_preparing_admissions == 0
+            && context.execution_generation == QueryContextGeneration::StarRocksUnbound
+            && context.num_fragments == 0;
+        if remove {
+            if in_active {
+                guard.active.remove(&query_id);
+            } else {
+                guard.second_chance.remove(&query_id);
+            }
+        }
+    }
+
     fn ensure_context(
         &self,
         query_id: QueryId,
@@ -2779,6 +2841,57 @@ impl QueryContextManager {
         guard.pending_incremental_scan_ranges.remove(&finst_id);
         #[cfg(feature = "compat")]
         guard.incremental_change_op_slots.remove(&finst_id);
+    }
+
+    /// Undo a StarRocks batch handoff before its shared start gate is released.
+    ///
+    /// The handoff publishes every fragment route and the query context atomically.
+    /// Its adapter-side rollback therefore removes the same complete route set and
+    /// drops the context, including descriptor cleanup leases, as one operation.
+    #[cfg(feature = "compat")]
+    pub(crate) fn rollback_starrocks_handoff(
+        &self,
+        execution: QueryExecutionKey,
+        fragment_instance_ids: &[UniqueId],
+    ) -> bool {
+        let query_id = execution.query_id();
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let context_matches = guard
+                .active
+                .get(&query_id)
+                .is_some_and(|context| context.matches_execution(execution));
+            let registered = guard
+                .finst_to_query
+                .iter()
+                .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
+                .collect::<HashSet<_>>();
+            let requested = fragment_instance_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if !context_matches || requested != registered {
+                return false;
+            }
+
+            for finst_id in fragment_instance_ids.iter().rev() {
+                guard.finst_to_query.remove(finst_id);
+                guard.fragment_completions.remove(finst_id);
+                guard.incremental_scan_nodes.remove(finst_id);
+                guard.pending_incremental_scan_ranges.remove(finst_id);
+                guard.incremental_change_op_slots.remove(finst_id);
+            }
+            guard.active.remove(&query_id)
+        };
+
+        if let Some(context) = removed {
+            context.runtime_filter_service().shutdown();
+            drop(context);
+            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn register_fragment_completion(

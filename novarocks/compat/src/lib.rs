@@ -1,5 +1,6 @@
 mod application;
 mod brpc;
+pub mod fragment;
 
 pub use application::{
     CompatApplicationError, CompatApplicationErrorKind, CompatApplicationHost, CompatServerConfig,

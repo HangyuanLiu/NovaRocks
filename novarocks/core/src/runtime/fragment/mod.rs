@@ -25,8 +25,6 @@ pub(crate) mod resources;
 pub(crate) mod runtime_state;
 pub(crate) mod scan;
 pub(crate) mod sink;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks_execution;
 pub(crate) mod submission;
 
 pub use error::{

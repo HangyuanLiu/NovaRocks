@@ -56,7 +56,7 @@ output_dir="$(cd "$output_dir" && pwd -P)"
 target_dir="$output_dir/target"
 build_command=(
   cargo build --profile "$profile"
-  -p novarocks-server -p novarocks
+  -p novarocks-server -p novarocks-compat
   --features compat
   --bin novarocks --bin starrocks-compat-probe
 )

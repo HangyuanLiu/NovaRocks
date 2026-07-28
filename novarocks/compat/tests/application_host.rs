@@ -49,7 +49,13 @@ impl CompatPorts for FakePorts {
         self.record("init-frontend-rpc");
     }
 
-    fn start_grpc(&mut self, _host: &str) -> Result<(), String> {
+    fn start_grpc(
+        &mut self,
+        _host: &str,
+        _fragment_sync_ingress: Arc<
+            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
+        >,
+    ) -> Result<(), String> {
         self.start("grpc")
     }
 

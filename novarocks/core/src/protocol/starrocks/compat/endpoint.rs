@@ -23,9 +23,7 @@ use crate::thrift::types::TNetworkAddress;
 /// Older FEs populated `deprecated_server`; current FEs populate `brpc_server`.
 /// When both fields are present, `brpc_server` wins. This rule can be removed once
 /// the minimum supported FE version no longer emits `deprecated_server`.
-pub(crate) fn destination_address(
-    destination: &TPlanFragmentDestination,
-) -> Option<&TNetworkAddress> {
+pub fn destination_address(destination: &TPlanFragmentDestination) -> Option<&TNetworkAddress> {
     destination_address_with_field(destination).map(|(address, _)| address)
 }
 
