@@ -83,7 +83,10 @@ pub(crate) fn run_insert(
         (
             crate::connector::metadata_load_table(
                 &reg,
-                crate::connector::query_request_context(None)?,
+                crate::connector::connector_request_context(
+                    None,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )?,
                 &target.catalog,
                 &target.namespace,
                 &target.table,

@@ -171,7 +171,10 @@ impl ViewEngine for StandaloneState {
     fn table_exists(&self, target: &ViewTarget) -> Result<bool, String> {
         crate::connector::metadata_table_exists(
             &self.connectors.read().expect("connector registry read"),
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.database,
             &target.view,
@@ -282,7 +285,10 @@ impl ViewEngine for StandaloneState {
             Some(catalog),
             &catalog_service_snapshot,
             &connectors_snapshot,
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             crate::sql::catalog::TableLookupMode::SchemaOnly,
         );
         let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, database)

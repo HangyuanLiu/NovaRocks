@@ -845,7 +845,10 @@ pub(crate) fn execute_create_database_statement(
     if if_not_exists
         && crate::connector::metadata_namespace_exists(
             &state.connectors.read().expect("connector registry read"),
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.namespace,
         )?
@@ -928,7 +931,10 @@ pub(crate) fn execute_create_table_statement(
             if stmt.if_not_exists
                 && crate::connector::metadata_table_exists(
                     &state.connectors.read().expect("connector registry read"),
-                    crate::connector::query_request_context(None)?,
+                    crate::connector::connector_request_context(
+                        None,
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    )?,
                     &target.catalog,
                     &target.namespace,
                     &target.table,
@@ -1007,7 +1013,10 @@ pub(crate) fn execute_drop_database_statement(
     if target.backend_name == "iceberg"
         && !crate::connector::metadata_namespace_exists(
             &state.connectors.read().expect("connector registry read"),
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.namespace,
         )?
@@ -1211,7 +1220,10 @@ pub(crate) fn execute_truncate_table_statement(
         let reg = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &reg,
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.namespace,
             &target.table,

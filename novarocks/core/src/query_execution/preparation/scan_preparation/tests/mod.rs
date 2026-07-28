@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
 
-use super::prepare_scan_bindings;
 use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
@@ -42,6 +41,19 @@ use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
+
+fn prepare_scan_bindings(
+    plan: &DistributedPlan,
+    connectors: &ConnectorRegistry,
+    resolver: Option<&dyn ScanBindingResolver>,
+) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+    super::prepare_scan_bindings(
+        plan,
+        connectors,
+        &crate::connector::test_request_context(),
+        resolver,
+    )
+}
 
 struct StaticResolver {
     execution: ResolvedScanExecution,

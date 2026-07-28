@@ -169,7 +169,10 @@ pub(crate) fn execute_delete_statement(
         let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &registry,
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.namespace,
             &target.table,
@@ -332,7 +335,10 @@ fn run_delete_dv_write_transaction(
         let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &registry,
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.namespace,
             &target.table,

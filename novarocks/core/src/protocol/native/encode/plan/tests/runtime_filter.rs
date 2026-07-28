@@ -170,6 +170,7 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &crate::connector::ConnectorRegistry::new(),
+        &crate::connector::test_request_context(),
         None,
     )
     .expect("prepare Graph-owned RF projection");
@@ -524,6 +525,7 @@ fn native_encoder_emits_explicit_empty_fragment_table() {
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &crate::connector::ConnectorRegistry::new(),
+        &crate::connector::test_request_context(),
         None,
     )
     .expect("prepare no-runtime-filter plan");

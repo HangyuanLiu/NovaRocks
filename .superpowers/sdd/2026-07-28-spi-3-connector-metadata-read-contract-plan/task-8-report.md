@@ -132,3 +132,68 @@ The complete gate sequence was rerun after the final live-test fixture migration
   declarations, or registry tests.
 - No `NeverCancelled` or fixed 60-second production request context remains in
   the Iceberg or StarRocks metadata/read adapters.
+
+## Code-review fix follow-up 2
+
+### Changed files/behavior
+
+- Replaced the thread-local `QueryConnectorCancellation` adapter with an
+  `Arc<AtomicBool>`-backed request cancellation adapter. The MySQL request
+  boundary constructs one `ConnectorRequestContext` from the request's real
+  disconnect/timeout signal and query-option deadline.
+- Made coordinator fragment and scan preparation require that context
+  explicitly. SELECT, EXPLAIN ANALYZE, and time-travel query preparation carry
+  the same request context into metadata, `begin_scan`, and `plan_splits`.
+- Direct session APIs, catalog trait callbacks, and independently initiated
+  MV/maintenance/write operations now construct an explicit operation-scoped
+  context at their visible owner boundary. No connector helper consults a
+  thread-local/global cancellation source or silently manufactures a default
+  context.
+- Reduced Iceberg `SplitPayload` to the split-owned namespace/table identity,
+  pinned snapshot ID, data file, projection, and limit. Serialized table
+  metadata remains in the scan handle once and is no longer cloned into every
+  split. Reader open reloads the provider-owned table and rejects an expired
+  pinned snapshot.
+- Statistics capability work remains owned by SPI-4 and was not changed.
+
+### RED evidence
+
+- `split_payload_does_not_repeat_serialized_table_metadata` initially failed
+  with `split payload repeated table metadata: 262899 bytes per split` after a
+  256 KiB serialized metadata fixture exposed metadata-size × split-count
+  amplification.
+- `scan_preparation_propagates_caller_cancellation` initially failed to compile
+  with `E0061`: `prepare_scan_bindings` accepted only three arguments and had
+  no way to receive the caller's context. Removing the old helper also exposed
+  every remaining implicit context caller at compile time.
+
+### Final GREEN evidence
+
+- `cargo fmt --all -- --check`: PASS
+- `cargo check -p novarocks --all-targets --profile dev-opt`: PASS
+- `cargo check -p novarocks --features compat --lib --profile dev-opt`: PASS
+- `cargo check -p novarocks-server --all-targets --profile dev-opt`: PASS
+- `cargo test -p novarocks-spi --features connector-conformance --profile dev-opt`:
+  PASS (6 connector conformance, 8 connector contract, 8 state-store contract)
+- `cargo test -p novarocks --lib connector --profile dev-opt`:
+  PASS (839 passed, 0 failed, 6762 filtered)
+- `cargo test -p novarocks --lib coordinator::prepare::scan_preparation::tests::dispatch::scan_preparation_propagates_caller_cancellation --profile dev-opt -- --exact --nocapture`:
+  PASS (1 passed, 0 failed)
+- `cargo test -p novarocks --lib connector::iceberg::provider::tests::split_payload_does_not_repeat_serialized_table_metadata --profile dev-opt -- --exact --nocapture`:
+  PASS (1 passed, 0 failed)
+- `git diff --check`: PASS
+
+### Follow-up audit
+
+- No `query_request_context`, `QueryConnectorCancellation`, or connector-side
+  `client_disconnected()` lookup remains.
+- `prepare_fragments` and `prepare_scan_bindings` cannot be called without an
+  explicit `ConnectorRequestContext`.
+- The split regression proves that a 256 KiB table metadata document does not
+  appear in a split payload and that 512 ordinary split payloads remain within
+  the SPI total-payload budget.
+- No statistics source file changed in this follow-up.
+
+### Commit
+
+- Message: `fix(connector): propagate request context and bound splits`

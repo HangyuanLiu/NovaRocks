@@ -46,6 +46,7 @@ pub(crate) use starrocks_table_stub::{
 };
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -57,25 +58,66 @@ use novarocks_spi::connector::{
 
 use self::host::{ConnectorHost, ConnectorHostError, ConnectorInstanceLease};
 
-struct QueryConnectorCancellation;
+struct RequestConnectorCancellation {
+    signal: Arc<AtomicBool>,
+}
 
-impl ConnectorCancellation for QueryConnectorCancellation {
+impl ConnectorCancellation for RequestConnectorCancellation {
     fn is_cancelled(&self) -> bool {
-        crate::runtime::query_cancel::client_disconnected()
+        self.signal.load(Ordering::SeqCst)
     }
 }
 
-pub(crate) fn query_request_context(
+struct QueryConnectorCancellation {
+    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+}
+
+impl ConnectorCancellation for QueryConnectorCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+fn build_connector_request_context(
     query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    cancellation: Arc<dyn ConnectorCancellation>,
 ) -> Result<ConnectorRequestContext, String> {
     let (_, query_expire) = crate::runtime::query_options::query_expire_durations(query_options);
     ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        Arc::new(QueryConnectorCancellation),
+        cancellation,
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
     .map_err(|error| error.to_string())
+}
+
+pub(crate) fn connector_request_context(
+    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    cancellation_signal: Arc<AtomicBool>,
+) -> Result<ConnectorRequestContext, String> {
+    build_connector_request_context(
+        query_options,
+        Arc::new(RequestConnectorCancellation {
+            signal: cancellation_signal,
+        }),
+    )
+}
+
+pub(crate) fn connector_request_context_for_query(
+    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+) -> Result<ConnectorRequestContext, String> {
+    build_connector_request_context(
+        query_options,
+        Arc::new(QueryConnectorCancellation { cancellation }),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_request_context() -> ConnectorRequestContext {
+    connector_request_context(None, Arc::new(AtomicBool::new(false)))
+        .expect("test connector request context")
 }
 
 fn metadata_instance(

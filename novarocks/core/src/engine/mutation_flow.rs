@@ -307,6 +307,10 @@ fn build_update_mor_change_stream_write_plan(
             Some(&target.catalog),
             &target.namespace,
             &mut query,
+            &crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
         )?;
     }
 
@@ -320,7 +324,10 @@ fn build_update_mor_change_stream_write_plan(
         Some(&target.catalog),
         &catalog_service_snapshot,
         &connectors_snapshot,
-        crate::connector::query_request_context(None)?,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -1518,7 +1525,10 @@ fn build_cow_update_distributed_write(
         let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &registry,
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.namespace,
             &target.table,
@@ -2569,7 +2579,10 @@ pub(crate) fn execute_merge_statement(
                 let registry = state.connectors.read().expect("connector registry read");
                 crate::connector::metadata_load_table(
                     &registry,
-                    crate::connector::query_request_context(None)?,
+                    crate::connector::connector_request_context(
+                        None,
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    )?,
                     &target.catalog,
                     &target.namespace,
                     &target.table,
@@ -3163,6 +3176,10 @@ fn build_merge_mor_change_stream_write_plan(
             Some(&target.catalog),
             &target.namespace,
             &mut query,
+            &crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
         )?;
     }
 
@@ -3176,7 +3193,10 @@ fn build_merge_mor_change_stream_write_plan(
         Some(&target.catalog),
         &catalog_service_snapshot,
         &connectors_snapshot,
-        crate::connector::query_request_context(None)?,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(

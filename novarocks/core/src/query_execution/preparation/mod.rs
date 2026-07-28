@@ -46,6 +46,7 @@ use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_role
 pub(crate) fn prepare_fragments(
     plan: &crate::sql::planner::distributed::DistributedPlan,
     connectors: &ConnectorRegistry,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn scan::ScanBindingResolver>,
 ) -> Result<PreparedFragmentSet, String> {
     let sealed_ids = plan
@@ -110,7 +111,7 @@ pub(crate) fn prepare_fragments(
             plan.runtime_filter_graph(),
             plan.fragments(),
         )?;
-    let scan_bindings = prepare_scan_bindings(plan, connectors, resolver)?;
+    let scan_bindings = prepare_scan_bindings(plan, connectors, context, resolver)?;
 
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();
@@ -554,8 +555,13 @@ mod tests {
                 .fragment_output_columns(9)
                 .is_none()
         );
-        let prepared = prepare_fragments(&plan, &crate::connector::ConnectorRegistry::new(), None)
-            .expect("sealed write output absence is legal");
+        let prepared = prepare_fragments(
+            &plan,
+            &crate::connector::ConnectorRegistry::new(),
+            &crate::connector::test_request_context(),
+            None,
+        )
+        .expect("sealed write output absence is legal");
         assert!(
             prepared
                 .fragment(9)
@@ -572,13 +578,17 @@ mod tests {
         crate::sql::planner::distributed::test_support::remove_fragment_output_for_test(
             &mut plan, 7,
         );
-        let error =
-            match prepare_fragments(&plan, &crate::connector::ConnectorRegistry::new(), None) {
-                Ok(_) => {
-                    panic!("non-write output absence must fail through production preparation")
-                }
-                Err(error) => error,
-            };
+        let error = match prepare_fragments(
+            &plan,
+            &crate::connector::ConnectorRegistry::new(),
+            &crate::connector::test_request_context(),
+            None,
+        ) {
+            Ok(_) => {
+                panic!("non-write output absence must fail through production preparation")
+            }
+            Err(error) => error,
+        };
         assert_eq!(
             error,
             "prepared sealed output mismatch fragment_id=7: non-write fragment is missing FragmentEdgeOutputCatalog output"
@@ -595,8 +605,13 @@ mod tests {
                     vec![BindingId::new(1), BindingId::new(2)];
             },
         );
-        let prepared = prepare_fragments(&plan, &crate::connector::ConnectorRegistry::new(), None)
-            .expect("prepare sealed graph");
+        let prepared = prepare_fragments(
+            &plan,
+            &crate::connector::ConnectorRegistry::new(),
+            &crate::connector::test_request_context(),
+            None,
+        )
+        .expect("prepare sealed graph");
 
         assert_eq!(prepared.runtime_filter_graph().channel_count(), 1);
         assert_eq!(prepared.runtime_filter_graph().binding_count(), 2);

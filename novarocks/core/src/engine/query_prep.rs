@@ -198,6 +198,7 @@ pub(crate) fn rewrite_time_travel_refs(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &mut sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // Walk CTEs
     if let Some(with) = &mut query.with {
@@ -207,6 +208,7 @@ pub(crate) fn rewrite_time_travel_refs(
                 current_catalog,
                 current_database,
                 cte.query.body.as_mut(),
+                connector_context,
             )?;
         }
     }
@@ -215,6 +217,7 @@ pub(crate) fn rewrite_time_travel_refs(
         current_catalog,
         current_database,
         query.body.as_mut(),
+        connector_context,
     )
 }
 
@@ -223,6 +226,7 @@ fn rewrite_time_travel_in_set_expr(
     current_catalog: Option<&str>,
     current_database: &str,
     expr: &mut sqlparser::ast::SetExpr,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     match expr {
         sqlparser::ast::SetExpr::Select(select) => {
@@ -232,6 +236,7 @@ fn rewrite_time_travel_in_set_expr(
                     current_catalog,
                     current_database,
                     &mut tw.relation,
+                    connector_context,
                 )?;
                 for join in &mut tw.joins {
                     rewrite_time_travel_in_factor(
@@ -239,6 +244,7 @@ fn rewrite_time_travel_in_set_expr(
                         current_catalog,
                         current_database,
                         &mut join.relation,
+                        connector_context,
                     )?;
                 }
             }
@@ -250,12 +256,14 @@ fn rewrite_time_travel_in_set_expr(
                 current_catalog,
                 current_database,
                 left.as_mut(),
+                connector_context,
             )?;
             rewrite_time_travel_in_set_expr(
                 state,
                 current_catalog,
                 current_database,
                 right.as_mut(),
+                connector_context,
             )
         }
         sqlparser::ast::SetExpr::Query(q) => rewrite_time_travel_in_set_expr(
@@ -263,6 +271,7 @@ fn rewrite_time_travel_in_set_expr(
             current_catalog,
             current_database,
             q.body.as_mut(),
+            connector_context,
         ),
         _ => Ok(()),
     }
@@ -273,6 +282,7 @@ fn rewrite_time_travel_in_factor(
     current_catalog: Option<&str>,
     current_database: &str,
     factor: &mut sqlparser::ast::TableFactor,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     match factor {
         sqlparser::ast::TableFactor::Table {
@@ -353,7 +363,7 @@ fn rewrite_time_travel_in_factor(
                     .clone();
                 let (table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
                     &connectors,
-                    crate::connector::query_request_context(None)?,
+                    connector_context.clone(),
                     &target.catalog,
                     &target.namespace,
                     &target.table,
@@ -407,6 +417,7 @@ fn rewrite_time_travel_in_factor(
             current_catalog,
             current_database,
             subquery.body.as_mut(),
+            connector_context,
         ),
         _ => Ok(()),
     }
@@ -458,7 +469,10 @@ pub(crate) fn materialize_external_schema_table_for_statement(
 
     let (mut table_def, _) = crate::connector::iceberg::provider::load_schema_table_def(
         &connectors,
-        crate::connector::query_request_context(None)?,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
         &target.catalog,
         &target.namespace,
         &target.table,

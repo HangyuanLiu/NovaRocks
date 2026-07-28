@@ -117,11 +117,11 @@ impl IcebergConnectorInstance {
     fn schema_for(
         &self,
         entry: &IcebergCatalogEntry,
-        table: &TablePayload,
+        namespace: &str,
+        table: &str,
         projection: &[usize],
     ) -> Result<SchemaRef, ConnectorError> {
-        let loaded =
-            load_table(entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
         let schema =
             iceberg::arrow::schema_to_arrow_schema(loaded.table.metadata().current_schema())
                 .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
@@ -304,7 +304,8 @@ impl ConnectorRead for IcebergConnectorInstance {
         self.validate_context(&request.context)?;
         let table = self.table_payload(table)?;
         let entry = self.entry(self.instance_id.as_str())?;
-        let output_schema = self.schema_for(&entry, &table, &request.projection)?;
+        let output_schema =
+            self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?;
         let snapshot_id = if table.explicit_files.is_some() {
             None
         } else {
@@ -367,7 +368,8 @@ impl ConnectorRead for IcebergConnectorInstance {
                 }
                 let estimated_bytes = u64::try_from(file.size).ok();
                 let payload = SplitPayload {
-                    table: scan.table.clone(),
+                    namespace: scan.table.namespace.clone(),
+                    table: scan.table.table.clone(),
                     snapshot_id: scan.snapshot_id,
                     data_file: file,
                     projection: scan.projection.clone(),
@@ -413,24 +415,26 @@ impl ConnectorRead for IcebergConnectorInstance {
         ensure_owner(split.owner(), &self.instance_id)?;
         let split: SplitPayload = decode_payload(split.payload(), "split")?;
         let entry = self.entry(self.instance_id.as_str())?;
-        let output_schema = self.schema_for(&entry, &split.table, &split.projection)?;
+        let output_schema =
+            self.schema_for(&entry, &split.namespace, &split.table, &split.projection)?;
         if output_schema.as_ref() != request.expected_schema.as_ref() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg reader expected schema does not match its scan projection",
             ));
         }
-        let loaded = load_table(&entry, &split.table.namespace, &split.table.table)
-            .map_err(map_iceberg_error)?;
+        let loaded =
+            load_table(&entry, &split.namespace, &split.table).map_err(map_iceberg_error)?;
         if let Some(snapshot_id) = split.snapshot_id {
-            let present = extract_data_files_with_stats_at(&loaded.table, snapshot_id)
-                .map_err(map_iceberg_error)?
-                .iter()
-                .any(|file| file.path == split.data_file.path);
-            if !present {
+            if loaded
+                .table
+                .metadata()
+                .snapshot_by_id(snapshot_id)
+                .is_none()
+            {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::NotFound,
-                    "Iceberg split data file is absent from its pinned snapshot",
+                    "Iceberg split references an expired snapshot",
                 ));
             }
         }
@@ -628,7 +632,8 @@ struct ScanPayload {
 
 #[derive(Deserialize, Serialize)]
 struct SplitPayload {
-    table: TablePayload,
+    namespace: String,
+    table: String,
     snapshot_id: Option<i64>,
     data_file: IcebergDataFileInfo,
     projection: Vec<usize>,
@@ -976,6 +981,61 @@ fn internal(message: String) -> ConnectorError {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
+
+    #[test]
+    fn split_payload_does_not_repeat_serialized_table_metadata() {
+        let table = TablePayload {
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            table_info: Some(IcebergTableInfo {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                table_uuid: None,
+                current_snapshot_id: Some(7),
+                schema_id: 1,
+                location: "s3://warehouse/db/orders".to_string(),
+                schema: IcebergSchemaDef { fields: Vec::new() },
+                serialized_metadata: Some("x".repeat(256 * 1024)),
+                serialized_metadata_rows: None,
+            }),
+            cloud_properties: BTreeMap::new(),
+            metadata_columns: Vec::new(),
+            metadata_table_type: None,
+            prepared_files: Vec::new(),
+            explicit_files: None,
+        };
+        let payload = SplitPayload {
+            namespace: table.namespace,
+            table: table.table,
+            snapshot_id: Some(7),
+            data_file: IcebergDataFileInfo::for_test(
+                "s3://warehouse/db/orders/data-1.parquet",
+                1024,
+                10,
+            ),
+            projection: vec![0],
+            limit: None,
+        };
+
+        let encoded = serde_json::to_vec(&payload).expect("encode split payload");
+        assert!(
+            encoded.len() < 4096,
+            "split payload repeated table metadata: {} bytes per split",
+            encoded.len()
+        );
+        assert!(
+            encoded.len().saturating_mul(512)
+                <= novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            "ordinary 512-split planning exceeds the total payload budget"
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn register_planned_files_fixture(
     registry: &crate::connector::ConnectorRegistry,
     catalog: &str,
@@ -1013,6 +1073,12 @@ pub(crate) fn register_planned_table_files_fixture(
             table: &ConnectorTableHandle,
             request: ConnectorBeginScanRequest,
         ) -> Result<ConnectorScan, ConnectorError> {
+            if request.context.cancellation().is_cancelled() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Cancelled,
+                    "planned-files fixture observed caller cancellation",
+                ));
+            }
             let table: TablePayload = decode_payload(table.payload(), "fixture table handle")?;
             if let Some(seen) = &self.seen_projections {
                 seen.lock()
@@ -1061,7 +1127,8 @@ pub(crate) fn register_planned_table_files_fixture(
                         format!("fixture-{index}"),
                         encode_payload(
                             &SplitPayload {
-                                table: scan.table.clone(),
+                                namespace: scan.table.namespace.clone(),
+                                table: scan.table.table.clone(),
                                 snapshot_id: None,
                                 data_file,
                                 projection: scan.projection.clone(),

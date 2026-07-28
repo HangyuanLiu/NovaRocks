@@ -1413,6 +1413,7 @@ mod tests {
                 let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
                     &connectors,
+                    &crate::connector::test_request_context(),
                     Some(&refresh_ctx),
                 )
                 .expect("join projection coalesce plan must prepare");

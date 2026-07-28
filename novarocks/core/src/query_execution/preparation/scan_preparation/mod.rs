@@ -38,9 +38,9 @@ use projection::{resolve_effective_required_reads, resolve_physical_columns};
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
     connectors: &ConnectorRegistry,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<ScanExecutionBindings, String> {
-    let context = crate::connector::query_request_context(None)?;
     let mut bindings = ScanExecutionBindings::default();
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     for fragment in plan.fragments() {
@@ -48,7 +48,7 @@ pub(super) fn prepare_scan_bindings(
             fragment.fragment_id,
             &fragment.root,
             connectors,
-            &context,
+            context,
             resolver,
             &mut seen_scan_node_ids,
             &mut bindings,

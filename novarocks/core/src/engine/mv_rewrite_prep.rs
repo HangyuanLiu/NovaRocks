@@ -234,7 +234,10 @@ fn build_candidate(
         .clone();
     let (target_table, _) = crate::connector::iceberg::provider::load_schema_table_def(
         &connectors,
-        crate::connector::query_request_context(None)?,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
         cat,
         ns,
         tbl,

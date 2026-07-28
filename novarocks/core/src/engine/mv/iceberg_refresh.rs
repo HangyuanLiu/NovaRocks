@@ -9303,6 +9303,10 @@ fn run_mv_full_select_result(
             current_catalog,
             current_database,
             &mut query,
+            &crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
         )?;
     }
     crate::engine::execute_query_with_catalog_service(
@@ -13423,7 +13427,10 @@ fn execute_imv_change_stream_writer(
         .clone();
     let resolved = crate::connector::metadata_load_table(
         &connectors_snapshot,
-        crate::connector::query_request_context(None)?,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
         &target.catalog,
         &target.namespace,
         &target.table,
@@ -19034,7 +19041,7 @@ mod tests {
         let connectors = env.state.connectors.read().expect("connector registry");
         let resolved = crate::connector::metadata_load_table(
             &connectors,
-            crate::connector::query_request_context(None).expect("request context"),
+            crate::connector::test_request_context(),
             "ice",
             "analytics",
             "mv_orders",
@@ -19046,7 +19053,7 @@ mod tests {
 
         let (schema_table, schema_id) = crate::connector::metadata_load_table(
             &connectors,
-            crate::connector::query_request_context(None).expect("request context"),
+            crate::connector::test_request_context(),
             "ice",
             "analytics",
             "mv_orders",
@@ -19059,7 +19066,7 @@ mod tests {
         let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
         let missing_schema_err = crate::connector::metadata_load_table(
             &connectors,
-            crate::connector::query_request_context(None).expect("request context"),
+            crate::connector::test_request_context(),
             "ice",
             "analytics",
             &legacy_alias_name,
@@ -19073,7 +19080,7 @@ mod tests {
 
         let missing_target_err = crate::connector::metadata_load_table(
             &connectors,
-            crate::connector::query_request_context(None).expect("request context"),
+            crate::connector::test_request_context(),
             "ice",
             "analytics",
             &legacy_alias_name,

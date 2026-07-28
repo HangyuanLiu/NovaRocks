@@ -122,7 +122,10 @@ pub(crate) fn build_dml_change_stream_write_plan(
         let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &registry,
-            crate::connector::query_request_context(None)?,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
             &target.catalog,
             &target.namespace,
             &target.table,

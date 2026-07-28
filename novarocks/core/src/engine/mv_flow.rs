@@ -764,7 +764,10 @@ pub(crate) fn analyze_visible_query(
         None,
         &catalog_service,
         &connectors,
-        crate::connector::query_request_context(None)?,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let (resolved, _cte_registry, _factory) =
@@ -800,6 +803,10 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
             current_catalog,
             current_database,
             &mut query,
+            &crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
         )?;
     }
 

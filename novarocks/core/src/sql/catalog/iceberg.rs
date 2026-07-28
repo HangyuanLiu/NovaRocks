@@ -56,7 +56,10 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
         let (table_def, current_schema_id) =
             crate::connector::iceberg::provider::load_schema_table_def(
                 &self.connectors,
-                crate::connector::query_request_context(None)?,
+                crate::connector::connector_request_context(
+                    None,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )?,
                 &self.name,
                 namespace,
                 table,

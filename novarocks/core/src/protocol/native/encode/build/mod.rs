@@ -62,6 +62,7 @@ fn build_for_test(
     let prepared = prepare_fragments(
         request.distributed_plan,
         request.connectors,
+        &crate::connector::test_request_context(),
         request.scan_binding_resolver,
     )?;
     let native_bundle = super::encode_native_fragment_bundle(request.distributed_plan, &prepared)?;
