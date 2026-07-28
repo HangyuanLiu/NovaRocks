@@ -880,14 +880,13 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
     Ok(())
 }
 
-pub fn stop_backend_service() {
+pub fn stop_backend_service() -> Result<(), String> {
     let (stop, wake_addr, join_handle) = {
-        let mut state = match backend_server_state().lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
+        let mut state = backend_server_state()
+            .lock()
+            .map_err(|_| "lock backend service state failed".to_string())?;
         if !state.started {
-            return;
+            return Ok(());
         }
         state.started = false;
         (
@@ -904,6 +903,94 @@ pub fn stop_backend_service() {
         let _ = TcpStream::connect(addr);
     }
     if let Some(handle) = join_handle {
-        let _ = handle.join();
+        join_backend_service_thread(handle)?;
+    }
+    Ok(())
+}
+
+fn join_backend_service_thread(handle: thread::JoinHandle<()>) -> Result<(), String> {
+    handle.join().map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|value| (*value).to_string())
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        format!("BackendService listener thread panicked: {detail}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn lock_server_state_test() -> MutexGuard<'static, ()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn reset_server_state() {
+        let state = super::backend_server_state();
+        state.clear_poison();
+        *state.lock().expect("lock backend state for reset") = super::BackendServerState::default();
+    }
+
+    #[test]
+    fn stop_backend_service_is_idempotent() {
+        let _test_guard = lock_server_state_test();
+        reset_server_state();
+        {
+            let mut state = super::backend_server_state()
+                .lock()
+                .expect("lock backend state");
+            state.started = true;
+            state.join_handle = Some(std::thread::spawn(|| {}));
+        }
+
+        super::stop_backend_service().expect("first stop");
+        super::stop_backend_service().expect("second stop");
+    }
+
+    #[test]
+    fn stop_backend_service_reports_stored_listener_panic() {
+        let _test_guard = lock_server_state_test();
+        reset_server_state();
+        {
+            let mut state = super::backend_server_state()
+                .lock()
+                .expect("lock backend state");
+            state.started = true;
+            state.join_handle = Some(std::thread::spawn(|| panic!("backend listener failed")));
+        }
+
+        let error = super::stop_backend_service().expect_err("panic must be reported");
+
+        assert_eq!(
+            error,
+            "BackendService listener thread panicked: backend listener failed"
+        );
+    }
+
+    #[test]
+    fn stop_backend_service_reports_state_lock_poison() {
+        let _test_guard = lock_server_state_test();
+        reset_server_state();
+        let state = super::backend_server_state();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.lock().expect("lock backend state before poison");
+            panic!("poison backend state");
+        });
+
+        let error = super::stop_backend_service().expect_err("poison must be reported");
+
+        assert_eq!(error, "lock backend service state failed");
+        state.clear_poison();
+        reset_server_state();
     }
 }

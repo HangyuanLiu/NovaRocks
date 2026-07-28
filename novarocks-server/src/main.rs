@@ -25,8 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "compat")]
-use novarocks::common::network;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
 
@@ -512,29 +510,15 @@ fn open_daemon_stdout_log() -> Result<(File, String), String> {
 }
 
 #[cfg(feature = "compat")]
-fn start_compat_be_services_and_ready_marker<G, H, B, C>(
-    start_grpc: G,
-    start_heartbeat: H,
-    start_backend: B,
-    start_brpc: C,
-    heartbeat_port: u16,
-    brpc_port: u16,
-    grpc_port: u16,
-    pid: u32,
-) -> Result<String, String>
-where
-    G: FnOnce() -> Result<(), String>,
-    H: FnOnce() -> Result<(), String>,
-    B: FnOnce() -> Result<(), String>,
-    C: FnOnce() -> Result<(), String>,
-{
-    start_grpc().map_err(|error| format!("start grpc/http/starlet listeners: {error}"))?;
-    start_heartbeat().map_err(|error| format!("start heartbeat listener: {error}"))?;
-    start_backend().map_err(|error| format!("start backend listener: {error}"))?;
-    start_brpc().map_err(|error| format!("start brpc listener: {error}"))?;
-    Ok(format!(
-        "NOVAROCKS_READY role=compat-be heartbeat_port={heartbeat_port} brpc_port={brpc_port} grpc_port={grpc_port} pid={pid}"
-    ))
+fn run_compat_application_with<E>(
+    config: novarocks::common::app_config::NovaRocksConfig,
+    running: Arc<AtomicBool>,
+    runner: impl FnOnce(novarocks_compat::CompatServerConfig, Box<dyn FnMut() -> bool>) -> Result<(), E>,
+) -> Result<(), E> {
+    runner(
+        novarocks_compat::CompatServerConfig { config },
+        Box::new(move || !running.load(Ordering::SeqCst)),
+    )
 }
 
 fn main() {
@@ -756,143 +740,33 @@ fn main() {
             }
 
             #[cfg(feature = "compat")]
-            let log_level_num = match cfg.log_level.as_str() {
-                "trace" | "debug" => 0,
-                "info" => 0,
-                "warn" => 1,
-                "error" => 2,
-                _ => 0,
+            let compat_result =
+                run_compat_application_with(cfg.clone(), running.clone(), |config, shutdown| {
+                    novarocks_compat::run_compat_server_until_shutdown(config, shutdown)
+                });
+
+            #[cfg(not(feature = "compat"))]
+            let grpc_stop_result = {
+                let server = &cfg.server;
+                novarocks::start_grpc_server(server.host.as_str()).expect("start grpc server");
+                println!(
+                    "novarocksd started (bind_host={}, http_port={})",
+                    server.host, server.http_port
+                );
+                println!("Press Ctrl-C to stop...");
+
+                while running.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let grpc_stop_result = novarocks::service::grpc_server::stop_grpc_server();
+                novarocks::service::report_worker::stop();
+                grpc_stop_result
             };
-
-            let server = &cfg.server;
-            #[cfg(feature = "compat")]
-            let advertise_endpoint =
-                network::advertise_endpoint_for_config(&cfg).expect("resolve advertise endpoint");
-
-            #[cfg(feature = "compat")]
-            novarocks::service::frontend_rpc::init_frontend_rpc_manager();
-
-            #[cfg(feature = "compat")]
-            {
-                let heartbeat_cfg = novarocks::service::heartbeat_service::HeartbeatConfig {
-                    host: server.host.clone(),
-                    advertise_host: advertise_endpoint.host.clone(),
-                    heartbeat_port: server.heartbeat_port,
-                    be_port: server.be_port,
-                    brpc_port: server.brpc_port,
-                    http_port: server.http_port,
-                    starlet_port: advertise_endpoint.port,
-                    mem_limit_bytes: cfg
-                        .runtime
-                        .effective_be_mem_limit_bytes()
-                        .expect("resolve BE memory limit"),
-                };
-                let backend_cfg = novarocks::service::backend_service::BackendServiceConfig {
-                    host: server.host.clone(),
-                    be_port: server.be_port,
-                };
-                let compat_cfg = novarocks::service::compat::CompatConfig {
-                    host: server.host.as_str(),
-                    heartbeat_port: server.heartbeat_port,
-                    brpc_port: server.brpc_port,
-                    internal_service_query_rpc_thread_num:
-                        novarocks::common::config::internal_service_query_rpc_thread_num()
-                            .min(u32::MAX as usize) as u32,
-                    debug_exec_batch_plan_json: cfg.debug.exec_batch_plan_json,
-                    log_level: log_level_num,
-                };
-                let ready_marker = start_compat_be_services_and_ready_marker(
-                    || novarocks::start_grpc_server(server.host.as_str()),
-                    || novarocks::service::heartbeat_service::start_heartbeat_server(heartbeat_cfg),
-                    || novarocks::service::backend_service::start_backend_service(backend_cfg),
-                    || {
-                        novarocks::service::compat::start(&compat_cfg)
-                            .map_err(|error| error.to_string())
-                    },
-                    server.heartbeat_port,
-                    server.brpc_port,
-                    server.grpc_port,
-                    pid,
-                )
-                .expect("start compatibility BE listeners");
-                println!("{ready_marker}");
-            }
-
-            #[cfg(not(feature = "compat"))]
-            novarocks::start_grpc_server(server.host.as_str()).expect("start grpc server");
-            #[cfg(feature = "compat")]
-            println!(
-                "novarocksd started (bind_host={}, advertise_host={}, advertise_port={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, grpc_port={}, starlet_port={})",
-                server.host,
-                advertise_endpoint.host,
-                advertise_endpoint.port,
-                server.heartbeat_port,
-                server.be_port,
-                server.brpc_port,
-                server.http_port,
-                server.grpc_port,
-                server.starlet_port
-            );
-            #[cfg(not(feature = "compat"))]
-            println!(
-                "novarocksd started (bind_host={}, http_port={})",
-                server.host, server.http_port
-            );
-            println!("Press Ctrl-C to stop...");
-
-            // Keep process alive until Ctrl-C, signal, or a supervised service failure.
-            #[cfg(feature = "compat")]
-            let mut compat_service_failure = None;
-            while running.load(Ordering::SeqCst) {
-                #[cfg(feature = "compat")]
-                match novarocks::service::grpc_server::poll_grpc_server_failure() {
-                    Ok(Some(failure)) => {
-                        compat_service_failure = Some(failure);
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        compat_service_failure =
-                            Some(format!("poll compat grpc supervisor failed: {error}"));
-                        break;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-
-            #[cfg(feature = "compat")]
-            if compat_service_failure.is_none() {
-                match novarocks::service::grpc_server::poll_grpc_server_failure() {
-                    Ok(Some(failure)) => compat_service_failure = Some(failure),
-                    Ok(None) => {}
-                    Err(error) => {
-                        compat_service_failure =
-                            Some(format!("poll compat grpc supervisor failed: {error}"));
-                    }
-                }
-            }
-
-            #[cfg(feature = "compat")]
-            novarocks::service::compat::stop();
-            #[cfg(feature = "compat")]
-            novarocks::service::backend_service::stop_backend_service();
-            #[cfg(feature = "compat")]
-            novarocks::service::heartbeat_service::stop_heartbeat_server();
-            let grpc_stop_result = novarocks::service::grpc_server::stop_grpc_server();
-            novarocks::service::report_worker::stop();
 
             // Cleanup: remove pid file
             let _ = fs::remove_file(pid_file);
             #[cfg(feature = "compat")]
-            {
-                let mut failures = compat_service_failure.into_iter().collect::<Vec<_>>();
-                if let Err(error) = grpc_stop_result {
-                    failures.push(format!("stop grpc server failed: {error}"));
-                }
-                if !failures.is_empty() {
-                    panic!("compatibility BE service failure: {}", failures.join("; "));
-                }
-            }
+            compat_result.expect("compatibility BE application failed");
             #[cfg(not(feature = "compat"))]
             grpc_stop_result.expect("stop grpc server");
             println!("novarocksd stopped");
@@ -1012,6 +886,65 @@ mod tests {
         load_config_and_resolve_role, parse_standalone_server_args, probe_all_backends,
         resolve_cluster_role,
     };
+
+    #[cfg(feature = "compat")]
+    mod compat_delegation {
+        use std::cell::Cell;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::super::run_compat_application_with;
+
+        #[test]
+        fn compat_run_delegates_the_loaded_config_once() {
+            let mut config = novarocks::common::app_config::NovaRocksConfig::default();
+            config.server.brpc_port = 18_060;
+            let running = Arc::new(AtomicBool::new(true));
+            let calls = Cell::new(0);
+
+            run_compat_application_with(config, running, |received, _shutdown_requested| {
+                calls.set(calls.get() + 1);
+                assert_eq!(received.config.server.brpc_port, 18_060);
+                Ok::<(), &'static str>(())
+            })
+            .expect("compat runner delegation");
+
+            assert_eq!(calls.get(), 1);
+        }
+
+        #[test]
+        fn compat_run_forwards_the_shared_shutdown_state() {
+            let running = Arc::new(AtomicBool::new(true));
+            let runner_running = running.clone();
+
+            run_compat_application_with(
+                novarocks::common::app_config::NovaRocksConfig::default(),
+                running,
+                move |_config, mut shutdown_requested| {
+                    assert!(!shutdown_requested());
+                    runner_running.store(false, Ordering::SeqCst);
+                    assert!(shutdown_requested());
+                    Ok::<(), &'static str>(())
+                },
+            )
+            .expect("compat runner delegation");
+        }
+
+        #[test]
+        fn compat_run_propagates_the_runner_error_unchanged() {
+            #[derive(Debug, PartialEq, Eq)]
+            struct RunnerError(&'static str);
+
+            let error = run_compat_application_with(
+                novarocks::common::app_config::NovaRocksConfig::default(),
+                Arc::new(AtomicBool::new(true)),
+                |_config, _shutdown_requested| Err(RunnerError("compat runner failed")),
+            )
+            .expect_err("runner error must propagate");
+
+            assert_eq!(error, RunnerError("compat runner failed"));
+        }
+    }
 
     mod frontend_dispatch {
         use super::dispatch_standalone_role_with_backend;

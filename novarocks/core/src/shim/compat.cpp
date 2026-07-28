@@ -21,6 +21,21 @@
 #include <iostream>
 #include <string>
 
+#ifdef __APPLE__
+// StarRocks' macOS brpc archive is built with optional gperftools call sites,
+// while NovaRocks does not enable gperftools. Keep the disabled implementations
+// with the core-owned native shim so downstream Rust applications do not need
+// to duplicate final-link policy.
+extern "C" __attribute__((weak)) void MallocExtension_ReleaseFreeMemory() {}
+extern "C" __attribute__((weak)) int ProfilerStart(const char*) {
+    return 0;
+}
+extern "C" __attribute__((weak)) void ProfilerStop() {}
+__attribute__((weak)) int GetStackTrace(void**, int, int) {
+    return 0;
+}
+#endif
+
 int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* err);
 void novarocks_compat_stop_brpc();
 

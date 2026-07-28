@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 novarocks = { path = "../novarocks/core" }
 novarocks-backend = { path = "../novarocks/backend" }
+novarocks-compat = { path = "../novarocks/compat", optional = true }
 novarocks-frontend = { path = "../novarocks/frontend" }
 anyhow = "1"
 ctrlc = "3.4"
@@ -18,7 +19,7 @@ libc = "0.2"
 tracing = "0.1"
 
 [features]
-compat = ["novarocks/compat"]
+compat = ["dep:novarocks-compat"]
 foundationdb-provider = ["novarocks/foundationdb-provider"]
 mysql-state-store-provider = ["novarocks/mysql-state-store-provider"]
 
