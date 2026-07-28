@@ -102,6 +102,7 @@ fn spawn_exec_fragment_native(
                     runtime_filter,
                 },
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+                crate::runtime::fragment::io::result::discard_result_writer(),
             )
         }))
         .unwrap_or_else(|payload| {

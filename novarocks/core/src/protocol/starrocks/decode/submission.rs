@@ -35,6 +35,10 @@ use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec,
     FragmentRuntimeOptions, ScanAssignments,
 };
+use crate::runtime::fragment::io::{
+    FragmentResultWriter, ResultPresentation, ResultProjection as FragmentResultProjection,
+    ResultWriteSpec,
+};
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::LookupFetcherLifecycle;
 use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
@@ -113,6 +117,7 @@ pub struct StarRocksSubmissionMetadata {
     descriptor_snapshot: Option<DescriptorSnapshot>,
     row_position_descriptors: HashMap<i32, RowPositionDescriptor>,
     result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+    typed_result_sink: bool,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
     report_destination: Option<StarRocksReportDestination>,
@@ -162,6 +167,43 @@ impl StarRocksSubmissionMetadata {
         self.result_override.as_ref()
     }
 
+    fn result_write_spec(
+        &self,
+        fragment_instance_id: crate::common::types::UniqueId,
+    ) -> Option<ResultWriteSpec> {
+        self.result_override.as_ref().map(|(config, projections)| {
+            let presentation = match config.sink_type {
+                crate::service::result_batch_wire::ResultSinkType::MySqlProtocol => {
+                    ResultPresentation::MysqlText
+                }
+                crate::service::result_batch_wire::ResultSinkType::HttpProtocol => {
+                    ResultPresentation::HttpJson
+                }
+                crate::service::result_batch_wire::ResultSinkType::Statistic => {
+                    ResultPresentation::Statistic
+                }
+            };
+            let projections = projections.as_ref().map(|projections| {
+                projections
+                    .iter()
+                    .map(|projection| {
+                        FragmentResultProjection::new(
+                            projection.slot_id,
+                            projection.primitive,
+                            projection.field_schema.clone(),
+                        )
+                    })
+                    .collect()
+            });
+            ResultWriteSpec::new(
+                fragment_instance_id,
+                presentation,
+                projections,
+                self.typed_result_sink,
+            )
+        })
+    }
+
     pub const fn root_sink_dop(&self) -> Option<i32> {
         self.root_sink_dop
     }
@@ -189,14 +231,17 @@ impl StarRocksSubmissionMetadata {
         exchange_transmitter: std::sync::Arc<
             dyn crate::runtime::fragment::io::ExchangeFrameTransmitter,
         >,
+        result_writer: std::sync::Arc<dyn FragmentResultWriter>,
+        fragment_instance_id: crate::common::types::UniqueId,
     ) -> crate::runtime::fragment::FragmentPrepareContext {
         crate::runtime::fragment::FragmentPrepareContext::new_with_execution_overrides(
             profiler,
             mem_tracker,
-            self.result_override.clone(),
+            self.result_write_spec(fragment_instance_id),
             self.root_sink_dop,
             self.group_execution_scan_dop,
             exchange_transmitter,
+            result_writer,
         )
     }
 }
@@ -682,6 +727,7 @@ fn decode_draft_parts(
             descriptor_snapshot,
             row_position_descriptors,
             result_override,
+            typed_result_sink: instance.typed_result_sink,
             root_sink_dop,
             group_execution_scan_dop: input.group_execution_scan_dop,
             report_destination,

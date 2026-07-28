@@ -29,7 +29,9 @@ use crate::runtime::fragment::error::{
 };
 use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
-use crate::runtime::fragment::io::ExchangeFrameTransmitter;
+use crate::runtime::fragment::io::{
+    ExchangeFrameTransmitter, FragmentResultWriter, ResultPresentation, ResultWriteSpec,
+};
 use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaults};
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -41,14 +43,14 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
-use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
 
 pub struct FragmentPrepareContext {
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-    result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+    result_writer: Arc<dyn FragmentResultWriter>,
+    result_spec: Option<ResultWriteSpec>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
     #[cfg(test)]
@@ -68,7 +70,8 @@ impl Default for FragmentPrepareContext {
             runtime_filter: None,
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
-            result_override: None,
+            result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
+            result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
             #[cfg(test)]
@@ -87,13 +90,15 @@ impl FragmentPrepareContext {
         mem_tracker: Option<Arc<MemTracker>>,
         runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        result_writer: Arc<dyn FragmentResultWriter>,
     ) -> Self {
         Self {
             profiler,
             mem_tracker,
             runtime_filter,
             exchange_transmitter,
-            result_override: None,
+            result_writer,
+            result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
             #[cfg(test)]
@@ -108,17 +113,19 @@ impl FragmentPrepareContext {
     pub(crate) fn new_with_execution_overrides(
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
-        result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+        result_spec: Option<ResultWriteSpec>,
         root_sink_dop: Option<i32>,
         group_execution_scan_dop: Option<i32>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        result_writer: Arc<dyn FragmentResultWriter>,
     ) -> Self {
         Self {
             profiler,
             mem_tracker,
             runtime_filter: None,
             exchange_transmitter,
-            result_override,
+            result_writer,
+            result_spec,
             root_sink_dop,
             group_execution_scan_dop,
             #[cfg(test)]
@@ -376,7 +383,15 @@ pub fn prepare_fragment(
     let prepare_result = (|| {
         resources.acquire_sink_commit(finst_id)?;
         context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;
-        resources.acquire_result(program, instance, context.mem_tracker.as_ref())?;
+        let result_spec = context.result_spec.clone().unwrap_or_else(|| {
+            ResultWriteSpec::new(
+                finst_id,
+                ResultPresentation::MysqlText,
+                None,
+                instance.runtime_options().typed_result_sink(),
+            )
+        });
+        resources.acquire_result(program, &context.result_writer, result_spec)?;
         context.fail_if_injected(PrepareFailurePoint::AfterResult)?;
         resources.acquire_exchange(program, instance)?;
         context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
@@ -408,7 +423,7 @@ pub fn prepare_fragment(
             instance.runtime_options().typed_result_sink(),
             program.root_plan_node_id().get(),
             Arc::clone(&context.exchange_transmitter),
-            context.result_override.clone(),
+            resources.result_session(),
         )?;
         let _group_execution_scan_dop = context.group_execution_scan_dop;
         let exchange_bindings = materialize_exchange_bindings(program, instance);

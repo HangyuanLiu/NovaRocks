@@ -39,12 +39,13 @@ use crate::runtime::fragment::error::{
 };
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
-use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
+use crate::runtime::fragment::io::FragmentResultSession;
 
 pub(crate) fn materialize_fragment_sink(
     program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     materialize_fragment_sink_components(
         program.sink(),
@@ -53,6 +54,7 @@ pub(crate) fn materialize_fragment_sink(
         instance.runtime_options().typed_result_sink(),
         program.root_plan_node_id().get(),
         transmitter,
+        result_session,
     )
 }
 
@@ -63,6 +65,7 @@ pub(crate) fn materialize_fragment_sink_components(
     typed_result_sink: bool,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     materialize_fragment_sink_components_with_result(
         program,
@@ -71,7 +74,7 @@ pub(crate) fn materialize_fragment_sink_components(
         typed_result_sink,
         plan_node_id,
         transmitter,
-        None,
+        result_session,
     )
 }
 
@@ -82,18 +85,14 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
     typed_result_sink: bool,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
-    result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+    result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     match (program.program(), assignment) {
         (FragmentSinkProgram::Result, FragmentSinkAssignment::None) => {
-            let (config, projections) =
-                result_override.unwrap_or_else(|| (ResultSinkConfig::mysql(), None));
-            Ok(Box::new(ResultBufferSinkFactory::new(
-                projections,
-                config,
-                None,
-                typed_result_sink,
-            )))
+            let session = result_session.ok_or_else(|| {
+                materialization_error("RESULT_SINK requires an opened Fragment result session")
+            })?;
+            Ok(Box::new(ResultBufferSinkFactory::new(session, None)))
         }
         (FragmentSinkProgram::Noop, FragmentSinkAssignment::None) => {
             Ok(Box::new(NoopSinkFactory::new()))
@@ -576,7 +575,7 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
             .expect("data stream sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "EXCHANGE_SINK (id=99)");
@@ -593,7 +592,7 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
             .expect("multicast sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "MULTI_CAST_DATA_STREAM_SINK (id=99)");
@@ -615,8 +614,8 @@ mod tests {
             sender_id: None,
         });
 
-        let factory =
-            materialize_fragment_sink(&program, &instance, test_transmitter()).expect("split sink");
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
+            .expect("split sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "SPLIT_DATA_STREAM_SINK (id=99)");
     }
@@ -665,7 +664,7 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
             .expect("router sink");
 
         assert_factory_and_operator_name(
@@ -679,8 +678,13 @@ mod tests {
         let program = fragment_program(FragmentSinkProgram::Result);
         let instance = instance(FragmentSinkAssignment::None);
 
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
-            .expect("result sink");
+        let factory = materialize_fragment_sink(
+            &program,
+            &instance,
+            test_transmitter(),
+            Some(crate::runtime::fragment::io::result::discard_result_session()),
+        )
+        .expect("result sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "RESULT_BUFFER_SINK (plan_node_id=-1)");
     }
@@ -693,6 +697,7 @@ mod tests {
             &program,
             &instance(FragmentSinkAssignment::None),
             test_transmitter(),
+            None,
         ) {
             Ok(_) => panic!("missing stream destinations must fail"),
             Err(error) => error,
@@ -716,11 +721,15 @@ mod tests {
             sender_id: None,
         };
 
-        let error =
-            match materialize_fragment_sink(&program, &instance(assignment), test_transmitter()) {
-                Ok(_) => panic!("one destination group must not be truncated against two branches"),
-                Err(error) => error,
-            };
+        let error = match materialize_fragment_sink(
+            &program,
+            &instance(assignment),
+            test_transmitter(),
+            None,
+        ) {
+            Ok(_) => panic!("one destination group must not be truncated against two branches"),
+            Err(error) => error,
+        };
 
         assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);
@@ -738,6 +747,7 @@ mod tests {
             false,
             47,
             test_transmitter(),
+            Some(crate::runtime::fragment::io::result::discard_result_session()),
         )
         .expect("result sink materialization");
 

@@ -34,7 +34,7 @@ use novarocks::protocol::starrocks::decode::{
     finish_fragment_submission, prepare_fragment_submission,
 };
 use novarocks::runtime::exchange;
-use novarocks::runtime::fragment::io::ExchangeFrameTransmitter;
+use novarocks::runtime::fragment::io::{ExchangeFrameTransmitter, FragmentResultWriter};
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
     prepare_fragment,
@@ -60,17 +60,20 @@ pub struct CompatFragmentService {
     queries: StarRocksFragmentQueryRuntime,
     controls: Arc<CompatFragmentControls>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+    result_writer: Arc<dyn FragmentResultWriter>,
 }
 
 impl CompatFragmentService {
     pub fn new(
         queries: StarRocksFragmentQueryRuntime,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        result_writer: Arc<dyn FragmentResultWriter>,
     ) -> Self {
         Self {
             queries,
             controls: Arc::new(CompatFragmentControls::default()),
             exchange_transmitter,
+            result_writer,
         }
     }
 
@@ -885,6 +888,8 @@ fn launch_prepared_fragments(
             profiler.clone(),
             Some(Arc::clone(&fragment_mem_tracker)),
             Arc::clone(&service.exchange_transmitter),
+            Arc::clone(&service.result_writer),
+            finst_id,
         );
         let dormant = match prepare_fragment(prepared.submission, prepare_context) {
             Ok(dormant) => dormant,
@@ -1841,6 +1846,8 @@ fn execute_plan_fragment_sync_with(
         None,
         Some(Arc::clone(&fragment_mem_tracker)),
         Arc::clone(&service.exchange_transmitter),
+        Arc::clone(&service.result_writer),
+        finst_id,
     );
     let dormant = prepare_fragment(prepared.submission, prepare_context)
         .map_err(|error| error.to_string())?;
@@ -1970,6 +1977,7 @@ mod tests {
         CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
+            crate::fragment::compat_result_writer(),
         )
     }
 
@@ -2251,6 +2259,7 @@ mod tests {
         let service = Arc::new(CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
+            crate::fragment::compat_result_writer(),
         ));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -2298,6 +2307,7 @@ mod tests {
         let service = Arc::new(CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
+            crate::fragment::compat_result_writer(),
         ));
         let execution_service = Arc::clone(&service);
         let execution = std::thread::spawn(move || {

@@ -21,7 +21,7 @@ use std::sync::{Arc, mpsc};
 
 use novarocks::common::app_config;
 use novarocks::novarocks_logging::{error, info, warn};
-use novarocks::runtime::fragment::io::ExchangeFrameTransmitter;
+use novarocks::runtime::fragment::io::{ExchangeFrameTransmitter, FragmentResultWriter};
 use novarocks::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
@@ -49,6 +49,7 @@ pub struct NativeFragmentService {
     pub(super) controls: Arc<FragmentControlRegistry>,
     queries: NativeFragmentQueryRuntime,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+    result_writer: Arc<dyn FragmentResultWriter>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     fail_worker_spawn_on_submission: Option<usize>,
@@ -65,11 +66,15 @@ impl std::fmt::Debug for NativeFragmentService {
 }
 
 impl NativeFragmentService {
-    pub fn new(exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>) -> Self {
+    pub fn new(
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        result_writer: Arc<dyn FragmentResultWriter>,
+    ) -> Self {
         Self {
             controls: Arc::new(FragmentControlRegistry::default()),
             queries: NativeFragmentQueryRuntime::global(),
             exchange_transmitter,
+            result_writer,
             lifecycle_observer: None,
             #[cfg(test)]
             fail_worker_spawn_on_submission: None,
@@ -84,7 +89,10 @@ impl NativeFragmentService {
     ) -> Self {
         Self {
             lifecycle_observer: Some(Arc::new(observer)),
-            ..Self::new(crate::fragment::grpc_exchange_transmitter())
+            ..Self::new(
+                crate::fragment::grpc_exchange_transmitter(),
+                crate::fragment::native_result_writer(),
+            )
         }
     }
 
@@ -96,7 +104,10 @@ impl NativeFragmentService {
         Self {
             lifecycle_observer: Some(Arc::new(observer)),
             fail_worker_spawn_on_submission: Some(fail_worker_spawn_on_submission),
-            ..Self::new(crate::fragment::grpc_exchange_transmitter())
+            ..Self::new(
+                crate::fragment::grpc_exchange_transmitter(),
+                crate::fragment::native_result_writer(),
+            )
         }
     }
 
@@ -140,8 +151,11 @@ impl NativeFragmentIngress for NativeFragmentService {
         let fragment_mem_tracker = admission.fragment_mem_tracker();
         let dormant = prepare_fragment(
             request.into_submission(),
-            admission
-                .into_prepare_context(profiler.clone(), Arc::clone(&self.exchange_transmitter)),
+            admission.into_prepare_context(
+                profiler.clone(),
+                Arc::clone(&self.exchange_transmitter),
+                Arc::clone(&self.result_writer),
+            ),
         )
         .map_err(NativeFragmentIngressError::new)?;
         self.observe(NativeFragmentLifecycleEvent::Prepared);
@@ -418,7 +432,10 @@ mod tests {
 
     #[test]
     fn registration_failure_drops_dormant_resources_before_retry() {
-        let service = NativeFragmentService::new(crate::fragment::grpc_exchange_transmitter());
+        let service = NativeFragmentService::new(
+            crate::fragment::grpc_exchange_transmitter(),
+            crate::fragment::native_result_writer(),
+        );
         let first = values_result_request(82_000, 82_002);
         let finst_id = first.fragment_instance_id();
         let reservation = service

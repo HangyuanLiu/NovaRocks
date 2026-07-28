@@ -17,7 +17,9 @@
 
 mod ffi;
 mod io;
+mod result_io;
 mod service;
 
 pub(crate) use io::brpc_exchange_transmitter;
+pub(crate) use result_io::compat_result_writer;
 pub use service::CompatFragmentService;

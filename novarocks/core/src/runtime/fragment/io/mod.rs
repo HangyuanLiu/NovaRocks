@@ -5,6 +5,7 @@ pub(crate) mod exchange_metrics;
 pub(crate) mod exchange_queue;
 pub mod lookup;
 pub mod result;
+pub mod result_format;
 
 pub use error::{FragmentIoError, FragmentIoErrorKind, FragmentIoOperation};
 pub use events::{
