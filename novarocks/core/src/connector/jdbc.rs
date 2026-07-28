@@ -14,6 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+pub(crate) mod provider;
+
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource};
@@ -61,19 +63,28 @@ impl ScanOp for JdbcScanOp {
             ScanMorsel::JdbcSingle => {}
             _ => return Err("jdbc scan received unexpected morsel".to_string()),
         }
-        let url = self.cfg.jdbc_url.as_str();
-        if url.starts_with("jdbc:sqlite:") {
-            return scan_sqlite_iter(&self.cfg);
-        }
-        if url.starts_with("jdbc:mysql:") || url.starts_with("mysql:") {
-            return scan_mysql_iter(&self.cfg);
-        }
-        Err(format!("unsupported jdbc_url scheme: {url}"))
+        read_jdbc_batches(&self.cfg)
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
         Ok(ScanMorsels::new(vec![ScanMorsel::JdbcSingle], false))
     }
+}
+
+/// Open a provider-owned JDBC batch iterator.
+///
+/// `JdbcScanOp` remains a temporary compatibility adapter while the legacy
+/// scan-source path is being removed. New connector SPI providers call this
+/// directly and never construct a core `ScanOp`.
+pub(crate) fn read_jdbc_batches(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
+    let url = cfg.jdbc_url.as_str();
+    if url.starts_with("jdbc:sqlite:") {
+        return scan_sqlite_iter(cfg);
+    }
+    if url.starts_with("jdbc:mysql:") || url.starts_with("mysql:") {
+        return scan_mysql_iter(cfg);
+    }
+    Err(format!("unsupported jdbc_url scheme: {url}"))
 }
 
 /// Static [`ScanSource`] for JDBC/MySQL scans. JDBC has no scan ranges, so

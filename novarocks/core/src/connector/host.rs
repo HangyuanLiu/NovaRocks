@@ -37,6 +37,13 @@ impl ConnectorHostError {
     pub(crate) fn kind(&self) -> ConnectorHostErrorKind {
         self.kind
     }
+
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: ConnectorHostErrorKind::UnknownInstance,
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for ConnectorHostError {
@@ -95,5 +102,30 @@ fn unknown_instance(instance_id: &ConnectorInstanceId) -> ConnectorHostError {
     ConnectorHostError {
         kind: ConnectorHostErrorKind::UnknownInstance,
         message: format!("unknown connector instance `{}`", instance_id.as_str()),
+    }
+}
+
+/// Keeps a decoder-created connector instance registered for the lifetime of
+/// its physical scan source.  Dropping the last lease unregisters the exact
+/// instance, so query-local credentials never accumulate in the shared host.
+pub(crate) struct ConnectorInstanceLease {
+    host: Arc<std::sync::RwLock<ConnectorHost>>,
+    instance_id: ConnectorInstanceId,
+}
+
+impl ConnectorInstanceLease {
+    pub(crate) fn new(
+        host: Arc<std::sync::RwLock<ConnectorHost>>,
+        instance_id: ConnectorInstanceId,
+    ) -> Self {
+        Self { host, instance_id }
+    }
+}
+
+impl Drop for ConnectorInstanceLease {
+    fn drop(&mut self) {
+        if let Ok(mut host) = self.host.write() {
+            let _ = host.unregister(&self.instance_id);
+        }
     }
 }
