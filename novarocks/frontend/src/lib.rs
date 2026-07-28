@@ -17,6 +17,7 @@
 
 pub mod application;
 pub mod deployment;
+pub mod dml;
 mod server;
 pub mod system_catalog;
 pub mod view;
