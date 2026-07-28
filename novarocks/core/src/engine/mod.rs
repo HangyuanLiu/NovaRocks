@@ -365,8 +365,6 @@ pub(crate) struct StandaloneState {
     >,
     /// Frontend-owned view application service, injected at engine open.
     pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
-    /// Frontend-owned statistics service, injected at engine open.
-    pub(crate) statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -395,7 +393,6 @@ impl Default for StandaloneState {
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
             view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
-            statistics_service: std::sync::Arc::new(statistics::EmptyStatisticsService),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,

@@ -69,9 +69,7 @@ impl QueryStatsProviders {
             .connectors
             .read()
             .expect("standalone connectors read lock");
-        let mut providers = Self::from_connectors(&connectors);
-        providers.catalog_statistics = Some(Arc::clone(&state.statistics_service));
-        providers
+        Self::from_connectors(&connectors)
     }
 
     pub(crate) fn from_optional_state(state: Option<&Arc<super::StandaloneState>>) -> Self {
