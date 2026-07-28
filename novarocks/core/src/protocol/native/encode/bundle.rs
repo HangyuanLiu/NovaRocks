@@ -17,8 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
-use crate::coordinator::prepare::PreparedFragmentSet;
 use crate::proto::plan::PlanFragment as NativePlanFragment;
+use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::sql::planner::distributed::{DistributedPlan, FragmentId};
 
 pub(crate) struct NativeFragmentBundle {
@@ -86,6 +86,13 @@ fn collect_native_fragment_bundle(
         return Err(fragment_set_error("native", expected_ids, &native_ids));
     }
     Ok(NativeFragmentBundle { by_fragment })
+}
+
+#[cfg(test)]
+pub(crate) fn empty_native_fragment_bundle_for_test() -> NativeFragmentBundle {
+    NativeFragmentBundle {
+        by_fragment: BTreeMap::new(),
+    }
 }
 
 fn fragment_set_error(

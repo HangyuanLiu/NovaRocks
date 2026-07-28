@@ -19,7 +19,7 @@ use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
 use crate::connector::iceberg::scan_range::IcebergScanRangeContext;
 use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext, TableHandle};
-use crate::coordinator::prepare::scan::{ResolvedIcebergFileScan, ResolvedScanExecution};
+use crate::query_execution::preparation::scan::{ResolvedIcebergFileScan, ResolvedScanExecution};
 use crate::sql::planner::payload::PlanScanNode;
 
 use super::projection::effective_scan_column_names;

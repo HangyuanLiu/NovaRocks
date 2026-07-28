@@ -34,6 +34,7 @@ pub mod lower;
 pub mod meta;
 pub mod mv;
 pub mod protocol;
+pub mod query_execution;
 pub mod runtime;
 pub(crate) mod runtime_filter;
 pub mod server;

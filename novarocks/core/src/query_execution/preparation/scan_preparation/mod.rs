@@ -18,7 +18,7 @@
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::starrocks::PlannedNativeStarRocksScan;
 use crate::connector::scan_planning::starrocks::plan_native_starrocks_scan;
-use crate::coordinator::prepare::scan::{
+use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
 };

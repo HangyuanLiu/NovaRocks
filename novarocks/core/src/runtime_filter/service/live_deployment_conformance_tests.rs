@@ -33,7 +33,6 @@ use crate::connector::iceberg::scan_model::{
     IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
 use crate::coordinator::execution::{CoordinatedQueryResult, ExecutionCoordinator};
 use crate::coordinator::ports::{
     CoordinatorExecutionPorts, CoordinatorObserver, RuntimeFilterDeploymentControlPort,
@@ -41,13 +40,16 @@ use crate::coordinator::ports::{
 use crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider;
 use crate::coordinator::scheduler::FragmentScheduler;
 use crate::coordinator::write::handle_fragment_report_exec_status;
-use crate::coordinator::write::report::FragmentExecStatusReport;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::runtime_filter::{
     NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
 };
 use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
 use crate::exec::operators::runtime_filter::tests_support::chunk;
+use crate::query_execution::fragment_transport::{
+    FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
+};
+use crate::query_execution::write::FragmentExecStatusReport;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::profile::{
     ProfileNode, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS, RuntimeProfileTree,
@@ -802,10 +804,11 @@ fn run_live_conformance(topology: ConformanceTopology) {
     connectors.register_scan_planner(Arc::new(
         crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
     ));
-    let prepared = crate::coordinator::prepare::prepare_fragments(&sealed, &connectors, None)
-        .expect("prepare the sealed live conformance plan");
+    let prepared =
+        crate::query_execution::preparation::prepare_fragments(&sealed, &connectors, None)
+            .expect("prepare the sealed live conformance plan");
     let expected_prepared =
-        crate::coordinator::prepare::prepare_fragments(&sealed, &connectors, None)
+        crate::query_execution::preparation::prepare_fragments(&sealed, &connectors, None)
             .expect("prepare the expected live scheduling projection");
     let native_bundle =
         crate::protocol::native::encode::encode_native_fragment_bundle(&sealed, &prepared)
@@ -2245,8 +2248,9 @@ fn run_live_topn(
     connectors.register_scan_planner(Arc::new(
         crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
     ));
-    let prepared = crate::coordinator::prepare::prepare_fragments(&sealed, &connectors, None)
-        .expect("prepare live TopN fragments");
+    let prepared =
+        crate::query_execution::preparation::prepare_fragments(&sealed, &connectors, None)
+            .expect("prepare live TopN fragments");
     let bundle = crate::protocol::native::encode::encode_native_fragment_bundle(&sealed, &prepared)
         .expect("encode live TopN native bundle");
     let scheduler = Arc::new(FragmentScheduler::from_live_backend_snapshot(

@@ -32,7 +32,6 @@ use std::time::Duration;
 #[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
 use crate::coordinator::ports::RuntimeFilterDeploymentControlPort;
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
@@ -47,6 +46,9 @@ use crate::proto::novarocks::{
 use crate::protocol::native::{
     RuntimeFilterQueryLifecycleOptions, encode_abort_runtime_filter_deployment,
     encode_participant_install,
+};
+use crate::query_execution::fragment_transport::{
+    FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
 };
 use crate::runtime_filter::deployment::participant_id_for_backend;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};

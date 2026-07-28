@@ -21,8 +21,6 @@ use std::sync::{Mutex, OnceLock};
 use crate::common::types::UniqueId;
 use crate::runtime::profile::RuntimeProfileTree;
 
-pub(crate) mod correlate;
-
 #[derive(Default)]
 struct StandaloneQueryProfileRegistry {
     active: BTreeSet<(i64, i64)>,

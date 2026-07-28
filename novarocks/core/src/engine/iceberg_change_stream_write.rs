@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex};
 use crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan;
 use crate::connector::iceberg::commit::{CleanupAttempt, CommitOutcome, CommitServiceError};
 use crate::coordinator::execution::CoordinatedQueryResult;
-use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::StandaloneState;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
 };
+use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::optimizer::OptimizedOperatorNode;
 use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec;

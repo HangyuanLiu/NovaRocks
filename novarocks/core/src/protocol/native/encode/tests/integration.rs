@@ -20,8 +20,8 @@ use prost::Message;
 
 use super::super::plan;
 use super::{column_expr, int_expr};
-use crate::coordinator::prepare::scan::ScanExecutionBindings;
 use crate::protocol::native::type_mapping::decode_type;
+use crate::query_execution::preparation::scan::ScanExecutionBindings;
 use crate::sql::column_id::ColumnId;
 
 fn empty_scan_bindings() -> &'static ScanExecutionBindings {

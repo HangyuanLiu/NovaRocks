@@ -21,11 +21,11 @@ use std::sync::{Mutex, OnceLock};
 use crate::common::engine_error::EngineError;
 use crate::common::types::UniqueId;
 use crate::coordinator::ports::CoordinatorReportHandler;
-use crate::coordinator::write::report::report_from_native;
 use crate::coordinator::write::{
     WriterReportLookup, handle_fragment_report_exec_status, lookup_native_writer_report,
     mark_query_failed,
 };
+use crate::query_execution::write::report_from_native;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::{exchange, result_buffer};
 
@@ -289,7 +289,7 @@ mod tests {
         let mut guard = crate::coordinator::write::write_registry_test_guard();
         let query = UniqueId { hi: 520_005, lo: 1 };
         let finst = UniqueId { hi: 520_005, lo: 2 };
-        let writer = crate::coordinator::write::report::WriterKey {
+        let writer = crate::query_execution::write::WriterKey {
             query_id: query,
             fragment_instance_id: finst,
             backend_num: 7,

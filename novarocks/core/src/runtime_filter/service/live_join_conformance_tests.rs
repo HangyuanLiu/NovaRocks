@@ -30,7 +30,6 @@ use crate::connector::iceberg::scan_model::{
     IcebergTableInfo,
 };
 use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
 use crate::coordinator::execution::{CoordinatedQueryResult, ExecutionCoordinator};
 use crate::coordinator::ports::{
     CoordinatorExecutionPorts, CoordinatorObserver, RuntimeFilterDeploymentControlPort,
@@ -42,6 +41,9 @@ use crate::exec::operators::hashjoin::native_runtime_filter::{
     NativeProducerCloseGateGuard, install_native_producer_close_gate_for_test,
 };
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+use crate::query_execution::fragment_transport::{
+    FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
+};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::profile::{ProfileNode, RuntimeProfileTree};
 use crate::runtime::query_options::QueryOptions;
@@ -936,8 +938,9 @@ fn run_live_join(
     connectors.register_scan_planner(Arc::new(
         crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
     ));
-    let prepared = crate::coordinator::prepare::prepare_fragments(&distributed, &connectors, None)
-        .expect("prepare live Join fragments");
+    let prepared =
+        crate::query_execution::preparation::prepare_fragments(&distributed, &connectors, None)
+            .expect("prepare live Join fragments");
     let bundle =
         crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
             .expect("encode live Join native bundle");
@@ -1204,8 +1207,9 @@ fn run_live_join_cancel() -> CancelRun {
     connectors.register_scan_planner(Arc::new(
         crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
     ));
-    let prepared = crate::coordinator::prepare::prepare_fragments(&distributed, &connectors, None)
-        .expect("prepare cancellable live Join fragments");
+    let prepared =
+        crate::query_execution::preparation::prepare_fragments(&distributed, &connectors, None)
+            .expect("prepare cancellable live Join fragments");
     let bundle =
         crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
             .expect("encode cancellable live Join bundle");

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use iceberg::spec::TableMetadata;
 
 use crate::connector::iceberg::commit::{IcebergCommitCollector, WrittenFile};
-use crate::coordinator::write::report::WriteCommitInput;
+use crate::query_execution::write::WriteCommitInput;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology;
@@ -235,8 +235,8 @@ mod tests {
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
-    use crate::coordinator::write::report::{WriteCommitInput, WriterCommitInput, WriterKey};
     use crate::proto::novarocks;
+    use crate::query_execution::write::{WriteCommitInput, WriterCommitInput, WriterKey};
     use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
 
     fn test_unpartitioned_metadata() -> TableMetadata {

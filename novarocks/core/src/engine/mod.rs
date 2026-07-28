@@ -2306,8 +2306,11 @@ fn explain_analyze_query(
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
-    let prepared =
-        crate::coordinator::prepare::prepare_fragments(&distributed_plan, connectors, None)?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        connectors,
+        None,
+    )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
         &prepared,
@@ -2334,17 +2337,16 @@ fn explain_analyze_query(
     }
 
     let actuals =
-        crate::coordinator::profile::correlate::collect_actuals_by_plan_node_id_from_profile_trees(
+        crate::query_execution::profile::collect_actuals_by_plan_node_id_from_profile_trees(
             &outcome.fragment_profiles,
         );
     let profile_summary =
-        crate::coordinator::profile::correlate::collect_distributed_profile_summary_from_profile_trees(
+        crate::query_execution::profile::collect_distributed_profile_summary_from_profile_trees(
             &outcome.fragment_profiles,
         );
-    let per_fragment =
-        crate::coordinator::profile::correlate::collect_per_fragment_profile_summaries(
-            &outcome.fragment_profiles,
-        );
+    let per_fragment = crate::query_execution::profile::collect_per_fragment_profile_summaries(
+        &outcome.fragment_profiles,
+    );
     let mut lines = Vec::new();
     lines.push(format!(
         "Planning: {} / Execution: {} / Rows: {}",
@@ -2354,19 +2356,17 @@ fn explain_analyze_query(
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
     if let Some(apply) =
-        crate::coordinator::profile::correlate::collect_native_runtime_filter_apply_from_profile_trees(
+        crate::query_execution::profile::collect_native_runtime_filter_apply_from_profile_trees(
             &outcome.fragment_profiles,
         )
     {
         lines.push(apply.to_string());
     }
-    if let Some(counters) =
-        crate::coordinator::profile::correlate::format_counter_sums_from_profile_trees(
-            &outcome.fragment_profiles,
-            ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
-            "ProfileCounters",
-        )
-    {
+    if let Some(counters) = crate::query_execution::profile::format_counter_sums_from_profile_trees(
+        &outcome.fragment_profiles,
+        ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
+        "ProfileCounters",
+    ) {
         lines.push(counters);
     }
     lines.extend(explain_distributed_plan_analyze(
@@ -2394,7 +2394,7 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
 ];
 
 fn format_distributed_profile_summary(
-    summary: &crate::coordinator::profile::correlate::DistributedProfileSummary,
+    summary: &crate::query_execution::profile::DistributedProfileSummary,
 ) -> String {
     format!(
         "Profile: fragments={} fragment_wall_max={} fragment_wall_sum={} driver_total={} driver_blocked={} source_wait={} sink_wait={} dependency_wait={} operator_active={} exchange_wait={} exchange_process={} network={} scan_io={}",
@@ -2694,7 +2694,7 @@ pub(crate) fn execute_query_as_iceberg_write(
             input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
         },
     )?;
-    let prepared = crate::coordinator::prepare::prepare_fragments(
+    let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
         None,
@@ -2824,7 +2824,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 }
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
-    pub(crate) prepared: crate::coordinator::prepare::PreparedFragmentSet,
+    pub(crate) prepared: crate::query_execution::preparation::PreparedFragmentSet,
     pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     pub(crate) commit_plan:
         crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
@@ -2859,8 +2859,8 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
     let scan_binding_resolver = mv_refresh_ctx
-        .map(|ctx| ctx as &dyn crate::coordinator::prepare::scan::ScanBindingResolver);
-    let prepared = crate::coordinator::prepare::prepare_fragments(
+        .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
         scan_binding_resolver,
@@ -2882,7 +2882,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 }
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
-    prepared: crate::coordinator::prepare::PreparedFragmentSet,
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_opts: Option<QueryOptions>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
@@ -3251,8 +3251,8 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
     let scan_binding_resolver = mv_refresh_ctx
-        .map(|ctx| ctx as &dyn crate::coordinator::prepare::scan::ScanBindingResolver);
-    let prepared = crate::coordinator::prepare::prepare_fragments(
+        .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
         scan_binding_resolver,
@@ -3312,8 +3312,8 @@ pub(crate) fn execute_logical_plan_with_options(
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
     let scan_binding_resolver = mv_refresh_ctx
-        .map(|ctx| ctx as &dyn crate::coordinator::prepare::scan::ScanBindingResolver);
-    let prepared = crate::coordinator::prepare::prepare_fragments(
+        .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
         scan_binding_resolver,
@@ -3358,7 +3358,8 @@ fn coordinated_execution_services() -> Result<
             let dispatcher = Arc::new(dispatcher);
             let scheduler = Arc::new(scheduler);
             (
-                dispatcher as Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
+                dispatcher
+                    as Arc<dyn crate::query_execution::fragment_transport::FragmentDispatcher>,
                 scheduler,
                 runtime_filter_deployment_control
                     as Arc<dyn crate::coordinator::ports::RuntimeFilterDeploymentControlPort>,
@@ -3406,7 +3407,7 @@ fn dispatch_and_scheduler_from_live_backend_snapshot(
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
-) -> Result<Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>, String> {
+) -> Result<Arc<dyn crate::query_execution::fragment_transport::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
         ClusterRole::Fe => {
@@ -5106,7 +5107,7 @@ mysql_port = 47892
     fn build_fragments_for_query(
         sql: &str,
     ) -> (
-        crate::coordinator::prepare::PreparedFragmentSet,
+        crate::query_execution::preparation::PreparedFragmentSet,
         crate::protocol::native::encode::NativeFragmentBundle,
     ) {
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
@@ -5222,9 +5223,12 @@ mysql_port = 47892
                 .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
-        let prepared =
-            crate::coordinator::prepare::prepare_fragments(&distributed_plan, &registry, None)
-                .expect("prepare fragments");
+        let prepared = crate::query_execution::preparation::prepare_fragments(
+            &distributed_plan,
+            &registry,
+            None,
+        )
+        .expect("prepare fragments");
         let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
             &distributed_plan,
             &prepared,

@@ -20,17 +20,18 @@
 //! Lifecycle: register expected writers, apply final status reports, produce
 //! exactly one commit or abort input, then unregister the query.
 
-pub(crate) mod report;
-
 use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::engine_error::EngineError;
 use crate::common::types::UniqueId;
-use crate::coordinator::write::report::{
-    FragmentExecStatusReport, WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
-};
 use crate::proto::novarocks;
+#[cfg(test)]
+use crate::query_execution::write::report_from_native;
+use crate::query_execution::write::{
+    FragmentExecStatusReport, WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
+    unique_id_from_native,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReportOutcome {
@@ -444,11 +445,9 @@ pub(crate) enum WriterReportLookup {
 pub(crate) fn lookup_native_writer_report(
     report: &novarocks::ExecStatusReport,
 ) -> Result<WriterReportLookup, String> {
-    let query_id = report::unique_id_from_native(
-        report.query_id.clone(),
-        "ExecStatusReport missing query_id",
-    )?;
-    let fragment_instance_id = report::unique_id_from_native(
+    let query_id =
+        unique_id_from_native(report.query_id.clone(), "ExecStatusReport missing query_id")?;
+    let fragment_instance_id = unique_id_from_native(
         report.fragment_instance_id.clone(),
         "ExecStatusReport missing fragment_instance_id",
     )?;
@@ -1103,7 +1102,7 @@ mod tests {
     fn report_from_native_preserves_iceberg_commit_metadata() {
         let writer = key(25, 35, 126, 226, 2);
 
-        let report = report::report_from_native(native_report(&writer)).expect("native report");
+        let report = report_from_native(native_report(&writer)).expect("native report");
 
         assert_eq!(report.query_id, writer.query_id);
         assert_eq!(report.fragment_instance_id, writer.fragment_instance_id);

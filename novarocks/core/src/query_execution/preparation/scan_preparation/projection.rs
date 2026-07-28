@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::coordinator::prepare::scan::{
+use crate::query_execution::preparation::scan::{
     ResolvedReadColumn, ResolvedReadReason, ResolvedScanColumn, ResolvedScanColumnKind,
 };
 use crate::sql::column_id::ColumnId;

@@ -59,7 +59,7 @@ use std::net::SocketAddr;
 
 use crate::common::types::UniqueId;
 use crate::coordinator::cluster::{LiveBackend, LiveBackendSnapshot};
-use crate::coordinator::prepare::{FragmentSchedulingView, PreparedFragment};
+use crate::query_execution::preparation::{FragmentSchedulingView, PreparedFragment};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::{
@@ -506,7 +506,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
-    use crate::coordinator::prepare::{
+    use crate::query_execution::preparation::{
         PreparedFragmentRole, PreparedFragmentSet, prepared_fragment_set_for_test,
     };
     use crate::sql::planner::distributed::{

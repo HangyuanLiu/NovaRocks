@@ -18,12 +18,12 @@
 use std::num::NonZeroU32;
 
 use super::super::expr::encode_expr;
-use crate::coordinator::prepare::runtime_filter_binding::{
+use crate::proto::plan;
+use crate::protocol::native::type_mapping::encode_type;
+use crate::query_execution::preparation::runtime_filter_binding::{
     PreparedReductionContract, PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
     PreparedRuntimeFilterContract, RuntimeFilterBindingTable,
 };
-use crate::proto::plan;
-use crate::protocol::native::type_mapping::encode_type;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
     ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, OrderContract,

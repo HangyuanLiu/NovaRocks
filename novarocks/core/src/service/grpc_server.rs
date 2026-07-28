@@ -3516,7 +3516,7 @@ mod pr3_tests {
         guard
             .register_query(
                 query,
-                vec![crate::coordinator::write::report::WriterKey {
+                vec![crate::query_execution::write::WriterKey {
                     query_id: query,
                     fragment_instance_id: finst,
                     backend_num: 0,
@@ -3546,7 +3546,7 @@ mod pr3_tests {
         let coord = guard
             .register_query(
                 query,
-                vec![crate::coordinator::write::report::WriterKey {
+                vec![crate::query_execution::write::WriterKey {
                     query_id: query,
                     fragment_instance_id: writer_finst,
                     backend_num: 0,
@@ -3596,7 +3596,7 @@ mod pr3_tests {
         let coord = guard
             .register_query(
                 query,
-                vec![crate::coordinator::write::report::WriterKey {
+                vec![crate::query_execution::write::WriterKey {
                     query_id: query,
                     fragment_instance_id: writer_finst,
                     backend_num: 0,
@@ -3635,7 +3635,7 @@ mod pr3_tests {
         let coord = guard
             .register_query(
                 query,
-                vec![crate::coordinator::write::report::WriterKey {
+                vec![crate::query_execution::write::WriterKey {
                     query_id: query,
                     fragment_instance_id: writer_finst,
                     backend_num: 0,

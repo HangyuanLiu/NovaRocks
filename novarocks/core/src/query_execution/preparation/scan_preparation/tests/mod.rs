@@ -33,7 +33,7 @@ use crate::connector::iceberg::scan_model::{
 use crate::connector::scan_planning::{
     BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext, TableHandle,
 };
-use crate::coordinator::prepare::scan::{
+use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
 use crate::sql::analysis::OutputColumn;
@@ -294,8 +294,8 @@ fn resolved_files(files: Vec<IcebergDataFileInfo>) -> ResolvedScanExecution {
 
 fn resolved_delta() -> ResolvedScanExecution {
     ResolvedScanExecution::IcebergDelta(
-        crate::coordinator::prepare::scan::ResolvedIcebergDeltaScan {
-            runtime_plan: crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan {
+        crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
+            runtime_plan: crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
                 table_location: "s3://bucket/test_table".to_string(),
                 data_columns: Vec::new(),
                 cloud_properties: BTreeMap::new(),

@@ -42,22 +42,24 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
 use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
-use crate::coordinator::prepare::{
-    PreparedFragment, PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
-};
 use crate::coordinator::profile::{
     StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
 };
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
 use crate::coordinator::runtime_filter_deployment::InstalledRuntimeFilterDeployment;
 use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
-use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::protocol::native::encode::NativeFragmentBundle;
+use crate::query_execution::fragment_transport::{
+    FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
+};
+use crate::query_execution::preparation::{
+    PreparedFragment, PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
+};
+use crate::query_execution::write::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
@@ -2005,8 +2007,8 @@ mod native_contract_tests {
     use arrow::array::{Array, Decimal128Array, Int32Array};
 
     use crate::coordinator::ports::CoordinatorObserver;
-    use crate::coordinator::write::report::FragmentExecStatusReport;
     use crate::proto::plan as native_plan;
+    use crate::query_execution::write::FragmentExecStatusReport;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
@@ -2068,7 +2070,7 @@ mod native_contract_tests {
             edges: Vec::new(),
             runtime_filter_graph: Default::default(),
         };
-        let prepared = crate::coordinator::prepare::prepare_fragments(
+        let prepared = crate::query_execution::preparation::prepare_fragments(
             &plan,
             &crate::connector::ConnectorRegistry::new(),
             None,
@@ -2123,7 +2125,7 @@ mod native_contract_tests {
     }
 
     fn prepared(fragment_ids: &[FragmentId]) -> PreparedFragmentSet {
-        crate::coordinator::prepare::prepared_fragment_set_for_test(
+        crate::query_execution::preparation::prepared_fragment_set_for_test(
             fragment_ids
                 .iter()
                 .map(|&fragment_id| (fragment_id, PreparedFragmentRole::Result, Vec::new()))
@@ -4197,7 +4199,7 @@ mod native_contract_tests {
                 edges: Vec::new(),
                 runtime_filter_graph: graph,
             };
-            let prepared = crate::coordinator::prepare::prepare_fragments(
+            let prepared = crate::query_execution::preparation::prepare_fragments(
                 &plan,
                 &crate::connector::ConnectorRegistry::new(),
                 None,

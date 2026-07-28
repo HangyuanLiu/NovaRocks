@@ -22,11 +22,11 @@ use async_trait::async_trait;
 
 use crate::common::types::UniqueId;
 use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::dispatch::FragmentDispatcher;
 use crate::coordinator::runtime_filter_deployment::{
     DeploymentEpochAllocator, NativeRuntimeFilterDeploymentPolicyProvider,
 };
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+use crate::query_execution::fragment_transport::FragmentDispatcher;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime_filter::deployment::RuntimeFilterQueryDeploymentPolicy;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;

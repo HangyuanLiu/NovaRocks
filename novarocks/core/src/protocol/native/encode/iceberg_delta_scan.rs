@@ -19,11 +19,11 @@
 
 use std::collections::HashMap;
 
-use crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan;
 use crate::exec::node::iceberg_delta_scan::{
     BaseDataFileLineage, DeletedFileVisibility, DeltaScanDeleteSidePayload, DeltaSourceFile,
     DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat, PositionDeleteSourceData,
 };
+use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;
 
 pub(super) fn encode_iceberg_delta_scan_plan_native(
     plan: &IcebergDeltaScanRuntimePlan,

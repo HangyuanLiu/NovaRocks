@@ -61,8 +61,8 @@ impl RegistryEventSink for QueryCleanupSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinator::write::report::WriterKey;
     use crate::coordinator::write::write_registry_test_guard;
+    use crate::query_execution::write::WriterKey;
     use crate::runtime::exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state};
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::query_state::{QueryState, in_flight_table};

@@ -75,7 +75,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
     let registry = registry(vec![data_file("s3://bucket/explicit.parquet")]);
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
-    let mut bindings = crate::coordinator::prepare::scan::ScanExecutionBindings::default();
+    let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
 
     collect_scan_bindings(
         0,
@@ -337,7 +337,7 @@ fn starrocks_planning_result_stores_ranges_and_source_descriptor() {
             tablet_schema: test_starrocks_tablet_schema_descriptor(30, &storage_columns),
         },
     };
-    let mut bindings = crate::coordinator::prepare::scan::ScanExecutionBindings::default();
+    let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
 
     store_planned_starrocks_scan(0, 42, planned, &mut bindings)
         .expect("store StarRocks planning result");

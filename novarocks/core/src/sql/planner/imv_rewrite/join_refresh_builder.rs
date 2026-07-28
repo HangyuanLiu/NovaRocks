@@ -1405,7 +1405,7 @@ mod tests {
         let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
             .and_then(crate::sql::planner::pipeline::build_distributed_plan)
             .and_then(|distributed_plan| {
-                let prepared = crate::coordinator::prepare::prepare_fragments(
+                let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
                     &connectors,
                     None,

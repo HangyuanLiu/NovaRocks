@@ -84,7 +84,7 @@ fn planner_broadcast_edge_remains_broadcast_through_builder_and_scheduling() {
     ));
 
     let target_fragment_id = result.0.scheduling_view().edges()[0].target_fragment_id;
-    let prepared = crate::coordinator::prepare::prepared_fragment_set_for_test(
+    let prepared = crate::query_execution::preparation::prepared_fragment_set_for_test(
         planned
             .fragments()
             .iter()
@@ -93,9 +93,9 @@ fn planner_broadcast_edge_remains_broadcast_through_builder_and_scheduling() {
                 (
                     fragment.fragment_id,
                     if is_target {
-                        crate::coordinator::prepare::PreparedFragmentRole::TerminalWrite
+                        crate::query_execution::preparation::PreparedFragmentRole::TerminalWrite
                     } else {
-                        crate::coordinator::prepare::PreparedFragmentRole::NonTerminal
+                        crate::query_execution::preparation::PreparedFragmentRole::NonTerminal
                     },
                     if is_target {
                         vec![(
@@ -429,7 +429,7 @@ fn lower_distributed_plan_owns_native_write_sink_shape() {
             .fragment(0)
             .expect("prepared write fragment")
             .execution_role(),
-        crate::coordinator::prepare::PreparedFragmentRole::TerminalWrite
+        crate::query_execution::preparation::PreparedFragmentRole::TerminalWrite
     );
     assert!(
         result
