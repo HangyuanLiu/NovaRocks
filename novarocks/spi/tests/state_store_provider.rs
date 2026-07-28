@@ -17,6 +17,9 @@
 
 #![cfg(feature = "state-store-conformance")]
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashSet};
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -182,6 +185,44 @@ fn provider_id_rejects_invalid_static_values() {
     assert!(StateStoreProviderId::try_new("provider-").is_err());
     assert!(StateStoreProviderId::try_new("provider--two").is_err());
     assert!(StateStoreProviderId::try_new("Test Provider").is_err());
+}
+
+#[test]
+fn provider_id_has_value_order_hash_and_descriptor_identity() {
+    let sqlite = StateStoreProviderId::new("sqlite");
+    let mysql = StateStoreProviderId::new("mysql");
+    assert_eq!(sqlite, StateStoreProviderId::new("sqlite"));
+    assert_ne!(sqlite, mysql);
+    assert!(mysql < sqlite);
+
+    let mut ordered = BTreeSet::new();
+    ordered.insert(sqlite);
+    ordered.insert(mysql);
+    assert_eq!(
+        ordered
+            .into_iter()
+            .map(StateStoreProviderId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["mysql", "sqlite"]
+    );
+
+    let mut hashed = HashSet::new();
+    hashed.insert(sqlite);
+    hashed.insert(StateStoreProviderId::new("sqlite"));
+    assert_eq!(hashed.len(), 1);
+    assert_eq!(
+        hash_of(sqlite),
+        hash_of(StateStoreProviderId::new("sqlite"))
+    );
+
+    assert_eq!(StateStoreProviderDescriptor::new(sqlite).id, sqlite);
+    assert_ne!(StateStoreProviderDescriptor::new(sqlite).id, mysql);
+}
+
+fn hash_of(id: StateStoreProviderId) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[test]
