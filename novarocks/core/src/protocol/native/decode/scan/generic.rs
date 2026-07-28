@@ -25,7 +25,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
 };
 
 use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
@@ -67,16 +67,13 @@ pub(super) fn lower_connector_read_scan(
             error.to_string(),
         )
     })?;
-    let instance = ctx
-        .connectors()?
-        .connector_instance(&instance_id)
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "instance_id",
-                error.to_string(),
-            )
-        })?;
+    let provider_id = ConnectorProviderId::parse(&source.provider_id).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "provider_id",
+            error.to_string(),
+        )
+    })?;
     let batch = ConnectorBatchBudget {
         max_rows: required_nonzero_usize(source.max_batch_rows, "max_batch_rows")?,
         max_bytes: required_nonzero_usize(source.max_batch_bytes, "max_batch_bytes")?,
@@ -179,18 +176,76 @@ pub(super) fn lower_connector_read_scan(
 
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
+    let file_ranges = scheduled
+        .iter()
+        .filter_map(|scheduled| scheduled.file_range().cloned())
+        .collect::<Vec<_>>();
+    let connectors = ctx.connectors()?;
+    let (instance, lifecycle) = match connectors.connector_instance(&instance_id) {
+        Ok(instance) => {
+            if instance.descriptor().provider_id != provider_id {
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "provider_id",
+                    format!(
+                        "ConnectorReadSource provider_id `{}` does not match registered instance provider `{}`",
+                        provider_id.as_str(),
+                        instance.descriptor().provider_id.as_str(),
+                    ),
+                ));
+            }
+            (instance, None)
+        }
+        Err(_) => {
+            let native_instance = connectors
+                .materialize_transport_connector_instance(
+                    &provider_id,
+                    instance_id,
+                    Bytes::copy_from_slice(&source.scan_payload),
+                    &file_ranges,
+                    output_schema.clone(),
+                )
+                .map_err(|error| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InvalidValue,
+                        "provider_id",
+                        error.to_string(),
+                    )
+                })?;
+            let (instance, lifecycle) = connectors
+                .register_ephemeral_connector_instance(native_instance)
+                .map_err(|error| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InvalidValue,
+                        "instance_id",
+                        error.to_string(),
+                    )
+                })?;
+            (instance, Some(lifecycle))
+        }
+    };
     let request = ConnectorOpenReaderRequest {
         expected_schema: output_schema.arrow_schema_ref(),
         batch,
         context: request_context,
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    let source = Arc::new(ConnectorReadScanSource::new_scheduled(
-        instance,
-        scheduled,
-        request,
-        output_schema.clone(),
-    ));
+    let source = Arc::new(match lifecycle {
+        Some(lifecycle) => ConnectorReadScanSource::new_scheduled_ephemeral(
+            instance,
+            scheduled,
+            request,
+            output_schema.clone(),
+            lifecycle,
+            None,
+        ),
+        None => ConnectorReadScanSource::new_scheduled(
+            instance,
+            scheduled,
+            request,
+            output_schema.clone(),
+        ),
+    });
     ctx.capture_scan_ranges(node.node_id, BoundScanRanges::None);
     let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)

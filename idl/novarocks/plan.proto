@@ -1014,6 +1014,7 @@ message ConnectorReadSource {
   uint64 max_batch_bytes = 5;          // required nonzero reader batch budget.
   uint64 max_handle_payload_bytes = 6; // required bounded provider-handle budget.
   uint64 max_total_payload_bytes = 7;  // required bounded request aggregate budget.
+  string provider_id = 8;              // normalized ConnectorProviderId for BE-local host lookup.
 }
 
 // One scheduled split in a ConnectorReadSource.

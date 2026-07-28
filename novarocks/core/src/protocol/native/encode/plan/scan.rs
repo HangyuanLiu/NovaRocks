@@ -668,7 +668,7 @@ fn encode_scan_source(
             table_model::ScanSource::IcebergDataFiles {
                 table,
                 files,
-                cloud_properties,
+                cloud_properties: _,
                 binding,
             } => Kind::IcebergDataFiles(plan::IcebergDataFiles {
                 table: Some(encode_iceberg_table_info(table)?),
@@ -690,7 +690,7 @@ fn encode_scan_source(
                 table,
                 metadata_table_type,
                 serialized_table,
-                cloud_properties,
+                cloud_properties: _,
                 metadata_payload,
             } => Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
                 table: Some(encode_iceberg_table_info(table)?),
