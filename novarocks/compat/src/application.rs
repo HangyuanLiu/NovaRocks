@@ -10,7 +10,7 @@ use novarocks::service::{
 };
 
 use crate::brpc;
-use crate::fragment::CompatFragmentService;
+use crate::fragment::{CompatFragmentService, install_process_fragment_service};
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -198,13 +198,19 @@ impl CompatApplicationHost {
             startup_summary,
         };
         host.ports.init_frontend_rpc();
-        let fragment_service = Arc::new(CompatFragmentService);
-        if let Err(error) = host.ports.start_grpc(&server.host, fragment_service) {
+        let fragment_service = Arc::new(CompatFragmentService::new(
+            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+        ));
+        let grpc_fragment_service: Arc<
+            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
+        > = fragment_service.clone();
+        if let Err(error) = host.ports.start_grpc(&server.host, grpc_fragment_service) {
             return Err(host.start_failure(
                 CompatApplicationErrorKind::GrpcStart,
                 format!("start grpc/http/starlet listeners: {error}"),
             ));
         }
+        install_process_fragment_service(fragment_service);
         host.started.grpc = true;
         if let Err(error) = host.ports.start_heartbeat(heartbeat_config) {
             return Err(host.start_failure(

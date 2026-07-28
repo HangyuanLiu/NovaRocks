@@ -43,7 +43,8 @@ use novarocks::runtime::profile::{ProfileUnit, Profiler};
 use novarocks::runtime::query_context::{LookupFetcherLifecycle, QueryId};
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks::runtime::starrocks_fragment_query::{
-    StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentQueryRuntime,
+    StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentPreStartHandoff,
+    StarRocksFragmentQueryRuntime,
 };
 use novarocks::service::fe_report;
 use novarocks::service::starrocks_fragment_dependency_resolver::resolve_dependencies;
@@ -54,8 +55,40 @@ use novarocks::service::starrocks_fragment_transport::{
 };
 use novarocks::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
-#[derive(Debug, Default)]
-pub struct CompatFragmentService;
+pub struct CompatFragmentService {
+    queries: StarRocksFragmentQueryRuntime,
+    controls: Arc<CompatFragmentControls>,
+}
+
+impl CompatFragmentService {
+    pub fn new(queries: StarRocksFragmentQueryRuntime) -> Self {
+        Self {
+            queries,
+            controls: Arc::new(CompatFragmentControls::default()),
+        }
+    }
+
+    pub fn submit_exec_batch_plan_fragments(&self, thrift_bytes: &[u8]) -> Result<usize, String> {
+        submit_exec_batch_plan_fragments_with(self, thrift_bytes)
+    }
+
+    pub fn submit_exec_plan_fragment(&self, thrift_bytes: &[u8]) -> Result<(), String> {
+        submit_exec_plan_fragment_with(self, thrift_bytes)
+    }
+
+    pub fn execute_plan_fragment_sync(
+        &self,
+        request: internal_service::TExecPlanFragmentParams,
+    ) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String>
+    {
+        execute_plan_fragment_sync_with(self, request)
+    }
+
+    pub fn cancel_fragment(&self, finst_id: UniqueId) {
+        self.controls
+            .cancel_fragment(finst_id, &format!("query canceled by FE: finst={finst_id}"));
+    }
+}
 
 impl novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress
     for CompatFragmentService
@@ -65,8 +98,40 @@ impl novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncI
         request: internal_service::TExecPlanFragmentParams,
     ) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String>
     {
-        execute_plan_fragment_sync(request)
+        self.execute_plan_fragment_sync(request)
     }
+}
+
+fn process_fragment_service_slot() -> &'static Mutex<Option<Arc<CompatFragmentService>>> {
+    static SERVICE: OnceLock<Mutex<Option<Arc<CompatFragmentService>>>> = OnceLock::new();
+    SERVICE.get_or_init(|| Mutex::new(None))
+}
+
+pub fn install_process_fragment_service(service: Arc<CompatFragmentService>) {
+    *process_fragment_service_slot()
+        .lock()
+        .expect("compat fragment service slot lock") = Some(service);
+}
+
+fn process_fragment_service() -> Result<Arc<CompatFragmentService>, String> {
+    if let Some(service) = process_fragment_service_slot()
+        .lock()
+        .expect("compat fragment service slot lock")
+        .clone()
+    {
+        return Ok(service);
+    }
+    #[cfg(test)]
+    {
+        static TEST_SERVICE: OnceLock<Arc<CompatFragmentService>> = OnceLock::new();
+        return Ok(Arc::clone(TEST_SERVICE.get_or_init(|| {
+            Arc::new(CompatFragmentService::new(
+                StarRocksFragmentQueryRuntime::new(),
+            ))
+        })));
+    }
+    #[cfg(not(test))]
+    Err("compat fragment service is not installed".to_string())
 }
 
 #[cfg(test)]
@@ -77,7 +142,6 @@ static TEST_FRAGMENT_LAUNCH_COUNT: std::sync::atomic::AtomicUsize =
 enum AdapterFailureStage {
     Prepare,
     ReportRegistration,
-    Start,
 }
 
 #[cfg(test)]
@@ -96,6 +160,37 @@ static TEST_FRAGMENT_LAUNCHES_BY_QUERY: OnceLock<Mutex<HashMap<QueryId, usize>>>
 
 #[cfg(test)]
 static TEST_REGISTERED_REPORTS: OnceLock<Mutex<HashMap<QueryId, Vec<UniqueId>>>> = OnceLock::new();
+
+#[cfg(test)]
+struct AdapterPausePlan {
+    query_id: QueryId,
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TEST_AFTER_HANDOFF_PAUSE: Mutex<Option<AdapterPausePlan>> = Mutex::new(None);
+
+#[cfg(test)]
+fn pause_after_handoff_before_start(query_id: QueryId) {
+    let plan = {
+        let mut pause = TEST_AFTER_HANDOFF_PAUSE
+            .lock()
+            .expect("adapter handoff pause lock");
+        if pause.as_ref().is_some_and(|plan| plan.query_id == query_id) {
+            pause.take()
+        } else {
+            None
+        }
+    };
+    if let Some(plan) = plan {
+        plan.entered.send(()).expect("signal handoff pause");
+        plan.release.recv().expect("release handoff pause");
+    }
+}
+
+#[cfg(not(test))]
+fn pause_after_handoff_before_start(_query_id: QueryId) {}
 
 #[cfg(test)]
 fn set_adapter_failure(plan: Option<AdapterFailurePlan>) {
@@ -300,6 +395,7 @@ fn validate_internal_addresses(
 }
 
 fn append_incremental_scan_ranges(
+    queries: &StarRocksFragmentQueryRuntime,
     exec_params: &mut internal_service::TPlanFragmentExecParams,
 ) -> Result<(), String> {
     backfill_per_node_scan_ranges(exec_params);
@@ -307,7 +403,6 @@ fn append_incremental_scan_ranges(
         hi: exec_params.fragment_instance_id.hi,
         lo: exec_params.fragment_instance_id.lo,
     };
-    let queries = StarRocksFragmentQueryRuntime::global();
     let mut decoded_updates = Vec::new();
     for (node_id, scan_ranges) in &exec_params.per_node_scan_ranges {
         if scan_ranges.is_empty() {
@@ -750,6 +845,7 @@ fn profile_report_interval_ns(
 }
 
 fn launch_prepared_fragments(
+    service: &CompatFragmentService,
     prepared: Vec<PreparedStarRocksFragment>,
     descriptor_preparation: StarRocksDescriptorPreparation,
     guard: StarRocksPrelaunchGuard,
@@ -766,7 +862,7 @@ fn launch_prepared_fragments(
     }
     let handoff = prepare_query_handoff(&prepared, descriptor_preparation.generation())?;
     let execution = handoff.execution();
-    let queries = StarRocksFragmentQueryRuntime::global();
+    let queries = service.queries.clone();
     let admission = queries.prepare_admission(
         handoff.query_id(),
         handoff.delivery_expire(),
@@ -837,18 +933,31 @@ fn launch_prepared_fragments(
         });
     }
     let created = launches.len();
-    let finst_ids = launches
-        .iter()
-        .map(|launch| launch.finst_id)
-        .collect::<Vec<_>>();
     let start_gate = Arc::new(BatchStartGate::default());
     let workers = spawn_dormant_workers(
         launches,
         execution,
         queries.clone(),
+        Arc::clone(&service.controls),
         Arc::clone(&start_gate),
     )?;
-    let committed_query_mem_tracker = match guard.handoff(|| {
+    let worker_finst_ids = workers
+        .iter()
+        .map(|worker| worker.finst_id)
+        .collect::<Vec<_>>();
+    let pending_routes = match service.controls.register_pending(
+        query_id,
+        &worker_finst_ids,
+        Arc::clone(&start_gate),
+    ) {
+        Ok(routes) => routes,
+        Err(error) => {
+            start_gate.abort(FragmentCancelReason::new(error.clone()));
+            abort_dormant_workers(workers);
+            return Err(error);
+        }
+    };
+    let committed_handoff = match guard.handoff(|| {
         commit_descriptor_handoff(&descriptor_preparation, |lease_factory| {
             queries.commit_handoff(handoff, || {
                 lease_factory.map(|factory| factory.into_cleanup_lease())
@@ -857,11 +966,14 @@ fn launch_prepared_fragments(
     }) {
         Ok(tracker) => tracker,
         Err(error) => {
-            start_gate.abort();
+            start_gate.abort(FragmentCancelReason::new(error.clone()));
+            drop(pending_routes);
             abort_dormant_workers(workers);
             return Err(error);
         }
     };
+    let committed_query_mem_tracker = committed_handoff.query_mem_tracker();
+    let mut pre_start = Some(committed_handoff.into_pre_start());
     debug_assert!(Arc::ptr_eq(
         &committed_query_mem_tracker,
         &admission.query_mem_tracker()
@@ -872,30 +984,30 @@ fn launch_prepared_fragments(
             rollback_committed_launch(
                 workers,
                 &start_gate,
-                &queries,
-                execution,
-                &finst_ids,
+                pre_start.take().expect("committed pre-start handoff"),
+                pending_routes,
                 &registered,
             );
             return Err(error);
         }
     };
-    for start_index in 1..=workers.len() {
-        if injected_adapter_failure(query_id, AdapterFailureStage::Start, start_index) {
-            rollback_committed_launch(
-                workers,
-                &start_gate,
-                &queries,
-                execution,
-                &finst_ids,
-                &registered_reports,
-            );
-            return Err(format!(
-                "injected StarRocks fragment start failure at index {start_index}"
-            ));
-        }
+    pause_after_handoff_before_start(query_id);
+    if !start_gate.start(|| {
+        pre_start
+            .take()
+            .expect("committed pre-start handoff")
+            .start();
+    }) {
+        rollback_committed_launch(
+            workers,
+            &start_gate,
+            pre_start.take().expect("aborted pre-start handoff"),
+            pending_routes,
+            &registered_reports,
+        );
+        return Err("StarRocks fragment batch was cancelled before start".to_string());
     }
-    start_gate.start();
+    pending_routes.handoff();
     for worker in workers {
         worker.detach();
     }
@@ -974,14 +1086,20 @@ fn unregister_fragment_reports(query_id: QueryId, registered: &[UniqueId]) {
 fn rollback_committed_launch(
     workers: Vec<DormantWorker>,
     start_gate: &BatchStartGate,
-    queries: &StarRocksFragmentQueryRuntime,
-    execution: StarRocksFragmentExecution,
-    finst_ids: &[UniqueId],
+    pre_start: StarRocksFragmentPreStartHandoff,
+    pending_routes: PendingFragmentRoutes,
     registered_reports: &[UniqueId],
 ) {
-    unregister_fragment_reports(execution.query_id(), registered_reports);
-    queries.rollback_handoff(execution, finst_ids);
-    start_gate.abort();
+    unregister_fragment_reports(pre_start.execution().query_id(), registered_reports);
+    let rolled_back = pre_start.rollback();
+    debug_assert!(
+        rolled_back,
+        "committed StarRocks handoff must be rollbackable before batch start"
+    );
+    start_gate.abort(FragmentCancelReason::new(
+        "StarRocks fragment batch rolled back before start",
+    ));
+    drop(pending_routes);
     join_dormant_workers(workers);
 }
 
@@ -995,30 +1113,56 @@ enum BatchStartState {
 
 #[derive(Debug, Default)]
 struct BatchStartGate {
-    state: Mutex<BatchStartState>,
+    state: Mutex<BatchStartGateState>,
     changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct BatchStartGateState {
+    phase: BatchStartState,
+    cancel_reason: Option<FragmentCancelReason>,
 }
 
 impl BatchStartGate {
     fn wait(&self) -> BatchStartState {
         let mut state = self.state.lock().expect("batch start gate lock");
-        while *state == BatchStartState::Pending {
+        while state.phase == BatchStartState::Pending {
             state = self
                 .changed
                 .wait(state)
                 .expect("batch start gate wait lock");
         }
-        *state
+        state.phase
     }
 
-    fn start(&self) {
-        *self.state.lock().expect("batch start gate lock") = BatchStartState::Started;
+    fn start(&self, seal_pre_start: impl FnOnce()) -> bool {
+        let mut state = self.state.lock().expect("batch start gate lock");
+        if state.phase != BatchStartState::Pending {
+            return false;
+        }
+        seal_pre_start();
+        state.phase = BatchStartState::Started;
         self.changed.notify_all();
+        true
     }
 
-    fn abort(&self) {
-        *self.state.lock().expect("batch start gate lock") = BatchStartState::Aborted;
-        self.changed.notify_all();
+    fn abort(&self, reason: FragmentCancelReason) {
+        let mut state = self.state.lock().expect("batch start gate lock");
+        if state.cancel_reason.is_none() {
+            state.cancel_reason = Some(reason);
+        }
+        if state.phase == BatchStartState::Pending {
+            state.phase = BatchStartState::Aborted;
+            self.changed.notify_all();
+        }
+    }
+
+    fn cancellation_reason(&self) -> Option<FragmentCancelReason> {
+        self.state
+            .lock()
+            .expect("batch start gate lock")
+            .cancel_reason
+            .clone()
     }
 }
 
@@ -1042,64 +1186,220 @@ impl DormantWorker {
 
 #[derive(Default)]
 struct CompatFragmentControls {
-    running: std::sync::Mutex<HashMap<UniqueId, (QueryId, RunningFragmentHandle)>>,
+    routes: std::sync::Mutex<HashMap<UniqueId, CompatFragmentRoute>>,
+}
+
+enum CompatFragmentRoute {
+    Pending {
+        query_id: QueryId,
+        gate: Arc<BatchStartGate>,
+    },
+    Running {
+        query_id: QueryId,
+        handle: RunningFragmentHandle,
+    },
 }
 
 impl CompatFragmentControls {
-    fn publish(&self, query_id: QueryId, finst_id: UniqueId, handle: RunningFragmentHandle) {
-        self.running
+    #[cfg(test)]
+    fn has_running_route(&self, query_id: QueryId, finst_id: UniqueId) -> bool {
+        self.routes
             .lock()
             .expect("compat fragment controls lock")
-            .insert(finst_id, (query_id, handle));
+            .get(&finst_id)
+            .is_some_and(|route| {
+                matches!(
+                    route,
+                    CompatFragmentRoute::Running {
+                        query_id: current,
+                        ..
+                    } if *current == query_id
+                )
+            })
     }
 
-    fn remove(&self, finst_id: UniqueId) {
-        self.running
-            .lock()
-            .expect("compat fragment controls lock")
-            .remove(&finst_id);
+    fn register_pending(
+        self: &Arc<Self>,
+        query_id: QueryId,
+        finst_ids: &[UniqueId],
+        gate: Arc<BatchStartGate>,
+    ) -> Result<PendingFragmentRoutes, String> {
+        let mut routes = self.routes.lock().expect("compat fragment controls lock");
+        if let Some(finst_id) = finst_ids
+            .iter()
+            .find(|finst_id| routes.contains_key(finst_id))
+        {
+            return Err(format!(
+                "compat fragment cancellation route already exists: finst_id={finst_id}"
+            ));
+        }
+        for finst_id in finst_ids {
+            routes.insert(
+                *finst_id,
+                CompatFragmentRoute::Pending {
+                    query_id,
+                    gate: Arc::clone(&gate),
+                },
+            );
+        }
+        Ok(PendingFragmentRoutes {
+            controls: Arc::clone(self),
+            query_id,
+            finst_ids: finst_ids.to_vec(),
+            gate,
+            active: true,
+        })
+    }
+
+    fn publish(
+        &self,
+        query_id: QueryId,
+        finst_id: UniqueId,
+        gate: &Arc<BatchStartGate>,
+        handle: RunningFragmentHandle,
+    ) {
+        let published = {
+            let mut routes = self.routes.lock().expect("compat fragment controls lock");
+            let matches_pending = routes.get(&finst_id).is_some_and(|route| {
+                matches!(
+                    route,
+                    CompatFragmentRoute::Pending {
+                        query_id: current,
+                        gate: current_gate,
+                    } if *current == query_id && Arc::ptr_eq(current_gate, gate)
+                )
+            });
+            if matches_pending {
+                routes.insert(
+                    finst_id,
+                    CompatFragmentRoute::Running {
+                        query_id,
+                        handle: handle.clone(),
+                    },
+                );
+            }
+            matches_pending
+        };
+        if published && let Some(reason) = gate.cancellation_reason() {
+            handle.cancel(reason);
+        }
+    }
+
+    fn remove(&self, query_id: QueryId, finst_id: UniqueId) {
+        let mut routes = self.routes.lock().expect("compat fragment controls lock");
+        if routes.get(&finst_id).is_some_and(|route| match route {
+            CompatFragmentRoute::Pending {
+                query_id: current, ..
+            }
+            | CompatFragmentRoute::Running {
+                query_id: current, ..
+            } => *current == query_id,
+        }) {
+            routes.remove(&finst_id);
+        }
     }
 
     fn cancel_query(&self, query_id: QueryId, reason: &str) {
-        let handles = self
-            .running
-            .lock()
-            .expect("compat fragment controls lock")
-            .values()
-            .filter_map(|(current, handle)| (*current == query_id).then(|| handle.clone()))
-            .collect::<Vec<_>>();
+        let (gates, handles) = {
+            let routes = self.routes.lock().expect("compat fragment controls lock");
+            let mut gates = Vec::new();
+            let mut handles = Vec::new();
+            for route in routes.values() {
+                match route {
+                    CompatFragmentRoute::Pending {
+                        query_id: current,
+                        gate,
+                    } if *current == query_id => {
+                        if !gates.iter().any(|current| Arc::ptr_eq(current, gate)) {
+                            gates.push(Arc::clone(gate));
+                        }
+                    }
+                    CompatFragmentRoute::Running {
+                        query_id: current,
+                        handle,
+                    } if *current == query_id => handles.push(handle.clone()),
+                    _ => {}
+                }
+            }
+            (gates, handles)
+        };
+        let reason = FragmentCancelReason::new(reason);
+        for gate in gates {
+            gate.abort(reason.clone());
+        }
         for handle in handles {
-            handle.cancel(FragmentCancelReason::new(reason));
+            handle.cancel(reason.clone());
         }
     }
 
     fn cancel_fragment(&self, finst_id: UniqueId, reason: &str) {
         let query_id = self
-            .running
+            .routes
             .lock()
             .expect("compat fragment controls lock")
             .get(&finst_id)
-            .map(|(query_id, _)| *query_id);
+            .map(|route| match route {
+                CompatFragmentRoute::Pending { query_id, .. }
+                | CompatFragmentRoute::Running { query_id, .. } => *query_id,
+            });
         if let Some(query_id) = query_id {
             self.cancel_query(query_id, reason);
         }
     }
 }
 
-fn compat_fragment_controls() -> &'static CompatFragmentControls {
-    static CONTROLS: OnceLock<CompatFragmentControls> = OnceLock::new();
-    CONTROLS.get_or_init(CompatFragmentControls::default)
+struct PendingFragmentRoutes {
+    controls: Arc<CompatFragmentControls>,
+    query_id: QueryId,
+    finst_ids: Vec<UniqueId>,
+    gate: Arc<BatchStartGate>,
+    active: bool,
+}
+
+impl PendingFragmentRoutes {
+    fn handoff(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingFragmentRoutes {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut routes = self
+            .controls
+            .routes
+            .lock()
+            .expect("compat fragment controls lock");
+        for finst_id in self.finst_ids.iter().rev() {
+            let owned = routes.get(finst_id).is_some_and(|route| {
+                matches!(
+                    route,
+                    CompatFragmentRoute::Pending {
+                        query_id,
+                        gate,
+                    } if *query_id == self.query_id && Arc::ptr_eq(gate, &self.gate)
+                )
+            });
+            if owned {
+                routes.remove(finst_id);
+            }
+        }
+    }
 }
 
 pub fn cancel_fragment(finst_id: UniqueId) {
-    compat_fragment_controls()
-        .cancel_fragment(finst_id, &format!("query canceled by FE: finst={finst_id}"));
+    if let Ok(service) = process_fragment_service() {
+        service.cancel_fragment(finst_id);
+    }
 }
 
 fn spawn_dormant_workers(
     launches: Vec<PreparedLaunchResources>,
     execution: StarRocksFragmentExecution,
     queries: StarRocksFragmentQueryRuntime,
+    controls: Arc<CompatFragmentControls>,
     start_gate: Arc<BatchStartGate>,
 ) -> Result<Vec<DormantWorker>, String> {
     let mut workers: Vec<DormantWorker> = Vec::with_capacity(launches.len());
@@ -1108,6 +1408,7 @@ fn spawn_dormant_workers(
         let query_id = execution.query_id();
         let profiler_for_wall = launch.profiler.clone();
         let queries = queries.clone();
+        let controls = Arc::clone(&controls);
         let worker_start_gate = Arc::clone(&start_gate);
         let join = match std::thread::Builder::new()
             .name(format!(
@@ -1126,9 +1427,9 @@ fn spawn_dormant_workers(
                         targets: launch.lookup_close_targets,
                     };
                     let running = launch.dormant.start();
-                    compat_fragment_controls().publish(query_id, finst_id, running.clone());
+                    controls.publish(query_id, finst_id, &worker_start_gate, running.clone());
                     let fact = running.join();
-                    compat_fragment_controls().remove(finst_id);
+                    controls.remove(query_id, finst_id);
                     (running, fact)
                 }));
                 let (running, report_error) = match completion {
@@ -1146,7 +1447,7 @@ fn spawn_dormant_workers(
                         (Some(running), error)
                     }
                     Err(payload) => {
-                        compat_fragment_controls().remove(finst_id);
+                        controls.remove(query_id, finst_id);
                         let msg = if let Some(s) = payload.downcast_ref::<&str>() {
                             (*s).to_string()
                         } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1174,7 +1475,7 @@ fn spawn_dormant_workers(
                 run_async_cleanup_sequence(
                     report_error,
                     |error| {
-                        compat_fragment_controls().cancel_query(query_id, error);
+                        controls.cancel_query(query_id, error);
                         for id in queries.cancel_query(execution, error.to_string()) {
                             exchange::cancel_fragment(id.hi, id.lo);
                         }
@@ -1195,7 +1496,9 @@ fn spawn_dormant_workers(
             }) {
             Ok(join) => join,
             Err(error) => {
-                start_gate.abort();
+                start_gate.abort(FragmentCancelReason::new(format!(
+                    "spawn StarRocks fragment adapter worker failed: {error}"
+                )));
                 join_dormant_workers(workers);
                 return Err(format!(
                     "spawn StarRocks fragment adapter worker failed: {error}"
@@ -1247,6 +1550,13 @@ fn run_async_cleanup_sequence<T>(
 }
 
 pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, String> {
+    process_fragment_service()?.submit_exec_batch_plan_fragments(thrift_bytes)
+}
+
+fn submit_exec_batch_plan_fragments_with(
+    service: &CompatFragmentService,
+    thrift_bytes: &[u8],
+) -> Result<usize, String> {
     let batch: internal_service::TExecBatchPlanFragmentsParams =
         thrift_binary_deserialize(thrift_bytes)?;
     if debug_exec_batch_plan_json() {
@@ -1401,10 +1711,17 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         .zip(resolutions)
         .map(|(draft, resolved)| finish_starrocks_draft(draft, resolved))
         .collect::<Result<Vec<_>, _>>()?;
-    launch_prepared_fragments(prepared, descriptor_preparation, guard)
+    launch_prepared_fragments(service, prepared, descriptor_preparation, guard)
 }
 
 pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
+    process_fragment_service()?.submit_exec_plan_fragment(thrift_bytes)
+}
+
+fn submit_exec_plan_fragment_with(
+    service: &CompatFragmentService,
+    thrift_bytes: &[u8],
+) -> Result<(), String> {
     let one: internal_service::TExecPlanFragmentParams = thrift_binary_deserialize(thrift_bytes)?;
     if debug_exec_batch_plan_json() {
         match thrift_named_json(&one) {
@@ -1427,7 +1744,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     };
     if one.fragment.is_none() {
         let mut params = params.clone();
-        append_incremental_scan_ranges(&mut params)?;
+        append_incremental_scan_ranges(&service.queries, &mut params)?;
         return Ok(());
     }
     let fragment = one.fragment.as_ref().expect("checked above");
@@ -1474,11 +1791,18 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token)?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
-    launch_prepared_fragments(vec![prepared], descriptor_preparation, guard)?;
+    launch_prepared_fragments(service, vec![prepared], descriptor_preparation, guard)?;
     Ok(())
 }
 
 pub fn execute_plan_fragment_sync(
+    one: internal_service::TExecPlanFragmentParams,
+) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
+    process_fragment_service()?.execute_plan_fragment_sync(one)
+}
+
+fn execute_plan_fragment_sync_with(
+    service: &CompatFragmentService,
     one: internal_service::TExecPlanFragmentParams,
 ) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
     let Some(params) = one.params.as_ref() else {
@@ -1549,7 +1873,7 @@ pub fn execute_plan_fragment_sync(
         descriptor_preparation.generation(),
     )?;
     let execution = handoff.execution();
-    let queries = StarRocksFragmentQueryRuntime::global();
+    let queries = service.queries.clone();
     let admission = queries.prepare_admission(
         handoff.query_id(),
         handoff.delivery_expire(),
@@ -1562,24 +1886,50 @@ pub fn execute_plan_fragment_sync(
         .into_prepare_context(None, Some(Arc::clone(&fragment_mem_tracker)));
     let dormant = prepare_fragment(prepared.submission, prepare_context)
         .map_err(|error| error.to_string())?;
-    let query_mem_tracker = guard.handoff(|| {
+    let start_gate = Arc::new(BatchStartGate::default());
+    let pending_routes =
+        service
+            .controls
+            .register_pending(query_id, &[finst_id], Arc::clone(&start_gate))?;
+    let committed_handoff = guard.handoff(|| {
         commit_descriptor_handoff(&descriptor_preparation, |lease_factory| {
             queries.commit_handoff(handoff, || {
                 lease_factory.map(|factory| factory.into_cleanup_lease())
             })
         })
     })?;
+    let query_mem_tracker = committed_handoff.query_mem_tracker();
     debug_assert!(Arc::ptr_eq(
         &query_mem_tracker,
         &admission.query_mem_tracker()
     ));
+    let mut pre_start = Some(committed_handoff.into_pre_start());
+    if !start_gate.start(|| {
+        pre_start
+            .take()
+            .expect("committed sync pre-start handoff")
+            .start();
+    }) {
+        let rolled_back = pre_start
+            .take()
+            .expect("aborted sync pre-start handoff")
+            .rollback();
+        debug_assert!(rolled_back, "sync pre-start handoff must be rollbackable");
+        drop(pending_routes);
+        return Err("StarRocks sync fragment was cancelled before start".to_string());
+    }
     let execution_result = {
         let _lookup_close_guard = LookupCloseGuard {
             query_id,
             targets: lookup_close_targets,
         };
         let running = dormant.start();
+        service
+            .controls
+            .publish(query_id, finst_id, &start_gate, running.clone());
+        pending_routes.handoff();
         let fact = running.join();
+        service.controls.remove(query_id, finst_id);
         let result = match fact.outcome() {
             FragmentOutcome::Succeeded => {
                 running.handoff_sink_commit();
@@ -1614,19 +1964,22 @@ fn resolve_pipeline_dop(request: &internal_service::TExecPlanFragmentParams) -> 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use novarocks::common::thrift::{thrift_binary_deserialize, thrift_binary_serialize};
     use novarocks::common::types::UniqueId;
     use novarocks::runtime::query_context::QueryId;
-    use novarocks::thrift::{data_sinks, internal_service, partitions, plan_nodes, planner, types};
+    use novarocks::thrift::{
+        data_sinks, descriptors, internal_service, partitions, plan_nodes, planner, types,
+    };
 
     use super::{
-        AdapterFailurePlan, AdapterFailureStage, TEST_FRAGMENT_LAUNCH_COUNT,
-        fragment_launch_count_for_query, registered_reports_for_query, run_async_cleanup_sequence,
-        set_adapter_failure, submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
+        AdapterFailurePlan, AdapterFailureStage, AdapterPausePlan, CompatFragmentService,
+        TEST_AFTER_HANDOFF_PAUSE, TEST_FRAGMENT_LAUNCH_COUNT, fragment_launch_count_for_query,
+        registered_reports_for_query, run_async_cleanup_sequence, set_adapter_failure,
+        submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
     };
 
     static FAILURE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1846,6 +2199,46 @@ mod tests {
         internal_service::TExecBatchPlanFragmentsParams::new(None, Some(requests))
     }
 
+    fn blocking_exchange_request(
+        query: UniqueId,
+        finst: UniqueId,
+    ) -> internal_service::TExecPlanFragmentParams {
+        let mut exchange = empty_set_node();
+        exchange.node_type = plan_nodes::TPlanNodeType::EXCHANGE_NODE;
+        exchange.exchange_node = Some(plan_nodes::TExchangeNode::new(
+            vec![1],
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let mut request = request(
+            query,
+            finst,
+            fragment(Some(plan_nodes::TPlan::new(vec![exchange]))),
+        );
+        request.desc_tbl = Some(descriptors::TDescriptorTable::new(
+            Some(vec![]),
+            vec![descriptors::TTupleDescriptor::new(
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+            )],
+            None,
+            None,
+        ));
+        request
+            .params
+            .as_mut()
+            .expect("fragment params")
+            .per_exch_num_senders
+            .insert(11, 1);
+        request
+    }
+
     fn wait_for_query_launches(query_id: UniqueId, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while fragment_launch_count_for_query(runtime_query_id(query_id)) < expected
@@ -1857,6 +2250,124 @@ mod tests {
             fragment_launch_count_for_query(runtime_query_id(query_id)),
             expected,
             "timed out waiting for fragment launches"
+        );
+    }
+
+    #[test]
+    fn batch_start_gate_does_not_start_after_abort() {
+        let gate = super::BatchStartGate::default();
+
+        gate.abort(novarocks::runtime::fragment::FragmentCancelReason::new(
+            "test cancellation",
+        ));
+        let _ = gate.start(|| {});
+
+        assert_eq!(
+            gate.wait(),
+            super::BatchStartState::Aborted,
+            "start must not overwrite a cancellation that already aborted the gate"
+        );
+    }
+
+    #[test]
+    fn cancel_after_handoff_aborts_the_pending_gate_before_any_driver_starts() {
+        let _failure_lock = FAILURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let query = UniqueId {
+            hi: 85_031,
+            lo: 85_032,
+        };
+        let finst = UniqueId {
+            hi: 85_033,
+            lo: 85_034,
+        };
+        let bytes = thrift_binary_serialize(&valid_batch(query, &[finst], false))
+            .expect("serialize cancellation batch");
+        let service = Arc::new(CompatFragmentService::new(
+            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+        ));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        *TEST_AFTER_HANDOFF_PAUSE
+            .lock()
+            .expect("adapter handoff pause lock") = Some(AdapterPausePlan {
+            query_id: runtime_query_id(query),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let launch_service = Arc::clone(&service);
+        let launch =
+            std::thread::spawn(move || launch_service.submit_exec_batch_plan_fragments(&bytes));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("handoff reached pending start gate");
+        service.cancel_fragment(finst);
+        release_tx.send(()).expect("release pending start gate");
+        let result = launch.join().expect("launch thread");
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("cancelled before start")),
+            "cancel after handoff must reject gate release: {result:?}"
+        );
+        assert_eq!(
+            fragment_launch_count_for_query(runtime_query_id(query)),
+            0,
+            "cancelled pending handoff must not launch a driver"
+        );
+    }
+
+    #[test]
+    fn cancel_fragment_reaches_a_running_sync_fragment() {
+        let query = UniqueId {
+            hi: 85_041,
+            lo: 85_042,
+        };
+        let finst = UniqueId {
+            hi: 85_043,
+            lo: 85_044,
+        };
+        let service = Arc::new(CompatFragmentService::new(
+            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+        ));
+        let execution_service = Arc::clone(&service);
+        let execution = std::thread::spawn(move || {
+            execution_service.execute_plan_fragment_sync(blocking_exchange_request(query, finst))
+        });
+
+        let query_id = runtime_query_id(query);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !service.controls.has_running_route(query_id, finst)
+            && !execution.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        if execution.is_finished() {
+            panic!(
+                "sync fragment exited before publishing a running route: {:?}",
+                execution.join().expect("sync fragment execution thread")
+            );
+        }
+        assert!(
+            service.controls.has_running_route(query_id, finst),
+            "sync fragment must publish a cancellable running route"
+        );
+        service.cancel_fragment(finst);
+
+        let result = execution.join().expect("sync fragment execution thread");
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("fragment cancelled")),
+            "cancel must reach the running sync fragment: {result:?}"
+        );
+        assert!(
+            !service.controls.has_running_route(query_id, finst),
+            "sync cancellation route must be removed after execution finishes"
         );
     }
 
@@ -2054,66 +2565,13 @@ mod tests {
         );
 
         drop(reset);
-        let reset = inject_failure(query, AdapterFailureStage::Start, 1);
-        let retry = submit_exec_batch_plan_fragments(&bytes);
-        assert!(
-            retry
-                .as_ref()
-                .is_err_and(|error| error.contains("start failure at index 1")),
-            "rollback must leave the same fragment IDs retryable: {retry:?}"
-        );
-        assert!(registered_reports_for_query(runtime_query_id(query)).is_empty());
-        drop(reset);
-    }
-
-    #[test]
-    fn nth_start_failure_releases_whole_batch_before_any_driver_starts() {
-        let _failure_lock = FAILURE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let query = UniqueId {
-            hi: 85_221,
-            lo: 85_222,
-        };
-        let finst_ids = [
-            UniqueId {
-                hi: 85_223,
-                lo: 85_224,
-            },
-            UniqueId {
-                hi: 85_225,
-                lo: 85_226,
-            },
-            UniqueId {
-                hi: 85_227,
-                lo: 85_228,
-            },
-        ];
-        let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, false))
-            .expect("serialize start failure batch");
-        let reset = inject_failure(query, AdapterFailureStage::Start, 2);
-
-        let result = submit_exec_batch_plan_fragments(&bytes);
-
-        assert!(
-            result
-                .as_ref()
-                .is_err_and(|error| error.contains("start failure at index 2")),
-            "unexpected result: {result:?}"
-        );
-        assert_eq!(
-            fragment_launch_count_for_query(runtime_query_id(query)),
-            0,
-            "shared start gate must keep all drivers dormant"
-        );
-        drop(reset);
 
         assert_eq!(
             submit_exec_batch_plan_fragments(&bytes),
-            Ok(3),
-            "full start compensation must leave the batch retryable"
+            Ok(2),
+            "report-registration rollback must leave the batch retryable"
         );
-        wait_for_query_launches(query, 3);
+        wait_for_query_launches(query, 2);
     }
 
     #[test]

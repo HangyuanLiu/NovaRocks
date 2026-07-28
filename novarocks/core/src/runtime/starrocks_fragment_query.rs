@@ -43,10 +43,15 @@ pub struct StarRocksFragmentQueryRuntime {
 }
 
 impl StarRocksFragmentQueryRuntime {
-    pub fn global() -> Self {
+    pub fn new() -> Self {
         Self {
             manager: query_context_manager(),
         }
+    }
+
+    #[cfg(test)]
+    fn from_manager_for_test(manager: Arc<QueryContextManager>) -> Self {
+        Self { manager }
     }
 
     pub fn prepare_admission(
@@ -74,9 +79,26 @@ impl StarRocksFragmentQueryRuntime {
         &self,
         handoff: StarRocksFragmentHandoff,
         make_cleanup_lease: impl FnOnce() -> Option<QueryCleanupLease>,
-    ) -> Result<Arc<MemTracker>, String> {
-        self.manager
-            .commit_starrocks_handoff(handoff.inner, make_cleanup_lease)
+    ) -> Result<StarRocksFragmentCommittedHandoff, String> {
+        let execution = handoff.execution;
+        let fragment_instance_ids = handoff
+            .inner
+            .instances
+            .iter()
+            .map(|(finst_id, _)| *finst_id)
+            .collect();
+        let query_mem_tracker = self
+            .manager
+            .commit_starrocks_handoff(handoff.inner, make_cleanup_lease)?;
+        Ok(StarRocksFragmentCommittedHandoff {
+            query_mem_tracker,
+            pre_start: StarRocksFragmentPreStartHandoff {
+                runtime: self.clone(),
+                execution,
+                fragment_instance_ids,
+                active: true,
+            },
+        })
     }
 
     pub fn incremental_change_op_slot(
@@ -138,20 +160,6 @@ impl StarRocksFragmentQueryRuntime {
     pub fn finish_fragment(&self, execution: StarRocksFragmentExecution) {
         self.manager.finish_fragment_execution(execution.inner);
     }
-
-    pub fn rollback_handoff(
-        &self,
-        execution: StarRocksFragmentExecution,
-        fragment_instance_ids: &[UniqueId],
-    ) {
-        let rolled_back = self
-            .manager
-            .rollback_starrocks_handoff(execution.inner, fragment_instance_ids);
-        debug_assert!(
-            rolled_back,
-            "committed StarRocks handoff must be rollbackable before batch start"
-        );
-    }
 }
 
 pub struct StarRocksFragmentAdmission {
@@ -202,6 +210,65 @@ impl StarRocksFragmentExecution {
 pub struct StarRocksFragmentHandoff {
     inner: StarRocksQueryHandoff,
     execution: StarRocksFragmentExecution,
+}
+
+pub struct StarRocksFragmentCommittedHandoff {
+    query_mem_tracker: Arc<MemTracker>,
+    pre_start: StarRocksFragmentPreStartHandoff,
+}
+
+impl StarRocksFragmentCommittedHandoff {
+    pub fn query_mem_tracker(&self) -> Arc<MemTracker> {
+        Arc::clone(&self.query_mem_tracker)
+    }
+
+    pub fn into_pre_start(self) -> StarRocksFragmentPreStartHandoff {
+        self.pre_start
+    }
+}
+
+pub struct StarRocksFragmentPreStartHandoff {
+    runtime: StarRocksFragmentQueryRuntime,
+    execution: StarRocksFragmentExecution,
+    fragment_instance_ids: Vec<UniqueId>,
+    active: bool,
+}
+
+impl StarRocksFragmentPreStartHandoff {
+    pub const fn execution(&self) -> StarRocksFragmentExecution {
+        self.execution
+    }
+
+    pub fn start(mut self) -> StarRocksFragmentExecution {
+        self.active = false;
+        self.execution
+    }
+
+    pub fn rollback(mut self) -> bool {
+        self.rollback_inner()
+    }
+
+    fn rollback_inner(&mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.active = false;
+        self.runtime
+            .manager
+            .rollback_starrocks_handoff(self.execution.inner, &self.fragment_instance_ids)
+    }
+}
+
+impl Drop for StarRocksFragmentPreStartHandoff {
+    fn drop(&mut self) {
+        if self.active {
+            let rolled_back = self.rollback_inner();
+            debug_assert!(
+                rolled_back,
+                "dropped pre-start StarRocks handoff must still own its exact query routes"
+            );
+        }
+    }
 }
 
 impl StarRocksFragmentHandoff {
@@ -265,5 +332,66 @@ pub struct StarRocksFragmentReportDecision {
 impl StarRocksFragmentReportDecision {
     pub const fn include_runtime_filter_profile(&self) -> bool {
         self.inner.include_runtime_filter_profile
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::cache::CacheOptions;
+    use crate::common::types::UniqueId;
+    use crate::runtime::query_context::{QueryContextManager, QueryId};
+
+    use super::{StarRocksFragmentHandoff, StarRocksFragmentQueryRuntime};
+
+    fn handoff(query_id: QueryId, generation: u64, finst_id: UniqueId) -> StarRocksFragmentHandoff {
+        StarRocksFragmentHandoff::new(
+            query_id,
+            generation,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            CacheOptions::from_query_options(None).expect("default cache options"),
+            None,
+            Some(1),
+            HashMap::new(),
+            HashMap::new(),
+            vec![(finst_id, HashMap::new())],
+        )
+        .expect("test handoff")
+    }
+
+    #[test]
+    fn rolling_back_a_pre_start_handoff_preserves_an_already_started_query() {
+        let manager = QueryContextManager::new_for_test();
+        let runtime = StarRocksFragmentQueryRuntime::from_manager_for_test(Arc::clone(&manager));
+        let started_query = QueryId::new(91_001, 91_002);
+        let started_finst = UniqueId {
+            hi: 91_003,
+            lo: 91_004,
+        };
+        let rollback_query = QueryId::new(91_005, 91_006);
+        let rollback_finst = UniqueId {
+            hi: 91_007,
+            lo: 91_008,
+        };
+
+        let started = runtime
+            .commit_handoff(handoff(started_query, 1, started_finst), || None)
+            .expect("started handoff");
+        let started_execution = started.into_pre_start().start();
+        let rollback = runtime
+            .commit_handoff(handoff(rollback_query, 1, rollback_finst), || None)
+            .expect("rollback handoff");
+
+        assert!(rollback.into_pre_start().rollback());
+        assert_eq!(
+            manager.query_execution_by_finst(started_finst),
+            Some(started_execution.inner),
+            "rolling back another pre-start lease must not delete a started query"
+        );
+        assert_eq!(manager.query_execution_by_finst(rollback_finst), None);
     }
 }
