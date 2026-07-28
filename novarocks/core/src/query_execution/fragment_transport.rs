@@ -20,10 +20,45 @@
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 
+/// Opaque data-plane batch returned by a fragment dispatcher.
+///
+/// The execution-layer `Chunk` remains owned by core. Role crates may route
+/// this value through the query-execution contract but cannot inspect or
+/// manufacture execution batches.
+pub struct FetchedQueryBatch {
+    chunk: Chunk,
+}
+
+impl FetchedQueryBatch {
+    pub(crate) fn new(chunk: Chunk) -> Self {
+        Self { chunk }
+    }
+
+    pub(crate) fn into_chunk(self) -> Chunk {
+        self.chunk
+    }
+}
+
+/// Borrowed opaque view of the root fetch schema.
+#[derive(Clone, Copy)]
+pub struct ExpectedOutputSchemaView<'a> {
+    schema: &'a ChunkSchemaRef,
+}
+
+impl<'a> ExpectedOutputSchemaView<'a> {
+    pub(crate) const fn new(schema: &'a ChunkSchemaRef) -> Self {
+        Self { schema }
+    }
+
+    pub(crate) const fn chunk_schema(self) -> &'a ChunkSchemaRef {
+        self.schema
+    }
+}
+
 /// Outcome of a single `fetch_result` call.
 pub enum FetchOutcome {
-    /// A result chunk is available.
-    Ready(Chunk),
+    /// A result batch is available.
+    Ready(FetchedQueryBatch),
     /// No chunk available yet; fragment is still running.
     NotReady,
     /// All chunks have been delivered; the root fragment is complete.
@@ -51,7 +86,7 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
         backend_idx: usize,
         finst_id: UniqueId,
         max_wait_ms: i64,
-        expected_chunk_schema: Option<&ChunkSchemaRef>,
+        expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
     ) -> Result<FetchOutcome, String>;
 
     /// Cancel all listed fragment instances on the given backend. Idempotent.
@@ -66,7 +101,7 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     }
 }
 
-pub(crate) struct NativeFragmentEnvelope {
+pub struct NativeFragmentEnvelope {
     plan: crate::proto::plan::PlanFragment,
     instance_params: crate::proto::novarocks::InstanceParams,
 }
@@ -92,11 +127,11 @@ impl NativeFragmentEnvelope {
         &self.instance_params
     }
 
-    pub(crate) fn fragment_id(&self) -> u32 {
+    pub fn fragment_id(&self) -> u32 {
         self.plan.fragment_id
     }
 
-    pub(crate) fn query_id(&self) -> Result<UniqueId, String> {
+    pub fn query_id(&self) -> Result<UniqueId, String> {
         let id = self
             .instance_params
             .query_id
@@ -108,7 +143,7 @@ impl NativeFragmentEnvelope {
         })
     }
 
-    pub(crate) fn fragment_instance_id(&self) -> Result<UniqueId, String> {
+    pub fn fragment_instance_id(&self) -> Result<UniqueId, String> {
         let id = self
             .instance_params
             .fragment_instance_id
@@ -118,6 +153,14 @@ impl NativeFragmentEnvelope {
             hi: id.hi,
             lo: id.lo,
         })
+    }
+
+    pub fn has_report_endpoint(&self) -> bool {
+        self.instance_params.report_endpoint.is_some()
+    }
+
+    pub fn uses_typed_result_sink(&self) -> bool {
+        self.instance_params.typed_result_sink
     }
 
     pub(crate) fn into_parts(

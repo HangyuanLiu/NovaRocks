@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod artifact;
+pub mod artifact;
 pub mod cancellation;
 pub mod contract;
-pub(crate) mod fragment_transport;
+#[cfg(feature = "query-execution-contract-test-support")]
+pub mod contract_test_support;
+pub mod fragment_transport;
 pub(crate) mod outcome;
 pub(crate) mod preparation;
 pub(crate) mod profile;
 pub mod service;
-pub(crate) mod write;
+pub mod write;
 
 #[cfg(test)]
 mod tests;

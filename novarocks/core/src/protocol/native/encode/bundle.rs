@@ -47,6 +47,17 @@ impl NativeFragmentBundle {
     }
 }
 
+#[cfg(feature = "query-execution-contract-test-support")]
+pub(crate) fn native_fragment_bundle_for_contract_test(
+    fragments: Vec<NativePlanFragment>,
+) -> Result<NativeFragmentBundle, String> {
+    let expected_ids = fragments
+        .iter()
+        .map(|fragment| fragment.fragment_id)
+        .collect::<BTreeSet<_>>();
+    collect_native_fragment_bundle(fragments, &expected_ids)
+}
+
 pub(crate) fn encode_native_fragment_bundle(
     plan: &DistributedPlan,
     prepared: &PreparedFragmentSet,

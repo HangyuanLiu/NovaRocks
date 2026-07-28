@@ -224,7 +224,9 @@ impl FragmentDispatcher for RecordingFragmentDispatcher {
         _backend_idx: usize,
         _finst_id: UniqueId,
         _max_wait_ms: i64,
-        _expected_chunk_schema: Option<&crate::exec::chunk::ChunkSchemaRef>,
+        _expected_output_schema: Option<
+            crate::query_execution::fragment_transport::ExpectedOutputSchemaView<'_>,
+        >,
     ) -> Result<FetchOutcome, String> {
         Ok(FetchOutcome::Eof)
     }

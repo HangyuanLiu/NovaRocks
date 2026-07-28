@@ -438,13 +438,15 @@ impl FragmentDispatcher for CancelAfterJoinDispatcher {
         backend_idx: usize,
         finst_id: UniqueId,
         max_wait_ms: i64,
-        expected_chunk_schema: Option<&ChunkSchemaRef>,
+        expected_output_schema: Option<
+            crate::query_execution::fragment_transport::ExpectedOutputSchemaView<'_>,
+        >,
     ) -> Result<FetchOutcome, String> {
         self.inner.fetch_result(
             backend_idx,
             finst_id,
             max_wait_ms.min(i64::try_from(MAX_WAIT.as_millis()).unwrap()),
-            expected_chunk_schema,
+            expected_output_schema,
         )
     }
 

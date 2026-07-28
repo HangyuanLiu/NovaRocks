@@ -15,26 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native coordinator-to-runtime wire encoders.
+mod contract_probe;
+mod scheduler;
 
-#[cfg(test)]
-mod boundary_schema;
-#[cfg(test)]
-mod build;
-mod bundle;
-mod expr;
-mod iceberg_delta_scan;
-mod iceberg_literal_json;
-pub(crate) mod instance;
-pub(crate) mod plan;
-
-#[cfg(feature = "query-execution-contract-test-support")]
-pub(crate) use bundle::native_fragment_bundle_for_contract_test;
-#[cfg(test)]
-pub(crate) use bundle::{NativeBundleTestDrift, corrupt_native_fragment_bundle_for_execution_test};
-pub(crate) use bundle::{NativeFragmentBundle, encode_native_fragment_bundle};
-pub(crate) use instance::encode_instance_params;
-pub(crate) use plan::encode_data_partition;
-
-#[cfg(test)]
-mod tests;
+pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

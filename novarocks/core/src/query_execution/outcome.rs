@@ -124,7 +124,7 @@ impl DistributedQueryOutcome {
     }
 }
 
-pub(crate) struct QueryOutcomeFactory {
+pub struct QueryOutcomeFactory {
     intent: DistributedQueryIntent,
 }
 
@@ -133,11 +133,11 @@ impl QueryOutcomeFactory {
         Self { intent }
     }
 
-    pub(crate) fn intent(&self) -> DistributedQueryIntent {
+    pub fn intent(&self) -> DistributedQueryIntent {
         self.intent
     }
 
-    pub(crate) fn write(
+    pub fn write(
         self,
         result: QueryResult,
         commit: Option<WriteCommitInput>,
@@ -199,7 +199,7 @@ impl QueryOutcomeFactory {
         }
     }
 
-    pub(crate) fn result(
+    pub fn result(
         self,
         result: QueryResult,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
@@ -209,7 +209,7 @@ impl QueryOutcomeFactory {
         }))
     }
 
-    pub(crate) fn profile(
+    pub fn profile(
         self,
         result: QueryResult,
         profiles: FragmentProfileSet,

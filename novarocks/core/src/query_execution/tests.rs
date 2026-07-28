@@ -100,14 +100,21 @@ fn request_owns_prepared_and_native_artifacts() {
     )
     .expect("valid production artifacts form an owned request");
 
-    let (artifacts, options, cancellation, completion) = request.into_internal_parts();
-    let (prepared, native_bundle) = artifacts.into_parts();
-    assert_eq!(prepared.fragment_ids().into_iter().collect::<Vec<_>>(), [7]);
-    assert_eq!(native_bundle.fragment_ids().collect::<Vec<_>>(), [7]);
     assert_eq!(
-        options.expect("request owns query options").pipeline_dop,
-        Some(3)
+        request
+            .artifacts()
+            .scheduling_view()
+            .fragment_ids()
+            .collect::<Vec<_>>(),
+        [7]
     );
+    assert_eq!(
+        request.options().native_submission_options().pipeline_dop(),
+        3
+    );
+    let parts = request.into_parts();
+    let cancellation = parts.cancellation;
+    let completion = parts.completion;
     assert!(!cancellation.is_cancelled());
     assert_eq!(completion.intent(), DistributedQueryIntent::Result);
 }
@@ -275,8 +282,10 @@ impl DistributedQueryCoordinator for RecordingCoordinator {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let (_, _, _, completion) = request.into_internal_parts();
-        completion.result(crate::runtime::query_result::QueryResult::empty())
+        request
+            .into_parts()
+            .completion
+            .result(crate::runtime::query_result::QueryResult::empty())
     }
 }
 

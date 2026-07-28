@@ -59,7 +59,7 @@ use std::net::SocketAddr;
 
 use crate::common::types::UniqueId;
 use crate::coordinator::cluster::{LiveBackend, LiveBackendSnapshot};
-use crate::query_execution::preparation::{FragmentSchedulingView, PreparedFragment};
+use crate::query_execution::preparation::{PreparedFragment, PreparedFragmentSchedulingView};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::{
@@ -173,7 +173,7 @@ impl FragmentScheduler {
     /// immutable live-backend snapshot.
     pub(crate) fn schedule(
         &self,
-        view: FragmentSchedulingView<'_>,
+        view: PreparedFragmentSchedulingView<'_>,
         query_id: UniqueId,
     ) -> Result<SchedulingPlan, String> {
         let live = self.live_backend_snapshot.entries();
@@ -464,7 +464,7 @@ fn populate_per_exch_num_senders(plan: &mut SchedulingPlan, edges: &[FragmentEdg
 /// output. The zero-range fallback (fragment total = 0, a single
 /// zero-row instance) is the one legal exception.
 fn assert_scan_fragment_instances_nonempty(
-    view: FragmentSchedulingView<'_>,
+    view: PreparedFragmentSchedulingView<'_>,
     fr: &PreparedFragment,
     instances: &[FragmentInstancePlacement],
 ) -> Result<(), String> {

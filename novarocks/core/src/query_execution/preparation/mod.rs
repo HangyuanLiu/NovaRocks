@@ -32,10 +32,10 @@ use crate::sql::planner::table::ScanSource;
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) use projection::prepared_fragment_set_for_test;
 pub(crate) use projection::{
-    FragmentSchedulingView, PreparedFragment, PreparedFragmentRole, PreparedFragmentSet,
+    PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedFragmentSet,
     PreparedOutputColumn,
 };
 #[cfg(test)]

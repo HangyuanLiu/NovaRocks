@@ -20,6 +20,51 @@ use crate::runtime::profile::{
 };
 use std::collections::HashMap;
 
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::outcome::FragmentProfileSet;
+use crate::query_execution::write::NativeExecutionReport;
+
+/// Pure consuming builder from neutral native reports to the intent-safe
+/// profile completion payload.
+///
+/// An execution can legitimately produce no fragment profile, so completion
+/// deliberately does not impose a non-empty production invariant.
+pub struct ProfileReportBuilder {
+    profiles: Vec<RuntimeProfileTree>,
+}
+
+impl ProfileReportBuilder {
+    pub fn new() -> Self {
+        Self {
+            profiles: Vec::new(),
+        }
+    }
+
+    pub fn apply(&mut self, report: NativeExecutionReport) -> Result<(), DistributedQueryError> {
+        if let Some(message) = report.failure_message() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::Failed,
+                message,
+            ));
+        }
+        let (_, profile) = report.into_parts();
+        if let Some(profile) = profile {
+            self.profiles.push(profile);
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> FragmentProfileSet {
+        FragmentProfileSet::new(self.profiles)
+    }
+}
+
+impl Default for ProfileReportBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeRuntimeFilterApply {
     pub(crate) input_rows: i64,

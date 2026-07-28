@@ -37,7 +37,6 @@ use crate::coordinator::ports::RuntimeFilterDeploymentControlPort;
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::chunk::ChunkSchema;
-use crate::exec::chunk::ChunkSchemaRef;
 use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
     CancelFragmentRequest, FetchResultRequest, SubmitFragmentRequest,
@@ -48,7 +47,7 @@ use crate::protocol::native::{
     encode_participant_install,
 };
 use crate::query_execution::fragment_transport::{
-    FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
+    FetchOutcome, FetchedQueryBatch, FragmentDispatcher, NativeFragmentEnvelope,
 };
 use crate::runtime_filter::deployment::participant_id_for_backend;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
@@ -379,7 +378,9 @@ impl FragmentDispatcher for RemoteDispatcher {
         backend_idx: usize,
         finst_id: UniqueId,
         max_wait_ms: i64,
-        expected_chunk_schema: Option<&ChunkSchemaRef>,
+        expected_output_schema: Option<
+            crate::query_execution::fragment_transport::ExpectedOutputSchemaView<'_>,
+        >,
     ) -> Result<FetchOutcome, String> {
         let (client, addr) = self.client_and_addr(backend_idx)?;
         // Counter increments only after a successful check_idx, so only valid-index
@@ -426,7 +427,7 @@ impl FragmentDispatcher for RemoteDispatcher {
                 }
                 let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
                     &resp.result_arrow_ipc,
-                    expected_chunk_schema,
+                    expected_output_schema.map(|view| view.chunk_schema()),
                 )?;
                 if chunks.len() != 1 {
                     return Err(format!(
@@ -435,7 +436,7 @@ impl FragmentDispatcher for RemoteDispatcher {
                     ));
                 }
                 let chunk = chunks.remove(0);
-                Ok(FetchOutcome::Ready(chunk))
+                Ok(FetchOutcome::Ready(FetchedQueryBatch::new(chunk)))
             }
             FetchStatus::NotReady => Ok(FetchOutcome::NotReady),
             FetchStatus::Eof => Ok(FetchOutcome::Eof),
@@ -858,9 +859,10 @@ mod tests {
             .fetch_result(0, make_finst_id(1, 2), 0, None)
             .expect("fetch");
 
-        let FetchOutcome::Ready(chunk) = outcome else {
+        let FetchOutcome::Ready(batch) = outcome else {
             panic!("expected ready chunk");
         };
+        let chunk = batch.into_chunk();
         assert_eq!(chunk.columns().len(), 1);
         assert_eq!(chunk.len(), 1);
         assert_eq!(chunk.columns()[0].data_type(), &DataType::Int32);

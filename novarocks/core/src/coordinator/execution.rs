@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -720,7 +720,7 @@ fn build_root_expected_chunk_schema(
     ChunkSchema::try_new(slots).map(Arc::new)
 }
 
-fn align_fetch_chunks_to_output_columns(
+pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
     output_columns: &[PreparedOutputColumn],
 ) -> Result<Vec<Chunk>, String> {
@@ -734,6 +734,7 @@ fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
     output_columns: &[PreparedOutputColumn],
 ) -> Result<Chunk, String> {
+    let row_count = chunk.batch.num_rows();
     if chunk.batch.num_columns() != output_columns.len() {
         return Err(format!(
             "typed root result column count mismatch: chunk has {}, output metadata has {}",
@@ -773,8 +774,12 @@ fn align_fetch_chunk_to_output_columns(
         arrays.push(array);
     }
 
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| format!("align typed root result batch failed: {e}"))?;
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        arrays,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .map_err(|e| format!("align typed root result batch failed: {e}"))?;
     let chunk_schema = chunk
         .chunk_schema()
         .with_fields_in_order(
@@ -824,7 +829,7 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
 // any plain/router mix, so at most one plain stream edge exists per source and
 // the insert never overwrites. Re-adding a shape check here would duplicate a
 // planner-owned decision (guarded by `planner_topology_contract`).
-fn build_stream_edge_by_source<'a>(
+pub(crate) fn build_stream_edge_by_source<'a>(
     edges: &'a [FragmentEdge],
 ) -> BTreeMap<FragmentId, &'a FragmentEdge> {
     let mut stream_edge_by_source = BTreeMap::new();
@@ -844,7 +849,7 @@ fn build_stream_edge_by_source<'a>(
 // this used to re-check, so grouping here only collects the sealed branches. Re-
 // adding a shape check here would duplicate a planner-owned decision (guarded by
 // `planner_topology_contract`).
-fn group_router_edges_by_source<'a>(
+pub(crate) fn group_router_edges_by_source<'a>(
     edges: &'a [FragmentEdge],
 ) -> BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>> {
     let mut grouped: BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> = BTreeMap::new();
@@ -869,7 +874,7 @@ fn validate_write_commit_ready(
     write.lock().expect("write coordinator lock").commit_input()
 }
 
-fn ensure_native_fragment_sink_supported(
+pub(crate) fn ensure_native_fragment_sink_supported(
     fragment_id: FragmentId,
     is_root: bool,
     is_terminal_write: bool,
@@ -888,7 +893,7 @@ fn ensure_native_fragment_sink_supported(
     ))
 }
 
-fn validate_fragment_output_kind(
+pub(crate) fn validate_fragment_output_kind(
     fragment_id: FragmentId,
     is_root: bool,
     is_terminal_write: bool,
@@ -924,7 +929,7 @@ fn validate_fragment_output_kind(
     Ok(())
 }
 
-fn validate_prepared_native_payloads(
+pub(crate) fn validate_prepared_native_payloads(
     prepared: &PreparedFragmentSet,
     native_bundle: &NativeFragmentBundle,
 ) -> Result<(), String> {
@@ -961,7 +966,7 @@ fn validate_prepared_native_payloads(
     Ok(())
 }
 
-fn validate_artifact_fragment_sets(
+pub(crate) fn validate_artifact_fragment_sets(
     prepared: &PreparedFragmentSet,
     native_bundle: &NativeFragmentBundle,
     scheduling: &crate::coordinator::scheduler::SchedulingPlan,
@@ -990,7 +995,7 @@ fn fragment_set_mismatch(
     )
 }
 
-fn validate_scheduling_placements(
+pub(crate) fn validate_scheduling_placements(
     plan: &crate::coordinator::scheduler::SchedulingPlan,
 ) -> Result<(), String> {
     for (&fragment_id, placements) in &plan.by_fragment {
@@ -1012,7 +1017,7 @@ fn validate_scheduling_placements(
     Ok(())
 }
 
-fn patch_native_iceberg_change_stream_router_sink(
+pub(crate) fn patch_native_iceberg_change_stream_router_sink(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
@@ -1206,7 +1211,7 @@ fn native_change_stream_branch_kind(
     }
 }
 
-fn patch_native_cte_multicast_sink(
+pub(crate) fn patch_native_cte_multicast_sink(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: CteId,
@@ -1740,13 +1745,14 @@ fn submit_and_fetch_loop_with_deployment_lease(
                 root_backend_idx,
                 root_finst_id.clone(),
                 fetch_wait_ms,
-                expected_root_chunk_schema,
+                expected_root_chunk_schema
+                    .map(crate::query_execution::fragment_transport::ExpectedOutputSchemaView::new),
             ) {
                 Err(e) => {
                     tracker.cancel_all(dispatcher.as_ref());
                     return Err(e);
                 }
-                Ok(FetchOutcome::Ready(chunk)) => chunks.push(chunk),
+                Ok(FetchOutcome::Ready(batch)) => chunks.push(batch.into_chunk()),
                 Ok(FetchOutcome::NotReady) => continue,
                 Ok(FetchOutcome::Eof) => break,
                 Ok(FetchOutcome::Err(e)) => {
@@ -2406,7 +2412,9 @@ mod native_contract_tests {
             _backend_idx: usize,
             finst_id: UniqueId,
             _max_wait_ms: i64,
-            _expected_chunk_schema: Option<&ChunkSchemaRef>,
+            _expected_output_schema: Option<
+                crate::query_execution::fragment_transport::ExpectedOutputSchemaView<'_>,
+            >,
         ) -> Result<FetchOutcome, String> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             match &self.fetch_behavior {

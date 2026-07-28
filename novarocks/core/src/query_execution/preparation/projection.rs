@@ -148,8 +148,8 @@ impl PreparedFragmentSet {
         }
     }
 
-    pub(crate) fn scheduling_view(&self) -> FragmentSchedulingView<'_> {
-        FragmentSchedulingView {
+    pub(crate) fn scheduling_view(&self) -> PreparedFragmentSchedulingView<'_> {
+        PreparedFragmentSchedulingView {
             by_fragment: &self.by_fragment,
             projection: &self.projection,
             scan_bindings: &self.scan_bindings,
@@ -179,16 +179,30 @@ impl PreparedFragmentSet {
     ) -> &crate::sql::planner::distributed::JoinBuildProgressCatalog {
         &self.projection.runtime_filter_join_progress
     }
+
+    pub(crate) fn into_runtime_filter_inputs(
+        self,
+    ) -> (
+        RuntimeFilterGraph,
+        crate::sql::planner::distributed::JoinBuildProgressCatalog,
+        Vec<FragmentEdge>,
+    ) {
+        (
+            self.runtime_filter_graph,
+            self.projection.runtime_filter_join_progress,
+            self.projection.edges,
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct FragmentSchedulingView<'a> {
+pub(crate) struct PreparedFragmentSchedulingView<'a> {
     by_fragment: &'a BTreeMap<FragmentId, PreparedFragment>,
     projection: &'a PreparedPlanProjection,
     scan_bindings: &'a ScanExecutionBindings,
 }
 
-impl<'a> FragmentSchedulingView<'a> {
+impl<'a> PreparedFragmentSchedulingView<'a> {
     pub(crate) fn fragment_ids(self) -> impl ExactSizeIterator<Item = FragmentId> + 'a {
         self.by_fragment.keys().copied()
     }
@@ -254,7 +268,7 @@ pub(super) fn prepared_fragment(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn prepared_fragment_set_for_test(
     fragments: Vec<(
         FragmentId,
