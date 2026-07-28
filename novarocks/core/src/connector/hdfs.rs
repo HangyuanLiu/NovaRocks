@@ -42,8 +42,8 @@ use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileC
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
 use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::connector::runtime::{
-    ConnectorReadAuxiliary, ConnectorReadScanSource, ConnectorScheduledSplit, ConnectorSplitAppend,
-    IncrementalConnectorSplitAdapter,
+    ConnectorReadAuxiliary, ConnectorReadCoreFacet, ConnectorReadScanSource,
+    ConnectorScheduledSplit, ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
@@ -395,6 +395,9 @@ pub(crate) fn plan_hdfs_read_source(
     let (instance, lifecycle) = connectors
         .register_ephemeral_connector_instance(instance)
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
+    let facet = Arc::new(HdfsCoreFacet {
+        op: HdfsScanOp::new(provider.config.scan.clone()),
+    });
     Ok(Arc::new(
         ConnectorReadScanSource::new_scheduled_ephemeral_with_incremental(
             instance,
@@ -409,7 +412,8 @@ pub(crate) fn plan_hdfs_read_source(
             incremental,
             has_more,
             Some(auxiliary),
-        ),
+        )
+        .with_core_facet(facet),
     ))
 }
 
@@ -948,6 +952,26 @@ pub struct HdfsScanOp {
     iceberg_runtime_pruning_profile_flushed: Arc<AtomicBool>,
 }
 
+struct HdfsCoreFacet {
+    op: HdfsScanOp,
+}
+
+impl ConnectorReadCoreFacet for HdfsCoreFacet {
+    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
+        self.op.flush_iceberg_runtime_pruning_profile(profile);
+    }
+
+    fn late_prune_morsel_with_ordered_predicate(
+        &self,
+        morsel: &ScanMorsel,
+        slot_id: SlotId,
+        predicate: &NativeOrderedRangePredicate,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        self.op
+            .late_prune_morsel_with_ordered_predicate(morsel, slot_id, predicate)
+    }
+}
+
 #[derive(Debug, Default)]
 struct HdfsIcebergRuntimePruningCounters {
     files_total: AtomicU64,
@@ -1240,11 +1264,10 @@ impl ScanOp for HdfsScanOp {
         slot_id: SlotId,
         predicate: &NativeOrderedRangePredicate,
     ) -> Result<ScanMorselPruneDecision, String> {
-        let ScanMorsel::FileRange {
-            iceberg_file_pruning: Some(metadata),
-            ..
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let Some(metadata) = range.iceberg_file_pruning.as_ref() else {
             return Ok(ScanMorselPruneDecision::Keep);
         };
         let Some(pruning) = self.cfg.iceberg_runtime_pruning.as_ref() else {

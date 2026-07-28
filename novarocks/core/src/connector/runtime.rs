@@ -26,16 +26,18 @@ use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorInstance, ConnectorOpenReaderRequest, ConnectorSplit,
 };
 
+use crate::common::ids::SlotId;
 use crate::connector::host::ConnectorInstanceLease;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
-    BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
-    ScanSource,
+    BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
+    ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanSource,
 };
 use crate::fs::scan_context::FileScanRange;
 use crate::runtime::profile::RuntimeProfile;
+use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
 
 pub(crate) struct ConnectorBatchReaderIter {
     reader: Option<Box<dyn ConnectorBatchReader>>,
@@ -125,6 +127,19 @@ pub(crate) trait ConnectorReadAuxiliary: Send + Sync {
         &self,
         range: &FileScanRange,
     ) -> Result<Option<Vec<EqualityDeleteSet>>, String>;
+}
+
+pub(crate) trait ConnectorReadCoreFacet: Send + Sync {
+    fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
+
+    fn late_prune_morsel_with_ordered_predicate(
+        &self,
+        _morsel: &ScanMorsel,
+        _slot_id: SlotId,
+        _predicate: &NativeOrderedRangePredicate,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        Ok(ScanMorselPruneDecision::Keep)
+    }
 }
 
 struct ConnectorSplitState {
@@ -235,6 +250,7 @@ pub(crate) struct ConnectorReadScanSource {
     lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
     auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
+    facet: Option<Arc<dyn ConnectorReadCoreFacet>>,
 }
 
 impl ConnectorReadScanSource {
@@ -255,6 +271,7 @@ impl ConnectorReadScanSource {
             lifecycle: None,
             incremental: None,
             auxiliary: None,
+            facet: None,
         }
     }
 
@@ -276,6 +293,7 @@ impl ConnectorReadScanSource {
             lifecycle: Some(lifecycle),
             incremental: None,
             auxiliary: None,
+            facet: None,
         }
     }
 
@@ -298,6 +316,7 @@ impl ConnectorReadScanSource {
             lifecycle: None,
             incremental: Some(incremental),
             auxiliary: None,
+            facet: None,
         }
     }
 
@@ -315,6 +334,7 @@ impl ConnectorReadScanSource {
             lifecycle: None,
             incremental: None,
             auxiliary: None,
+            facet: None,
         }
     }
 
@@ -357,6 +377,7 @@ impl ConnectorReadScanSource {
             lifecycle: Some(lifecycle),
             incremental,
             auxiliary,
+            facet: None,
         }
     }
 
@@ -375,7 +396,13 @@ impl ConnectorReadScanSource {
             lifecycle: None,
             incremental: None,
             auxiliary: Some(auxiliary),
+            facet: None,
         }
+    }
+
+    pub(crate) fn with_core_facet(mut self, facet: Arc<dyn ConnectorReadCoreFacet>) -> Self {
+        self.facet = Some(facet);
+        self
     }
 }
 
@@ -392,6 +419,7 @@ impl ScanSource for ConnectorReadScanSource {
             _lifecycle: self.lifecycle.clone(),
             incremental: self.incremental.clone(),
             auxiliary: self.auxiliary.clone(),
+            facet: self.facet.clone(),
         }))
     }
 }
@@ -406,9 +434,28 @@ struct ConnectorReadScanOp {
     _lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
     auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
+    facet: Option<Arc<dyn ConnectorReadCoreFacet>>,
 }
 
 impl ScanOp for ConnectorReadScanOp {
+    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
+        if let Some(facet) = &self.facet {
+            facet.flush_morsel_materialization_profile(profile);
+        }
+    }
+
+    fn late_prune_morsel_with_ordered_predicate(
+        &self,
+        morsel: &ScanMorsel,
+        slot_id: SlotId,
+        predicate: &NativeOrderedRangePredicate,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        self.facet
+            .as_ref()
+            .map(|facet| facet.late_prune_morsel_with_ordered_predicate(morsel, slot_id, predicate))
+            .unwrap_or(Ok(ScanMorselPruneDecision::Keep))
+    }
+
     fn execute_iter(
         &self,
         morsel: ScanMorsel,
