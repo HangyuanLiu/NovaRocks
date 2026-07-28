@@ -918,7 +918,7 @@ fn observe_test_overwrite_stats_table(
         .count();
     let count = if existing == 0 && max == "123" { 3 } else { 1 };
     #[cfg(test)]
-    run_compat_append_decision_hook();
+    run_compat_append_decision_hook(service);
     for index in 0..count {
         state.column_stats.push(ColumnStatRow {
             key: key.clone(),
@@ -934,20 +934,20 @@ fn observe_test_overwrite_stats_table(
 }
 
 #[cfg(test)]
-type CompatAppendDecisionHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+type CompatAppendDecisionHook = std::sync::Arc<dyn Fn(&FrontendStatisticsService) + Send + Sync>;
 
 #[cfg(test)]
 static COMPAT_APPEND_DECISION_HOOK: std::sync::Mutex<Option<CompatAppendDecisionHook>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-fn run_compat_append_decision_hook() {
+fn run_compat_append_decision_hook(service: &FrontendStatisticsService) {
     let hook = COMPAT_APPEND_DECISION_HOOK
         .lock()
         .expect("compat append decision hook lock")
         .clone();
     if let Some(hook) = hook {
-        hook();
+        hook(service);
     }
 }
 
@@ -1145,76 +1145,32 @@ fn table_key(name: &str, current_database: &str) -> Result<TableKey, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, mpsc};
-    use std::time::Duration;
+    use std::sync::{Arc, TryLockError};
 
     use super::*;
 
     #[test]
     fn compatibility_seed_decision_and_append_share_one_write_lock() {
-        let service = Arc::new(FrontendStatisticsService::new());
+        let service = FrontendStatisticsService::new();
         let key = TableKey {
             db: "db1".to_string(),
             table: "test_overwrite_stats_table".to_string(),
         };
         let source = StatisticsInsertSource::Values(vec![vec![StatisticsLiteral::Int(123)]]);
-        let arrivals = Arc::new(AtomicUsize::new(0));
-        let (arrived_tx, arrived_rx) = mpsc::channel();
-        let release_first = Arc::new((Mutex::new(false), Condvar::new()));
-        let hook = {
-            let arrivals = Arc::clone(&arrivals);
-            let arrived_tx = arrived_tx.clone();
-            let release_first = Arc::clone(&release_first);
-            Arc::new(move || {
-                let arrival = arrivals.fetch_add(1, Ordering::SeqCst);
-                arrived_tx.send(arrival).expect("report hook arrival");
-                if arrival == 0 {
-                    let (released, wake) = &*release_first;
-                    let mut released = released.lock().expect("release lock");
-                    while !*released {
-                        released = wake.wait(released).expect("release wait");
-                    }
-                }
-            }) as CompatAppendDecisionHook
-        };
+        let hook = Arc::new(|service: &FrontendStatisticsService| {
+            assert!(matches!(
+                service.state.try_write(),
+                Err(TryLockError::WouldBlock)
+            ));
+        }) as CompatAppendDecisionHook;
         *COMPAT_APPEND_DECISION_HOOK
             .lock()
             .expect("install decision hook") = Some(hook);
 
-        let first = {
-            let service = Arc::clone(&service);
-            let key = key.clone();
-            let source = source.clone();
-            std::thread::spawn(move || {
-                observe_test_overwrite_stats_table(&service, &key, &source).unwrap()
-            })
-        };
-        assert_eq!(arrived_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
-        let second = {
-            let service = Arc::clone(&service);
-            let key = key.clone();
-            let source = source.clone();
-            std::thread::spawn(move || {
-                observe_test_overwrite_stats_table(&service, &key, &source).unwrap()
-            })
-        };
-        let second_arrival = arrived_rx.recv_timeout(Duration::from_millis(100));
-
-        {
-            let (released, wake) = &*release_first;
-            *released.lock().expect("release lock") = true;
-            wake.notify_one();
-        }
-        first.join().unwrap();
-        second.join().unwrap();
+        observe_test_overwrite_stats_table(&service, &key, &source).unwrap();
         *COMPAT_APPEND_DECISION_HOOK
             .lock()
             .expect("remove decision hook") = None;
-        assert!(
-            second_arrival.is_err(),
-            "a second writer reached the decision gap before the first append"
-        );
 
         let state = service.state.read().expect("frontend statistics read lock");
         assert_eq!(
@@ -1223,7 +1179,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.key == key)
                 .count(),
-            4
+            3
         );
     }
 }
