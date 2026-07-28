@@ -337,7 +337,7 @@ pub(crate) fn prepare_fragment(
                 )),
                 query_id: Some(query_id),
                 fragment_instance_id: Some(finst_id),
-                backend_num: None,
+                backend_num: Some(instance.backend_num().get()),
                 mem_tracker: context.mem_tracker.clone(),
                 native_runtime_filter_context: context.runtime_filter.clone(),
             },
@@ -402,10 +402,12 @@ mod tests {
         ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
         FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract,
     };
-    use crate::exec::fragment::sink::FragmentSinkProgram;
+    use crate::exec::fragment::sink::{DataStreamSinkProgram, FragmentSinkProgram};
     use crate::exec::node::exchange_source::ExchangeSourceNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::operators::DataStreamPartitionType;
+    use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
     use crate::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
     use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome};
     use crate::runtime::fragment::instance::{
@@ -503,6 +505,66 @@ mod tests {
             FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
             NonZeroUsize::new(1).expect("one driver"),
             BackendNum::try_new(1).expect("backend number"),
+        );
+        FragmentSubmission::try_new(program, instance).expect("valid submission")
+    }
+
+    fn data_stream_submission(
+        finst_id: UniqueId,
+        backend_num: i32,
+        query_options: QueryOptions,
+    ) -> FragmentSubmission {
+        let program = Arc::new(FragmentProgram::new(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::Values(ValuesNode {
+                        chunk: Chunk::default(),
+                        node_id: 19,
+                    }),
+                },
+            },
+            FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(
+                DataStreamSinkProgram::try_new(
+                    17,
+                    Vec::new(),
+                    DataStreamPartitionType::Unpartitioned,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    ExprArena::default(),
+                )
+                .expect("data stream program"),
+            ))
+            .expect("data stream sink"),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
+        ));
+        let destination = FragmentDestination::new(
+            UniqueId {
+                hi: finst_id.hi + 2,
+                lo: finst_id.lo + 2,
+            },
+            RuntimeEndpoint::new("127.0.0.1", 1).expect("test endpoint"),
+        );
+        let instance = FragmentInstanceSpec::new_native(
+            FragmentContractVersion::CURRENT,
+            QueryId {
+                hi: finst_id.hi - 2,
+                lo: finst_id.lo - 2,
+            },
+            FragmentInstanceId::new(finst_id),
+            ScanAssignments::default(),
+            ExchangeInputAssignments::default(),
+            FragmentSinkAssignment::StreamDestinations {
+                destinations: vec![destination],
+                sender_id: Some(11),
+            },
+            FragmentRuntimeOptions::new(query_options, None, false),
+            NonZeroUsize::new(1).expect("one driver"),
+            BackendNum::try_new(backend_num).expect("backend number"),
         );
         FragmentSubmission::try_new(program, instance).expect("valid submission")
     }
@@ -674,6 +736,59 @@ mod tests {
             crate::service::fe_report::progress_report_call_count_for_test(finst_id),
             0,
             "kernel handle path must not invoke the legacy progress reporter"
+        );
+    }
+
+    #[test]
+    fn kernel_data_stream_eos_preserves_backend_identity_without_legacy_reporting() {
+        let mut query_options = QueryOptions::default();
+        query_options.enable_profile = true;
+        query_options.runtime_profile_report_interval = Some(1);
+        let priming_state = crate::runtime::runtime_state::RuntimeState::new(
+            Some(query_options.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!priming_state.should_report_exec_state());
+        std::thread::sleep(Duration::from_millis(1_050));
+        let finst_id = UniqueId {
+            hi: 72_281,
+            lo: 72_282,
+        };
+        let running = prepare_fragment(
+            data_stream_submission(finst_id, 37, query_options),
+            FragmentPrepareContext::default(),
+        )
+        .expect("fragment prepares")
+        .start();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let be_number = loop {
+            if let Some(be_number) = crate::exec::operators::take_eos_be_number_for_test(finst_id) {
+                break be_number;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "data stream sink did not create an EOS payload"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        running.cancel(FragmentCancelReason::new("test cleanup"));
+        let _ = running.join();
+        assert_eq!(
+            be_number, 37,
+            "EOS sender identity must preserve the submission backend number"
+        );
+        assert_eq!(
+            crate::service::fe_report::progress_report_call_count_for_test(finst_id),
+            0,
+            "kernel data-stream path must keep legacy progress reporting disabled"
         );
     }
 

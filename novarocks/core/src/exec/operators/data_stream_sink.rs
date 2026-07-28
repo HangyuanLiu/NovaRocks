@@ -40,6 +40,8 @@ use arrow::datatypes::DataType;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -50,6 +52,31 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 const NEED_INPUT_LOG_EVERY: u64 = 1;
 
 static NEED_INPUT_BLOCKED_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static DATA_STREAM_PAYLOAD_IDENTITIES: OnceLock<Mutex<Vec<(UniqueId, i32, bool)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn take_eos_be_number_for_test(fragment_instance_id: UniqueId) -> Option<i32> {
+    let mut identities = DATA_STREAM_PAYLOAD_IDENTITIES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("data stream payload identity lock");
+    let position = identities
+        .iter()
+        .position(|(finst_id, _, eos)| *finst_id == fragment_instance_id && *eos)?;
+    Some(identities.swap_remove(position).1)
+}
+
+#[cfg(test)]
+fn record_payload_identity_for_test(fragment_instance_id: UniqueId, be_number: i32, eos: bool) {
+    DATA_STREAM_PAYLOAD_IDENTITIES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("data stream payload identity lock")
+        .push((fragment_instance_id, be_number, eos));
+}
 
 fn should_log_need_input() -> bool {
     if NEED_INPUT_LOG_EVERY <= 1 {
@@ -1667,6 +1694,8 @@ impl DataStreamSinkOperator {
         pending: PendingPayload,
         error_state: Arc<RuntimeErrorState>,
     ) -> ExchangeSendTask {
+        #[cfg(test)]
+        record_payload_identity_for_test(self.fragment_instance_id, pending.be_number, pending.eos);
         ExchangeSendTask {
             dest_host,
             dest_port,
