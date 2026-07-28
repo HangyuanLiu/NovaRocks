@@ -15,15 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod artifact;
-pub mod cancellation;
-pub mod contract;
-pub(crate) mod fragment_transport;
-pub(crate) mod outcome;
-pub(crate) mod preparation;
-pub(crate) mod profile;
-pub mod service;
-pub(crate) mod write;
+//! Explicit value injection for distributed query execution.
 
-#[cfg(test)]
-mod tests;
+use std::sync::Arc;
+
+use crate::query_execution::contract::{
+    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
+    DistributedQueryRequest,
+};
+
+#[derive(Clone)]
+pub struct QueryExecutionService {
+    coordinator: Arc<dyn DistributedQueryCoordinator>,
+}
+
+impl QueryExecutionService {
+    pub fn new(coordinator: Arc<dyn DistributedQueryCoordinator>) -> Self {
+        Self { coordinator }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        request: DistributedQueryRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.coordinator.execute(request)
+    }
+}

@@ -2326,6 +2326,7 @@ fn explain_analyze_query(
         execution_ports,
         scheduler,
         Some(query_opts),
+        current_query_cancellation_view(),
     )
     .execute_with_profile_outcome()?;
     let execution_elapsed = execution_start.elapsed();
@@ -2710,6 +2711,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         execution_ports,
         scheduler,
         query_opts,
+        current_query_cancellation_view(),
     )
     .execute_with_write_outcome()
 }
@@ -2893,6 +2895,7 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
         execution_ports,
         scheduler,
         query_opts,
+        current_query_cancellation_view(),
     )
     .execute_with_write_outcome()
 }
@@ -3268,6 +3271,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         execution_ports,
         scheduler,
         query_opts,
+        current_query_cancellation_view(),
     )
     .execute()
 }
@@ -3329,8 +3333,17 @@ pub(crate) fn execute_logical_plan_with_options(
         execution_ports,
         scheduler,
         query_opts,
+        current_query_cancellation_view(),
     )
     .execute()
+}
+
+fn current_query_cancellation_view() -> crate::query_execution::cancellation::QueryCancellationView
+{
+    match crate::runtime::query_cancel::current_client_disconnect_signal() {
+        Some(signal) => crate::query_execution::cancellation::QueryCancellationView::new(signal),
+        None => crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
+    }
 }
 
 fn coordinated_execution_services() -> Result<

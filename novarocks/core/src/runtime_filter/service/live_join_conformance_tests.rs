@@ -1042,8 +1042,15 @@ fn run_live_join(
         ..Default::default()
     };
     let started = Instant::now();
-    let outcome = match ExecutionCoordinator::new(prepared, bundle, ports, scheduler, Some(options))
-        .execute_with_profiles_for_test()
+    let outcome = match ExecutionCoordinator::new(
+        prepared,
+        bundle,
+        ports,
+        scheduler,
+        Some(options),
+        crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
+    )
+    .execute_with_profiles_for_test()
     {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -1259,9 +1266,16 @@ fn run_live_join_cancel() -> CancelRun {
         ..Default::default()
     };
     let started = Instant::now();
-    let error = ExecutionCoordinator::new(prepared, bundle, ports, scheduler, Some(options))
-        .execute_with_profiles_for_test()
-        .expect_err("live Join cancellation must interrupt execution");
+    let error = ExecutionCoordinator::new(
+        prepared,
+        bundle,
+        ports,
+        scheduler,
+        Some(options),
+        crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
+    )
+    .execute_with_profiles_for_test()
+    .expect_err("live Join cancellation must interrupt execution");
     assert!(
         started.elapsed() <= MAX_WAIT,
         "cancelled live Join exceeded {MAX_WAIT:?}"

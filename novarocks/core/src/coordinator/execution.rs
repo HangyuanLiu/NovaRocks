@@ -53,6 +53,7 @@ use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::protocol::native::encode::NativeFragmentBundle;
+use crate::query_execution::cancellation::QueryCancellationView;
 use crate::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
 };
@@ -113,6 +114,7 @@ pub(crate) struct ExecutionCoordinator {
     execution_ports: CoordinatorExecutionPorts,
     scheduler: Arc<FragmentScheduler>,
     query_options: CoordinatorQueryOptions,
+    cancellation: QueryCancellationView,
     #[cfg(test)]
     scheduled_plan_test_drift: Option<ScheduledPlanTestDrift>,
     #[cfg(test)]
@@ -176,6 +178,7 @@ impl ExecutionCoordinator {
         execution_ports: CoordinatorExecutionPorts,
         scheduler: Arc<FragmentScheduler>,
         query_options: Option<QueryOptions>,
+        cancellation: QueryCancellationView,
     ) -> Self {
         Self {
             prepared,
@@ -183,6 +186,7 @@ impl ExecutionCoordinator {
             execution_ports,
             scheduler,
             query_options: CoordinatorQueryOptions::from_upstream(query_options),
+            cancellation,
             #[cfg(test)]
             scheduled_plan_test_drift: None,
             #[cfg(test)]
@@ -210,6 +214,7 @@ impl ExecutionCoordinator {
         let prepared = self.prepared;
         let native_bundle = self.native_bundle;
         let query_options = self.query_options;
+        let cancellation = self.cancellation;
         #[cfg(test)]
         let scheduled_plan_test_drift = self.scheduled_plan_test_drift;
         #[cfg(test)]
@@ -632,6 +637,7 @@ impl ExecutionCoordinator {
             write_coordinator,
             collect_profiles,
             observer.as_ref(),
+            &cancellation,
             installed_runtime_filter_deployment,
         )?;
         if let Some(commit) = fetch_result.write_commit.as_ref() {
@@ -1573,6 +1579,7 @@ pub(crate) fn submit_and_fetch_loop(
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
     collect_profiles: bool,
     observer: &dyn CoordinatorObserver,
+    cancellation: &QueryCancellationView,
 ) -> Result<SubmitAndFetchResult, String> {
     submit_and_fetch_loop_with_deployment_lease(
         dispatcher,
@@ -1588,6 +1595,7 @@ pub(crate) fn submit_and_fetch_loop(
         write_coordinator,
         collect_profiles,
         observer,
+        cancellation,
         None,
     )
 }
@@ -1607,6 +1615,7 @@ fn submit_and_fetch_loop_with_deployment_lease(
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
     collect_profiles: bool,
     observer: &dyn CoordinatorObserver,
+    cancellation: &QueryCancellationView,
     mut installed_runtime_filter_deployment: Option<InstalledRuntimeFilterDeployment>,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
@@ -1704,7 +1713,7 @@ fn submit_and_fetch_loop_with_deployment_lease(
                 tracker.cancel_all(dispatcher.as_ref());
                 return Err(err);
             }
-            if crate::runtime::query_cancel::client_disconnected() {
+            if cancellation.is_cancelled() {
                 tracker.cancel_all(dispatcher.as_ref());
                 return Err("client disconnected".to_string());
             }
@@ -1752,7 +1761,7 @@ fn submit_and_fetch_loop_with_deployment_lease(
             "root fragment {}/{} does not produce a result buffer and has no write coordinator",
             root_finst_id.hi, root_finst_id.lo
         ));
-    } else if crate::runtime::query_cancel::client_disconnected() {
+    } else if cancellation.is_cancelled() {
         tracker.cancel_all(dispatcher.as_ref());
         return Err("client disconnected".to_string());
     } else if std::time::Instant::now() >= deadline {
@@ -1761,8 +1770,14 @@ fn submit_and_fetch_loop_with_deployment_lease(
     }
 
     let (write_commit, write_abort) = if let Some(write) = write_coordinator {
-        match wait_for_write_commit_ready(write, tracker, dispatcher.as_ref(), deadline, timeout_ms)
-        {
+        match wait_for_write_commit_ready(
+            write,
+            tracker,
+            dispatcher.as_ref(),
+            deadline,
+            timeout_ms,
+            cancellation,
+        ) {
             Ok(commit) => (Some(commit), None),
             Err(e) => {
                 let abort = write.lock().expect("write coordinator lock").abort_input();
@@ -1785,6 +1800,7 @@ fn submit_and_fetch_loop_with_deployment_lease(
             deadline,
             timeout_ms,
             runtime_query_id,
+            cancellation,
         )?
     } else {
         BTreeMap::new()
@@ -1806,6 +1822,7 @@ fn wait_for_profile_reports(
     deadline: std::time::Instant,
     timeout_ms: i64,
     runtime_query_id: crate::runtime::query_context::QueryId,
+    cancellation: &QueryCancellationView,
 ) -> Result<BTreeMap<UniqueId, RuntimeProfileTree>, String> {
     const PROFILE_REPORT_POLL_INTERVAL_MS: i64 = 10;
 
@@ -1823,7 +1840,7 @@ fn wait_for_profile_reports(
             tracker.cancel_all(dispatcher);
             return Err(err);
         }
-        if crate::runtime::query_cancel::client_disconnected() {
+        if cancellation.is_cancelled() {
             tracker.cancel_all(dispatcher);
             return Err("client disconnected".to_string());
         }
@@ -1860,13 +1877,14 @@ fn wait_for_write_commit_ready(
     dispatcher: &dyn FragmentDispatcher,
     deadline: std::time::Instant,
     timeout_ms: i64,
+    cancellation: &QueryCancellationView,
 ) -> Result<WriteCommitInput, String> {
     const WRITE_COMMIT_POLL_INTERVAL_MS: i64 = 10;
 
     loop {
         poll_write_failure_and_cancel(write, tracker, dispatcher)?;
 
-        if crate::runtime::query_cancel::client_disconnected() {
+        if cancellation.is_cancelled() {
             tracker.cancel_all(dispatcher);
             return Err("client disconnected".to_string());
         }
@@ -2119,6 +2137,7 @@ mod native_contract_tests {
             ),
             scheduler,
             query_options,
+            QueryCancellationView::never_cancelled(),
         );
         coordinator.scheduled_plan_test_drift = scheduled_plan_test_drift;
         coordinator
@@ -2732,6 +2751,7 @@ mod native_contract_tests {
             None,
             false,
             &observer,
+            &QueryCancellationView::never_cancelled(),
         )
         .expect("native submissions execute");
 
@@ -2774,6 +2794,7 @@ mod native_contract_tests {
             None,
             false,
             &observer,
+            &QueryCancellationView::never_cancelled(),
         )
         .expect_err("second native submit must fail");
 
@@ -2821,6 +2842,7 @@ mod native_contract_tests {
             None,
             false,
             &CountingCoordinatorObserver::default(),
+            &QueryCancellationView::never_cancelled(),
         )
         .expect_err("backend loss during submit must fail the mapped query");
 
@@ -2878,6 +2900,7 @@ mod native_contract_tests {
             None,
             false,
             &CountingCoordinatorObserver::default(),
+            &QueryCancellationView::never_cancelled(),
         )
         .expect_err("malformed later submission must fail before dispatch");
 
@@ -2953,6 +2976,7 @@ mod native_contract_tests {
                 None,
                 false,
                 &CountingCoordinatorObserver::default(),
+                &QueryCancellationView::never_cancelled(),
             )
             .expect_err("invalid submission ids must fail");
             assert!(err.contains(expected), "{err}");
@@ -3010,6 +3034,7 @@ mod native_contract_tests {
                     None,
                     false,
                     &CountingCoordinatorObserver::default(),
+                    &QueryCancellationView::never_cancelled(),
                 )
                 .expect_err("invalid submission query id must fail before dispatch");
 
@@ -3070,6 +3095,7 @@ mod native_contract_tests {
                 None,
                 false,
                 &CountingCoordinatorObserver::default(),
+                &QueryCancellationView::never_cancelled(),
             )
             .expect_err("root submission identity drift must fail before dispatch");
 
@@ -3125,6 +3151,7 @@ mod native_contract_tests {
                 None,
                 false,
                 &CountingCoordinatorObserver::default(),
+                &QueryCancellationView::never_cancelled(),
             )
             .expect_err("native lifecycle failure must surface");
             assert!(err.contains(expected), "{err}");
@@ -3143,33 +3170,34 @@ mod native_contract_tests {
         let inner = CapturingDispatcher::with_fetch(None, TestFetchBehavior::NotReady);
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let err = crate::runtime::query_cancel::with_client_disconnect_signal(disconnected, || {
-            let mut tracker = InFlightTracker::default();
-            submit_and_fetch_loop(
-                &dispatcher,
-                &mut tracker,
-                vec![
-                    (
-                        1,
-                        submission(3, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 1 }),
-                    ),
-                    (
-                        0,
-                        submission(7, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 2 }),
-                    ),
-                ],
-                7,
-                0,
-                UniqueId { hi, lo: 2 },
-                &UniqueId { hi, lo: 99 },
-                true,
-                1_000,
-                None,
-                None,
-                false,
-                &CountingCoordinatorObserver::default(),
-            )
-        })
+        let cancellation =
+            crate::query_execution::cancellation::QueryCancellationView::new(disconnected);
+        let mut tracker = InFlightTracker::default();
+        let err = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![
+                (
+                    1,
+                    submission(3, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 1 }),
+                ),
+                (
+                    0,
+                    submission(7, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 2 }),
+                ),
+            ],
+            7,
+            0,
+            UniqueId { hi, lo: 2 },
+            &UniqueId { hi, lo: 99 },
+            true,
+            1_000,
+            None,
+            None,
+            false,
+            &CountingCoordinatorObserver::default(),
+            &cancellation,
+        )
         .expect_err("disconnect must surface");
         assert!(err.contains("client disconnected"), "{err}");
         let mut canceled = inner.cancellations.lock().unwrap().clone();
@@ -3229,6 +3257,7 @@ mod native_contract_tests {
             Some(&write),
             false,
             &CountingCoordinatorObserver::default(),
+            &QueryCancellationView::never_cancelled(),
         )
         .expect("writer failure returns structured abort");
         assert!(result.write_commit.is_none());
@@ -3289,6 +3318,7 @@ mod native_contract_tests {
                 Some(&write),
                 false,
                 &CountingCoordinatorObserver::default(),
+                &QueryCancellationView::never_cancelled(),
             )
             .expect("post-EOF write outcome");
             report_thread.join().unwrap();
@@ -3342,6 +3372,7 @@ mod native_contract_tests {
             Some(&write),
             false,
             &CountingCoordinatorObserver::default(),
+            &QueryCancellationView::never_cancelled(),
         )
         .expect("write-only root commits");
         assert!(result.write_commit.is_some());
@@ -3393,6 +3424,7 @@ mod native_contract_tests {
             None,
             true,
             &CountingCoordinatorObserver::default(),
+            &QueryCancellationView::never_cancelled(),
         )
         .expect("native profiles collected");
         assert_eq!(result.fragment_profiles.len(), 1);
@@ -4232,7 +4264,14 @@ mod native_contract_tests {
                 control,
             );
             ports.runtime_filter_policy_provider = policy_provider;
-            ExecutionCoordinator::new(prepared, native_bundle, ports, scheduler(), None)
+            ExecutionCoordinator::new(
+                prepared,
+                native_bundle,
+                ports,
+                scheduler(),
+                None,
+                QueryCancellationView::never_cancelled(),
+            )
         }
 
         fn native_policy(events: Arc<Mutex<Vec<String>>>) -> Arc<RecordingPolicyProvider> {
@@ -4509,6 +4548,7 @@ mod native_contract_tests {
                 None,
                 false,
                 &CountingCoordinatorObserver::default(),
+                &QueryCancellationView::never_cancelled(),
                 Some(deployment),
             )
             .expect_err("first submit failure must abort the installed deployment");
@@ -4568,6 +4608,7 @@ mod native_contract_tests {
                 None,
                 false,
                 &CountingCoordinatorObserver::default(),
+                &QueryCancellationView::never_cancelled(),
                 Some(deployment),
             )
             .expect_err("middle submit failure must abort the installed deployment");

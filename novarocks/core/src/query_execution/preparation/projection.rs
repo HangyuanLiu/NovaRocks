@@ -181,20 +181,6 @@ impl PreparedFragmentSet {
     }
 }
 
-/// Constructs the intentionally empty immutable artifact set used only by the
-/// public query-execution contract conformance fixture.
-pub(crate) fn empty_prepared_fragment_set_for_contract_test() -> PreparedFragmentSet {
-    PreparedFragmentSet::new(
-        BTreeMap::new(),
-        ScanExecutionBindings::default(),
-        Vec::new(),
-        0,
-        Vec::new(),
-        RuntimeFilterGraph::default(),
-        Default::default(),
-    )
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct FragmentSchedulingView<'a> {
     by_fragment: &'a BTreeMap<FragmentId, PreparedFragment>,

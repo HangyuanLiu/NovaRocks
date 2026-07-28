@@ -854,6 +854,7 @@ fn run_live_conformance(topology: ConformanceTopology) {
         execution_ports,
         Arc::clone(&scheduler),
         None,
+        crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
     );
     let (coordinator_done_tx, coordinator_done_rx) = mpsc::sync_channel(1);
     let coordinator_thread = std::thread::spawn(move || {
@@ -2301,9 +2302,16 @@ fn run_live_topn(
         ..Default::default()
     };
     let started = Instant::now();
-    let outcome = ExecutionCoordinator::new(prepared, bundle, ports, scheduler, Some(options))
-        .execute_with_profiles_for_test()
-        .unwrap_or_else(|error| panic!("execute production-shaped live TopN: {error}"));
+    let outcome = ExecutionCoordinator::new(
+        prepared,
+        bundle,
+        ports,
+        scheduler,
+        Some(options),
+        crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
+    )
+    .execute_with_profiles_for_test()
+    .unwrap_or_else(|error| panic!("execute production-shaped live TopN: {error}"));
     assert!(
         started.elapsed() <= Duration::from_secs(10),
         "live TopN execution exceeded ten seconds"

@@ -15,15 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod artifact;
-pub mod cancellation;
-pub mod contract;
-pub(crate) mod fragment_transport;
-pub(crate) mod outcome;
-pub(crate) mod preparation;
-pub(crate) mod profile;
-pub mod service;
-pub(crate) mod write;
+//! Owned immutable handoff produced by core preparation.
 
-#[cfg(test)]
-mod tests;
+use crate::protocol::native::encode::NativeFragmentBundle;
+use crate::query_execution::preparation::PreparedFragmentSet;
+
+pub(crate) struct PreparedDistributedQuery {
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+}
+
+impl PreparedDistributedQuery {
+    pub(super) fn new(prepared: PreparedFragmentSet, native_bundle: NativeFragmentBundle) -> Self {
+        Self {
+            prepared,
+            native_bundle,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (PreparedFragmentSet, NativeFragmentBundle) {
+        (self.prepared, self.native_bundle)
+    }
+}

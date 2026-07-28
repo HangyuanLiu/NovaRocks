@@ -88,12 +88,6 @@ fn collect_native_fragment_bundle(
     Ok(NativeFragmentBundle { by_fragment })
 }
 
-pub(crate) fn empty_native_fragment_bundle_for_contract_test() -> NativeFragmentBundle {
-    NativeFragmentBundle {
-        by_fragment: BTreeMap::new(),
-    }
-}
-
 fn fragment_set_error(
     label: &str,
     expected: &BTreeSet<FragmentId>,

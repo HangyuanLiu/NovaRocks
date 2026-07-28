@@ -32,7 +32,6 @@ use crate::sql::planner::table::ScanSource;
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
 
-pub(crate) use projection::empty_prepared_fragment_set_for_contract_test;
 #[cfg(test)]
 pub(crate) use projection::prepared_fragment_set_for_test;
 pub(crate) use projection::{
