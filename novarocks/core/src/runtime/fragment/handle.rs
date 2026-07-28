@@ -29,6 +29,7 @@ use crate::runtime::fragment::error::{
 };
 use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
+use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaults};
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -46,6 +47,7 @@ pub struct FragmentPrepareContext {
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+    exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
@@ -57,12 +59,15 @@ pub struct FragmentPrepareContext {
     start_failure: Option<StartFailurePoint>,
 }
 
+#[cfg(test)]
 impl Default for FragmentPrepareContext {
     fn default() -> Self {
         Self {
             profiler: None,
             mem_tracker: None,
             runtime_filter: None,
+            exchange_transmitter:
+                crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             result_override: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -81,11 +86,13 @@ impl FragmentPrepareContext {
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
         runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     ) -> Self {
         Self {
             profiler,
             mem_tracker,
             runtime_filter,
+            exchange_transmitter,
             result_override: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -104,11 +111,13 @@ impl FragmentPrepareContext {
         result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
         root_sink_dop: Option<i32>,
         group_execution_scan_dop: Option<i32>,
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     ) -> Self {
         Self {
             profiler,
             mem_tracker,
             runtime_filter: None,
+            exchange_transmitter,
             result_override,
             root_sink_dop,
             group_execution_scan_dop,
@@ -398,6 +407,7 @@ pub fn prepare_fragment(
             finst_id,
             instance.runtime_options().typed_result_sink(),
             program.root_plan_node_id().get(),
+            Arc::clone(&context.exchange_transmitter),
             context.result_override.clone(),
         )?;
         let _group_execution_scan_dop = context.group_execution_scan_dop;

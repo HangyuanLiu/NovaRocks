@@ -21,7 +21,6 @@ pub mod cluster_heartbeat;
 pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
-pub mod exchange_sender;
 #[cfg(feature = "compat")]
 pub(crate) mod exec_state_reporter;
 #[cfg(feature = "compat")]

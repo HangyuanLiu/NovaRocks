@@ -19,3 +19,18 @@ pub struct ExchangeFrame {
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
     fn transmit(&self, frame: ExchangeFrame) -> Result<(), FragmentIoError>;
 }
+
+#[cfg(test)]
+pub(crate) fn discard_exchange_transmitter() -> std::sync::Arc<dyn ExchangeFrameTransmitter> {
+    std::sync::Arc::new(DiscardExchangeFrameTransmitter)
+}
+
+#[cfg(test)]
+struct DiscardExchangeFrameTransmitter;
+
+#[cfg(test)]
+impl ExchangeFrameTransmitter for DiscardExchangeFrameTransmitter {
+    fn transmit(&self, _frame: ExchangeFrame) -> Result<(), FragmentIoError> {
+        Ok(())
+    }
+}

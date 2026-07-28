@@ -16,6 +16,8 @@
 // under the License.
 
 mod ffi;
+mod io;
 mod service;
 
+pub(crate) use io::brpc_exchange_transmitter;
 pub use service::CompatFragmentService;

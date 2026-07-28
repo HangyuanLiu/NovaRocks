@@ -16,6 +16,8 @@
 // under the License.
 
 mod control;
+mod io;
 mod service;
 
+pub(crate) use io::grpc_exchange_transmitter;
 pub use service::NativeFragmentService;

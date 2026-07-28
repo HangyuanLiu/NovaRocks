@@ -115,6 +115,7 @@ mod tests {
     fn fragment_ffi_requires_an_explicit_service_context() {
         let service = CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+            crate::fragment::brpc_exchange_transmitter(),
         );
         let context = std::ptr::from_ref(&service).cast();
         let malformed_payload = [0_u8];

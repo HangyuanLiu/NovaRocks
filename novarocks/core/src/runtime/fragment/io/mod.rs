@@ -1,6 +1,8 @@
 pub mod error;
 pub mod events;
 pub mod exchange;
+pub(crate) mod exchange_metrics;
+pub(crate) mod exchange_queue;
 pub mod lookup;
 pub mod result;
 

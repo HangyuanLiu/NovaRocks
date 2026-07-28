@@ -26,6 +26,7 @@ use crate::common::config::debug_exec_node_output;
 use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::runtime::fragment::error::{FragmentExecutionError, FragmentExecutionErrorKind};
+use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
@@ -207,9 +208,15 @@ pub(crate) fn native_execution_readiness_channel() -> (
 pub(crate) fn execute_native_submission(
     submission: FragmentSubmission,
     context: NativeExecutionContext,
+    exchange_transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
 ) -> Result<FragmentOutput, FragmentExecutionError> {
     let failure_trigger = configured_fragment_failure_trigger();
-    execute_native_submission_with_failure_trigger(submission, context, failure_trigger.as_deref())
+    execute_native_submission_with_failure_trigger(
+        submission,
+        context,
+        exchange_transmitter,
+        failure_trigger.as_deref(),
+    )
 }
 
 fn configured_fragment_failure_trigger() -> Option<PathBuf> {
@@ -219,6 +226,7 @@ fn configured_fragment_failure_trigger() -> Option<PathBuf> {
 pub(crate) fn execute_native_submission_with_failure_trigger(
     submission: FragmentSubmission,
     context: NativeExecutionContext,
+    exchange_transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     failure_trigger: Option<&Path>,
 ) -> Result<FragmentOutput, FragmentExecutionError> {
     let instance = submission.instance();
@@ -263,9 +271,10 @@ pub(crate) fn execute_native_submission_with_failure_trigger(
         );
         context.readiness.signal_ready();
     }
-    let sink = materialize_fragment_sink(program, instance).map_err(|error| {
-        FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
-    })?;
+    let sink =
+        materialize_fragment_sink(program, instance, exchange_transmitter).map_err(|error| {
+            FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
+        })?;
     if program.sink().kind() != FragmentSinkKind::Result {
         context.readiness.signal_ready();
     }
@@ -463,6 +472,7 @@ mod tests {
                 readiness,
                 runtime_filter: None,
             },
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
         )
         .expect("noop submission executes");
 
@@ -484,6 +494,7 @@ mod tests {
                 readiness,
                 runtime_filter: None,
             },
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             Some(trigger.as_path()),
         )
         .expect_err("armed fragment must fail");
@@ -510,6 +521,7 @@ mod tests {
                 readiness,
                 runtime_filter: None,
             },
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             Some(trigger.as_path()),
         )
         .expect("consumed trigger must not poison later fragments");

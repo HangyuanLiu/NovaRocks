@@ -186,6 +186,9 @@ impl StarRocksSubmissionMetadata {
         &self,
         profiler: Option<crate::runtime::profile::Profiler>,
         mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
+        exchange_transmitter: std::sync::Arc<
+            dyn crate::runtime::fragment::io::ExchangeFrameTransmitter,
+        >,
     ) -> crate::runtime::fragment::FragmentPrepareContext {
         crate::runtime::fragment::FragmentPrepareContext::new_with_execution_overrides(
             profiler,
@@ -193,6 +196,7 @@ impl StarRocksSubmissionMetadata {
             self.result_override.clone(),
             self.root_sink_dop,
             self.group_execution_scan_dop,
+            exchange_transmitter,
         )
     }
 }

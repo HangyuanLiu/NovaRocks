@@ -27,6 +27,7 @@ use std::time::Duration;
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::runtime::fragment::FragmentPrepareContext;
+use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
@@ -164,11 +165,16 @@ impl NativeFragmentAdmissionResources {
         Arc::clone(&self.fragment_mem_tracker)
     }
 
-    pub fn into_prepare_context(self, profiler: Option<Profiler>) -> FragmentPrepareContext {
+    pub fn into_prepare_context(
+        self,
+        profiler: Option<Profiler>,
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+    ) -> FragmentPrepareContext {
         FragmentPrepareContext::new(
             profiler,
             Some(self.fragment_mem_tracker),
             self.runtime_filter,
+            exchange_transmitter,
         )
     }
 }

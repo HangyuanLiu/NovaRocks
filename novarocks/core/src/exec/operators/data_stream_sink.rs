@@ -34,8 +34,11 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
+use crate::runtime::fragment::io::exchange::{ExchangeFrame, ExchangeFrameTransmitter};
+use crate::runtime::fragment::io::exchange_queue::{
+    ExchangeSendTask, ExchangeSendTracker, exchange_send_queue,
+};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
-use crate::service::exchange_sender::{ExchangeSendTask, ExchangeSendTracker, exchange_send_queue};
 use arrow::datatypes::DataType;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -1123,6 +1126,7 @@ pub(crate) struct DataStreamSinkFactory {
     fragment_instance_id: UniqueId,
     sender_id: Option<i32>,
     partition_arena: ExprArena,
+    transmitter: Arc<dyn ExchangeFrameTransmitter>,
     plan_node_id: i32,
     finish_state: Arc<DataStreamSinkFinishState>,
     shared_sequence: Arc<AtomicI64>,
@@ -1135,6 +1139,7 @@ impl DataStreamSinkFactory {
         sender_id: Option<i32>,
         plan_node_id: i32,
         partition_arena: ExprArena,
+        transmitter: Arc<dyn ExchangeFrameTransmitter>,
     ) -> Self {
         // Align with StarRocks FE ExplainAnalyzer: ExchangeSinkOperator uses the *upstream plan node id*
         // (not the destination exchange node id) as `plan_node_id`.
@@ -1153,6 +1158,7 @@ impl DataStreamSinkFactory {
             fragment_instance_id,
             sender_id,
             partition_arena,
+            transmitter,
             plan_node_id,
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
             shared_sequence: Arc::new(AtomicI64::new(0)),
@@ -1223,6 +1229,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             name: self.name.clone(),
             input: self.input.clone(),
             fragment_instance_id: self.fragment_instance_id,
+            transmitter: Arc::clone(&self.transmitter),
             arena,
             expr_ids,
             init_error,
@@ -1273,6 +1280,7 @@ struct DataStreamSinkOperator {
     name: String,
     input: DataStreamSinkFactoryInput,
     fragment_instance_id: UniqueId,
+    transmitter: Arc<dyn ExchangeFrameTransmitter>,
     arena: ExprArena,
     expr_ids: Vec<ExprId>,
     init_error: Option<String>,
@@ -1672,8 +1680,7 @@ impl DataStreamSinkOperator {
             accounting.transfer_to(Arc::clone(tracker));
         }
         let task = self.build_exchange_send_task(
-            addr.host().to_string(),
-            addr.port() as u16,
+            addr.clone(),
             dest_finst_id,
             pending,
             Arc::clone(error_state),
@@ -1688,8 +1695,7 @@ impl DataStreamSinkOperator {
 
     fn build_exchange_send_task(
         &self,
-        dest_host: String,
-        dest_port: u16,
+        destination: crate::runtime::endpoint::RuntimeEndpoint,
         dest_finst_id: UniqueId,
         pending: PendingPayload,
         error_state: Arc<RuntimeErrorState>,
@@ -1697,19 +1703,18 @@ impl DataStreamSinkOperator {
         #[cfg(test)]
         record_payload_identity_for_test(self.fragment_instance_id, pending.be_number, pending.eos);
         ExchangeSendTask {
-            dest_host,
-            dest_port,
-            finst_id: dest_finst_id,
-            sender_finst_id: UniqueId {
-                hi: self.fragment_instance_id.hi,
-                lo: self.fragment_instance_id.lo,
+            frame: ExchangeFrame {
+                destination,
+                destination_fragment_instance_id: dest_finst_id,
+                sender_fragment_instance_id: self.fragment_instance_id,
+                destination_node_id: self.input.dest_node_id,
+                sender_id: self.sender_id,
+                backend_number: pending.be_number,
+                eos: pending.eos,
+                sequence: pending.sequence,
+                payload: pending.payload,
             },
-            node_id: self.input.dest_node_id,
-            sender_id: self.sender_id,
-            be_number: pending.be_number,
-            eos: pending.eos,
-            sequence: pending.sequence,
-            payload: pending.payload,
+            transmitter: Arc::clone(&self.transmitter),
             payload_accounting: pending.accounting,
             encode_ns: pending.encode_ns,
             payload_bytes: pending.payload_bytes,
@@ -2243,6 +2248,7 @@ mod tests {
                 Vec::new(),
             )
             .expect("test sink input"),
+            transmitter: crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             fragment_instance_id: UniqueId { hi: 1, lo: 2 },
             arena: ExprArena::default(),
             expr_ids: Vec::new(),
@@ -2281,8 +2287,7 @@ mod tests {
         let mut op = make_test_operator();
         op.fragment_instance_id = UniqueId { hi: 81, lo: 82 };
         op.build_exchange_send_task(
-            "127.0.0.1".to_string(),
-            9030,
+            RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
             UniqueId { hi: 91, lo: 92 },
             PendingPayload {
                 be_number: 7,
@@ -2395,8 +2400,14 @@ mod tests {
     fn exchange_send_task_carries_distinct_dest_and_sender_finsts() {
         let task = make_test_exchange_send_task();
 
-        assert_eq!(task.finst_id, UniqueId { hi: 91, lo: 92 });
-        assert_eq!(task.sender_finst_id, UniqueId { hi: 81, lo: 82 });
+        assert_eq!(
+            task.frame.destination_fragment_instance_id,
+            UniqueId { hi: 91, lo: 92 }
+        );
+        assert_eq!(
+            task.frame.sender_fragment_instance_id,
+            UniqueId { hi: 81, lo: 82 }
+        );
     }
 
     #[test]

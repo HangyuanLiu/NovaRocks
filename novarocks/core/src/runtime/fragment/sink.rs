@@ -38,11 +38,13 @@ use crate::runtime::fragment::error::{
     FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
 };
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
+use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
 
 pub(crate) fn materialize_fragment_sink(
     program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     materialize_fragment_sink_components(
         program.sink(),
@@ -50,6 +52,7 @@ pub(crate) fn materialize_fragment_sink(
         instance.fragment_instance_id().get(),
         instance.runtime_options().typed_result_sink(),
         program.root_plan_node_id().get(),
+        transmitter,
     )
 }
 
@@ -59,6 +62,7 @@ pub(crate) fn materialize_fragment_sink_components(
     fragment_instance_id: crate::common::types::UniqueId,
     typed_result_sink: bool,
     plan_node_id: i32,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     materialize_fragment_sink_components_with_result(
         program,
@@ -66,6 +70,7 @@ pub(crate) fn materialize_fragment_sink_components(
         fragment_instance_id,
         typed_result_sink,
         plan_node_id,
+        transmitter,
         None,
     )
 }
@@ -76,6 +81,7 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
     fragment_instance_id: crate::common::types::UniqueId,
     typed_result_sink: bool,
     plan_node_id: i32,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     match (program.program(), assignment) {
@@ -106,6 +112,7 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
                 *sender_id,
                 plan_node_id,
                 stream.partition_arena().clone(),
+                std::sync::Arc::clone(&transmitter),
             )))
         }
         (
@@ -117,6 +124,7 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
             fragment_instance_id,
             *sender_id,
             plan_node_id,
+            std::sync::Arc::clone(&transmitter),
         ),
         (
             FragmentSinkProgram::SplitDataStream(split),
@@ -127,6 +135,7 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
             fragment_instance_id,
             *sender_id,
             plan_node_id,
+            std::sync::Arc::clone(&transmitter),
         ),
         (FragmentSinkProgram::IcebergTable(table), FragmentSinkAssignment::None) => {
             IcebergTableSinkFactory::try_new(table.factory_input())
@@ -147,6 +156,7 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
             fragment_instance_id,
             *sender_id,
             plan_node_id,
+            std::sync::Arc::clone(&transmitter),
         ),
         (static_program, dynamic_assignment) => Err(materialization_error(format!(
             "sink {} cannot be materialized with assignment {}",
@@ -211,6 +221,7 @@ fn materialize_multicast(
     fragment_instance_id: crate::common::types::UniqueId,
     sender_id: Option<i32>,
     plan_node_id: i32,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     ensure_group_count(program.sinks().len(), groups.len())?;
     let sinks = program
@@ -227,6 +238,7 @@ fn materialize_multicast(
         sender_id,
         program.partition_arena().clone(),
         plan_node_id,
+        transmitter,
     )))
 }
 
@@ -236,6 +248,7 @@ fn materialize_split(
     fragment_instance_id: crate::common::types::UniqueId,
     sender_id: Option<i32>,
     plan_node_id: i32,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     let sinks = program
         .sinks()
@@ -251,6 +264,7 @@ fn materialize_split(
         plan_node_id,
         std::sync::Arc::new(program.arena().clone()),
         program.split_exprs().to_vec(),
+        transmitter,
     )))
 }
 
@@ -260,6 +274,7 @@ fn materialize_router(
     fragment_instance_id: crate::common::types::UniqueId,
     sender_id: Option<i32>,
     plan_node_id: i32,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     ensure_group_count(program.branches().len(), groups.len())?;
     let branches = program
@@ -288,6 +303,7 @@ fn materialize_router(
         sender_id,
         program.partition_arena().clone(),
         plan_node_id,
+        transmitter,
     )
     .map(|factory| Box::new(factory) as Box<dyn OperatorFactory>)
     .map_err(materialization_error)
@@ -413,6 +429,7 @@ mod tests {
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
+    use crate::runtime::fragment::io::ExchangeFrameTransmitter;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use crate::sql::common::ChangeStreamBranchKind;
@@ -420,6 +437,10 @@ mod tests {
     #[cfg(feature = "compat")]
     use super::starrocks_factory_input;
     use super::{materialize_fragment_sink, materialize_fragment_sink_components};
+
+    fn test_transmitter() -> std::sync::Arc<dyn ExchangeFrameTransmitter> {
+        crate::runtime::fragment::io::exchange::discard_exchange_transmitter()
+    }
 
     fn stream_program() -> DataStreamSinkProgram {
         DataStreamSinkProgram::try_new(
@@ -555,7 +576,8 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance).expect("data stream sink");
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
+            .expect("data stream sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "EXCHANGE_SINK (id=99)");
     }
@@ -571,7 +593,8 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance).expect("multicast sink");
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
+            .expect("multicast sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "MULTI_CAST_DATA_STREAM_SINK (id=99)");
     }
@@ -592,7 +615,8 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance).expect("split sink");
+        let factory =
+            materialize_fragment_sink(&program, &instance, test_transmitter()).expect("split sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "SPLIT_DATA_STREAM_SINK (id=99)");
     }
@@ -641,7 +665,8 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance).expect("router sink");
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
+            .expect("router sink");
 
         assert_factory_and_operator_name(
             factory.as_ref(),
@@ -654,7 +679,8 @@ mod tests {
         let program = fragment_program(FragmentSinkProgram::Result);
         let instance = instance(FragmentSinkAssignment::None);
 
-        let factory = materialize_fragment_sink(&program, &instance).expect("result sink");
+        let factory = materialize_fragment_sink(&program, &instance, test_transmitter())
+            .expect("result sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "RESULT_BUFFER_SINK (plan_node_id=-1)");
     }
@@ -663,11 +689,14 @@ mod tests {
     fn data_stream_materialization_requires_stream_destinations() {
         let program = fragment_program(FragmentSinkProgram::DataStream(stream_program()));
 
-        let error =
-            match materialize_fragment_sink(&program, &instance(FragmentSinkAssignment::None)) {
-                Ok(_) => panic!("missing stream destinations must fail"),
-                Err(error) => error,
-            };
+        let error = match materialize_fragment_sink(
+            &program,
+            &instance(FragmentSinkAssignment::None),
+            test_transmitter(),
+        ) {
+            Ok(_) => panic!("missing stream destinations must fail"),
+            Err(error) => error,
+        };
 
         assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);
@@ -687,10 +716,11 @@ mod tests {
             sender_id: None,
         };
 
-        let error = match materialize_fragment_sink(&program, &instance(assignment)) {
-            Ok(_) => panic!("one destination group must not be truncated against two branches"),
-            Err(error) => error,
-        };
+        let error =
+            match materialize_fragment_sink(&program, &instance(assignment), test_transmitter()) {
+                Ok(_) => panic!("one destination group must not be truncated against two branches"),
+                Err(error) => error,
+            };
 
         assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);
@@ -707,6 +737,7 @@ mod tests {
             UniqueId { hi: 3, lo: 4 },
             false,
             47,
+            test_transmitter(),
         )
         .expect("result sink materialization");
 
