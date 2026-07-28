@@ -57,7 +57,6 @@ use novarocks_spi::connector::{ConnectorInstance, ConnectorInstanceId};
 use self::host::{ConnectorHost, ConnectorHostError, ConnectorInstanceLease};
 
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use crate::exec::node::scan::{BoundScanRanges, ScanSource};
 
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
@@ -349,27 +348,9 @@ mod scan_planning_registry_tests {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum ScanConfig {
-    Jdbc(JdbcScanConfig),
-}
-
-pub trait ScanConnector: Send + Sync {
-    fn name(&self) -> &'static str;
-    /// Split a decoder-built `ScanConfig` into a static `ScanSource` (for the
-    /// plan node) plus the enriched `BoundScanRanges` (for the instance's scan
-    /// assignment). Binding is deferred to execution time
-    /// (`materialize_scan_bindings`); this no longer eagerly builds a `ScanOp`.
-    fn create_scan_node(
-        &self,
-        cfg: ScanConfig,
-    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String>;
-}
-
 #[derive(Clone)]
 pub struct ConnectorRegistry {
     connector_host: Arc<RwLock<ConnectorHost>>,
-    scan_connectors: HashMap<&'static str, Arc<dyn ScanConnector>>,
     catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
     table_sources: HashMap<&'static str, Arc<dyn TableSource>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
@@ -381,17 +362,12 @@ impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
             connector_host: Arc::new(RwLock::new(ConnectorHost::default())),
-            scan_connectors: HashMap::new(),
             catalog_backends: HashMap::new(),
             table_sources: HashMap::new(),
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
             scan_planners: HashMap::new(),
         }
-    }
-
-    pub fn register_scan_connector(&mut self, connector: Arc<dyn ScanConnector>) {
-        self.scan_connectors.insert(connector.name(), connector);
     }
 
     pub(crate) fn register_connector_instance(
@@ -508,21 +484,6 @@ impl ConnectorRegistry {
             .cloned()
             .ok_or_else(|| format!("unknown scan planner: {name}"))
     }
-
-    /// Resolve the connector and split its `ScanConfig` into a static
-    /// `ScanSource` (stored on the plan node) plus the enriched
-    /// `BoundScanRanges` (routed into the instance's scan assignment). The
-    /// per-instance `ScanOp` is materialized later by `materialize_scan_bindings`.
-    pub fn create_scan_node(
-        &self,
-        connector_name: &str,
-        cfg: ScanConfig,
-    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
-        let Some(connector) = self.scan_connectors.get(connector_name) else {
-            return Err(format!("unknown scan connector: {connector_name}"));
-        };
-        connector.create_scan_node(cfg)
-    }
 }
 
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
@@ -555,18 +516,12 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
 impl Default for ConnectorRegistry {
     fn default() -> Self {
         let mut reg = ConnectorRegistry::new();
-        let jdbc = Arc::new(JdbcConnector { name: "jdbc" });
-        let mysql = Arc::new(JdbcConnector { name: "mysql" });
-        reg.register_scan_connector(jdbc);
-        reg.register_scan_connector(mysql);
         reg
     }
 }
 
 impl std::fmt::Debug for ConnectorRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut scan_connectors: Vec<_> = self.scan_connectors.keys().copied().collect();
-        scan_connectors.sort();
         let mut catalog_backends: Vec<_> = self.catalog_backends.keys().copied().collect();
         catalog_backends.sort();
         let mut table_sources: Vec<_> = self.table_sources.keys().copied().collect();
@@ -578,39 +533,11 @@ impl std::fmt::Debug for ConnectorRegistry {
         let mut scan_planners: Vec<_> = self.scan_planners.keys().copied().collect();
         scan_planners.sort();
         f.debug_struct("ConnectorRegistry")
-            .field("scan_connectors", &scan_connectors)
             .field("catalog_backends", &catalog_backends)
             .field("table_sources", &table_sources)
             .field("table_sinks", &table_sinks)
             .field("mv_backends", &mv_backends)
             .field("scan_planners", &scan_planners)
             .finish()
-    }
-}
-
-#[derive(Clone, Debug)]
-struct JdbcConnector {
-    name: &'static str,
-}
-
-impl ScanConnector for JdbcConnector {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn create_scan_node(
-        &self,
-        cfg: ScanConfig,
-    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
-        match cfg {
-            ScanConfig::Jdbc(cfg) => {
-                let source: Arc<dyn ScanSource> = Arc::new(jdbc::JdbcScanSource::new(cfg));
-                Ok((source, BoundScanRanges::None))
-            }
-            _ => Err(format!(
-                "unsupported scan config for connector {}",
-                self.name
-            )),
-        }
     }
 }
