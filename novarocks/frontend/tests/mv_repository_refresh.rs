@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use novarocks::mv::persistence::partition::ReplaceMvPartitionStatesRequest;
 use novarocks::mv::persistence::refresh::{
     MvRefreshFinalizeRequest, MvRefreshState, RecordPublishCommitRequest,
     RecordStagingCommitRequest,
@@ -154,4 +155,96 @@ fn unfinished_refreshes_preserve_conflict_and_commit_unknown_guards() {
         .clear_refresh_progress(definition.mv_id)
         .expect_err("commit unknown cannot be cleared");
     assert_eq!(clear.kind(), MvRepositoryErrorKind::Conflict);
+}
+
+#[test]
+fn refresh_commands_return_not_found_for_missing_definition_and_refresh() {
+    let (_temp, _runtime, _host, repository) = repository();
+    assert_eq!(
+        repository
+            .begin_refresh_intent(99, BTreeMap::new())
+            .expect_err("missing definition")
+            .kind(),
+        MvRepositoryErrorKind::NotFound
+    );
+    assert_eq!(
+        repository
+            .record_staging_commit(RecordStagingCommitRequest {
+                refresh_id: 99,
+                staging_snapshot_id: 1,
+                rows: 1,
+                base_table_uuids: BTreeMap::new(),
+            })
+            .expect_err("missing refresh")
+            .kind(),
+        MvRepositoryErrorKind::NotFound
+    );
+}
+
+#[test]
+fn dropping_a_finalized_mv_removes_refresh_and_partition_records_before_reopen() {
+    let (_temp, runtime, host, repository) = repository();
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_drop_cleanup"),
+        )
+        .expect("create definition");
+    let refresh = repository
+        .begin_refresh_intent(definition.mv_id, BTreeMap::new())
+        .expect("begin refresh");
+    repository
+        .record_staging_commit(RecordStagingCommitRequest {
+            refresh_id: refresh.refresh_id,
+            staging_snapshot_id: 1,
+            rows: 1,
+            base_table_uuids: BTreeMap::new(),
+        })
+        .expect("stage refresh");
+    repository
+        .record_publish_commit(RecordPublishCommitRequest {
+            refresh_id: refresh.refresh_id,
+            published_snapshot_id: 2,
+        })
+        .expect("publish refresh");
+    repository
+        .finalize_refresh(MvRefreshFinalizeRequest {
+            refresh_id: refresh.refresh_id,
+            rows: 1,
+            base_snapshots: BTreeMap::new(),
+            base_table_uuids: BTreeMap::new(),
+            target_snapshot_id: Some(2),
+        })
+        .expect("finalize refresh");
+    repository
+        .replace_partition_states(ReplaceMvPartitionStatesRequest {
+            mv_id: definition.mv_id,
+            partition_keys: ["p1".to_string()].into(),
+            last_refresh_ms: 1,
+            base_snapshots: BTreeMap::new(),
+            target_snapshot_id: Some(2),
+            last_refresh_id: refresh.refresh_id,
+            max_entries: 10,
+        })
+        .expect("persist partition");
+    assert!(repository.drop_by_id(definition.mv_id).expect("drop MV"));
+    drop(repository);
+    let reopened = runtime
+        .block_on(StateStoreMvRepository::open(
+            host.state_store().expect("StateStore"),
+            runtime.handle().clone(),
+        ))
+        .expect("reopen after cleanup");
+    assert!(
+        reopened
+            .load_refresh(refresh.refresh_id)
+            .expect("load refresh")
+            .is_none()
+    );
+    assert!(
+        reopened
+            .list_partition_states(definition.mv_id)
+            .expect("list removed partition states")
+            .is_empty()
+    );
 }
