@@ -19,6 +19,7 @@ pub mod hdfs;
 pub(crate) mod host;
 pub mod iceberg;
 pub mod jdbc;
+pub(crate) mod runtime;
 pub(crate) mod scan_model;
 pub(crate) mod scan_planning;
 pub mod schema;
@@ -72,6 +73,8 @@ mod backend_test;
 mod host_test;
 #[cfg(test)]
 mod iceberg_provider_test;
+#[cfg(test)]
+mod runtime_test;
 
 #[cfg(not(feature = "compat"))]
 mod starrocks_table_stub {
