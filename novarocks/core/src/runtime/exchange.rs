@@ -305,7 +305,6 @@ fn register_expected_chunk_schema_inner(
     }
     let receiver = get_or_create(key);
     let mut st = receiver.mu.lock().expect("exchange receiver lock");
-    st.expected_senders = st.expected_senders.max(expected_senders);
     match st.expected_chunk_schema.as_ref() {
         Some(_) if reject_existing => {
             return Err(format!(
@@ -327,6 +326,7 @@ fn register_expected_chunk_schema_inner(
             st.expected_chunk_schema = Some(chunk_schema);
         }
     }
+    st.expected_senders = st.expected_senders.max(expected_senders);
     receiver.cv.notify_all();
     Ok(())
 }

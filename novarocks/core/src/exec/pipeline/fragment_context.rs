@@ -53,6 +53,7 @@ pub(crate) struct FragmentContext {
     enable_profile: bool,
     #[allow(dead_code)]
     runtime_profile_report_interval_ns: Option<i64>,
+    legacy_progress_reporting: bool,
     final_error: Mutex<Option<String>>,
     cancelled: AtomicBool,
     event_scheduler: Arc<EventScheduler>,
@@ -82,6 +83,29 @@ impl FragmentContext {
             backend_num,
             enable_profile,
             runtime_profile_report_interval_ns,
+            legacy_progress_reporting: true,
+            final_error: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            event_scheduler: Arc::new(EventScheduler::new()),
+        }
+    }
+
+    pub(crate) fn new_report_neutral(
+        profiler: Option<Profiler>,
+        runtime_state: Arc<RuntimeState>,
+        fragment_instance_id: Option<(i64, i64)>,
+    ) -> Self {
+        Self {
+            next_driver_id: AtomicI32::new(0),
+            profiler,
+            runtime_state,
+            fragment_instance_id,
+            query_id: None,
+            fe_addr: None,
+            backend_num: None,
+            enable_profile: false,
+            runtime_profile_report_interval_ns: None,
+            legacy_progress_reporting: false,
             final_error: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             event_scheduler: Arc::new(EventScheduler::new()),
@@ -123,6 +147,10 @@ impl FragmentContext {
     #[allow(dead_code)]
     pub(crate) fn runtime_profile_report_interval_ns(&self) -> Option<i64> {
         self.runtime_profile_report_interval_ns
+    }
+
+    pub(crate) const fn legacy_progress_reporting(&self) -> bool {
+        self.legacy_progress_reporting
     }
 
     pub(crate) fn next_driver_id(&self) -> i32 {

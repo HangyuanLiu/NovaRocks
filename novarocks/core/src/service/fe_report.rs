@@ -81,9 +81,22 @@ struct ReportInstance {
 }
 
 static REPORT_REGISTRY: OnceLock<Mutex<HashMap<UniqueId, ReportInstance>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_PROGRESS_REPORT_CALLS: OnceLock<Mutex<HashMap<UniqueId, usize>>> = OnceLock::new();
 
 fn registry() -> &'static Mutex<HashMap<UniqueId, ReportInstance>> {
     REPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn progress_report_call_count_for_test(finst_id: UniqueId) -> usize {
+    TEST_PROGRESS_REPORT_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("test progress report calls lock")
+        .get(&finst_id)
+        .copied()
+        .unwrap_or(0)
 }
 
 #[cfg(feature = "compat")]
@@ -300,6 +313,14 @@ pub(crate) fn report_fragment_done(
 }
 
 pub(crate) fn report_exec_state(finst_id: UniqueId) {
+    #[cfg(test)]
+    {
+        let mut calls = TEST_PROGRESS_REPORT_CALLS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("test progress report calls lock");
+        *calls.entry(finst_id).or_default() += 1;
+    }
     let instance = {
         let guard = registry().lock().expect("report registry lock");
         guard.get(&finst_id).cloned()

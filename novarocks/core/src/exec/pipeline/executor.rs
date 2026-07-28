@@ -306,6 +306,84 @@ pub(crate) fn prepare_pipeline_execution(
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     >,
 ) -> Result<PreparedPipelineExecution, String> {
+    prepare_pipeline_execution_inner(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_bindings,
+        scan_bindings,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        root_sink_dop,
+        runtime_filter_context,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_report_neutral_pipeline_execution(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    root_sink_dop: Option<i32>,
+    runtime_filter_context: Option<
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    >,
+) -> Result<PreparedPipelineExecution, String> {
+    prepare_pipeline_execution_inner(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_bindings,
+        scan_bindings,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        None,
+        None,
+        None,
+        root_sink_dop,
+        runtime_filter_context,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_pipeline_execution_inner(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<RuntimeEndpoint>,
+    backend_num: Option<i32>,
+    root_sink_dop: Option<i32>,
+    runtime_filter_context: Option<
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    >,
+    report_neutral: bool,
+) -> Result<PreparedPipelineExecution, String> {
     let dep_manager = DependencyManager::new();
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
@@ -322,14 +400,22 @@ pub(crate) fn prepare_pipeline_execution(
             runtime_filter_context,
         )?;
 
-    let ctx = Arc::new(FragmentContext::new(
-        profiler.clone(),
-        Arc::clone(&runtime_state),
-        exchange_finst_id,
-        query_id,
-        fe_addr,
-        backend_num,
-    ));
+    let ctx = Arc::new(if report_neutral {
+        FragmentContext::new_report_neutral(
+            profiler.clone(),
+            Arc::clone(&runtime_state),
+            exchange_finst_id,
+        )
+    } else {
+        FragmentContext::new(
+            profiler.clone(),
+            Arc::clone(&runtime_state),
+            exchange_finst_id,
+            query_id,
+            fe_addr,
+            backend_num,
+        )
+    });
     let mut sink = Some(sink);
 
     // Collect all drivers

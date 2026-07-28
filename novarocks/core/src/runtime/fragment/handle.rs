@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use crate::common::config::debug_exec_node_output;
 use crate::exec::fragment::program::FragmentProgram;
-use crate::exec::pipeline::executor::{PreparedPipelineExecution, prepare_pipeline_execution};
+use crate::exec::pipeline::executor::{
+    PreparedPipelineExecution, prepare_report_neutral_pipeline_execution,
+};
 use crate::runtime::fragment::error::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
     FragmentLaunchErrorKind, FragmentLaunchStage,
@@ -308,7 +310,6 @@ pub(crate) fn prepare_fragment(
     let instance = submission.instance();
     let query_id = instance.query_id();
     let finst_id = instance.fragment_instance_id().get();
-    let backend_num = instance.backend_num().get();
     let logical_pipeline_dop = i32::try_from(instance.pipeline_dop().get()).map_err(|_| {
         FragmentLaunchError::new(
             FragmentLaunchStage::BuildPipelines,
@@ -336,7 +337,7 @@ pub(crate) fn prepare_fragment(
                 )),
                 query_id: Some(query_id),
                 fragment_instance_id: Some(finst_id),
-                backend_num: Some(backend_num),
+                backend_num: None,
                 mem_tracker: context.mem_tracker.clone(),
                 native_runtime_filter_context: context.runtime_filter.clone(),
             },
@@ -352,7 +353,7 @@ pub(crate) fn prepare_fragment(
         let sink = materialize_fragment_sink(program, instance)?;
         let exchange_bindings = materialize_exchange_bindings(program, instance);
         let scan_bindings = materialize_scan_bindings(program, instance)?;
-        prepare_pipeline_execution(
+        prepare_report_neutral_pipeline_execution(
             program.plan().clone(),
             debug_exec_node_output(),
             Duration::from_millis(50),
@@ -363,9 +364,6 @@ pub(crate) fn prepare_fragment(
             context.profiler.clone(),
             pipeline_dop,
             runtime_state,
-            Some(query_id),
-            None,
-            Some(backend_num),
             None,
             context.runtime_filter.clone(),
         )
@@ -424,6 +422,18 @@ mod tests {
     use crate::runtime::fragment::resources::ResourceKind;
 
     fn result_exchange_submission(finst_id: UniqueId) -> FragmentSubmission {
+        result_exchange_submission_with(
+            finst_id,
+            NonZeroUsize::new(1).expect("one sender"),
+            QueryOptions::default(),
+        )
+    }
+
+    fn result_exchange_submission_with(
+        finst_id: UniqueId,
+        expected_senders: NonZeroUsize,
+        query_options: QueryOptions,
+    ) -> FragmentSubmission {
         let node_id = FragmentNodeId::new(17);
         let schema = Arc::new(ChunkSchema::empty());
         let program = Arc::new(FragmentProgram::new(
@@ -453,10 +463,10 @@ mod tests {
             ScanAssignments::default(),
             ExchangeInputAssignments::new(BTreeMap::from([(
                 node_id,
-                ExchangeInputAssignment::new(NonZeroUsize::new(1).expect("one sender")),
+                ExchangeInputAssignment::new(expected_senders),
             )])),
             FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(query_options, None, false),
             NonZeroUsize::new(1).expect("one driver"),
             BackendNum::try_new(1).expect("backend number"),
         );
@@ -604,15 +614,67 @@ mod tests {
         .expect("existing exchange owner registers");
 
         let error = expect_prepare_error(prepare_fragment(
-            result_exchange_submission(finst_id),
+            result_exchange_submission_with(
+                finst_id,
+                NonZeroUsize::new(7).expect("seven senders"),
+                QueryOptions::default(),
+            ),
             FragmentPrepareContext::default(),
         ));
 
         assert!(error.detail().contains("already registered"));
         assert!(!sink_commit::is_registered(finst_id));
         assert!(!result_buffer::is_registered(finst_id));
-        assert!(snapshot_receiver_state(key).is_some());
+        let snapshot = snapshot_receiver_state(key).expect("existing exchange owner remains");
+        assert_eq!(
+            snapshot.expected_senders, 1,
+            "failed duplicate acquisition must not mutate the existing owner"
+        );
         crate::runtime::exchange::cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn kernel_handle_never_invokes_legacy_progress_reporter() {
+        let mut query_options = QueryOptions::default();
+        query_options.enable_profile = true;
+        query_options.runtime_profile_report_interval = Some(1);
+        let priming_state = crate::runtime::runtime_state::RuntimeState::new(
+            Some(query_options.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!priming_state.should_report_exec_state());
+        std::thread::sleep(Duration::from_millis(1_050));
+
+        let finst_id = UniqueId {
+            hi: 72_271,
+            lo: 72_272,
+        };
+        let running = prepare_fragment(
+            result_exchange_submission_with(
+                finst_id,
+                NonZeroUsize::new(1).expect("one sender"),
+                query_options,
+            ),
+            FragmentPrepareContext::default(),
+        )
+        .expect("fragment prepares")
+        .start();
+        assert!(running.submitted_driver_count() > 0);
+        std::thread::sleep(Duration::from_millis(100));
+
+        running.cancel(FragmentCancelReason::new("test cleanup"));
+        let _ = running.join();
+        assert_eq!(
+            crate::service::fe_report::progress_report_call_count_for_test(finst_id),
+            0,
+            "kernel handle path must not invoke the legacy progress reporter"
+        );
     }
 
     #[test]
