@@ -98,7 +98,7 @@ impl StateStoreMvRepository {
     async fn validate_open_state(&self) -> Result<(), MvRepositoryError> {
         let records = self.scan_prefix(mv_prefix().map_err(corruption)?).await?;
         let mut definitions = BTreeMap::new();
-        let mut target_records = Vec::new();
+        let mut target_records = BTreeMap::new();
         let mut downstream = BTreeMap::new();
         let mut upstream = BTreeMap::new();
         for record in records {
@@ -123,7 +123,7 @@ impl StateStoreMvRepository {
                 key::MvKeyKind::TargetLookup => {
                     let lookup: DecodedMvRecord<MvTargetLookup> =
                         decode_record(&record.key, &record.value).map_err(corruption)?;
-                    target_records.push((record.key, lookup.value));
+                    target_records.insert(record.key, lookup.value);
                 }
                 key::MvKeyKind::DependencyDownstream => {
                     let dependency: DecodedMvRecord<StoredMvDependency> =
@@ -162,7 +162,7 @@ impl StateStoreMvRepository {
                 }
             }
         }
-        for (key, lookup) in target_records {
+        for (key, lookup) in &target_records {
             let definition = definitions
                 .get(&lookup.mv_id)
                 .ok_or_else(|| corruption("MV target lookup references a missing definition"))?;
@@ -175,10 +175,27 @@ impl StateStoreMvRepository {
                 &target.name,
             )
             .map_err(corruption)?
-                != key
+                != *key
             {
                 return Err(corruption(
                     "MV target lookup key does not match its definition target",
+                ));
+            }
+        }
+        for definition in definitions.values() {
+            let Some(target) = definition_target(definition)? else {
+                continue;
+            };
+            let target_key = target_lookup_key(
+                &target.catalog.unwrap_or_default(),
+                &target.database,
+                &target.name,
+            )
+            .map_err(corruption)?;
+            if target_records.get(&target_key).map(|lookup| lookup.mv_id) != Some(definition.mv_id)
+            {
+                return Err(corruption(
+                    "MV definition target has no matching target lookup record",
                 ));
             }
         }
@@ -269,6 +286,7 @@ impl StateStoreMvRepository {
         request: CreateMvRepositoryRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         validate_create_request(&request)?;
+        prevalidate_create_operation(operation_id, explicit_id, &request)?;
         let recovery_request = request.clone();
         let store = Arc::clone(&self.store);
         let metrics = &self.runner_metrics;
@@ -392,7 +410,14 @@ impl StateStoreMvRepository {
                                 recovery
                             }
                         }),
-                    novarocks_spi::state_store::CommitResolution::NotCommitted => Err(original),
+                    novarocks_spi::state_store::CommitResolution::NotCommitted => {
+                        Box::pin(self.create_with_optional_id_async(
+                            operation_id,
+                            explicit_id,
+                            recovery_request,
+                        ))
+                        .await
+                    }
                     novarocks_spi::state_store::CommitResolution::Unresolved => {
                         self.recover_create(operation_id, &recovery_request, original)
                             .await
@@ -421,6 +446,17 @@ impl StateStoreMvRepository {
                 .unwrap_or(false)
                 && definition_matches_request(&definition, request);
             if !matches_definition {
+                continue;
+            }
+            let sequence_key = sequence_key().map_err(corruption)?;
+            let Some(sequence_record) = self.read_record(&sequence_key).await? else {
+                continue;
+            };
+            let sequence: DecodedMvRecord<MvSequence> =
+                decode_record(&sequence_key, &sequence_record.value).map_err(corruption)?;
+            if sequence.operation_id != operation_id
+                || sequence.value.last_allocated_id < definition.mv_id
+            {
                 continue;
             }
             if let Some(target) = definition_target(&definition)? {
@@ -1094,6 +1130,54 @@ fn validate_create_request(request: &CreateMvRepositoryRequest) -> Result<(), Mv
         return Err(invalid(
             "MV definition target catalog, namespace, and table must be set together",
         ));
+    }
+    Ok(())
+}
+
+/// Validate every possible CREATE key and envelope before the first write
+/// transaction. IDs are fixed-width keys and Avro longs are bounded by the
+/// explicit maximum, so `i64::MAX` is the conservative encoding probe for an
+/// automatically allocated ID as well as an explicit ID.
+fn prevalidate_create_operation(
+    operation_id: Uuid,
+    explicit_id: Option<i64>,
+    request: &CreateMvRepositoryRequest,
+) -> Result<(), MvRepositoryError> {
+    let mv_id = explicit_id.unwrap_or(i64::MAX);
+    if mv_id <= 0 {
+        return Err(invalid("MV definition ID must be positive"));
+    }
+    let definition = definition_from_request(mv_id, request);
+    let _ = sequence_key().map_err(invalid)?;
+    let _ = encode_record(
+        MvRecordKind::Sequence,
+        operation_id,
+        &MvSequence {
+            last_allocated_id: mv_id,
+        },
+    )
+    .map_err(invalid)?;
+    let _ = definition_by_id_key(mv_id).map_err(invalid)?;
+    let _ = encode_definition(operation_id, &definition).map_err(invalid)?;
+    if let Some(target) = definition_target(&definition)? {
+        let _ = target_lookup_key(
+            &target.catalog.unwrap_or_default(),
+            &target.database,
+            &target.name,
+        )
+        .map_err(invalid)?;
+        let _ = encode_record(
+            MvRecordKind::TargetLookup,
+            operation_id,
+            &MvTargetLookup { mv_id },
+        )
+        .map_err(invalid)?;
+    }
+    for dependency in deduplicate_dependencies(mv_id, &request.dependencies).map_err(invalid)? {
+        let _ = dependency_by_downstream_key(mv_id, &dependency.upstream).map_err(invalid)?;
+        let _ = dependency_by_upstream_key(&dependency.upstream, mv_id).map_err(invalid)?;
+        let _ =
+            encode_record(MvRecordKind::Dependency, operation_id, &dependency).map_err(invalid)?;
     }
     Ok(())
 }

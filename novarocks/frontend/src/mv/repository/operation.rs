@@ -17,10 +17,11 @@
 
 use novarocks::mv::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::state_store::{
-    CommitResolution, StateStore, StateStoreError, StateStoreErrorKind, TransactionId,
+    CommitOutcome, CommitResolution, StateStore, StateStoreError, StateStoreErrorKind,
+    TransactionId,
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
-use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
+use novarocks_state_store::{OperationId, RunFailure, derive_transaction_id, run_side_effect_free};
 
 pub(crate) fn state_store_error(error: StateStoreError) -> MvRepositoryError {
     let kind = match error.kind() {
@@ -96,20 +97,68 @@ pub(crate) async fn run_raw<T, F>(
     metrics: &StateStoreMetrics,
     operation_id: uuid::Uuid,
     purpose: &str,
-    operation: F,
+    mut operation: F,
 ) -> Result<T, RunFailure>
 where
     F: for<'a> FnMut(
         &'a mut dyn novarocks_spi::state_store::WriteTransaction,
     ) -> futures::future::BoxFuture<'a, Result<T, StateStoreError>>,
 {
-    run_side_effect_free(
+    let result = run_side_effect_free(
         store,
         metrics,
         OperationId::from(operation_id),
         purpose,
-        operation,
+        &mut operation,
     )
     .await
-    .map(|success| success.value)
+    .map(|success| success.value);
+    match result {
+        Err(RunFailure::Begin(error)) if error.kind() == StateStoreErrorKind::InvalidRequest => {
+            // A resolved-aborted commit leaves its derived transaction ID terminal.
+            // Continue the same stable operation on its next deterministic attempt.
+            run_after_known_abort(store, operation_id, purpose, operation).await
+        }
+        other => other,
+    }
+}
+
+async fn run_after_known_abort<T, F>(
+    store: &dyn StateStore,
+    operation_id: uuid::Uuid,
+    purpose: &str,
+    mut operation: F,
+) -> Result<T, RunFailure>
+where
+    F: for<'a> FnMut(
+        &'a mut dyn novarocks_spi::state_store::WriteTransaction,
+    ) -> futures::future::BoxFuture<'a, Result<T, StateStoreError>>,
+{
+    for attempt in 2..=store.limits().runner_max_attempts {
+        let transaction_id = derive_transaction_id(OperationId::from(operation_id), attempt);
+        let mut transaction = store
+            .begin_write(transaction_id, purpose)
+            .await
+            .map_err(RunFailure::Begin)?;
+        let value = operation(transaction.as_mut())
+            .await
+            .map_err(RunFailure::Operation)?;
+        match transaction.commit().await {
+            CommitOutcome::Committed(_) => return Ok(value),
+            CommitOutcome::Conflict(_) | CommitOutcome::TransientBeforeCommit(_) => continue,
+            CommitOutcome::DefiniteFailure(error) => {
+                return Err(RunFailure::DefiniteFailure(error));
+            }
+            CommitOutcome::CommitUnknown(error) => {
+                return Err(RunFailure::CommitUnknown {
+                    transaction_id,
+                    error,
+                });
+            }
+        }
+    }
+    Err(RunFailure::RetryExhausted(StateStoreError::new(
+        StateStoreErrorKind::Conflict,
+        "MV StateStore known-abort retry budget exhausted",
+    )))
 }
