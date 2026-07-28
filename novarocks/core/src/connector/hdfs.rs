@@ -47,8 +47,8 @@ use crate::connector::runtime::{
 };
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
-    BoundScanRanges, HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
-    ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanSource,
+    HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
+    ScanMorselPruneDecision, ScanMorsels, ScanSource,
 };
 use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
@@ -443,9 +443,7 @@ pub(crate) fn plan_hdfs_read_source(
     let (instance, lifecycle) = connectors
         .register_ephemeral_connector_instance(instance)
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
-    let facet = Arc::new(HdfsCoreFacet {
-        op: HdfsScanOp::new(provider.config.scan.clone()),
-    });
+    let facet = Arc::new(HdfsRuntimePruningFacet::new(provider.config.scan.clone()));
     Ok(Arc::new(
         ConnectorReadScanSource::new_scheduled_ephemeral_with_incremental(
             instance,
@@ -1039,32 +1037,12 @@ impl ConnectorReadAuxiliary for HdfsDeleteAuxiliary {
 }
 
 #[derive(Clone, Debug)]
-pub struct HdfsScanOp {
+struct HdfsRuntimePruningFacet {
     cfg: HdfsScanConfig,
     row_position_scan: bool,
     next_scan_range_id: Arc<AtomicI32>,
     iceberg_runtime_pruning_counters: Arc<HdfsIcebergRuntimePruningCounters>,
     iceberg_runtime_pruning_profile_flushed: Arc<AtomicBool>,
-}
-
-struct HdfsCoreFacet {
-    op: HdfsScanOp,
-}
-
-impl ConnectorReadCoreFacet for HdfsCoreFacet {
-    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
-        self.op.flush_iceberg_runtime_pruning_profile(profile);
-    }
-
-    fn late_prune_morsel_with_ordered_predicate(
-        &self,
-        morsel: &ScanMorsel,
-        slot_id: SlotId,
-        predicate: &NativeOrderedRangePredicate,
-    ) -> Result<ScanMorselPruneDecision, String> {
-        self.op
-            .late_prune_morsel_with_ordered_predicate(morsel, slot_id, predicate)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -1156,8 +1134,8 @@ impl HdfsIcebergRuntimePruningCounters {
     }
 }
 
-impl HdfsScanOp {
-    pub fn new(cfg: HdfsScanConfig) -> Self {
+impl HdfsRuntimePruningFacet {
+    fn new(cfg: HdfsScanConfig) -> Self {
         let row_position_scan = cfg
             .ranges
             .iter()
@@ -1330,29 +1308,6 @@ impl HdfsScanOp {
     ) -> HdfsIcebergRuntimePruningCounterSnapshot {
         self.iceberg_runtime_pruning_counters.snapshot()
     }
-}
-
-impl ScanOp for HdfsScanOp {
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        let Some(range) = morsel.file_range() else {
-            return Err("hdfs scan received unexpected morsel".to_string());
-        };
-        build_hdfs_range_iter(&self.cfg, range, profile, runtime_filters)
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        self.build_morsels_from_ordered_ranges(self.ordered_initial_ranges())
-    }
-
-    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
-        self.flush_iceberg_runtime_pruning_profile(profile);
-    }
-
     fn late_prune_morsel_with_ordered_predicate(
         &self,
         morsel: &ScanMorsel,
@@ -1397,10 +1352,7 @@ impl ScanOp for HdfsScanOp {
         }
     }
 
-    fn supports_incremental_scan_ranges(&self) -> bool {
-        true
-    }
-
+    #[cfg(test)]
     fn build_incremental_morsels(
         &self,
         scan_ranges: &[IncrementalScanRange],
@@ -1517,101 +1469,24 @@ impl ScanOp for HdfsScanOp {
         Ok(ScanMorsels::new(morsels, has_more))
     }
 
-    fn profile_name(&self) -> Option<String> {
-        let prefix = "HDFS_SCAN";
-        if let Some(label) = self.cfg.profile_label.as_deref()
-            && let Some(id) = label
-                .strip_prefix("hdfs_scan_node_id=")
-                .and_then(|s| s.parse::<i32>().ok())
-        {
-            return Some(format!("{prefix} (id={id})"));
-        }
-        Some(prefix.to_string())
+    #[cfg(test)]
+    fn build_morsels(&self) -> Result<ScanMorsels, String> {
+        self.build_morsels_from_ordered_ranges(self.ordered_initial_ranges())
+    }
+}
+
+impl ConnectorReadCoreFacet for HdfsRuntimePruningFacet {
+    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
+        self.flush_iceberg_runtime_pruning_profile(profile);
     }
 
-    fn load_iceberg_position_deletes(
+    fn late_prune_morsel_with_ordered_predicate(
         &self,
         morsel: &ScanMorsel,
-    ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        let Some(range) = morsel.file_range() else {
-            return Ok(None);
-        };
-        HdfsDeleteAuxiliary::new(self.cfg.object_store_config.clone())
-            .load_iceberg_position_deletes(&range)
-    }
-
-    fn load_iceberg_equality_deletes(
-        &self,
-        morsel: &ScanMorsel,
-    ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
-    {
-        let Some(range) = morsel.file_range() else {
-            return Ok(None);
-        };
-        HdfsDeleteAuxiliary::new(self.cfg.object_store_config.clone())
-            .load_iceberg_equality_deletes(&range)
-    }
-}
-
-/// Static [`ScanSource`] for HDFS / Iceberg-data file scans.
-///
-/// Everything except the file ranges is fixed at decode time and stored here.
-/// The per-instance `ranges` / `has_more` arrive via [`BoundScanRanges::File`]
-/// at bind time. `original_range_count` is not carried on the source: every
-/// decoder sets it to `ranges.len()` at construction (compat captures it before
-/// `apply_path_rewrite`, which rewrites paths in place without changing the
-/// count), so `bind` recomputes it from the bound ranges identically.
-pub(crate) struct HdfsScanSource {
-    limit: Option<usize>,
-    profile_label: Option<String>,
-    format: Option<FileFormatConfig>,
-    object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
-    iceberg_table_locations: HashMap<i64, String>,
-    query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
-    iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
-}
-
-impl HdfsScanSource {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        limit: Option<usize>,
-        profile_label: Option<String>,
-        format: Option<FileFormatConfig>,
-        object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
-        iceberg_table_locations: HashMap<i64, String>,
-        query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
-        iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
-    ) -> Self {
-        Self {
-            limit,
-            profile_label,
-            format,
-            object_store_config,
-            iceberg_table_locations,
-            query_global_dicts,
-            iceberg_runtime_pruning,
-        }
-    }
-}
-
-impl ScanSource for HdfsScanSource {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
-        let BoundScanRanges::File { ranges, has_more } = ranges else {
-            return Err("hdfs scan source requires File scan ranges".to_string());
-        };
-        let cfg = HdfsScanConfig {
-            original_range_count: ranges.len(),
-            ranges,
-            has_more,
-            limit: self.limit,
-            profile_label: self.profile_label.clone(),
-            format: self.format.clone(),
-            object_store_config: self.object_store_config.clone(),
-            iceberg_table_locations: self.iceberg_table_locations.clone(),
-            query_global_dicts: self.query_global_dicts.clone(),
-            iceberg_runtime_pruning: self.iceberg_runtime_pruning.clone(),
-        };
-        Ok(Arc::new(HdfsScanOp::new(cfg)))
+        slot_id: SlotId,
+        predicate: &NativeOrderedRangePredicate,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        self.late_prune_morsel_with_ordered_predicate(morsel, slot_id, predicate)
     }
 }
 
@@ -1640,8 +1515,8 @@ mod tests {
     use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::node::scan::{
-        BoundScanRanges, HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange,
-        ScanMorsel, ScanMorselPruneDecision, ScanOp, ScanSource,
+        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel,
+        ScanMorselPruneDecision, ScanOp,
     };
     use crate::formats::parquet::{
         ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
@@ -1656,8 +1531,8 @@ mod tests {
 
     use super::{
         HdfsConnectorInstance, HdfsDeleteAuxiliary, HdfsIcebergRuntimePruningConfig,
-        HdfsIncrementalSplitAdapter, HdfsInstanceConfig, HdfsScanConfig, HdfsScanOp,
-        HdfsScanSource, apply_parquet_pruning_gate_for_delete_files,
+        HdfsIncrementalSplitAdapter, HdfsInstanceConfig, HdfsRuntimePruningFacet, HdfsScanConfig,
+        apply_parquet_pruning_gate_for_delete_files,
     };
     use crate::connector::runtime::{ConnectorReadAuxiliary, IncrementalConnectorSplitAdapter};
 
@@ -1755,56 +1630,6 @@ mod tests {
         assert_eq!(
             provider.range_for_index(1).expect("registered range").path,
             "s3://bucket/path/next.parquet"
-        );
-    }
-
-    fn hdfs_scan_source_for_test() -> HdfsScanSource {
-        HdfsScanSource::new(
-            None,
-            None,
-            None,
-            None,
-            HashMap::new(),
-            Default::default(),
-            None,
-        )
-    }
-
-    #[test]
-    fn hdfs_scan_source_bind_file_ranges_yields_file_morsels() {
-        let source = hdfs_scan_source_for_test();
-        let op = source
-            .bind(BoundScanRanges::File {
-                ranges: vec![
-                    plain_file_range("s3://bucket/path/a.parquet"),
-                    plain_file_range("s3://bucket/path/b.parquet"),
-                ],
-                has_more: false,
-            })
-            .expect("hdfs scan source bind should succeed");
-
-        let morsels = op.build_morsels().expect("build morsels");
-        assert!(!morsels.has_more);
-        assert_eq!(morsels.morsels.len(), 2);
-        assert!(
-            morsels
-                .morsels
-                .iter()
-                .all(|morsel| matches!(morsel, ScanMorsel::FileRange { .. })),
-            "expected all FileRange morsels, got {:?}",
-            morsels.morsels
-        );
-    }
-
-    #[test]
-    fn hdfs_scan_source_bind_rejects_wrong_variant() {
-        let source = hdfs_scan_source_for_test();
-        let Err(err) = source.bind(BoundScanRanges::None) else {
-            panic!("non-File scan ranges must be rejected");
-        };
-        assert!(
-            err.contains("hdfs scan source requires File scan ranges"),
-            "err={err}"
         );
     }
 
@@ -2020,7 +1845,7 @@ mod tests {
     fn native_scan_ordered_live_hdfs_skips_only_exact_file_range_evidence() {
         let mut cfg = hdfs_cfg_with_two_iceberg_files_for_test();
         cfg.ranges = Vec::new();
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
         let predicate = ordered_i32_predicate(50);
 
         let exact_miss = iceberg_file_range_for_runtime_pruning_test(
@@ -2029,7 +1854,7 @@ mod tests {
                 "k1", 90, 110,
             )),
         );
-        let exact_miss = HdfsScanOp::new(HdfsScanConfig {
+        let exact_miss = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![exact_miss],
             ..op.cfg.clone()
         })
@@ -2052,7 +1877,7 @@ mod tests {
             "s3://bucket/path/explicit-no-nulls.parquet",
             Some(explicit_no_nulls),
         );
-        let explicit_no_nulls = HdfsScanOp::new(HdfsScanConfig {
+        let explicit_no_nulls = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![explicit_no_nulls],
             ..op.cfg.clone()
         })
@@ -2075,7 +1900,7 @@ mod tests {
             "s3://bucket/path/missing-counts.parquet",
             Some(iceberg_file_pruning_metadata_for_i32_range("k1", 90, 110)),
         );
-        let missing_counts = HdfsScanOp::new(HdfsScanConfig {
+        let missing_counts = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![missing_counts],
             ..op.cfg.clone()
         })
@@ -2094,7 +1919,7 @@ mod tests {
             ScanMorselPruneDecision::Keep
         );
 
-        let missing_metadata = HdfsScanOp::new(HdfsScanConfig {
+        let missing_metadata = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![iceberg_file_range_for_runtime_pruning_test(
                 "s3://bucket/path/missing-metadata.parquet",
                 None,
@@ -2129,7 +1954,7 @@ mod tests {
             )]),
             null_states: HashMap::new(),
         };
-        let unsupported = HdfsScanOp::new(HdfsScanConfig {
+        let unsupported = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![iceberg_file_range_for_runtime_pruning_test(
                 "s3://bucket/path/unsupported-string-bounds.parquet",
                 Some(unsupported_metadata),
@@ -2197,7 +2022,7 @@ mod tests {
         );
         let mut cfg = hdfs_cfg_with_two_iceberg_files_for_test();
         cfg.ranges = vec![range];
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
         let morsel = op
             .build_morsels()
             .expect("thrift roundtrip morsel")
@@ -2361,7 +2186,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[
@@ -2412,7 +2237,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[
@@ -2475,7 +2300,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[
@@ -2523,7 +2348,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let err = op
             .build_incremental_morsels(&[make_hdfs_range("s3://bucket/path/file.parquet", None)])
@@ -2562,7 +2387,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[make_hdfs_range("s3://bucket/path/file.parquet", None)])
@@ -2590,7 +2415,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[make_hdfs_range_with_change_op(
@@ -2666,7 +2491,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op.build_morsels().expect("build morsels");
 
@@ -2715,7 +2540,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op.build_morsels().expect("build morsels");
 
