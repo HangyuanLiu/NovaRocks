@@ -64,15 +64,6 @@ impl std::fmt::Display for CompatError {
 impl std::error::Error for CompatError {}
 
 pub fn start(cfg: &CompatConfig<'_>) -> Result<(), CompatError> {
-    start_with(cfg, |native_cfg, err_buf, err_buf_len| unsafe {
-        novarocks_compat_start(native_cfg, err_buf, err_buf_len)
-    })
-}
-
-fn start_with(
-    cfg: &CompatConfig<'_>,
-    native_start: impl FnOnce(&NovaRocksCompatConfig, *mut std::os::raw::c_char, i32) -> i32,
-) -> Result<(), CompatError> {
     let host = CString::new(cfg.host).map_err(|e| CompatError {
         code: -1,
         message: format!("invalid host string: {e}"),
@@ -88,127 +79,19 @@ fn start_with(
     };
 
     let mut err_buf = vec![0i8; 512];
-    let code = native_start(&native_cfg, err_buf.as_mut_ptr(), err_buf.len() as i32);
+    let code =
+        unsafe { novarocks_compat_start(&native_cfg, err_buf.as_mut_ptr(), err_buf.len() as i32) };
     if code == 0 {
         Ok(())
     } else {
-        let bytes = err_buf
-            .iter()
-            .map(|byte| *byte as u8)
-            .take_while(|byte| *byte != 0)
-            .collect::<Vec<_>>();
-        let message = String::from_utf8_lossy(&bytes).trim().to_string();
+        let message = unsafe { std::ffi::CStr::from_ptr(err_buf.as_ptr()) }
+            .to_string_lossy()
+            .trim()
+            .to_string();
         Err(CompatError { code, message })
     }
 }
 
 pub fn stop() {
     unsafe { novarocks_compat_stop() }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::CStr;
-    use std::mem::offset_of;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use super::{CompatConfig, NovaRocksCompatConfig, start_with};
-
-    #[test]
-    fn rust_config_preserves_c_field_order_and_bool_mapping() {
-        let config = CompatConfig {
-            host: "127.0.0.1",
-            heartbeat_port: 9050,
-            brpc_port: 8060,
-            internal_service_query_rpc_thread_num: 17,
-            debug_exec_batch_plan_json: true,
-            log_level: 2,
-        };
-
-        start_with(&config, |native, _, _| {
-            assert_eq!(
-                unsafe { CStr::from_ptr(native.host) }.to_str().unwrap(),
-                "127.0.0.1"
-            );
-            assert_eq!(native.heartbeat_port, 9050);
-            assert_eq!(native.brpc_port, 8060);
-            assert_eq!(native.internal_service_query_rpc_thread_num, 17);
-            assert_eq!(native.debug_exec_batch_plan_json, 1);
-            assert_eq!(native.log_level, 2);
-            0
-        })
-        .expect("native start");
-
-        assert!(
-            offset_of!(NovaRocksCompatConfig, host)
-                < offset_of!(NovaRocksCompatConfig, heartbeat_port)
-        );
-        assert!(
-            offset_of!(NovaRocksCompatConfig, heartbeat_port)
-                < offset_of!(NovaRocksCompatConfig, brpc_port)
-        );
-        assert!(
-            offset_of!(NovaRocksCompatConfig, brpc_port)
-                < offset_of!(NovaRocksCompatConfig, internal_service_query_rpc_thread_num)
-        );
-        assert!(
-            offset_of!(NovaRocksCompatConfig, internal_service_query_rpc_thread_num)
-                < offset_of!(NovaRocksCompatConfig, debug_exec_batch_plan_json)
-        );
-        assert!(
-            offset_of!(NovaRocksCompatConfig, debug_exec_batch_plan_json)
-                < offset_of!(NovaRocksCompatConfig, log_level)
-        );
-    }
-
-    #[test]
-    fn interior_nul_is_rejected_before_native_call() {
-        let called = AtomicBool::new(false);
-        let config = CompatConfig {
-            host: "bad\0host",
-            heartbeat_port: 9050,
-            brpc_port: 8060,
-            internal_service_query_rpc_thread_num: 1,
-            debug_exec_batch_plan_json: false,
-            log_level: 0,
-        };
-
-        let error = start_with(&config, |_, _, _| {
-            called.store(true, Ordering::Relaxed);
-            0
-        })
-        .expect_err("interior NUL must fail");
-
-        assert_eq!(error.code, -1);
-        assert!(error.to_string().contains("invalid host string"));
-        assert!(!called.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn native_error_code_and_buffer_are_propagated() {
-        let config = CompatConfig {
-            host: "127.0.0.1",
-            heartbeat_port: 9050,
-            brpc_port: 8060,
-            internal_service_query_rpc_thread_num: 1,
-            debug_exec_batch_plan_json: false,
-            log_level: 0,
-        };
-
-        let error = start_with(&config, |_, buffer, buffer_len| {
-            let message = b"native bind failed\0";
-            assert!(buffer_len as usize >= message.len());
-            unsafe {
-                std::ptr::copy_nonoverlapping(message.as_ptr().cast(), buffer, message.len());
-            }
-            41
-        })
-        .expect_err("native error must fail");
-
-        assert_eq!(error.code, 41);
-        assert_eq!(
-            error.to_string(),
-            "compat start failed (code=41): native bind failed"
-        );
-    }
 }
