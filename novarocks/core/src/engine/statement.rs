@@ -24,7 +24,10 @@
 
 use std::sync::Arc;
 
-use crate::engine::{StandaloneState, StatementResult, delete_catalog_attachment_if_needed};
+use crate::engine::{
+    StandaloneState, StatementResult, delete_catalog_attachment_if_needed,
+    unregister_iceberg_connector_instance,
+};
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -962,6 +965,7 @@ pub(crate) fn execute_drop_catalog_statement(
         Ok(()) => {
             drop(guard);
             let normalized_catalog = normalize_identifier(catalog_name)?;
+            unregister_iceberg_connector_instance(state, &normalized_catalog)?;
             delete_catalog_attachment_if_needed(state, &normalized_catalog)?;
             state
                 .catalog_service

@@ -70,6 +70,8 @@ pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, St
 mod backend_test;
 #[cfg(test)]
 mod host_test;
+#[cfg(test)]
+mod iceberg_provider_test;
 
 #[cfg(not(feature = "compat"))]
 mod starrocks_table_stub {

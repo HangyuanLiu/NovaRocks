@@ -2240,14 +2240,26 @@ impl StandaloneSession {
         &self,
         stmt: crate::sql::parser::ast::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
+        let normalized_catalog = normalize_identifier(&stmt.name)?;
         let mut guard = self
             .inner
             .iceberg_catalogs
             .write()
             .expect("standalone iceberg catalog write lock");
+        let created = !guard.contains_catalog(&stmt.name)?;
         guard.create_catalog(&stmt.name, &stmt.properties)?;
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
+        if let Err(error) = register_iceberg_connector_instance(&self.inner, &normalized_catalog) {
+            if created {
+                self.inner
+                    .iceberg_catalogs
+                    .write()
+                    .expect("standalone iceberg catalog write lock")
+                    .drop_catalog(&normalized_catalog)?;
+            }
+            return Err(error);
+        }
         let (backend, source) = {
             let connectors = self
                 .inner
@@ -2264,11 +2276,24 @@ impl StandaloneSession {
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                 &stmt.name, backend, source,
             ));
-        persist_catalog_attachment_if_needed(
+        if let Err(error) = persist_catalog_attachment_if_needed(
             &self.inner,
-            &normalize_identifier(&stmt.name)?,
+            &normalized_catalog,
             &persisted_properties,
-        )?;
+        ) {
+            unregister_iceberg_connector_instance(&self.inner, &normalized_catalog)?;
+            if created {
+                self.inner
+                    .iceberg_catalogs
+                    .write()
+                    .expect("standalone iceberg catalog write lock")
+                    .drop_catalog(&normalized_catalog)?;
+            }
+            self.inner
+                .catalog_service
+                .unregister_catalog(&normalized_catalog);
+            return Err(error);
+        }
         Ok(StatementResult::Ok)
     }
 
@@ -2866,24 +2891,67 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
         )
     };
 
-    {
-        let mut guard = state
-            .iceberg_catalogs
-            .write()
-            .expect("standalone iceberg catalog write lock");
-        for catalog in &catalogs {
+    for catalog in &catalogs {
+        {
+            let mut guard = state
+                .iceberg_catalogs
+                .write()
+                .expect("standalone iceberg catalog write lock");
             guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    &catalog.catalog,
-                    Arc::clone(&backend),
-                    Arc::clone(&source),
-                ));
         }
+        let normalized_catalog = normalize_identifier(&catalog.catalog)?;
+        if let Err(error) = register_iceberg_connector_instance(state, &normalized_catalog) {
+            state
+                .iceberg_catalogs
+                .write()
+                .expect("standalone iceberg catalog write lock")
+                .drop_catalog(&normalized_catalog)?;
+            return Err(error);
+        }
+        state
+            .catalog_service
+            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                &catalog.catalog,
+                Arc::clone(&backend),
+                Arc::clone(&source),
+            ));
     }
 
     Ok(())
+}
+
+fn register_iceberg_connector_instance(
+    state: &Arc<StandaloneState>,
+    normalized_catalog: &str,
+) -> Result<(), String> {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    let instance = crate::connector::iceberg::provider::IcebergConnectorInstance::new(
+        instance_id,
+        Arc::clone(&state.iceberg_catalogs),
+    )
+    .map_err(|error| format!("create Iceberg connector instance: {error}"))?;
+    state
+        .connectors
+        .write()
+        .expect("connector registry write lock")
+        .register_connector_instance(instance)
+        .map_err(|error| format!("register Iceberg connector instance: {error}"))
+}
+
+fn unregister_iceberg_connector_instance(
+    state: &Arc<StandaloneState>,
+    normalized_catalog: &str,
+) -> Result<(), String> {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    state
+        .connectors
+        .write()
+        .expect("connector registry write lock")
+        .unregister_connector_instance(&instance_id)
+        .map(|_| ())
+        .map_err(|error| format!("unregister Iceberg connector instance: {error}"))
 }
 
 pub(crate) fn persist_catalog_attachment_if_needed(
@@ -7958,6 +8026,41 @@ path = "meta/operations.sqlite"
             .execute_in_database(&create_table_sql, "default")
             .expect("create table");
         (engine, session)
+    }
+
+    #[test]
+    fn iceberg_catalog_lifecycle_registers_and_unregisters_its_connector_instance() {
+        let warehouse = tempfile::tempdir().expect("warehouse tempdir");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog Ice_One properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create catalog");
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice_one")
+            .expect("connector instance ID");
+        let state = engine.state_for_test();
+        {
+            let connectors = state
+                .connectors
+                .read()
+                .expect("connector registry read lock");
+            connectors
+                .connector_instance(&instance_id)
+                .expect("Iceberg connector instance must be registered");
+        }
+
+        session
+            .execute_in_database("drop catalog Ice_One", "default")
+            .expect("drop catalog");
+        let connectors = state
+            .connectors
+            .read()
+            .expect("connector registry read lock");
+        assert!(connectors.connector_instance(&instance_id).is_err());
     }
 
     fn open_row_lineage_iceberg_session_with_table(
