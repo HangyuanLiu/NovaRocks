@@ -19,7 +19,8 @@
 //! Providers own handle codecs and `ConnectorBatchReader`; this module is the
 //! sole conversion boundary into core's `Chunk` execution representation.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorInstance, ConnectorOpenReaderRequest, ConnectorSplit,
@@ -29,7 +30,8 @@ use crate::connector::host::ConnectorInstanceLease;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
-    BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp, ScanSource,
+    BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
+    ScanSource,
 };
 use crate::runtime::profile::RuntimeProfile;
 
@@ -37,6 +39,46 @@ pub(crate) struct ConnectorBatchReaderIter {
     reader: Option<Box<dyn ConnectorBatchReader>>,
     chunk_schema: ChunkSchemaRef,
     finished: bool,
+}
+
+/// Provider-private conversion result for FE ranges that arrive after a scan
+/// source has already been scheduled. The generic runtime never decodes the
+/// range or split payload.
+pub(crate) struct ConnectorSplitAppend {
+    pub(crate) splits: Vec<ConnectorSplit>,
+    pub(crate) has_more: bool,
+}
+
+/// Core-internal adapter used only by compat/native transport adapters that
+/// receive incremental ranges. It deliberately is not part of the SPI trait.
+pub(crate) trait IncrementalConnectorSplitAdapter: Send + Sync {
+    fn append_incremental_ranges(
+        &self,
+        ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String>;
+}
+
+struct ConnectorSplitState {
+    splits: Vec<ConnectorSplit>,
+    split_ids: BTreeSet<String>,
+    total_payload_bytes: usize,
+    has_more: bool,
+}
+
+impl ConnectorSplitState {
+    fn new(splits: Vec<ConnectorSplit>, has_more: bool) -> Self {
+        let split_ids = splits
+            .iter()
+            .map(|split| split.split_id().to_string())
+            .collect();
+        let total_payload_bytes = splits.iter().map(|split| split.payload().len()).sum();
+        Self {
+            splits,
+            split_ids,
+            total_payload_bytes,
+            has_more,
+        }
+    }
 }
 
 impl ConnectorBatchReaderIter {
@@ -108,10 +150,11 @@ impl Drop for ConnectorBatchReaderIter {
 /// adapts the returned Arrow batches into `Chunk`s.
 pub(crate) struct ConnectorReadScanSource {
     instance: Arc<ConnectorInstance>,
-    splits: Vec<ConnectorSplit>,
+    splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
     lifecycle: Option<Arc<ConnectorInstanceLease>>,
+    incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
 }
 
 impl ConnectorReadScanSource {
@@ -123,10 +166,11 @@ impl ConnectorReadScanSource {
     ) -> Self {
         Self {
             instance,
-            splits,
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(splits, false))),
             request,
             chunk_schema,
             lifecycle: None,
+            incremental: None,
         }
     }
 
@@ -139,10 +183,29 @@ impl ConnectorReadScanSource {
     ) -> Self {
         Self {
             instance,
-            splits,
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(splits, false))),
             request,
             chunk_schema,
             lifecycle: Some(lifecycle),
+            incremental: None,
+        }
+    }
+
+    pub(crate) fn new_with_incremental(
+        instance: Arc<ConnectorInstance>,
+        splits: Vec<ConnectorSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        incremental: Arc<dyn IncrementalConnectorSplitAdapter>,
+        has_more: bool,
+    ) -> Self {
+        Self {
+            instance,
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(splits, has_more))),
+            request,
+            chunk_schema,
+            lifecycle: None,
+            incremental: Some(incremental),
         }
     }
 }
@@ -154,22 +217,24 @@ impl ScanSource for ConnectorReadScanSource {
         }
         Ok(Arc::new(ConnectorReadScanOp {
             instance: Arc::clone(&self.instance),
-            splits: self.splits.clone(),
+            splits: Arc::clone(&self.splits),
             request: self.request.clone(),
             chunk_schema: Arc::clone(&self.chunk_schema),
             _lifecycle: self.lifecycle.clone(),
+            incremental: self.incremental.clone(),
         }))
     }
 }
 
 struct ConnectorReadScanOp {
     instance: Arc<ConnectorInstance>,
-    splits: Vec<ConnectorSplit>,
+    splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
     // Keep ephemeral provider credentials registered until every scan op and
     // reader derived from this source has drained.
     _lifecycle: Option<Arc<ConnectorInstanceLease>>,
+    incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
 }
 
 impl ScanOp for ConnectorReadScanOp {
@@ -184,12 +249,16 @@ impl ScanOp for ConnectorReadScanOp {
         };
         let split = self
             .splits
+            .read()
+            .map_err(|_| "SPI connector split state lock poisoned".to_string())?
+            .splits
             .get(index)
+            .cloned()
             .ok_or_else(|| format!("SPI connector scan split index {index} is out of bounds"))?;
         let reader = self
             .instance
             .read()
-            .open_reader(split, self.request.clone())
+            .open_reader(&split, self.request.clone())
             .map_err(|error| error.to_string())?;
         Ok(Box::new(ConnectorBatchReaderIter::new(
             reader,
@@ -198,11 +267,89 @@ impl ScanOp for ConnectorReadScanOp {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
+        let state = self
+            .splits
+            .read()
+            .map_err(|_| "SPI connector split state lock poisoned".to_string())?;
         Ok(ScanMorsels::new(
-            (0..self.splits.len())
+            (0..state.splits.len())
                 .map(|index| ScanMorsel::ConnectorSplit { index })
                 .collect(),
-            false,
+            state.has_more,
+        ))
+    }
+
+    fn supports_incremental_scan_ranges(&self) -> bool {
+        self.incremental.is_some()
+    }
+
+    fn build_incremental_morsels(
+        &self,
+        ranges: &[IncrementalScanRange],
+    ) -> Result<ScanMorsels, String> {
+        let adapter = self
+            .incremental
+            .as_ref()
+            .ok_or_else(|| "SPI connector scan does not support incremental ranges".to_string())?;
+        let mut state = self
+            .splits
+            .write()
+            .map_err(|_| "SPI connector split state lock poisoned".to_string())?;
+        if !state.has_more {
+            return Err("SPI connector split queue is closed".to_string());
+        }
+        let appended = adapter.append_incremental_ranges(ranges)?;
+        let expected_owner = &self.instance.descriptor().instance_id;
+        let start = state.splits.len();
+        let mut appended_ids = BTreeSet::new();
+        let append_payload_bytes = appended.splits.iter().try_fold(0usize, |total, split| {
+            if split.owner() != expected_owner {
+                return Err(
+                    "incremental connector split owner does not match its instance".to_string(),
+                );
+            }
+            if split.payload().len() > self.request.context.max_handle_payload_bytes() {
+                return Err(
+                    "incremental connector split payload exceeds its handle budget".to_string(),
+                );
+            }
+            if state.split_ids.contains(split.split_id()) {
+                return Err(format!(
+                    "incremental connector split ID `{}` already exists",
+                    split.split_id()
+                ));
+            }
+            if !appended_ids.insert(split.split_id().to_string()) {
+                return Err(format!(
+                    "incremental connector split ID `{}` is duplicated in one append",
+                    split.split_id()
+                ));
+            }
+            total
+                .checked_add(split.payload().len())
+                .ok_or_else(|| "incremental connector split payload total overflowed".to_string())
+        })?;
+        let total_payload_bytes = state
+            .total_payload_bytes
+            .checked_add(append_payload_bytes)
+            .ok_or_else(|| "incremental connector split payload total overflowed".to_string())?;
+        if total_payload_bytes > self.request.context.max_total_payload_bytes() {
+            return Err(
+                "incremental connector split payloads exceed their total budget".to_string(),
+            );
+        }
+        for split in appended.splits {
+            state.split_ids.insert(split.split_id().to_string());
+            state.splits.push(split);
+        }
+        state.total_payload_bytes = total_payload_bytes;
+        state.has_more = appended.has_more;
+        let end = state.splits.len();
+        Ok(ScanMorsels::new(
+            (start..end)
+                .map(|index| ScanMorsel::ConnectorSplit { index })
+                .collect(),
+            state.has_more,
         ))
     }
 }

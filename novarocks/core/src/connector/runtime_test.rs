@@ -27,10 +27,15 @@ use novarocks_spi::connector::{
     ConnectorSplitPlanningRequest, ConnectorTableHandle,
 };
 
-use super::runtime::{ConnectorBatchReaderIter, ConnectorReadScanSource};
+use super::runtime::{
+    ConnectorBatchReaderIter, ConnectorReadScanSource, ConnectorSplitAppend,
+    IncrementalConnectorSplitAdapter,
+};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
+use crate::exec::node::scan::{
+    BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanOp, ScanSource,
+};
 
 struct FakeReader {
     batches: Vec<Result<Option<RecordBatch>, ConnectorError>>,
@@ -210,4 +215,210 @@ fn read_scan_source_opens_a_typed_split_and_adapts_its_batches() {
         .expect("reader chunks");
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].len(), 1);
+}
+
+struct FakeIncrementalSplitAdapter {
+    append: Mutex<Option<ConnectorSplitAppend>>,
+}
+
+impl IncrementalConnectorSplitAdapter for FakeIncrementalSplitAdapter {
+    fn append_incremental_ranges(
+        &self,
+        _ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String> {
+        self.append
+            .lock()
+            .expect("incremental split lock")
+            .take()
+            .ok_or_else(|| "no incremental split was configured".to_string())
+    }
+}
+
+struct CountingIncrementalSplitAdapter {
+    calls: Arc<Mutex<usize>>,
+}
+
+impl IncrementalConnectorSplitAdapter for CountingIncrementalSplitAdapter {
+    fn append_incremental_ranges(
+        &self,
+        _ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String> {
+        *self.calls.lock().expect("incremental calls") += 1;
+        Ok(ConnectorSplitAppend {
+            splits: Vec::new(),
+            has_more: false,
+        })
+    }
+}
+
+#[test]
+fn incremental_connector_source_appends_only_new_connector_morsels() {
+    let instance_id = ConnectorInstanceId::parse("test.incremental").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let initial =
+        ConnectorSplit::try_new(instance_id.clone(), "initial", bytes::Bytes::new(), Some(1))
+            .expect("initial split");
+    let next = ConnectorSplit::try_new(instance_id, "next", bytes::Bytes::new(), Some(1))
+        .expect("next split");
+    let adapter = Arc::new(FakeIncrementalSplitAdapter {
+        append: Mutex::new(Some(ConnectorSplitAppend {
+            splits: vec![next],
+            has_more: false,
+        })),
+    });
+    let source = ConnectorReadScanSource::new_with_incremental(
+        instance,
+        vec![initial],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+        adapter,
+        true,
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    assert!(matches!(
+        op.build_morsels()
+            .expect("initial morsels")
+            .morsels
+            .as_slice(),
+        [ScanMorsel::ConnectorSplit { index: 0 }]
+    ));
+    let appended = op
+        .build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
+        .expect("append connector split");
+    assert!(matches!(
+        appended.morsels.as_slice(),
+        [ScanMorsel::ConnectorSplit { index: 1 }]
+    ));
+    assert!(!appended.has_more);
+}
+
+#[test]
+fn incremental_connector_source_rejects_append_after_eos_without_calling_provider() {
+    let instance_id = ConnectorInstanceId::parse("test.closed").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let source = ConnectorReadScanSource::new_with_incremental(
+        instance,
+        vec![
+            ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
+                .expect("initial split"),
+        ],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+        Arc::new(CountingIncrementalSplitAdapter {
+            calls: Arc::clone(&calls),
+        }),
+        false,
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    let err = op
+        .build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
+        .expect_err("closed source must not accept more ranges");
+    assert!(err.contains("closed"), "err={err}");
+    assert_eq!(*calls.lock().expect("incremental calls"), 0);
+    assert!(matches!(
+        op.build_morsels()
+            .expect("morsels after rejected append")
+            .morsels
+            .as_slice(),
+        [ScanMorsel::ConnectorSplit { index: 0 }]
+    ));
+}
+
+#[test]
+fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically() {
+    let instance_id = ConnectorInstanceId::parse("test.duplicate").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let next = ConnectorSplit::try_new(
+        instance_id.clone(),
+        "duplicate",
+        bytes::Bytes::new(),
+        Some(1),
+    )
+    .expect("duplicate split");
+    let source = ConnectorReadScanSource::new_with_incremental(
+        instance,
+        vec![
+            ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
+                .expect("initial split"),
+        ],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+        Arc::new(FakeIncrementalSplitAdapter {
+            append: Mutex::new(Some(ConnectorSplitAppend {
+                splits: vec![next.clone(), next],
+                has_more: false,
+            })),
+        }),
+        true,
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    let err = op
+        .build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
+        .expect_err("duplicate split IDs must fail");
+    assert!(err.contains("duplicate"), "err={err}");
+    assert!(matches!(
+        op.build_morsels()
+            .expect("morsels after rejected append")
+            .morsels
+            .as_slice(),
+        [ScanMorsel::ConnectorSplit { index: 0 }]
+    ));
 }
