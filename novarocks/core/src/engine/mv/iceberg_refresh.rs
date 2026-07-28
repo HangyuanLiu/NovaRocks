@@ -3477,7 +3477,8 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 table_uuids.clone(),
                 target_snapshot_id,
                 IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-            )?;
+            )
+            .map_err(iceberg_mv_post_publish_finalize_error)?;
             Ok(StatementResult::Ok)
         },
         || {
@@ -3728,7 +3729,8 @@ fn refresh_iceberg_union_projection_mv(
                 table_uuids,
                 recorded_target_snapshot_id,
                 IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-            )?;
+            )
+            .map_err(iceberg_mv_post_publish_finalize_error)?;
             Ok(StatementResult::Ok)
         },
         || {
@@ -10312,7 +10314,7 @@ fn finalize_iceberg_mv_metadata_only_refresh(
     mv_definition: &StoredMvDefinition,
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
         state,
         target,
@@ -10330,10 +10332,11 @@ fn finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
     partition_state: IcebergMvPartitionStateFinalize<'_>,
-) -> Result<StatementResult, String> {
-    let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
-    let refresh_id =
-        begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
+    let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)
+        .map_err(IcebergMvRefreshExecutionError::pre_commit)?;
+    let refresh_id = begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())
+        .map_err(IcebergMvRefreshExecutionError::pre_commit)?;
     finalize_iceberg_mv_refresh_with_partition_state(
         state,
         refresh_id,
@@ -10342,7 +10345,8 @@ fn finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
         table_uuids,
         target_snapshot_id,
         partition_state,
-    )?;
+    )
+    .map_err(iceberg_mv_post_publish_finalize_error)?;
     Ok(StatementResult::Ok)
 }
 
@@ -12233,7 +12237,8 @@ fn execute_join_delta_branches_logical(
                 table_uuids,
                 target_snapshot_id,
                 IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-            )?;
+            )
+            .map_err(iceberg_mv_post_publish_finalize_error)?;
             return Ok(StatementResult::Ok);
         }
         JoinIncrementalRefreshMode::AppendOnly => mv_definition
@@ -12347,7 +12352,8 @@ fn execute_join_delta_branches_logical(
         table_uuids,
         published_snapshot_id,
         IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-    )?;
+    )
+    .map_err(iceberg_mv_post_publish_finalize_error)?;
     Ok(StatementResult::Ok)
 }
 
@@ -13446,7 +13452,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 table_uuids.clone(),
                 target_snapshot_id,
                 IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-            )?;
+            )
+            .map_err(iceberg_mv_post_publish_finalize_error)?;
             return Ok(StatementResult::Ok);
         }
         NonJoinIncrementalChangePlan::FullRebuild { lineage, reason } => {
@@ -13813,7 +13820,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
             table_uuids,
             target_snapshot_id,
             IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-        )?;
+        )
+        .map_err(iceberg_mv_post_publish_finalize_error)?;
         return Ok(StatementResult::Ok);
     }
 
@@ -13888,7 +13896,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
         table_uuids.clone(),
         published_snapshot_id,
         IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-    )?;
+    )
+    .map_err(iceberg_mv_post_publish_finalize_error)?;
 
     tracing::info!(
         "iceberg mv {}.{}.{}: incremental refresh complete: \
@@ -22852,6 +22861,86 @@ mod tests {
                 .contains("test-only injected MV repository failure at FinalizeRefresh"),
             "failure={failure:?}"
         );
+    }
+
+    fn assert_public_iceberg_refresh_finalize_failure(
+        state: &Arc<StandaloneState>,
+        expected_refresh_count: usize,
+    ) {
+        let refreshes = load_all_mv_refreshes(state);
+        assert_eq!(refreshes.len(), expected_refresh_count);
+        let refresh = refreshes.last().expect("failed refresh");
+        assert_eq!(refresh.state, MvRefreshState::PublishCommitted);
+
+        let operation = load_test_operation_for_refresh(state, refresh.refresh_id);
+        assert_eq!(
+            operation.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::FinalizeFailedKnownCommitted
+        );
+        let failure = operation.failure.expect("retryable finalize failure fact");
+        assert_eq!(
+            failure.kind,
+            crate::meta::repository::iceberg_operation::IcebergOperationFailureKind::FinalizeKnownCommitted
+        );
+        assert_eq!(
+            failure.next_action,
+            crate::meta::repository::iceberg_operation::IcebergOperationNextAction::RetryFinalize
+        );
+    }
+
+    #[test]
+    fn public_incremental_refresh_finalize_failure_is_known_committed() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_mv_and_refresh_once(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(2, "b")]);
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        let _failure =
+            fail_next_mv_repository_command(TestMvRepositoryFailurePoint::FinalizeRefresh);
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("incremental refresh finalizer must fail");
+
+        assert!(
+            err.contains("[CommitKnownCommittedFinalizeFailed]"),
+            "err={err}"
+        );
+        assert_public_iceberg_refresh_finalize_failure(&env.state, 2);
+    }
+
+    #[test]
+    fn public_join_incremental_refresh_finalize_failure_is_known_committed() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_join_orders_table(&env.state, "ice", "sales", "orders");
+        create_join_customers_table(&env.state, "ice", "sales", "customers");
+        insert_into_join_orders_table(&env.state, "ice", "sales", "orders", &[(1, 10)]);
+        insert_into_join_customers_table(&env.state, "ice", "sales", "customers", &[(10, "east")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders_customers
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT o.id, c.region
+                FROM ice.sales.orders o
+                JOIN ice.sales.customers c ON o.customer_id = c.id",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create join iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders_customers");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first join refresh");
+
+        insert_into_join_orders_table(&env.state, "ice", "sales", "orders", &[(2, 20)]);
+        insert_into_join_customers_table(&env.state, "ice", "sales", "customers", &[(20, "west")]);
+        let _failure =
+            fail_next_mv_repository_command(TestMvRepositoryFailurePoint::FinalizeRefresh);
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("join incremental refresh finalizer must fail");
+
+        assert!(
+            err.contains("[CommitKnownCommittedFinalizeFailed]"),
+            "err={err}"
+        );
+        assert_public_iceberg_refresh_finalize_failure(&env.state, 2);
     }
 
     #[test]
