@@ -1954,18 +1954,6 @@ pub(crate) fn dispatch_statement(
                     current_database,
                     &stmt,
                 ),
-                Err(error)
-                    if error.kind()
-                        == crate::mv::application::MvApplicationErrorKind::Unavailable
-                        && state.mv_repository.availability().is_available() =>
-                {
-                    crate::engine::mv_flow::create_mv(
-                        state,
-                        current_catalog,
-                        current_database,
-                        &stmt,
-                    )
-                }
                 Err(error) => Err(error.to_string()),
             }
         }
@@ -4099,7 +4087,10 @@ mod tests {
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::meta::MetaStoreProvider;
-    use crate::mv::application::UnavailableMvApplicationService;
+    use crate::mv::application::{
+        MvApplicationError, MvApplicationErrorKind, MvApplicationService, MvApplicationStatement,
+        MvEngine, MvRequestContext, UnavailableMvApplicationService,
+    };
     use crate::mv::repository::{MvTarget, UnavailableMvRepository};
     use crate::runtime::query_options::QueryOptions;
     use arrow::array::{
@@ -4111,6 +4102,22 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    struct AlwaysUnavailableMvApplicationService;
+
+    impl MvApplicationService for AlwaysUnavailableMvApplicationService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn MvEngine,
+            _statement: &MvApplicationStatement,
+            _context: MvRequestContext<'_>,
+        ) -> Result<Option<crate::mv::application::MvStatementResult>, MvApplicationError> {
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Unavailable,
+                "injected frontend MV service is unavailable",
+            ))
+        }
+    }
 
     #[derive(Clone)]
     struct FixedCatalogStatisticsService {
@@ -6617,6 +6624,39 @@ mysql_port = 47892
                 || err.contains("materialized view")
                 || err.contains("StarRocks table"),
             "unexpected dispatch error: {err}"
+        );
+    }
+
+    #[test]
+    fn create_mv_surfaces_frontend_unavailable_without_legacy_fallback() {
+        let mut state = StandaloneState::default();
+        state.mv_repository = Arc::new(crate::mv::test_repository::InMemoryMvRepository::default());
+        state.mv_application_service = Arc::new(AlwaysUnavailableMvApplicationService);
+        let state = Arc::new(state);
+        register_connector_backends(&state);
+
+        let statement = crate::sql::parser::parse_sql(
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(id) BUCKETS 1 \
+                 AS SELECT 1 AS id",
+        )
+        .expect("parse materialized-view create")
+        .pop()
+        .expect("one materialized-view statement");
+        let err = dispatch_statement(&state, None, "analytics", statement)
+            .expect_err("frontend unavailable error must surface directly");
+
+        assert_eq!(err, "injected frontend MV service is unavailable");
+        assert!(
+            state
+                .mv_repository
+                .find_by_target(&MvTarget {
+                    catalog: None,
+                    database: "analytics".to_string(),
+                    name: "orders_mv".to_string(),
+                })
+                .expect("read available MV repository")
+                .is_none(),
+            "frontend service errors must not fall back to legacy target creation or metadata writes"
         );
     }
 
