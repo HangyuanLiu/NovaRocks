@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::array::{
@@ -40,7 +40,8 @@ use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileC
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
 use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::connector::runtime::{
-    ConnectorReadAuxiliary, ConnectorReadScanSource, ConnectorScheduledSplit,
+    ConnectorReadAuxiliary, ConnectorReadScanSource, ConnectorScheduledSplit, ConnectorSplitAppend,
+    IncrementalConnectorSplitAdapter,
 };
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
@@ -63,13 +64,28 @@ pub(crate) struct HdfsInstanceConfig {
 pub(crate) struct HdfsConnectorInstance {
     instance_id: ConnectorInstanceId,
     config: HdfsInstanceConfig,
+    ranges: Mutex<Vec<FileScanRange>>,
+    next_scan_range_id: AtomicI32,
+    incremental_lock: Mutex<()>,
 }
 
 impl HdfsConnectorInstance {
     pub(crate) fn new(instance_id: ConnectorInstanceId, config: HdfsInstanceConfig) -> Self {
+        let next_scan_range_id = config
+            .scan
+            .ranges
+            .iter()
+            .filter_map(|range| (range.scan_range_id >= 0).then_some(range.scan_range_id))
+            .max()
+            .map(|value| value.saturating_add(1))
+            .unwrap_or(0);
+        let ranges = config.scan.ranges.clone();
         Self {
             instance_id,
             config,
+            ranges: Mutex::new(ranges),
+            next_scan_range_id: AtomicI32::new(next_scan_range_id),
+            incremental_lock: Mutex::new(()),
         }
     }
 
@@ -101,7 +117,13 @@ impl HdfsConnectorInstance {
     }
 
     fn split_for_index(&self, index: usize) -> Result<ConnectorSplit, ConnectorError> {
-        let range = self.config.scan.ranges.get(index).ok_or_else(|| {
+        let ranges = self.ranges.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "HDFS range state lock poisoned",
+            )
+        })?;
+        let range = ranges.get(index).ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "HDFS split index is out of bounds",
@@ -113,6 +135,34 @@ impl HdfsConnectorInstance {
             bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
             Some(range.length),
         )
+    }
+
+    fn range_for_index(&self, index: usize) -> Result<FileScanRange, ConnectorError> {
+        self.ranges
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "HDFS range state lock poisoned",
+                )
+            })?
+            .get(index)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "HDFS split index is out of bounds",
+                )
+            })
+    }
+
+    fn range_count(&self) -> Result<usize, ConnectorError> {
+        self.ranges.lock().map(|ranges| ranges.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "HDFS range state lock poisoned",
+            )
+        })
     }
 
     fn split_index(&self, split: &ConnectorSplit) -> Result<usize, ConnectorError> {
@@ -134,6 +184,180 @@ impl HdfsConnectorInstance {
             )
         })
     }
+
+    fn append_incremental_ranges(
+        &self,
+        scan_ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String> {
+        let _append = self
+            .incremental_lock
+            .lock()
+            .map_err(|_| "HDFS incremental range lock poisoned".to_string())?;
+        let mut ranges = self
+            .ranges
+            .lock()
+            .map_err(|_| "HDFS range state lock poisoned".to_string())?;
+        let row_position_scan = ranges
+            .iter()
+            .any(|range| range.scan_range_id >= 0 || range.first_row_id.is_some());
+        let expected_file_format = match self.config.scan.format.as_ref() {
+            Some(FileFormatConfig::Parquet(_)) => Some(HdfsScanFileFormat::Parquet),
+            Some(FileFormatConfig::Orc(_)) => Some(HdfsScanFileFormat::Orc),
+            None => None,
+        };
+        let mut next_scan_range_id = self.next_scan_range_id.load(Ordering::Acquire);
+        let mut has_more = false;
+        let mut appended = Vec::new();
+
+        for scan_range in scan_ranges {
+            if let Some(value) = scan_range.has_more() {
+                has_more = value;
+            }
+            let IncrementalScanRange::Hdfs {
+                range: hdfs_range, ..
+            } = scan_range
+            else {
+                continue;
+            };
+            if let Some(expected) = expected_file_format {
+                let file_format = hdfs_range.file_format.ok_or_else(|| {
+                    "incremental hdfs scan range is missing file_format".to_string()
+                })?;
+                if file_format != expected {
+                    return Err(format!(
+                        "incremental hdfs scan range file_format mismatch: expected {:?}, got {:?}",
+                        expected, file_format
+                    ));
+                }
+            }
+            let path = if let Some(path) = hdfs_range
+                .full_path
+                .as_ref()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+            {
+                path.to_string()
+            } else if let Some(relative_path) = hdfs_range
+                .relative_path
+                .as_ref()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+            {
+                let table_id = hdfs_range.table_id.ok_or_else(|| {
+                    "incremental hdfs scan range has relative_path but missing table_id".to_string()
+                })?;
+                let base = self
+                    .config
+                    .scan
+                    .iceberg_table_locations
+                    .get(&table_id)
+                    .map(|location| location.trim_end_matches('/'))
+                    .ok_or_else(|| {
+                        format!(
+                            "incremental hdfs scan range missing cached iceberg location for table_id={table_id}"
+                        )
+                    })?;
+                let relative_path = relative_path.trim_start_matches('/');
+                if relative_path.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base}/{relative_path}")
+                }
+            } else {
+                return Err(
+                    "incremental hdfs scan range requires non-empty full_path or relative_path"
+                        .to_string(),
+                );
+            };
+            let file_len = u64::try_from(hdfs_range.file_length).unwrap_or(0);
+            let offset = u64::try_from(hdfs_range.offset).unwrap_or(0);
+            let mut length = u64::try_from(hdfs_range.length).unwrap_or(0);
+            if length == 0 && file_len > offset {
+                length = file_len - offset;
+            }
+            let (scan_range_id, first_row_id) = if row_position_scan {
+                let first_row_id = hdfs_range.first_row_id.ok_or_else(|| {
+                    "incremental hdfs scan range missing first_row_id for row position scan"
+                        .to_string()
+                })?;
+                let scan_range_id = next_scan_range_id;
+                next_scan_range_id = next_scan_range_id.saturating_add(1);
+                (scan_range_id, Some(first_row_id))
+            } else {
+                (-1, None)
+            };
+            let delete_files = if let Some(range) = ranges.iter().find(|range| {
+                range.path == path && range.offset == offset && range.length == length
+            }) {
+                range.delete_files.clone()
+            } else {
+                let same_path_delete_file_count = ranges
+                    .iter()
+                    .filter(|range| range.path == path && !range.delete_files.is_empty())
+                    .count();
+                if same_path_delete_file_count > 0 {
+                    return Err(format!(
+                        "incremental HDFS range cannot safely reuse lowered Iceberg delete files for \
+                         path={path} offset={offset} length={length}; found \
+                         {same_path_delete_file_count} same-path lowered range(s) with delete files but \
+                         no exact match"
+                    ));
+                }
+                Vec::new()
+            };
+            appended.push(FileScanRange {
+                path,
+                file_len,
+                offset,
+                length,
+                scan_range_id,
+                first_row_id,
+                data_sequence_number: None,
+                ivm_change_op: hdfs_range.ivm_change_op,
+                included_positions: None,
+                external_datacache: hdfs_range.external_datacache.clone(),
+                delete_files,
+                iceberg_file_pruning: None,
+            });
+        }
+
+        let start = ranges.len();
+        ranges.extend(appended.iter().cloned());
+        self.next_scan_range_id
+            .store(next_scan_range_id, Ordering::Release);
+        let scheduled = appended
+            .into_iter()
+            .enumerate()
+            .map(|(offset, range)| {
+                let index = start + offset;
+                ConnectorSplit::try_new(
+                    self.instance_id.clone(),
+                    format!("hdfs-{index}"),
+                    bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+                    Some(range.length),
+                )
+                .map(|split| ConnectorScheduledSplit::file(split, range))
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ConnectorSplitAppend::Scheduled {
+            scheduled,
+            has_more,
+        })
+    }
+}
+
+struct HdfsIncrementalSplitAdapter {
+    provider: Arc<HdfsConnectorInstance>,
+}
+
+impl IncrementalConnectorSplitAdapter for HdfsIncrementalSplitAdapter {
+    fn append_incremental_ranges(
+        &self,
+        ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String> {
+        self.provider.append_incremental_ranges(ranges)
+    }
 }
 
 pub(crate) fn plan_hdfs_read_source(
@@ -147,32 +371,42 @@ pub(crate) fn plan_hdfs_read_source(
     let auxiliary = Arc::new(HdfsDeleteAuxiliary::new(
         provider.config.scan.object_store_config.clone(),
     ));
-    let scheduled = (0..provider.config.scan.ranges.len())
+    let scheduled = (0..provider.range_count()?)
         .map(|index| {
             Ok(ConnectorScheduledSplit::file(
                 provider.split_for_index(index)?,
-                provider.config.scan.ranges[index].clone(),
+                provider.range_for_index(index)?,
             ))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     let expected_schema = provider.config.chunk_schema.arrow_schema_ref();
     let chunk_schema = Arc::clone(&provider.config.chunk_schema);
-    let instance = provider.connector_instance()?;
+    let has_more = provider.config.scan.has_more;
+    let incremental = has_more.then(|| {
+        Arc::new(HdfsIncrementalSplitAdapter {
+            provider: Arc::clone(&provider),
+        }) as Arc<dyn IncrementalConnectorSplitAdapter>
+    });
+    let instance = Arc::clone(&provider).connector_instance()?;
     let (instance, lifecycle) = connectors
         .register_ephemeral_connector_instance(instance)
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
-    Ok(Arc::new(ConnectorReadScanSource::new_scheduled_ephemeral(
-        instance,
-        scheduled,
-        ConnectorOpenReaderRequest {
-            expected_schema,
-            batch,
-            context,
-        },
-        chunk_schema,
-        lifecycle,
-        Some(auxiliary),
-    )))
+    Ok(Arc::new(
+        ConnectorReadScanSource::new_scheduled_ephemeral_with_incremental(
+            instance,
+            scheduled,
+            ConnectorOpenReaderRequest {
+                expected_schema,
+                batch,
+                context,
+            },
+            chunk_schema,
+            lifecycle,
+            incremental,
+            has_more,
+            Some(auxiliary),
+        ),
+    ))
 }
 
 impl ConnectorRead for HdfsConnectorInstance {
@@ -210,7 +444,7 @@ impl ConnectorRead for HdfsConnectorInstance {
                 "invalid HDFS scan handle",
             ));
         }
-        (0..self.config.scan.ranges.len())
+        (0..self.range_count()?)
             .map(|index| self.split_for_index(index))
             .collect()
     }
@@ -229,12 +463,7 @@ impl ConnectorRead for HdfsConnectorInstance {
             ));
         }
         let index = self.split_index(split)?;
-        let range = self.config.scan.ranges.get(index).cloned().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "HDFS split index is out of bounds",
-            )
-        })?;
+        let range = self.range_for_index(index)?;
         let mut scan = self.config.scan.clone();
         scan.original_range_count = 1;
         scan.ranges = vec![range];
@@ -1244,7 +1473,7 @@ mod tests {
     use crate::connector::iceberg::scan_model::IcebergColumnStats;
     #[cfg(feature = "compat")]
     use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
-    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::node::scan::{
         BoundScanRanges, HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange,
         ScanMorsel, ScanMorselPruneDecision, ScanOp, ScanSource,
@@ -1261,10 +1490,11 @@ mod tests {
     use crate::runtime_filter::port::ordered_bound::OrderedScalar;
 
     use super::{
-        HdfsDeleteAuxiliary, HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp,
+        HdfsConnectorInstance, HdfsDeleteAuxiliary, HdfsIcebergRuntimePruningConfig,
+        HdfsIncrementalSplitAdapter, HdfsInstanceConfig, HdfsScanConfig, HdfsScanOp,
         HdfsScanSource, apply_parquet_pruning_gate_for_delete_files,
     };
-    use crate::connector::runtime::ConnectorReadAuxiliary;
+    use crate::connector::runtime::{ConnectorReadAuxiliary, IncrementalConnectorSplitAdapter};
 
     fn plain_file_range(path: &str) -> FileScanRange {
         FileScanRange {
@@ -1299,6 +1529,63 @@ mod tests {
                 .load_iceberg_equality_deletes(&range)
                 .expect("no delete files should not open storage")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn hdfs_incremental_adapter_registers_file_sidecars_before_reading() {
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse("hdfs.test").expect("instance ID");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("value", DataType::Int32, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let provider = Arc::new(HdfsConnectorInstance::new(
+            instance_id,
+            HdfsInstanceConfig {
+                scan: HdfsScanConfig {
+                    ranges: vec![plain_file_range("s3://bucket/path/seed.parquet")],
+                    original_range_count: 1,
+                    has_more: true,
+                    limit: None,
+                    profile_label: None,
+                    format: None,
+                    object_store_config: None,
+                    iceberg_table_locations: HashMap::new(),
+                    query_global_dicts: Default::default(),
+                    iceberg_runtime_pruning: None,
+                },
+                chunk_schema,
+            },
+        ));
+        let adapter = HdfsIncrementalSplitAdapter {
+            provider: Arc::clone(&provider),
+        };
+
+        let appended = adapter
+            .append_incremental_ranges(&[
+                make_hdfs_range("s3://bucket/path/next.parquet", None),
+                make_end_marker(false),
+            ])
+            .expect("append HDFS range");
+        let crate::connector::runtime::ConnectorSplitAppend::Scheduled {
+            scheduled,
+            has_more,
+        } = appended
+        else {
+            panic!("HDFS adapter must schedule file sidecars");
+        };
+        assert!(!has_more);
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(provider.range_count().expect("range count"), 2);
+        assert_eq!(
+            provider.range_for_index(1).expect("registered range").path,
+            "s3://bucket/path/next.parquet"
         );
     }
 
