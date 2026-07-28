@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CatalogBackend` / `TableSource` / `TableSink` / `MvBackend`
+//! `CatalogBackend` / `TableSink` / `MvBackend`
 //! implementations for StarRocks table, wrapping `catalog.rs`, `ddl.rs`,
 //! `txn.rs`, `mv_ddl.rs`, and `mv_refresh.rs`.
 
@@ -24,7 +24,7 @@ use std::sync::{Arc, Weak};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::{
-    CatalogBackend, CreateTableRequest, MvBackend, ResolvedTable, TableSink, TableSource,
+    CatalogBackend, CreateTableRequest, MvBackend, ResolvedTable, TableSink,
 };
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::{
@@ -39,7 +39,6 @@ use crate::mv::refresh::execution::{
 use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
 use crate::sql::parser::ast::{Literal, ObjectName};
-use crate::sql::planner::table::TableDef;
 use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct StarRocksTableBackend {
@@ -169,31 +168,6 @@ impl CatalogBackend for StarRocksTableBackend {
             table: table.to_string(),
             columns: table_def.columns,
         })
-    }
-}
-
-pub(crate) struct StarRocksTableSource {
-    _state: Weak<StandaloneState>,
-}
-
-impl StarRocksTableSource {
-    pub(crate) fn new(state: &Arc<StandaloneState>) -> Self {
-        Self {
-            _state: Arc::downgrade(state),
-        }
-    }
-}
-
-impl TableSource for StarRocksTableSource {
-    fn name(&self) -> &'static str {
-        "starrocks"
-    }
-
-    fn build_table_def(&self, _table: &ResolvedTable) -> Result<TableDef, String> {
-        Err(
-            "StarRocks table definitions are registered through register_starrocks_table_in_catalog"
-                .to_string(),
-        )
     }
 }
 
