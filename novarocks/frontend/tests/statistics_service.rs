@@ -659,6 +659,57 @@ fn compatibility_overwrite_row_count(service: &FrontendStatisticsService) -> usi
 }
 
 #[test]
+fn concurrent_first_compatibility_appends_seed_only_once() {
+    use std::sync::{Arc, Barrier};
+
+    const ROUNDS: usize = 24;
+    const WRITERS: usize = 32;
+    for round in 0..ROUNDS {
+        let service = Arc::new(FrontendStatisticsService::new());
+        let engine = Arc::new(FakeStatisticsEngine::with_local_columns(vec![
+            StatisticsColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+            },
+        ]));
+        let ready = Arc::new(Barrier::new(WRITERS));
+        let threads = (0..WRITERS)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                let engine = Arc::clone(&engine);
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    let source =
+                        StatisticsInsertSource::Values(vec![vec![StatisticsLiteral::Int(123)]]);
+                    ready.wait();
+                    service
+                        .observe_insert(
+                            engine.as_ref(),
+                            StatisticsInsertObservation {
+                                database: "db1",
+                                table: "test_overwrite_stats_table",
+                                insert_columns: &[],
+                                source: &source,
+                                overwrite_mode: StatisticsOverwriteMode::Append,
+                            },
+                        )
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(
+            compatibility_overwrite_row_count(&service),
+            WRITERS + 2,
+            "the initial three-row seed must be decided atomically in round {round}"
+        );
+    }
+}
+
+#[test]
 fn cte_name_shadows_a_physical_table_in_outer_query_usage() {
     let service = FrontendStatisticsService::new();
     let query = parse_query(

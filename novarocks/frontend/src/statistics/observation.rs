@@ -907,19 +907,16 @@ fn observe_test_overwrite_stats_table(
     } else {
         max
     };
-    let existing = {
-        let state = service.state.read().expect("frontend statistics read lock");
-        state
-            .column_stats
-            .iter()
-            .filter(|row| row.key == *key)
-            .count()
-    };
-    let count = if existing == 0 && max == "123" { 3 } else { 1 };
     let mut state = service
         .state
         .write()
         .expect("frontend statistics write lock");
+    let existing = state
+        .column_stats
+        .iter()
+        .filter(|row| row.key == *key)
+        .count();
+    let count = if existing == 0 && max == "123" { 3 } else { 1 };
     for index in 0..count {
         state.column_stats.push(ColumnStatRow {
             key: key.clone(),
