@@ -18,8 +18,6 @@
 pub mod backend_service;
 pub(crate) mod cluster_heartbeat;
 #[cfg(feature = "compat")]
-pub mod compat;
-#[cfg(feature = "compat")]
 pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;

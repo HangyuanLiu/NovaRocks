@@ -3313,6 +3313,7 @@ dependencies = [
  "mysql",
  "novarocks",
  "novarocks-backend",
+ "novarocks-compat",
  "novarocks-frontend",
  "reqwest",
  "tempfile",
