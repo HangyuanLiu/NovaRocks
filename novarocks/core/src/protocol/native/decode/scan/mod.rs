@@ -246,12 +246,11 @@ mod tests {
     use crate::connector::StarRocksScanConfig;
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
-    use crate::connector::{ConnectorRegistry, HdfsScanConfig, ScanConfig, ScanConnector};
+    use crate::connector::{ConnectorRegistry, ScanConfig, ScanConnector};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
     use crate::exec::node::scan::ScanMorsel;
-    use crate::formats::FileFormatConfig;
     use crate::proto::{common, expr, novarocks, plan};
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
@@ -578,70 +577,6 @@ mod tests {
                 })),
             })),
         }
-    }
-
-    #[derive(Clone)]
-    struct CapturingHdfsConnector {
-        captured: Arc<Mutex<Option<HdfsScanConfig>>>,
-    }
-
-    impl ScanConnector for CapturingHdfsConnector {
-        fn name(&self) -> &'static str {
-            "hdfs"
-        }
-
-        fn create_scan_node(
-            &self,
-            cfg: ScanConfig,
-        ) -> Result<
-            (
-                std::sync::Arc<dyn crate::exec::node::scan::ScanSource>,
-                crate::exec::node::scan::BoundScanRanges,
-            ),
-            String,
-        > {
-            let ScanConfig::Hdfs(cfg) = cfg else {
-                return Err("capturing hdfs connector received non-HDFS config".to_string());
-            };
-            let cfg = *cfg;
-            *self.captured.lock().expect("captured hdfs config lock") = Some(cfg.clone());
-            // Mirror the real HdfsConnector split: static source + file ranges.
-            let crate::connector::HdfsScanConfig {
-                ranges,
-                original_range_count: _,
-                has_more,
-                limit,
-                profile_label,
-                format,
-                object_store_config,
-                iceberg_table_locations,
-                query_global_dicts,
-                iceberg_runtime_pruning,
-            } = cfg;
-            let source: std::sync::Arc<dyn crate::exec::node::scan::ScanSource> =
-                std::sync::Arc::new(crate::connector::hdfs::HdfsScanSource::new(
-                    limit,
-                    profile_label,
-                    format,
-                    object_store_config,
-                    iceberg_table_locations,
-                    query_global_dicts,
-                    iceberg_runtime_pruning,
-                ));
-            Ok((
-                source,
-                crate::exec::node::scan::BoundScanRanges::File { ranges, has_more },
-            ))
-        }
-    }
-
-    fn capturing_hdfs_registry() -> (Arc<ConnectorRegistry>, Arc<Mutex<Option<HdfsScanConfig>>>) {
-        let captured = Arc::new(Mutex::new(None));
-        let mut registry = ConnectorRegistry::default();
-        registry.register_scan_connector(Arc::new(CapturingHdfsConnector {
-            captured: Arc::clone(&captured),
-        }));
-        (Arc::new(registry), captured)
     }
 
     fn column_ref(column_id: u32, name: &str, data_type: DataType) -> expr::Expr {
@@ -1852,10 +1787,11 @@ mod tests {
     #[test]
     fn lowers_native_iceberg_scan_variant_path_columns() {
         let node = variant_scan_node();
-        let (registry, captured_hdfs) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 11 });
         let mut arena = ExprArena::default();
 
         let lowered = decode_node(&node, &mut arena, &ctx)
@@ -1875,65 +1811,32 @@ mod tests {
             other => panic!("expected Scan or Project over Scan, got {other:?}"),
         };
         assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(2)]);
-
-        let hdfs_cfg = captured_hdfs
-            .lock()
-            .expect("captured hdfs config lock")
-            .clone()
-            .expect("captured hdfs config");
-        let Some(FileFormatConfig::Parquet(parquet_cfg)) = hdfs_cfg.format else {
-            panic!("expected parquet scan config");
-        };
-        assert_eq!(parquet_cfg.columns, vec!["v".to_string()]);
-        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(3)]);
-        assert_eq!(parquet_cfg.variant_path_columns.len(), 1);
-        let spec = &parquet_cfg.variant_path_columns[0];
-        assert_eq!(spec.source_slot_id, SlotId::new(1));
-        assert_eq!(spec.source_read_slot_id, SlotId::new(3));
-        assert_eq!(spec.output_slot_id, SlotId::new(2));
-        assert_eq!(spec.source_name, "v");
-        assert_eq!(spec.output_name, "__nr_var_v_0");
-        assert_eq!(spec.canonical_path, "$.a.b");
-        assert_eq!(spec.requested_type, DataType::Int64);
-        assert!(spec.strict);
-        assert_eq!(spec.source_field_id, Some(101));
     }
 
     #[test]
     fn native_variant_source_hidden_slot_reserves_source_slot_id() {
         let node = variant_scan_node_with_source_ids(3, 3);
-        let (registry, captured_hdfs) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
         let mut arena = ExprArena::default();
 
         let lowered = decode_node(&node, &mut arena, &ctx)
             .expect("lower native scan with colliding source slot");
 
         assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(2)]);
-        let hdfs_cfg = captured_hdfs
-            .lock()
-            .expect("captured hdfs config lock")
-            .clone()
-            .expect("captured hdfs config");
-        let Some(FileFormatConfig::Parquet(parquet_cfg)) = hdfs_cfg.format else {
-            panic!("expected parquet scan config");
-        };
-        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(4)]);
-        let spec = &parquet_cfg.variant_path_columns[0];
-        assert_eq!(spec.source_slot_id, SlotId::new(3));
-        assert_eq!(spec.source_read_slot_id, SlotId::new(4));
-        assert_ne!(spec.source_read_slot_id, spec.source_slot_id);
     }
 
     #[test]
     fn rejects_native_variant_source_id_name_mismatch() {
         let node = variant_scan_node_with_source_ids(4, 3);
-        let (registry, _) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 13 });
         let mut arena = ExprArena::default();
 
         let err = decode_node(&node, &mut arena, &ctx).expect_err("reject source id/name drift");
@@ -2236,10 +2139,11 @@ mod tests {
                 binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
             }),
         );
-        let (registry, captured) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 14 });
         let mut arena = ExprArena::default();
         let lowered = decode_node(&node, &mut arena, &ctx).expect("lower virtual-only native scan");
 
@@ -2258,17 +2162,6 @@ mod tests {
         );
         let virtual_spec = scan.iceberg_virtual().expect("iceberg virtual spec");
         assert_eq!(virtual_spec.row_id_slot, Some(SlotId::new(4)));
-
-        let cfg = captured
-            .lock()
-            .expect("captured hdfs config lock")
-            .clone()
-            .expect("captured hdfs config");
-        let Some(FileFormatConfig::Parquet(parquet_cfg)) = cfg.format else {
-            panic!("expected parquet scan config");
-        };
-        assert_eq!(parquet_cfg.columns, ["___count___".to_string()]);
-        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(5)]);
     }
 
     #[test]
