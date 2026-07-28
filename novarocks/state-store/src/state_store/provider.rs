@@ -84,6 +84,7 @@ impl StateStoreProviderRegistration {
     }
 }
 
+#[derive(Default)]
 pub struct StateStoreProviderRegistry {
     registrations: BTreeMap<StateStoreProviderId, StateStoreProviderRegistration>,
 }
@@ -311,6 +312,17 @@ mod tests {
             },
             foundationdb_client: None,
         }
+    }
+
+    #[test]
+    fn default_registry_has_no_registered_providers() {
+        let registry = StateStoreProviderRegistry::default();
+
+        let error = match registry.bind(MYSQL_STATE_STORE_PROVIDER_ID, &mysql_host_config()) {
+            Ok(_) => panic!("default registry must not bind an unregistered provider"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StateStoreHostErrorKind::ProviderNotRegistered);
     }
 
     #[test]
