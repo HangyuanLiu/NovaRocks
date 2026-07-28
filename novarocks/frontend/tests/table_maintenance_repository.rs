@@ -38,6 +38,7 @@ use novarocks_state_store::{
     StateStoreRuntime, open_state_store,
 };
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 const PREFIX: &str = "novarocks/frontend/table-maintenance/v1/";
@@ -379,6 +380,7 @@ struct CommitUnknownStore {
     inner: Arc<dyn StateStore>,
     apply_before_unknown: bool,
     begin_write_count: Arc<AtomicUsize>,
+    recovery_gate: Option<Arc<RecoveryGate>>,
 }
 
 #[async_trait]
@@ -396,6 +398,9 @@ impl StateStore for CommitUnknownStore {
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+        if let Some(gate) = &self.recovery_gate {
+            gate.pause_if_armed().await;
+        }
         self.inner.begin_read().await
     }
 
@@ -408,6 +413,7 @@ impl StateStore for CommitUnknownStore {
         Ok(Box::new(CommitUnknownTransaction {
             inner: self.inner.begin_write(transaction_id, purpose).await?,
             apply_before_unknown: self.apply_before_unknown,
+            recovery_gate: self.recovery_gate.clone(),
         }))
     }
 
@@ -433,6 +439,7 @@ impl StateStore for CommitUnknownStore {
 struct CommitUnknownTransaction {
     inner: Box<dyn WriteTransaction>,
     apply_before_unknown: bool,
+    recovery_gate: Option<Arc<RecoveryGate>>,
 }
 
 #[async_trait]
@@ -482,11 +489,42 @@ impl WriteTransaction for CommitUnknownTransaction {
                 self.inner.commit().await,
                 CommitOutcome::Committed(_)
             ));
+            if let Some(gate) = &self.recovery_gate {
+                gate.arm();
+            }
         }
         CommitOutcome::CommitUnknown(StateStoreError::new(
             StateStoreErrorKind::Transient,
             "scripted optimize job commit outcome is unknown",
         ))
+    }
+}
+
+#[derive(Default)]
+struct RecoveryGate {
+    armed: std::sync::atomic::AtomicBool,
+    reached: Notify,
+    release: Notify,
+}
+
+impl RecoveryGate {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn pause_if_armed(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    async fn wait_until_recovery(&self) {
+        self.reached.notified().await;
+    }
+
+    fn allow_recovery(&self) {
+        self.release.notify_one();
     }
 }
 
@@ -499,6 +537,7 @@ async fn commit_unknown_uses_authoritative_operation_marker_without_blind_retry(
         inner: committed_inner,
         apply_before_unknown: true,
         begin_write_count: Arc::clone(&committed_writes),
+        recovery_gate: None,
     });
     let committed = OptimizeJobRepository::open(Arc::clone(&committed_store))
         .await
@@ -522,6 +561,7 @@ async fn commit_unknown_uses_authoritative_operation_marker_without_blind_retry(
         inner: unresolved_inner,
         apply_before_unknown: false,
         begin_write_count: Arc::clone(&unresolved_writes),
+        recovery_gate: None,
     });
     let unresolved = OptimizeJobRepository::open(Arc::clone(&unresolved_store))
         .await
@@ -538,6 +578,51 @@ async fn commit_unknown_uses_authoritative_operation_marker_without_blind_retry(
         raw_prefix_count(unresolved_store.as_ref(), "operations/").await,
         0
     );
+}
+
+#[tokio::test]
+async fn commit_unknown_recovery_accepts_legal_successor_without_mutation_retry() {
+    let temp = TempDir::new().unwrap();
+    let inner = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let advancing = OptimizeJobRepository::open(Arc::clone(&inner))
+        .await
+        .unwrap();
+    let created = advancing
+        .create(create_request("ice", "db", "t", 10, 100))
+        .await
+        .unwrap();
+
+    let recovery_gate = Arc::new(RecoveryGate::default());
+    let recovering_writes = Arc::new(AtomicUsize::new(0));
+    let recovering_store: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
+        inner: Arc::clone(&inner),
+        apply_before_unknown: true,
+        begin_write_count: Arc::clone(&recovering_writes),
+        recovery_gate: Some(Arc::clone(&recovery_gate)),
+    });
+    let recovering = OptimizeJobRepository::open(recovering_store).await.unwrap();
+    let claim = tokio::spawn(async move { recovering.claim(created.job_id, 200).await });
+
+    recovery_gate.wait_until_recovery().await;
+    advancing
+        .record_outcome(created.job_id, outcome(11))
+        .await
+        .unwrap();
+    advancing.finish(created.job_id, 300).await.unwrap();
+    recovery_gate.allow_recovery();
+
+    let recovered = claim
+        .await
+        .expect("join claim recovery")
+        .expect("authoritative marker proves claim")
+        .expect("claim returned its post-mutation result");
+    assert_eq!(recovered.state, OptimizeJobState::Running);
+    assert_eq!(recovered.started_at_ms, Some(200));
+    assert_eq!(
+        advancing.list().await.unwrap()[0].state,
+        OptimizeJobState::Finished
+    );
+    assert_eq!(recovering_writes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

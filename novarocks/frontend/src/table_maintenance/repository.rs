@@ -79,6 +79,10 @@ impl RepositoryError {
     fn store(message: impl Into<String>) -> Self {
         Self::new(RepositoryErrorKind::Store, message)
     }
+
+    fn with_context(self, context: impl fmt::Display) -> Self {
+        Self::new(self.kind, format!("{context}: {}", self.message))
+    }
 }
 
 impl fmt::Display for RepositoryError {
@@ -366,8 +370,18 @@ impl OptimizeJobRepository {
                 RepositoryError::store(format!("list optimize job state page failed: {error}"))
             })?;
             for index in page.records {
-                let job_id = decode_index_key(prefix_text, &index.key)?;
-                let value_job_id = decode_index_value(&index.value)?;
+                let job_id = decode_index_key(prefix_text, &index.key).map_err(|error| {
+                    error.with_context(format!(
+                        "list {} optimize jobs: decode state index key",
+                        expected_state.as_str()
+                    ))
+                })?;
+                let value_job_id = decode_index_value(&index.value).map_err(|error| {
+                    error.with_context(format!(
+                        "list {} optimize jobs: decode state index for job {job_id}",
+                        expected_state.as_str()
+                    ))
+                })?;
                 if job_id != value_job_id {
                     return Err(RepositoryError::corruption(format!(
                         "optimize job state index identity mismatch: key job {job_id}, value job {value_job_id}"
@@ -479,11 +493,16 @@ impl OptimizeJobRepository {
                 "operation marker is absent",
             ));
         };
+        let marker_context = format!(
+            "{context} authoritative operation {} ({expected_action:?})",
+            operation_id.as_uuid()
+        );
         let marker: StoredOptimizeOperationV1 = decode_json(
             operation_record.value.as_bytes(),
             "optimize operation marker",
-        )?;
-        validate_operation_marker(&marker)?;
+        )
+        .map_err(|error| error.with_context(&marker_context))?;
+        validate_operation_marker(&marker).map_err(|error| error.with_context(&marker_context))?;
         if marker.operation_id != *operation_id.as_uuid()
             || marker.action != expected_action
             || expected_job_id.is_some_and(|job_id| job_id != marker.job_id)
@@ -492,7 +511,7 @@ impl OptimizeJobRepository {
                 "{context} authoritative operation marker does not match the requested operation"
             )));
         }
-        let stored = load_job_from_transaction(transaction.as_mut(), marker.job_id)
+        let current = load_job_from_transaction(transaction.as_mut(), marker.job_id)
             .await
             .map_err(|error| {
                 commit_unknown_error(
@@ -515,13 +534,9 @@ impl OptimizeJobRepository {
                 &format!("authoritative read finish failed: {error}"),
             )
         })?;
-        if stored.last_operation_id != *operation_id.as_uuid() {
-            return Err(RepositoryError::corruption(format!(
-                "{context} job {} does not contain the authoritative operation id",
-                marker.job_id
-            )));
-        }
-        Ok(OptimizeJob::from(&stored))
+        validate_operation_successor(&marker, &current)
+            .map_err(|error| error.with_context(&marker_context))?;
+        Ok(OptimizeJob::from(&marker.post_job))
     }
 }
 
@@ -542,7 +557,12 @@ async fn apply_create(
     if let Some(active) = transaction.get(&active_key).await? {
         let active_job_id = match decode_index_value(&active.value) {
             Ok(job_id) => job_id,
-            Err(error) => return Ok(Err(error)),
+            Err(error) => {
+                return Ok(Err(error.with_context(format!(
+                    "create optimize job for {} failed: decode active target index",
+                    target_context(&request.target)
+                ))));
+            }
         };
         let active_job = match load_job_from_transaction(transaction, active_job_id).await? {
             Ok(Some(job)) => job.stored,
@@ -640,7 +660,7 @@ async fn apply_create(
     let (operation_key, operation_value) = match operation_record(
         operation_id,
         StoredOptimizeOperationActionV1::Create,
-        job_id,
+        &stored,
     ) {
         Ok(record) => record,
         Err(error) => return Ok(Err(error)),
@@ -717,11 +737,14 @@ async fn apply_claim(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    let (operation_key, operation_value) =
-        match operation_record(operation_id, StoredOptimizeOperationActionV1::Claim, job_id) {
-            Ok(record) => record,
-            Err(error) => return Ok(Err(error)),
-        };
+    let (operation_key, operation_value) = match operation_record(
+        operation_id,
+        StoredOptimizeOperationActionV1::Claim,
+        &job.stored,
+    ) {
+        Ok(record) => record,
+        Err(error) => return Ok(Err(error)),
+    };
     transaction
         .put(key, value, Precondition::Version(job.version))
         .await?;
@@ -761,7 +784,7 @@ async fn apply_record_outcome(
     let (operation_key, operation_value) = match operation_record(
         operation_id,
         StoredOptimizeOperationActionV1::RecordOutcome,
-        job_id,
+        &job.stored,
     ) {
         Ok(record) => record,
         Err(error) => return Ok(Err(error)),
@@ -851,7 +874,8 @@ async fn terminalize_job(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let (operation_key, operation_value) = match operation_record(operation_id, action, job_id) {
+    let (operation_key, operation_value) = match operation_record(operation_id, action, &job.stored)
+    {
         Ok(record) => record,
         Err(error) => return Ok(Err(error)),
     };
@@ -922,7 +946,9 @@ async fn require_index(
         Ok(index_job_id) => Ok(Err(RepositoryError::corruption(format!(
             "{action} {job_id} failed: state index references job {index_job_id}"
         )))),
-        Err(error) => Ok(Err(error)),
+        Err(error) => Ok(Err(error.with_context(format!(
+            "{action} {job_id} failed: decode required state index {prefix}"
+        )))),
     }
 }
 
@@ -950,7 +976,11 @@ async fn require_active_index(
             job.job_id,
             target_context(&target)
         )))),
-        Err(error) => Ok(Err(error)),
+        Err(error) => Ok(Err(error.with_context(format!(
+            "{action} {} for {} failed: decode active target index",
+            job.job_id,
+            target_context(&target)
+        )))),
     }
 }
 
@@ -1055,13 +1085,14 @@ fn encode_job(stored: &StoredOptimizeJobV1) -> RepositoryResult<Value> {
 fn operation_record(
     operation_id: OperationId,
     action: StoredOptimizeOperationActionV1,
-    job_id: i64,
+    post_job: &StoredOptimizeJobV1,
 ) -> RepositoryResult<(Key, Value)> {
     let marker = StoredOptimizeOperationV1 {
         schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
         operation_id: *operation_id.as_uuid(),
         action,
-        job_id,
+        job_id: post_job.job_id,
+        post_job: post_job.clone(),
     };
     Ok((
         operation_key(operation_id)?,
@@ -1070,10 +1101,101 @@ fn operation_record(
 }
 
 fn validate_operation_marker(marker: &StoredOptimizeOperationV1) -> RepositoryResult<()> {
-    if marker.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION || marker.job_id <= 0 {
+    if marker.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION {
         return Err(RepositoryError::corruption(
-            "optimize operation marker is corrupt",
+            "optimize operation marker has an unsupported schema version",
         ));
+    }
+    validate_stored_job(&marker.post_job)?;
+    if marker.job_id != marker.post_job.job_id {
+        return Err(RepositoryError::corruption(format!(
+            "optimize operation marker job id {} does not match post-job id {}",
+            marker.job_id, marker.post_job.job_id
+        )));
+    }
+    if marker.operation_id != marker.post_job.last_operation_id {
+        return Err(RepositoryError::corruption(format!(
+            "optimize operation marker {} does not match post-job last operation id",
+            marker.operation_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_operation_successor(
+    marker: &StoredOptimizeOperationV1,
+    current: &StoredOptimizeJobV1,
+) -> RepositoryResult<()> {
+    let post = &marker.post_job;
+    let expected_post_state = match marker.action {
+        StoredOptimizeOperationActionV1::Create => StoredOptimizeJobStateV1::Pending,
+        StoredOptimizeOperationActionV1::Claim | StoredOptimizeOperationActionV1::RecordOutcome => {
+            StoredOptimizeJobStateV1::Running
+        }
+        StoredOptimizeOperationActionV1::Finish => StoredOptimizeJobStateV1::Finished,
+        StoredOptimizeOperationActionV1::Fail => StoredOptimizeJobStateV1::Failed,
+    };
+    if post.state != expected_post_state
+        || (marker.action == StoredOptimizeOperationActionV1::Claim && post.outcome.is_some())
+        || (marker.action == StoredOptimizeOperationActionV1::RecordOutcome
+            && post.outcome.is_none())
+    {
+        return Err(RepositoryError::corruption(format!(
+            "operation marker action {:?} has invalid post-job state {}",
+            marker.action,
+            OptimizeJobState::from(post.state).as_str()
+        )));
+    }
+    if post.job_id != current.job_id
+        || post.target != current.target
+        || post.base_snapshot_id != current.base_snapshot_id
+        || post.created_at_ms != current.created_at_ms
+    {
+        return Err(RepositoryError::corruption(format!(
+            "current optimize job {} does not preserve the operation post-job identity",
+            current.job_id
+        )));
+    }
+
+    let legal = match marker.action {
+        StoredOptimizeOperationActionV1::Create => match current.state {
+            StoredOptimizeJobStateV1::Pending => current == post,
+            StoredOptimizeJobStateV1::Running
+            | StoredOptimizeJobStateV1::Finished
+            | StoredOptimizeJobStateV1::Failed => true,
+        },
+        StoredOptimizeOperationActionV1::Claim => {
+            current.started_at_ms == post.started_at_ms
+                && match current.state {
+                    StoredOptimizeJobStateV1::Running => {
+                        current == post || current.outcome.is_some()
+                    }
+                    StoredOptimizeJobStateV1::Finished | StoredOptimizeJobStateV1::Failed => true,
+                    StoredOptimizeJobStateV1::Pending => false,
+                }
+        }
+        StoredOptimizeOperationActionV1::RecordOutcome => {
+            current.started_at_ms == post.started_at_ms
+                && current.outcome.is_some()
+                && matches!(
+                    current.state,
+                    StoredOptimizeJobStateV1::Running
+                        | StoredOptimizeJobStateV1::Finished
+                        | StoredOptimizeJobStateV1::Failed
+                )
+        }
+        StoredOptimizeOperationActionV1::Finish | StoredOptimizeOperationActionV1::Fail => {
+            current == post
+        }
+    };
+    if !legal {
+        return Err(RepositoryError::corruption(format!(
+            "current optimize job {} state {} is not a legal successor of {:?} post-state {}",
+            current.job_id,
+            OptimizeJobState::from(current.state).as_str(),
+            marker.action,
+            OptimizeJobState::from(post.state).as_str()
+        )));
     }
     Ok(())
 }

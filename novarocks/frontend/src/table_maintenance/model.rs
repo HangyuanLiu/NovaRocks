@@ -112,6 +112,7 @@ pub(crate) struct StoredOptimizeOperationV1 {
     pub operation_id: Uuid,
     pub action: StoredOptimizeOperationActionV1,
     pub job_id: i64,
+    pub post_job: StoredOptimizeJobV1,
 }
 
 impl From<&MaintenanceTarget> for StoredMaintenanceTargetV1 {
