@@ -28,8 +28,8 @@ use novarocks_spi::connector::{
 };
 
 use super::runtime::{
-    ConnectorBatchReaderIter, ConnectorReadScanSource, ConnectorScheduledSplit,
-    ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
+    ConnectorBatchReaderIter, ConnectorReadAuxiliary, ConnectorReadScanSource,
+    ConnectorScheduledSplit, ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
@@ -483,4 +483,81 @@ fn connector_file_split_opens_opaque_split_and_preserves_range_sidecar() {
         .collect::<Result<Vec<_>, _>>()
         .expect("reader chunks");
     assert_eq!(chunks.len(), 1);
+}
+
+struct FakeDeleteAuxiliary;
+
+impl ConnectorReadAuxiliary for FakeDeleteAuxiliary {
+    fn load_iceberg_position_deletes(
+        &self,
+        _range: &FileScanRange,
+    ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        let mut positions = roaring::RoaringTreemap::new();
+        positions.insert(4);
+        Ok(Some(positions))
+    }
+
+    fn load_iceberg_equality_deletes(
+        &self,
+        _range: &FileScanRange,
+    ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
+    {
+        Ok(None)
+    }
+}
+
+#[test]
+fn connector_file_split_delegates_delete_opening_without_exposing_payload() {
+    let instance_id = ConnectorInstanceId::parse("test.file.delete").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let source = ConnectorReadScanSource::new_scheduled_with_auxiliary(
+        instance,
+        vec![ConnectorScheduledSplit::file(
+            ConnectorSplit::try_new(instance_id, "file-delete", bytes::Bytes::new(), Some(1))
+                .expect("split"),
+            FileScanRange {
+                path: "file:///tmp/provider-owned.parquet".to_string(),
+                file_len: 12,
+                offset: 0,
+                length: 12,
+                scan_range_id: 0,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: None,
+            },
+        )],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+        Arc::new(FakeDeleteAuxiliary),
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    let morsel = op.build_morsels().expect("morsel").morsels.remove(0);
+    let deletes = op
+        .load_iceberg_position_deletes(&morsel)
+        .expect("delete loader")
+        .expect("position deletes");
+    assert!(deletes.contains(4));
 }
