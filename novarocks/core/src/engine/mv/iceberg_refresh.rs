@@ -3352,12 +3352,14 @@ fn recorded_target_snapshot_id(
 /// - (Some(p), Some(c)) p == c → no-op metadata refresh (bump last_refresh_ms)
 /// - (Some(p), Some(c)) p != c → incremental: append-delta SELECT → fast-append MV snapshot
 /// - (Some(p), None)      → fail-fast (base snapshot was garbage-collected)
+#[cfg(test)]
 pub(crate) fn refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    let connector_context = crate::connector::test_request_context();
     let iceberg_target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let target = MvTarget {
         catalog: Some(iceberg_target.catalog),
@@ -3369,17 +3371,40 @@ pub(crate) fn refresh_iceberg_mv(
     let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
         return Err("iceberg planner returned a non-iceberg refresh plan".to_string());
     };
-    execute_iceberg_mv_refresh(state, payload, &plan.contract)
-        .map(|_| StatementResult::Ok)
-        .map_err(|error| error.message)
+    execute_iceberg_mv_refresh_with_connector_context(
+        state,
+        payload,
+        &plan.contract,
+        &connector_context,
+    )
+    .map(|_| StatementResult::Ok)
+    .map_err(|error| error.message)
 }
 
+#[cfg(test)]
 pub(crate) fn repartition_iceberg_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &AlterMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    repartition_iceberg_mv_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        stmt,
+        &crate::connector::test_request_context(),
+    )
+}
+
+pub(crate) fn repartition_iceberg_mv_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &AlterMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let AlterMaterializedViewAction::Repartition(fields) = &stmt.action else {
         return Err(
             "ALTER MATERIALIZED VIEW repartition executor received non-repartition action"
@@ -3485,6 +3510,7 @@ pub(crate) fn repartition_iceberg_mv(
                     current_catalog,
                     current_database,
                     physical_sql,
+                    connector_context,
                 )
             };
             match prepare_projection_repartition_payload(
@@ -3525,6 +3551,7 @@ pub(crate) fn repartition_iceberg_mv(
                         visible_sql,
                         actual_calls,
                         state_query,
+                        connector_context,
                     )
                 };
             match prepare_aggregate_repartition_payload(
@@ -3554,6 +3581,7 @@ pub(crate) fn repartition_iceberg_mv(
                     current_catalog,
                     current_database,
                     physical_sql,
+                    connector_context,
                 )
             };
             match prepare_union_projection_repartition_payload(
@@ -3659,6 +3687,7 @@ pub(crate) fn repartition_iceberg_mv(
             &base_refs,
             &pin,
             aliases,
+            connector_context,
         )
         .map_err(|err| {
             abort_and_restore_iceberg_mv_repartition_default_spec(
@@ -3760,6 +3789,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
     full: bool,
     runtime: ValidatedIcebergRefreshRuntime,
     execution: &IcebergValidatedRefreshExecution<'_>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let ValidatedIcebergRefreshRuntime {
         target,
@@ -3973,6 +4003,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 dispatch_schema_contract,
                 refresh_contract.apply_key,
                 execution,
+                connector_context,
             );
         }
         // Projection / filter over a single scan: fall through to the inline
@@ -4122,6 +4153,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                         current_catalog,
                         current_database,
                         physical_sql,
+                        connector_context,
                     )
                 };
                 prepare_projection_first_refresh_chunks(
@@ -4217,6 +4249,7 @@ fn refresh_iceberg_union_projection_mv(
     schema_contract: &mv_schema::MvSchemaContract,
     apply_key: ApplyKeyContract,
     execution: &IcebergValidatedRefreshExecution<'_>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     validate_union_projection_base_refs(base_refs, schema_contract)?;
 
@@ -4380,6 +4413,7 @@ fn refresh_iceberg_union_projection_mv(
                         current_catalog,
                         current_database,
                         physical_sql,
+                        connector_context,
                     )
                 };
                 prepare_union_projection_first_refresh_chunks(
@@ -6612,6 +6646,7 @@ fn build_iceberg_refresh_plan(
 struct IcebergValidatedRefreshExecution<'a> {
     validated: ValidatedRefreshExecution<'a>,
     pin: Option<Arc<RefreshSnapshotPin>>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 struct ValidatedIcebergRefreshRuntime {
@@ -6903,7 +6938,7 @@ fn build_validated_refresh_context(
         namespace: target.namespace,
         table: target.table,
     };
-    let ctx = IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
+    let mut ctx = IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
         target_identity,
         mv_definition.mv_id,
         current_catalog,
@@ -6923,6 +6958,7 @@ fn build_validated_refresh_context(
         execution.affected_partitions().clone(),
         state.mv_refresh_pruning_limits,
     )?;
+    ctx.connector_context = Some(execution.connector_context.clone());
     #[cfg(test)]
     {
         assert!(
@@ -7001,11 +7037,28 @@ fn validate_refresh_pin_table_uuids_against_baseline(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn execute_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     plan: &IcebergRefreshPlan,
     contract: &RefreshPlanContract,
 ) -> Result<IcebergRefreshOutcome, RefreshError> {
+    execute_iceberg_mv_refresh_with_connector_context(
+        state,
+        plan,
+        contract,
+        &crate::connector::test_request_context(),
+    )
+}
+
+pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
+    state: &Arc<StandaloneState>,
+    plan: &IcebergRefreshPlan,
+    contract: &RefreshPlanContract,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<IcebergRefreshOutcome, RefreshError> {
+    crate::connector::validate_request_context(connector_context)
+        .map_err(RefreshError::pre_commit)?;
     let _refresh_guard = acquire_mv_refresh_lock().map_err(RefreshError::pre_commit)?;
     // Recovery may complete or roll back historical attempts before validating
     // this plan. The no-write guarantee below applies to the current attempt.
@@ -7064,6 +7117,7 @@ pub(crate) fn execute_iceberg_mv_refresh(
         IcebergValidatedRefreshExecution {
             validated: initially_validated,
             pin: None,
+            connector_context: connector_context.clone(),
         }
     } else {
         #[cfg(test)]
@@ -7091,6 +7145,7 @@ pub(crate) fn execute_iceberg_mv_refresh(
         IcebergValidatedRefreshExecution {
             validated,
             pin: Some(pin),
+            connector_context: connector_context.clone(),
         }
     };
 
@@ -7109,6 +7164,7 @@ pub(crate) fn execute_iceberg_mv_refresh(
         plan.stmt.full,
         runtime,
         &execution,
+        connector_context,
     )
     .map_err(IcebergMvRefreshExecutionError::into_refresh_error)?;
     Ok(IcebergRefreshOutcome {
@@ -9296,6 +9352,7 @@ fn run_mv_full_select_result(
     current_catalog: Option<&str>,
     current_database: &str,
     mut query: sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::runtime::query_result::QueryResult, String> {
     if crate::engine::query_prep::has_time_travel_refs(&query) {
         crate::engine::query_prep::rewrite_time_travel_refs(
@@ -9303,18 +9360,16 @@ fn run_mv_full_select_result(
             current_catalog,
             current_database,
             &mut query,
-            &crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context,
         )?;
     }
-    crate::engine::execute_query_with_catalog_service(
+    crate::engine::execute_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        connector_context,
     )
 }
 
@@ -9339,6 +9394,9 @@ fn first_refresh_iceberg_aggregate_mv(
             select_sql,
             calls,
             state_query,
+            ctx.connector_context.as_ref().ok_or_else(|| {
+                "Iceberg MV refresh is missing its caller connector context".to_string()
+            })?,
         )
     };
     let chunks = match prepare_aggregate_first_refresh_chunks(
@@ -9387,6 +9445,9 @@ fn first_refresh_branch_union_aggregate_iceberg_mv(
             select_sql,
             calls,
             state_query,
+            ctx.connector_context.as_ref().ok_or_else(|| {
+                "Iceberg MV refresh is missing its caller connector context".to_string()
+            })?,
         )
     };
     let chunks = match prepare_branch_union_aggregate_first_refresh_chunks(
@@ -9576,6 +9637,7 @@ fn read_aggregate_state_for_refresh(
     select_sql: &str,
     calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     state_query: sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<AggregateStateRead, String> {
     let source_layout = build_aggregate_layout_for_refresh_select_sql(
         state,
@@ -9583,8 +9645,15 @@ fn read_aggregate_state_for_refresh(
         current_database,
         select_sql,
         calls,
+        connector_context,
     )?;
-    let result = run_mv_full_select_result(state, current_catalog, current_database, state_query)?;
+    let result = run_mv_full_select_result(
+        state,
+        current_catalog,
+        current_database,
+        state_query,
+        connector_context,
+    )?;
     Ok(AggregateStateRead {
         result,
         source_layout,
@@ -9686,10 +9755,17 @@ fn build_aggregate_layout_for_refresh_select_sql(
     current_database: &str,
     select_sql: &str,
     calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
     let visible_analysis =
-        analyze_mv_select(state, current_catalog, current_database, &visible_query)?;
+        crate::engine::mv::analysis_adapter::analyze_mv_select_with_connector_context(
+            state,
+            current_catalog,
+            current_database,
+            &visible_query,
+            connector_context,
+        )?;
     build_aggregate_layout_from_analysis(calls, &visible_analysis)
 }
 
@@ -10038,12 +10114,14 @@ fn rebuild_iceberg_mv(
     base_snapshot_id: Option<i64>,
     current_table_uuid: &str,
     partition_contract: Option<&mv_schema::MvPartitionContract>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let chunks = match run_mv_full_select_chunks_with_catalog(
         state,
         Some(&target.catalog),
         current_database,
         physical_full_select_sql,
+        connector_context,
     ) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -11060,6 +11138,7 @@ fn build_join_projection_repartition_context(
     base_refs: &[TableIdentity],
     pin: &RefreshSnapshotPin,
     aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(IcebergMvRefreshContext, TableIdentity, TableIdentity), String> {
     if base_refs.len() != 2 {
         return Err("iceberg join MV repartition requires exactly two base tables".to_string());
@@ -11101,7 +11180,7 @@ fn build_join_projection_repartition_context(
         current_catalog,
         current_database,
     );
-    let ctx = {
+    let mut ctx = {
         let iceberg_catalog_guard = state
             .iceberg_catalogs
             .read()
@@ -11126,6 +11205,7 @@ fn build_join_projection_repartition_context(
             state.mv_refresh_pruning_limits,
         )?
     };
+    ctx.connector_context = Some(connector_context.clone());
     Ok((ctx, left_ref.clone(), right_ref.clone()))
 }
 
@@ -13425,12 +13505,16 @@ fn execute_imv_change_stream_writer(
         .read()
         .expect("standalone connector registry read lock")
         .clone();
+    let connector_context = refresh_plan
+        .mv_refresh_ctx
+        .and_then(|ctx| ctx.connector_context.as_ref())
+        .ok_or_else(|| {
+            "Iceberg MV change-stream write is missing its caller connector context".to_string()
+        })?;
+    crate::connector::validate_request_context(connector_context)?;
     let resolved = crate::connector::metadata_load_table(
         &connectors_snapshot,
-        crate::connector::connector_request_context(
-            None,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )?,
+        connector_context.clone(),
         &target.catalog,
         &target.namespace,
         &target.table,
@@ -13446,15 +13530,17 @@ fn execute_imv_change_stream_writer(
         target_ref,
         data_route_output_ordinal,
     )?;
-    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
-        state,
-        Some(&target.catalog),
-        &target.namespace,
-        &refresh_plan.optimized_tree,
-        &mut dag,
-        refresh_plan.mv_refresh_ctx,
-        None,
-    )?;
+    let planned =
+        crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
+            state,
+            Some(&target.catalog),
+            &target.namespace,
+            &refresh_plan.optimized_tree,
+            &mut dag,
+            refresh_plan.mv_refresh_ctx,
+            None,
+            connector_context,
+        )?;
     #[cfg(test)]
     if let Some(result) = take_imv_change_stream_execution_result_for_test() {
         return executed_change_stream_write_from_result(result, planned.commit_plan);
@@ -14230,6 +14316,9 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 Some(change.current_snapshot_id),
                 change.current_table_uuid,
                 None,
+                ctx.connector_context.as_ref().ok_or_else(|| {
+                    "Iceberg MV refresh is missing its caller connector context".to_string()
+                })?,
             );
         }
         NonJoinIncrementalChangePlan::ChangeStream {
@@ -20261,6 +20350,7 @@ mod tests {
             Some("ice"),
             &env.current_db,
             &physical_full_select_sql,
+            &crate::connector::test_request_context(),
         )
         .expect("collect repartition payload");
         let payload = RepartitionChunkPayload::from_chunks(chunks, &pin);
@@ -23328,6 +23418,7 @@ mod tests {
             Some(base_snapshot_id),
             &current_table_uuid,
             None,
+            &crate::connector::test_request_context(),
         )
         .expect("ordinary full rebuild fallback should finalize without partition contract");
 

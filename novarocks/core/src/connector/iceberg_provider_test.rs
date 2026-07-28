@@ -97,9 +97,27 @@ fn registry_with_table() -> (Arc<RwLock<IcebergCatalogRegistry>>, tempfile::Temp
     (registry, warehouse)
 }
 
+fn remove_snapshot_manifest_files(path: &std::path::Path) -> usize {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(path).expect("read fixture directory") {
+        let entry = entry.expect("read fixture entry");
+        let path = entry.path();
+        if path.is_dir() {
+            removed += remove_snapshot_manifest_files(&path);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "avro")
+        {
+            std::fs::remove_file(&path).expect("remove snapshot manifest");
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[test]
 fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
-    let (registry, _warehouse) = registry_with_table();
+    let (registry, warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
     let instance = IcebergConnectorInstance::new(instance_id.clone(), registry)
         .expect("iceberg connector instance");
@@ -163,6 +181,10 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     assert_eq!(splits.len(), 1);
     assert_eq!(splits[0].owner(), &instance_id);
     assert!(splits[0].estimated_bytes().is_some_and(|bytes| bytes > 0));
+    assert!(
+        remove_snapshot_manifest_files(warehouse.path()) > 0,
+        "fixture must contain snapshot manifests before reader opens"
+    );
     let corrupt_split = super::iceberg::provider::replace_split_path_for_test(
         &splits[0],
         "file:///warehouse/db/orders/not-in-snapshot.parquet",
@@ -190,25 +212,27 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
         error.to_string().contains("does not belong"),
         "unexpected corrupt split error: {error}"
     );
-    let mut reader = instance
-        .read()
-        .open_reader(
-            &splits[0],
-            ConnectorOpenReaderRequest {
-                expected_schema: resolved.schema,
-                batch: ConnectorBatchBudget {
-                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
-                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+    for _ in 0..2 {
+        let mut reader = instance
+            .read()
+            .open_reader(
+                &splits[0],
+                ConnectorOpenReaderRequest {
+                    expected_schema: Arc::clone(&resolved.schema),
+                    batch: ConnectorBatchBudget {
+                        max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                        max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+                    },
+                    context: context(),
                 },
-                context: context(),
-            },
-        )
-        .expect("open reader");
-    let batch = reader
-        .next_batch()
-        .expect("read batch")
-        .expect("expected one batch");
-    assert_eq!(batch.num_rows(), 1);
-    assert!(reader.next_batch().expect("read EOS").is_none());
-    reader.close().expect("close reader");
+            )
+            .expect("open reader without re-reading snapshot manifests");
+        let batch = reader
+            .next_batch()
+            .expect("read batch")
+            .expect("expected one batch");
+        assert_eq!(batch.num_rows(), 1);
+        assert!(reader.next_batch().expect("read EOS").is_none());
+        reader.close().expect("close reader");
+    }
 }

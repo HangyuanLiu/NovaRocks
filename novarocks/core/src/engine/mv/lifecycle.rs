@@ -109,11 +109,25 @@ pub(crate) struct IcebergRefreshOutcome {
     pub completed_inside_execute: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub(crate) struct RefreshCtx {
     pub refresh_id: Option<i64>,
     pub expected_target_snapshot_id: Option<i64>,
     pub recovery_required: bool,
+    pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+impl RefreshCtx {
+    pub(crate) fn new(
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            refresh_id: None,
+            expected_target_snapshot_id: None,
+            recovery_required: false,
+            connector_context,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

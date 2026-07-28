@@ -312,11 +312,33 @@ pub(crate) fn analyze_mv_select(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<MvAnalysis, String> {
+    let connector_context = crate::connector::connector_request_context(
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    analyze_mv_select_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        &connector_context,
+    )
+}
+
+pub(crate) fn analyze_mv_select_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<MvAnalysis, String> {
     analyze_mv_select_with(
         query,
         current_catalog,
         current_database,
-        |resolved_refs| register_iceberg_tables_for_mv_analysis(state, resolved_refs),
+        |resolved_refs| {
+            register_iceberg_tables_for_mv_analysis(state, resolved_refs, connector_context)
+        },
         |query_for_analysis| {
             let catalog = state
                 .catalog_service
@@ -334,6 +356,7 @@ pub(crate) fn analyze_mv_select(
 fn register_iceberg_tables_for_mv_analysis(
     state: &Arc<StandaloneState>,
     resolved_refs: &[ResolvedTableRef],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let connectors = state
         .connectors
@@ -353,10 +376,7 @@ fn register_iceberg_tables_for_mv_analysis(
         drop_local_table_registration_if_exists(state, namespace, table)?;
         let (mut table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
             &connectors,
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             catalog,
             namespace,
             table,

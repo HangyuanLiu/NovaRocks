@@ -163,7 +163,7 @@ impl MvBackend for StarRocksTableMvBackend {
     fn execute_refresh(
         &self,
         plan: &RefreshPlan,
-        _ctx: &mut RefreshCtx,
+        ctx: &mut RefreshCtx,
     ) -> Result<RefreshOutcome, RefreshError> {
         let BackendRefreshPlan::StarRocks(plan_payload) = &plan.backend_plan else {
             return Err(RefreshError::user(
@@ -182,6 +182,7 @@ impl MvBackend for StarRocksTableMvBackend {
                 plan_payload.current_catalog.as_deref(),
                 &plan_payload.current_database,
                 &plan_payload.stmt,
+                &ctx.connector_context,
             )
             .map_err(RefreshError::pre_commit)?;
         }

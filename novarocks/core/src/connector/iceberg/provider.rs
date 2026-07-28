@@ -20,8 +20,8 @@
 //! contain only catalog/table identity and a snapshot pin; core code transports
 //! them as opaque bytes and never downcasts into Iceberg objects.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -51,11 +51,13 @@ use crate::formats::FileFormatConfig;
 use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
 
 const PROVIDER_ID: &str = "iceberg";
+const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct IcebergConnectorInstance {
     instance_id: ConnectorInstanceId,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
+    snapshot_memberships: Arc<SnapshotMembershipCache>,
 }
 
 impl IcebergConnectorInstance {
@@ -66,6 +68,9 @@ impl IcebergConnectorInstance {
         let provider = Arc::new(Self {
             instance_id: instance_id.clone(),
             registry,
+            snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
+                MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
+            )),
         });
         ConnectorInstance::try_new(
             ConnectorInstanceDescriptor {
@@ -198,6 +203,142 @@ impl IcebergConnectorInstance {
         ChunkSchema::try_new(slots)
             .map(Arc::new)
             .map_err(|error| internal(format!("build Iceberg chunk schema: {error}")))
+    }
+
+    fn snapshot_membership(
+        &self,
+        entry: &IcebergCatalogEntry,
+        namespace: &str,
+        table: &str,
+        snapshot_id: i64,
+    ) -> Result<Arc<HashSet<SnapshotFileIdentity>>, ConnectorError> {
+        let key = SnapshotMembershipKey {
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+            snapshot_id,
+        };
+        self.snapshot_memberships.get_or_try_init(key, || {
+            let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
+            extract_data_files_with_stats_at(&loaded.table, snapshot_id)
+                .map_err(map_iceberg_error)
+                .map(|files| {
+                    Arc::new(
+                        files
+                            .into_iter()
+                            .map(|file| SnapshotFileIdentity {
+                                path: file.path,
+                                size: file.size,
+                                row_count: file.record_count,
+                            })
+                            .collect(),
+                    )
+                })
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SnapshotMembershipKey {
+    namespace: String,
+    table: String,
+    snapshot_id: i64,
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct SnapshotFileIdentity {
+    path: String,
+    size: i64,
+    row_count: Option<i64>,
+}
+
+impl From<&IcebergDataFileInfo> for SnapshotFileIdentity {
+    fn from(file: &IcebergDataFileInfo) -> Self {
+        Self {
+            path: file.path.clone(),
+            size: file.size,
+            row_count: file.row_count,
+        }
+    }
+}
+
+type SnapshotMembership = Result<Arc<HashSet<SnapshotFileIdentity>>, ConnectorError>;
+type SnapshotMembershipCell = Arc<OnceLock<SnapshotMembership>>;
+
+struct SnapshotMembershipCache {
+    capacity: usize,
+    state: Mutex<SnapshotMembershipCacheState>,
+}
+
+#[derive(Default)]
+struct SnapshotMembershipCacheState {
+    entries: HashMap<SnapshotMembershipKey, SnapshotMembershipCell>,
+    order: VecDeque<SnapshotMembershipKey>,
+}
+
+impl SnapshotMembershipCache {
+    fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "snapshot membership cache capacity must be nonzero"
+        );
+        Self {
+            capacity,
+            state: Mutex::new(SnapshotMembershipCacheState::default()),
+        }
+    }
+
+    fn cell(&self, key: &SnapshotMembershipKey) -> Result<SnapshotMembershipCell, ConnectorError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| internal(format!("snapshot membership cache lock: {error}")))?;
+        if let Some(cell) = state.entries.get(key).cloned() {
+            state.order.retain(|cached| cached != key);
+            state.order.push_back(key.clone());
+            return Ok(cell);
+        }
+        while state.entries.len() >= self.capacity {
+            let Some(evicted) = state.order.pop_front() else {
+                return Err(internal(
+                    "snapshot membership cache lost its eviction order".to_string(),
+                ));
+            };
+            state.entries.remove(&evicted);
+        }
+        let cell = Arc::new(OnceLock::new());
+        state.entries.insert(key.clone(), Arc::clone(&cell));
+        state.order.push_back(key.clone());
+        Ok(cell)
+    }
+
+    fn get_or_try_init(
+        &self,
+        key: SnapshotMembershipKey,
+        load: impl FnOnce() -> SnapshotMembership,
+    ) -> SnapshotMembership {
+        let cell = self.cell(&key)?;
+        let result = cell.get_or_init(load).clone();
+        if result.is_err()
+            && let Ok(mut state) = self.state.lock()
+            && state
+                .entries
+                .get(&key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+        {
+            state.entries.remove(&key);
+            state.order.retain(|cached| cached != &key);
+        }
+        result
+    }
+
+    fn insert(
+        &self,
+        key: SnapshotMembershipKey,
+        membership: Arc<HashSet<SnapshotFileIdentity>>,
+    ) -> Result<(), ConnectorError> {
+        let cell = self.cell(&key)?;
+        let _ = cell.set(Ok(membership));
+        Ok(())
     }
 }
 
@@ -351,6 +492,21 @@ impl ConnectorRead for IcebergConnectorInstance {
                     .collect()
             }
         };
+        if let Some(snapshot_id) = scan.snapshot_id {
+            self.snapshot_memberships.insert(
+                SnapshotMembershipKey {
+                    namespace: scan.table.namespace.clone(),
+                    table: scan.table.table.clone(),
+                    snapshot_id,
+                },
+                Arc::new(
+                    files
+                        .iter()
+                        .map(SnapshotFileIdentity::from)
+                        .collect::<HashSet<_>>(),
+                ),
+            )?;
+        }
         let mut remaining = scan.limit;
         let mut splits = Vec::new();
         let mut total_payload_bytes = 0usize;
@@ -422,14 +578,10 @@ impl ConnectorRead for IcebergConnectorInstance {
                     "Iceberg split references an expired snapshot",
                 ));
             }
-            let belongs_to_snapshot = extract_data_files_with_stats_at(&loaded.table, snapshot_id)
-                .map_err(map_iceberg_error)?
-                .into_iter()
-                .any(|file| {
-                    file.path == split.data_file.path
-                        && file.size == split.data_file.size
-                        && file.record_count == split.data_file.row_count
-                });
+            let membership =
+                self.snapshot_membership(&entry, &split.namespace, &split.table, snapshot_id)?;
+            let belongs_to_snapshot =
+                membership.contains(&SnapshotFileIdentity::from(&split.data_file));
             if !belongs_to_snapshot {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
@@ -1055,6 +1207,46 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_membership_cache_is_bounded_and_reloads_evicted_snapshot() {
+        fn key(snapshot_id: i64) -> SnapshotMembershipKey {
+            SnapshotMembershipKey {
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                snapshot_id,
+            }
+        }
+
+        let cache = SnapshotMembershipCache::new(1);
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let membership = || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Arc::new(HashSet::new()))
+        };
+
+        cache
+            .get_or_try_init(key(1), membership)
+            .expect("load first snapshot");
+        cache
+            .get_or_try_init(key(1), membership)
+            .expect("reuse first snapshot");
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        cache
+            .get_or_try_init(key(2), membership)
+            .expect("load second snapshot");
+        cache
+            .get_or_try_init(key(1), membership)
+            .expect("reload evicted first snapshot");
+
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            cache.state.lock().expect("cache state").entries.len(),
+            1,
+            "cache must never retain more snapshots than its configured capacity"
+        );
+    }
+
+    #[test]
     fn split_payload_does_not_repeat_serialized_table_metadata() {
         let table = TablePayload {
             namespace: "db".to_string(),
@@ -1220,6 +1412,9 @@ mod tests {
         let provider = IcebergConnectorInstance {
             instance_id,
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+            snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
+                MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
+            )),
         };
 
         let error = provider

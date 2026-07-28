@@ -293,3 +293,89 @@ The complete gate sequence was rerun after the final live-test fixture migration
 ### Planned commit
 
 - Message: `fix(connector): enforce request and split integrity`
+
+## Code-review fix follow-up 4
+
+### Changed files/behavior
+
+- Preserved the caller's `ConnectorRequestContext` through custom
+  materialized-view and Iceberg-ref dispatch. Iceberg and StarRocks MV
+  analysis, pinned reads, delta reads, change-stream preparation, and refresh
+  lifecycle execution now reuse that context instead of creating a fresh
+  cancellation flag. The background scheduler constructs a context only at
+  its own operation-owner boundary.
+- Added cancellation/deadline validation after custom dispatch entry and at
+  the Iceberg-ref metadata/mutation boundaries, so cancellation that arrives
+  after the initial session precheck still aborts before mutation.
+- Replaced per-open pinned-manifest walks with a provider-owned bounded cache
+  of compact snapshot membership identities `(path, size, row_count)`.
+  `plan_splits` seeds the cache; a cache miss loads the pinned snapshot once;
+  repeated `open_reader` calls validate in memory. The cache has a fixed
+  64-snapshot capacity, LRU eviction, single initialization per resident key,
+  and failed loads are removed so later requests can retry.
+- Expired snapshots remain `NotFound`, while stale or forged split identities
+  remain `CorruptData`. Split payloads still do not carry serialized table
+  metadata. Statistics capability work remains owned by Task 9 and was not
+  changed.
+
+### RED evidence
+
+- `materialized_view_dispatch_observes_cancellation_after_entry` initially
+  failed because dispatch continued to MV lookup and returned
+  `materialized view does not exist: ice.analytics.orders_mv` instead of
+  `connector request was cancelled`.
+- `iceberg_ref_dispatch_observes_cancellation_after_entry` initially failed
+  because dispatch continued to catalog lookup and returned
+  `unknown catalog: ice` instead of `connector request was cancelled`.
+- `iceberg_instance_resolves_metadata_and_plans_a_snapshot_split` initially
+  failed after the planned snapshot manifest files were removed: repeated
+  `open_reader` returned `NotFound`, proving it rewalked the manifest rather
+  than using provider-owned snapshot membership.
+
+### Focused GREEN evidence
+
+- `cargo test -p novarocks --lib
+  materialized_view_dispatch_observes_cancellation_after_entry --profile
+  dev-opt -- --nocapture`: PASS (1 passed, 0 failed).
+- `cargo test -p novarocks --lib
+  iceberg_ref_dispatch_observes_cancellation_after_entry --profile dev-opt --
+  --nocapture`: PASS (1 passed, 0 failed).
+- `cargo test -p novarocks --lib
+  iceberg_instance_resolves_metadata_and_plans_a_snapshot_split --profile
+  dev-opt -- --nocapture`: PASS (1 passed, 0 failed). After planning, all
+  manifest files are removed; the original split still opens and reads twice,
+  while a corrupted split remains `ConnectorErrorKind::CorruptData`.
+- `cargo test -p novarocks --lib
+  snapshot_membership_cache_is_bounded_and_reloads_evicted_snapshot --profile
+  dev-opt -- --nocapture`: PASS (1 passed, 0 failed). A capacity-one cache
+  reuses the resident membership, evicts it when another snapshot enters, and
+  reloads it on the next access while retaining only one entry.
+
+### Final GREEN evidence
+
+- `cargo fmt --all -- --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p novarocks --all-targets --profile dev-opt`: PASS
+- `cargo check -p novarocks --features compat --lib --profile dev-opt`: PASS
+- `cargo check -p novarocks-server --all-targets --profile dev-opt`: PASS
+- `cargo test -p novarocks-spi --features connector-conformance --profile
+  dev-opt`: PASS (6 connector conformance, 8 connector contract, 8 state-store
+  contract)
+- `cargo test -p novarocks --lib connector --profile dev-opt`: PASS
+  (842 passed, 0 failed, 6766 filtered)
+
+### Follow-up audit
+
+- Request-owned MV/ref paths contain no fresh `AtomicBool(false)` cancellation
+  source. Explicit contexts reach both connector metadata calls and distributed
+  scan preparation. Test-only wrappers use test contexts, and the scheduler is
+  the sole background refresh operation owner.
+- The snapshot cache stores only compact file identities, is fixed-capacity,
+  and does not copy `TablePayload` or serialized metadata into each split.
+- The cache preserves fail-fast identity validation and retries failed
+  membership loads instead of retaining transient errors.
+- No statistics source file or Task 9 artifact changed in this follow-up.
+
+### Planned commit
+
+- Message: `fix(connector): preserve refresh context and cache split validation`

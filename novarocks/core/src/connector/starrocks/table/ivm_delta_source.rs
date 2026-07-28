@@ -28,7 +28,7 @@ use crate::connector::iceberg::changes::{
     scan_equality_delete_rows_for_table_at,
 };
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
-use crate::engine::{StandaloneState, execute_query};
+use crate::engine::{StandaloneState, execute_query_with_catalog_provider};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
 use crate::runtime::query_result::QueryResult;
@@ -211,6 +211,7 @@ pub(crate) fn execute_delta_source_query(
     input: IvmDeltaSourceInput<'_>,
     select_sql: &str,
     source_files: IvmDeltaSourceFiles,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryResult, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
@@ -252,14 +253,17 @@ pub(crate) fn execute_delta_source_query(
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    execute_query(
+    execute_query_with_catalog_provider(
         &executable,
+        &delta_catalog,
         &delta_catalog,
         &connectors_snapshot,
         input.current_database,
         input.state.exchange_port,
         None,
         &input.state.query_execution,
+        connector_context,
+        None,
     )
 }
 

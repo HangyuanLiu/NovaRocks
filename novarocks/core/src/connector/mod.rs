@@ -114,6 +114,16 @@ pub(crate) fn connector_request_context_for_query(
     )
 }
 
+pub(crate) fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), String> {
+    if context.cancellation().is_cancelled() {
+        return Err("connector request was cancelled".to_string());
+    }
+    if Instant::now() >= context.deadline() {
+        return Err("connector request deadline elapsed".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn test_request_context() -> ConnectorRequestContext {
     connector_request_context(None, Arc::new(AtomicBool::new(false)))

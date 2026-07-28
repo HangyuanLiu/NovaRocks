@@ -2788,17 +2788,32 @@ pub(crate) fn dispatch_statement(
             crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
         }
         Statement::AlterMaterializedView(stmt) => {
-            crate::engine::mv_flow::alter_mv(state, current_catalog, current_database, &stmt)
+            crate::engine::mv_flow::alter_mv_with_connector_context(
+                state,
+                current_catalog,
+                current_database,
+                &stmt,
+                connector_context,
+            )
         }
         Statement::RefreshMaterializedView(stmt) => {
-            crate::engine::mv_flow::refresh_mv(state, current_catalog, current_database, &stmt)
+            crate::engine::mv_flow::refresh_mv_with_connector_context(
+                state,
+                current_catalog,
+                current_database,
+                &stmt,
+                connector_context,
+            )
         }
         Statement::ShowMaterializedViews(stmt) => {
             crate::engine::mv_flow::list_mvs(state, current_catalog, &stmt)
         }
-        Statement::AlterIcebergRef(stmt) => {
-            crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
-        }
+        Statement::AlterIcebergRef(stmt) => crate::engine::iceberg_ref_flow::execute(
+            state,
+            current_database,
+            &stmt,
+            connector_context,
+        ),
         Statement::Truncate { name, target_ref } => {
             crate::engine::statement::execute_truncate_table_statement(
                 state,
@@ -3857,6 +3872,30 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
+    build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
+        state,
+        _current_catalog,
+        current_database,
+        optimized_tree,
+        dag,
+        mv_refresh_ctx,
+        pre_expand_keyed_assert,
+        &connector_context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
+    state: &Arc<StandaloneState>,
+    _current_catalog: Option<&str>,
+    current_database: &str,
+    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
+    pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let connectors_snapshot = state
         .connectors
         .read()
@@ -3878,7 +3917,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
-        &connector_context,
+        connector_context,
         scan_binding_resolver,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
@@ -7751,6 +7790,86 @@ mysql_port = 47892
             &context,
         )
         .expect_err("cancelled caller must stop custom statement dispatch");
+
+        assert_eq!(error, "connector request was cancelled");
+    }
+
+    struct CancelAfterDispatch {
+        polls: AtomicUsize,
+    }
+
+    impl novarocks_spi::connector::ConnectorCancellation for CancelAfterDispatch {
+        fn is_cancelled(&self) -> bool {
+            self.polls.fetch_add(1, Ordering::SeqCst) > 0
+        }
+    }
+
+    fn cancel_after_dispatch_context() -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            Arc::new(CancelAfterDispatch {
+                polls: AtomicUsize::new(0),
+            }),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("connector request context")
+    }
+
+    #[test]
+    fn materialized_view_dispatch_observes_cancellation_after_entry() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(
+                crate::sql::parser::ast::RefreshMaterializedViewStmt {
+                    name: crate::sql::parser::ast::ObjectName {
+                        parts: vec!["analytics".to_string(), "orders_mv".to_string()],
+                    },
+                    full: false,
+                },
+            ),
+            &cancel_after_dispatch_context(),
+        )
+        .expect_err("MV work dispatched by a cancelled caller must stop");
+
+        assert_eq!(error, "connector request was cancelled");
+    }
+
+    #[test]
+    fn iceberg_ref_dispatch_observes_cancellation_after_entry() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            crate::sql::parser::ast::Statement::AlterIcebergRef(
+                crate::sql::parser::ast::AlterIcebergRefStmt {
+                    table: crate::sql::parser::ast::ObjectName {
+                        parts: vec![
+                            "ice".to_string(),
+                            "analytics".to_string(),
+                            "orders".to_string(),
+                        ],
+                    },
+                    action: crate::sql::parser::ast::AlterIcebergRefAction::CreateBranch {
+                        name: "cancelled".to_string(),
+                        anchor: crate::sql::parser::ast::SnapshotAnchor::CurrentMain,
+                        if_not_exists: false,
+                        replace: false,
+                        ignored_options: Vec::new(),
+                    },
+                },
+            ),
+            &cancel_after_dispatch_context(),
+        )
+        .expect_err("Iceberg ref work dispatched by a cancelled caller must stop");
 
         assert_eq!(error, "connector request was cancelled");
     }

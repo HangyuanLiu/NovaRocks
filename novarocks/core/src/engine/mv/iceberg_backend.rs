@@ -96,7 +96,7 @@ impl MvBackend for IcebergMvBackend {
     fn execute_refresh(
         &self,
         plan: &RefreshPlan,
-        _ctx: &mut RefreshCtx,
+        ctx: &mut RefreshCtx,
     ) -> Result<RefreshOutcome, RefreshError> {
         let BackendRefreshPlan::Iceberg(plan_payload) = &plan.backend_plan else {
             return Err(RefreshError::user(
@@ -104,11 +104,13 @@ impl MvBackend for IcebergMvBackend {
             ));
         };
         let state = self.state().map_err(RefreshError::pre_commit)?;
-        let outcome = crate::engine::mv::iceberg_refresh::execute_iceberg_mv_refresh(
-            &state,
-            plan_payload,
-            &plan.contract,
-        )?;
+        let outcome =
+            crate::engine::mv::iceberg_refresh::execute_iceberg_mv_refresh_with_connector_context(
+                &state,
+                plan_payload,
+                &plan.contract,
+                &ctx.connector_context,
+            )?;
         Ok(RefreshOutcome {
             mv_id: plan.contract.mv_id,
             target: plan.contract.target.clone(),

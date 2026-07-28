@@ -30,9 +30,15 @@ pub(crate) fn run_mv_full_select_chunks_with_catalog(
     current_catalog: Option<&str>,
     database: &str,
     select_sql: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<Chunk>, String> {
-    let result =
-        execute_query_for_mv_refresh_with_catalog(state, current_catalog, database, select_sql)?;
+    let result = execute_query_for_mv_refresh_with_catalog(
+        state,
+        current_catalog,
+        database,
+        select_sql,
+        connector_context,
+    )?;
     query_result_to_chunks(result)
 }
 
