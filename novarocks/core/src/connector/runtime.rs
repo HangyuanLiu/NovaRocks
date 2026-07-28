@@ -25,6 +25,7 @@ use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorInstance, ConnectorOpenReaderRequest, ConnectorSplit,
 };
 
+use crate::connector::host::ConnectorInstanceLease;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
@@ -110,6 +111,7 @@ pub(crate) struct ConnectorReadScanSource {
     splits: Vec<ConnectorSplit>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
+    lifecycle: Option<Arc<ConnectorInstanceLease>>,
 }
 
 impl ConnectorReadScanSource {
@@ -124,6 +126,23 @@ impl ConnectorReadScanSource {
             splits,
             request,
             chunk_schema,
+            lifecycle: None,
+        }
+    }
+
+    pub(crate) fn new_ephemeral(
+        instance: Arc<ConnectorInstance>,
+        splits: Vec<ConnectorSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        lifecycle: Arc<ConnectorInstanceLease>,
+    ) -> Self {
+        Self {
+            instance,
+            splits,
+            request,
+            chunk_schema,
+            lifecycle: Some(lifecycle),
         }
     }
 }
@@ -138,6 +157,7 @@ impl ScanSource for ConnectorReadScanSource {
             splits: self.splits.clone(),
             request: self.request.clone(),
             chunk_schema: Arc::clone(&self.chunk_schema),
+            _lifecycle: self.lifecycle.clone(),
         }))
     }
 }
@@ -147,6 +167,9 @@ struct ConnectorReadScanOp {
     splits: Vec<ConnectorSplit>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
+    // Keep ephemeral provider credentials registered until every scan op and
+    // reader derived from this source has drained.
+    _lifecycle: Option<Arc<ConnectorInstanceLease>>,
 }
 
 impl ScanOp for ConnectorReadScanOp {

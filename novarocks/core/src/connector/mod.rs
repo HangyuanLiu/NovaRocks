@@ -50,11 +50,11 @@ pub(crate) use starrocks_table_stub::{
 
 use scan_planning::ConnectorScanPlanner;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use novarocks_spi::connector::{ConnectorInstance, ConnectorInstanceId};
 
-use self::host::{ConnectorHost, ConnectorHostError};
+use self::host::{ConnectorHost, ConnectorHostError, ConnectorInstanceLease};
 
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 use crate::exec::node::scan::{BoundScanRanges, ScanSource};
@@ -373,7 +373,7 @@ pub trait ScanConnector: Send + Sync {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
-    connector_host: ConnectorHost,
+    connector_host: Arc<RwLock<ConnectorHost>>,
     scan_connectors: HashMap<&'static str, Arc<dyn ScanConnector>>,
     catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
     table_sources: HashMap<&'static str, Arc<dyn TableSource>>,
@@ -385,7 +385,7 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
-            connector_host: ConnectorHost::default(),
+            connector_host: Arc::new(RwLock::new(ConnectorHost::default())),
             scan_connectors: HashMap::new(),
             catalog_backends: HashMap::new(),
             table_sources: HashMap::new(),
@@ -400,24 +400,54 @@ impl ConnectorRegistry {
     }
 
     pub(crate) fn register_connector_instance(
-        &mut self,
+        &self,
         instance: ConnectorInstance,
     ) -> Result<(), ConnectorHostError> {
-        self.connector_host.register(instance)
+        self.connector_host
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .register(instance)
     }
 
     pub(crate) fn unregister_connector_instance(
-        &mut self,
+        &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
-        self.connector_host.unregister(instance_id)
+        self.connector_host
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .unregister(instance_id)
     }
 
     pub(crate) fn connector_instance(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
-        self.connector_host.resolve(instance_id)
+        self.connector_host
+            .read()
+            .map_err(|_| ConnectorHostError::unavailable("connector host read lock poisoned"))?
+            .resolve(instance_id)
+    }
+
+    /// Register a query-local instance and return a lease that removes it once
+    /// the physical scan no longer retains it.
+    pub(crate) fn register_ephemeral_connector_instance(
+        &self,
+        instance: ConnectorInstance,
+    ) -> Result<(Arc<ConnectorInstance>, Arc<ConnectorInstanceLease>), ConnectorHostError> {
+        let instance_id = instance.descriptor().instance_id.clone();
+        self.register_connector_instance(instance)?;
+        let lease = Arc::new(ConnectorInstanceLease::new(
+            Arc::clone(&self.connector_host),
+            instance_id.clone(),
+        ));
+        match self.connector_instance(&instance_id) {
+            Ok(instance) => Ok((instance, lease)),
+            Err(error) => {
+                drop(lease);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn register_catalog_backend(&mut self, backend: Arc<dyn CatalogBackend>) {

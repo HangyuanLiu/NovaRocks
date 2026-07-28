@@ -664,6 +664,7 @@ fn lower_node_with_children_typed(
                 tuple_slots,
                 &context.query_options,
                 connectors,
+                context.query_id,
                 context.scan_ranges,
             )?,
             t if t == plan_nodes::TPlanNodeType::FILE_SCAN_NODE => lower_file_scan_node(
@@ -688,6 +689,7 @@ fn lower_node_with_children_typed(
                 connectors,
                 db_name,
                 context.decode_facts,
+                context.query_id,
                 context.scan_ranges,
             )?,
             t if t == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE => lower_hdfs_scan_node(
