@@ -62,7 +62,7 @@ pub struct RemoveOrphanOutcome {
     pub deleted_file_locations: Vec<String>,
 }
 
-/// Top-level entry point called from `engine::iceberg_remove_orphan_files`.
+/// Top-level entry point called from `engine::iceberg_maintenance`.
 ///
 /// Algorithm (spec §4.2):
 /// 1. Enumerate live file set (all snapshots in metadata + metadata-log).
