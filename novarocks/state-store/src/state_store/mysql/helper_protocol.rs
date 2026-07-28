@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::de::{IgnoredAny, MapAccess, Visitor};
@@ -27,13 +27,13 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
-use super::test_support::MysqlCommitTestApi;
+use super::test_support::{MysqlCommitTestApi, MysqlProviderTestHarness};
 use novarocks_spi::state_store::MAX_VALUE_BYTES;
 
 use crate::state_store::limits::MYSQL_MAX_KEY_BYTES;
 use crate::state_store::{
     FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+    StateStoreProviderConfig,
 };
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
@@ -47,6 +47,7 @@ const MAX_VALUE_HEX_BYTES: usize = MAX_VALUE_BYTES * 2;
 const MAX_TOKEN_HEX_BYTES: usize = 16 * 1024;
 const COMMIT_HOOK_DEADLINE: Duration = Duration::from_secs(5);
 const COMMIT_OWNER_DEADLINE: Duration = Duration::from_secs(6);
+const COMMAND_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 enum Direction {
@@ -275,7 +276,7 @@ impl Response {
 
 #[derive(Default)]
 struct HelperState {
-    runtime: Option<StateStoreRuntime>,
+    runtime: Option<MysqlProviderTestHarness>,
     store: Option<Arc<dyn StateStore>>,
     transactions: HashMap<Uuid, Box<dyn WriteTransaction>>,
     next_id: u64,
@@ -371,23 +372,26 @@ impl HelperState {
         }
         let database = required_env(id, "NOVAROCKS_MYSQL_DATABASE")?;
         let config = client_config(id)?;
-        let mut runtime = StateStoreRuntime::mysql(config)
+        let mut runtime = MysqlProviderTestHarness::boot(config)
             .map_err(|error| ProtocolError::state_store(id, "OpenFailed", &error))?;
-        let store = match open_state_store(
-            &runtime,
-            StateStoreConfig {
-                cluster_id,
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Mysql { database },
-            },
-            deployment(),
-        )
-        .await
+        let store = match runtime
+            .open_store(
+                StateStoreConfig {
+                    cluster_id,
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Mysql { database },
+                },
+                deployment(),
+                Instant::now() + COMMAND_DEADLINE,
+            )
+            .await
         {
             Ok(store) => store,
             Err(error) => {
                 let mut primary = ProtocolError::state_store(id, "OpenFailed", &error);
-                if let Err(shutdown_error) = runtime.shutdown().await {
+                if let Err(shutdown_error) =
+                    runtime.shutdown(Instant::now() + COMMAND_DEADLINE).await
+                {
                     primary.error_kind = Some(format!(
                         "{:?}+Shutdown{:?}",
                         error.kind(),
@@ -623,7 +627,7 @@ impl HelperState {
         self.store.take();
         if let Some(mut runtime) = self.runtime.take() {
             runtime
-                .shutdown()
+                .shutdown(Instant::now() + COMMAND_DEADLINE)
                 .await
                 .map_err(|error| ProtocolError::state_store(id, "ShutdownFailed", &error))?;
         }

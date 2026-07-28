@@ -37,8 +37,8 @@ use super::client::{
 use super::codec::MysqlCodec;
 use super::error::{MysqlNativeError, MysqlReadStatementError, MysqlTransactionDisposition};
 use super::range::{decode_record, read_range_page};
+use super::runtime::MysqlRuntimeGuard;
 use crate::state_store::metrics::StateStoreMetrics;
-use crate::state_store::runtime::MysqlRuntimeGuard;
 use novarocks_spi::state_store::{
     CommitOutcome, CommitReceipt, ContinuationToken, Direction, Key, Precondition, RangePage,
     RangeRequest, ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind,
@@ -2092,7 +2092,7 @@ impl MysqlHeldKvLock {
     }
 }
 
-pub(in crate::state_store) async fn hold_kv_lock_for_test(
+pub(super) async fn hold_kv_lock_for_test(
     pool: Arc<dyn PoolLifecycle>,
     operation: MysqlRuntimeGuard,
     key: &[u8],
@@ -2141,7 +2141,7 @@ pub(crate) async fn insert_malformed_kv_row_for_test(
         .await
 }
 
-pub(in crate::state_store) async fn deadlock_1213_maps_to_conflict_for_test(
+pub(super) async fn deadlock_1213_maps_to_conflict_for_test(
     pool: Arc<dyn PoolLifecycle>,
     first_operation: MysqlRuntimeGuard,
     second_operation: MysqlRuntimeGuard,
@@ -2224,7 +2224,7 @@ pub(in crate::state_store) async fn deadlock_1213_maps_to_conflict_for_test(
     Ok(())
 }
 
-pub(in crate::state_store) async fn lock_timeout_1205_rolls_back_before_conflict_for_test(
+pub(super) async fn lock_timeout_1205_rolls_back_before_conflict_for_test(
     pool: Arc<dyn PoolLifecycle>,
     first_operation: MysqlRuntimeGuard,
     second_operation: MysqlRuntimeGuard,

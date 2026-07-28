@@ -25,6 +25,8 @@ use novarocks_spi::state_store::{
 use super::config::{StateStoreHostConfig, StateStoreProviderConfig};
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
 use super::limits::{MYSQL_MAX_KEY_BYTES, resolve_state_store_limits};
+#[cfg(feature = "mysql-state-store-provider")]
+use super::mysql::provider::MysqlStateStoreProviderFactory;
 use super::sqlite::SqliteStateStoreProviderFactory;
 
 pub const SQLITE_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
@@ -177,6 +179,33 @@ pub fn builtin_state_store_provider_registry()
             )))
         },
     ))?;
+    #[cfg(feature = "mysql-state-store-provider")]
+    registry.register(StateStoreProviderRegistration::available(
+        MYSQL_STATE_STORE_PROVIDER_ID,
+        MYSQL_MAX_KEY_BYTES,
+        |config| {
+            let StateStoreProviderConfig::Mysql { database } = &config.state_store.store.provider
+            else {
+                return Err(StateStoreHostError::new(
+                    StateStoreHostErrorKind::Bind,
+                    Some(MYSQL_STATE_STORE_PROVIDER_ID),
+                    "MySQL provider binder requires MySQL provider configuration",
+                ));
+            };
+            let client = config.state_store.mysql_client.clone().ok_or_else(|| {
+                StateStoreHostError::new(
+                    StateStoreHostErrorKind::Bind,
+                    Some(MYSQL_STATE_STORE_PROVIDER_ID),
+                    "MySQL provider binder requires MySQL client configuration",
+                )
+            })?;
+            Ok(Box::new(MysqlStateStoreProviderFactory::new(
+                database.clone(),
+                client,
+            )))
+        },
+    ))?;
+    #[cfg(not(feature = "mysql-state-store-provider"))]
     registry.register(StateStoreProviderRegistration::unavailable(
         MYSQL_STATE_STORE_PROVIDER_ID,
         "MySQL provider is not compiled in",

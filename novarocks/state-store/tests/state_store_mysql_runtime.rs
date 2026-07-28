@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "mysql-state-store-provider")]
+#![cfg(all(
+    feature = "mysql-state-store-provider",
+    feature = "state-store-test-hooks"
+))]
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use novarocks_spi::state_store::StateStoreErrorKind;
 use novarocks_state_store::mysql::test_support::{
-    acquire_operation, acquire_provider_handle, active_readiness, begin_shutdown, hold_connection,
-    is_accepting, pollute_session, pool_count, prepare_pool, restart_mysql_fixture, runtime_owner,
-    validate_owner,
+    MysqlProviderTestHarness, acquire_operation, acquire_provider_handle, active_readiness,
+    begin_shutdown, hold_connection, is_accepting, pollute_session, pool_count, prepare_pool,
+    restart_mysql_fixture, runtime_owner, validate_owner,
 };
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store::mysql::test_support::{
@@ -33,7 +36,7 @@ use novarocks_state_store::mysql::test_support::{
 };
 use novarocks_state_store::{
     FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+    StateStoreProviderConfig,
 };
 
 fn environment_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -78,6 +81,19 @@ fn deployment() -> FeDeploymentView {
     }
 }
 
+async fn open_state_store(
+    runtime: &MysqlProviderTestHarness,
+    config: StateStoreConfig,
+    deployment: FeDeploymentView,
+) -> Result<
+    std::sync::Arc<dyn novarocks_spi::state_store::StateStore>,
+    novarocks_spi::state_store::StateStoreError,
+> {
+    runtime
+        .open_store(config, deployment, Instant::now() + Duration::from_secs(30))
+        .await
+}
+
 fn fixture_client_config() -> MySqlClientConfig {
     let password_env =
         std::env::var("NOVAROCKS_MYSQL_PASSWORD_ENV").expect("fixture password env name");
@@ -110,8 +126,9 @@ fn mysql_runtime_requires_tokio_context() {
     unsafe {
         std::env::set_var("NOVAROCKS_SS3_RUNTIME_CONTEXT_PASSWORD", "secret");
     }
-    let error = StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_CONTEXT_PASSWORD"))
-        .expect_err("MySQL runtime construction must require an active Tokio runtime");
+    let error =
+        MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_CONTEXT_PASSWORD"))
+            .expect_err("MySQL runtime construction must require an active Tokio runtime");
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
 }
 
@@ -121,13 +138,17 @@ async fn mysql_runtime_rejects_pid_mismatch() {
     unsafe {
         std::env::set_var("NOVAROCKS_SS3_RUNTIME_PID_PASSWORD", "secret");
     }
-    let mut runtime = StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_PID_PASSWORD"))
-        .expect("construct MySQL runtime");
+    let mut runtime =
+        MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_PID_PASSWORD"))
+            .expect("construct MySQL runtime");
     let owner = runtime_owner(&runtime).expect("read runtime owner");
     let error = validate_owner(&runtime, owner.pid.wrapping_add(1))
         .expect_err("a different process must be rejected");
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
-    runtime.shutdown().await.expect("shutdown owner runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown owner runtime");
 }
 
 #[test]
@@ -142,7 +163,7 @@ fn mysql_runtime_rejects_independent_tokio_runtime() {
         .expect("build first runtime");
     let runtime = first
         .block_on(async {
-            StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_TOKIO_PASSWORD"))
+            MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_TOKIO_PASSWORD"))
         })
         .expect("construct MySQL runtime");
     let second = tokio::runtime::Builder::new_current_thread()
@@ -157,7 +178,7 @@ fn mysql_runtime_rejects_independent_tokio_runtime() {
     });
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
     first
-        .block_on(runtime.shutdown())
+        .block_on(runtime.shutdown(Instant::now() + Duration::from_secs(5)))
         .expect("shutdown on owner runtime");
 }
 
@@ -168,14 +189,17 @@ async fn mysql_runtime_rejects_provider_mismatch() {
         std::env::set_var("NOVAROCKS_SS3_RUNTIME_PROVIDER_PASSWORD", "secret");
     }
     let mut runtime =
-        StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_PROVIDER_PASSWORD"))
+        MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_PROVIDER_PASSWORD"))
             .expect("construct MySQL runtime");
     let error = match open_state_store(&runtime, sqlite_store_config(), deployment()).await {
         Ok(_) => panic!("MySQL runtime must reject SQLite"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
-    runtime.shutdown().await.expect("shutdown owner runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown owner runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -185,7 +209,7 @@ async fn mysql_runtime_reuses_one_pool_per_database() {
         std::env::set_var("NOVAROCKS_SS3_RUNTIME_POOL_PASSWORD", "secret");
     }
     let mut runtime =
-        StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_POOL_PASSWORD"))
+        MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_POOL_PASSWORD"))
             .expect("construct MySQL runtime");
     prepare_pool(&runtime, "novarocks_runtime_pool")
         .await
@@ -194,7 +218,10 @@ async fn mysql_runtime_reuses_one_pool_per_database() {
         .await
         .expect("reuse first pool");
     assert_eq!(pool_count(&runtime).expect("pool count"), 1);
-    runtime.shutdown().await.expect("shutdown owner runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown owner runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -204,17 +231,17 @@ async fn mysql_runtime_shutdown_is_retryable_after_handles_drain() {
         std::env::set_var("NOVAROCKS_SS3_RUNTIME_DRAIN_PASSWORD", "secret");
     }
     let mut runtime =
-        StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_DRAIN_PASSWORD"))
+        MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_DRAIN_PASSWORD"))
             .expect("construct MySQL runtime");
     let handle = acquire_provider_handle(&runtime).expect("acquire provider handle");
     let first = runtime
-        .shutdown_with_timeout(Duration::from_millis(20))
+        .shutdown(Instant::now() + Duration::from_millis(20))
         .await
         .expect_err("live handles must defer shutdown");
     assert_eq!(first.kind(), StateStoreErrorKind::DeadlineExceeded);
     drop(handle);
     runtime
-        .shutdown_with_timeout(Duration::from_secs(1))
+        .shutdown(Instant::now() + Duration::from_secs(1))
         .await
         .expect("shutdown must be retryable after drain");
 }
@@ -226,7 +253,7 @@ async fn mysql_runtime_stops_new_open_and_operations_during_shutdown() {
         std::env::set_var("NOVAROCKS_SS3_RUNTIME_STOP_PASSWORD", "secret");
     }
     let mut runtime =
-        StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_STOP_PASSWORD"))
+        MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_STOP_PASSWORD"))
             .expect("construct MySQL runtime");
     let handle = acquire_provider_handle(&runtime).expect("acquire provider handle");
     begin_shutdown(&runtime).expect("begin shutdown");
@@ -243,7 +270,7 @@ async fn mysql_runtime_stops_new_open_and_operations_during_shutdown() {
     );
     drop(handle);
     runtime
-        .shutdown_with_timeout(Duration::from_secs(1))
+        .shutdown(Instant::now() + Duration::from_secs(1))
         .await
         .expect("shutdown after handle drain");
 }
@@ -263,7 +290,7 @@ async fn mysql_runtime_debug_redacts_client_configuration() {
         tls_ca_path: Some(ca_path.clone()),
         ..client_config("NOVAROCKS_SS3_RUNTIME_DEBUG_PASSWORD")
     };
-    let mut runtime = StateStoreRuntime::mysql(config).expect("construct MySQL runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("construct MySQL runtime");
     let debug = format!("{runtime:?}");
     for secret in [
         "sensitive.mysql.internal",
@@ -275,8 +302,11 @@ async fn mysql_runtime_debug_redacts_client_configuration() {
     ] {
         assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
     }
-    assert!(debug.contains("StateStoreRuntime::Mysql"));
-    runtime.shutdown().await.expect("shutdown owner runtime");
+    assert!(debug.contains("MysqlProviderTestHarness::Mysql"));
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown owner runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -285,7 +315,7 @@ async fn mysql_runtime_rejects_missing_password_environment_value() {
     unsafe {
         std::env::remove_var("NOVAROCKS_SS3_MISSING_PASSWORD");
     }
-    let error = StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_MISSING_PASSWORD"))
+    let error = MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_MISSING_PASSWORD"))
         .expect_err("missing secret must fail");
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
 }
@@ -296,7 +326,7 @@ async fn mysql_runtime_rejects_empty_password_environment_value() {
     unsafe {
         std::env::set_var("NOVAROCKS_SS3_EMPTY_PASSWORD", "");
     }
-    let error = StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_EMPTY_PASSWORD"))
+    let error = MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_EMPTY_PASSWORD"))
         .expect_err("empty secret must fail");
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
 }
@@ -310,7 +340,7 @@ async fn mysql_client_pool_is_lazy_until_active_readiness() {
     let mut config = client_config("NOVAROCKS_SS3_LAZY_PASSWORD");
     config.host = "127.0.0.1".to_owned();
     config.port = 1;
-    let mut runtime = StateStoreRuntime::mysql(config).expect("lazy runtime construction");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("lazy runtime construction");
     prepare_pool(&runtime, "novarocks_lazy_pool")
         .await
         .expect("Pool::new must stay lazy");
@@ -322,14 +352,17 @@ async fn mysql_client_pool_is_lazy_until_active_readiness() {
         error.kind(),
         StateStoreErrorKind::DeadlineExceeded | StateStoreErrorKind::ProviderUnavailable
     ));
-    runtime.shutdown().await.expect("shutdown lazy pool");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown lazy pool");
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn mysql_client_readiness_checks_exact_server_and_session_contract() {
     let _guard = environment_lock();
-    let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("fixture runtime construction");
+    let mut runtime = MysqlProviderTestHarness::boot(fixture_client_config())
+        .expect("fixture runtime construction");
     let snapshot = active_readiness(&runtime, &fixture_database(), Duration::from_secs(3))
         .await
         .expect("active readiness");
@@ -340,7 +373,10 @@ async fn mysql_client_readiness_checks_exact_server_and_session_contract() {
     assert!(snapshot.sql_mode.contains("STRICT"));
     assert_eq!(snapshot.time_zone, "+00:00");
     assert_eq!(snapshot.character_set, "utf8mb4");
-    runtime.shutdown().await.expect("shutdown fixture runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown fixture runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -353,18 +389,18 @@ async fn mysql_client_readiness_maps_auth_database_and_tls_failures() {
         std::env::set_var("NOVAROCKS_SS3_BAD_AUTH_PASSWORD", "wrong-password");
     }
     bad_auth.password_env = "NOVAROCKS_SS3_BAD_AUTH_PASSWORD".to_owned();
-    let mut auth_runtime = StateStoreRuntime::mysql(bad_auth).expect("auth runtime");
+    let mut auth_runtime = MysqlProviderTestHarness::boot(bad_auth).expect("auth runtime");
     let auth = active_readiness(&auth_runtime, &database, Duration::from_secs(2))
         .await
         .expect_err("bad auth must fail");
     assert_eq!(auth.kind(), StateStoreErrorKind::InvalidConfiguration);
     auth_runtime
-        .shutdown()
+        .shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("shutdown auth runtime");
 
     let mut database_runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("database runtime");
+        MysqlProviderTestHarness::boot(fixture_client_config()).expect("database runtime");
     let missing_database = active_readiness(
         &database_runtime,
         "novarocks_ss3_database_does_not_exist",
@@ -377,7 +413,7 @@ async fn mysql_client_readiness_maps_auth_database_and_tls_failures() {
         StateStoreErrorKind::InvalidConfiguration
     );
     database_runtime
-        .shutdown()
+        .shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("shutdown database runtime");
 
@@ -387,20 +423,23 @@ async fn mysql_client_readiness_maps_auth_database_and_tls_failures() {
     bad_tls.host = "localhost".to_owned();
     bad_tls.tls_mode = MySqlTlsMode::VerifyIdentity;
     bad_tls.tls_ca_path = Some(invalid_ca.path().to_path_buf());
-    let mut tls_runtime = StateStoreRuntime::mysql(bad_tls).expect("TLS runtime");
+    let mut tls_runtime = MysqlProviderTestHarness::boot(bad_tls).expect("TLS runtime");
     let tls = active_readiness(&tls_runtime, &database, Duration::from_secs(2))
         .await
         .expect_err("invalid CA must fail");
     assert_eq!(tls.kind(), StateStoreErrorKind::InvalidConfiguration);
-    tls_runtime.shutdown().await.expect("shutdown TLS runtime");
+    tls_runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown TLS runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn mysql_client_pool_reset_and_checkout_hygiene_clear_session_pollution() {
     let _guard = environment_lock();
     let database = fixture_database();
-    let mut runtime =
-        StateStoreRuntime::mysql(fixture_client_config()).expect("fixture runtime construction");
+    let mut runtime = MysqlProviderTestHarness::boot(fixture_client_config())
+        .expect("fixture runtime construction");
     pollute_session(&runtime, &database, Duration::from_secs(2))
         .await
         .expect("pollute checked-out session");
@@ -410,7 +449,10 @@ async fn mysql_client_pool_reset_and_checkout_hygiene_clear_session_pollution() 
     assert_eq!(snapshot.time_zone, "+00:00");
     assert!(snapshot.sql_mode.contains("STRICT"));
     assert_eq!(snapshot.character_set, "utf8mb4");
-    runtime.shutdown().await.expect("shutdown fixture runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown fixture runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -423,7 +465,7 @@ async fn mysql_client_connect_deadline_is_bounded() {
     config.host = "203.0.113.1".to_owned();
     config.port = 3306;
     config.connect_timeout_ms = 100;
-    let mut runtime = StateStoreRuntime::mysql(config).expect("deadline runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("deadline runtime");
     let started = std::time::Instant::now();
     let error = active_readiness(
         &runtime,
@@ -437,7 +479,10 @@ async fn mysql_client_connect_deadline_is_bounded() {
         error.kind(),
         StateStoreErrorKind::DeadlineExceeded | StateStoreErrorKind::ProviderUnavailable
     ));
-    runtime.shutdown().await.expect("shutdown deadline runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown deadline runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -447,7 +492,7 @@ async fn mysql_client_pool_exhaustion_honors_operation_deadline() {
     config.pool_min = 1;
     config.pool_max = 1;
     let database = fixture_database();
-    let mut runtime = StateStoreRuntime::mysql(config).expect("fixture runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("fixture runtime");
     let held = hold_connection(&runtime, &database, Duration::from_secs(2))
         .await
         .expect("hold the only connection");
@@ -456,7 +501,10 @@ async fn mysql_client_pool_exhaustion_honors_operation_deadline() {
         .expect_err("pool wait must honor total deadline");
     assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded);
     drop(held);
-    runtime.shutdown().await.expect("shutdown fixture runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown fixture runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -467,7 +515,7 @@ async fn mysql_client_pool_wait_can_outlive_connect_timeout_within_operation_dea
     config.pool_min = 1;
     config.pool_max = 1;
     let database = fixture_database();
-    let mut runtime = StateStoreRuntime::mysql(config).expect("fixture runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("fixture runtime");
     let held = hold_connection(&runtime, &database, Duration::from_secs(2))
         .await
         .expect("hold the only connection");
@@ -479,7 +527,10 @@ async fn mysql_client_pool_wait_can_outlive_connect_timeout_within_operation_dea
     active_readiness(&runtime, &database, Duration::from_secs(1))
         .await
         .expect("pool wait may exceed connect timeout while inside total deadline");
-    runtime.shutdown().await.expect("shutdown fixture runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown fixture runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -490,7 +541,7 @@ async fn mysql_client_readiness_timeout_destroys_undrained_connection() {
     config.pool_min = 1;
     config.pool_max = 1;
     let database = fixture_database();
-    let mut runtime = StateStoreRuntime::mysql(config).expect("fixture runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("fixture runtime");
     let before = active_readiness(&runtime, &database, Duration::from_secs(2))
         .await
         .expect("establish pooled connection");
@@ -507,7 +558,10 @@ async fn mysql_client_readiness_timeout_destroys_undrained_connection() {
         before.connection_id, after.connection_id,
         "undrained readiness connection must not return to the pool"
     );
-    runtime.shutdown().await.expect("shutdown fixture runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown fixture runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -517,7 +571,7 @@ async fn mysql_runtime_discards_stale_connections_after_server_restart() {
     config.pool_min = 1;
     config.pool_max = 1;
     let database = fixture_database();
-    let mut runtime = StateStoreRuntime::mysql(config).expect("fixture runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("fixture runtime");
     active_readiness(&runtime, &database, Duration::from_secs(2))
         .await
         .expect("establish pooled connection before restart");
@@ -531,7 +585,10 @@ async fn mysql_runtime_discards_stale_connections_after_server_restart() {
         .expect("discard stale connection and establish a fresh one");
     assert_eq!(snapshot.server_version, "8.4.10");
     assert_eq!(pool_count(&runtime).expect("pool count"), 1);
-    runtime.shutdown().await.expect("shutdown fixture runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown fixture runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -542,7 +599,7 @@ async fn mysql_runtime_destroys_connection_when_cancelled_statement_is_not_drain
     config.pool_min = 1;
     config.pool_max = 1;
     let database = fixture_database();
-    let mut runtime = StateStoreRuntime::mysql(config).expect("fixture runtime");
+    let mut runtime = MysqlProviderTestHarness::boot(config).expect("fixture runtime");
     let before = active_readiness(&runtime, &database, Duration::from_secs(2))
         .await
         .expect("establish pooled connection");
@@ -559,5 +616,8 @@ async fn mysql_runtime_destroys_connection_when_cancelled_statement_is_not_drain
         before.connection_id, after.connection_id,
         "the cancelled statement connection must not return to the pool"
     );
-    runtime.shutdown().await.expect("shutdown fixture runtime");
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown fixture runtime");
 }

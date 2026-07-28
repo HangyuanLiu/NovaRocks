@@ -27,10 +27,13 @@ pub mod helper_protocol;
 pub(crate) mod identity;
 #[cfg(feature = "state-store-test-hooks")]
 pub(crate) mod open_test_hooks;
+pub(crate) mod provider;
 pub(crate) mod range;
+pub(crate) mod runtime;
 pub(crate) mod schema;
 pub(crate) mod txn;
 
+#[cfg(feature = "state-store-test-hooks")]
 #[doc(hidden)]
 pub mod test_support;
 
@@ -43,12 +46,39 @@ use tokio::time::Instant;
 use self::identity::MysqlIdentitySnapshot;
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
-    WriteTransaction,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
+    StoreIdentity, TransactionId, WriteTransaction,
 };
 
+use self::runtime::MysqlProviderHandle;
 use super::metrics::StateStoreMetrics;
-use super::runtime::MysqlProviderHandle;
+
+pub(super) struct LegacyMysqlRuntime {
+    inner: runtime::MysqlRuntime,
+}
+
+impl LegacyMysqlRuntime {
+    pub(super) fn boot(config: super::MySqlClientConfig) -> Result<Self, StateStoreError> {
+        Ok(Self {
+            inner: runtime::MysqlRuntime::boot(config)?,
+        })
+    }
+
+    pub(super) async fn open_store(
+        &self,
+        database: String,
+        request: StateStoreOpenRequest,
+    ) -> Result<Arc<dyn StateStore>, StateStoreError> {
+        self.inner.open_store(database, request).await
+    }
+
+    pub(super) async fn shutdown_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), StateStoreError> {
+        self.inner.shutdown_until(deadline).await
+    }
+}
 
 pub(super) struct MysqlStateStore {
     lease: MysqlProviderHandle,
@@ -63,7 +93,7 @@ pub(super) struct MysqlOpenCancellation {
 }
 
 impl MysqlStateStore {
-    pub(super) async fn open(
+    async fn open(
         lease: MysqlProviderHandle,
         database: String,
         cluster_id: String,
