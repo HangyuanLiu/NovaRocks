@@ -334,25 +334,18 @@ fn adopt_mv_target_compaction_snapshot_if_present(
     rewrite_target: &WholeTableRewriteTarget,
     new_snapshot_id: i64,
 ) -> Result<(), String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(());
-    };
-    let mut txn = provider
-        .begin_write("adopt iceberg mv target compaction snapshot")
-        .map_err(|e| format!("open mv compaction-snapshot adopt transaction failed: {e}"))?;
     let adopted = state
-        .mv_repo
+        .mv_repository
         .adopt_target_compaction_snapshot(
-            txn.as_mut(),
-            &rewrite_target.catalog,
-            &rewrite_target.namespace,
-            &rewrite_target.table,
+            &crate::mv::model::MvTarget {
+                catalog: Some(rewrite_target.catalog.clone()),
+                database: rewrite_target.namespace.clone(),
+                name: rewrite_target.table.clone(),
+            },
             rewrite_target.base_snapshot_id,
             new_snapshot_id,
         )
         .map_err(|e| format!("adopt iceberg mv target compaction snapshot failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit mv compaction-snapshot adopt transaction failed: {e}"))?;
     if adopted {
         tracing::info!(
             catalog = rewrite_target.catalog,

@@ -193,6 +193,8 @@ pub async fn run_standalone_server_with_config_until_shutdown<F>(
     table_maintenance_service: std::sync::Arc<
         dyn crate::engine::table_maintenance::TableMaintenanceService,
     >,
+    mv_repository: std::sync::Arc<dyn crate::mv::repository::MvRepository>,
+    mv_application_service: std::sync::Arc<dyn crate::mv::application::MvApplicationService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -211,6 +213,8 @@ where
         view_service,
         statistics_service,
         table_maintenance_service,
+        mv_repository,
+        mv_application_service,
         shutdown,
     )
     .await
@@ -253,6 +257,8 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         std::sync::Arc::new(crate::engine::view::EmptyViewService),
         std::sync::Arc::new(crate::engine::statistics::EmptyStatisticsService),
         std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+        std::sync::Arc::new(crate::mv::repository::UnavailableMvRepository),
+        std::sync::Arc::new(crate::mv::application::UnavailableMvApplicationService),
         std::future::pending(),
     ))
 }
@@ -265,6 +271,8 @@ async fn run_with_resolved_options_until_shutdown<F>(
     table_maintenance_service: std::sync::Arc<
         dyn crate::engine::table_maintenance::TableMaintenanceService,
     >,
+    mv_repository: std::sync::Arc<dyn crate::mv::repository::MvRepository>,
+    mv_application_service: std::sync::Arc<dyn crate::mv::application::MvApplicationService>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -283,6 +291,8 @@ where
             view_service,
             statistics_service,
             table_maintenance_service,
+            mv_repository,
+            mv_application_service,
         )?,
         None => StandaloneNovaRocks::open(opts)?,
     };

@@ -3288,10 +3288,12 @@ dependencies = [
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
+ "apache-avro",
  "arrow",
  "async-trait",
  "bytes",
  "chrono",
+ "futures",
  "hex",
  "novarocks",
  "novarocks-catalog",
@@ -3318,6 +3320,7 @@ dependencies = [
  "novarocks-backend",
  "novarocks-compat",
  "novarocks-frontend",
+ "novarocks-state-store",
  "reqwest",
  "tempfile",
  "tokio",

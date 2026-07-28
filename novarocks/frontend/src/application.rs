@@ -25,6 +25,7 @@ use novarocks_state_store::{
 };
 
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
+use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::statistics::FrontendStatisticsService;
 use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::view::FrontendViewService;
@@ -38,6 +39,7 @@ pub enum FrontendApplicationErrorKind {
     StateStoreHost,
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
+    MvServiceOpen,
     Server,
     Shutdown,
 }
@@ -84,6 +86,8 @@ pub struct FrontendApplicationHost {
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     table_maintenance_service:
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
+    mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
+    mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
     state_store_host: Option<StateStoreHost>,
 }
 
@@ -95,6 +99,8 @@ impl FrontendApplicationHost {
             statistics_service: None,
             view_service: None,
             table_maintenance_service: None,
+            mv_repository: None,
+            mv_application_service: None,
             state_store_host: None,
         };
 
@@ -130,6 +136,34 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
+        match host.state_store() {
+            Some(store) => {
+                match StateStoreMvRepository::open(store, tokio::runtime::Handle::current()).await {
+                    Ok(repository) => {
+                        let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
+                            repository;
+                        host.mv_application_service =
+                            Some(Arc::new(FrontendMvService::new(Arc::clone(&repository))));
+                        host.mv_repository = Some(repository);
+                    }
+                    Err(error) => {
+                        return Err(host
+                            .cleanup_open_error(FrontendApplicationError::new(
+                                FrontendApplicationErrorKind::MvServiceOpen,
+                                error,
+                            ))
+                            .await);
+                    }
+                }
+            }
+            None => {
+                host.mv_repository =
+                    Some(Arc::new(novarocks::mv::repository::UnavailableMvRepository));
+                host.mv_application_service = Some(Arc::new(
+                    novarocks::mv::application::UnavailableMvApplicationService,
+                ));
+            }
+        }
 
         Ok(host)
     }
@@ -156,6 +190,24 @@ impl FrontendApplicationHost {
             self.table_maintenance_service
                 .as_ref()
                 .expect("frontend table-maintenance service is installed before host open returns"),
+        )
+    }
+
+    pub fn mv_repository(&self) -> Arc<dyn novarocks::mv::repository::MvRepository> {
+        Arc::clone(
+            self.mv_repository
+                .as_ref()
+                .expect("frontend MV repository is installed before host open returns"),
+        )
+    }
+
+    pub fn mv_application_service(
+        &self,
+    ) -> Arc<dyn novarocks::mv::application::MvApplicationService> {
+        Arc::clone(
+            self.mv_application_service
+                .as_ref()
+                .expect("frontend MV application service is installed before host open returns"),
         )
     }
 
@@ -228,6 +280,8 @@ impl FrontendApplicationHost {
         self.table_maintenance_service.take();
         self.statistics_service.take();
         self.view_service.take();
+        self.mv_application_service.take();
+        self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             if let Err(error) = host
                 .shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)

@@ -63,11 +63,11 @@ use crate::connector::starrocks::table::txn::{
     write_chunks_into_starrocks_partition_for_mv_refresh_with_row_delta,
 };
 use crate::meta::repository::job::CreateEraseJobRequest;
-use crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest;
 use crate::meta::repository::starrocks_table::{
     StageStarRocksMvRefreshRequest, StagedStarRocksMvRefresh,
 };
 use crate::mv::persistence::definition::StoredMvDefinition;
+use crate::mv::persistence::refresh::UpdateStarRocksMvRefreshSummaryRequest;
 use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn refresh_mv(
@@ -1593,16 +1593,9 @@ fn load_mv_definition_by_id(
     state: &Arc<StandaloneState>,
     mv_id: i64,
 ) -> Result<Option<StoredMvDefinition>, String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "materialized view metadata provider is not configured".to_string())?;
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open mv definition read transaction failed: {e}"))?;
     state
-        .mv_repo
-        .load_by_id(read.as_ref(), mv_id)
+        .mv_repository
+        .load_by_id(mv_id)
         .map_err(|e| format!("load mv definition failed: {e}"))
 }
 
@@ -1611,36 +1604,18 @@ fn begin_mv_refresh_intent(
     mv_id: i64,
     target_snapshots: BTreeMap<String, i64>,
 ) -> Result<(), String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "materialized view refresh requires metadata provider".to_string())?;
-    let mut txn = provider
-        .begin_write("begin materialized view refresh")
-        .map_err(|e| format!("open mv refresh transaction failed: {e}"))?;
     state
-        .mv_repo
-        .begin_refresh_intent(txn.as_mut(), mv_id, target_snapshots)
+        .mv_repository
+        .begin_refresh_intent(mv_id, target_snapshots)
         .map_err(|e| format!("begin mv refresh intent failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit mv refresh intent failed: {e}"))?;
     Ok(())
 }
 
 fn clear_mv_refresh_progress(state: &Arc<StandaloneState>, mv_id: i64) -> Result<(), String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "materialized view refresh requires metadata provider".to_string())?;
-    let mut txn = provider
-        .begin_write("clear materialized view refresh progress")
-        .map_err(|e| format!("open mv refresh cleanup transaction failed: {e}"))?;
     state
-        .mv_repo
-        .clear_refresh_progress(txn.as_mut(), mv_id)
+        .mv_repository
+        .clear_refresh_progress(mv_id)
         .map_err(|e| format!("clear mv refresh progress failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit mv refresh cleanup failed: {e}"))?;
     Ok(())
 }
 
@@ -1651,28 +1626,16 @@ fn update_starrocks_mv_refresh_summary(
     base_snapshots: BTreeMap<String, i64>,
     base_table_uuids: BTreeMap<String, String>,
 ) -> Result<(), String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "materialized view refresh requires metadata provider".to_string())?;
-    let mut txn = provider
-        .begin_write("update StarRocks materialized view refresh summary")
-        .map_err(|e| format!("open mv refresh summary transaction failed: {e}"))?;
     state
-        .mv_repo
-        .update_starrocks_refresh_summary_if_present(
-            txn.as_mut(),
-            UpdateStarRocksMvRefreshSummaryRequest {
-                mv_id,
-                last_refresh_ms: super::mv_ddl::now_ms(),
-                last_refresh_rows,
-                base_snapshots,
-                base_table_uuids,
-            },
-        )
+        .mv_repository
+        .update_starrocks_refresh_summary_if_present(UpdateStarRocksMvRefreshSummaryRequest {
+            mv_id,
+            last_refresh_ms: super::mv_ddl::now_ms(),
+            last_refresh_rows,
+            base_snapshots,
+            base_table_uuids,
+        })
         .map_err(|e| format!("update mv refresh summary failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit mv refresh summary failed: {e}"))?;
     Ok(())
 }
 
@@ -1749,10 +1712,11 @@ fn activate_starrocks_mv_refresh_partition(
             },
         )
         .map_err(|e| format!("enqueue StarRocks MV refresh erase job failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit StarRocks MV refresh activate metadata failed: {e}"))?;
     state
-        .mv_repo
+        .mv_repository
         .update_starrocks_refresh_summary_if_present(
-            txn.as_mut(),
             UpdateStarRocksMvRefreshSummaryRequest {
                 mv_id: table_id,
                 last_refresh_ms: super::mv_ddl::now_ms(),
@@ -1761,9 +1725,14 @@ fn activate_starrocks_mv_refresh_partition(
                 base_table_uuids: base_metadata.table_uuids,
             },
         )
-        .map_err(|e| format!("update StarRocks MV refresh summary failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit StarRocks MV refresh activate metadata failed: {e}"))?;
+        .map_err(|e| {
+            crate::common::engine_error::EngineError::commit_known_committed_finalize_failed(
+                format!(
+                    "StarRocks MV refresh table partition is visible but MV summary finalization failed: {e}"
+                ),
+            )
+            .to_bracketed_user_message()
+        })?;
     Ok(())
 }
 
@@ -1783,6 +1752,133 @@ pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdent
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod mixed_boundary_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use crate::meta::repository::starrocks_table::{
+        CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest, StarRocksPartitionState,
+        StarRocksTableKind,
+    };
+    use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
+    use crate::mv::test_repository::{
+        TestMvRepositoryFailurePoint, fail_next_mv_repository_command,
+    };
+
+    #[test]
+    fn activated_partition_summary_failure_keeps_partition_visibility_and_erase_job() {
+        let dir = TempDir::new().expect("create metadata directory");
+        let provider: Arc<dyn MetaStoreProvider> = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("metadata.sqlite"))
+                .expect("open metadata provider"),
+        );
+        let state = Arc::new(StandaloneState {
+            metadata_provider: Some(Arc::clone(&provider)),
+            mv_repository: crate::engine::test_mv_repository(),
+            ..StandaloneState::default()
+        });
+        let mut write = provider
+            .begin_write("seed StarRocks refresh boundary test")
+            .expect("write");
+        let database = state
+            .starrocks_table_repo
+            .get_or_create_database(write.as_mut(), "db")
+            .expect("database");
+        let layout = state
+            .starrocks_table_repo
+            .create_table_layout(
+                write.as_mut(),
+                CreateStarRocksTableLayoutRequest {
+                    db_id: database.db_id,
+                    table_name: "mv".to_string(),
+                    keys_type: "DUP_KEYS".to_string(),
+                    bucket_num: 1,
+                    kind: StarRocksTableKind::MaterializedView,
+                    schema_version: 0,
+                    tablet_schema_pb: vec![],
+                    columns: vec![CreateStarRocksColumnRequest {
+                        column_name: "k".to_string(),
+                        logical_type: "BIGINT".to_string(),
+                        nullable: false,
+                        visible: true,
+                        is_key: true,
+                    }],
+                    partition_name: "p0".to_string(),
+                    warehouse_uri: "s3://test/warehouse".to_string(),
+                },
+            )
+            .expect("table layout");
+        let staged = state
+            .starrocks_table_repo
+            .stage_mv_refresh_partition(
+                write.as_mut(),
+                StageStarRocksMvRefreshRequest {
+                    table_id: layout.table.table_id,
+                    db_id: database.db_id,
+                    bucket_num: 1,
+                    partition_name: "p0".to_string(),
+                    warehouse_uri: "s3://test/warehouse".to_string(),
+                },
+            )
+            .expect("stage refresh partition");
+        write.commit().expect("commit seed");
+
+        let _failure = fail_next_mv_repository_command(
+            TestMvRepositoryFailurePoint::UpdateStarRocksRefreshSummary,
+        );
+        let error = activate_starrocks_mv_refresh_partition(
+            &state,
+            layout.table.table_id,
+            layout.partition.partition_id,
+            "s3://test/warehouse/db_1/table_1/partition_1",
+            &staged,
+            11,
+            CurrentBaseMetadata::default(),
+        )
+        .expect_err("post-visible MV finalization must fail");
+
+        assert!(
+            error.starts_with("[CommitKnownCommittedFinalizeFailed]"),
+            "{error}"
+        );
+        assert!(!error.contains("CommitKnownUncommitted"), "{error}");
+        let read = provider.begin_read().expect("read committed state");
+        let snapshot = state
+            .starrocks_table_repo
+            .load_snapshot(read.as_ref())
+            .expect("load snapshot");
+        assert_eq!(
+            snapshot
+                .partitions
+                .iter()
+                .find(|partition| partition.partition_id == layout.partition.partition_id)
+                .expect("old partition")
+                .state,
+            StarRocksPartitionState::Retired
+        );
+        assert_eq!(
+            snapshot
+                .partitions
+                .iter()
+                .find(|partition| partition.partition_id == staged.partition_id)
+                .expect("new partition")
+                .state,
+            StarRocksPartitionState::Active
+        );
+        let erase_jobs = state
+            .job_repo
+            .list_runnable_erase_jobs(read.as_ref(), i64::MAX)
+            .expect("list erase jobs");
+        assert!(erase_jobs.iter().any(|job| {
+            job.table_id == layout.table.table_id
+                && job.partition_id == Some(layout.partition.partition_id)
+        }));
+    }
 }
 
 fn refresh_starrocks_catalog(state: &Arc<StandaloneState>) -> Result<(), String> {

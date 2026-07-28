@@ -23,7 +23,6 @@ pub mod backend;
 pub mod iceberg_operation;
 pub mod id_scopes;
 pub mod job;
-pub mod mv;
 pub mod starrocks_table;
 pub mod starrocks_txn;
 

@@ -64,6 +64,31 @@ pub struct StoredMvDefinition {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateMvDefinitionRequest {
+    pub select_sql: String,
+    pub base_table_refs: Vec<String>,
+    pub primary_key_columns: Vec<String>,
+    pub storage_engine: String,
+    pub target_catalog: Option<String>,
+    pub target_namespace: Option<String>,
+    pub target_table: Option<String>,
+    pub schema_contract: Option<MvSchemaContract>,
+    pub partition_spec: Option<MvPartitionContract>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateMvRefreshMetadataRequest {
+    pub mv_id: i64,
+    pub refresh_policy: StoredMvRefreshPolicy,
+    pub refresh_paused: bool,
+    pub refresh_interval_ms: Option<i64>,
+    pub max_staleness_ms: Option<i64>,
+    pub last_scheduler_error: Option<String>,
+    pub next_refresh_after_ms: Option<i64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredMvDefinitionAvro {
     mv_id: i64,

@@ -49,10 +49,13 @@ use crate::connector::{
 use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
-use crate::meta::repository::job::JobMetaRepository;
-use crate::meta::repository::mv::MvMetaRepository;
+use crate::meta::repository::job::{
+    JobMetaRepository,
+};
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
+use crate::mv::application::{MvApplicationService, UnavailableMvApplicationService};
+use crate::mv::repository::{MvRepository, UnavailableMvRepository};
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
 use novarocks_catalog::identifier::normalize_identifier;
@@ -350,7 +353,11 @@ pub(crate) struct StandaloneState {
     pub(crate) backend_repo: BackendMetaRepository,
     pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
     pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
-    pub(crate) mv_repo: MvMetaRepository,
+    /// Provider-neutral MV metadata boundary. Production wiring is installed by
+    /// the frontend host; the core default deliberately rejects MV operations.
+    pub(crate) mv_repository: Arc<dyn MvRepository>,
+    /// Frontend-owned MV statement application boundary.
+    pub(crate) mv_application_service: Arc<dyn MvApplicationService>,
     pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
@@ -389,7 +396,8 @@ impl Default for StandaloneState {
             backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
-            mv_repo: MvMetaRepository,
+            mv_repository: Arc::new(UnavailableMvRepository),
+            mv_application_service: Arc::new(UnavailableMvApplicationService),
             catalog_attachment_repo: CatalogAttachmentRepository,
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
@@ -427,6 +435,11 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     TestSerializationGuard { _guard: guard }
+}
+
+#[cfg(test)]
+pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
+    Arc::new(crate::mv::test_repository::InMemoryMvRepository::default())
 }
 
 #[derive(Clone)]
@@ -469,6 +482,8 @@ impl StandaloneNovaRocks {
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
             std::sync::Arc::new(statistics::EmptyStatisticsService),
             std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            std::sync::Arc::new(UnavailableMvRepository),
+            std::sync::Arc::new(UnavailableMvApplicationService),
             _test_guard,
         );
         #[cfg(not(test))]
@@ -478,6 +493,8 @@ impl StandaloneNovaRocks {
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
             std::sync::Arc::new(statistics::EmptyStatisticsService),
             std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            std::sync::Arc::new(UnavailableMvRepository),
+            std::sync::Arc::new(UnavailableMvApplicationService),
         )
     }
 
@@ -496,6 +513,8 @@ impl StandaloneNovaRocks {
         table_maintenance_service: std::sync::Arc<
             dyn crate::engine::table_maintenance::TableMaintenanceService,
         >,
+        mv_repository: std::sync::Arc<dyn MvRepository>,
+        mv_application_service: std::sync::Arc<dyn MvApplicationService>,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -509,6 +528,8 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             table_maintenance_service,
+            mv_repository,
+            mv_application_service,
             _test_guard,
         );
         #[cfg(not(test))]
@@ -518,6 +539,8 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             table_maintenance_service,
+            mv_repository,
+            mv_application_service,
         )
     }
 
@@ -531,6 +554,8 @@ impl StandaloneNovaRocks {
         table_maintenance_service: std::sync::Arc<
             dyn crate::engine::table_maintenance::TableMaintenanceService,
         >,
+        mv_repository: std::sync::Arc<dyn MvRepository>,
+        mv_application_service: std::sync::Arc<dyn MvApplicationService>,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -585,11 +610,12 @@ impl StandaloneNovaRocks {
             )),
             starrocks_table_config,
             mv_refresh_pruning_limits,
-            metadata_provider,
+            metadata_provider: metadata_provider.clone(),
             backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
-            mv_repo: MvMetaRepository,
+            mv_repository,
+            mv_application_service,
             catalog_attachment_repo: CatalogAttachmentRepository,
             job_repo: JobMetaRepository,
             exchange_port,
@@ -1905,7 +1931,31 @@ pub(crate) fn dispatch_statement(
 
     match statement {
         Statement::CreateMaterializedView(stmt) => {
-            crate::engine::mv_flow::create_mv(state, current_catalog, current_database, &stmt)
+            let engine =
+                crate::engine::mv::iceberg_refresh::StandaloneMvEngine::new(Arc::clone(state));
+            let statement = crate::mv::application::MvApplicationStatement::Create(
+                crate::mv::application::MvCreateStatement::from(&stmt),
+            );
+            match state.mv_application_service.try_handle_statement(
+                &engine,
+                &statement,
+                crate::mv::application::MvRequestContext {
+                    current_catalog,
+                    current_database,
+                },
+            ) {
+                Ok(Some(crate::mv::application::MvStatementResult::Ok)) => Ok(StatementResult::Ok),
+                Ok(Some(crate::mv::application::MvStatementResult::Query(result))) => {
+                    Ok(StatementResult::Query(result))
+                }
+                Ok(None) => crate::engine::mv_flow::create_mv(
+                    state,
+                    current_catalog,
+                    current_database,
+                    &stmt,
+                ),
+                Err(error) => Err(error.to_string()),
+            }
         }
         Statement::DropMaterializedView(stmt) => {
             crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
@@ -3472,36 +3522,36 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
         default_port,
         crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
     ) {
-            Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
-                .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
-            Err(e) if e.contains("Address already in use") || e.contains("os error 48") => {
-                let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|bind_err| {
-                    format!("reserve standalone grpc exchange port failed: {bind_err}")
-                })?;
-                let fallback_port = listener
-                    .local_addr()
-                    .map_err(|addr_err| {
-                        format!("read standalone grpc exchange port failed: {addr_err}")
-                    })?
-                    .port();
-                drop(listener);
-                crate::service::grpc_server::start_grpc_exchange_server(
-                    "127.0.0.1",
-                    fallback_port,
-                    crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
-                )
-                    .map_err(|start_err| {
-                        format!(
-                            "start standalone grpc exchange server failed on fallback port {}: {}",
-                            fallback_port, start_err
-                        )
-                    })?;
-                crate::service::grpc_server::grpc_server_bound_port().map_err(|e| {
-                    format!("read standalone grpc exchange server fallback port failed: {e}")
+        Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
+            .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
+        Err(e) if e.contains("Address already in use") || e.contains("os error 48") => {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|bind_err| {
+                format!("reserve standalone grpc exchange port failed: {bind_err}")
+            })?;
+            let fallback_port = listener
+                .local_addr()
+                .map_err(|addr_err| {
+                    format!("read standalone grpc exchange port failed: {addr_err}")
                 })?
-            }
-            Err(e) => return Err(format!("start standalone grpc exchange server failed: {e}")),
-        };
+                .port();
+            drop(listener);
+            crate::service::grpc_server::start_grpc_exchange_server(
+                "127.0.0.1",
+                fallback_port,
+                crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+            )
+            .map_err(|start_err| {
+                format!(
+                    "start standalone grpc exchange server failed on fallback port {}: {}",
+                    fallback_port, start_err
+                )
+            })?;
+            crate::service::grpc_server::grpc_server_bound_port().map_err(|e| {
+                format!("read standalone grpc exchange server fallback port failed: {e}")
+            })?
+        }
+        Err(e) => return Err(format!("start standalone grpc exchange server failed: {e}")),
+    };
 
     wait_for_standalone_exchange_server(started_port)?;
 
@@ -4036,6 +4086,12 @@ mod tests {
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
+    use crate::meta::MetaStoreProvider;
+    use crate::mv::application::{
+        MvApplicationError, MvApplicationErrorKind, MvApplicationService, MvApplicationStatement,
+        MvEngine, MvRequestContext, UnavailableMvApplicationService,
+    };
+    use crate::mv::repository::{MvTarget, UnavailableMvRepository};
     use crate::runtime::query_options::QueryOptions;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -4046,6 +4102,22 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    struct AlwaysUnavailableMvApplicationService;
+
+    impl MvApplicationService for AlwaysUnavailableMvApplicationService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn MvEngine,
+            _statement: &MvApplicationStatement,
+            _context: MvRequestContext<'_>,
+        ) -> Result<Option<crate::mv::application::MvStatementResult>, MvApplicationError> {
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Unavailable,
+                "injected frontend MV service is unavailable",
+            ))
+        }
+    }
 
     #[derive(Clone)]
     struct FixedCatalogStatisticsService {
@@ -4190,6 +4262,8 @@ mod tests {
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::clone(&service) as Arc<dyn StatisticsService>,
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         )
         .expect("open");
         engine
@@ -4265,6 +4339,8 @@ mod tests {
             Arc::clone(&service) as Arc<dyn ViewService>,
             Arc::new(crate::engine::statistics::EmptyStatisticsService),
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         )
         .expect("open engine with recording view service");
         let session = engine.session();
@@ -4398,6 +4474,8 @@ mod tests {
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::new(crate::engine::statistics::EmptyStatisticsService),
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         )
         .expect("open engine with injected system catalog");
 
@@ -4527,6 +4605,8 @@ path = "{metadata_path}"
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::new(crate::engine::statistics::EmptyStatisticsService),
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         )
         .expect("open FE engine");
         let session = engine.session();
@@ -4566,6 +4646,8 @@ path = "{metadata_path}"
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::new(crate::engine::statistics::EmptyStatisticsService),
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         )
         .expect("open FE engine");
         engine
@@ -4581,6 +4663,8 @@ path = "{metadata_path}"
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::new(crate::engine::statistics::EmptyStatisticsService),
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         )
         .expect("reopen FE engine");
         let result = reopened
@@ -4603,6 +4687,8 @@ path = "{metadata_path}"
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::new(crate::engine::statistics::EmptyStatisticsService),
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         )
         .expect("open all-in-one engine");
         let session = engine.session();
@@ -4981,6 +5067,8 @@ mysql_port = 47892
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::new(crate::engine::statistics::EmptyStatisticsService),
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
         );
         assert!(
             result.is_ok(),
@@ -6454,8 +6542,12 @@ mysql_port = 47892
             assert!(
                 engine
                     .inner
-                    .mv_repo
-                    .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+                    .mv_repository
+                    .find_by_target(&MvTarget {
+                        catalog: Some("ice".to_string()),
+                        database: "analytics".to_string(),
+                        name: "mv_orders".to_string()
+                    })
                     .expect("find iceberg mv definition")
                     .is_some()
             );
@@ -6532,6 +6624,39 @@ mysql_port = 47892
                 || err.contains("materialized view")
                 || err.contains("StarRocks table"),
             "unexpected dispatch error: {err}"
+        );
+    }
+
+    #[test]
+    fn create_mv_surfaces_frontend_unavailable_without_legacy_fallback() {
+        let mut state = StandaloneState::default();
+        state.mv_repository = Arc::new(crate::mv::test_repository::InMemoryMvRepository::default());
+        state.mv_application_service = Arc::new(AlwaysUnavailableMvApplicationService);
+        let state = Arc::new(state);
+        register_connector_backends(&state);
+
+        let statement = crate::sql::parser::parse_sql(
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(id) BUCKETS 1 \
+                 AS SELECT 1 AS id",
+        )
+        .expect("parse materialized-view create")
+        .pop()
+        .expect("one materialized-view statement");
+        let err = dispatch_statement(&state, None, "analytics", statement)
+            .expect_err("frontend unavailable error must surface directly");
+
+        assert_eq!(err, "injected frontend MV service is unavailable");
+        assert!(
+            state
+                .mv_repository
+                .find_by_target(&MvTarget {
+                    catalog: None,
+                    database: "analytics".to_string(),
+                    name: "orders_mv".to_string(),
+                })
+                .expect("read available MV repository")
+                .is_none(),
+            "frontend service errors must not fall back to legacy target creation or metadata writes"
         );
     }
 

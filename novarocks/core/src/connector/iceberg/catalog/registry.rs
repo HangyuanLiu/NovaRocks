@@ -224,6 +224,16 @@ impl IcebergCatalogEntry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn poison_table_cache_for_test(&self) {
+        let cache = Arc::clone(&self.table_cache);
+        let _ = std::thread::spawn(move || {
+            let _guard = cache.write().expect("table cache write lock");
+            panic!("injected table cache failure");
+        })
+        .join();
+    }
+
     pub(crate) fn cached_data_files(
         &self,
         namespace_name: &str,

@@ -18,4 +18,6 @@
 pub mod definition;
 pub mod dependency;
 pub mod descriptor;
+pub mod partition;
+pub mod refresh;
 pub mod schema;

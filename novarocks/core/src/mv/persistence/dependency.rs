@@ -31,6 +31,12 @@ pub struct StoredMvDependency {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateMvDependencyRequest {
+    pub upstream: MvDependencyObjectRef,
+    pub created_at_ms: i64,
+}
+
 pub(crate) fn stored_definition_dependency_ref(
     definition: &StoredMvDefinition,
     starrocks_name: Option<(&str, &str)>,

@@ -22,8 +22,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::mv::refresh_io::{load_current_iceberg_base_table, parse_iceberg_table_refs};
-use crate::meta::repository::mv::{MvRefreshState, UpdateMvRefreshMetadataRequest};
-use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::persistence::definition::{
+    StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
+use crate::mv::persistence::refresh::MvRefreshState;
+use crate::mv::repository::MvRepository;
 use crate::novarocks_config::StandaloneServerConfig;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
 use novarocks_catalog::identifier::TableIdentity;
@@ -614,15 +617,12 @@ struct SchedulerMetadata {
 fn load_scheduler_metadata(
     state: &Arc<crate::engine::StandaloneState>,
 ) -> Result<SchedulerMetadata, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
+    if !state.mv_repository.availability().is_available() {
         return Ok(SchedulerMetadata::default());
-    };
-    let txn = provider
-        .begin_read()
-        .map_err(|e| format!("open MV scheduler read transaction failed: {e}"))?;
+    }
     let definitions = state
-        .mv_repo
-        .list_definitions(txn.as_ref())
+        .mv_repository
+        .list_definitions()
         .map_err(|e| format!("list MV definitions failed: {e}"))?;
     let mut active_refreshes = BTreeMap::new();
     for definition in &definitions {
@@ -630,8 +630,8 @@ fn load_scheduler_metadata(
             continue;
         };
         let Some(refresh) = state
-            .mv_repo
-            .load_refresh(txn.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .map_err(|e| format!("load active MV refresh failed: {e}"))?
         else {
             continue;
@@ -703,25 +703,16 @@ fn update_scheduler_metadata<F>(
 where
     F: FnOnce(&StoredMvDefinition) -> Result<UpdateMvRefreshMetadataRequest, String>,
 {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "MV refresh scheduler requires metadata provider".to_string())?;
-    let mut txn = provider
-        .begin_write("update MV refresh scheduler metadata")
-        .map_err(|e| format!("open MV scheduler write transaction failed: {e}"))?;
     let definition = state
-        .mv_repo
-        .load_by_id(txn.as_ref(), mv_id)
+        .mv_repository
+        .load_by_id(mv_id)
         .map_err(|e| format!("load MV definition failed: {e}"))?
         .ok_or_else(|| format!("MV definition {mv_id} not found"))?;
     let req = build_request(&definition)?;
     state
-        .mv_repo
-        .update_refresh_metadata(txn.as_mut(), req)
+        .mv_repository
+        .update_refresh_metadata(req)
         .map_err(|e| format!("update MV scheduler metadata failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit MV scheduler metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -762,24 +753,16 @@ fn load_refresh_execution_target(
     state: &Arc<crate::engine::StandaloneState>,
     mv_id: i64,
 ) -> Result<RefreshExecutionTarget, String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "MV refresh scheduler requires metadata provider".to_string())?;
-    let txn = provider
-        .begin_read()
-        .map_err(|e| format!("open MV refresh scheduler read transaction failed: {e}"))?;
     let definition = state
-        .mv_repo
-        .load_by_id(txn.as_ref(), mv_id)
+        .mv_repository
+        .load_by_id(mv_id)
         .map_err(|e| format!("load MV definition failed: {e}"))?
         .ok_or_else(|| format!("MV definition {mv_id} not found"))?;
-    refresh_execution_target_for_definition(state, txn.as_ref(), &definition)
+    refresh_execution_target_for_definition(state, &definition)
 }
 
 fn refresh_execution_target_for_definition(
     state: &Arc<crate::engine::StandaloneState>,
-    txn: &dyn crate::meta::MetaReadTxn,
     definition: &StoredMvDefinition,
 ) -> Result<RefreshExecutionTarget, String> {
     match (
@@ -805,14 +788,21 @@ fn refresh_execution_target_for_definition(
         }
     }
 
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "StarRocks MV refresh scheduler requires metadata provider".to_string())?;
+    let txn = provider
+        .begin_read()
+        .map_err(|e| format!("open StarRocks MV scheduler read transaction failed: {e}"))?;
     let table = state
         .starrocks_table_repo
-        .load_table(txn, definition.mv_id)
+        .load_table(txn.as_ref(), definition.mv_id)
         .map_err(|e| format!("load StarRocks MV table failed: {e}"))?
         .ok_or_else(|| format!("StarRocks MV table {} not found", definition.mv_id))?;
     let database = state
         .starrocks_table_repo
-        .load_database(txn, table.db_id)
+        .load_database(txn.as_ref(), table.db_id)
         .map_err(|e| format!("load StarRocks MV database failed: {e}"))?
         .ok_or_else(|| format!("StarRocks database {} not found", table.db_id))?;
     Ok(RefreshExecutionTarget {
@@ -859,7 +849,7 @@ pub(crate) fn start_refresh_coordinator_for_server(
     engine: &crate::engine::StandaloneNovaRocks,
     config: RefreshCoordinatorConfig,
 ) -> RefreshCoordinatorHandle {
-    if !config.enabled {
+    if !config.enabled || !engine.inner.mv_repository.availability().is_available() {
         return RefreshCoordinatorHandle::disabled();
     }
     let state = Arc::clone(&engine.inner);
@@ -931,8 +921,8 @@ pub(crate) fn scan_refresh_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::repository::mv::MvRefreshState;
     use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+    use crate::mv::persistence::refresh::MvRefreshState;
     use std::collections::BTreeMap;
 
     #[derive(Default)]

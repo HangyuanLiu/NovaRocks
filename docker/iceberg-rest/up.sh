@@ -528,6 +528,7 @@ export NOVA_ENV_REST_WAREHOUSE_URI="$rest_warehouse"
 export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
 export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone-managed-lake.toml"
 export NOVAROCKS_STANDALONE_SCHEDULER_CONFIG="$runtime_dir/standalone-managed-lake-scheduler.toml"
+export NOVAROCKS_STATE_STORE_PATH="$runtime_dir/state-store.sqlite"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
 export NOVAROCKS_SPARK_IMAGE="$spark_image"
@@ -580,6 +581,7 @@ cat > "$manifest_file" <<EOF
     "grpc_port": $grpc_port,
     "standalone_config": "$runtime_dir/standalone-managed-lake.toml",
     "standalone_scheduler_config": "$runtime_dir/standalone-managed-lake-scheduler.toml",
+    "state_store_path": "$runtime_dir/state-store.sqlite",
     "sql_test_config": "$runtime_dir/sql-test.conf",
     "ice_rest_catalog_sql": "$runtime_dir/ice-rest-catalog.sql",
     "managed_lake_warehouse": "$managed_warehouse",
