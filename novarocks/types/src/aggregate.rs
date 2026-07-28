@@ -364,7 +364,7 @@ mod tests {
         let sum = crate::canonical_agg_decimal_type("sum", &input).unwrap();
         let distinct = crate::canonical_agg_decimal_type("multi_distinct_sum", &input).unwrap();
         assert_eq!(
-            infer_agg_function_types("sum", &[input.clone()], false).unwrap(),
+            infer_agg_function_types("sum", std::slice::from_ref(&input), false).unwrap(),
             (sum.clone(), Some(sum))
         );
         assert_eq!(
