@@ -25,7 +25,7 @@ use super::common::{
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{ScanReadPlan, maybe_project_data_scan_output};
 use crate::cache::{CacheOptions, DataCacheContext};
-use crate::connector::hdfs::{HdfsInstanceConfig, plan_starrocks_hdfs_read_source};
+use crate::connector::hdfs::{HdfsInstanceConfig, plan_native_hdfs_read_source};
 use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -112,17 +112,10 @@ pub(super) fn lower_iceberg_data_files_scan(
         iceberg_runtime_pruning,
     };
     let predicate = lower_scan_predicate(scan, arena, &read_plan.read_layout)?;
-    let query_id = ctx.query_id().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "query_id",
-            "IcebergDataFiles requires a query identity for connector cancellation",
-        )
-    })?;
     let query_options = ctx.query_options().cloned().unwrap_or_default();
-    let source = plan_starrocks_hdfs_read_source(
+    let source = plan_native_hdfs_read_source(
         ctx.connectors()?,
-        query_id,
+        ctx.query_id(),
         node.node_id,
         HdfsInstanceConfig {
             scan: cfg,
