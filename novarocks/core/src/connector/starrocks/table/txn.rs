@@ -831,10 +831,11 @@ fn mark_starrocks_txn_visible_with_mv_refresh_metadata(
         .starrocks_txn_repo
         .mark_visible(&state.starrocks_table_repo, txn.as_mut(), txn_id)
         .map_err(|e| format!("mark StarRocks MV refresh txn visible failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit StarRocks MV refresh visible metadata failed: {e}"))?;
     state
-        .mv_repo
+        .mv_repository
         .update_starrocks_refresh_summary_if_present(
-            txn.as_mut(),
             UpdateStarRocksMvRefreshSummaryRequest {
                 mv_id,
                 last_refresh_ms: current_time_ms(),
@@ -843,9 +844,14 @@ fn mark_starrocks_txn_visible_with_mv_refresh_metadata(
                 base_table_uuids: table_uuids,
             },
         )
-        .map_err(|e| format!("update StarRocks MV refresh metadata failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit StarRocks MV refresh visible metadata failed: {e}"))?;
+        .map_err(|e| {
+            crate::common::engine_error::EngineError::commit_known_committed_finalize_failed(
+                format!(
+                    "StarRocks transaction {txn_id} is visible but MV refresh summary finalization failed: {e}"
+                ),
+            )
+            .to_bracketed_user_message()
+        })?;
     Ok(())
 }
 
@@ -864,6 +870,139 @@ fn mark_starrocks_txn_aborted(state: &Arc<StandaloneState>, txn_id: i64) -> Resu
     txn.commit()
         .map_err(|e| format!("commit StarRocks txn abort metadata failed: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod mixed_boundary_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use crate::meta::repository::starrocks_table::{
+        CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest, StarRocksTableKind,
+        StarRocksTableState,
+    };
+    use crate::meta::repository::starrocks_txn::StarRocksTxnState;
+    use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
+    use crate::mv::test_legacy_repository_adapter::{
+        TestMvRepositoryFailurePoint, fail_next_mv_repository_command,
+    };
+
+    struct Fixture {
+        _dir: TempDir,
+        provider: Arc<dyn MetaStoreProvider>,
+        state: Arc<StandaloneState>,
+        table_id: i64,
+        partition_id: i64,
+        txn_id: i64,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = TempDir::new().expect("create metadata directory");
+        let provider: Arc<dyn MetaStoreProvider> = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("metadata.sqlite"))
+                .expect("open metadata provider"),
+        );
+        let state = Arc::new(StandaloneState {
+            metadata_provider: Some(Arc::clone(&provider)),
+            mv_repository: crate::engine::test_mv_repository(Arc::clone(&provider)),
+            ..StandaloneState::default()
+        });
+        let mut write = provider
+            .begin_write("seed StarRocks MV boundary test")
+            .expect("write");
+        let database = state
+            .starrocks_table_repo
+            .get_or_create_database(write.as_mut(), "db")
+            .expect("database");
+        let layout = state
+            .starrocks_table_repo
+            .create_table_layout(
+                write.as_mut(),
+                CreateStarRocksTableLayoutRequest {
+                    db_id: database.db_id,
+                    table_name: "mv".to_string(),
+                    keys_type: "DUP_KEYS".to_string(),
+                    bucket_num: 1,
+                    kind: StarRocksTableKind::MaterializedView,
+                    schema_version: 0,
+                    tablet_schema_pb: vec![],
+                    columns: vec![CreateStarRocksColumnRequest {
+                        column_name: "k".to_string(),
+                        logical_type: "BIGINT".to_string(),
+                        nullable: false,
+                        visible: true,
+                        is_key: true,
+                    }],
+                    partition_name: "p0".to_string(),
+                    warehouse_uri: "s3://test/warehouse".to_string(),
+                },
+            )
+            .expect("table layout");
+        assert_eq!(layout.table.state, StarRocksTableState::Active);
+        let prepared = state
+            .starrocks_txn_repo
+            .prepare(
+                &state.starrocks_table_repo,
+                write.as_mut(),
+                layout.table.table_id,
+                layout.partition.partition_id,
+            )
+            .expect("prepare txn");
+        state
+            .starrocks_txn_repo
+            .mark_written(write.as_mut(), prepared.txn_id)
+            .expect("mark written");
+        write.commit().expect("commit seed");
+        Fixture {
+            _dir: dir,
+            provider,
+            state,
+            table_id: layout.table.table_id,
+            partition_id: layout.partition.partition_id,
+            txn_id: prepared.txn_id,
+        }
+    }
+
+    #[test]
+    fn visible_transaction_summary_failure_preserves_the_actual_visible_commit() {
+        let fixture = fixture();
+        let _failure = fail_next_mv_repository_command(
+            TestMvRepositoryFailurePoint::UpdateStarRocksRefreshSummary,
+        );
+
+        let error = mark_starrocks_txn_visible_with_mv_refresh_metadata(
+            &fixture.state,
+            fixture.txn_id,
+            fixture.table_id,
+            7,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .expect_err("post-visible MV finalization must fail");
+
+        assert!(
+            error.starts_with("[CommitKnownCommittedFinalizeFailed]"),
+            "{error}"
+        );
+        assert!(!error.contains("CommitKnownUncommitted"), "{error}");
+        let read = fixture.provider.begin_read().expect("read committed state");
+        let txn = fixture
+            .state
+            .starrocks_txn_repo
+            .load(read.as_ref(), fixture.txn_id)
+            .expect("load txn")
+            .expect("txn exists");
+        assert_eq!(txn.state, StarRocksTxnState::Visible);
+        let partition = fixture
+            .state
+            .starrocks_table_repo
+            .load_partition(read.as_ref(), fixture.partition_id)
+            .expect("load partition")
+            .expect("partition exists");
+        assert_eq!(partition.visible_version, txn.commit_version);
+    }
 }
 
 fn current_time_ms() -> i64 {

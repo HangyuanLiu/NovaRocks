@@ -30,7 +30,6 @@ use crate::connector::starrocks::lake::storage_schema_wire::encode_tablet_schema
 use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
-use crate::meta::MetaReadTxn;
 use crate::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest,
     StarRocksTableKind as RepoStarRocksTableKind,
@@ -39,6 +38,7 @@ use crate::mv::persistence::definition::{
     CreateMvDefinitionRequest, StoredMvDefinition, StoredMvRefreshPolicy,
 };
 use crate::mv::persistence::refresh::MvRefreshState;
+use crate::mv::repository::{CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest};
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
@@ -98,6 +98,9 @@ pub(crate) fn create_mv(
     current_database: &str,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    if !state.mv_repository.availability().is_available() {
+        return Err("materialized view service requires [state_store]".to_string());
+    }
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
     let default_engine = state
         .starrocks_table_config
@@ -268,10 +271,6 @@ pub(crate) fn create_mv(
             .job_repo
             .delete_for_table(txn.as_mut(), *table_id)
             .map_err(|e| format!("delete reclaimed erase jobs failed: {e}"))?;
-        state
-            .mv_repo
-            .drop_by_id(txn.as_mut(), *table_id)
-            .map_err(|e| format!("delete reclaimed materialized view definition failed: {e}"))?;
     }
 
     let created = state
@@ -316,44 +315,6 @@ pub(crate) fn create_mv(
         .map_err(|e| {
             format!("create StarRocks materialized view bootstrap txn metadata failed: {e}")
         })?;
-    let mv_definition = state
-        .mv_repo
-        .create_definition_with_id(
-            txn.as_mut(),
-            created.table.table_id,
-            CreateMvDefinitionRequest {
-                select_sql: stmt.select_sql.clone(),
-                base_table_refs: iceberg_table_ref_fqns(&base_refs),
-                primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
-                storage_engine: StarRocksMvStorageEngine::StarRocks.as_sql_str().to_string(),
-                target_catalog: None,
-                target_namespace: None,
-                target_table: None,
-                schema_contract: None,
-                partition_spec: None,
-                created_at_ms,
-            },
-        )
-        .map_err(|e| format!("persist materialized view definition failed: {e}"))?;
-    state
-        .mv_repo
-        .update_refresh_metadata(
-            txn.as_mut(),
-            crate::engine::mv_flow::refresh_metadata_request_for_create(
-                mv_definition.mv_id,
-                &stmt.refresh_policy,
-            ),
-        )
-        .map_err(|e| format!("persist materialized view refresh metadata failed: {e}"))?;
-    state
-        .mv_repo
-        .replace_dependencies_for_mv(
-            txn.as_mut(),
-            mv_definition.mv_id,
-            resolved_dependencies.dependencies,
-        )
-        .map_err(|e| format!("persist materialized view dependencies failed: {e}"))?;
-
     let object_store_profile =
         ObjectStoreProfile::from_s3_store_config(&starrocks_table_config.s3)?;
     let mut bootstrapped_tablet_ids = Vec::new();
@@ -411,6 +372,44 @@ pub(crate) fn create_mv(
             "commit StarRocks materialized view metadata failed: {err}"
         ));
     }
+
+    // The StarRocks table transaction is now visible. MV metadata is a
+    // separate provider-neutral command, so it must not be rolled back or
+    // reported as uncommitted if its finalize step fails.
+    for table_id in reclaimed {
+        state.mv_repository.drop_by_id(table_id).map_err(|e| {
+            crate::common::engine_error::EngineError::commit_known_committed_finalize_failed(
+                format!(
+                    "StarRocks materialized view table is visible but reclaimed MV definition cleanup failed: {e}"
+                ),
+            )
+            .to_bracketed_user_message()
+        })?;
+    }
+    finalize_visible_starrocks_mv_create(
+        state,
+        CreateMvRepositoryWithIdRequest {
+            mv_id: created.table.table_id,
+            create: CreateMvRepositoryRequest {
+                definition: CreateMvDefinitionRequest {
+                    select_sql: stmt.select_sql.clone(),
+                    base_table_refs: iceberg_table_ref_fqns(&base_refs),
+                    primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
+                    storage_engine: StarRocksMvStorageEngine::StarRocks.as_sql_str().to_string(),
+                    target_catalog: None,
+                    target_namespace: None,
+                    target_table: None,
+                    schema_contract: None,
+                    partition_spec: None,
+                    created_at_ms,
+                },
+                refresh: crate::engine::mv_flow::initial_refresh_configuration_for_create(
+                    &stmt.refresh_policy,
+                ),
+                dependencies: resolved_dependencies.dependencies,
+            },
+        },
+    )?;
 
     let read = provider
         .begin_read()
@@ -970,19 +969,47 @@ pub(crate) fn drop_mv(
         &crate::mv::dependency::model::starrocks_mv_dependency_ref(&db_name, &mv_name),
     )?;
 
-    crate::connector::starrocks::table::ddl::drop_starrocks_table_with_metadata(
-        state,
-        &db_name,
-        &mv_name,
-        |txn, table_id| {
-            state
-                .mv_repo
-                .drop_by_id(txn, table_id)
-                .map_err(|e| format!("delete materialized view definition failed: {e}"))?;
-            Ok(())
-        },
-    )?;
+    crate::connector::starrocks::table::ddl::drop_starrocks_table(state, &db_name, &mv_name)?;
+    finalize_visible_starrocks_mv_drop(state, runtime.table.table_id)?;
     Ok(StatementResult::Ok)
+}
+
+/// Complete the provider-neutral half of CREATE after the StarRocks table
+/// transaction has committed. Keeping this boundary explicit prevents callers
+/// from treating the visible table as rolled back when StateStore finalization
+/// cannot be completed.
+fn finalize_visible_starrocks_mv_create(
+    state: &Arc<StandaloneState>,
+    request: CreateMvRepositoryWithIdRequest,
+) -> Result<(), String> {
+    state
+        .mv_repository
+        .create_with_id(uuid::Uuid::new_v4(), request)
+        .map(|_| ())
+        .map_err(|e| {
+            crate::common::engine_error::EngineError::commit_known_committed_finalize_failed(
+                format!(
+                    "StarRocks materialized view table is visible but MV definition finalization failed: {e}"
+                ),
+            )
+            .to_bracketed_user_message()
+        })
+}
+
+/// Complete the provider-neutral half of DROP after the StarRocks table
+/// tombstone and its erase job have committed.
+fn finalize_visible_starrocks_mv_drop(
+    state: &Arc<StandaloneState>,
+    mv_id: i64,
+) -> Result<(), String> {
+    state.mv_repository.drop_by_id(mv_id).map(|_| ()).map_err(|e| {
+        crate::common::engine_error::EngineError::commit_known_committed_finalize_failed(
+            format!(
+                "StarRocks materialized view table is dropped but MV definition finalization failed: {e}"
+            ),
+        )
+        .to_bracketed_user_message()
+    })
 }
 
 pub(crate) fn iceberg_table_ref_fqns(base_refs: &[TableIdentity]) -> Vec<String> {
@@ -995,21 +1022,12 @@ pub(crate) fn list_mv_rows(
     stmt: &ShowMaterializedViewsStmt,
     storage_filter: Option<MvStorageEngine>,
 ) -> Result<Vec<MvListRow>, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
+    if !state.mv_repository.availability().is_available() {
         return Ok(vec![]);
-    };
-    // Share a single read transaction across `list_definitions` and every
-    // per-row `dependency_display_for_mv` lookup. This avoids M+1 RAII
-    // open/close cycles for M materialized views and, more importantly,
-    // gives the entire SHOW MATERIALIZED VIEWS result a consistent
-    // metadata snapshot: concurrent CREATE/DROP MV writers cannot make
-    // dependency display drift away from the MV list we just read.
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
+    }
     let definitions = state
-        .mv_repo
-        .list_definitions(read.as_ref())
+        .mv_repository
+        .list_definitions()
         .map_err(|e| format!("load materialized view definitions failed: {e}"))?;
     let snapshot = state
         .starrocks_table
@@ -1027,8 +1045,7 @@ pub(crate) fn list_mv_rows(
             continue;
         }
         let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
-        let (refresh_state, retry_after_time) =
-            refresh_status_for_mv(state, read.as_ref(), mv, now_ms)?;
+        let (refresh_state, retry_after_time) = refresh_status_for_mv(state, mv, now_ms)?;
         if engine == MvStorageEngine::Iceberg {
             let Some(target_catalog) = mv.target_catalog.as_deref() else {
                 continue;
@@ -1058,7 +1075,7 @@ pub(crate) fn list_mv_rows(
                 last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
                 base_tables: mv.base_table_refs.join(", "),
                 select_text: mv.select_sql.clone(),
-                dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
+                dependencies: dependency_display_for_mv(state, mv.mv_id)?,
                 refresh_paused: mv.refresh_paused.to_string(),
                 next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
                 last_scheduler_error: mv.last_scheduler_error.clone(),
@@ -1098,7 +1115,7 @@ pub(crate) fn list_mv_rows(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
-            dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
+            dependencies: dependency_display_for_mv(state, mv.mv_id)?,
             refresh_paused: mv.refresh_paused.to_string(),
             next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
             last_scheduler_error: mv.last_scheduler_error.clone(),
@@ -1112,7 +1129,6 @@ pub(crate) fn list_mv_rows(
 
 fn refresh_status_for_mv(
     state: &Arc<StandaloneState>,
-    read: &dyn MetaReadTxn,
     mv: &StoredMvDefinition,
     now_ms: i64,
 ) -> Result<(String, Option<String>), String> {
@@ -1127,8 +1143,8 @@ fn refresh_status_for_mv(
     }
     if let Some(refresh_id) = mv.active_refresh_id {
         let refresh = state
-            .mv_repo
-            .load_refresh(read, refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .map_err(|e| format!("load active MV refresh failed: {e}"))?;
         if refresh
             .as_ref()
@@ -1172,17 +1188,12 @@ fn refresh_status_for_mv(
     }
 }
 
-/// Render the dependency-column text for a single MV row. Callers must pass
-/// the shared read transaction opened by `list_mv_rows` so that every row
-/// observes the same metadata snapshot and we avoid M+1 transaction opens.
-fn dependency_display_for_mv(
-    state: &Arc<StandaloneState>,
-    read: &dyn MetaReadTxn,
-    mv_id: i64,
-) -> Result<String, String> {
+/// Render the dependency-column text for a single MV row through the typed
+/// repository; provider read transactions never escape this boundary.
+fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result<String, String> {
     let dependencies = state
-        .mv_repo
-        .list_dependencies_by_downstream(read, mv_id)
+        .mv_repository
+        .list_dependencies_by_downstream(mv_id)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
         .iter()
@@ -1477,5 +1488,180 @@ fn cleanup_bootstrapped_tablets(tablet_ids: &[i64]) {
         for tablet_id in tablet_ids {
             let _ = remove_tablet_runtime(*tablet_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod mixed_boundary_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use crate::meta::repository::job::CreateEraseJobRequest;
+    use crate::meta::repository::starrocks_table::{
+        CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest, StarRocksTableKind,
+        StarRocksTableState,
+    };
+    use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
+    use crate::mv::test_legacy_repository_adapter::{
+        TestMvRepositoryFailurePoint, fail_next_mv_repository_command,
+    };
+
+    struct Fixture {
+        _dir: TempDir,
+        provider: Arc<dyn MetaStoreProvider>,
+        state: Arc<StandaloneState>,
+        table_id: i64,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = TempDir::new().expect("create metadata directory");
+        let provider: Arc<dyn MetaStoreProvider> = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("metadata.sqlite"))
+                .expect("open metadata provider"),
+        );
+        let state = Arc::new(StandaloneState {
+            metadata_provider: Some(Arc::clone(&provider)),
+            mv_repository: crate::engine::test_mv_repository(Arc::clone(&provider)),
+            ..StandaloneState::default()
+        });
+        let mut write = provider
+            .begin_write("seed StarRocks DDL boundary test")
+            .expect("write");
+        let database = state
+            .starrocks_table_repo
+            .get_or_create_database(write.as_mut(), "db")
+            .expect("database");
+        let layout = state
+            .starrocks_table_repo
+            .create_table_layout(
+                write.as_mut(),
+                CreateStarRocksTableLayoutRequest {
+                    db_id: database.db_id,
+                    table_name: "mv".to_string(),
+                    keys_type: "DUP_KEYS".to_string(),
+                    bucket_num: 1,
+                    kind: StarRocksTableKind::MaterializedView,
+                    schema_version: 0,
+                    tablet_schema_pb: vec![],
+                    columns: vec![CreateStarRocksColumnRequest {
+                        column_name: "k".to_string(),
+                        logical_type: "BIGINT".to_string(),
+                        nullable: false,
+                        visible: true,
+                        is_key: true,
+                    }],
+                    partition_name: "p0".to_string(),
+                    warehouse_uri: "s3://test/warehouse".to_string(),
+                },
+            )
+            .expect("table layout");
+        write.commit().expect("commit visible table metadata");
+        Fixture {
+            _dir: dir,
+            provider,
+            state,
+            table_id: layout.table.table_id,
+        }
+    }
+
+    fn assert_known_committed(error: String) {
+        assert!(
+            error.starts_with("[CommitKnownCommittedFinalizeFailed]"),
+            "{error}"
+        );
+        assert!(!error.contains("CommitKnownUncommitted"), "{error}");
+    }
+
+    #[test]
+    fn create_definition_failure_keeps_the_actual_visible_starrocks_table() {
+        let fixture = fixture();
+        let _failure = fail_next_mv_repository_command(TestMvRepositoryFailurePoint::CreateWithId);
+        let error = finalize_visible_starrocks_mv_create(
+            &fixture.state,
+            CreateMvRepositoryWithIdRequest {
+                mv_id: fixture.table_id,
+                create: CreateMvRepositoryRequest {
+                    definition: CreateMvDefinitionRequest {
+                        select_sql: "SELECT k FROM db.base".to_string(),
+                        base_table_refs: vec![],
+                        primary_key_columns: vec![],
+                        storage_engine: "starrocks".to_string(),
+                        target_catalog: None,
+                        target_namespace: None,
+                        target_table: None,
+                        schema_contract: None,
+                        partition_spec: None,
+                        created_at_ms: 1,
+                    },
+                    refresh: Default::default(),
+                    dependencies: vec![],
+                },
+            },
+        )
+        .expect_err("post-visible definition finalization must fail");
+        assert_known_committed(error);
+
+        let read = fixture.provider.begin_read().expect("read committed state");
+        let table = fixture
+            .state
+            .starrocks_table_repo
+            .load_table(read.as_ref(), fixture.table_id)
+            .expect("load table")
+            .expect("table exists");
+        assert_eq!(table.state, StarRocksTableState::Active);
+    }
+
+    #[test]
+    fn drop_definition_failure_keeps_the_actual_committed_tombstone_and_erase_job() {
+        let fixture = fixture();
+        let mut write = fixture
+            .provider
+            .begin_write("commit visible MV drop")
+            .expect("write");
+        fixture
+            .state
+            .starrocks_table_repo
+            .mark_table_dropping(write.as_mut(), fixture.table_id)
+            .expect("mark dropping");
+        fixture
+            .state
+            .job_repo
+            .create_erase_job(
+                write.as_mut(),
+                CreateEraseJobRequest {
+                    table_id: fixture.table_id,
+                    partition_id: None,
+                    root_path: "s3://test/warehouse/db_1/table_1".to_string(),
+                    now_ms: 1,
+                },
+            )
+            .expect("enqueue erase job");
+        write.commit().expect("commit visible drop");
+
+        let _failure = fail_next_mv_repository_command(TestMvRepositoryFailurePoint::DropById);
+        let error = finalize_visible_starrocks_mv_drop(&fixture.state, fixture.table_id)
+            .expect_err("post-visible definition cleanup must fail");
+        assert_known_committed(error);
+
+        let read = fixture.provider.begin_read().expect("read committed state");
+        let table = fixture
+            .state
+            .starrocks_table_repo
+            .load_table(read.as_ref(), fixture.table_id)
+            .expect("load table")
+            .expect("table exists");
+        assert_eq!(table.state, StarRocksTableState::Dropping);
+        let erase_jobs = fixture
+            .state
+            .job_repo
+            .list_runnable_erase_jobs(read.as_ref(), i64::MAX)
+            .expect("list erase jobs");
+        assert!(
+            erase_jobs
+                .iter()
+                .any(|job| { job.table_id == fixture.table_id && job.partition_id.is_none() })
+        );
     }
 }

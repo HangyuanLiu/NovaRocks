@@ -39,6 +39,7 @@ use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
     TableMaintenanceEngine, TableMaintenanceService,
 };
+use crate::mv::repository::MvRepository;
 
 /// Signals consumed by the coordinator thread. `Wake` is sent after every
 /// successful MV refresh; `Stop` is sent by the handle on drop.
@@ -286,15 +287,12 @@ fn load_candidates(
     ),
     String,
 > {
-    let Some(provider) = state.metadata_provider.as_ref() else {
+    if !state.mv_repository.availability().is_available() {
         return Ok((Vec::new(), Vec::new()));
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open mv maintenance read transaction failed: {e}"))?;
+    }
     let definitions = state
-        .mv_repo
-        .list_definitions(read.as_ref())
+        .mv_repository
+        .list_definitions()
         .map_err(|e| format!("list mv definitions for maintenance failed: {e}"))?;
     let candidates = definitions
         .iter()
@@ -431,7 +429,7 @@ pub(crate) fn start_maintenance_coordinator_for_server(
     engine: &crate::engine::StandaloneNovaRocks,
     config: MaintenanceCoordinatorConfig,
 ) -> MaintenanceCoordinatorHandle {
-    if !config.enabled {
+    if !config.enabled || !engine.inner.mv_repository.availability().is_available() {
         return MaintenanceCoordinatorHandle::disabled();
     }
     let state = Arc::clone(&engine.inner);

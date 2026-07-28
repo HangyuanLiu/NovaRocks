@@ -138,12 +138,14 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
     let metadata_dir = TempDir::new().expect("metadata tempdir");
     let warehouse_dir = TempDir::new().expect("warehouse tempdir");
     let metadata_path = metadata_dir.path().join("standalone.sqlite");
-    let metadata_provider =
-        crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
+    let metadata_provider: Arc<dyn crate::meta::MetaStoreProvider> = Arc::new(
+        crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider"),
+    );
     let maintenance_service = Arc::new(InlineTableMaintenanceService::default());
     let service_port: Arc<dyn TableMaintenanceService> = maintenance_service.clone();
     let state = Arc::new_cyclic(|self_weak| StandaloneState {
-        metadata_provider: Some(Arc::new(metadata_provider)),
+        mv_repository: crate::engine::test_mv_repository(Arc::clone(&metadata_provider)),
+        metadata_provider: Some(metadata_provider),
         exchange_port: loopback_backend.exchange_port,
         table_maintenance_service: Arc::clone(&service_port),
         self_weak: self_weak.clone(),

@@ -3907,15 +3907,9 @@ fn starrocks_mv_dependencies_for_target(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
 ) -> Result<Vec<StarRocksMvDependency>, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
     let definitions = state
-        .mv_repo
-        .list_definitions(read.as_ref())
+        .mv_repository
+        .list_definitions()
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
     let target_key = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
     let target_key_lower = target_key.to_ascii_lowercase();

@@ -23,6 +23,7 @@ use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
 use crate::engine::{StandaloneState, StatementResult};
+use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
 #[derive(Clone, Debug)]
@@ -151,15 +152,9 @@ pub(crate) fn try_update_be_configs(
 fn materialized_view_rows(
     state: &Arc<StandaloneState>,
 ) -> Result<Vec<MaterializedViewInfoRow>, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
     let definitions = state
-        .mv_repo
-        .list_definitions(read.as_ref())
+        .mv_repository
+        .list_definitions()
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
     let snapshot = state
         .starrocks_table

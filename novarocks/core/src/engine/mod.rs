@@ -50,9 +50,12 @@ use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered}
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
+#[cfg(test)]
 use crate::meta::repository::mv::MvMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
+use crate::mv::application::{MvApplicationService, UnavailableMvApplicationService};
+use crate::mv::repository::{MvRepository, UnavailableMvRepository};
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
 use novarocks_catalog::identifier::normalize_identifier;
@@ -350,6 +353,14 @@ pub(crate) struct StandaloneState {
     pub(crate) backend_repo: BackendMetaRepository,
     pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
     pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
+    /// Provider-neutral MV metadata boundary. Production wiring is installed by
+    /// the frontend host; the core default deliberately rejects MV operations.
+    pub(crate) mv_repository: Arc<dyn MvRepository>,
+    /// Frontend-owned MV statement application boundary.
+    pub(crate) mv_application_service: Arc<dyn MvApplicationService>,
+    /// Test-only characterization fixture. Production code has no legacy MV
+    /// repository handle; all production callers must use `mv_repository`.
+    #[cfg(test)]
     pub(crate) mv_repo: MvMetaRepository,
     pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
@@ -389,6 +400,9 @@ impl Default for StandaloneState {
             backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
+            mv_repository: Arc::new(UnavailableMvRepository),
+            mv_application_service: Arc::new(UnavailableMvApplicationService),
+            #[cfg(test)]
             mv_repo: MvMetaRepository,
             catalog_attachment_repo: CatalogAttachmentRepository,
             iceberg_operation_repo: IcebergOperationRepository,
@@ -427,6 +441,13 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     TestSerializationGuard { _guard: guard }
+}
+
+#[cfg(test)]
+pub(crate) fn test_mv_repository(
+    provider: Arc<dyn crate::meta::MetaStoreProvider>,
+) -> Arc<dyn MvRepository> {
+    Arc::new(crate::mv::test_legacy_repository_adapter::LegacyMvRepositoryAdapter::new(provider))
 }
 
 #[derive(Clone)]
@@ -585,10 +606,25 @@ impl StandaloneNovaRocks {
             )),
             starrocks_table_config,
             mv_refresh_pruning_limits,
-            metadata_provider,
+            metadata_provider: metadata_provider.clone(),
             backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
+            mv_repository: {
+                #[cfg(test)]
+                {
+                    metadata_provider
+                        .as_ref()
+                        .map(|provider| test_mv_repository(Arc::clone(provider)))
+                        .unwrap_or_else(|| Arc::new(UnavailableMvRepository))
+                }
+                #[cfg(not(test))]
+                {
+                    Arc::new(UnavailableMvRepository)
+                }
+            },
+            mv_application_service: Arc::new(UnavailableMvApplicationService),
+            #[cfg(test)]
             mv_repo: MvMetaRepository,
             catalog_attachment_repo: CatalogAttachmentRepository,
             job_repo: JobMetaRepository,

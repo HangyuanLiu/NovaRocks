@@ -28,6 +28,7 @@ use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
+use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
@@ -336,20 +337,13 @@ fn existing_mv_storage_engine_by_target(
     state: &Arc<StandaloneState>,
     target: &crate::engine::mv::iceberg_refresh::IcebergMvTarget,
 ) -> Result<Option<MvStorageEngine>, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(None);
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open MV metadata read transaction failed: {e}"))?;
     let Some(definition) = state
-        .mv_repo
-        .find_by_target(
-            read.as_ref(),
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        )
+        .mv_repository
+        .find_by_target(&MvTarget {
+            catalog: Some(target.catalog.clone()),
+            database: target.namespace.clone(),
+            name: target.table.clone(),
+        })
         .map_err(|e| format!("load MV definition by target failed: {e}"))?
     else {
         return Ok(None);
@@ -371,17 +365,30 @@ fn stored_refresh_policy(
     }
 }
 
+pub(crate) fn initial_refresh_configuration_for_create(
+    policy: &MaterializedViewRefreshPolicy,
+) -> crate::mv::repository::InitialMvRefreshConfiguration {
+    let (policy, interval_ms) = stored_refresh_policy(policy);
+    crate::mv::repository::InitialMvRefreshConfiguration {
+        policy,
+        paused: false,
+        interval_ms,
+        max_staleness_ms: None,
+        next_refresh_after_ms: None,
+    }
+}
+
 pub(crate) fn refresh_metadata_request_for_create(
     mv_id: i64,
     policy: &MaterializedViewRefreshPolicy,
 ) -> UpdateMvRefreshMetadataRequest {
-    let (refresh_policy, refresh_interval_ms) = stored_refresh_policy(policy);
+    let initial = initial_refresh_configuration_for_create(policy);
     UpdateMvRefreshMetadataRequest {
         mv_id,
-        refresh_policy,
+        refresh_policy: initial.policy,
         refresh_paused: false,
-        refresh_interval_ms,
-        max_staleness_ms: None,
+        refresh_interval_ms: initial.interval_ms,
+        max_staleness_ms: initial.max_staleness_ms,
         last_scheduler_error: None,
         next_refresh_after_ms: None,
     }
@@ -406,7 +413,6 @@ fn refresh_metadata_request_for_policy(
 
 fn load_definition_for_alter(
     state: &Arc<StandaloneState>,
-    txn: &dyn crate::meta::MetaReadTxn,
     current_catalog: Option<&str>,
     db: &str,
     name: &crate::sql::parser::ast::ObjectName,
@@ -414,8 +420,12 @@ fn load_definition_for_alter(
     let target =
         crate::engine::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
     let Some(definition) = state
-        .mv_repo
-        .find_by_target(txn, &target.catalog, &target.namespace, &target.table)
+        .mv_repository
+        .find_by_target(&MvTarget {
+            catalog: Some(target.catalog.clone()),
+            database: target.namespace.clone(),
+            name: target.table.clone(),
+        })
         .map_err(|e| format!("load MV definition by target failed: {e}"))?
     else {
         return Err(format!(
@@ -580,15 +590,7 @@ pub(crate) fn alter_mv(
             stmt,
         );
     }
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "ALTER MATERIALIZED VIEW requires metadata provider".to_string())?;
-    let mut txn = provider
-        .begin_write("alter materialized view refresh metadata")
-        .map_err(|e| format!("open MV metadata write transaction failed: {e}"))?;
-    let definition =
-        load_definition_for_alter(state, txn.as_ref(), current_catalog, db, &stmt.name)?;
+    let definition = load_definition_for_alter(state, current_catalog, db, &stmt.name)?;
     let req = match &stmt.action {
         AlterMaterializedViewAction::SetRefresh(policy) => {
             refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
@@ -619,11 +621,9 @@ pub(crate) fn alter_mv(
         }
     };
     state
-        .mv_repo
-        .update_refresh_metadata(txn.as_mut(), req.clone())
+        .mv_repository
+        .update_refresh_metadata(req.clone())
         .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit MV refresh metadata failed: {e}"))?;
     crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor(
         state,
         &definition,

@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use crate::mv::repository::MvRepository;
 use crate::sql::catalog::PlannerTableProvider;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::cascades_rules::mv_rewrite::{
@@ -97,15 +98,9 @@ fn try_prepare(
     }
 
     // 2. List stored MVs.
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("mv metadata read txn: {e}"))?;
     let definitions = state
-        .mv_repo
-        .list_definitions(read.as_ref())
+        .mv_repository
+        .list_definitions()
         .map_err(|e| format!("list mv definitions: {e}"))?;
 
     let stats_providers = QueryStatsProviders::from_standalone_state(state);

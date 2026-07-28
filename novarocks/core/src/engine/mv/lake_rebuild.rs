@@ -189,24 +189,18 @@ pub(crate) fn rebuild_one_discovered_mv_if_missing(
     entry: &crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
     mv: &DiscoveredIcebergMv,
 ) -> Result<(), String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "metadata provider required for IMV lake rebuild".to_string())?;
-
     // Cache-hit check: skip MVs already recorded in SQLite. The rebuilt target
     // maps to (discovered.catalog, discovered.namespace, discovered.table).
-    {
-        let read = provider
-            .begin_read()
-            .map_err(|e| format!("open IMV rebuild read transaction failed: {e}"))?;
-        let existing = state
-            .mv_repo
-            .find_by_target(read.as_ref(), &mv.catalog, &mv.namespace, &mv.table)
-            .map_err(|e| format!("look up MV definition during lake rebuild failed: {e}"))?;
-        if existing.is_some() {
-            return Ok(());
-        }
+    let existing = state
+        .mv_repository
+        .find_by_target(&crate::mv::model::MvTarget {
+            catalog: Some(mv.catalog.clone()),
+            database: mv.namespace.clone(),
+            name: mv.table.clone(),
+        })
+        .map_err(|e| format!("look up MV definition during lake rebuild failed: {e}"))?;
+    if existing.is_some() {
+        return Ok(());
     }
 
     // Read the MV table's current-snapshot provenance for the refresh watermark.
@@ -227,28 +221,25 @@ pub(crate) fn rebuild_one_discovered_mv_if_missing(
     let dependencies =
         dependency_requests_from_descriptor(&mv.descriptor.base_dependencies, created_at_ms)?;
 
-    let mut txn = provider
-        .begin_write("rebuild iceberg materialized view definition from lake")
-        .map_err(|e| format!("open IMV rebuild write transaction failed: {e}"))?;
     let definition = state
-        .mv_repo
-        .create_definition(txn.as_mut(), rebuilt.create_request)
+        .mv_repository
+        .create(
+            uuid::Uuid::new_v4(),
+            crate::mv::repository::CreateMvRepositoryRequest {
+                definition: rebuilt.create_request,
+                refresh: Default::default(),
+                dependencies: dependencies.clone(),
+            },
+        )
         .map_err(|e| format!("rebuild iceberg MV repository metadata failed: {e}"))?;
     state
-        .mv_repo
+        .mv_repository
         .set_rebuilt_refresh_watermark(
-            txn.as_mut(),
             definition.mv_id,
             rebuilt.last_refresh_snapshots,
             rebuilt.last_refresh_table_uuids,
         )
         .map_err(|e| format!("stamp rebuilt iceberg MV refresh watermark failed: {e}"))?;
-    state
-        .mv_repo
-        .replace_dependencies_for_mv(txn.as_mut(), definition.mv_id, dependencies)
-        .map_err(|e| format!("rebuild iceberg MV dependency metadata failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit rebuilt iceberg MV metadata failed: {e}"))?;
     Ok(())
 }
 

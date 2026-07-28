@@ -264,48 +264,35 @@ fn clear_sqlite_and_rebuild_from_lake(
     entry: &crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
     mv: &crate::engine::mv::iceberg_discovery::DiscoveredIcebergMv,
 ) -> Result<(), String> {
-    let provider = state.metadata_provider.as_ref().ok_or_else(|| {
-        format!(
-            "{PROCEDURE_NAME} full level requires a metadata provider (SQLite) to clear and rebuild"
-        )
-    })?;
-
     // 1. Confirm the SQLite definition currently exists; the round-trip is only
     //    meaningful if there is a cached record to clear.
-    {
-        let read = provider
-            .begin_read()
-            .map_err(|e| format!("open stateless-rebuild read transaction failed: {e}"))?;
-        let existing = state
-            .mv_repo
-            .find_by_target(read.as_ref(), &mv.catalog, &mv.namespace, &mv.table)
-            .map_err(|e| format!("look up MV definition before full rebuild failed: {e}"))?;
-        if existing.is_none() {
-            return Err(format!(
-                "{PROCEDURE_NAME} full level: MV '{}.{}' has no SQLite definition to clear (target {}.{}.{}); cannot prove a clear+rebuild round-trip",
-                mv.namespace, mv.public_name, mv.catalog, mv.namespace, mv.table
-            ));
-        }
+    let target = crate::mv::model::MvTarget {
+        catalog: Some(mv.catalog.clone()),
+        database: mv.namespace.clone(),
+        name: mv.table.clone(),
+    };
+    let existing = state
+        .mv_repository
+        .find_by_target(&target)
+        .map_err(|e| format!("look up MV definition before full rebuild failed: {e}"))?;
+    if existing.is_none() {
+        return Err(format!(
+            "{PROCEDURE_NAME} full level: MV '{}.{}' has no repository definition to clear (target {}.{}.{}); cannot prove a clear+rebuild round-trip",
+            mv.namespace, mv.public_name, mv.catalog, mv.namespace, mv.table
+        ));
     }
 
     // 2. Clear the SQLite records for this MV target. The lake MV table is
     //    left untouched — exactly the "SQLite forgot, lake remembers" state.
-    {
-        let mut txn = provider
-            .begin_write("stateless-rebuild full: clear MV SQLite definition")
-            .map_err(|e| format!("open stateless-rebuild write transaction failed: {e}"))?;
-        let dropped = state
-            .mv_repo
-            .drop_by_target(txn.as_mut(), &mv.catalog, &mv.namespace, &mv.table)
-            .map_err(|e| format!("clear MV SQLite definition for full rebuild failed: {e}"))?;
-        if !dropped {
-            return Err(format!(
-                "{PROCEDURE_NAME} full level: expected to clear MV SQLite definition for target {}.{}.{}",
-                mv.catalog, mv.namespace, mv.table
-            ));
-        }
-        txn.commit()
-            .map_err(|e| format!("commit stateless-rebuild clear failed: {e}"))?;
+    let dropped = state
+        .mv_repository
+        .drop_by_target(&target)
+        .map_err(|e| format!("clear MV repository definition for full rebuild failed: {e}"))?;
+    if !dropped {
+        return Err(format!(
+            "{PROCEDURE_NAME} full level: expected to clear MV repository definition for target {}.{}.{}",
+            mv.catalog, mv.namespace, mv.table
+        ));
     }
 
     // 3. Rebuild the single target MV purely from the lake package.
@@ -313,20 +300,15 @@ fn clear_sqlite_and_rebuild_from_lake(
 
     // 4. Confirm the definition reappeared. If it did not, statelessness failed:
     //    the lake package did not carry enough to reconstruct the SQLite record.
-    {
-        let read = provider
-            .begin_read()
-            .map_err(|e| format!("open stateless-rebuild verify transaction failed: {e}"))?;
-        let rebuilt = state
-            .mv_repo
-            .find_by_target(read.as_ref(), &mv.catalog, &mv.namespace, &mv.table)
-            .map_err(|e| format!("verify MV definition after full rebuild failed: {e}"))?;
-        if rebuilt.is_none() {
-            return Err(format!(
-                "{PROCEDURE_NAME} full level: MV SQLite definition for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
-                mv.catalog, mv.namespace, mv.table
-            ));
-        }
+    let rebuilt = state
+        .mv_repository
+        .find_by_target(&target)
+        .map_err(|e| format!("verify MV definition after full rebuild failed: {e}"))?;
+    if rebuilt.is_none() {
+        return Err(format!(
+            "{PROCEDURE_NAME} full level: MV repository definition for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
+            mv.catalog, mv.namespace, mv.table
+        ));
     }
 
     Ok(())

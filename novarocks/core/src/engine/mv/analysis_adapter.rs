@@ -173,21 +173,9 @@ pub(crate) fn list_mv_rows(
     stmt: &ShowMaterializedViewsStmt,
     storage_filter: Option<MvStorageEngine>,
 ) -> Result<Vec<MvListRow>, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(vec![]);
-    };
-    // Share a single read transaction across `list_definitions` and every
-    // per-row `dependency_display_for_mv` lookup. This avoids M+1 RAII
-    // open/close cycles for M materialized views and, more importantly,
-    // gives the entire SHOW MATERIALIZED VIEWS result a consistent
-    // metadata snapshot: concurrent CREATE/DROP MV writers cannot make
-    // dependency display drift away from the MV list we just read.
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
     let definitions = state
-        .mv_repo
-        .list_definitions(read.as_ref())
+        .mv_repository
+        .list_definitions()
         .map_err(|e| format!("load materialized view definitions failed: {e}"))?;
     let now_ms = now_ms();
 
@@ -199,8 +187,7 @@ pub(crate) fn list_mv_rows(
             continue;
         }
         let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
-        let (refresh_state, retry_after_time) =
-            refresh_status_for_mv(state, read.as_ref(), mv, now_ms)?;
+        let (refresh_state, retry_after_time) = refresh_status_for_mv(state, mv, now_ms)?;
         if engine != MvStorageEngine::Iceberg {
             continue;
         }
@@ -232,7 +219,7 @@ pub(crate) fn list_mv_rows(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
-            dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
+            dependencies: dependency_display_for_mv(state, mv.mv_id)?,
             refresh_paused: mv.refresh_paused.to_string(),
             next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
             last_scheduler_error: mv.last_scheduler_error.clone(),
@@ -246,7 +233,6 @@ pub(crate) fn list_mv_rows(
 
 fn refresh_status_for_mv(
     state: &Arc<StandaloneState>,
-    read: &dyn MetaReadTxn,
     mv: &StoredMvDefinition,
     now_ms: i64,
 ) -> Result<(String, Option<String>), String> {
@@ -261,8 +247,8 @@ fn refresh_status_for_mv(
     }
     if let Some(refresh_id) = mv.active_refresh_id {
         let refresh = state
-            .mv_repo
-            .load_refresh(read, refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .map_err(|e| format!("load active MV refresh failed: {e}"))?;
         if refresh
             .as_ref()
@@ -306,17 +292,12 @@ fn refresh_status_for_mv(
     }
 }
 
-/// Render the dependency-column text for a single MV row. Callers must pass
-/// the shared read transaction opened by `list_mv_rows` so that every row
-/// observes the same metadata snapshot and we avoid M+1 transaction opens.
-fn dependency_display_for_mv(
-    state: &Arc<StandaloneState>,
-    read: &dyn MetaReadTxn,
-    mv_id: i64,
-) -> Result<String, String> {
+/// Render the dependency-column text for a single MV row through the typed
+/// repository boundary.
+fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result<String, String> {
     let dependencies = state
-        .mv_repo
-        .list_dependencies_by_downstream(read, mv_id)
+        .mv_repository
+        .list_dependencies_by_downstream(mv_id)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
         .iter()
