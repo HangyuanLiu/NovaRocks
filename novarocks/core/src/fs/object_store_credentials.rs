@@ -57,6 +57,7 @@ pub enum ObjectStoreCredentialsSource {
     S3AProperties,
     IcebergSinkCloudProperties,
     StandaloneConfig,
+    ConnectorStartupConfig,
     StarRocksObjectStoreProfile,
     StarletProfile,
 }
@@ -68,6 +69,7 @@ impl ObjectStoreCredentialsSource {
             Self::S3AProperties => "s3a_properties",
             Self::IcebergSinkCloudProperties => "iceberg_sink_cloud_properties",
             Self::StandaloneConfig => "standalone_config",
+            Self::ConnectorStartupConfig => "connector_startup_config",
             Self::StarRocksObjectStoreProfile => "starrocks_object_store_profile",
             Self::StarletProfile => "starlet_profile",
         }

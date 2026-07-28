@@ -434,6 +434,7 @@ mod tests {
                     split_id: "split-1".to_string(),
                     split_payload: vec![1, 2, 3],
                     estimated_bytes: Some(3),
+                    file_execution: None,
                 }],
                 max_batch_rows: 128,
                 max_batch_bytes: 4096,
@@ -487,6 +488,63 @@ mod tests {
                 .to_string()
                 .ends_with("connector_read.max_batch_rows")
         );
+    }
+
+    #[test]
+    fn native_connector_read_carrier_restores_core_file_sidecar_without_provider_decoding() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "test.native".to_string(),
+                scan_payload: vec![0],
+                splits: vec![plan::ConnectorReadSplit {
+                    split_id: "file-1".to_string(),
+                    split_payload: vec![1, 2, 3],
+                    estimated_bytes: Some(3),
+                    file_execution: Some(plan::FileExecutionSidecar {
+                        version: 1,
+                        file_format: plan::FileExecutionFormat::Parquet as i32,
+                        path: "s3://bucket/table/data.parquet".to_string(),
+                        file_length: 100,
+                        offset: 7,
+                        length: 31,
+                        delete_files: Vec::new(),
+                        deletion_vector: None,
+                        first_row_id: Some(11),
+                        data_sequence_number: Some(12),
+                        included_positions: vec![13, 17],
+                        change_op: Some(1),
+                        file_pruning_min_max_values: Default::default(),
+                    }),
+                }],
+                max_batch_rows: 128,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(connector_read_registry("test.native"))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 11 });
+        let decoded = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect("decode ConnectorReadSource with a core file sidecar");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("expected decoded scan node");
+        };
+        let op = scan
+            .source()
+            .bind(context.captured_ranges_for_test(node.node_id))
+            .expect("bind generic connector source");
+        let morsels = op.build_morsels().expect("build generic connector morsels");
+        assert!(matches!(
+            &morsels.morsels[..],
+            [ScanMorsel::ConnectorFileSplit { range, .. }]
+                if range.path == "s3://bucket/table/data.parquet"
+                    && range.offset == 7
+                    && range.length == 31
+                    && range.first_row_id == Some(11)
+                    && range.data_sequence_number == Some(12)
+                    && range.included_positions == Some(vec![13, 17])
+        ));
     }
 
     fn assert_scan_column_type_error(
