@@ -44,6 +44,9 @@ pub mod mysql;
 
 #[cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
 #[doc(hidden)]
+pub use foundationdb::provider::FoundationDbProviderTestHarness;
+#[cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
+#[doc(hidden)]
 pub use foundationdb::test_support::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
 
 pub use config::{
@@ -121,7 +124,7 @@ pub async fn open_state_store(
                 "FoundationDB provider is not compiled in",
             ));
             #[cfg(feature = "foundationdb-provider")]
-            return runtime.open_foundationdb_store(&config).await;
+            return runtime.open_foundationdb_store(&config, deployment).await;
         }
         StateStoreProviderConfig::Mysql { .. } => {
             #[cfg(not(feature = "mysql-state-store-provider"))]

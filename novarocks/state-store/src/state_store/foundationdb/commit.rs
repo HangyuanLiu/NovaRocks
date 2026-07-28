@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 use super::codec::{DurableCommitState, KeyspaceCodec, REVISION_BYTES};
 use super::txn::create_raw_transaction_with_observer;
+use crate::state_store::foundationdb::runtime::OperationHandle;
 use crate::state_store::metrics::StateStoreMetrics;
-use crate::state_store::runtime::OperationHandle;
 use novarocks_spi::state_store::{
     CommitOutcome, CommitReceipt, CommitResolution, StateStoreError, StateStoreErrorKind,
     StateStoreLimits, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId,

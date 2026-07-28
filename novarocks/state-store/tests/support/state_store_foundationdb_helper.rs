@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::state_store::{
@@ -26,8 +27,8 @@ use novarocks_spi::state_store::{
     RangeRequest, StateRecord, StateStore, TransactionId, Value, VersionToken, WriteTransaction,
 };
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig, StateStoreRuntime, arm_next_foundationdb_commit, open_state_store,
+    FeDeploymentView, FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, arm_next_foundationdb_commit,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -309,7 +310,7 @@ struct PendingCommit {
 
 #[derive(Default)]
 struct HelperState {
-    runtime: Option<StateStoreRuntime>,
+    runtime: Option<FoundationDbProviderTestHarness>,
     store: Option<Arc<dyn StateStore>>,
     transactions: HashMap<Uuid, Box<dyn WriteTransaction>>,
     pending: HashMap<Uuid, PendingCommit>,
@@ -368,25 +369,26 @@ impl HelperState {
         }
         let cluster_file = cluster_file()?;
         let mut runtime =
-            StateStoreRuntime::foundationdb(client_config()).map_err(display_error)?;
-        let store = match open_state_store(
-            &runtime,
-            StateStoreConfig {
-                cluster_id,
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Foundationdb {
-                    cluster_file,
-                    keyspace_id,
+            FoundationDbProviderTestHarness::boot(client_config()).map_err(display_error)?;
+        let store = match runtime
+            .open_store(
+                StateStoreConfig {
+                    cluster_id,
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Foundationdb {
+                        cluster_file,
+                        keyspace_id,
+                    },
                 },
-            },
-            deployment(),
-        )
-        .await
+                deployment(),
+                test_deadline(),
+            )
+            .await
         {
             Ok(store) => store,
             Err(error) => {
                 let open_error = display_error(error);
-                let shutdown_error = match runtime.shutdown().await {
+                let shutdown_error = match runtime.shutdown(test_deadline()).await {
                     Ok(()) => None,
                     Err(shutdown_error) => {
                         self.runtime = Some(runtime);
@@ -550,7 +552,10 @@ impl HelperState {
         }
         self.store.take();
         if let Some(mut runtime) = self.runtime.take() {
-            runtime.shutdown().await.map_err(display_error)?;
+            runtime
+                .shutdown(test_deadline())
+                .await
+                .map_err(display_error)?;
         }
         Ok(Response::success("Shutdown"))
     }
@@ -569,6 +574,10 @@ impl HelperState {
             .get_mut(&transaction_id)
             .ok_or_else(|| format!("transaction {transaction_id} is not active"))
     }
+}
+
+fn test_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
 }
 
 fn client_config() -> FoundationDbClientConfig {

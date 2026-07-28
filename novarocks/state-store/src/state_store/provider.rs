@@ -23,6 +23,8 @@ use novarocks_spi::state_store::{
 };
 
 use super::config::{StateStoreHostConfig, StateStoreProviderConfig};
+#[cfg(feature = "foundationdb-provider")]
+use super::foundationdb::provider::FoundationDbStateStoreProviderFactory;
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
 use super::limits::{MYSQL_MAX_KEY_BYTES, resolve_state_store_limits};
 #[cfg(feature = "mysql-state-store-provider")]
@@ -211,6 +213,37 @@ pub fn builtin_state_store_provider_registry()
         "MySQL provider is not compiled in",
         MYSQL_MAX_KEY_BYTES,
     ))?;
+    #[cfg(feature = "foundationdb-provider")]
+    registry.register(StateStoreProviderRegistration::available(
+        FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
+        MAX_KEY_BYTES,
+        |config| {
+            let StateStoreProviderConfig::Foundationdb {
+                cluster_file,
+                keyspace_id,
+            } = &config.state_store.store.provider
+            else {
+                return Err(StateStoreHostError::new(
+                    StateStoreHostErrorKind::Bind,
+                    Some(FOUNDATIONDB_STATE_STORE_PROVIDER_ID),
+                    "FoundationDB provider binder requires FoundationDB provider configuration",
+                ));
+            };
+            let client = config.foundationdb_client.clone().ok_or_else(|| {
+                StateStoreHostError::new(
+                    StateStoreHostErrorKind::Bind,
+                    Some(FOUNDATIONDB_STATE_STORE_PROVIDER_ID),
+                    "FoundationDB provider binder requires FoundationDB client configuration",
+                )
+            })?;
+            Ok(Box::new(FoundationDbStateStoreProviderFactory::new(
+                cluster_file.clone(),
+                *keyspace_id,
+                client,
+            )))
+        },
+    ))?;
+    #[cfg(not(feature = "foundationdb-provider"))]
     registry.register(StateStoreProviderRegistration::unavailable(
         FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
         "FoundationDB provider is not compiled in",

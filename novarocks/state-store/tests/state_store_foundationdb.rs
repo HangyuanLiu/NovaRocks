@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "foundationdb-provider")]
+#![cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(feature = "state-store-test-hooks")]
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "state-store-test-hooks")]
 use async_trait::async_trait;
@@ -33,8 +34,8 @@ use novarocks_spi::state_store::{
     RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
 };
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+    FeDeploymentView, FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig,
 };
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
@@ -88,6 +89,10 @@ fn deployment() -> FeDeploymentView {
         active_fe_count: NonZeroUsize::new(2).expect("non-zero FE count"),
         topology_revision: Bytes::from_static(b"foundationdb-suite-topology"),
     }
+}
+
+fn test_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
 }
 
 async fn write_partial_identity(keyspace_id: Uuid) {
@@ -164,15 +169,16 @@ async fn seed(store: &dyn StateStore, records: &[(&'static [u8], &'static [u8])]
     assert_committed(transaction.commit().await);
 }
 
-async fn transaction_scenarios(runtime: &StateStoreRuntime) {
+async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
     let keyspace_id = Uuid::new_v4();
-    let store = open_state_store(
-        runtime,
-        transaction_store_config("transaction-cluster", keyspace_id),
-        deployment(),
-    )
-    .await
-    .expect("open transaction keyspace");
+    let store = harness
+        .open_store(
+            transaction_store_config("transaction-cluster", keyspace_id),
+            deployment(),
+            test_deadline(),
+        )
+        .await
+        .expect("open transaction keyspace");
 
     let binary_key = key(Bytes::from_static(&[0x00, 0xff, 0x10]));
     let binary_value = value(Bytes::from_static(&[0xff, 0x00, 0x20]));
@@ -426,23 +432,24 @@ async fn transaction_scenarios(runtime: &StateStoreRuntime) {
     reverse.abort().await.expect("abort reverse scan");
 
     let limited_keyspace_id = Uuid::new_v4();
-    let limited_store = open_state_store(
-        runtime,
-        StateStoreConfig {
-            cluster_id: "limited-cluster".to_owned(),
-            limits: StateStoreLimitOverrides {
-                max_transaction_bytes: Some(16 * 1024),
-                ..Default::default()
+    let limited_store = harness
+        .open_store(
+            StateStoreConfig {
+                cluster_id: "limited-cluster".to_owned(),
+                limits: StateStoreLimitOverrides {
+                    max_transaction_bytes: Some(16 * 1024),
+                    ..Default::default()
+                },
+                provider: StateStoreProviderConfig::Foundationdb {
+                    cluster_file: cluster_file(),
+                    keyspace_id: limited_keyspace_id,
+                },
             },
-            provider: StateStoreProviderConfig::Foundationdb {
-                cluster_file: cluster_file(),
-                keyspace_id: limited_keyspace_id,
-            },
-        },
-        deployment(),
-    )
-    .await
-    .expect("open limited keyspace");
+            deployment(),
+            test_deadline(),
+        )
+        .await
+        .expect("open limited keyspace");
     let transaction_id = TransactionId::from(Uuid::new_v4());
     let mut limited = limited_store
         .begin_write(transaction_id, "pre-io-limit")
@@ -493,14 +500,15 @@ async fn transaction_scenarios(runtime: &StateStoreRuntime) {
     drop(store);
 }
 
-async fn durable_commit_and_change_scenarios(runtime: &StateStoreRuntime) {
-    let store = open_state_store(
-        runtime,
-        transaction_store_config("durable-cluster", Uuid::new_v4()),
-        deployment(),
-    )
-    .await
-    .expect("open durable commit keyspace");
+async fn durable_commit_and_change_scenarios(harness: &FoundationDbProviderTestHarness) {
+    let store = harness
+        .open_store(
+            transaction_store_config("durable-cluster", Uuid::new_v4()),
+            deployment(),
+            test_deadline(),
+        )
+        .await
+        .expect("open durable commit keyspace");
 
     let tombstoned = TransactionId::from(Uuid::new_v4());
     assert_eq!(
@@ -687,14 +695,15 @@ async fn durable_commit_and_change_scenarios(runtime: &StateStoreRuntime) {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
-async fn cancellation_safe_supervisor_scenarios(runtime: &StateStoreRuntime) {
-    let store = open_state_store(
-        runtime,
-        transaction_store_config("supervisor-cluster", Uuid::new_v4()),
-        deployment(),
-    )
-    .await
-    .expect("open supervisor keyspace");
+async fn cancellation_safe_supervisor_scenarios(harness: &FoundationDbProviderTestHarness) {
+    let store = harness
+        .open_store(
+            transaction_store_config("supervisor-cluster", Uuid::new_v4()),
+            deployment(),
+            test_deadline(),
+        )
+        .await
+        .expect("open supervisor keyspace");
 
     let cancellation_control =
         arm_next_foundationdb_commit(true, false, false).expect("arm pre-native gate");
@@ -776,26 +785,27 @@ fn conformance_limit_overrides() -> StateStoreLimitOverrides {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
-fn conformance_factory(runtime: Rc<StateStoreRuntime>) -> StateStoreFactory {
+fn conformance_factory(runtime: Rc<FoundationDbProviderTestHarness>) -> StateStoreFactory {
     Rc::new(move || {
         let runtime = Rc::clone(&runtime);
         Box::pin(async move {
-            let store = open_state_store(
-                runtime.as_ref(),
-                StateStoreConfig {
-                    cluster_id: "foundationdb-conformance-cluster".to_owned(),
-                    limits: conformance_limit_overrides(),
-                    provider: StateStoreProviderConfig::Foundationdb {
-                        cluster_file: cluster_file(),
-                        keyspace_id: Uuid::new_v4(),
+            let store = runtime
+                .open_store(
+                    StateStoreConfig {
+                        cluster_id: "foundationdb-conformance-cluster".to_owned(),
+                        limits: conformance_limit_overrides(),
+                        provider: StateStoreProviderConfig::Foundationdb {
+                            cluster_file: cluster_file(),
+                            keyspace_id: Uuid::new_v4(),
+                        },
                     },
-                },
-                FeDeploymentView {
-                    active_fe_count: NonZeroUsize::new(2).expect("non-zero FE count"),
-                    topology_revision: Bytes::from_static(b"foundationdb-conformance-topology"),
-                },
-            )
-            .await?;
+                    FeDeploymentView {
+                        active_fe_count: NonZeroUsize::new(2).expect("non-zero FE count"),
+                        topology_revision: Bytes::from_static(b"foundationdb-conformance-topology"),
+                    },
+                    test_deadline(),
+                )
+                .await?;
             let controller: Arc<dyn PostDispatchController> =
                 Arc::new(FoundationDbPostDispatchController);
             Ok(StateStoreConformanceFixture::new(store, controller))
@@ -885,15 +895,15 @@ async fn await_terminal(store: &dyn StateStore, transaction_id: TransactionId) -
 #[tokio::test(flavor = "multi_thread")]
 async fn foundationdb_suite() {
     let runtime = Rc::new(
-        StateStoreRuntime::foundationdb(client_config())
+        FoundationDbProviderTestHarness::boot(client_config())
             .expect("boot process-owned FoundationDB runtime"),
     );
 
     let keyspace_id = Uuid::new_v4();
     let config = store_config("identity-cluster", keyspace_id);
     let (left, right) = tokio::join!(
-        open_state_store(runtime.as_ref(), config.clone(), deployment()),
-        open_state_store(runtime.as_ref(), config, deployment())
+        runtime.open_store(config.clone(), deployment(), test_deadline()),
+        runtime.open_store(config, deployment(), test_deadline())
     );
     let left = left.expect("initialize FoundationDB keyspace");
     let right = right.expect("concurrent open converges on keyspace identity");
@@ -903,12 +913,13 @@ async fn foundationdb_suite() {
     assert_eq!(left_identity.cluster_id, "identity-cluster");
     assert_eq!(left_identity.initial_incarnation, 1);
 
-    let mismatch = match open_state_store(
-        runtime.as_ref(),
-        store_config("different-cluster", keyspace_id),
-        deployment(),
-    )
-    .await
+    let mismatch = match runtime
+        .open_store(
+            store_config("different-cluster", keyspace_id),
+            deployment(),
+            test_deadline(),
+        )
+        .await
     {
         Ok(_) => panic!("existing keyspace must reject a cluster identity mismatch"),
         Err(error) => error,
@@ -917,12 +928,13 @@ async fn foundationdb_suite() {
 
     let corrupt_keyspace = Uuid::new_v4();
     write_partial_identity(corrupt_keyspace).await;
-    let corruption = match open_state_store(
-        runtime.as_ref(),
-        store_config("identity-cluster", corrupt_keyspace),
-        deployment(),
-    )
-    .await
+    let corruption = match runtime
+        .open_store(
+            store_config("identity-cluster", corrupt_keyspace),
+            deployment(),
+            test_deadline(),
+        )
+        .await
     {
         Ok(_) => panic!("partial identity must fail closed"),
         Err(error) => error,
@@ -946,9 +958,12 @@ async fn foundationdb_suite() {
 
     drop(right);
     drop(left);
-    let mut runtime = Rc::try_unwrap(runtime).expect("all FoundationDB runtime owners drained");
+    let mut runtime = match Rc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("all FoundationDB runtime owners drained"),
+    };
     runtime
-        .shutdown()
+        .shutdown(test_deadline())
         .await
         .expect("shutdown FoundationDB runtime after all handles drain");
 }
