@@ -231,7 +231,6 @@ impl NativePlanDecodeContext {
         self.query_options.as_ref()
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn query_id(&self) -> Option<QueryId> {
         self.query_id
     }

@@ -107,7 +107,7 @@ impl Drop for ConnectorBatchReaderIter {
 /// adapts the returned Arrow batches into `Chunk`s.
 pub(crate) struct ConnectorReadScanSource {
     instance: Arc<ConnectorInstance>,
-    split: ConnectorSplit,
+    splits: Vec<ConnectorSplit>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
 }
@@ -115,13 +115,13 @@ pub(crate) struct ConnectorReadScanSource {
 impl ConnectorReadScanSource {
     pub(crate) fn new(
         instance: Arc<ConnectorInstance>,
-        split: ConnectorSplit,
+        splits: Vec<ConnectorSplit>,
         request: ConnectorOpenReaderRequest,
         chunk_schema: ChunkSchemaRef,
     ) -> Self {
         Self {
             instance,
-            split,
+            splits,
             request,
             chunk_schema,
         }
@@ -135,7 +135,7 @@ impl ScanSource for ConnectorReadScanSource {
         }
         Ok(Arc::new(ConnectorReadScanOp {
             instance: Arc::clone(&self.instance),
-            split: self.split.clone(),
+            splits: self.splits.clone(),
             request: self.request.clone(),
             chunk_schema: Arc::clone(&self.chunk_schema),
         }))
@@ -144,7 +144,7 @@ impl ScanSource for ConnectorReadScanSource {
 
 struct ConnectorReadScanOp {
     instance: Arc<ConnectorInstance>,
-    split: ConnectorSplit,
+    splits: Vec<ConnectorSplit>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
 }
@@ -156,13 +156,17 @@ impl ScanOp for ConnectorReadScanOp {
         _profile: Option<RuntimeProfile>,
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<crate::exec::node::BoxedExecIter, String> {
-        if !matches!(morsel, ScanMorsel::Empty) {
+        let ScanMorsel::ConnectorSplit { index } = morsel else {
             return Err("SPI connector scan received an unexpected morsel".to_string());
-        }
+        };
+        let split = self
+            .splits
+            .get(index)
+            .ok_or_else(|| format!("SPI connector scan split index {index} is out of bounds"))?;
         let reader = self
             .instance
             .read()
-            .open_reader(&self.split, self.request.clone())
+            .open_reader(split, self.request.clone())
             .map_err(|error| error.to_string())?;
         Ok(Box::new(ConnectorBatchReaderIter::new(
             reader,
@@ -171,6 +175,11 @@ impl ScanOp for ConnectorReadScanOp {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        Ok(ScanMorsels::new(vec![ScanMorsel::Empty], false))
+        Ok(ScanMorsels::new(
+            (0..self.splits.len())
+                .map(|index| ScanMorsel::ConnectorSplit { index })
+                .collect(),
+            false,
+        ))
     }
 }

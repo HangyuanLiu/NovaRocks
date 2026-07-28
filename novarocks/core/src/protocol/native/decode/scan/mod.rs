@@ -18,6 +18,7 @@
 mod common;
 mod delete_files;
 mod file_range;
+mod generic;
 mod iceberg_data;
 mod iceberg_delta;
 mod iceberg_metadata;
@@ -162,6 +163,12 @@ pub(crate) fn lower_scan_node(
                 ))
             }
         }
+        plan::scan_source::Kind::ConnectorRead(source) => {
+            reject_variant_columns_for_source(scan, "ConnectorReadSource")
+                .map_err(|error| error.into_native(path.clone()))?;
+            generic::lower_connector_read_scan(node, scan, source, &output_columns, ctx, arena)
+                .map_err(|error| error.into_native(source_path.field("connector_read")))
+        }
     }
 }
 
@@ -218,6 +225,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use arrow::datatypes::DataType;
+    use arrow::record_batch::RecordBatch;
+    use novarocks_spi::connector::{
+        ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorInstance,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorOpenReaderRequest,
+        ConnectorProviderId, ConnectorRead, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+        ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::super::node::{
@@ -347,6 +361,135 @@ mod tests {
                 })),
             })),
         }
+    }
+
+    struct EmptyConnectorReader;
+
+    impl ConnectorBatchReader for EmptyConnectorReader {
+        fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    struct NativeCarrierTestRead {
+        instance_id: ConnectorInstanceId,
+    }
+
+    impl ConnectorRead for NativeCarrierTestRead {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn begin_scan(
+            &self,
+            _table: &ConnectorTableHandle,
+            _request: ConnectorBeginScanRequest,
+        ) -> Result<ConnectorScan, ConnectorError> {
+            unreachable!("native carrier starts after split planning")
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &ConnectorScanHandle,
+            _request: ConnectorSplitPlanningRequest,
+        ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+            unreachable!("native carrier starts after split planning")
+        }
+
+        fn open_reader(
+            &self,
+            _split: &ConnectorSplit,
+            _request: ConnectorOpenReaderRequest,
+        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+            Ok(Box::new(EmptyConnectorReader))
+        }
+    }
+
+    fn connector_read_registry(instance_id: &str) -> Arc<ConnectorRegistry> {
+        let instance_id = ConnectorInstanceId::parse(instance_id).expect("instance ID");
+        let instance = ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(NativeCarrierTestRead { instance_id }),
+        )
+        .expect("connector instance");
+        let mut registry = ConnectorRegistry::new();
+        registry
+            .register_connector_instance(instance)
+            .expect("register connector instance");
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn native_connector_read_carrier_resolves_the_typed_host_and_executes_its_split() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "test.native".to_string(),
+                scan_payload: vec![0],
+                splits: vec![plan::ConnectorReadSplit {
+                    split_id: "split-1".to_string(),
+                    split_payload: vec![1, 2, 3],
+                    estimated_bytes: Some(3),
+                }],
+                max_batch_rows: 128,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(connector_read_registry("test.native"))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 9 });
+        let decoded = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect("decode ConnectorReadSource");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("expected decoded scan node");
+        };
+        let op = scan
+            .source()
+            .bind(context.captured_ranges_for_test(node.node_id))
+            .expect("bind generic connector source");
+        let rows = op
+            .execute_iter(ScanMorsel::ConnectorSplit { index: 0 }, None, None)
+            .expect("open typed reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read typed split");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn native_connector_read_carrier_rejects_zero_batch_budget() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "test.native".to_string(),
+                scan_payload: Vec::new(),
+                splits: Vec::new(),
+                max_batch_rows: 0,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(connector_read_registry("test.native"))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 10 });
+        let error = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect_err("zero batch budget must fail native decoding");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+        assert!(
+            protocol
+                .path()
+                .to_string()
+                .ends_with("connector_read.max_batch_rows")
+        );
     }
 
     fn assert_scan_column_type_error(
