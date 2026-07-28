@@ -245,6 +245,10 @@ storage.
 
 ### StarRocks-Compatible Backend Mode
 
+This daemon interface requires a binary built with the `compat` feature. A
+native build fails fast for `run`, `start`, and `restart`; use the standalone
+role commands below for native FE, BE, or all-in-one deployments.
+
 CLI usage:
 
 ```bash
@@ -288,6 +292,17 @@ Or use a config file:
 ```bash
 NO_PROXY=127.0.0.1,localhost \
 cargo run -p novarocks-server -- standalone --config ./novarocks.toml
+```
+
+Native role examples:
+
+```bash
+# One process that composes a real FE and BE through the gRPC boundary.
+cargo run -p novarocks-server -- standalone --role all-in-one --config ./novarocks.toml
+
+# Split FE/BE deployment.
+cargo run -p novarocks-server -- standalone --role be --config ./be.toml
+cargo run -p novarocks-server -- standalone --role fe --config ./fe.toml
 ```
 
 Connect with a MySQL client:

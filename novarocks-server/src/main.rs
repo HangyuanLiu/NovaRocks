@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
 
+mod composition;
+
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {
     mysql_port: Option<u16>,
@@ -51,6 +53,18 @@ fn print_standalone_server_usage() {
     eprintln!("Example:");
     eprintln!("  novarocks standalone --port 9030 --config /etc/novarocks/novarocks.toml");
     eprintln!("  novarocks standalone --role be --config /etc/novarocks/novarocks.toml");
+}
+
+#[cfg(feature = "compat")]
+fn validate_daemon_build(_command: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(feature = "compat"))]
+fn validate_daemon_build(command: &str) -> Result<(), String> {
+    Err(format!(
+        "the {command} daemon interface requires a compat build; use `novarocks standalone --role be|fe|all-in-one --config <path>` for native roles"
+    ))
 }
 
 /// Build the tracing EnvFilter expression from config: prefer the explicit
@@ -207,44 +221,26 @@ pub(crate) fn probe_all_backends(backends: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch_standalone_role(
+fn dispatch_standalone_role_with_all_in_one(
     role: novarocks::common::app_config::ClusterRole,
     cfg: novarocks::common::app_config::NovaRocksConfig,
     port_override: Option<u16>,
     run_frontend: impl FnOnce(
         novarocks::common::app_config::NovaRocksConfig,
         Option<u16>,
-        bool,
-    ) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    dispatch_standalone_role_with_backend(
-        role,
-        cfg,
-        port_override,
-        run_frontend,
-        run_standalone_be_role,
-    )
-}
-
-fn dispatch_standalone_role_with_backend(
-    role: novarocks::common::app_config::ClusterRole,
-    cfg: novarocks::common::app_config::NovaRocksConfig,
-    port_override: Option<u16>,
-    run_frontend: impl FnOnce(
-        novarocks::common::app_config::NovaRocksConfig,
-        Option<u16>,
-        bool,
     ) -> anyhow::Result<()>,
     run_backend: impl FnOnce(
         novarocks::common::app_config::NovaRocksConfig,
         Option<u16>,
     ) -> anyhow::Result<()>,
+    run_all_in_one: impl FnOnce(
+        novarocks::common::app_config::NovaRocksConfig,
+        Option<u16>,
+    ) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match role {
-        novarocks::common::app_config::ClusterRole::AllInOne => {
-            run_frontend(cfg, port_override, true)
-        }
-        novarocks::common::app_config::ClusterRole::Fe => run_frontend(cfg, port_override, false),
+        novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
+        novarocks::common::app_config::ClusterRole::Fe => run_frontend(cfg, port_override),
         novarocks::common::app_config::ClusterRole::Be => run_backend(cfg, port_override),
     }
 }
@@ -274,19 +270,23 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
     novarocks::server::configure_standalone_internal_rpc_transport();
 
-    dispatch_standalone_role(
+    let frontend_config_path = resolved_config_path.clone();
+
+    dispatch_standalone_role_with_all_in_one(
         role,
         cfg,
         cli.mysql_port,
-        move |cfg, port, local_exchange| {
+        move |cfg, port| {
             novarocks_frontend::run_frontend_server(novarocks_frontend::FrontendServerConfig {
                 config: cfg,
-                config_path: resolved_config_path,
+                config_path: frontend_config_path,
                 port_override: port,
-                local_exchange,
+                grpc_endpoint: novarocks_frontend::FrontendGrpcEndpointOwnership::HostedReportOnly,
             })
             .map_err(|error| anyhow::anyhow!("{error}"))
         },
+        run_standalone_be_role,
+        move |cfg, port| composition::run_all_in_one(cfg, resolved_config_path, port),
     )
 }
 
@@ -577,6 +577,13 @@ fn main() {
             }
         }
     }
+    if matches!(mode, "run" | "start" | "restart")
+        && let Err(error) = validate_daemon_build(mode)
+    {
+        eprintln!("{error}");
+        process::exit(1);
+    }
+
     let pid_file = "novarocks.pid";
     match mode {
         "start" => {
@@ -745,31 +752,14 @@ fn main() {
                     novarocks_compat::run_compat_server_until_shutdown(config, shutdown)
                 });
 
-            #[cfg(not(feature = "compat"))]
-            let grpc_stop_result = {
-                let server = &cfg.server;
-                novarocks::start_grpc_server(server.host.as_str()).expect("start grpc server");
-                println!(
-                    "novarocksd started (bind_host={}, http_port={})",
-                    server.host, server.http_port
-                );
-                println!("Press Ctrl-C to stop...");
-
-                while running.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                let grpc_stop_result = novarocks::service::grpc_server::stop_grpc_server();
-                novarocks::service::report_worker::stop();
-                grpc_stop_result
-            };
-
             // Cleanup: remove pid file
             let _ = fs::remove_file(pid_file);
             #[cfg(feature = "compat")]
             compat_result.expect("compatibility BE application failed");
-            #[cfg(not(feature = "compat"))]
-            grpc_stop_result.expect("stop grpc server");
+            #[cfg(feature = "compat")]
             println!("novarocksd stopped");
+            #[cfg(not(feature = "compat"))]
+            unreachable!("native daemon commands are rejected before runtime initialization");
         }
         "stop" => match read_pid_file(pid_file) {
             Ok(Some(pid)) => {
@@ -882,10 +872,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        StandaloneServerCliArgs, dispatch_standalone_role, dispatch_standalone_role_with_backend,
+        StandaloneServerCliArgs, dispatch_standalone_role_with_all_in_one,
         load_config_and_resolve_role, parse_standalone_server_args, probe_all_backends,
         resolve_cluster_role,
     };
+
+    #[cfg(not(feature = "compat"))]
+    #[test]
+    fn native_daemon_commands_fail_before_runtime_initialization() {
+        let error = super::validate_daemon_build("run")
+            .expect_err("native build must reject the daemon command");
+        assert!(error.contains("requires a compat build"), "{error}");
+        assert!(
+            error.contains("standalone --role be|fe|all-in-one"),
+            "{error}"
+        );
+    }
 
     #[cfg(feature = "compat")]
     mod compat_delegation {
@@ -947,37 +949,44 @@ mod tests {
     }
 
     mod frontend_dispatch {
-        use super::dispatch_standalone_role_with_backend;
+        use super::dispatch_standalone_role_with_all_in_one;
 
         #[test]
-        fn fe_and_all_in_one_dispatch_use_frontend_runner() {
-            for (role, expected_local_exchange) in [
-                (novarocks::common::app_config::ClusterRole::Fe, false),
-                (novarocks::common::app_config::ClusterRole::AllInOne, true),
+        fn fe_and_all_in_one_dispatch_use_distinct_composition_roots() {
+            for role in [
+                novarocks::common::app_config::ClusterRole::Fe,
+                novarocks::common::app_config::ClusterRole::AllInOne,
             ] {
                 let frontend_calls = std::cell::Cell::new(0);
                 let backend_calls = std::cell::Cell::new(0);
-                dispatch_standalone_role_with_backend(
+                let all_in_one_calls = std::cell::Cell::new(0);
+                dispatch_standalone_role_with_all_in_one(
                     role,
                     novarocks::common::app_config::NovaRocksConfig::default(),
                     None,
-                    |_, _, local_exchange| {
+                    |_, _| {
                         frontend_calls.set(frontend_calls.get() + 1);
-                        assert_eq!(local_exchange, expected_local_exchange);
                         Ok(())
                     },
                     |_, _| {
                         backend_calls.set(backend_calls.get() + 1);
                         Ok(())
                     },
+                    |_, _| {
+                        all_in_one_calls.set(all_in_one_calls.get() + 1);
+                        Ok(())
+                    },
                 )
-                .expect("frontend role dispatch should succeed");
+                .expect("role dispatch should succeed");
                 assert_eq!(
                     frontend_calls.get(),
-                    1,
-                    "{role:?} must invoke frontend once"
+                    (role == novarocks::common::app_config::ClusterRole::Fe) as usize
                 );
                 assert_eq!(backend_calls.get(), 0, "{role:?} must not invoke backend");
+                assert_eq!(
+                    all_in_one_calls.get(),
+                    (role == novarocks::common::app_config::ClusterRole::AllInOne) as usize
+                );
             }
         }
 
@@ -985,12 +994,13 @@ mod tests {
         fn be_dispatch_invokes_backend_runner_exactly_once() {
             let frontend_calls = std::cell::Cell::new(0);
             let backend_calls = std::cell::Cell::new(0);
+            let all_in_one_calls = std::cell::Cell::new(0);
 
-            dispatch_standalone_role_with_backend(
+            dispatch_standalone_role_with_all_in_one(
                 novarocks::common::app_config::ClusterRole::Be,
                 novarocks::common::app_config::NovaRocksConfig::default(),
                 None,
-                |_, _, _| {
+                |_, _| {
                     frontend_calls.set(frontend_calls.get() + 1);
                     Ok(())
                 },
@@ -998,11 +1008,16 @@ mod tests {
                     backend_calls.set(backend_calls.get() + 1);
                     Ok(())
                 },
+                |_, _| {
+                    all_in_one_calls.set(all_in_one_calls.get() + 1);
+                    Ok(())
+                },
             )
             .expect("BE role dispatch should succeed");
 
             assert_eq!(frontend_calls.get(), 0, "BE must not invoke frontend");
             assert_eq!(backend_calls.get(), 1, "BE must invoke backend once");
+            assert_eq!(all_in_one_calls.get(), 0, "BE must not invoke all-in-one");
         }
     }
 
@@ -1098,11 +1113,13 @@ mod tests {
     fn test_dispatch_role_fe_with_no_backend_enters_coordinator() {
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends.clear();
-        dispatch_standalone_role(
+        dispatch_standalone_role_with_all_in_one(
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _, _| Ok(()),
+            |_, _| Ok(()),
+            |_, _| panic!("role=fe must not invoke the backend runner"),
+            |_, _| panic!("role=fe must not invoke the all-in-one runner"),
         )
         .expect("role=fe may start without configured backends");
     }
@@ -1141,11 +1158,13 @@ mod tests {
         let addr2 = l2.local_addr().expect("listener 2 addr");
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends = vec![addr1.to_string(), addr2.to_string()];
-        dispatch_standalone_role(
+        dispatch_standalone_role_with_all_in_one(
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _, _| Ok(()),
+            |_, _| Ok(()),
+            |_, _| panic!("role=fe must not invoke the backend runner"),
+            |_, _| panic!("role=fe must not invoke the all-in-one runner"),
         )
         .expect("fe with multiple reachable backends should enter coordinator path");
         drop(l1);
@@ -1163,11 +1182,13 @@ mod tests {
         drop(dead);
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends = vec![live_addr.to_string(), format!("127.0.0.1:{dead_port}")];
-        dispatch_standalone_role(
+        dispatch_standalone_role_with_all_in_one(
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _, _| Ok(()),
+            |_, _| Ok(()),
+            |_, _| panic!("role=fe must not invoke the backend runner"),
+            |_, _| panic!("role=fe must not invoke the all-in-one runner"),
         )
         .expect("role=fe startup should not synchronously dial backends");
         drop(live);
@@ -1257,8 +1278,15 @@ backends = ["{backend_addr}"]
         let (cfg, role, _) =
             load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
-        dispatch_standalone_role(role, cfg, None, |_, _, _| Ok(()))
-            .expect("fe with reachable backend must enter coordinator path");
+        dispatch_standalone_role_with_all_in_one(
+            role,
+            cfg,
+            None,
+            |_, _| Ok(()),
+            |_, _| panic!("role=fe must not invoke the backend runner"),
+            |_, _| panic!("role=fe must not invoke the all-in-one runner"),
+        )
+        .expect("fe with reachable backend must enter coordinator path");
     }
 
     #[test]
@@ -1412,11 +1440,13 @@ backends = ["127.0.0.1:9070"]
             ..StandaloneServerConfig::default()
         });
         let captured_port: std::cell::Cell<u16> = std::cell::Cell::new(0);
-        dispatch_standalone_role(
+        dispatch_standalone_role_with_all_in_one(
             novarocks::common::app_config::ClusterRole::AllInOne,
             cfg,
             None,
-            |cfg, _port, _local_exchange| {
+            |_, _| panic!("all-in-one must not use the frontend-only runner"),
+            |_, _| panic!("all-in-one must not use the backend-only runner"),
+            |cfg, _port| {
                 // The closure must receive the sentinel config (not a freshly
                 // defaulted one).
                 captured_port.set(
