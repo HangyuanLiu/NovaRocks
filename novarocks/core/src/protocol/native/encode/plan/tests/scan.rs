@@ -147,9 +147,9 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
     };
     let runtime = delta.delta_plan.as_ref().expect("prepared runtime payload");
     assert_eq!(runtime.table_location, "s3://prepared/orders");
-    assert_eq!(
-        runtime.cloud_properties.get("endpoint").map(String::as_str),
-        Some("http://prepared-minio")
+    assert!(
+        runtime.cloud_properties.is_empty(),
+        "native delta plans must use each BE's startup connector configuration"
     );
 }
 
@@ -206,6 +206,19 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
     .expect("encode ordinary Iceberg binding");
 
     assert_eq!(with_binding, without_binding);
+    let scan = encoded_root_scan_for_test(&with_binding);
+    let table = scan.table.as_ref().expect("bound table");
+    let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+        .source
+        .as_ref()
+        .and_then(|source| source.kind.as_ref())
+    else {
+        panic!("ordinary source must encode as IcebergDataFiles");
+    };
+    assert!(
+        files.cloud_properties.is_empty(),
+        "native Iceberg plans must not carry object-store configuration"
+    );
 }
 
 #[test]

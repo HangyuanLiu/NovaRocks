@@ -38,7 +38,7 @@ pub(super) fn encode_iceberg_delta_scan_plan_native(
                 field_id: column.field_id,
             })
             .collect(),
-        cloud_properties: plan.cloud_properties.clone().into_iter().collect(),
+        cloud_properties: Default::default(),
         change_files: plan
             .change_files
             .iter()

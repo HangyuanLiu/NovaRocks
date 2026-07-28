@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -25,8 +25,7 @@ use super::super::layout::Layout;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
-use crate::fs::object_store::{ObjectStoreConfig, apply_object_store_runtime_defaults};
-use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
+use crate::fs::object_store::ObjectStoreConfig;
 use crate::proto::{common, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::common::error::ProtocolErrorKind;
@@ -311,30 +310,44 @@ pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragme
     }
 }
 
-pub(super) fn resolve_cloud_object_store_config(
+/// Loads the object-store configuration that was installed on this BE at
+/// startup. Native fragment payloads must not carry credentials or endpoint
+/// configuration because every BE receives the same deployment configuration.
+pub(super) fn resolve_native_connector_object_store_config(
     cloud_properties: &HashMap<String, String>,
 ) -> Result<Option<ObjectStoreConfig>, NativeFragmentLeafDecodeError> {
-    let props = cloud_properties
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let Some(credentials) = ObjectStoreCredentials::optional_from_aws_s3_properties(
-        ObjectStoreCredentialsSource::AwsS3Properties,
-        &props,
-    )
-    .map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(
+    reject_native_connector_cloud_properties(cloud_properties)?;
+    crate::common::app_config::config()
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "connector.object_store",
+                error,
+            )
+        })?
+        .connector
+        .object_store_config()
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "connector.object_store",
+                error,
+            )
+        })
+}
+
+pub(super) fn reject_native_connector_cloud_properties(
+    cloud_properties: &HashMap<String, String>,
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    if cloud_properties.is_empty() {
+        Ok(())
+    } else {
+        Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
             "cloud_properties",
-            error,
-        )
-    })?
-    else {
-        return Ok(None);
-    };
-    let mut cfg = credentials.to_object_store_config();
-    apply_object_store_runtime_defaults(&mut cfg);
-    Ok(Some(cfg))
+            "native connector scans must use the BE startup connector configuration; cloud_properties are not accepted",
+        ))
+    }
 }
 
 pub(super) fn table_location_map(table: &plan::IcebergTableInfo) -> HashMap<i64, String> {
@@ -343,4 +356,22 @@ pub(super) fn table_location_map(table: &plan::IcebergTableInfo) -> HashMap<i64,
         locations.insert(i64::from(table.schema_id), table.location.clone());
     }
     locations
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::reject_native_connector_cloud_properties;
+
+    #[test]
+    fn native_connector_scan_rejects_plan_object_store_properties() {
+        let error = reject_native_connector_cloud_properties(&HashMap::from([(
+            "aws.s3.access_key".to_string(),
+            "not-for-the-plan".to_string(),
+        )]))
+        .expect_err("native connector scan must reject plan-side configuration");
+
+        assert!(error.contains("startup connector configuration"));
+    }
 }

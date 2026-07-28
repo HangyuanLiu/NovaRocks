@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{
-    lower_scan_predicate, parse_scan_limit, resolve_cloud_object_store_config, scan_batch_size,
-    table_location_map,
+    lower_scan_predicate, parse_scan_limit, resolve_native_connector_object_store_config,
+    scan_batch_size, table_location_map,
 };
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{ScanReadPlan, maybe_project_data_scan_output};
@@ -88,7 +88,8 @@ pub(super) fn lower_iceberg_data_files_scan(
         variant_path_columns: read_plan.variant_path_columns.clone(),
         query_global_dicts: Default::default(),
     };
-    let object_store_config = resolve_cloud_object_store_config(&source.cloud_properties)?;
+    let object_store_config =
+        resolve_native_connector_object_store_config(&source.cloud_properties)?;
     let iceberg_runtime_pruning = Some(HdfsIcebergRuntimePruningConfig {
         slot_to_column: read_plan
             .read_slot_ids

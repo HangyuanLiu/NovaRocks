@@ -27,7 +27,10 @@ use crate::proto::plan;
 use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
-use super::common::{DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit};
+use super::common::{
+    DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit,
+    reject_native_connector_cloud_properties,
+};
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
@@ -39,6 +42,7 @@ pub(super) fn lower_iceberg_metadata_scan(
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
+    reject_native_connector_cloud_properties(&source.cloud_properties)?;
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
     let metadata_table_type = metadata_table_type(source.metadata_table_type).map_err(|error| {
