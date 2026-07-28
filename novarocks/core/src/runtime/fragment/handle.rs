@@ -252,21 +252,46 @@ impl DormantFragmentHandle {
     }
 
     pub fn start(self) -> RunningFragmentHandle {
-        let pipeline = self.prepared.start();
-        if let Some(failure) = self.start_failure {
-            pipeline.fail(failure.detail().to_string());
-        }
+        #[cfg(test)]
+        let initial_failure = self
+            .start_failure
+            .map(|failure| failure.detail().to_string());
+        #[cfg(not(test))]
+        let initial_failure = None;
+        self.start_with_initial_failure(initial_failure)
+    }
+
+    /// Enter the running lifecycle with a terminal execution failure already latched.
+    ///
+    /// Drivers are still submitted and drained through the normal terminal-fact path.
+    pub fn start_failed(self, error: impl Into<String>) -> RunningFragmentHandle {
+        self.start_with_initial_failure(Some(error.into()))
+    }
+
+    fn start_with_initial_failure(self, initial_failure: Option<String>) -> RunningFragmentHandle {
+        let Self {
+            prepared,
+            resources,
+            query_id,
+            fragment_instance_id,
+            profiler,
+            ..
+        } = self;
+        let pipeline = match initial_failure {
+            Some(error) => prepared.start_failed(error),
+            None => prepared.start(),
+        };
         RunningFragmentHandle {
             inner: Arc::new(RunningFragmentInner {
                 pipeline,
                 state: std::sync::Mutex::new(RunningFragmentState {
-                    resources: self.resources,
+                    resources,
                     cancel_reason: None,
                     terminal: None,
                 }),
-                query_id: self.query_id,
-                fragment_instance_id: self.fragment_instance_id,
-                profiler: self.profiler,
+                query_id,
+                fragment_instance_id,
+                profiler,
             }),
         }
     }

@@ -93,6 +93,11 @@ impl NativeFragmentRequest {
         self.submission.program().runtime_filters().has_bindings()
     }
 
+    pub fn uses_result_sink(&self) -> bool {
+        self.submission.program().sink().kind()
+            == crate::exec::fragment::program::FragmentSinkKind::Result
+    }
+
     pub fn root_plan_node_id(&self) -> i32 {
         self.submission.program().root_plan_node_id().get()
     }

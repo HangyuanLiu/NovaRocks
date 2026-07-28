@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver as ReadinessReceiver, SyncSender as ReadinessSender};
 use std::time::Duration;
 
@@ -212,27 +210,6 @@ pub(crate) fn execute_native_submission(
     exchange_transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_writer: std::sync::Arc<dyn FragmentResultWriter>,
 ) -> Result<FragmentOutput, FragmentExecutionError> {
-    let failure_trigger = configured_fragment_failure_trigger();
-    execute_native_submission_with_failure_trigger(
-        submission,
-        context,
-        exchange_transmitter,
-        result_writer,
-        failure_trigger.as_deref(),
-    )
-}
-
-fn configured_fragment_failure_trigger() -> Option<PathBuf> {
-    std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").map(PathBuf::from)
-}
-
-pub(crate) fn execute_native_submission_with_failure_trigger(
-    submission: FragmentSubmission,
-    context: NativeExecutionContext,
-    exchange_transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
-    result_writer: std::sync::Arc<dyn FragmentResultWriter>,
-    failure_trigger: Option<&Path>,
-) -> Result<FragmentOutput, FragmentExecutionError> {
     let instance = submission.instance();
     let program = submission.program();
     let query_id = instance.query_id();
@@ -290,17 +267,6 @@ pub(crate) fn execute_native_submission_with_failure_trigger(
     if program.sink().kind() != FragmentSinkKind::Result {
         context.readiness.signal_ready();
     }
-    if let Some(token) = consume_fragment_failure_trigger(failure_trigger)? {
-        eprintln!(
-            "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token={} query_hi={} query_lo={} finst_hi={} finst_lo={}",
-            token, query_id.hi, query_id.lo, fragment_instance_id.hi, fragment_instance_id.lo
-        );
-        return Err(FragmentExecutionError::new(
-            FragmentExecutionErrorKind::Pipeline,
-            "fragment executor failure injected after start",
-        ));
-    }
-
     // PBF-2 launches each validated submission once. Instance-owned scan and
     // exchange state is materialized per-instance from the shared static
     // program (no bound ops baked into the plan nodes).
@@ -337,62 +303,6 @@ pub(crate) fn execute_native_submission_with_failure_trigger(
     Ok(FragmentOutput { profile_json: None })
 }
 
-fn consume_fragment_failure_trigger(
-    failure_trigger: Option<&Path>,
-) -> Result<Option<String>, FragmentExecutionError> {
-    let Some(path) = failure_trigger else {
-        return Ok(None);
-    };
-    static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);
-    let claim_sequence = NEXT_CLAIM.fetch_add(1, Ordering::Relaxed);
-    let claim_path =
-        path.with_extension(format!("claimed-{}-{claim_sequence}", std::process::id()));
-    match std::fs::rename(path, &claim_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(FragmentExecutionError::new(
-                FragmentExecutionErrorKind::Pipeline,
-                format!(
-                    "claim fragment executor failure trigger {} failed: {error}",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    let token_result = std::fs::read_to_string(&claim_path);
-    let cleanup_result = std::fs::remove_file(&claim_path);
-    let token = token_result.map_err(|error| {
-        FragmentExecutionError::new(
-            FragmentExecutionErrorKind::Pipeline,
-            format!(
-                "read claimed fragment executor failure trigger {} failed: {error}",
-                claim_path.display()
-            ),
-        )
-    })?;
-    cleanup_result.map_err(|error| {
-        FragmentExecutionError::new(
-            FragmentExecutionErrorKind::Pipeline,
-            format!(
-                "remove claimed fragment executor failure trigger {} failed: {error}",
-                claim_path.display()
-            ),
-        )
-    })?;
-    let token = token.trim();
-    if token.is_empty() || token.split_ascii_whitespace().count() != 1 {
-        return Err(FragmentExecutionError::new(
-            FragmentExecutionErrorKind::Pipeline,
-            format!(
-                "fragment executor failure trigger {} contains an invalid evidence token",
-                path.display()
-            ),
-        ));
-    }
-    Ok(Some(token.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -419,9 +329,7 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
 
     use super::{
-        NativeExecutionContext, NativeExecutionStart, consume_fragment_failure_trigger,
-        execute_native_submission, execute_native_submission_with_failure_trigger,
-        native_execution_readiness_channel,
+        NativeExecutionContext, execute_native_submission, native_execution_readiness_channel,
     };
 
     fn noop_values_submission() -> FragmentSubmission {
@@ -474,72 +382,5 @@ mod tests {
         .expect("noop submission executes");
 
         assert!(output.profile_json.is_none());
-    }
-
-    #[test]
-    fn fragment_executor_failure_trigger_fires_after_readiness_and_only_once() {
-        let temp = tempfile::tempdir().expect("temp trigger directory");
-        let trigger = temp.path().join("fail-next-fragment");
-        std::fs::write(&trigger, b"armed").expect("arm fragment failure");
-        let (readiness, receiver) = native_execution_readiness_channel();
-
-        let error = execute_native_submission_with_failure_trigger(
-            noop_values_submission(),
-            NativeExecutionContext {
-                profiler: None,
-                mem_tracker: None,
-                readiness,
-                runtime_filter: None,
-            },
-            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
-            crate::runtime::fragment::io::result::discard_result_writer(),
-            Some(trigger.as_path()),
-        )
-        .expect_err("armed fragment must fail");
-
-        assert_eq!(
-            receiver.recv().expect("executor readiness"),
-            NativeExecutionStart::Ready,
-            "the injected failure must happen after the fragment executor publishes readiness"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("fragment executor failure injected after start"),
-            "{error}"
-        );
-        assert!(!trigger.exists(), "the trigger must be consumed once");
-
-        let (readiness, _receiver) = native_execution_readiness_channel();
-        execute_native_submission_with_failure_trigger(
-            noop_values_submission(),
-            NativeExecutionContext {
-                profiler: None,
-                mem_tracker: None,
-                readiness,
-                runtime_filter: None,
-            },
-            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
-            crate::runtime::fragment::io::result::discard_result_writer(),
-            Some(trigger.as_path()),
-        )
-        .expect("consumed trigger must not poison later fragments");
-    }
-
-    #[test]
-    fn fragment_failure_trigger_atomically_carries_step_token() {
-        let temp = tempfile::tempdir().expect("temp trigger directory");
-        let trigger = temp.path().join("fail-next-fragment");
-        std::fs::write(&trigger, b"step-token-17").expect("arm fragment failure");
-
-        assert_eq!(
-            consume_fragment_failure_trigger(Some(trigger.as_path()))
-                .expect("consume trigger token"),
-            Some("step-token-17".to_string())
-        );
-        assert_eq!(
-            consume_fragment_failure_trigger(Some(trigger.as_path())).expect("trigger is one-shot"),
-            None
-        );
     }
 }

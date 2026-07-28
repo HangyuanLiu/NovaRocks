@@ -285,6 +285,11 @@ pub(crate) trait ServerHandle: Send {
             "fragment executor failure injection is unsupported by this server mode (index={index})"
         )
     }
+    fn release_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
+        bail!(
+            "fragment executor failure release is unsupported by this server mode (index={index})"
+        )
+    }
     fn disarm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
         bail!(
             "fragment executor failure cleanup is unsupported by this server mode (index={index})"
@@ -898,7 +903,17 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
         self.ensure_be_index(index)?;
+        if self.fragment_failure_tokens[index].is_some() {
+            bail!("cross-process BE[{index}] already has an armed fragment executor failure token");
+        }
         let trigger_path = &self.fragment_failure_trigger_paths[index];
+        remove_fragment_failure_file(&fragment_failure_release_path(trigger_path)).with_context(
+            || {
+                format!(
+                    "clear stale fragment executor failure release for cross-process BE[{index}]"
+                )
+            },
+        )?;
         let token = next_fragment_failure_token(index);
         publish_fragment_failure_token(trigger_path, &token).with_context(|| {
             format!(
@@ -914,21 +929,44 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
+    fn release_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self.fragment_failure_tokens[index]
+            .as_deref()
+            .with_context(|| {
+                format!("cross-process BE[{index}] has no armed fragment executor failure token")
+            })?;
+        let release_path =
+            fragment_failure_release_path(&self.fragment_failure_trigger_paths[index]);
+        publish_fragment_failure_token(&release_path, token).with_context(|| {
+            format!(
+                "release fragment executor failure for cross-process BE[{index}] at {}",
+                release_path.display()
+            )
+        })?;
+        println!(
+            "released fragment executor failure for cross-process BE[{index}] release={} token={token}",
+            release_path.display(),
+        );
+        Ok(())
+    }
+
     fn disarm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
         self.ensure_be_index(index)?;
         let trigger_path = &self.fragment_failure_trigger_paths[index];
-        match fs::remove_file(trigger_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "disarm fragment executor failure for cross-process BE[{index}] at {}",
-                        trigger_path.display()
-                    )
-                });
-            }
-        }
+        remove_fragment_failure_file(trigger_path).with_context(|| {
+            format!(
+                "disarm fragment executor failure trigger for cross-process BE[{index}] at {}",
+                trigger_path.display()
+            )
+        })?;
+        let release_path = fragment_failure_release_path(trigger_path);
+        remove_fragment_failure_file(&release_path).with_context(|| {
+            format!(
+                "disarm fragment executor failure release for cross-process BE[{index}] at {}",
+                release_path.display()
+            )
+        })?;
         self.fragment_failure_tokens[index] = None;
         Ok(())
     }
@@ -1129,6 +1167,18 @@ fn next_fragment_failure_token(index: usize) -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{}-{index}-{nanos}-{sequence}", std::process::id())
+}
+
+fn fragment_failure_release_path(trigger_path: &Path) -> PathBuf {
+    trigger_path.with_extension("release")
+}
+
+fn remove_fragment_failure_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn publish_fragment_failure_token(trigger_path: &Path, token: &str) -> Result<()> {
@@ -1567,7 +1617,7 @@ mod tests {
         }
     }
 
-static BASE_CONFIG: &str = r#"
+    static BASE_CONFIG: &str = r#"
 [metadata]
 provider = "sqlite"
 path = "tmp/sql-tests.sqlite"

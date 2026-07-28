@@ -28,7 +28,7 @@ SELECT generate_series FROM TABLE(generate_series(1, 1000000));
 
 -- query 2
 -- @kill_be_after_fragment_start=1
--- @expect_error=BE[1]
+-- @expect_error=backend 1 lost after heartbeat timeout
 SELECT COUNT(*) FROM ${case_db}.resilience_series;
 
 -- query 3

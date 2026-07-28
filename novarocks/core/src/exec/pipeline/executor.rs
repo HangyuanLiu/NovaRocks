@@ -70,16 +70,39 @@ impl PreparedPipelineExecution {
 
     /// Submit this execution exactly once by consuming its dormant task collection.
     pub(crate) fn start(self) -> RunningPipelineExecution {
-        let submitted_driver_count = self.tasks.len();
-        let fragment_wall_timer = self
-            .fragment_profiler
+        self.start_with_initial_failure(None)
+    }
+
+    /// Submit this execution with a terminal failure already latched.
+    pub(crate) fn start_failed(self, error: String) -> RunningPipelineExecution {
+        self.start_with_initial_failure(Some(error))
+    }
+
+    fn start_with_initial_failure(
+        self,
+        initial_failure: Option<String>,
+    ) -> RunningPipelineExecution {
+        let Self {
+            tasks,
+            completion,
+            fragment_ctx,
+            runtime_state,
+            fragment_profiler,
+        } = self;
+        let submitted_driver_count = tasks.len();
+        let fragment_wall_timer = fragment_profiler
             .as_ref()
             .map(|p| p.scoped_timer("FragmentWallTime"));
-        global_driver_executor().submit(self.tasks);
+        if let Some(error) = initial_failure
+            && completion.fail(error.clone())
+        {
+            fragment_ctx.set_final_status(error);
+        }
+        global_driver_executor().submit(tasks);
         RunningPipelineExecution {
-            completion: self.completion,
-            fragment_ctx: self.fragment_ctx,
-            runtime_state: self.runtime_state,
+            completion,
+            fragment_ctx,
+            runtime_state,
             submitted_driver_count,
             fragment_wall_timer: Mutex::new(fragment_wall_timer),
         }
