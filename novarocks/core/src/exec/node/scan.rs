@@ -64,6 +64,12 @@ pub enum ScanMorsel {
     IcebergMetadata {
         index: usize,
     },
+    /// Provider-neutral scheduled connector split. The generic core adapter
+    /// resolves the index to an SPI-owned split; no provider payload appears
+    /// in the core morsel contract.
+    ConnectorSplit {
+        index: usize,
+    },
     Schema {
         table_name: String,
     },
@@ -108,6 +114,9 @@ impl ScanMorsel {
             ScanMorsel::JdbcSingle => "jdbc_single".to_string(),
             ScanMorsel::IcebergMetadata { index } => {
                 format!("iceberg_metadata_index={index}")
+            }
+            ScanMorsel::ConnectorSplit { index } => {
+                format!("connector_split_index={index}")
             }
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),

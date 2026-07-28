@@ -183,7 +183,7 @@ fn read_scan_source_opens_a_typed_split_and_adapts_its_batches() {
         ConnectorSplit::try_new(instance_id, "split", bytes::Bytes::new(), Some(1)).expect("split");
     let source = ConnectorReadScanSource::new(
         instance,
-        split,
+        vec![split.clone(), split],
         ConnectorOpenReaderRequest {
             expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             batch: ConnectorBatchBudget {
@@ -195,8 +195,16 @@ fn read_scan_source_opens_a_typed_split_and_adapts_its_batches() {
         chunk_schema(),
     );
     let op = source.bind(BoundScanRanges::None).expect("bind source");
+    let morsels = op.build_morsels().expect("build connector morsels");
+    assert!(matches!(
+        morsels.morsels.as_slice(),
+        [
+            ScanMorsel::ConnectorSplit { index: 0 },
+            ScanMorsel::ConnectorSplit { index: 1 }
+        ]
+    ));
     let chunks = op
-        .execute_iter(ScanMorsel::Empty, None, None)
+        .execute_iter(ScanMorsel::ConnectorSplit { index: 0 }, None, None)
         .expect("execute reader")
         .collect::<Result<Vec<_>, _>>()
         .expect("reader chunks");

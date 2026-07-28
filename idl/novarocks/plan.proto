@@ -998,7 +998,29 @@ message ScanSource {
     IcebergMvTargetState iceberg_mv_target_state = 5;     // IMV target-state scan.
     IcebergMvTargetLocator iceberg_mv_target_locator = 6; // IMV target-locator scan.
     StarRocksTableSource starrocks_table = 7;              // StarRocks tablet scan.
+    ConnectorReadSource connector_read = 8;                // provider-owned opaque scan and splits.
   }
+}
+
+// A provider-neutral, already-planned connector read. The opaque handles are
+// decoded only by the selected ConnectorInstance. Metadata resolution and
+// split planning occur before this carrier is emitted; core retains split
+// scheduling, batching, cancellation, and Chunk adaptation ownership.
+message ConnectorReadSource {
+  string instance_id = 1;              // normalized ConnectorInstanceId.
+  bytes scan_payload = 2;              // bounded provider-owned scan handle.
+  repeated ConnectorReadSplit splits = 3; // provider-owned executable splits.
+  uint64 max_batch_rows = 4;           // required nonzero reader batch budget.
+  uint64 max_batch_bytes = 5;          // required nonzero reader batch budget.
+  uint64 max_handle_payload_bytes = 6; // required bounded provider-handle budget.
+  uint64 max_total_payload_bytes = 7;  // required bounded request aggregate budget.
+}
+
+// One scheduled split in a ConnectorReadSource.
+message ConnectorReadSplit {
+  string split_id = 1;                 // provider-assigned stable split identity.
+  bytes split_payload = 2;             // bounded provider-owned split handle.
+  optional uint64 estimated_bytes = 3; // optional scheduler hint.
 }
 
 // Native StarRocks table identity and physical-column metadata.
