@@ -44,7 +44,7 @@ pub use model::{
 pub use runner::{
     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,
 };
-// pub use service::DmlService;
+pub use service::DmlService;
 
 /// Current wall-clock time in Unix milliseconds, used for operation timestamps.
 pub(crate) fn now_unix_millis() -> i64 {
