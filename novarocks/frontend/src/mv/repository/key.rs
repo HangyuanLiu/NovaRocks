@@ -46,6 +46,30 @@ pub fn sequence_key() -> Result<Key, String> {
     key_from_path("sequence/mv-id")
 }
 
+pub(crate) fn mv_prefix() -> Result<Key, String> {
+    key_from_path("")
+}
+
+pub(crate) fn definition_prefix() -> Result<Key, String> {
+    key_from_path("definition/by-id/")
+}
+
+pub(crate) fn dependency_by_downstream_prefix(mv_id: i64) -> Result<Key, String> {
+    key_from_path(&format!(
+        "dependency/by-downstream/{}/",
+        encode_positive_id(mv_id)?
+    ))
+}
+
+pub(crate) fn dependency_by_upstream_prefix(
+    upstream: &MvDependencyObjectRef,
+) -> Result<Key, String> {
+    key_from_path(&format!(
+        "dependency/by-upstream/{}/",
+        hex::encode(dependency_identity(upstream)?.as_bytes())
+    ))
+}
+
 pub fn definition_by_id_key(mv_id: i64) -> Result<Key, String> {
     key_from_path(&format!("definition/by-id/{}", encode_positive_id(mv_id)?))
 }

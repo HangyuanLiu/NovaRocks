@@ -3293,6 +3293,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "futures",
  "hex",
  "novarocks",
  "novarocks-catalog",
