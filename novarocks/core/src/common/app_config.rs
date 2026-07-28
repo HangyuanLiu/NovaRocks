@@ -1672,6 +1672,34 @@ mod tests {
     }
 
     #[test]
+    fn connector_startup_object_store_section_parses() {
+        let config: NovaRocksConfig = toml::from_str(
+            r#"
+[connector.object_store]
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "access"
+access_key_secret = "secret"
+region = "us-east-1"
+enable_path_style_access = true
+"#,
+        )
+        .expect("parse connector startup configuration");
+
+        let object_store = config
+            .connector
+            .object_store
+            .expect("configured connector object store");
+        assert_eq!(
+            object_store.endpoint.as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(object_store.access_key_id.as_deref(), Some("access"));
+        assert_eq!(object_store.access_key_secret.as_deref(), Some("secret"));
+        assert_eq!(object_store.region.as_deref(), Some("us-east-1"));
+        assert_eq!(object_store.enable_path_style_access, Some(true));
+    }
+
+    #[test]
     fn state_store_config_loads_explicit_sqlite_provider() -> anyhow::Result<()> {
         let temp = tempfile::NamedTempFile::new()?;
         std::fs::write(
