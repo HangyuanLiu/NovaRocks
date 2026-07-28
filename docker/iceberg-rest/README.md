@@ -74,10 +74,18 @@ Important generated files (under the runtime entry):
 - `manifest.json` — machine-readable ports, endpoints, compose project, and config paths.
 - `README.md` — human-readable summary of the active environment.
 - `standalone-managed-lake.toml` — NovaRocks standalone config.
+- `standalone-managed-lake-scheduler.toml` — the same fixture with the MV refresh scheduler enabled.
 - `sql-test.conf` — SQL test runner config.
 - `ice-rest-catalog.sql` — REST catalog DDL for this workspace.
 - `spark-defaults.conf` — Spark catalog config for REST Catalog + MinIO.
 - `spark-iceberg-v3-smoke.sql` — Spark SQL that creates and writes a format-v3 Iceberg row-lineage table.
+
+Both standalone configs use the same per-worktree SQLite StateStore at
+`runtime/<env-id>/frontend-state.sqlite`, with `<env-id>` as the cluster ID and
+`fe-1` as the deployment owner. The frontend maintenance service stores
+asynchronous `ALTER TABLE ... OPTIMIZE` jobs there, so terminal job history
+survives a server restart that reuses the runtime entry. Purging the runtime
+entry also removes this local durability fixture.
 
 Use the generated configs:
 
@@ -218,13 +226,26 @@ docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 trap "docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 
+SERVER_LOG=/tmp/novarocks-server.log
 NO_PROXY=127.0.0.1,localhost \
-cargo run --release -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG" &
+cargo run --release -p novarocks-server -- standalone \
+  --config "$NOVAROCKS_STANDALONE_CONFIG" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 trap "kill $SERVER_PID; docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 
-# wait for MySQL port to be open, then run the suite
-until nc -z 127.0.0.1 "$NOVA_ENV_MYSQL_PORT"; do sleep 1; done
+# Wait for this process's post-bind marker. A port probe can hit a stale process.
+for i in $(seq 1 60); do
+  if grep -q '^NOVAROCKS_READY ' "$SERVER_LOG"; then break; fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    tail -40 "$SERVER_LOG" >&2
+    exit 1
+  fi
+  sleep 1
+done
+grep -q '^NOVAROCKS_READY ' "$SERVER_LOG" || {
+  tail -40 "$SERVER_LOG" >&2
+  exit 1
+}
 
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \

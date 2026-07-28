@@ -357,6 +357,12 @@ exchange_wait_ms = 300000
 provider = "sqlite"
 path = "$runtime_dir/standalone-managed-lake.sqlite"
 
+[state_store]
+provider = "sqlite"
+path = "$runtime_dir/frontend-state.sqlite"
+cluster_id = "$env_id"
+deployment_owner = "fe-1"
+
 [standalone_server]
 mysql_port = $mysql_port
 user = "root"
@@ -380,6 +386,12 @@ exchange_wait_ms = 300000
 [metadata]
 provider = "sqlite"
 path = "$runtime_dir/standalone-managed-lake.sqlite"
+
+[state_store]
+provider = "sqlite"
+path = "$runtime_dir/frontend-state.sqlite"
+cluster_id = "$env_id"
+deployment_owner = "fe-1"
 
 [standalone_server]
 mysql_port = $mysql_port
@@ -603,11 +615,16 @@ Do not guess ports.
 - Env exports: \`$exports_file\`
 - Standalone config: \`$runtime_dir/standalone-managed-lake.toml\`
 - Scheduler-enabled standalone config: \`$runtime_dir/standalone-managed-lake-scheduler.toml\`
+- Frontend StateStore: \`$runtime_dir/frontend-state.sqlite\`
 - SQL test config: \`$runtime_dir/sql-test.conf\`
 - StarRocks-table test warehouse: \`$starrocks_table_warehouse\`
 - REST catalog SQL: \`$runtime_dir/ice-rest-catalog.sql\`
 - Spark defaults: \`$spark_defaults_file\`
 - Spark v3 smoke SQL: \`$spark_v3_smoke_sql\`
+
+Both standalone configs use this worktree-local StateStore. Frontend
+\`ALTER TABLE ... OPTIMIZE\` job history is durable across restarts only while
+the same runtime entry and StateStore path are retained.
 
 Use:
 
