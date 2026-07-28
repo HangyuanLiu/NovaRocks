@@ -15,5 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod connector;
-pub mod state_store;
+mod context;
+mod error;
+mod handle;
+mod identity;
+
+pub use context::{ConnectorCancellation, ConnectorRequestContext};
+pub use error::{ConnectorError, ConnectorErrorKind};
+pub use handle::{
+    ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
