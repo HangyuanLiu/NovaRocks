@@ -44,9 +44,17 @@
 
 use super::*;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tempfile::TempDir;
 
+use crate::engine::table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
+    MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine,
+    TableMaintenanceService,
+};
 use crate::engine::{StandaloneSession, StandaloneState, StatementResult};
 use crate::sql::parser::ast::CreateMaterializedViewStmt;
 
@@ -54,10 +62,71 @@ use crate::sql::parser::ast::CreateMaterializedViewStmt;
 
 struct MaintenanceTestEnv {
     state: Arc<StandaloneState>,
+    maintenance_service: Arc<InlineTableMaintenanceService>,
     current_db: String,
     _metadata_dir: TempDir,
     _warehouse_dir: TempDir,
     _loopback_backend: crate::engine::StandaloneLoopbackTestBackend,
+}
+
+#[derive(Default)]
+struct InlineTableMaintenanceService {
+    automatic_actions: Mutex<Vec<MaintenanceActionRequest>>,
+    optimize_targets: Mutex<Vec<MaintenanceTarget>>,
+    next_job_id: AtomicI64,
+}
+
+impl TableMaintenanceService for InlineTableMaintenanceService {
+    fn start(&self, _engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn try_handle_statement(
+        &self,
+        _engine: &dyn TableMaintenanceEngine,
+        _sql: &str,
+        _context: MaintenanceRequestContext<'_>,
+    ) -> Result<Option<MaintenanceStatementResult>, String> {
+        Ok(None)
+    }
+
+    fn execute_automatic_action(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        self.automatic_actions
+            .lock()
+            .expect("automatic action lock")
+            .push(request.clone());
+        engine.execute_action(request)
+    }
+
+    fn submit_automatic_optimize(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+    ) -> Result<OptimizeSubmission, String> {
+        self.optimize_targets
+            .lock()
+            .expect("optimize target lock")
+            .push(target.clone());
+        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let base_snapshot_id = engine.current_snapshot_id(&target)?;
+        engine.execute_action(MaintenanceActionRequest::RewriteDataFiles {
+            target,
+            base_snapshot_id,
+            job_id: Some(job_id),
+            options: BTreeMap::new(),
+            branch: None,
+            where_clause: None,
+        })?;
+        Ok(OptimizeSubmission::Submitted { job_id })
+    }
+
+    fn shutdown(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Real `StandaloneState` with a local hadoop iceberg catalog named `catalog`
@@ -71,9 +140,13 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
     let metadata_path = metadata_dir.path().join("standalone.sqlite");
     let metadata_provider =
         crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
-    let state = Arc::new(StandaloneState {
+    let maintenance_service = Arc::new(InlineTableMaintenanceService::default());
+    let service_port: Arc<dyn TableMaintenanceService> = maintenance_service.clone();
+    let state = Arc::new_cyclic(|self_weak| StandaloneState {
         metadata_provider: Some(Arc::new(metadata_provider)),
         exchange_port: loopback_backend.exchange_port,
+        table_maintenance_service: Arc::clone(&service_port),
+        self_weak: self_weak.clone(),
         ..StandaloneState::default()
     });
     crate::connector::register_standalone_backends(&state);
@@ -105,6 +178,7 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
     }
     MaintenanceTestEnv {
         state,
+        maintenance_service,
         current_db: current_db.to_string(),
         _metadata_dir: metadata_dir,
         _warehouse_dir: warehouse_dir,
@@ -435,16 +509,13 @@ fn scenario_1_auto_optimize_skips_sequence_isolated_row_lineage_files() {
     });
     run_pass(&env, &mut coordinator);
 
-    let provider = env.state.metadata_provider.as_ref().expect("provider");
-    let read = provider.begin_read().expect("read txn");
-    let jobs = env
-        .state
-        .job_repo
-        .show_iceberg_optimize_jobs(read.as_ref())
-        .expect("list jobs");
     assert!(
-        jobs.is_empty(),
-        "sequence-isolated row-lineage files are not compactable; jobs: {jobs:?}"
+        env.maintenance_service
+            .optimize_targets
+            .lock()
+            .expect("optimize target lock")
+            .is_empty(),
+        "sequence-isolated row-lineage files must not submit automatic optimize"
     );
 
     // Capture data-file count AFTER maintenance and assert no no-op rewrite was
@@ -830,27 +901,20 @@ fn optimize_preserves_mv_apply_key_for_incremental_delete() {
     });
     run_pass(&env, &mut coordinator);
 
-    // The optimize worker thread is not spawned under cfg(test); drive the
-    // submitted job synchronously. With the fix it rewrites the storage table
-    // (carrying `__nova_base_row_id` verbatim) and reaches Finished.
-    crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
-        .expect("run optimize job");
-
-    let provider = env.state.metadata_provider.as_ref().expect("provider");
-    let read = provider.begin_read().expect("read txn");
-    let jobs = env
-        .state
-        .job_repo
-        .show_iceberg_optimize_jobs(read.as_ref())
-        .expect("list jobs");
-    drop(read);
-    assert!(!jobs.is_empty(), "expected an auto-submitted optimize job");
-    assert!(
-        jobs.iter().all(|j| matches!(
-            j.state,
-            crate::meta::repository::job::IcebergOptimizeJobState::Finished
-        )),
-        "optimize of the MV storage table must Finish (not Fail): {jobs:?}"
+    // The fake service executes the submitted rewrite synchronously through the
+    // real engine port, preserving the same connector executor used by the
+    // frontend worker.
+    assert_eq!(
+        *env.maintenance_service
+            .optimize_targets
+            .lock()
+            .expect("optimize target lock"),
+        vec![MaintenanceTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_keyed".to_string(),
+        }],
+        "MV coordinator must submit optimize through the injected service"
     );
 
     // Contents must be unchanged by the pure rewrite.
@@ -995,24 +1059,17 @@ fn optimize_preserves_aggregate_mv_apply_key_and_state() {
         cfg.policy.compaction_min_data_files = 1;
     });
     run_pass(&env, &mut coordinator);
-    crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
-        .expect("run optimize job");
-
-    let provider = env.state.metadata_provider.as_ref().expect("provider");
-    let read = provider.begin_read().expect("read txn");
-    let jobs = env
-        .state
-        .job_repo
-        .show_iceberg_optimize_jobs(read.as_ref())
-        .expect("list jobs");
-    drop(read);
-    assert!(!jobs.is_empty(), "expected an auto-submitted optimize job");
-    assert!(
-        jobs.iter().all(|j| matches!(
-            j.state,
-            crate::meta::repository::job::IcebergOptimizeJobState::Finished
-        )),
-        "optimize of the aggregate MV storage table must Finish (not Fail): {jobs:?}"
+    assert_eq!(
+        *env.maintenance_service
+            .optimize_targets
+            .lock()
+            .expect("optimize target lock"),
+        vec![MaintenanceTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_agg".to_string(),
+        }],
+        "aggregate MV coordinator must submit optimize through the injected service"
     );
 
     // Contents unchanged by the pure rewrite.
@@ -1140,8 +1197,7 @@ fn dv_compaction_on_aggregate_mv_table() {
         cfg.policy.dv_min_delete_files = 2;
     });
     run_pass(&env, &mut coordinator);
-    // DV compaction runs inline (block_on) in the executor; no optimize job queue
-    // is involved. No `run_optimize_jobs_once` call needed.
+    // DV compaction runs inline through the injected maintenance service.
 
     // MUST-HAVE assertion 1: the pass succeeded (no panic above).
     // MUST-HAVE assertion 2: the MV still answers correctly after DV compaction.

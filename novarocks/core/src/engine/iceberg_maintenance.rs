@@ -42,10 +42,8 @@ use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
 };
 use crate::fs::object_store::ObjectStoreConfig;
-use crate::meta::repository::job::CreateIcebergOptimizeJobRequest;
 
-/// Return type shared by SQL-driven actions and the legacy automatic
-/// maintenance caller that Task 6 will rewire.
+/// Connector handles shared by synchronous and worker-driven maintenance.
 pub(crate) type MaintenanceCatalogTriple =
     (Arc<dyn Catalog>, TableIdent, Option<ObjectStoreConfig>);
 
@@ -256,10 +254,10 @@ fn run_rewrite_data_files_action(
         catalog = %target.catalog,
         namespace = %target.namespace,
         table = %target.table,
-        target_snapshot_id = ?rewrite_result.optimize_outcome.target_snapshot_id,
-        rewritten_data_files_count = rewrite_result.optimize_outcome.rewritten_data_files,
-        added_data_files_count = rewrite_result.optimize_outcome.added_data_files,
-        removed_delete_files_count = rewrite_result.optimize_outcome.deleted_data_files,
+        target_snapshot_id = ?rewrite_result.outcome.target_snapshot_id,
+        rewritten_data_files_count = rewrite_result.outcome.rewritten_data_files,
+        added_data_files_count = rewrite_result.outcome.added_data_files,
+        removed_delete_files_count = rewrite_result.outcome.deleted_data_files,
         "rewrite_data_files: completed"
     );
 
@@ -270,22 +268,22 @@ fn rewrite_data_files_outcome_from_result(
     result: &WholeTableRewriteResult,
 ) -> Result<MaintenanceActionOutcome, String> {
     Ok(MaintenanceActionOutcome::RewriteDataFiles {
-        target_snapshot_id: result.optimize_outcome.target_snapshot_id,
+        target_snapshot_id: result.outcome.target_snapshot_id,
         rewritten_data_files_count: checked_i32_metric(
-            result.optimize_outcome.rewritten_data_files,
+            result.outcome.rewritten_data_files,
             "rewritten_data_files_count",
         )?,
         added_data_files_count: checked_i32_metric(
-            result.optimize_outcome.added_data_files,
+            result.outcome.added_data_files,
             "added_data_files_count",
         )?,
         rewritten_bytes_count: result.before_metrics.data_bytes,
         failed_data_files_count: 0,
         removed_delete_files_count: checked_i32_metric(
-            result.optimize_outcome.deleted_data_files,
+            result.outcome.deleted_data_files,
             "removed_delete_files_count",
         )?,
-        output_record_count: result.optimize_outcome.output_record_count,
+        output_record_count: result.outcome.output_record_count,
     })
 }
 
@@ -362,55 +360,7 @@ fn checked_i32_metric(value: i64, name: &str) -> Result<i32, String> {
     i32::try_from(value).map_err(|_| format!("rewrite_data_files metric `{name}` overflow"))
 }
 
-/// Create a pending legacy MetaStore optimize job. This remains solely for the
-/// Task 6 automatic caller/worker cutover and is not reachable from user SQL.
-pub(crate) fn enqueue_optimize_job(
-    state: &Arc<StandaloneState>,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<i64, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Err("iceberg optimize requires metadata provider".to_string());
-    };
-    let (iceberg_catalog, table_ident, _) =
-        resolve_maintenance_catalog(state, catalog, namespace, table)?;
-    let resolved_table = table_ident.name().to_string();
-    let loaded = block_on_iceberg(async move { iceberg_catalog.load_table(&table_ident).await })?
-        .map_err(|error| {
-        format!("load iceberg table {catalog}.{namespace}.{table} for optimize failed: {error}")
-    })?;
-    let base_snapshot_id = loaded
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id())
-        .ok_or_else(|| {
-            format!("iceberg table {catalog}.{namespace}.{table} has no current snapshot")
-        })?;
-    let mut transaction = provider
-        .begin_write("create iceberg optimize job")
-        .map_err(|error| format!("open iceberg optimize job transaction failed: {error}"))?;
-    let job = state
-        .job_repo
-        .create_iceberg_optimize_job(
-            transaction.as_mut(),
-            CreateIcebergOptimizeJobRequest {
-                catalog: catalog.to_string(),
-                namespace: namespace.to_string(),
-                table: resolved_table,
-                base_snapshot_id,
-                now_ms: maintenance_now_ms(),
-            },
-        )
-        .map_err(|error| format!("create iceberg optimize job failed: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("commit iceberg optimize job failed: {error}"))?;
-    Ok(job.id)
-}
-
 /// Resolve a registered Iceberg catalog into an executable connector handle.
-/// The legacy automatic maintenance coordinator also uses this until Task 6.
 pub(crate) fn resolve_maintenance_catalog(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
@@ -455,13 +405,4 @@ fn resolve_maintenance_table_name(
 
 fn action_target(target: &MaintenanceTarget) -> String {
     format!("{}.{}.{}", target.catalog, target.namespace, target.table)
-}
-
-fn maintenance_now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }

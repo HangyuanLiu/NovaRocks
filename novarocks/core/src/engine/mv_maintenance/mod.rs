@@ -35,6 +35,10 @@ use self::policy::{
 };
 
 use crate::engine::StandaloneState;
+use crate::engine::table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
+    TableMaintenanceEngine, TableMaintenanceService,
+};
 
 /// Signals consumed by the coordinator thread. `Wake` is sent after every
 /// successful MV refresh; `Stop` is sent by the handle on drop.
@@ -44,47 +48,19 @@ pub(crate) enum MaintenanceSignal {
     Stop,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MaintenanceTarget {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
+fn target_fqn(target: &MaintenanceTarget) -> String {
+    format!("{}.{}.{}", target.catalog, target.namespace, target.table)
 }
 
-impl MaintenanceTarget {
-    pub(crate) fn fqn(&self) -> String {
-        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum OptimizeSubmission {
-    Submitted { job_id: i64 },
-    AlreadyActive,
-}
-
-/// Side-effect boundary: real impl talks to iceberg catalogs and the job
-/// queue; tests inject a recording fake (same pattern as RefreshExecutor in
-/// mv_scheduler.rs).
+/// Side-effect boundary between MV policy/coordinator ownership and the
+/// injected table-maintenance application service.
 pub(crate) trait MaintenanceExecutor {
-    fn expire_snapshots(
+    fn execute_action(
         &mut self,
-        target: &MaintenanceTarget,
-        older_than_ms: i64,
-        retain_last: u32,
-    ) -> Result<crate::connector::iceberg::commit::expire_snapshots::ExpireOutcome, String>;
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String>;
 
-    fn rewrite_position_deletes(
-        &mut self,
-        target: &MaintenanceTarget,
-        min_input_files: usize,
-    ) -> Result<
-        crate::connector::iceberg::commit::rewrite_position_delete_files::RewritePositionDeleteOutcome,
-        String,
-    >;
-
-    fn submit_optimize(&mut self, target: &MaintenanceTarget)
-    -> Result<OptimizeSubmission, String>;
+    fn submit_optimize(&mut self, target: MaintenanceTarget) -> Result<OptimizeSubmission, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,23 +155,45 @@ impl MaintenanceCoordinator {
                     older_than_ms,
                     retain_last,
                 } => executor
-                    .expire_snapshots(target, *older_than_ms, *retain_last)
-                    .map(|o| {
-                        format!(
-                            "expired_snapshots={} deleted_files={}",
-                            o.expired_snapshot_count, o.deleted_file_count
-                        )
+                    .execute_action(MaintenanceActionRequest::ExpireSnapshots {
+                        target: target.clone(),
+                        older_than_ms: Some(*older_than_ms),
+                        retain_last: Some(*retain_last),
+                    })
+                    .and_then(|outcome| match outcome {
+                        MaintenanceActionOutcome::ExpireSnapshots { .. } => {
+                            Ok("expire_snapshots=completed".to_string())
+                        }
+                        other => Err(format!(
+                            "automatic expire snapshots returned unexpected outcome: {other:?}"
+                        )),
                     }),
-                MaintenanceAction::RewritePositionDeletes { min_input_files } => executor
-                    .rewrite_position_deletes(target, *min_input_files)
-                    .map(|o| {
-                        format!(
-                            "rewritten_delete_files={} added_delete_files={}",
-                            o.rewritten_delete_files_count, o.added_delete_files_count
-                        )
-                    }),
+                MaintenanceAction::RewritePositionDeletes { min_input_files } => {
+                    let mut options = BTreeMap::new();
+                    options.insert("min-input-files".to_string(), min_input_files.to_string());
+                    executor
+                        .execute_action(MaintenanceActionRequest::RewritePositionDeleteFiles {
+                            target: target.clone(),
+                            options,
+                            where_clause: None,
+                        })
+                        .and_then(|outcome| match outcome {
+                            MaintenanceActionOutcome::RewritePositionDeleteFiles {
+                                rewritten_delete_files_count,
+                                added_delete_files_count,
+                                ..
+                            } => Ok(format!(
+                                "rewritten_delete_files={rewritten_delete_files_count} \
+                                 added_delete_files={added_delete_files_count}"
+                            )),
+                            other => Err(format!(
+                                "automatic position-delete rewrite returned unexpected outcome: \
+                                 {other:?}"
+                            )),
+                        })
+                }
                 MaintenanceAction::SubmitOptimize => {
-                    executor.submit_optimize(target).map(|s| match s {
+                    executor.submit_optimize(target.clone()).map(|s| match s {
                         OptimizeSubmission::Submitted { job_id } => {
                             format!("optimize_job_id={job_id}")
                         }
@@ -209,7 +207,7 @@ impl MaintenanceCoordinator {
                 Ok(detail) => {
                     self.record_success(mv_id, kind);
                     tracing::info!(
-                        table = %target.fqn(),
+                        table = %target_fqn(target),
                         action = ?kind,
                         data_files = ?stats.total_data_files,
                         files_size = ?stats.total_files_size_bytes,
@@ -221,7 +219,7 @@ impl MaintenanceCoordinator {
                 Err(err) => {
                     self.record_failure(mv_id, kind, now_ms, max_failures);
                     tracing::warn!(
-                        table = %target.fqn(),
+                        table = %target_fqn(target),
                         action = ?kind,
                         error = %err,
                         "auto maintenance action failed"
@@ -231,7 +229,7 @@ impl MaintenanceCoordinator {
         }
         for (kind, reason) in &outcome.skips {
             tracing::debug!(
-                table = %target.fqn(),
+                table = %target_fqn(target),
                 action = ?kind,
                 reason = ?reason,
                 "auto maintenance action skipped"
@@ -242,93 +240,34 @@ impl MaintenanceCoordinator {
     }
 }
 
-/// Production executor: expire / DV-rewrite run inline via block_on_iceberg;
-/// optimize is submitted to the existing SQLite job queue and executed by the
-/// iceberg-optimize-worker.
+/// Production executor for the MV caller. Application dispatch and optimize
+/// lifecycle ownership stay behind the injected service; connector execution
+/// remains available through the borrowed engine port.
 pub(crate) struct StateMaintenanceExecutor {
-    state: Arc<StandaloneState>,
+    service: Arc<dyn TableMaintenanceService>,
+    engine: Arc<dyn TableMaintenanceEngine>,
 }
 
 impl StateMaintenanceExecutor {
     pub(crate) fn new(state: Arc<StandaloneState>) -> Self {
-        Self { state }
+        let service = Arc::clone(&state.table_maintenance_service);
+        let engine = state as Arc<dyn TableMaintenanceEngine>;
+        Self { service, engine }
     }
 }
 
 impl MaintenanceExecutor for StateMaintenanceExecutor {
-    fn expire_snapshots(
+    fn execute_action(
         &mut self,
-        target: &MaintenanceTarget,
-        older_than_ms: i64,
-        retain_last: u32,
-    ) -> Result<crate::connector::iceberg::commit::expire_snapshots::ExpireOutcome, String> {
-        let (catalog, table_ident, _) =
-            crate::engine::iceberg_maintenance::resolve_maintenance_catalog(
-                &self.state,
-                &target.catalog,
-                &target.namespace,
-                &target.table,
-            )?;
-        let params = crate::connector::iceberg::commit::expire_snapshots::ExpireParams {
-            older_than_ms: Some(older_than_ms),
-            retain_last: Some(retain_last),
-        };
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
-            crate::connector::iceberg::commit::expire_snapshots::run_expire_snapshots(
-                catalog,
-                table_ident,
-                params,
-            )
-            .await
-        })?
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        self.service
+            .execute_automatic_action(self.engine.as_ref(), request)
     }
 
-    fn rewrite_position_deletes(
-        &mut self,
-        target: &MaintenanceTarget,
-        min_input_files: usize,
-    ) -> Result<
-        crate::connector::iceberg::commit::rewrite_position_delete_files::RewritePositionDeleteOutcome,
-        String,
-    >{
-        let (catalog, table_ident, _) =
-            crate::engine::iceberg_maintenance::resolve_maintenance_catalog(
-                &self.state,
-                &target.catalog,
-                &target.namespace,
-                &target.table,
-            )?;
-        let options =
-            crate::connector::iceberg::commit::rewrite_position_delete_files::RewritePositionDeleteOptions {
-                rewrite_all: false,
-                min_input_files,
-            };
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
-            crate::connector::iceberg::commit::rewrite_position_delete_files::run_rewrite_position_delete_files(
-                catalog,
-                table_ident,
-                options,
-            )
-            .await
-        })?
-    }
-
-    fn submit_optimize(
-        &mut self,
-        target: &MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, String> {
-        match crate::engine::iceberg_maintenance::enqueue_optimize_job(
-            &self.state,
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        ) {
-            Ok(job_id) => Ok(OptimizeSubmission::Submitted { job_id }),
-            // The job repo rejects duplicates with a conflict error; treat it
-            // as "already active" instead of a failure.
-            Err(err) if err.contains("already exists") => Ok(OptimizeSubmission::AlreadyActive),
-            Err(err) => Err(err),
-        }
+    fn submit_optimize(&mut self, target: MaintenanceTarget) -> Result<OptimizeSubmission, String> {
+        self.service
+            .submit_automatic_optimize(self.engine.as_ref(), target)
     }
 }
 
@@ -397,7 +336,7 @@ impl MaintenanceCoordinator {
         for candidate in &candidates {
             if candidate.refresh_in_flight {
                 tracing::debug!(
-                    table = %candidate.target.fqn(),
+                    table = %target_fqn(&candidate.target),
                     "auto maintenance skipped: refresh in flight"
                 );
                 continue;
@@ -418,7 +357,7 @@ impl MaintenanceCoordinator {
                 Ok(stats) => stats,
                 Err(err) => {
                     tracing::warn!(
-                        table = %candidate.target.fqn(),
+                        table = %target_fqn(&candidate.target),
                         error = %err,
                         "auto maintenance stats collection failed"
                     );
@@ -553,8 +492,16 @@ mod integration_tests;
 mod tests {
     use super::policy::*;
     use super::*;
-    use crate::connector::iceberg::commit::expire_snapshots::ExpireOutcome;
-    use crate::connector::iceberg::commit::rewrite_position_delete_files::RewritePositionDeleteOutcome;
+    use crate::engine::table_maintenance::{
+        MaintenanceActionOutcome as ServiceActionOutcome,
+        MaintenanceActionRequest as ServiceActionRequest,
+        MaintenanceRequestContext as ServiceRequestContext,
+        MaintenanceStatementResult as ServiceStatementResult,
+        MaintenanceTarget as ServiceMaintenanceTarget,
+        OptimizeSubmission as ServiceOptimizeSubmission, TABLE_MAINTENANCE_SERVICE_UNAVAILABLE,
+        TableMaintenanceEngine, TableMaintenanceService,
+    };
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct RecordingExecutor {
@@ -565,39 +512,167 @@ mod tests {
     }
 
     impl MaintenanceExecutor for RecordingExecutor {
-        fn expire_snapshots(
+        fn execute_action(
             &mut self,
-            target: &MaintenanceTarget,
-            older_than_ms: i64,
-            retain_last: u32,
-        ) -> Result<ExpireOutcome, String> {
-            self.expires
-                .push((target.fqn(), older_than_ms, retain_last));
-            match self.fail_expire.as_ref() {
-                Some(message) => Err(message.clone()),
-                None => Ok(ExpireOutcome {
-                    expired_snapshot_count: 1,
-                    deleted_file_count: 2,
-                }),
+            request: MaintenanceActionRequest,
+        ) -> Result<MaintenanceActionOutcome, String> {
+            match request {
+                MaintenanceActionRequest::ExpireSnapshots {
+                    target,
+                    older_than_ms,
+                    retain_last,
+                } => {
+                    self.expires.push((
+                        target_fqn(&target),
+                        older_than_ms.expect("automatic expire older_than"),
+                        retain_last.expect("automatic expire retain_last"),
+                    ));
+                    match self.fail_expire.as_ref() {
+                        Some(message) => Err(message.clone()),
+                        None => Ok(MaintenanceActionOutcome::ExpireSnapshots {
+                            deleted_data_files_count: None,
+                            deleted_position_delete_files_count: None,
+                            deleted_equality_delete_files_count: None,
+                            deleted_manifest_files_count: None,
+                            deleted_manifest_lists_count: None,
+                            deleted_statistics_files_count: None,
+                        }),
+                    }
+                }
+                MaintenanceActionRequest::RewritePositionDeleteFiles {
+                    target, options, ..
+                } => {
+                    let min_input_files = options
+                        .get("min-input-files")
+                        .expect("automatic rewrite min-input-files")
+                        .parse()
+                        .expect("numeric automatic rewrite min-input-files");
+                    self.dv_rewrites
+                        .push((target_fqn(&target), min_input_files));
+                    Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
+                        rewritten_delete_files_count: 0,
+                        added_delete_files_count: 0,
+                        rewritten_bytes_count: 0,
+                        added_bytes_count: 0,
+                    })
+                }
+                other => Err(format!(
+                    "unexpected maintenance request in recording executor: {other:?}"
+                )),
             }
-        }
-
-        fn rewrite_position_deletes(
-            &mut self,
-            target: &MaintenanceTarget,
-            min_input_files: usize,
-        ) -> Result<RewritePositionDeleteOutcome, String> {
-            self.dv_rewrites.push((target.fqn(), min_input_files));
-            Ok(RewritePositionDeleteOutcome::default())
         }
 
         fn submit_optimize(
             &mut self,
-            target: &MaintenanceTarget,
+            target: MaintenanceTarget,
         ) -> Result<OptimizeSubmission, String> {
-            self.optimize_submissions.push(target.fqn());
+            self.optimize_submissions.push(target_fqn(&target));
             Ok(OptimizeSubmission::Submitted { job_id: 7 })
         }
+    }
+
+    struct RecordingTableMaintenanceService {
+        automatic_actions: Mutex<Vec<ServiceActionRequest>>,
+        optimize_targets: Mutex<Vec<ServiceMaintenanceTarget>>,
+        action_error: Option<String>,
+        optimize_submission: ServiceOptimizeSubmission,
+    }
+
+    impl RecordingTableMaintenanceService {
+        fn accepting(optimize_submission: ServiceOptimizeSubmission) -> Self {
+            Self {
+                automatic_actions: Mutex::new(Vec::new()),
+                optimize_targets: Mutex::new(Vec::new()),
+                action_error: None,
+                optimize_submission,
+            }
+        }
+
+        fn failing(message: &str) -> Self {
+            Self {
+                automatic_actions: Mutex::new(Vec::new()),
+                optimize_targets: Mutex::new(Vec::new()),
+                action_error: Some(message.to_string()),
+                optimize_submission: ServiceOptimizeSubmission::Submitted { job_id: 1 },
+            }
+        }
+    }
+
+    impl TableMaintenanceService for RecordingTableMaintenanceService {
+        fn start(&self, _engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn TableMaintenanceEngine,
+            _sql: &str,
+            _context: ServiceRequestContext<'_>,
+        ) -> Result<Option<ServiceStatementResult>, String> {
+            Ok(None)
+        }
+
+        fn execute_automatic_action(
+            &self,
+            _engine: &dyn TableMaintenanceEngine,
+            request: ServiceActionRequest,
+        ) -> Result<ServiceActionOutcome, String> {
+            self.automatic_actions
+                .lock()
+                .expect("automatic action lock")
+                .push(request.clone());
+            if let Some(error) = self.action_error.as_ref() {
+                return Err(error.clone());
+            }
+            match request {
+                ServiceActionRequest::ExpireSnapshots { .. } => {
+                    Ok(ServiceActionOutcome::ExpireSnapshots {
+                        deleted_data_files_count: None,
+                        deleted_position_delete_files_count: None,
+                        deleted_equality_delete_files_count: None,
+                        deleted_manifest_files_count: None,
+                        deleted_manifest_lists_count: None,
+                        deleted_statistics_files_count: None,
+                    })
+                }
+                ServiceActionRequest::RewritePositionDeleteFiles { .. } => {
+                    Ok(ServiceActionOutcome::RewritePositionDeleteFiles {
+                        rewritten_delete_files_count: 2,
+                        added_delete_files_count: 1,
+                        rewritten_bytes_count: 200,
+                        added_bytes_count: 100,
+                    })
+                }
+                other => Err(format!(
+                    "unexpected automatic action in MV maintenance test: {other:?}"
+                )),
+            }
+        }
+
+        fn submit_automatic_optimize(
+            &self,
+            _engine: &dyn TableMaintenanceEngine,
+            target: ServiceMaintenanceTarget,
+        ) -> Result<ServiceOptimizeSubmission, String> {
+            self.optimize_targets
+                .lock()
+                .expect("optimize target lock")
+                .push(target);
+            Ok(self.optimize_submission)
+        }
+
+        fn shutdown(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn state_executor_with_service(
+        service: Arc<dyn TableMaintenanceService>,
+    ) -> StateMaintenanceExecutor {
+        StateMaintenanceExecutor::new(Arc::new(StandaloneState {
+            table_maintenance_service: service,
+            ..StandaloneState::default()
+        }))
     }
 
     fn target() -> MaintenanceTarget {
@@ -642,6 +717,170 @@ mod tests {
     }
 
     const NOW: i64 = 1_000_000_000;
+
+    #[test]
+    fn state_executor_routes_typed_automatic_requests_to_injected_service() {
+        let service = Arc::new(RecordingTableMaintenanceService::accepting(
+            ServiceOptimizeSubmission::AlreadyActive,
+        ));
+        let mut executor =
+            state_executor_with_service(Arc::clone(&service) as Arc<dyn TableMaintenanceService>);
+        let mut coordinator = coordinator();
+
+        coordinator.process_table(1, &target(), &old_small_file_stats(), &mut executor, NOW);
+
+        assert_eq!(
+            *service
+                .automatic_actions
+                .lock()
+                .expect("automatic action lock"),
+            vec![ServiceActionRequest::ExpireSnapshots {
+                target: ServiceMaintenanceTarget {
+                    catalog: "ice".to_string(),
+                    namespace: "analytics".to_string(),
+                    table: "mv_x".to_string(),
+                },
+                older_than_ms: Some(568_000_000),
+                retain_last: Some(1),
+            }]
+        );
+        assert_eq!(
+            *service
+                .optimize_targets
+                .lock()
+                .expect("optimize target lock"),
+            vec![ServiceMaintenanceTarget {
+                catalog: "ice".to_string(),
+                namespace: "analytics".to_string(),
+                table: "mv_x".to_string(),
+            }]
+        );
+
+        let mut changed_stats = old_small_file_stats();
+        changed_stats.current_snapshot_id = Some(31);
+        let second =
+            coordinator.process_table(1, &target(), &changed_stats, &mut executor, NOW + 1);
+        assert!(
+            second
+                .skips
+                .contains(&(ActionKind::Optimize, SkipReason::Cooldown)),
+            "typed AlreadyActive is a successful no-op and must retain optimize cooldown"
+        );
+        assert!(
+            !coordinator
+                .runtime_entry(1)
+                .consecutive_failures
+                .contains_key(&ActionKind::Optimize)
+        );
+    }
+
+    #[test]
+    fn state_executor_routes_position_delete_rewrite_to_injected_service() {
+        let service = Arc::new(RecordingTableMaintenanceService::accepting(
+            ServiceOptimizeSubmission::Submitted { job_id: 9 },
+        ));
+        let mut executor =
+            state_executor_with_service(Arc::clone(&service) as Arc<dyn TableMaintenanceService>);
+        let mut coordinator = coordinator();
+        let stats = TableMaintenanceStats {
+            current_snapshot_id: Some(30),
+            snapshots: vec![SnapshotInfo {
+                snapshot_id: 30,
+                timestamp_ms: NOW,
+            }],
+            total_data_files: Some(1),
+            max_compactable_data_files: Some(1),
+            total_files_size_bytes: Some(DEFAULT_TARGET_FILE_SIZE_BYTES),
+            total_delete_files: Some(10),
+            ..TableMaintenanceStats::default()
+        };
+
+        coordinator.process_table(1, &target(), &stats, &mut executor, NOW);
+
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("min-input-files".to_string(), "2".to_string());
+        assert_eq!(
+            *service
+                .automatic_actions
+                .lock()
+                .expect("automatic action lock"),
+            vec![ServiceActionRequest::RewritePositionDeleteFiles {
+                target: ServiceMaintenanceTarget {
+                    catalog: "ice".to_string(),
+                    namespace: "analytics".to_string(),
+                    table: "mv_x".to_string(),
+                },
+                options,
+                where_clause: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn service_execution_failure_enters_existing_backoff_state() {
+        let service = Arc::new(RecordingTableMaintenanceService::failing(
+            "automatic maintenance execution failed",
+        ));
+        let mut executor =
+            state_executor_with_service(Arc::clone(&service) as Arc<dyn TableMaintenanceService>);
+        let mut coordinator = coordinator();
+        let mut stats = old_small_file_stats();
+        stats.total_data_files = Some(0);
+        stats.max_compactable_data_files = Some(0);
+        stats.total_files_size_bytes = Some(0);
+
+        coordinator.process_table(1, &target(), &stats, &mut executor, NOW);
+
+        assert_eq!(
+            service
+                .automatic_actions
+                .lock()
+                .expect("automatic action lock")
+                .len(),
+            1
+        );
+        let runtime = coordinator.runtime_entry(1);
+        assert_eq!(
+            runtime.consecutive_failures.get(&ActionKind::Expire),
+            Some(&1)
+        );
+        assert_eq!(
+            runtime.next_attempt_after_ms.get(&ActionKind::Expire),
+            Some(&(NOW + FAILURE_BACKOFF_BASE_MS))
+        );
+    }
+
+    #[test]
+    fn empty_service_unavailability_enters_existing_backoff_state() {
+        let mut executor = state_executor_with_service(Arc::new(
+            crate::engine::table_maintenance::EmptyTableMaintenanceService,
+        ));
+        let error = executor
+            .execute_action(MaintenanceActionRequest::ExpireSnapshots {
+                target: target(),
+                older_than_ms: Some(100),
+                retain_last: Some(1),
+            })
+            .expect_err("empty service must reject automatic maintenance");
+        assert_eq!(error, TABLE_MAINTENANCE_SERVICE_UNAVAILABLE);
+
+        let mut coordinator = coordinator();
+        let mut stats = old_small_file_stats();
+        stats.total_data_files = Some(0);
+        stats.max_compactable_data_files = Some(0);
+        stats.total_files_size_bytes = Some(0);
+        coordinator.process_table(1, &target(), &stats, &mut executor, NOW);
+
+        let runtime = coordinator.runtime_entry(1);
+        assert_eq!(
+            runtime.consecutive_failures.get(&ActionKind::Expire),
+            Some(&1)
+        );
+        assert_eq!(
+            runtime.next_attempt_after_ms.get(&ActionKind::Expire),
+            Some(&(NOW + FAILURE_BACKOFF_BASE_MS))
+        );
+    }
 
     #[test]
     fn process_table_runs_planned_actions_and_records_snapshot() {

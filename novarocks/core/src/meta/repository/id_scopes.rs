@@ -53,10 +53,6 @@ pub fn erase_job() -> IdScope {
     stable("job.erase")
 }
 
-pub fn iceberg_optimize_job() -> IdScope {
-    stable("job.iceberg_optimize")
-}
-
 pub fn iceberg_operation() -> IdScope {
     stable("iceberg.operation")
 }

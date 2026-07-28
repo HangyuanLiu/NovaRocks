@@ -625,11 +625,6 @@ impl StandaloneNovaRocks {
     }
 
     #[cfg(test)]
-    pub(crate) fn run_pending_optimize_jobs_for_test(&self) -> Result<(), String> {
-        crate::connector::iceberg::compact::run_optimize_jobs_once(&self.inner)
-    }
-
-    #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> Arc<StandaloneState> {
         Arc::clone(&self.inner)
     }
@@ -4283,7 +4278,6 @@ mod tests {
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
-    use crate::meta::MetaStoreProvider;
     use crate::runtime::query_options::QueryOptions;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -7858,8 +7852,6 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn iceberg_row_lineage_optimize_does_not_advance_next_row_id() {
-        use crate::meta::repository::job::{IcebergOptimizeJobState, StoredIcebergOptimizeJob};
-
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
 
@@ -7874,8 +7866,8 @@ path = "meta/operations.sqlite"
         }
         let (next_row_id_before, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
 
-        // Locate the current snapshot id so the OPTIMIZE job's base_snapshot_id
-        // matches the table's live state — that's the precondition for
+        // Locate the current snapshot id so the rewrite target matches the
+        // table's live state — that's the precondition for
         // `validate_base_snapshot` inside the rewrite executor.
         let base_snapshot_id = {
             let registry = engine.inner.iceberg_catalogs.read().expect("registry");
@@ -7891,21 +7883,18 @@ path = "meta/operations.sqlite"
                 .snapshot_id()
         };
 
-        let job = StoredIcebergOptimizeJob {
-            id: 1,
+        let target = crate::connector::iceberg::compact::WholeTableRewriteTarget {
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
             table: "t".to_string(),
             base_snapshot_id,
-            state: IcebergOptimizeJobState::Pending,
-            created_at_ms: 0,
-            started_at_ms: None,
-            finished_at_ms: None,
-            error_message: None,
-            outcome: None,
+            job_id: None,
         };
-        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(&engine.inner, &job)
-            .expect("run optimize job");
+        let outcome = crate::connector::iceberg::compact::execute_whole_table_rewrite_for_target(
+            &engine.inner,
+            &target,
+        )
+        .expect("rewrite whole table");
         assert!(
             outcome.target_snapshot_id.is_some(),
             "OPTIMIZE on a non-empty row-lineage table must commit a Replace snapshot"
@@ -7940,8 +7929,6 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn iceberg_row_lineage_optimize_preserves_row_identity() {
-        use crate::meta::repository::job::{IcebergOptimizeJobState, StoredIcebergOptimizeJob};
-
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
         session
@@ -7977,21 +7964,18 @@ path = "meta/operations.sqlite"
 
         let base_snapshot_id =
             current_iceberg_snapshot_id(&engine, "ice", "db1", "t").expect("base snapshot");
-        let job = StoredIcebergOptimizeJob {
-            id: 2,
+        let target = crate::connector::iceberg::compact::WholeTableRewriteTarget {
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
             table: "t".to_string(),
             base_snapshot_id,
-            state: IcebergOptimizeJobState::Pending,
-            created_at_ms: 0,
-            started_at_ms: None,
-            finished_at_ms: None,
-            error_message: None,
-            outcome: None,
+            job_id: None,
         };
-        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(&engine.inner, &job)
-            .expect("run optimize job");
+        let outcome = crate::connector::iceberg::compact::execute_whole_table_rewrite_for_target(
+            &engine.inner,
+            &target,
+        )
+        .expect("rewrite whole table");
         assert!(
             outcome.target_snapshot_id.is_some(),
             "OPTIMIZE on a non-empty row-lineage table must commit"
