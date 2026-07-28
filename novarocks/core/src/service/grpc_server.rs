@@ -2647,7 +2647,9 @@ mod pr3_tests {
         NativeFragmentIngressError, NativeFragmentRequest,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Notify;
     use tonic::Request;
 
     struct CapturingReportHandler {
@@ -2740,6 +2742,64 @@ mod pr3_tests {
                 .lock()
                 .expect("native fragment cancellations")
                 .push(request);
+            Ok(())
+        }
+    }
+
+    struct GatedNativeFragmentIngress {
+        entered: Notify,
+        accepted: Mutex<bool>,
+        acceptance_gate: Condvar,
+    }
+
+    impl GatedNativeFragmentIngress {
+        fn new() -> Self {
+            Self {
+                entered: Notify::new(),
+                accepted: Mutex::new(false),
+                acceptance_gate: Condvar::new(),
+            }
+        }
+
+        async fn wait_until_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn accept(&self) {
+            *self
+                .accepted
+                .lock()
+                .expect("native fragment acceptance gate") = true;
+            self.acceptance_gate.notify_all();
+        }
+    }
+
+    impl NativeFragmentIngress for GatedNativeFragmentIngress {
+        fn submit(
+            &self,
+            request: NativeFragmentRequest,
+        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+            self.entered.notify_one();
+            let mut accepted = self
+                .accepted
+                .lock()
+                .expect("native fragment acceptance gate");
+            while !*accepted {
+                accepted = self
+                    .acceptance_gate
+                    .wait(accepted)
+                    .expect("native fragment acceptance gate");
+            }
+            Ok(NativeFragmentAccepted::new(
+                request.query_id(),
+                request.fragment_instance_id(),
+            ))
+        }
+
+        fn cancel(
+            &self,
+            _request: NativeFragmentCancelRequest,
+        ) -> Result<(), NativeFragmentIngressError> {
             Ok(())
         }
     }
@@ -3106,8 +3166,8 @@ mod pr3_tests {
     }
 
     #[tokio::test]
-    async fn submit_fragment_success_response_follows_injected_ingress_acceptance() {
-        let ingress = Arc::new(RecordingNativeFragmentIngress::default());
+    async fn submit_fragment_success_waits_for_injected_ingress_acceptance() {
+        let ingress = Arc::new(GatedNativeFragmentIngress::new());
         let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
         let query_id = QueryId {
             hi: 7_301,
@@ -3118,8 +3178,8 @@ mod pr3_tests {
             lo: 7_304,
         };
 
-        let response = svc
-            .submit_fragment(Request::new(SubmitFragmentRequest {
+        let mut rpc = tokio::spawn(async move {
+            svc.submit_fragment(Request::new(SubmitFragmentRequest {
                 plan: Some(empty_values_result_fragment(7, 41)),
                 instance_params: Some(novarocks::InstanceParams {
                     query_id: Some(ProtoUniqueId {
@@ -3140,18 +3200,29 @@ mod pr3_tests {
                 }),
             }))
             .await
+        });
+
+        ingress.wait_until_entered().await;
+        let rpc_still_pending = tokio::time::timeout(Duration::from_millis(100), &mut rpc)
+            .await
+            .is_err();
+        if !rpc_still_pending {
+            ingress.accept();
+            panic!("tonic success returned before the injected ingress accepted the fragment");
+        }
+        assert!(
+            rpc_still_pending,
+            "RPC must remain pending while the injected ingress has not accepted the fragment"
+        );
+
+        ingress.accept();
+        let response = rpc
+            .await
+            .expect("RPC task must not panic")
             .expect("RPC level success")
             .into_inner();
 
         assert_eq!(response.status_code, 0, "{}", response.message);
-        assert_eq!(
-            *ingress
-                .submissions
-                .lock()
-                .expect("native fragment submissions"),
-            vec![(query_id, finst_id)],
-            "successful tonic response must be observable only after the injected ingress accepts"
-        );
     }
 
     #[tokio::test]
