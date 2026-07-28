@@ -31,12 +31,14 @@ use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::meta::MetaReadTxn;
-use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvRefreshState};
 use crate::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest,
     StarRocksTableKind as RepoStarRocksTableKind,
 };
-use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::persistence::definition::{
+    CreateMvDefinitionRequest, StoredMvDefinition, StoredMvRefreshPolicy,
+};
+use crate::mv::persistence::refresh::MvRefreshState;
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{

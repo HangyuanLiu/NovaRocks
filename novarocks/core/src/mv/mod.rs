@@ -17,10 +17,12 @@
 
 pub(crate) mod aggregate_state;
 pub(crate) mod analysis;
+pub mod application;
 pub mod dependency;
 pub(crate) mod model;
 pub(crate) mod partition;
 pub mod persistence;
 pub(crate) mod refresh;
+pub mod repository;
 pub(crate) mod rewrite;
 pub(crate) mod schema_validation;

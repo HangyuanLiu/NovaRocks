@@ -24,9 +24,10 @@ use crate::engine::mv::lifecycle::{
 };
 use crate::engine::statement::{AlterIcebergPropertiesStmt, PropertiesOp};
 use crate::engine::{StandaloneState, StatementResult};
-use crate::meta::repository::mv::UpdateMvRefreshMetadataRequest;
 use crate::mv::model::{MvStorageEngine, MvTarget};
-use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::persistence::definition::{
+    StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,

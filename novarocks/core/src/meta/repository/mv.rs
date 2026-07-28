@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::meta::keys::{NS_MV, normalize_lookup_name};
 use crate::meta::repository::{
@@ -31,10 +31,22 @@ use crate::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use crate::mv::persistence::definition::{
-    MV_DEFINITION_SUBJECT, StoredMvDefinition, StoredMvDefinitionAvro, StoredMvRefreshPolicy,
+    CreateMvDefinitionRequest, MV_DEFINITION_SUBJECT, StoredMvDefinition, StoredMvDefinitionAvro,
+    StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
-use crate::mv::persistence::dependency::{MV_DEPENDENCY_SUBJECT, StoredMvDependency};
-use crate::mv::persistence::schema::{MvPartitionContract, MvSchemaContract};
+use crate::mv::persistence::dependency::{
+    CreateMvDependencyRequest, MV_DEPENDENCY_SUBJECT, StoredMvDependency,
+};
+use crate::mv::persistence::partition::{
+    MvPartitionRefreshStatus, RecordFailedMvPartitionStatesRequest,
+    ReplaceMvPartitionStatesRequest, StoredMvPartitionState, UpdateMvPartitionContractRequest,
+};
+use crate::mv::persistence::refresh::{
+    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
+    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
+    RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
+};
+use crate::mv::repository::MvTargetLookup;
 
 const MV_TARGET_LOOKUP_KIND: &str = "mv.target_lookup";
 const MV_REFRESH_KIND: &str = "mv.refresh";
@@ -47,209 +59,6 @@ pub struct MvMetaRepository;
 pub struct VersionedMvDefinition {
     pub record_revision: MetaRevision,
     pub value: StoredMvDefinition,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateMvDefinitionRequest {
-    pub select_sql: String,
-    pub base_table_refs: Vec<String>,
-    pub primary_key_columns: Vec<String>,
-    pub storage_engine: String,
-    pub target_catalog: Option<String>,
-    pub target_namespace: Option<String>,
-    pub target_table: Option<String>,
-    pub schema_contract: Option<MvSchemaContract>,
-    pub partition_spec: Option<MvPartitionContract>,
-    pub created_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpdateMvRefreshMetadataRequest {
-    pub mv_id: i64,
-    pub refresh_policy: StoredMvRefreshPolicy,
-    pub refresh_paused: bool,
-    pub refresh_interval_ms: Option<i64>,
-    pub max_staleness_ms: Option<i64>,
-    pub last_scheduler_error: Option<String>,
-    pub next_refresh_after_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MvPartitionRefreshStatus {
-    Fresh,
-    Refreshing,
-    Failed,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredMvPartitionState {
-    pub mv_id: i64,
-    pub partition_key: String,
-    pub status: MvPartitionRefreshStatus,
-    pub last_refresh_ms: Option<i64>,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub target_snapshot_id: Option<i64>,
-    pub last_refresh_id: Option<i64>,
-    pub failure_message: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReplaceMvPartitionStatesRequest {
-    pub mv_id: i64,
-    pub partition_keys: BTreeSet<String>,
-    pub last_refresh_ms: i64,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub target_snapshot_id: Option<i64>,
-    pub last_refresh_id: i64,
-    pub max_entries: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecordFailedMvPartitionStatesRequest {
-    pub mv_id: i64,
-    pub partition_keys: BTreeSet<String>,
-    pub failure_message: String,
-    pub last_refresh_ms: i64,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub target_snapshot_id: Option<i64>,
-    pub last_refresh_id: i64,
-    pub max_entries: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateMvDependencyRequest {
-    pub upstream: MvDependencyObjectRef,
-    pub created_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MvTargetLookup {
-    pub mv_id: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefreshExternalOutcome {
-    pub target_snapshot_id: Option<i64>,
-    pub commit_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefreshCommitMarker {
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredMvRefresh {
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    #[serde(default)]
-    pub operation_id: Option<i64>,
-    pub state: MvRefreshState,
-    #[serde(default)]
-    pub target_catalog: Option<String>,
-    #[serde(default)]
-    pub target_namespace: Option<String>,
-    #[serde(default)]
-    pub target_table: Option<String>,
-    #[serde(default)]
-    pub staging_branch: Option<String>,
-    #[serde(default)]
-    pub expected_main_snapshot_id: Option<i64>,
-    #[serde(default)]
-    pub staging_snapshot_id: Option<i64>,
-    #[serde(default)]
-    pub published_snapshot_id: Option<i64>,
-    #[serde(default)]
-    pub target_snapshots: BTreeMap<String, i64>,
-    #[serde(default)]
-    pub base_table_uuids: BTreeMap<String, String>,
-    #[serde(default)]
-    pub rows: Option<i64>,
-    #[serde(default)]
-    pub marker: Option<RefreshCommitMarker>,
-    #[serde(default)]
-    pub external_outcome: Option<RefreshExternalOutcome>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MvRefreshState {
-    IntentCreated,
-    StagingCommitted,
-    #[serde(alias = "EXTERNAL_COMMITTED")]
-    PublishCommitted,
-    Finalized,
-    AbortRequested,
-    Aborted,
-    CommitUnknown,
-}
-
-impl MvRefreshState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::IntentCreated => "INTENT_CREATED",
-            Self::StagingCommitted => "STAGING_COMMITTED",
-            Self::PublishCommitted => "PUBLISH_COMMITTED",
-            Self::Finalized => "FINALIZED",
-            Self::AbortRequested => "ABORT_REQUESTED",
-            Self::Aborted => "ABORTED",
-            Self::CommitUnknown => "COMMIT_UNKNOWN",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BeginIcebergMvRefreshRequest {
-    pub mv_id: i64,
-    pub operation_id: Option<i64>,
-    pub target_catalog: String,
-    pub target_namespace: String,
-    pub target_table: String,
-    pub staging_branch: String,
-    pub expected_main_snapshot_id: Option<i64>,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub marker_token: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecordStagingCommitRequest {
-    pub refresh_id: i64,
-    pub staging_snapshot_id: i64,
-    pub rows: i64,
-    pub base_table_uuids: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecordPublishCommitRequest {
-    pub refresh_id: i64,
-    pub published_snapshot_id: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvRefreshFinalizeRequest {
-    pub refresh_id: i64,
-    pub rows: i64,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_uuids: BTreeMap<String, String>,
-    pub target_snapshot_id: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpdateStarRocksMvRefreshSummaryRequest {
-    pub mv_id: i64,
-    pub last_refresh_ms: i64,
-    pub last_refresh_rows: i64,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_uuids: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpdateMvPartitionContractRequest {
-    pub mv_id: i64,
-    pub partition_spec: MvPartitionContract,
 }
 
 impl MvMetaRepository {

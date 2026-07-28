@@ -21,7 +21,7 @@
 use crate::sql::parser::ast::ObjectName;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum AlterIcebergRefAction {
+pub enum AlterIcebergRefAction {
     CreateBranch {
         name: String,
         anchor: SnapshotAnchor,
@@ -47,13 +47,13 @@ pub(crate) enum AlterIcebergRefAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum SnapshotAnchor {
+pub enum SnapshotAnchor {
     SnapshotId(i64),
     CurrentMain,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AlterIcebergRefStmt {
+pub struct AlterIcebergRefStmt {
     pub table: ObjectName,
     pub action: AlterIcebergRefAction,
 }

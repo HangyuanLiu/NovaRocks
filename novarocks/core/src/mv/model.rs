@@ -53,14 +53,14 @@ impl MvStorageEngine {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvTarget {
+pub struct MvTarget {
     pub catalog: Option<String>,
     pub database: String,
     pub name: String,
 }
 
 impl MvTarget {
-    pub(crate) fn display_name(&self) -> String {
+    pub fn display_name(&self) -> String {
         match self.catalog.as_deref() {
             Some(catalog) => format!("{catalog}.{}.{}", self.database, self.name),
             None => format!("{}.{}", self.database, self.name),

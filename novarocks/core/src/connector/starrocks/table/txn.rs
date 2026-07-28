@@ -42,9 +42,9 @@ use crate::formats::starrocks::data::build_native_record_batch;
 use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tablet_snapshot};
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest;
 use crate::meta::repository::starrocks_txn::StoredStarRocksTxn;
 use crate::mv::aggregate_state::mv_agg_state::{self, AggregateMvLayout};
+use crate::mv::persistence::refresh::UpdateStarRocksMvRefreshSummaryRequest;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{

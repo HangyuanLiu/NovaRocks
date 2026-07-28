@@ -21,13 +21,14 @@ use novarocks::meta::MetaPayload;
 use novarocks::meta::avro::{
     decode_payload, encode_payload, encode_payload_with_schema, schema_catalog,
 };
-use novarocks::meta::repository::mv::{
-    MvRefreshState, MvTargetLookup, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefresh,
-};
 use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks::mv::persistence::dependency::StoredMvDependency;
+use novarocks::mv::persistence::refresh::{
+    MvRefreshState, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefresh,
+};
+use novarocks::mv::repository::MvTargetLookup;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

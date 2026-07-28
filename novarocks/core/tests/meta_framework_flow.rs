@@ -17,11 +17,13 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvMetaRepository,
-    MvRefreshFinalizeRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
-};
+use novarocks::meta::repository::mv::MvMetaRepository;
 use novarocks::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
+use novarocks::mv::persistence::definition::CreateMvDefinitionRequest;
+use novarocks::mv::persistence::refresh::{
+    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, RecordPublishCommitRequest,
+    RecordStagingCommitRequest,
+};
 
 #[test]
 fn refresh_transaction_can_recover_after_external_commit_before_finalize()

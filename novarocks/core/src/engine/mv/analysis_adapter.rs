@@ -28,10 +28,10 @@ use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::MvListRow;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::meta::MetaReadTxn;
-use crate::meta::repository::mv::MvRefreshState;
 use crate::mv::analysis::{MvAnalysis, ResolvedTableRef, analyze_mv_select_with};
 use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::persistence::refresh::MvRefreshState;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::ast::ShowMaterializedViewsStmt;
 

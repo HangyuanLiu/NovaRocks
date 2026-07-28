@@ -63,11 +63,11 @@ use crate::connector::starrocks::table::txn::{
     write_chunks_into_starrocks_partition_for_mv_refresh_with_row_delta,
 };
 use crate::meta::repository::job::CreateEraseJobRequest;
-use crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest;
 use crate::meta::repository::starrocks_table::{
     StageStarRocksMvRefreshRequest, StagedStarRocksMvRefresh,
 };
 use crate::mv::persistence::definition::StoredMvDefinition;
+use crate::mv::persistence::refresh::UpdateStarRocksMvRefreshSummaryRequest;
 use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn refresh_mv(

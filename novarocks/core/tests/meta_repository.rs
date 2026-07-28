@@ -26,15 +26,11 @@ use novarocks::meta::repository::iceberg_operation::{
     IcebergOperationState, IcebergOperationTarget, IcebergRecoveryEvidenceRecord,
     StoredIcebergOperation,
 };
-use novarocks::meta::repository::job::{CreateEraseJobRequest, JobMetaRepository, JobState};
-use novarocks::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
-    MvMetaRepository, MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState,
-    MvTargetLookup, RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome,
-    ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
-    UpdateMvRefreshMetadataRequest, UpdateStarRocksMvRefreshSummaryRequest,
+use novarocks::meta::repository::job::{
+    CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
+    IcebergOptimizeJobState, JobMetaRepository, JobState,
 };
+use novarocks::meta::repository::mv::MvMetaRepository;
 use novarocks::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksDatabaseRequest,
     CreateStarRocksTableLayoutRequest, CreateStarRocksTableRequest, StageStarRocksMvRefreshRequest,
@@ -55,13 +51,27 @@ use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks::mv::persistence::definition::StoredMvRefreshPolicy;
+use novarocks::mv::persistence::definition::{
+    CreateMvDefinitionRequest, UpdateMvRefreshMetadataRequest,
+};
+use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
 use novarocks::mv::persistence::dependency::StoredMvDependency;
+use novarocks::mv::persistence::partition::{
+    MvPartitionRefreshStatus, RecordFailedMvPartitionStatesRequest,
+    ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
+};
+use novarocks::mv::persistence::refresh::{
+    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
+    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
+    RefreshExternalOutcome, UpdateStarRocksMvRefreshSummaryRequest,
+};
 use novarocks::mv::persistence::schema::{
     ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
     ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
     MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
     TargetContract, TargetVisibleColumn,
 };
+use novarocks::mv::repository::MvTargetLookup;
 use serde::{Deserialize, Serialize};
 
 fn create_starrocks_table_with_partition(

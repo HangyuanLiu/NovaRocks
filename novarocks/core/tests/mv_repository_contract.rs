@@ -18,25 +18,45 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks::meta::keys::NS_MV;
-use novarocks::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
-    MvMetaRepository, MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState,
-    RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
-    RefreshExternalOutcome, ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
-    UpdateMvRefreshMetadataRequest, UpdateStarRocksMvRefreshSummaryRequest,
-};
+use novarocks::meta::repository::mv::MvMetaRepository;
 use novarocks::meta::{MetaKeyPrefix, MetaStoreProvider, SqliteMetaStoreProvider};
+use novarocks::mv::application::{
+    CreatedMvTarget, MvApplicationErrorKind, MvApplicationService, MvEngine, MvEngineError,
+    MvRequestContext, PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
+    UnavailableMvApplicationService,
+};
 use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks::mv::persistence::definition::StoredMvRefreshPolicy;
+use novarocks::mv::persistence::definition::{
+    CreateMvDefinitionRequest, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
 use novarocks::mv::persistence::dependency::StoredMvDependency;
+use novarocks::mv::persistence::partition::{
+    MvPartitionRefreshStatus, RecordFailedMvPartitionStatesRequest,
+    ReplaceMvPartitionStatesRequest, StoredMvPartitionState, UpdateMvPartitionContractRequest,
+};
+use novarocks::mv::persistence::refresh::{
+    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
+    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
+    StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
+};
 use novarocks::mv::persistence::schema::{
     ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
     ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
     MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
     TargetContract, TargetVisibleColumn,
 };
+use novarocks::mv::repository::{
+    CreateMvDependencyRequest, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
+    UnavailableMvRepository,
+};
+use novarocks::sql::parser::ast::{
+    CreateMaterializedViewStmt, MaterializedViewRefreshPolicy, ObjectName, Statement,
+};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1152,4 +1172,110 @@ fn dependency_ledger_freezes_both_indexes_replace_delete_guard_and_drop_cleanup(
             .all(|(path, _)| !path.starts_with("dependency/"))
     );
     Ok(())
+}
+
+struct ProviderNeutralFakeEngine;
+
+impl MvEngine for ProviderNeutralFakeEngine {
+    fn prepare_create(
+        &self,
+        _request: PrepareMvCreateRequest<'_>,
+        _repository: &dyn MvRepository,
+    ) -> Result<PreparedMvCreate, MvEngineError> {
+        panic!("unavailable application service must not call prepare_create")
+    }
+
+    fn create_target(
+        &self,
+        _plan: &PreparedMvCreate,
+        _operation_id: Uuid,
+    ) -> Result<CreatedMvTarget, MvEngineError> {
+        panic!("unavailable application service must not create a target")
+    }
+
+    fn inspect_created_target(
+        &self,
+        _plan: &PreparedMvCreate,
+        _target: &CreatedMvTarget,
+    ) -> Result<PreparedMvDefinition, MvEngineError> {
+        panic!("unavailable application service must not inspect a target")
+    }
+
+    fn sync_target_descriptor(
+        &self,
+        _target: &CreatedMvTarget,
+        _definition: &novarocks::mv::persistence::definition::StoredMvDefinition,
+    ) -> Result<(), MvEngineError> {
+        panic!("unavailable application service must not sync a descriptor")
+    }
+
+    fn register_target(&self, _target: &CreatedMvTarget) -> Result<(), MvEngineError> {
+        panic!("unavailable application service must not register a target")
+    }
+
+    fn drop_created_target(&self, _target: &CreatedMvTarget) -> Result<(), MvEngineError> {
+        panic!("unavailable application service must not drop a target")
+    }
+}
+
+#[test]
+fn core_ports_are_provider_neutral_and_unavailable_create_has_stable_error() {
+    fn accepts_repository(_repository: &dyn MvRepository) {}
+    accepts_repository(&UnavailableMvRepository);
+
+    let query = Parser::parse_sql(&GenericDialect, "SELECT id FROM orders")
+        .expect("query")
+        .pop()
+        .and_then(|statement| match statement {
+            sqlparser::ast::Statement::Query(query) => Some(*query),
+            _ => None,
+        })
+        .expect("SELECT query");
+    let statement = Statement::CreateMaterializedView(CreateMaterializedViewStmt {
+        name: ObjectName {
+            parts: vec!["orders_mv".to_string()],
+        },
+        if_not_exists: false,
+        partition_by: None,
+        distribution: None,
+        refresh_policy: MaterializedViewRefreshPolicy::Manual,
+        select_sql: "SELECT id FROM orders".to_string(),
+        select_query: query,
+        properties: vec![("storage_engine".to_string(), "iceberg".to_string())],
+        primary_key: None,
+    });
+
+    let error = UnavailableMvApplicationService
+        .try_handle_statement(
+            &ProviderNeutralFakeEngine,
+            &statement,
+            MvRequestContext {
+                current_catalog: Some("ice"),
+                current_database: "analytics",
+            },
+        )
+        .expect_err("CREATE must report the missing StateStore-backed service");
+    assert_eq!(error.kind(), MvApplicationErrorKind::Unavailable);
+    assert_eq!(
+        error.to_string(),
+        "materialized view service requires [state_store]"
+    );
+
+    let repository_error = MvRepositoryError::new(
+        MvRepositoryErrorKind::KnownCommittedFinalizeFailed,
+        "descriptor sync failed after commit",
+    );
+    assert_eq!(
+        repository_error.kind(),
+        MvRepositoryErrorKind::KnownCommittedFinalizeFailed
+    );
+    assert_eq!(
+        repository_error.message(),
+        "descriptor sync failed after commit"
+    );
+
+    let canonical_refresh: Option<StoredMvRefresh> = None;
+    let canonical_partition: Option<StoredMvPartitionState> = None;
+    assert!(canonical_refresh.is_none());
+    assert!(canonical_partition.is_none());
 }

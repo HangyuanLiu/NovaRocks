@@ -16,7 +16,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod ast;
+pub mod ast;
 pub(crate) mod dialect;
 pub(crate) mod procedure;
 pub(crate) mod query_refs;

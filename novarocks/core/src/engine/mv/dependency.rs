@@ -20,7 +20,6 @@ use std::sync::Arc;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
-use crate::meta::repository::mv::CreateMvDependencyRequest;
 use crate::mv::analysis::ResolvedTableRef;
 use crate::mv::dependency::graph::{
     topological_upstream_order_for_edges, validate_no_cycle_for_edges,
@@ -36,6 +35,7 @@ use crate::mv::dependency::scope::{
 use crate::mv::persistence::definition::StoredMvDefinition;
 #[cfg(test)]
 use crate::mv::persistence::definition::StoredMvRefreshPolicy;
+use crate::mv::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::persistence::dependency::stored_definition_dependency_ref;
 use novarocks_catalog::identifier::TableIdentity;
 

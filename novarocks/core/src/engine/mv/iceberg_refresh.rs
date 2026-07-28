@@ -68,11 +68,6 @@ use crate::meta::repository::iceberg_operation::{
     IcebergOperationNextAction, IcebergOperationState, IcebergOperationTarget,
     StoredIcebergOperation,
 };
-use crate::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
-    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
-    ReplaceMvPartitionStatesRequest, StoredMvRefresh, UpdateMvPartitionContractRequest,
-};
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
 use crate::mv::analysis::rebind::rewrite_select_sql_for_rebind;
@@ -85,9 +80,23 @@ use crate::mv::analysis::{
 };
 use crate::mv::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
+use crate::mv::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::persistence::descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
+};
+#[cfg(test)]
+use crate::mv::persistence::partition::MvPartitionRefreshStatus;
+use crate::mv::persistence::partition::{
+    ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
+};
+#[cfg(test)]
+use crate::mv::persistence::refresh::UpdateStarRocksMvRefreshSummaryRequest;
+use crate::mv::persistence::refresh::{
+    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
+    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
+    StoredMvRefresh,
 };
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::persistence::schema::{
@@ -1109,9 +1118,7 @@ fn create_apply_key_contract_source(apply_key: &ApplyKeyContract) -> mv_schema::
     }
 }
 
-fn descriptor_dependency_from_request(
-    request: &crate::meta::repository::mv::CreateMvDependencyRequest,
-) -> DescriptorDependency {
+fn descriptor_dependency_from_request(request: &CreateMvDependencyRequest) -> DescriptorDependency {
     let upstream = &request.upstream;
     DescriptorDependency {
         catalog: upstream.catalog.clone().unwrap_or_default(),
@@ -17289,7 +17296,7 @@ mod tests {
             .mv_repo
             .update_starrocks_refresh_summary_if_present(
                 txn.as_mut(),
-                crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest {
+                UpdateStarRocksMvRefreshSummaryRequest {
                     mv_id: mv.mv_id,
                     last_refresh_ms: now_ms(),
                     last_refresh_rows: 0,
@@ -17324,7 +17331,7 @@ mod tests {
             .mv_repo
             .update_starrocks_refresh_summary_if_present(
                 txn.as_mut(),
-                crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest {
+                UpdateStarRocksMvRefreshSummaryRequest {
                     mv_id: mv.mv_id,
                     last_refresh_ms: now_ms(),
                     last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
@@ -17369,7 +17376,7 @@ mod tests {
             .mv_repo
             .update_starrocks_refresh_summary_if_present(
                 txn.as_mut(),
-                crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest {
+                UpdateStarRocksMvRefreshSummaryRequest {
                     mv_id: mv.mv_id,
                     last_refresh_ms: now_ms(),
                     last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
@@ -22889,10 +22896,7 @@ mod tests {
             .expect("list partition states");
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].partition_key, "spec=7;region=s:east");
-        assert_eq!(
-            states[0].status,
-            crate::meta::repository::mv::MvPartitionRefreshStatus::Fresh
-        );
+        assert_eq!(states[0].status, MvPartitionRefreshStatus::Fresh);
         assert_eq!(states[0].last_refresh_id, Some(refresh_id));
         assert_eq!(states[0].target_snapshot_id, Some(40));
         assert_eq!(states[0].base_snapshots["ice.sales.orders"], 20);
