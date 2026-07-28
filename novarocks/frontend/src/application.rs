@@ -272,6 +272,29 @@ impl FrontendApplicationHost {
             .report_handler()
     }
 
+    pub fn native_report_handler(
+        &self,
+    ) -> Arc<dyn novarocks::query_execution::report::NativeReportHandler> {
+        Arc::new(self.coordinator_report_handler())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_distributed_query_for_test(
+        &self,
+        request: novarocks::query_execution::contract::DistributedQueryRequest,
+    ) -> Result<
+        novarocks::query_execution::contract::DistributedQueryOutcome,
+        novarocks::query_execution::contract::DistributedQueryError,
+    > {
+        novarocks::query_execution::contract::DistributedQueryCoordinator::execute(
+            self.coordinator
+                .as_ref()
+                .expect("frontend coordinator is installed before host open returns")
+                .as_ref(),
+            request,
+        )
+    }
+
     pub fn backend_query_activity(&self) -> BackendQueryActivity {
         self.coordinator
             .as_ref()

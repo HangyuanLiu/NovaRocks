@@ -260,6 +260,7 @@ where
     F: Future<Output = ()> + Send,
 {
     configure_standalone_internal_rpc_transport();
+    let native_report_handler = Arc::clone(&services.native_report_handler);
 
     let opts = StandaloneOptions {
         config_path: resolved.config_path.clone(),
@@ -268,8 +269,11 @@ where
         Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg, services)?,
         None => StandaloneNovaRocks::open(opts, services)?,
     };
-    let owns_grpc_endpoint =
-        start_standalone_grpc_endpoint(&resolved.grpc_bind_host, resolved.grpc_endpoint)?;
+    let owns_grpc_endpoint = start_standalone_grpc_endpoint(
+        &resolved.grpc_bind_host,
+        resolved.grpc_endpoint,
+        native_report_handler,
+    )?;
     if owns_grpc_endpoint {
         let bound_port = crate::service::grpc_server::grpc_server_bound_port()?;
         engine.publish_coordinator_report_bound_port(bound_port);
@@ -429,20 +433,24 @@ fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, St
 fn start_standalone_grpc_endpoint(
     grpc_bind_host: &str,
     ownership: StandaloneGrpcEndpointOwnership,
+    native_report_handler: Arc<dyn crate::query_execution::report::NativeReportHandler>,
 ) -> Result<bool, String> {
     if !ownership.hosts_report_endpoint() {
         return Ok(false);
     }
 
     let grpc_port = crate::common::config::grpc_port();
-    crate::service::grpc_server::start_grpc_report_server(grpc_bind_host, grpc_port).map_err(
-        |error| {
-            format!(
-                "failed to start required standalone coordinator grpc report endpoint on {}:{}: {}",
-                grpc_bind_host, grpc_port, error
-            )
-        },
-    )?;
+    crate::service::grpc_server::start_grpc_report_server(
+        grpc_bind_host,
+        grpc_port,
+        native_report_handler,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to start required standalone coordinator grpc report endpoint on {}:{}: {}",
+            grpc_bind_host, grpc_port, error
+        )
+    })?;
     info!(
         "standalone coordinator grpc report endpoint started on {}:{}",
         grpc_bind_host, grpc_port

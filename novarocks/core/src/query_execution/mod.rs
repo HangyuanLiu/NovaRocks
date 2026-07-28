@@ -25,6 +25,7 @@ pub mod fragment_transport;
 pub(crate) mod outcome;
 pub(crate) mod preparation;
 pub(crate) mod profile;
+pub mod report;
 mod runtime_filter;
 pub mod service;
 pub mod write;

@@ -370,3 +370,21 @@ pub(crate) fn report_from_native(
         filtered_rows: report.filtered_rows,
     })
 }
+
+/// Decode the native report wire DTO into the frontend-owned coordinator value.
+///
+/// The protobuf remains a transport concern while role crates receive the
+/// capability-safe value used by the distributed-query contract.
+pub fn decode_native_execution_report(
+    report: novarocks::ExecStatusReport,
+) -> Result<NativeExecutionReport, String> {
+    let profile = report
+        .profile
+        .as_ref()
+        .map(RuntimeProfileTree::from_proto)
+        .transpose()?;
+    Ok(NativeExecutionReport {
+        write: report_from_native(report)?,
+        profile,
+    })
+}

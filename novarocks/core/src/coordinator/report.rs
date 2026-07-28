@@ -25,6 +25,7 @@ use crate::coordinator::write::{
     WriterReportLookup, handle_fragment_report_exec_status, lookup_native_writer_report,
     mark_query_failed,
 };
+use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use crate::query_execution::write::report_from_native;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::{exchange, result_buffer};
@@ -97,6 +98,16 @@ impl CoordinatorReportHandler for CoordinatorExecStatusReportHandler {
                 }
             }
         }
+    }
+}
+
+impl NativeReportHandler for CoordinatorExecStatusReportHandler {
+    fn handle_native_report(
+        &self,
+        report: crate::proto::novarocks::ExecStatusReport,
+    ) -> Result<(), NativeReportHandlerError> {
+        self.handle_exec_status_report(report)
+            .map_err(NativeReportHandlerError::from)
     }
 }
 

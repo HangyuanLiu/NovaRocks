@@ -353,6 +353,24 @@ mod tests {
             self.reports_on_submit(submit_count, vec![report], coordinator);
         }
 
+        fn native_wire_report_on_submit(
+            &self,
+            submit_count: usize,
+            report: novarocks::proto::novarocks::ExecStatusReport,
+            coordinator: &FrontendDistributedQueryCoordinator,
+        ) {
+            let handler = coordinator.report_handler();
+            *self.report_on_submit.lock().unwrap() = Some((
+                submit_count,
+                Box::new(move || {
+                    novarocks::query_execution::report::NativeReportHandler::handle_native_report(
+                        &handler, report,
+                    )
+                    .expect("frontend native report ingress accepts the active query");
+                }),
+            ));
+        }
+
         fn reports_on_submit(
             &self,
             submit_count: usize,
@@ -583,6 +601,27 @@ mod tests {
             1
         );
         assert!(!dispatcher.fetches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn frontend_native_report_ingress_shares_the_execution_registry() {
+        let fixture = non_empty_result_contract_fixture();
+        let backends = fixture.backends().to_vec();
+        let batch = fixture.result_batch();
+        let report = fixture.successful_fragment_report_proto();
+        let request = fixture.into_request();
+        let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
+        let scheduler =
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+        let coordinator = test_coordinator(QueryId::new(41, 73), scheduler, dispatcher.clone());
+        dispatcher.native_wire_report_on_submit(2, report, &coordinator);
+
+        let outcome = coordinator
+            .execute(request)
+            .expect("frontend accepts native report through the transport port");
+
+        assert_result_outcome_preserved(outcome, 1).expect("engine consumes Result payload");
+        assert_eq!(dispatcher.submissions.lock().unwrap().len(), 2);
     }
 
     #[test]

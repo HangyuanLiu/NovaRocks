@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
+use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::{
     backend_service, frontend_rpc, grpc_server, heartbeat_service, report_worker,
 };
@@ -13,6 +14,25 @@ use crate::brpc;
 use crate::fragment::CompatFragmentService;
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const COMPAT_REPORT_ROLE_REJECTION: &str =
+    "compat backend role does not own native coordinator report ingress";
+
+struct CompatNativeReportHandler;
+
+impl NativeReportHandler for CompatNativeReportHandler {
+    fn handle_native_report(
+        &self,
+        _report: novarocks::proto::novarocks::ExecStatusReport,
+    ) -> Result<(), NativeReportHandlerError> {
+        Err(NativeReportHandlerError::role_rejected(
+            COMPAT_REPORT_ROLE_REJECTION,
+        ))
+    }
+}
+
+fn compat_native_report_handler() -> Arc<dyn NativeReportHandler> {
+    Arc::new(CompatNativeReportHandler)
+}
 
 pub struct CompatServerConfig {
     pub config: NovaRocksConfig,
@@ -207,7 +227,11 @@ impl CompatApplicationHost {
         let grpc_fragment_service: Arc<
             dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
         > = host.fragment_service.clone();
-        if let Err(error) = host.ports.start_grpc(&server.host, grpc_fragment_service) {
+        if let Err(error) = host.ports.start_grpc(
+            &server.host,
+            grpc_fragment_service,
+            compat_native_report_handler(),
+        ) {
             return Err(host.start_failure(
                 CompatApplicationErrorKind::GrpcStart,
                 format!("start grpc/http/starlet listeners: {error}"),
@@ -359,6 +383,7 @@ trait CompatPorts: Send {
         fragment_sync_ingress: Arc<
             dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
         >,
+        report_handler: Arc<dyn NativeReportHandler>,
     ) -> Result<(), String>;
     fn start_heartbeat(&mut self, config: heartbeat_service::HeartbeatConfig)
     -> Result<(), String>;
@@ -388,8 +413,9 @@ impl CompatPorts for LiveCompatPorts {
         fragment_sync_ingress: Arc<
             dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
         >,
+        report_handler: Arc<dyn NativeReportHandler>,
     ) -> Result<(), String> {
-        grpc_server::start_grpc_server(host, fragment_sync_ingress)
+        grpc_server::start_grpc_server(host, fragment_sync_ingress, report_handler)
     }
 
     fn start_heartbeat(

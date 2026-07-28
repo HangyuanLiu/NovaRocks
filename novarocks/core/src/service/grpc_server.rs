@@ -49,11 +49,12 @@ use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::starmgr;
-use crate::coordinator::ports::CoordinatorReportHandler;
+#[cfg(test)]
 use crate::coordinator::report::CoordinatorExecStatusReportHandler;
 #[cfg(feature = "compat")]
 use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
+use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
@@ -164,7 +165,7 @@ fn pause_standalone_grpc_startup_after_reservation() {
 pub struct GrpcService {
     allow_local_execution: bool,
     native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
-    report_handler: Arc<dyn CoordinatorReportHandler>,
+    report_handler: Arc<dyn NativeReportHandler>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
     #[cfg(test)]
@@ -181,44 +182,10 @@ impl std::fmt::Debug for GrpcService {
     }
 }
 
-#[cfg(test)]
-impl Default for GrpcService {
-    fn default() -> Self {
-        Self::full_execution()
-    }
-}
-
 impl GrpcService {
-    #[cfg(test)]
-    pub fn full_execution() -> Self {
-        Self::full_execution_with_native_fragment_ingress(Arc::new(
-            RejectingTestNativeFragmentIngress,
-        ))
-    }
-
-    pub fn full_execution_with_native_fragment_ingress(
+    pub fn with_fragment_execution(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
-    ) -> Self {
-        Self::full_execution_with_native_ingress_and_report_handler(
-            native_fragment_ingress,
-            Arc::new(CoordinatorExecStatusReportHandler),
-        )
-    }
-
-    #[cfg(feature = "compat")]
-    fn execution_without_native_fragment_ingress() -> Self {
-        Self::with_handlers(
-            true,
-            None,
-            Arc::new(CoordinatorExecStatusReportHandler),
-            query_scoped_runtime_filter_envelope_ingress(),
-            query_scoped_runtime_filter_deployment_ingress(),
-        )
-    }
-
-    fn full_execution_with_native_ingress_and_report_handler(
-        native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
-        report_handler: Arc<dyn CoordinatorReportHandler>,
+        report_handler: Arc<dyn NativeReportHandler>,
     ) -> Self {
         Self::with_handlers(
             true,
@@ -229,23 +196,20 @@ impl GrpcService {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn full_execution_with_report_handler(
-        report_handler: Arc<dyn CoordinatorReportHandler>,
+    #[cfg(feature = "compat")]
+    fn execution_without_native_fragment_ingress(
+        report_handler: Arc<dyn NativeReportHandler>,
     ) -> Self {
-        Self::full_execution_with_native_ingress_and_report_handler(
-            Arc::new(RejectingTestNativeFragmentIngress),
+        Self::with_handlers(
+            true,
+            None,
             report_handler,
+            query_scoped_runtime_filter_envelope_ingress(),
+            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
-    pub fn report_only() -> Self {
-        Self::report_only_with_report_handler(Arc::new(CoordinatorExecStatusReportHandler))
-    }
-
-    pub(crate) fn report_only_with_report_handler(
-        report_handler: Arc<dyn CoordinatorReportHandler>,
-    ) -> Self {
+    pub fn report_ingress_only(report_handler: Arc<dyn NativeReportHandler>) -> Self {
         Self::with_handlers(
             false,
             None,
@@ -258,7 +222,7 @@ impl GrpcService {
     fn with_handlers(
         allow_local_execution: bool,
         native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
-        report_handler: Arc<dyn CoordinatorReportHandler>,
+        report_handler: Arc<dyn NativeReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
         runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
     ) -> Self {
@@ -277,7 +241,7 @@ impl GrpcService {
 
     #[cfg(test)]
     pub(crate) fn full_execution_with_handlers(
-        report_handler: Arc<dyn CoordinatorReportHandler>,
+        report_handler: Arc<dyn NativeReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     ) -> Self {
         Self::with_handlers(
@@ -291,7 +255,7 @@ impl GrpcService {
 
     #[cfg(test)]
     pub(crate) fn report_only_with_handlers(
-        report_handler: Arc<dyn CoordinatorReportHandler>,
+        report_handler: Arc<dyn NativeReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     ) -> Self {
         Self::with_handlers(
@@ -305,7 +269,7 @@ impl GrpcService {
 
     #[cfg(test)]
     pub(crate) fn full_execution_with_runtime_filter_manager(
-        report_handler: Arc<dyn CoordinatorReportHandler>,
+        report_handler: Arc<dyn NativeReportHandler>,
         manager: Arc<crate::runtime::query_context::QueryContextManager>,
     ) -> Self {
         let mut service = Self::with_handlers(
@@ -338,6 +302,54 @@ impl GrpcService {
             )))
         }
     }
+}
+
+#[cfg(test)]
+impl Default for GrpcService {
+    fn default() -> Self {
+        legacy_fragment_execution_service()
+    }
+}
+
+#[cfg(test)]
+impl GrpcService {
+    fn full_execution() -> Self {
+        legacy_fragment_execution_service()
+    }
+
+    fn report_only() -> Self {
+        legacy_report_ingress_service()
+    }
+
+    fn full_execution_with_report_handler(report_handler: Arc<dyn NativeReportHandler>) -> Self {
+        Self::with_fragment_execution(Arc::new(RejectingTestNativeFragmentIngress), report_handler)
+    }
+
+    fn report_only_with_report_handler(report_handler: Arc<dyn NativeReportHandler>) -> Self {
+        Self::report_ingress_only(report_handler)
+    }
+
+    fn full_execution_with_native_fragment_ingress(
+        native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    ) -> Self {
+        Self::with_fragment_execution(
+            native_fragment_ingress,
+            Arc::new(CoordinatorExecStatusReportHandler),
+        )
+    }
+}
+
+#[cfg(test)]
+fn legacy_fragment_execution_service() -> GrpcService {
+    GrpcService::with_fragment_execution(
+        Arc::new(RejectingTestNativeFragmentIngress),
+        Arc::new(CoordinatorExecStatusReportHandler),
+    )
+}
+
+#[cfg(test)]
+fn legacy_report_ingress_service() -> GrpcService {
+    GrpcService::report_ingress_only(Arc::new(CoordinatorExecStatusReportHandler))
 }
 
 #[cfg(test)]
@@ -1065,10 +1077,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         let report_handler = Arc::clone(&self.report_handler);
         let result = tokio::task::spawn_blocking(move || {
             let report = report.ok_or_else(|| {
-                EngineError::protocol_decode("ReportExecStatusRequest missing report")
+                NativeReportHandlerError::from(EngineError::protocol_decode(
+                    "ReportExecStatusRequest missing report",
+                ))
             })?;
-            report_handler.handle_exec_status_report(report)?;
-            Ok::<(), EngineError>(())
+            report_handler.handle_native_report(report)?;
+            Ok::<(), NativeReportHandlerError>(())
         })
         .await
         .map_err(|e| {
@@ -1085,9 +1099,9 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             )),
             Err(e) => Ok(tonic::Response::new(
                 proto::novarocks::ReportExecStatusResponse {
-                    status_code: e.to_report_status_code(),
-                    message: e.to_user_message(),
-                    error_code: e.to_report_error_code().to_string(),
+                    status_code: e.status_code(),
+                    message: e.message().to_string(),
+                    error_code: e.error_code().to_string(),
                 },
             )),
         }
@@ -1102,9 +1116,9 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         let report_handler = Arc::clone(&self.report_handler);
         let result = tokio::task::spawn_blocking(move || {
             for report in reports {
-                report_handler.handle_exec_status_report(report)?;
+                report_handler.handle_native_report(report)?;
             }
-            Ok::<(), EngineError>(())
+            Ok::<(), NativeReportHandlerError>(())
         })
         .await
         .map_err(|e| {
@@ -1121,9 +1135,9 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             )),
             Err(e) => Ok(tonic::Response::new(
                 proto::novarocks::BatchReportExecStatusResponse {
-                    status_code: e.to_report_status_code(),
-                    message: e.to_user_message(),
-                    error_code: e.to_report_error_code().to_string(),
+                    status_code: e.status_code(),
+                    message: e.message().to_string(),
+                    error_code: e.error_code().to_string(),
                 },
             )),
         }
@@ -1420,6 +1434,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
 pub fn start_grpc_server(
     host: &str,
     fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+    report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     start_grpc_server_on_ports(
         host,
@@ -1427,6 +1442,7 @@ pub fn start_grpc_server(
         grpc_port(),
         starlet_port(),
         fragment_sync_ingress,
+        report_handler,
     )
 }
 
@@ -1434,8 +1450,9 @@ pub fn start_grpc_server(
 pub fn start_grpc_server_with_native_fragment_ingress(
     host: &str,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
-    start_grpc_http_server(host, http_port(), native_fragment_ingress)
+    start_grpc_http_server(host, http_port(), native_fragment_ingress, report_handler)
 }
 
 #[cfg(not(feature = "compat"))]
@@ -1443,6 +1460,7 @@ fn start_grpc_http_server(
     host: &str,
     grpc_http_port: u16,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     {
         let state = grpc_server_state()
@@ -1480,9 +1498,8 @@ fn start_grpc_http_server(
                     .map_err(|error| format!("create grpc/http tokio listener failed: {error}"))?;
                 let mut http_shutdown = shutdown_rx.clone();
 
-                let svc = GrpcService::full_execution_with_native_fragment_ingress(
-                    native_fragment_ingress,
-                );
+                let svc =
+                    GrpcService::with_fragment_execution(native_fragment_ingress, report_handler);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -1589,6 +1606,7 @@ fn start_grpc_server_on_ports(
     grpc_port: u16,
     starlet_port: u16,
     fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+    report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     {
         let state = grpc_server_state()
@@ -1656,14 +1674,16 @@ fn start_grpc_server_on_ports(
                 );
 
                 let http_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                    GrpcService::execution_without_native_fragment_ingress(),
+                    GrpcService::execution_without_native_fragment_ingress(Arc::clone(
+                        &report_handler,
+                    )),
                 )
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                 let http_app =
                     build_novarocks_http_app(Routes::new(http_svc), fragment_sync_ingress);
                 let grpc_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                    GrpcService::execution_without_native_fragment_ingress(),
+                    GrpcService::execution_without_native_fragment_ingress(report_handler),
                 )
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -1975,12 +1995,12 @@ impl std::fmt::Debug for StandaloneGrpcMode {
 }
 
 impl StandaloneGrpcMode {
-    fn service(&self) -> GrpcService {
+    fn service(self, report_handler: Arc<dyn NativeReportHandler>) -> GrpcService {
         match self {
             StandaloneGrpcMode::FullExecution(ingress) => {
-                GrpcService::full_execution_with_native_fragment_ingress(Arc::clone(ingress))
+                GrpcService::with_fragment_execution(ingress, report_handler)
             }
-            StandaloneGrpcMode::ReportOnly => GrpcService::report_only(),
+            StandaloneGrpcMode::ReportOnly => GrpcService::report_ingress_only(report_handler),
         }
     }
 
@@ -1995,28 +2015,35 @@ impl StandaloneGrpcMode {
 /// Start a lightweight gRPC exchange/report server on a specific port.
 ///
 /// This does not require global config to be initialised: the caller supplies
-/// the bind address and native fragment ingress directly.
+/// the bind address, native fragment ingress, and report handler directly.
 pub fn start_grpc_exchange_server(
     host: &str,
     port: u16,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     start_standalone_grpc_server(
         host,
         port,
         StandaloneGrpcMode::FullExecution(native_fragment_ingress),
+        report_handler,
     )
 }
 
 /// Start a report-only standalone NovaRocksGrpc endpoint on a specific port.
-pub fn start_grpc_report_server(host: &str, port: u16) -> Result<(), String> {
-    start_standalone_grpc_server(host, port, StandaloneGrpcMode::ReportOnly)
+pub fn start_grpc_report_server(
+    host: &str,
+    port: u16,
+    report_handler: Arc<dyn NativeReportHandler>,
+) -> Result<(), String> {
+    start_standalone_grpc_server(host, port, StandaloneGrpcMode::ReportOnly, report_handler)
 }
 
 fn start_standalone_grpc_server(
     host: &str,
     port: u16,
     mode: StandaloneGrpcMode,
+    report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     {
         let mut state = grpc_server_state()
@@ -2075,7 +2102,7 @@ fn start_standalone_grpc_server(
                 })?;
                 let mut shutdown = shutdown_rx.clone();
 
-                let svc = mode.service();
+                let svc = mode.service(report_handler);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -2506,6 +2533,7 @@ mod tests {
                 "127.0.0.1",
                 first_port,
                 super::rejecting_test_native_fragment_ingress(),
+                Arc::new(super::CoordinatorExecStatusReportHandler),
             )
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -2522,6 +2550,7 @@ mod tests {
                 "127.0.0.1",
                 second_port,
                 super::rejecting_test_native_fragment_ingress(),
+                Arc::new(super::CoordinatorExecStatusReportHandler),
             )
         });
         let second_deadline = std::time::Instant::now() + Duration::from_millis(100);
@@ -2675,11 +2704,11 @@ mod pr3_tests {
     use super::proto::{novarocks, plan};
     use crate::common::engine_error::EngineError;
     use crate::common::types::UniqueId;
-    use crate::coordinator::ports::CoordinatorReportHandler;
     use crate::protocol::native::{
         RuntimeFilterQueryLifecycleOptions, encode_abort_runtime_filter_deployment,
         encode_participant_install,
     };
+    use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
     use crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install;
     use crate::runtime::query_context::{QueryContextManager, QueryId};
     use crate::runtime_filter::port::transport::{
@@ -2720,12 +2749,17 @@ mod pr3_tests {
         }
     }
 
-    impl CoordinatorReportHandler for CapturingReportHandler {
-        fn handle_exec_status_report(&self, report: ExecStatusReport) -> Result<(), EngineError> {
+    impl NativeReportHandler for CapturingReportHandler {
+        fn handle_native_report(
+            &self,
+            report: ExecStatusReport,
+        ) -> Result<(), NativeReportHandlerError> {
             let mut reports = self.reports.lock().expect("capture reports");
             reports.push(report);
             match &self.fail_on_call {
-                Some((call, error)) if reports.len() == *call => Err(error.clone()),
+                Some((call, error)) if reports.len() == *call => {
+                    Err(NativeReportHandlerError::from(error.clone()))
+                }
                 _ => Ok(()),
             }
         }

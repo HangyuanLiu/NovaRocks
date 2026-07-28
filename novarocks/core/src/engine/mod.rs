@@ -548,6 +548,8 @@ pub struct StandaloneOpenServices {
         std::sync::Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
     pub coordinator_report_endpoint:
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
+    pub native_report_handler:
+        std::sync::Arc<dyn crate::query_execution::report::NativeReportHandler>,
 }
 
 impl StandaloneOpenServices {
@@ -567,6 +569,9 @@ impl StandaloneOpenServices {
         coordinator_report_endpoint: std::sync::Arc<
             dyn crate::query_execution::backend::CoordinatorReportEndpointSink,
         >,
+        native_report_handler: std::sync::Arc<
+            dyn crate::query_execution::report::NativeReportHandler,
+        >,
     ) -> Self {
         Self {
             system_catalog,
@@ -578,6 +583,7 @@ impl StandaloneOpenServices {
             query_execution,
             backend_query_events,
             coordinator_report_endpoint,
+            native_report_handler,
         }
     }
 }
@@ -646,6 +652,8 @@ impl StandaloneNovaRocks {
         let cfg =
             crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
         let role = cfg.cluster.role;
+        #[cfg(test)]
+        let native_report_handler = Arc::clone(&services.native_report_handler);
         let exchange_port = match role {
             crate::common::app_config::ClusterRole::Fe => {
                 // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
@@ -655,7 +663,7 @@ impl StandaloneNovaRocks {
             | crate::common::app_config::ClusterRole::AllInOne => {
                 #[cfg(test)]
                 {
-                    ensure_standalone_exchange_server()?
+                    ensure_standalone_exchange_server(native_report_handler)?
                 }
                 #[cfg(not(test))]
                 {
@@ -695,6 +703,7 @@ impl StandaloneNovaRocks {
             query_execution,
             backend_query_events,
             coordinator_report_endpoint,
+            native_report_handler: _,
         } = services;
         let inner = Arc::new_cyclic(|self_weak| StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
@@ -3589,7 +3598,9 @@ pub(crate) fn install_all_in_one_loopback_backend_for_test()
     let test_guard = acquire_standalone_test_guard();
     let registry_guard = crate::coordinator::cluster::BackendRegistryTestGuard::new();
     let cfg = crate::novarocks_config::install_default_for_test();
-    let exchange_port = ensure_standalone_exchange_server()?;
+    let exchange_port = ensure_standalone_exchange_server(Arc::new(
+        crate::coordinator::report::CoordinatorExecStatusReportHandler,
+    ))?;
     let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
         .parse()
         .map_err(|e| format!("parse all-in-one test loopback endpoint failed: {e}"))?;
@@ -3605,7 +3616,9 @@ pub(crate) fn install_all_in_one_loopback_backend_for_test()
 }
 
 #[cfg(test)]
-fn ensure_standalone_exchange_server() -> Result<u16, String> {
+fn ensure_standalone_exchange_server(
+    native_report_handler: Arc<dyn crate::query_execution::report::NativeReportHandler>,
+) -> Result<u16, String> {
     static STANDALONE_EXCHANGE_PORT: OnceLock<u16> = OnceLock::new();
 
     if let Some(port) = STANDALONE_EXCHANGE_PORT.get() {
@@ -3617,6 +3630,7 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
         "127.0.0.1",
         default_port,
         crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+        Arc::clone(&native_report_handler),
     ) {
         Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
             .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
@@ -3635,6 +3649,7 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
                 "127.0.0.1",
                 fallback_port,
                 crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+                native_report_handler,
             )
             .map_err(|start_err| {
                 format!(
@@ -4387,6 +4402,7 @@ mod tests {
             super::legacy_test_query_execution_service(),
             Arc::new(crate::query_execution::backend::NoopBackendQueryEventSink),
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
+            Arc::new(crate::coordinator::report::CoordinatorExecStatusReportHandler),
         )
     }
 

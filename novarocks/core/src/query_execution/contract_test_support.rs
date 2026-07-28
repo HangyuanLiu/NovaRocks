@@ -80,6 +80,23 @@ impl ResultContractFixture {
         )
     }
 
+    pub fn successful_fragment_report_proto(&self) -> crate::proto::novarocks::ExecStatusReport {
+        crate::proto::novarocks::ExecStatusReport {
+            query_id: Some(crate::proto::common::UniqueId { hi: 41, lo: 73 }),
+            fragment_instance_id: Some(crate::proto::common::UniqueId {
+                hi: 41,
+                lo: i64::from(11_u32) << 16,
+            }),
+            backend_num: 0,
+            done: true,
+            status: Some(crate::proto::common::Status {
+                code: 0,
+                message: String::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
     pub fn into_request(self) -> DistributedQueryRequest {
         self.request
     }
