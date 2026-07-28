@@ -326,13 +326,36 @@ impl ConnectorReadScanSource {
         lifecycle: Arc<ConnectorInstanceLease>,
         auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
     ) -> Self {
+        Self::new_scheduled_ephemeral_with_incremental(
+            instance,
+            scheduled,
+            request,
+            chunk_schema,
+            lifecycle,
+            None,
+            false,
+            auxiliary,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_scheduled_ephemeral_with_incremental(
+        instance: Arc<ConnectorInstance>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        lifecycle: Arc<ConnectorInstanceLease>,
+        incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
+        has_more: bool,
+        auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
+    ) -> Self {
         Self {
             instance,
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
             request,
             chunk_schema,
             lifecycle: Some(lifecycle),
-            incremental: None,
+            incremental,
             auxiliary,
         }
     }
