@@ -3288,6 +3288,7 @@ dependencies = [
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
+ "apache-avro",
  "arrow",
  "async-trait",
  "bytes",
