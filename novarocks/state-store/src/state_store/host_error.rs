@@ -110,8 +110,26 @@ impl fmt::Display for StateStoreHostError {
         if let Some(provider_id) = self.provider_id {
             write!(formatter, " ({provider_id})")?;
         }
-        write!(formatter, ": {}", self.message)
+        write!(formatter, ": {}", self.message)?;
+        if let Some(primary) = &self.primary {
+            write!(formatter, "; primary: {primary}")?;
+        }
+        if let Some(cleanup) = &self.cleanup {
+            write!(formatter, "; cleanup failed: {cleanup}")?;
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for StateStoreHostError {}
+impl std::error::Error for StateStoreHostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.primary
+            .as_ref()
+            .map(|primary| primary as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.cleanup
+                    .as_ref()
+                    .map(|cleanup| cleanup as &(dyn std::error::Error + 'static))
+            })
+    }
+}

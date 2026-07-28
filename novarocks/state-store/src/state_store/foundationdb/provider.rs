@@ -196,15 +196,34 @@ async fn run_foundationdb_runtime_owner<R: FoundationDbProviderRuntime>(
 
 async fn retain_foundationdb_runtime_until_safe<R: FoundationDbProviderRuntime>(mut runtime: R) {
     loop {
-        if runtime
+        match runtime
             .shutdown_until(Instant::now() + Duration::from_secs(5))
             .await
-            .is_ok()
         {
-            return;
+            Ok(()) => return,
+            Err(error) if error.kind() == StateStoreErrorKind::DeadlineExceeded => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    provider = "foundationdb",
+                    lifecycle = "terminal_failure_quarantined",
+                    error_kind = ?error.kind(),
+                    "FoundationDB runtime retained for process lifetime after terminal shutdown failure"
+                );
+                quarantine_foundationdb_runtime(runtime);
+                return;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn quarantine_foundationdb_runtime<R: FoundationDbProviderRuntime>(runtime: R) {
+    // A terminal stop/join failure can retain a live native network thread whose
+    // Drop contract aborts the process. The process-global FDB state is already
+    // poisoned and cannot restart, so retain the owner for the remaining process
+    // lifetime without polling or retrying a stable failure.
+    let _ = Box::leak(Box::new(runtime));
 }
 
 pub(crate) struct FoundationDbStateStoreProviderFactory {
@@ -466,6 +485,7 @@ mod tests {
         open_entered: Arc<AtomicBool>,
         shutdown_calls: Arc<AtomicUsize>,
         shutdown_failures: Arc<AtomicUsize>,
+        shutdown_failure_kind: StateStoreErrorKind,
         dropped: Arc<AtomicBool>,
         unsafe_drop: Arc<AtomicBool>,
         stopped: bool,
@@ -520,7 +540,7 @@ mod tests {
             Box::pin(async move {
                 if should_fail {
                     Err(StateStoreError::new(
-                        StateStoreErrorKind::ProviderUnavailable,
+                        self.shutdown_failure_kind,
                         "injected FoundationDB cleanup failure",
                     ))
                 } else {
@@ -583,6 +603,18 @@ mod tests {
     }
 
     fn fake_runtime(open: FakeOpen, shutdown_failures: usize) -> (FakeRuntime, FakeRuntimeControl) {
+        fake_runtime_with_shutdown_failure(
+            open,
+            shutdown_failures,
+            StateStoreErrorKind::DeadlineExceeded,
+        )
+    }
+
+    fn fake_runtime_with_shutdown_failure(
+        open: FakeOpen,
+        shutdown_failures: usize,
+        shutdown_failure_kind: StateStoreErrorKind,
+    ) -> (FakeRuntime, FakeRuntimeControl) {
         let control = FakeRuntimeControl {
             open_entered: Arc::new(AtomicBool::new(false)),
             shutdown_calls: Arc::new(AtomicUsize::new(0)),
@@ -595,6 +627,7 @@ mod tests {
                 open_entered: Arc::clone(&control.open_entered),
                 shutdown_calls: Arc::clone(&control.shutdown_calls),
                 shutdown_failures: Arc::new(AtomicUsize::new(shutdown_failures)),
+                shutdown_failure_kind,
                 dropped: Arc::clone(&control.dropped),
                 unsafe_drop: Arc::clone(&control.unsafe_drop),
                 stopped: false,
@@ -681,10 +714,51 @@ mod tests {
         assert_eq!(error.kind(), StateStoreErrorKind::Corruption);
         assert_eq!(
             error.cleanup_context().map(StateStoreError::kind),
-            Some(StateStoreErrorKind::ProviderUnavailable)
+            Some(StateStoreErrorKind::DeadlineExceeded)
         );
         wait_for_count(control.shutdown_calls.as_ref(), 2).await;
         wait_for_true(control.dropped.as_ref()).await;
+        assert!(!control.unsafe_drop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_cleanup_failure_is_quarantined_without_polling() {
+        let (runtime, control) = fake_runtime_with_shutdown_failure(
+            FakeOpen::Fail,
+            usize::MAX,
+            StateStoreErrorKind::ProviderUnavailable,
+        );
+
+        let error = match super::open_provider_with_runtime(
+            runtime,
+            std::path::PathBuf::from("test.cluster"),
+            Uuid::nil(),
+            open_request(Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        {
+            Ok(_) => panic!("fake FoundationDB open must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StateStoreErrorKind::Corruption);
+        assert_eq!(
+            error.cleanup_context().map(StateStoreError::kind),
+            Some(StateStoreErrorKind::ProviderUnavailable)
+        );
+
+        wait_for_count(control.shutdown_calls.as_ref(), 2).await;
+        let terminal_calls = control.shutdown_calls.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            control.shutdown_calls.load(Ordering::Acquire),
+            terminal_calls,
+            "stable terminal failure must not schedule another shutdown call"
+        );
+        assert!(
+            !control.dropped.load(Ordering::Acquire),
+            "unsafe terminal runtime must remain owned by quarantine"
+        );
         assert!(!control.unsafe_drop.load(Ordering::Acquire));
     }
 

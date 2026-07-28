@@ -35,6 +35,7 @@ use super::client::{
 };
 #[cfg(feature = "state-store-test-hooks")]
 use super::client::{checkout_hygienic_connection, pollute_session as mysql_pollute_session};
+use super::provider::MysqlProviderOpen;
 #[cfg(feature = "state-store-test-hooks")]
 use super::test_support::{
     MysqlHeldAdvisoryLock, MysqlHeldConnection, MysqlReadinessSnapshot, MysqlRuntimeOwner,
@@ -52,11 +53,6 @@ const RUNTIME_PID_ERROR: &str = "state store runtime belongs to a different proc
 pub(super) struct MysqlRuntime {
     shared: Arc<MysqlRuntimeShared>,
     lifecycle: Mutex<MysqlRuntimeLifecycle>,
-}
-
-struct MysqlOpenWaiterGuard {
-    cancellation: MysqlOpenCancellation,
-    armed: bool,
 }
 
 struct MysqlRuntimeShared {
@@ -157,6 +153,17 @@ impl MysqlRuntime {
         database: String,
         request: StateStoreOpenRequest,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
+        let mut opening = self.start_open_store(database, request)?;
+        let result = (&mut opening.future).await;
+        opening.complete();
+        result
+    }
+
+    pub(super) fn start_open_store(
+        &self,
+        database: String,
+        request: StateStoreOpenRequest,
+    ) -> Result<MysqlProviderOpen, StateStoreError> {
         self.validate_process_and_context()?;
         let opening = self.acquire_operation()?;
         let pool = self.get_or_create_pool(&database)?;
@@ -165,11 +172,11 @@ impl MysqlRuntime {
             Instant::now() + request.limits.transaction_deadline,
         );
         let cancellation = MysqlOpenCancellation::new();
-        let waiter = MysqlOpenWaiterGuard::new(cancellation.clone());
         let shared = Arc::clone(&self.shared);
         let cluster_id = request.cluster_id;
         let limits = request.limits;
         let (sender, receiver) = oneshot::channel();
+        let task_cancellation = cancellation.clone();
         tokio::spawn(async move {
             let result = Self::open_store_owned(
                 shared,
@@ -178,20 +185,23 @@ impl MysqlRuntime {
                 cluster_id,
                 limits,
                 deadline,
-                cancellation,
+                task_cancellation,
                 opening,
             )
             .await;
             let _ = sender.send(result);
         });
-        let result = receiver.await.map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::ProviderUnavailable,
-                "MySQL state store open task stopped unexpectedly",
-            )
-        });
-        waiter.complete();
-        result?
+        Ok(MysqlProviderOpen::new(
+            Box::pin(async move {
+                receiver.await.map_err(|_| {
+                    StateStoreError::new(
+                        StateStoreErrorKind::ProviderUnavailable,
+                        "MySQL state store open task stopped unexpectedly",
+                    )
+                })?
+            }),
+            move || cancellation.cancel(),
+        ))
     }
 
     async fn open_store_owned(
@@ -635,29 +645,6 @@ fn shutdown_deadline_error() -> StateStoreError {
         StateStoreErrorKind::DeadlineExceeded,
         "MySQL runtime handles did not drain before shutdown deadline",
     )
-}
-
-#[cfg(feature = "mysql-state-store-provider")]
-impl MysqlOpenWaiterGuard {
-    fn new(cancellation: MysqlOpenCancellation) -> Self {
-        Self {
-            cancellation,
-            armed: true,
-        }
-    }
-
-    fn complete(mut self) {
-        self.armed = false;
-    }
-}
-
-#[cfg(feature = "mysql-state-store-provider")]
-impl Drop for MysqlOpenWaiterGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.cancellation.cancel();
-        }
-    }
 }
 
 #[cfg(feature = "mysql-state-store-provider")]

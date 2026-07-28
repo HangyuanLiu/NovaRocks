@@ -42,6 +42,8 @@ enum FakeOpen {
     Ready,
     Fail,
     MismatchedInstance { cleanup_fails: bool },
+    NonReadyInstance { cleanup_fails: bool },
+    ReadyWithoutStore { cleanup_fails: bool },
 }
 
 struct FakeFactory {
@@ -70,18 +72,37 @@ impl StateStoreProviderFactory for FakeFactory {
                 "fake open failed",
             ));
         }
-        let (descriptor, cleanup_fails) = match self.mode {
-            FakeOpen::Ready => (self.descriptor, false),
+        let (descriptor, lifecycle, state_store, cleanup_fails) = match self.mode {
+            FakeOpen::Ready => (
+                self.descriptor,
+                StateStoreProviderLifecycle::Ready,
+                Some(Arc::new(FakeStore) as Arc<dyn StateStore>),
+                false,
+            ),
             FakeOpen::MismatchedInstance { cleanup_fails } => (
                 StateStoreProviderDescriptor::new(OTHER_PROVIDER_ID),
+                StateStoreProviderLifecycle::Ready,
+                Some(Arc::new(FakeStore) as Arc<dyn StateStore>),
+                cleanup_fails,
+            ),
+            FakeOpen::NonReadyInstance { cleanup_fails } => (
+                self.descriptor,
+                StateStoreProviderLifecycle::Draining,
+                Some(Arc::new(FakeStore) as Arc<dyn StateStore>),
+                cleanup_fails,
+            ),
+            FakeOpen::ReadyWithoutStore { cleanup_fails } => (
+                self.descriptor,
+                StateStoreProviderLifecycle::Ready,
+                None,
                 cleanup_fails,
             ),
             FakeOpen::Fail => unreachable!(),
         };
         Ok(Box::new(FakeInstance {
             descriptor,
-            lifecycle: StateStoreProviderLifecycle::Ready,
-            state_store: Some(Arc::new(FakeStore)),
+            lifecycle,
+            state_store,
             events: Arc::clone(&self.events),
             cleanup_fails,
             shutdown_deadline: Arc::clone(&self.shutdown_deadline),
@@ -121,7 +142,11 @@ impl StateStoreProviderInstance for FakeInstance {
                 "fake shutdown deadline exceeded",
             ));
         }
-        if Arc::strong_count(self.state_store.as_ref().unwrap()) == 1 {
+        if self
+            .state_store
+            .as_ref()
+            .is_some_and(|state_store| Arc::strong_count(state_store) == 1)
+        {
             self.events.lock().unwrap().push("host_exposure_dropped");
         }
         self.events.lock().unwrap().push("instance_shutdown");
@@ -337,6 +362,82 @@ async fn post_open_validation_uses_same_deadline_and_retains_primary_and_cleanup
     assert_eq!(
         error.cleanup().unwrap().kind(),
         StateStoreErrorKind::Internal
+    );
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("DescriptorMismatch (sqlite)"));
+    assert!(diagnostic.contains("state store provider instance descriptor mismatch"));
+    assert!(diagnostic.contains("fake cleanup failed"));
+    let source = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<StateStoreError>())
+        .expect("host error source must retain the structured primary");
+    assert_eq!(source.kind(), StateStoreErrorKind::Internal);
+    assert_eq!(*open_deadline.lock().unwrap(), Some(deadline));
+    assert_eq!(*shutdown_deadline.lock().unwrap(), Some(deadline));
+}
+
+#[tokio::test]
+async fn post_open_non_ready_instance_rolls_back_with_same_deadline() {
+    let (registry, (_, open_deadline, shutdown_deadline)) =
+        fake_registry(FakeOpen::NonReadyInstance {
+            cleanup_fails: true,
+        });
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    let error = match StateStoreHost::open(
+        &registry,
+        sqlite_host_config("unused.sqlite".into()),
+        single_fe_view(),
+        deadline,
+    )
+    .await
+    {
+        Ok(_) => panic!("non-ready provider instance must not produce a host"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), StateStoreHostErrorKind::Open);
+    assert_eq!(error.provider_id(), Some(SQLITE_STATE_STORE_PROVIDER_ID));
+    assert_eq!(
+        error.primary().map(StateStoreError::kind),
+        Some(StateStoreErrorKind::Internal)
+    );
+    assert_eq!(
+        error.cleanup().map(StateStoreError::kind),
+        Some(StateStoreErrorKind::Internal)
+    );
+    assert_eq!(*open_deadline.lock().unwrap(), Some(deadline));
+    assert_eq!(*shutdown_deadline.lock().unwrap(), Some(deadline));
+}
+
+#[tokio::test]
+async fn post_open_ready_without_store_rolls_back_with_same_deadline() {
+    let (registry, (_, open_deadline, shutdown_deadline)) =
+        fake_registry(FakeOpen::ReadyWithoutStore {
+            cleanup_fails: true,
+        });
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    let error = match StateStoreHost::open(
+        &registry,
+        sqlite_host_config("unused.sqlite".into()),
+        single_fe_view(),
+        deadline,
+    )
+    .await
+    {
+        Ok(_) => panic!("ready instance without a store must not produce a host"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), StateStoreHostErrorKind::Open);
+    assert_eq!(error.provider_id(), Some(SQLITE_STATE_STORE_PROVIDER_ID));
+    assert_eq!(
+        error.primary().map(StateStoreError::kind),
+        Some(StateStoreErrorKind::Internal)
+    );
+    assert_eq!(
+        error.cleanup().map(StateStoreError::kind),
+        Some(StateStoreErrorKind::Internal)
     );
     assert_eq!(*open_deadline.lock().unwrap(), Some(deadline));
     assert_eq!(*shutdown_deadline.lock().unwrap(), Some(deadline));

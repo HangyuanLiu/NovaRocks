@@ -191,3 +191,104 @@ impl FrontendApplicationHost {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use novarocks_spi::state_store::{
+        FeDeploymentView, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
+        StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
+    };
+    use novarocks_state_store::{
+        SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
+        StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+        StateStoreProviderRegistration, StateStoreProviderRegistry,
+    };
+
+    use super::{FrontendApplicationError, FrontendApplicationErrorKind};
+
+    const SECRET_CONFIG_VALUE: &str = "client-secret-must-not-leak";
+    const DESCRIPTOR: StateStoreProviderDescriptor =
+        StateStoreProviderDescriptor::new(SQLITE_STATE_STORE_PROVIDER_ID);
+
+    struct FailingFactory;
+
+    #[async_trait]
+    impl StateStoreProviderFactory for FailingFactory {
+        fn descriptor(&self) -> &StateStoreProviderDescriptor {
+            &DESCRIPTOR
+        }
+
+        async fn open(
+            self: Box<Self>,
+            _request: StateStoreOpenRequest,
+        ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
+            Err(StateStoreError::new(
+                StateStoreErrorKind::Corruption,
+                "injected provider primary failure",
+            )
+            .with_cleanup_context(StateStoreError::new(
+                StateStoreErrorKind::DeadlineExceeded,
+                "injected provider cleanup failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn frontend_stringification_preserves_host_primary_and_cleanup_context() {
+        let temp = tempfile::tempdir().expect("temporary host diagnostics directory");
+        let mut registry = StateStoreProviderRegistry::new();
+        registry
+            .register(StateStoreProviderRegistration::available(
+                SQLITE_STATE_STORE_PROVIDER_ID,
+                novarocks_spi::state_store::MAX_KEY_BYTES,
+                |_| Ok(Box::new(FailingFactory)),
+            ))
+            .expect("register diagnostic provider");
+        let host_error = match StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "diagnostic-cluster".to_owned(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: temp.path().join("state-store.sqlite"),
+                            deployment_owner: SECRET_CONFIG_VALUE.to_owned(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).unwrap(),
+                topology_revision: Bytes::from_static(b"topology-r1"),
+            },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("injected provider failure must reject host open"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            host_error.primary().map(StateStoreError::kind),
+            Some(StateStoreErrorKind::Corruption)
+        );
+        let frontend_error =
+            FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, host_error);
+        let diagnostic = frontend_error.to_string();
+
+        assert!(diagnostic.contains("StateStoreHost"));
+        assert!(diagnostic.contains("Open (sqlite)"));
+        assert!(diagnostic.contains("injected provider primary failure"));
+        assert!(diagnostic.contains("injected provider cleanup failure"));
+        assert!(!diagnostic.contains(SECRET_CONFIG_VALUE));
+    }
+}
