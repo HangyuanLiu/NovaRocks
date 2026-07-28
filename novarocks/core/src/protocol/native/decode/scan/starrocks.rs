@@ -23,7 +23,8 @@ use super::common::{
     DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit, scan_batch_size,
 };
 use super::native_starrocks::decode_starrocks_scan_preparation;
-use crate::connector::{ScanConfig, StarRocksScanConfig};
+use crate::connector::StarRocksScanConfig;
+use crate::connector::starrocks::plan_native_starrocks_read_source;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -121,18 +122,22 @@ pub(super) fn lower_starrocks_scan(
             deferred_lake_resolution: Some(prepared.deferred_lake_resolution),
             topn_filter_column_map: HashMap::new(),
         };
-        let (source, bound_ranges) = ctx
-            .connectors()?
-            .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))
-            .map_err(|error| {
-                NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InvalidValue,
-                    "source",
-                    error,
-                )
-            })?;
-        // Route the enriched ranges to the instance; bind happens at materialize.
-        ctx.capture_scan_ranges(node.node_id, bound_ranges);
+        let query_options = ctx.query_options().cloned().unwrap_or_default();
+        let source = plan_native_starrocks_read_source(
+            ctx.connectors()?,
+            ctx.query_id(),
+            node.node_id,
+            cfg,
+            &query_options,
+        )
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "source",
+                error,
+            )
+        })?;
+        ctx.capture_scan_ranges(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
         let scan_node = crate::exec::node::scan::ScanNode::new(source)
             .with_node_id(node.node_id)
             .with_output_chunk_schema(Arc::clone(&output_schema))

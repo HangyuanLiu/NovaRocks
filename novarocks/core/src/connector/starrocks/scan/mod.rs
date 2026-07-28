@@ -25,3 +25,4 @@ pub use op::{
     LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange,
     StarRocksSchemaColumnHint,
 };
+pub(crate) use op::{plan_compat_starrocks_read_source, plan_native_starrocks_read_source};

@@ -222,7 +222,7 @@ pub(crate) fn scan_read_binding_for_test(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatch;
@@ -242,11 +242,9 @@ mod tests {
     use crate::common::ids::SlotId;
     #[cfg(feature = "compat")]
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-    #[cfg(feature = "compat")]
-    use crate::connector::StarRocksScanConfig;
+    use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
-    use crate::connector::{ConnectorRegistry, ScanConfig, ScanConnector};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
@@ -773,94 +771,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "compat")]
-    #[derive(Clone)]
-    struct CapturingStarRocksConnector {
-        captured: Arc<Mutex<Option<StarRocksScanConfig>>>,
-    }
-
-    #[cfg(feature = "compat")]
-    impl ScanConnector for CapturingStarRocksConnector {
-        fn name(&self) -> &'static str {
-            "starrocks"
-        }
-
-        fn create_scan_node(
-            &self,
-            cfg: ScanConfig,
-        ) -> Result<
-            (
-                std::sync::Arc<dyn crate::exec::node::scan::ScanSource>,
-                crate::exec::node::scan::BoundScanRanges,
-            ),
-            String,
-        > {
-            let ScanConfig::StarRocks(cfg) = cfg else {
-                return Err("capturing StarRocks connector received non-StarRocks config".into());
-            };
-            let cfg = *cfg;
-            *self
-                .captured
-                .lock()
-                .expect("captured StarRocks config lock") = Some(cfg.clone());
-            // Mirror the real StarRocksConnector split: static source + tablets.
-            let StarRocksScanConfig {
-                db_name,
-                table_name,
-                properties,
-                ranges,
-                has_more,
-                required_chunk_schema,
-                output_chunk_schema,
-                query_global_dicts,
-                limit,
-                batch_size,
-                query_timeout,
-                mem_limit,
-                profile_label,
-                min_max_predicates,
-                lake_schema_meta,
-                deferred_lake_resolution,
-                topn_filter_column_map,
-            } = cfg;
-            let source: std::sync::Arc<dyn crate::exec::node::scan::ScanSource> =
-                std::sync::Arc::new(crate::connector::starrocks::StarRocksScanSource {
-                    db_name,
-                    table_name,
-                    properties,
-                    required_chunk_schema,
-                    output_chunk_schema,
-                    query_global_dicts,
-                    limit,
-                    batch_size,
-                    query_timeout,
-                    mem_limit,
-                    profile_label,
-                    min_max_predicates,
-                    lake_schema_meta,
-                    deferred_lake_resolution,
-                    topn_filter_column_map,
-                });
-            Ok((
-                source,
-                crate::exec::node::scan::BoundScanRanges::StarRocksTablet { ranges, has_more },
-            ))
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn capturing_starrocks_registry() -> (
-        Arc<ConnectorRegistry>,
-        Arc<Mutex<Option<StarRocksScanConfig>>>,
-    ) {
-        let captured = Arc::new(Mutex::new(None));
-        let mut registry = ConnectorRegistry::new();
-        registry.register_scan_connector(Arc::new(CapturingStarRocksConnector {
-            captured: Arc::clone(&captured),
-        }));
-        (Arc::new(registry), captured)
-    }
-
     #[cfg(not(feature = "compat"))]
     #[test]
     fn rejects_starrocks_native_scan_without_compat_feature() {
@@ -884,7 +794,7 @@ mod tests {
             lo: 8_700_000_000_000_003,
         };
         let node = scan_node(starrocks_source());
-        let (connectors, captured) = capturing_starrocks_registry();
+        let connectors = Arc::new(ConnectorRegistry::new());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(connectors)
             .with_query_id(query_id)
@@ -895,13 +805,6 @@ mod tests {
         decode_node(&node, &mut arena, &ctx)
             .expect("valid StarRocks scan decode must defer tablet-path resolution");
 
-        let cfg = captured
-            .lock()
-            .expect("captured StarRocks config lock")
-            .clone()
-            .expect("StarRocks connector config");
-        assert!(!cfg.properties.contains_key("partition_storage_paths"));
-        assert!(cfg.deferred_lake_resolution.is_some());
         assert!(crate::runtime::starlet_shard_registry::select_paths(&[tablet_id]).is_empty());
     }
 
