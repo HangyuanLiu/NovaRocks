@@ -15,19 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod artifact;
-pub mod backend;
-pub mod cancellation;
-pub mod contract;
-#[cfg(feature = "query-execution-contract-test-support")]
-pub mod contract_test_support;
-pub mod fragment_transport;
-pub(crate) mod outcome;
-pub(crate) mod preparation;
-pub(crate) mod profile;
-mod runtime_filter;
-pub mod service;
-pub mod write;
+use std::sync::Arc;
 
-#[cfg(test)]
-mod tests;
+use novarocks::query_execution::contract::DistributedQueryError;
+use novarocks::query_execution::write::NativeExecutionReport;
+
+use super::query_registry::FrontendQueryRegistry;
+
+#[derive(Clone)]
+pub struct FrontendCoordinatorReportHandler {
+    registry: Arc<FrontendQueryRegistry>,
+}
+
+impl FrontendCoordinatorReportHandler {
+    pub(crate) fn new(registry: Arc<FrontendQueryRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn handle_native_report(
+        &self,
+        report: NativeExecutionReport,
+    ) -> Result<(), DistributedQueryError> {
+        self.registry.record_report(report)
+    }
+}

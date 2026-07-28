@@ -16,6 +16,7 @@
 // under the License.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -24,7 +25,7 @@ use std::task::Poll;
 use novarocks::common::app_config::NovaRocksConfig;
 use novarocks_state_store::StateStoreHostConfig;
 
-use crate::{FrontendApplicationError, FrontendApplicationHost};
+use crate::{FrontendApplicationError, FrontendApplicationHost, FrontendExecutionConfig};
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -85,10 +86,11 @@ where
 {
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
+    let execution = resolve_frontend_execution_config(&config)?;
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
-        |state_store| async move { FrontendApplicationHost::open(state_store).await },
+        |state_store| async move { FrontendApplicationHost::open(state_store, execution).await },
         |host| {
             (
                 host.view_service(),
@@ -96,6 +98,9 @@ where
                 host.table_maintenance_service(),
                 host.mv_repository(),
                 host.mv_application_service(),
+                host.query_execution_service(),
+                host.backend_query_event_sink(),
+                host.coordinator_report_endpoint_sink(),
             )
         },
         move |config,
@@ -105,6 +110,9 @@ where
             table_maintenance_service,
             mv_repository,
             mv_application_service,
+            query_execution,
+            backend_query_events,
+            coordinator_report_endpoint,
         ),
               shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
@@ -112,12 +120,17 @@ where
                 config.config_path,
                 config.port_override,
                 config.grpc_endpoint.core_ownership(),
-                system_catalog,
-                view_service,
-                statistics_service,
-                table_maintenance_service,
-                mv_repository,
-                mv_application_service,
+                novarocks::engine::StandaloneOpenServices::new(
+                    system_catalog,
+                    view_service,
+                    statistics_service,
+                    table_maintenance_service,
+                    mv_repository,
+                    mv_application_service,
+                    query_execution,
+                    backend_query_events,
+                    coordinator_report_endpoint,
+                ),
                 shutdown,
             )
             .await
@@ -140,10 +153,11 @@ where
 {
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
+    let execution = resolve_frontend_execution_config(&config)?;
     run_frontend_server_with_signal_and_ports(
         config,
         signal,
-        FrontendApplicationHost::open,
+        |state_store| async move { FrontendApplicationHost::open(state_store, execution).await },
         |host| {
             (
                 host.view_service(),
@@ -151,6 +165,9 @@ where
                 host.table_maintenance_service(),
                 host.mv_repository(),
                 host.mv_application_service(),
+                host.query_execution_service(),
+                host.backend_query_event_sink(),
+                host.coordinator_report_endpoint_sink(),
             )
         },
         move |config,
@@ -160,6 +177,9 @@ where
             table_maintenance_service,
             mv_repository,
             mv_application_service,
+            query_execution,
+            backend_query_events,
+            coordinator_report_endpoint,
         ),
               shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
@@ -167,12 +187,17 @@ where
                 config.config_path,
                 config.port_override,
                 config.grpc_endpoint.core_ownership(),
-                system_catalog,
-                view_service,
-                statistics_service,
-                table_maintenance_service,
-                mv_repository,
-                mv_application_service,
+                novarocks::engine::StandaloneOpenServices::new(
+                    system_catalog,
+                    view_service,
+                    statistics_service,
+                    table_maintenance_service,
+                    mv_repository,
+                    mv_application_service,
+                    query_execution,
+                    backend_query_events,
+                    coordinator_report_endpoint,
+                ),
                 shutdown,
             )
             .await
@@ -183,6 +208,23 @@ where
         |host| async move { host.shutdown().await },
     )
     .await
+}
+
+fn resolve_frontend_execution_config(
+    server: &FrontendServerConfig,
+) -> Result<FrontendExecutionConfig, FrontendApplicationError> {
+    let advertised =
+        novarocks::common::network::standalone_advertise_endpoint_for_config(&server.config)
+            .map_err(FrontendApplicationError::server)?;
+    let runtime_filter_worker_count =
+        NonZeroUsize::new(server.config.runtime.actual_exec_threads()).ok_or_else(|| {
+            FrontendApplicationError::server("frontend runtime-filter worker count must be nonzero")
+        })?;
+    Ok(FrontendExecutionConfig::new(
+        advertised.host,
+        advertised.port,
+        runtime_filter_worker_count,
+    ))
 }
 
 async fn run_frontend_server_until_shutdown_with_ports<

@@ -49,9 +49,7 @@ use crate::connector::{
 use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
-use crate::meta::repository::job::{
-    JobMetaRepository,
-};
+use crate::meta::repository::job::JobMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 use crate::mv::application::{MvApplicationService, UnavailableMvApplicationService};
@@ -376,12 +374,27 @@ pub(crate) struct StandaloneState {
     /// to enter connector execution paths that require the shared state Arc.
     pub(crate) self_weak: Weak<StandaloneState>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
-    /// defaults to a no-op. See `engine::system_catalog`.
+    /// see `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
+    /// Frontend-owned distributed query execution service. Every distributed
+    /// engine path must cross this injected value; core never locates or
+    /// constructs a coordinator concrete.
+    pub(crate) query_execution: crate::query_execution::service::QueryExecutionService,
+    /// Frontend-owned query activity used by backend lifecycle management.
+    /// Core forwards events through this boundary and performs no query-wide
+    /// or BE-local cleanup itself.
+    pub(crate) backend_query_events:
+        std::sync::Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
+    pub(crate) coordinator_report_endpoint:
+        std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
+    #[cfg(not(test))]
+    pub(crate) backend_heartbeat_manager:
+        std::sync::Mutex<Option<crate::coordinator::cluster::HeartbeatManagerHandle>>,
     #[cfg(test)]
     pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
 
+#[cfg(test)]
 impl Default for StandaloneState {
     fn default() -> Self {
         Self {
@@ -409,10 +422,76 @@ impl Default for StandaloneState {
             ),
             self_weak: Weak::new(),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
+            query_execution: legacy_test_query_execution_service(),
+            backend_query_events: std::sync::Arc::new(
+                crate::query_execution::backend::NoopBackendQueryEventSink,
+            ),
+            coordinator_report_endpoint: std::sync::Arc::new(
+                crate::query_execution::backend::NoopCoordinatorReportEndpointSink,
+            ),
             #[cfg(test)]
             _test_guard: None,
         }
     }
+}
+
+#[cfg(test)]
+struct LegacyTestDistributedQueryCoordinator;
+
+#[cfg(test)]
+impl crate::query_execution::contract::DistributedQueryCoordinator
+    for LegacyTestDistributedQueryCoordinator
+{
+    fn execute(
+        &self,
+        request: crate::query_execution::contract::DistributedQueryRequest,
+    ) -> Result<
+        crate::query_execution::contract::DistributedQueryOutcome,
+        crate::query_execution::contract::DistributedQueryError,
+    > {
+        let parts = request.into_parts();
+        let intent = parts.completion.intent();
+        let query_options = Some(parts.options.runtime_options().clone());
+        let (prepared, native_bundle) = parts.artifacts.into_legacy_test_parts();
+        let (execution_ports, scheduler) =
+            coordinated_execution_services_for_test().map_err(|message| {
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                    message,
+                )
+            })?;
+        let coordinator = crate::coordinator::execution::ExecutionCoordinator::new(
+            prepared,
+            native_bundle,
+            execution_ports,
+            scheduler,
+            query_options,
+            parts.cancellation,
+        );
+        let result = match intent {
+            crate::query_execution::contract::DistributedQueryIntent::Profile => {
+                coordinator.execute_with_profile_outcome()
+            }
+            crate::query_execution::contract::DistributedQueryIntent::Result
+            | crate::query_execution::contract::DistributedQueryIntent::Write => {
+                coordinator.execute_with_write_outcome()
+            }
+        }
+        .map_err(|message| {
+            crate::query_execution::contract::DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                message,
+            )
+        })?;
+        parts.completion.from_coordinated_result(result)
+    }
+}
+
+#[cfg(test)]
+fn legacy_test_query_execution_service() -> crate::query_execution::service::QueryExecutionService {
+    crate::query_execution::service::QueryExecutionService::new(std::sync::Arc::new(
+        LegacyTestDistributedQueryCoordinator,
+    ))
 }
 
 #[cfg(test)]
@@ -452,8 +531,59 @@ pub struct StandaloneSession {
     inner: Arc<StandaloneState>,
 }
 
+/// Explicit application services required to open the core SQL engine.
+///
+/// The value has no default: the owning frontend must construct every
+/// application-level service, including distributed query execution.
+pub struct StandaloneOpenServices {
+    pub system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
+    pub view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+    pub statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
+    pub table_maintenance_service:
+        std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
+    pub mv_repository: std::sync::Arc<dyn MvRepository>,
+    pub mv_application_service: std::sync::Arc<dyn MvApplicationService>,
+    pub query_execution: crate::query_execution::service::QueryExecutionService,
+    pub backend_query_events:
+        std::sync::Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
+    pub coordinator_report_endpoint:
+        std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
+}
+
+impl StandaloneOpenServices {
+    pub fn new(
+        system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
+        view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+        statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
+        table_maintenance_service: std::sync::Arc<
+            dyn crate::engine::table_maintenance::TableMaintenanceService,
+        >,
+        mv_repository: std::sync::Arc<dyn MvRepository>,
+        mv_application_service: std::sync::Arc<dyn MvApplicationService>,
+        query_execution: crate::query_execution::service::QueryExecutionService,
+        backend_query_events: std::sync::Arc<
+            dyn crate::query_execution::backend::BackendQueryEventSink,
+        >,
+        coordinator_report_endpoint: std::sync::Arc<
+            dyn crate::query_execution::backend::CoordinatorReportEndpointSink,
+        >,
+    ) -> Self {
+        Self {
+            system_catalog,
+            view_service,
+            statistics_service,
+            table_maintenance_service,
+            mv_repository,
+            mv_application_service,
+            query_execution,
+            backend_query_events,
+            coordinator_report_endpoint,
+        }
+    }
+}
+
 impl StandaloneNovaRocks {
-    pub fn open(opts: StandaloneOptions) -> Result<Self, String> {
+    pub fn open(opts: StandaloneOptions, services: StandaloneOpenServices) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
         #[cfg(test)]
@@ -476,26 +606,9 @@ impl StandaloneNovaRocks {
             }
         }
         #[cfg(test)]
-        return Self::open_body(
-            opts,
-            std::sync::Arc::new(system_catalog::EmptySystemCatalog),
-            std::sync::Arc::new(crate::engine::view::EmptyViewService),
-            std::sync::Arc::new(statistics::EmptyStatisticsService),
-            std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            std::sync::Arc::new(UnavailableMvRepository),
-            std::sync::Arc::new(UnavailableMvApplicationService),
-            _test_guard,
-        );
+        return Self::open_body(opts, services, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(
-            opts,
-            std::sync::Arc::new(system_catalog::EmptySystemCatalog),
-            std::sync::Arc::new(crate::engine::view::EmptyViewService),
-            std::sync::Arc::new(statistics::EmptyStatisticsService),
-            std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            std::sync::Arc::new(UnavailableMvRepository),
-            std::sync::Arc::new(UnavailableMvApplicationService),
-        )
+        Self::open_body(opts, services)
     }
 
     /// Open the engine using an already-loaded, validated config.
@@ -507,14 +620,7 @@ impl StandaloneNovaRocks {
     pub fn open_with_config(
         opts: StandaloneOptions,
         cfg: novarocks_config::NovaRocksConfig,
-        system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
-        view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
-        statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
-        table_maintenance_service: std::sync::Arc<
-            dyn crate::engine::table_maintenance::TableMaintenanceService,
-        >,
-        mv_repository: std::sync::Arc<dyn MvRepository>,
-        mv_application_service: std::sync::Arc<dyn MvApplicationService>,
+        services: StandaloneOpenServices,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -522,40 +628,16 @@ impl StandaloneNovaRocks {
         crate::coordinator::cluster::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
-        return Self::open_body(
-            opts,
-            system_catalog,
-            view_service,
-            statistics_service,
-            table_maintenance_service,
-            mv_repository,
-            mv_application_service,
-            _test_guard,
-        );
+        return Self::open_body(opts, services, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(
-            opts,
-            system_catalog,
-            view_service,
-            statistics_service,
-            table_maintenance_service,
-            mv_repository,
-            mv_application_service,
-        )
+        Self::open_body(opts, services)
     }
 
     /// Common engine-open body.  Called after the process-wide config has
     /// already been installed by the caller.
     fn open_body(
         opts: StandaloneOptions,
-        system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
-        view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
-        statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
-        table_maintenance_service: std::sync::Arc<
-            dyn crate::engine::table_maintenance::TableMaintenanceService,
-        >,
-        mv_repository: std::sync::Arc<dyn MvRepository>,
-        mv_application_service: std::sync::Arc<dyn MvApplicationService>,
+        services: StandaloneOpenServices,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -603,6 +685,17 @@ impl StandaloneNovaRocks {
             None => None,
         };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
+        let StandaloneOpenServices {
+            system_catalog,
+            view_service,
+            statistics_service,
+            table_maintenance_service,
+            mv_repository,
+            mv_application_service,
+            query_execution,
+            backend_query_events,
+            coordinator_report_endpoint,
+        } = services;
         let inner = Arc::new_cyclic(|self_weak| StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
@@ -624,15 +717,26 @@ impl StandaloneNovaRocks {
             statistics_service,
             table_maintenance_service,
             self_weak: self_weak.clone(),
+            query_execution,
+            backend_query_events,
+            coordinator_report_endpoint,
+            #[cfg(not(test))]
+            backend_heartbeat_manager: std::sync::Mutex::new(None),
             #[cfg(test)]
             _test_guard,
-            ..Default::default()
+            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
+            iceberg_operation_repo: IcebergOperationRepository,
+            maintenance_signal_tx: std::sync::Mutex::new(None),
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
         if role == crate::common::app_config::ClusterRole::Fe {
             backend_ops::ensure_backend_registry(&inner)?;
             backend_ops::wait_for_configured_backends_live(&inner)?;
+        }
+        if role == crate::common::app_config::ClusterRole::AllInOne {
+            backend_ops::publish_live_backends(&inner)?;
         }
         let engine = Self { inner };
         let engine_port =
@@ -651,6 +755,10 @@ impl StandaloneNovaRocks {
         StandaloneSession {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {
+        self.inner.coordinator_report_endpoint.set_bound_port(port);
     }
 
     #[cfg(test)]
@@ -1127,6 +1235,7 @@ impl StandaloneSession {
                     current_database,
                     None,
                     Some(&self.inner),
+                    &self.inner.query_execution,
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -1208,6 +1317,7 @@ impl StandaloneSession {
                     current_database,
                     self.inner.exchange_port,
                     query_opts.clone(),
+                    &self.inner.query_execution,
                     Some(&self.inner),
                 )?;
                 Ok(StatementResult::Query(result))
@@ -2266,6 +2376,7 @@ fn explain_analyze_query(
     current_database: &str,
     query_opts: Option<QueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::ExplainLevel;
     use crate::sql::explain::distributed::explain_distributed_plan_analyze;
@@ -2318,17 +2429,14 @@ fn explain_analyze_query(
     let planning_elapsed = planning_start.elapsed();
 
     let query_opts = query_options_for_explain_analyze(query_opts);
-    let (execution_ports, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
-    let outcome = crate::coordinator::execution::ExecutionCoordinator::new(
+    let outcome = execute_distributed_profile(
+        query_execution,
         prepared,
         native_bundle,
-        execution_ports,
-        scheduler,
         Some(query_opts),
         current_query_cancellation_view(),
-    )
-    .execute_with_profile_outcome()?;
+    )?;
     let execution_elapsed = execution_start.elapsed();
     if let Some(abort) = outcome.write_abort.as_ref() {
         return Err(abort.reason.clone());
@@ -2511,6 +2619,7 @@ pub(crate) fn execute_query(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
 ) -> Result<QueryResult, String> {
     execute_query_with_catalog_provider(
         query,
@@ -2520,6 +2629,7 @@ pub(crate) fn execute_query(
         current_database,
         exchange_port,
         query_opts,
+        query_execution,
         None,
     )
 }
@@ -2555,6 +2665,7 @@ pub(crate) fn execute_query_with_catalog_service(
         current_database,
         state.exchange_port,
         query_opts,
+        &state.query_execution,
         Some(state),
     )
 }
@@ -2704,16 +2815,13 @@ pub(crate) fn execute_query_as_iceberg_write(
         &distributed_plan,
         &prepared,
     )?;
-    let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::coordinator::execution::ExecutionCoordinator::new(
+    execute_distributed_write(
+        &state.query_execution,
         prepared,
         native_bundle,
-        execution_ports,
-        scheduler,
         query_opts,
         current_query_cancellation_view(),
     )
-    .execute_with_write_outcome()
 }
 
 #[cfg(test)]
@@ -2884,20 +2992,18 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 }
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
+    state: &Arc<StandaloneState>,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_opts: Option<QueryOptions>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
-    let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::coordinator::execution::ExecutionCoordinator::new(
+    execute_distributed_write(
+        &state.query_execution,
         prepared,
         native_bundle,
-        execution_ports,
-        scheduler,
         query_opts,
         current_query_cancellation_view(),
     )
-    .execute_with_write_outcome()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2923,7 +3029,12 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     if let Some(result) = observe_change_stream_write_build_for_test(&planned.topology) {
         return Ok(result);
     }
-    execute_planned_iceberg_change_stream_write(planned.prepared, planned.native_bundle, query_opts)
+    execute_planned_iceberg_change_stream_write(
+        state,
+        planned.prepared,
+        planned.native_bundle,
+        query_opts,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2935,6 +3046,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
@@ -2945,6 +3057,7 @@ pub(crate) fn execute_query_with_catalog_provider(
         current_database,
         exchange_port,
         query_opts,
+        query_execution,
         None,
         None,
         None,
@@ -2974,6 +3087,7 @@ pub(crate) fn execute_query_with_options(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
@@ -2985,6 +3099,7 @@ pub(crate) fn execute_query_with_options(
         current_database,
         exchange_port,
         query_opts,
+        query_execution,
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
@@ -3001,6 +3116,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
@@ -3015,6 +3131,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         current_database,
         exchange_port,
         query_opts,
+        query_execution,
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
@@ -3032,6 +3149,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
@@ -3044,6 +3162,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
         current_database,
         exchange_port,
         query_opts,
+        query_execution,
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
@@ -3170,6 +3289,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
@@ -3264,16 +3384,13 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         &distributed_plan,
         &prepared,
     )?;
-    let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::coordinator::execution::ExecutionCoordinator::new(
+    execute_distributed_result(
+        query_execution,
         prepared,
         native_bundle,
-        execution_ports,
-        scheduler,
         query_opts,
         current_query_cancellation_view(),
     )
-    .execute()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3285,6 +3402,7 @@ pub(crate) fn execute_logical_plan_with_options(
     _current_database: &str,
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
@@ -3326,16 +3444,13 @@ pub(crate) fn execute_logical_plan_with_options(
         &distributed_plan,
         &prepared,
     )?;
-    let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::coordinator::execution::ExecutionCoordinator::new(
+    execute_distributed_result(
+        query_execution,
         prepared,
         native_bundle,
-        execution_ports,
-        scheduler,
         query_opts,
         current_query_cancellation_view(),
     )
-    .execute()
 }
 
 fn current_query_cancellation_view() -> crate::query_execution::cancellation::QueryCancellationView
@@ -3346,152 +3461,119 @@ fn current_query_cancellation_view() -> crate::query_execution::cancellation::Qu
     }
 }
 
-fn coordinated_execution_services() -> Result<
+fn execute_distributed_result(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    query_options: Option<QueryOptions>,
+    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+) -> Result<QueryResult, String> {
+    let request = crate::query_execution::contract::build_distributed_query_request(
+        prepared,
+        native_bundle,
+        query_options,
+        crate::query_execution::contract::DistributedQueryIntent::Result,
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .map_err(|error| error.to_string())
+}
+
+fn execute_distributed_write(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    query_options: Option<QueryOptions>,
+    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
+    let request = crate::query_execution::contract::build_distributed_query_request(
+        prepared,
+        native_bundle,
+        query_options,
+        crate::query_execution::contract::DistributedQueryIntent::Write,
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let (query_result, write_commit, write_abort) = query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::coordinator::execution::CoordinatedQueryResult {
+        query_result,
+        write_commit,
+        write_abort,
+        fragment_profiles: Vec::new(),
+    })
+}
+
+fn execute_distributed_profile(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    query_options: Option<QueryOptions>,
+    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
+    let request = crate::query_execution::contract::build_distributed_query_request(
+        prepared,
+        native_bundle,
+        query_options,
+        crate::query_execution::contract::DistributedQueryIntent::Profile,
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let (query_result, fragment_profiles) = query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_profile)
+        .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::coordinator::execution::CoordinatedQueryResult {
+        query_result,
+        write_commit: None,
+        write_abort: None,
+        fragment_profiles: fragment_profiles.into_profiles(),
+    })
+}
+
+#[cfg(test)]
+fn coordinated_execution_services_for_test() -> Result<
     (
         crate::coordinator::ports::CoordinatorExecutionPorts,
         Arc<crate::coordinator::scheduler::FragmentScheduler>,
     ),
     String,
 > {
-    use crate::common::app_config::ClusterRole;
-    let role = crate::novarocks_config::config()
-        .map(|c| c.cluster.role)
-        .unwrap_or(ClusterRole::AllInOne);
-    let (dispatcher, scheduler, runtime_filter_deployment_control) = match role {
-        ClusterRole::Fe | ClusterRole::AllInOne => {
-            let entries = backend_ops::live_backend_dispatch_entries()?;
-            let snapshot = crate::coordinator::cluster::LiveBackendSnapshot::new(entries);
-            let runtime_filter_deployment_control = Arc::new(
-                crate::service::grpc_fragment_dispatcher::GrpcRuntimeFilterDeploymentControl::new(
-                    snapshot.entries(),
-                )?,
-            );
-            let (dispatcher, scheduler) =
-                dispatch_and_scheduler_from_live_backend_snapshot(snapshot)?;
-            let dispatcher = Arc::new(dispatcher);
-            let scheduler = Arc::new(scheduler);
-            (
-                dispatcher
-                    as Arc<dyn crate::query_execution::fragment_transport::FragmentDispatcher>,
-                scheduler,
-                runtime_filter_deployment_control
-                    as Arc<dyn crate::coordinator::ports::RuntimeFilterDeploymentControlPort>,
-            )
-        }
-        ClusterRole::Be => {
-            return Err("role=be must not enter standalone coordinator".into());
-        }
-    };
+    let entries = backend_ops::live_backend_dispatch_entries()?;
+    let snapshot = crate::coordinator::cluster::LiveBackendSnapshot::new(entries);
+    let runtime_filter_deployment_control = Arc::new(
+        crate::service::grpc_fragment_dispatcher::GrpcRuntimeFilterDeploymentControl::new(
+            snapshot.entries(),
+        )?,
+    );
+    let dispatcher = Arc::new(
+        crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+            snapshot.entries(),
+        )?,
+    );
+    let scheduler = Arc::new(
+        crate::coordinator::scheduler::FragmentScheduler::from_live_backend_snapshot(snapshot),
+    );
     let report_endpoint = crate::service::grpc_coordinator_adapter::coordinator_report_endpoint()?;
     let observer =
         Arc::new(crate::service::grpc_coordinator_adapter::PrometheusCoordinatorObserver);
-    let execution_ports = crate::coordinator::ports::CoordinatorExecutionPorts::new(
-        dispatcher,
-        report_endpoint,
-        observer,
-        runtime_filter_deployment_control,
-    );
-    Ok((execution_ports, scheduler))
-}
-
-fn dispatch_and_scheduler_from_live_backend_snapshot(
-    snapshot: crate::coordinator::cluster::LiveBackendSnapshot,
-) -> Result<
-    (
-        crate::service::grpc_fragment_dispatcher::RemoteDispatcher,
-        crate::coordinator::scheduler::FragmentScheduler,
-    ),
-    String,
-> {
-    let dispatcher =
-        crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-            snapshot.entries(),
-        )?;
-    let scheduler =
-        crate::coordinator::scheduler::FragmentScheduler::from_live_backend_snapshot(snapshot);
-    Ok((dispatcher, scheduler))
-}
-
-/// Select a `FragmentDispatcher` implementation based on the effective cluster role.
-///
-/// - `Fe`: prefer explicit `[cluster].backends`; when the active config is
-///   truly `role=fe`, fall back to live registry backends.
-/// - `AllInOne`: use `RemoteDispatcher` bound to live registry backends.
-/// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
-pub(crate) fn dispatcher_for_role(
-    role: crate::common::app_config::ClusterRole,
-) -> Result<Arc<dyn crate::query_execution::fragment_transport::FragmentDispatcher>, String> {
-    use crate::common::app_config::ClusterRole;
-    match role {
-        ClusterRole::Fe => {
-            let (configured, may_use_live_registry) =
-                configured_fe_dispatch_entries_and_live_fallback()?;
-            if let Some(entries) = configured {
-                return Ok(Arc::new(
-                    crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-                        &entries,
-                    )?,
-                ));
-            }
-            if !may_use_live_registry {
-                return Err(with_fe_error_context(
-                    "no configured backend available".to_string(),
-                ));
-            }
-            let entries = backend_ops::live_backend_dispatch_entries()
-                .map_err(|e| with_fe_error_context(e))?;
-            Ok(Arc::new(
-                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-                    &entries,
-                )?,
-            ))
-        }
-        ClusterRole::AllInOne => {
-            let entries = backend_ops::live_backend_dispatch_entries()?;
-            Ok(Arc::new(
-                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-                    &entries,
-                )?,
-            ))
-        }
-        ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
-    }
-}
-
-type FeDispatchSelection = (Option<Vec<(usize, std::net::SocketAddr)>>, bool);
-
-fn configured_fe_dispatch_entries_and_live_fallback() -> Result<FeDispatchSelection, String> {
-    let cfg = novarocks_config::config()
-        .map_err(|e| with_fe_error_context(format!("cannot read config: {e}")))?;
-    if cfg.cluster.backends.is_empty() {
-        return Ok((
-            None,
-            cfg.cluster.role == crate::common::app_config::ClusterRole::Fe,
-        ));
-    }
-    let entries = cfg
-        .cluster
-        .backends
-        .iter()
-        .enumerate()
-        .map(|(idx, backend)| {
-            backend
-                .parse::<std::net::SocketAddr>()
-                .map(|endpoint| (idx, endpoint))
-                .map_err(|e| {
-                    with_fe_error_context(format!("invalid backend addr '{backend}': {e}"))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((Some(entries), true))
-}
-
-fn with_fe_error_context(err: String) -> String {
-    if err.starts_with("role=fe:") {
-        err
-    } else {
-        format!("role=fe: {err}")
-    }
+    Ok((
+        crate::coordinator::ports::CoordinatorExecutionPorts::new(
+            dispatcher,
+            report_endpoint,
+            observer,
+            runtime_filter_deployment_control,
+        ),
+        scheduler,
+    ))
 }
 
 #[cfg(test)]
@@ -4078,8 +4160,9 @@ mod build_iceberg_create_table_ddl_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryResult, StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
-        StatementResult, dispatch_statement, register_connector_backends,
+        QueryResult, StandaloneNovaRocks, StandaloneOpenServices, StandaloneOptions,
+        StandaloneSession, StandaloneState, StatementResult, dispatch_statement,
+        register_connector_backends,
     };
     #[cfg(feature = "compat")]
     use super::{
@@ -4106,6 +4189,11 @@ mod tests {
         MvEngine, MvRequestContext, UnavailableMvApplicationService,
     };
     use crate::mv::repository::{MvTarget, UnavailableMvRepository};
+    use crate::query_execution::contract::{
+        DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
+        DistributedQueryRequest,
+    };
+    use crate::query_execution::service::QueryExecutionService;
     use crate::runtime::query_options::QueryOptions;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -4266,18 +4354,70 @@ mod tests {
         }
     }
 
+    fn test_open_services() -> StandaloneOpenServices {
+        test_open_services_with(
+            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+            Arc::new(crate::engine::view::EmptyViewService),
+        )
+    }
+
+    fn test_open_services_with(
+        system_catalog: Arc<dyn SystemCatalog>,
+        view_service: Arc<dyn ViewService>,
+    ) -> StandaloneOpenServices {
+        test_open_services_with_statistics(
+            system_catalog,
+            view_service,
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
+        )
+    }
+
+    fn test_open_services_with_statistics(
+        system_catalog: Arc<dyn SystemCatalog>,
+        view_service: Arc<dyn ViewService>,
+        statistics_service: Arc<dyn StatisticsService>,
+    ) -> StandaloneOpenServices {
+        StandaloneOpenServices::new(
+            system_catalog,
+            view_service,
+            statistics_service,
+            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
+            Arc::new(UnavailableMvRepository),
+            Arc::new(UnavailableMvApplicationService),
+            super::legacy_test_query_execution_service(),
+            Arc::new(crate::query_execution::backend::NoopBackendQueryEventSink),
+            Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
+        )
+    }
+
+    struct RecordingQueryExecutionCoordinator {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DistributedQueryCoordinator for RecordingQueryExecutionCoordinator {
+        fn execute(
+            &self,
+            request: DistributedQueryRequest,
+        ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            request
+                .into_parts()
+                .completion
+                .result(crate::runtime::query_result::QueryResult::empty())
+        }
+    }
+
     #[test]
     fn open_with_config_uses_injected_statistics_service() {
         let service = Arc::new(RecordingStatisticsService::default());
         let engine = StandaloneNovaRocks::open_with_config(
             StandaloneOptions::default(),
             crate::common::app_config::NovaRocksConfig::default(),
-            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-            Arc::new(crate::engine::view::EmptyViewService),
-            Arc::clone(&service) as Arc<dyn StatisticsService>,
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services_with_statistics(
+                Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+                Arc::new(crate::engine::view::EmptyViewService),
+                Arc::clone(&service) as Arc<dyn StatisticsService>,
+            ),
         )
         .expect("open");
         engine
@@ -4285,6 +4425,28 @@ mod tests {
             .execute_in_database("ANALYZE TABLE t1", "db1")
             .expect("injected service handles statement");
         assert_eq!(service.statements(), vec!["ANALYZE TABLE t1"]);
+    }
+
+    #[test]
+    fn standalone_query_uses_injected_query_execution_service() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(StandaloneState {
+            exchange_port: 1,
+            query_execution: QueryExecutionService::new(Arc::new(
+                RecordingQueryExecutionCoordinator {
+                    calls: Arc::clone(&calls),
+                },
+            )),
+            ..Default::default()
+        });
+        register_connector_backends(&state);
+        let session = StandaloneSession { inner: state };
+
+        session
+            .query("SELECT 1")
+            .expect("injected coordinator serves the planned query");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4349,12 +4511,10 @@ mod tests {
         let engine = StandaloneNovaRocks::open_with_config(
             StandaloneOptions::default(),
             crate::common::app_config::NovaRocksConfig::default(),
-            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-            Arc::clone(&service) as Arc<dyn ViewService>,
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services_with(
+                Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+                Arc::clone(&service) as Arc<dyn ViewService>,
+            ),
         )
         .expect("open engine with recording view service");
         let session = engine.session();
@@ -4484,12 +4644,10 @@ mod tests {
         let engine = StandaloneNovaRocks::open_with_config(
             StandaloneOptions::default(),
             cfg,
-            Arc::new(TestSchemataCatalog),
-            Arc::new(crate::engine::view::EmptyViewService),
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services_with(
+                Arc::new(TestSchemataCatalog),
+                Arc::new(crate::engine::view::EmptyViewService),
+            ),
         )
         .expect("open engine with injected system catalog");
 
@@ -4615,12 +4773,7 @@ path = "{metadata_path}"
         let engine = StandaloneNovaRocks::open_with_config(
             StandaloneOptions::default(),
             cfg,
-            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-            Arc::new(crate::engine::view::EmptyViewService),
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services(),
         )
         .expect("open FE engine");
         let session = engine.session();
@@ -4656,12 +4809,7 @@ path = "{metadata_path}"
         let engine = StandaloneNovaRocks::open_with_config(
             StandaloneOptions::default(),
             cfg.clone(),
-            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-            Arc::new(crate::engine::view::EmptyViewService),
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services(),
         )
         .expect("open FE engine");
         engine
@@ -4673,12 +4821,7 @@ path = "{metadata_path}"
         let reopened = StandaloneNovaRocks::open_with_config(
             StandaloneOptions::default(),
             cfg,
-            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-            Arc::new(crate::engine::view::EmptyViewService),
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services(),
         )
         .expect("reopen FE engine");
         let result = reopened
@@ -4697,12 +4840,7 @@ path = "{metadata_path}"
         let engine = StandaloneNovaRocks::open_with_config(
             StandaloneOptions::default(),
             cfg,
-            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-            Arc::new(crate::engine::view::EmptyViewService),
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services(),
         )
         .expect("open all-in-one engine");
         let session = engine.session();
@@ -4730,7 +4868,8 @@ path = "{metadata_path}"
 
     #[test]
     fn create_catalog_registers_catalog_service_entry() {
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
+            .expect("open");
         let warehouse = TempDir::new().expect("warehouse");
         let sql = format!(
             r#"CREATE EXTERNAL CATALOG ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
@@ -5025,9 +5164,12 @@ path = "meta/catalog.db"
         )
         .expect("write config");
 
-        let engine = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: Some(config_path),
-        })
+        let engine = StandaloneNovaRocks::open(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            test_open_services(),
+        )
         .expect("open engine");
 
         assert!(engine.inner.metadata_provider.is_some());
@@ -5077,12 +5219,7 @@ mysql_port = 47892
                 config_path: Some(config_path),
             },
             cfg,
-            Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-            Arc::new(crate::engine::view::EmptyViewService),
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-            Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            test_open_services(),
         );
         assert!(
             result.is_ok(),
@@ -5094,12 +5231,256 @@ mysql_port = 47892
 
     #[test]
     fn alter_iceberg_schema_dispatches_before_generic_sqlparser() {
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("engine");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
+            .expect("engine");
         let err = engine
             .session()
             .execute("ALTER TABLE missing.db.t ADD COLUMN c INT")
             .expect_err("unknown catalog");
         assert!(err.contains("unknown catalog"));
+    }
+
+    #[test]
+    fn show_alter_table_optimize_reads_persisted_jobs() {
+        let temp = TempDir::new().expect("metadata temp dir");
+        let config_path = write_test_metadata_config(&temp, "metadata.db");
+        let engine = StandaloneNovaRocks::open(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            test_open_services(),
+        )
+        .expect("engine");
+        let outcome = crate::meta::repository::job::IcebergOptimizeJobOutcome {
+            target_snapshot_id: Some(124),
+            rewritten_data_files: 3,
+            deleted_data_files: 2,
+            added_data_files: 1,
+            output_record_count: 7,
+        };
+        seed_finished_iceberg_optimize_job(&engine, "ice", "db1", "orders", 123, 1000, outcome);
+
+        let result = engine
+            .session()
+            .query(
+                "SHOW ALTER TABLE OPTIMIZE FROM db1 WHERE TableName = 'orders' \
+                 ORDER BY CreateTime DESC LIMIT 1",
+            )
+            .expect("show optimize jobs");
+
+        assert_eq!(result.row_count(), 1);
+        let chunk = &result.chunks[0];
+        let table_names = chunk
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("table name column");
+        let states = chunk
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("state column");
+        let target_snapshot_ids = chunk
+            .batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("target snapshot column");
+        let input_data_files = chunk
+            .batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("input data files column");
+        let output_data_files = chunk
+            .batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("output data files column");
+        let input_delete_files = chunk
+            .batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("input delete files column");
+        let output_delete_files = chunk
+            .batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("output delete files column");
+        assert_eq!(table_names.value(0), "orders");
+        assert_eq!(states.value(0), "FINISHED");
+        assert_eq!(target_snapshot_ids.value(0), "124");
+        assert_eq!(input_data_files.value(0), "3");
+        assert_eq!(output_data_files.value(0), "1");
+        assert_eq!(input_delete_files.value(0), "2");
+        assert_eq!(output_delete_files.value(0), "0");
+    }
+
+    #[test]
+    fn show_alter_table_optimize_uses_session_catalog_and_database() {
+        let temp = TempDir::new().expect("metadata temp dir");
+        let config_path = write_test_metadata_config(&temp, "metadata.db");
+        let engine = StandaloneNovaRocks::open(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            test_open_services(),
+        )
+        .expect("engine");
+        seed_pending_iceberg_optimize_job(&engine, "ice1", "db1", "orders", 101, 1_000);
+        seed_pending_iceberg_optimize_job(&engine, "ice2", "db1", "orders", 102, 2_000);
+        seed_pending_iceberg_optimize_job(&engine, "ice1", "db2", "orders", 103, 3_000);
+
+        let session = engine.session();
+        let current = match session
+            .execute_in_context("SHOW ALTER TABLE OPTIMIZE", Some("ice1"), "db1", None)
+            .expect("show current context")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("SHOW returned ok"),
+        };
+        assert_eq!(optimize_show_job_ids(&current), vec!["1"]);
+
+        let from_db = match session
+            .execute_in_context(
+                "SHOW ALTER TABLE OPTIMIZE FROM db1 ORDER BY CreateTime DESC",
+                Some("ice1"),
+                "db2",
+                None,
+            )
+            .expect("show from db under current catalog")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("SHOW returned ok"),
+        };
+        assert_eq!(optimize_show_job_ids(&from_db), vec!["1"]);
+
+        let explicit_catalog = match session
+            .execute_in_context(
+                "SHOW ALTER TABLE OPTIMIZE FROM ice2.db1",
+                Some("ice1"),
+                "db1",
+                None,
+            )
+            .expect("show explicit catalog")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("SHOW returned ok"),
+        };
+        assert_eq!(optimize_show_job_ids(&explicit_catalog), vec!["2"]);
+    }
+
+    fn seed_pending_iceberg_optimize_job(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        base_snapshot_id: i64,
+        created_at_ms: i64,
+    ) -> i64 {
+        let provider = engine
+            .inner
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed pending iceberg optimize job")
+            .expect("write");
+        let job = engine
+            .inner
+            .job_repo
+            .create_iceberg_optimize_job(
+                txn.as_mut(),
+                crate::meta::repository::job::CreateIcebergOptimizeJobRequest {
+                    catalog: catalog.to_string(),
+                    namespace: namespace.to_string(),
+                    table: table.to_string(),
+                    base_snapshot_id,
+                    now_ms: created_at_ms,
+                },
+            )
+            .expect("create optimize job");
+        txn.commit().expect("commit create optimize job");
+        job.id
+    }
+
+    fn seed_finished_iceberg_optimize_job(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        base_snapshot_id: i64,
+        created_at_ms: i64,
+        outcome: crate::meta::repository::job::IcebergOptimizeJobOutcome,
+    ) {
+        let job_id = seed_pending_iceberg_optimize_job(
+            engine,
+            catalog,
+            namespace,
+            table,
+            base_snapshot_id,
+            created_at_ms,
+        );
+        let provider = engine
+            .inner
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+
+        let mut txn = provider
+            .begin_write("claim synthetic optimize job")
+            .expect("claim write");
+        engine
+            .inner
+            .job_repo
+            .claim_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 100)
+            .expect("claim synthetic optimize job");
+        txn.commit().expect("commit claim optimize job");
+
+        let mut txn = provider
+            .begin_write("record synthetic optimize outcome")
+            .expect("outcome write");
+        engine
+            .inner
+            .job_repo
+            .record_iceberg_optimize_job_outcome(
+                txn.as_mut(),
+                job_id,
+                created_at_ms + 200,
+                outcome.clone(),
+            )
+            .expect("record synthetic optimize outcome");
+        txn.commit().expect("commit optimize outcome");
+
+        let mut txn = provider
+            .begin_write("finish synthetic optimize job")
+            .expect("finish write");
+        engine
+            .inner
+            .job_repo
+            .finish_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 300, outcome)
+            .expect("finish synthetic optimize job");
+        txn.commit().expect("commit finish optimize job");
+    }
+
+    fn optimize_show_job_ids(result: &QueryResult) -> Vec<String> {
+        if result.row_count() == 0 {
+            return Vec::new();
+        }
+        let ids = result.chunks[0]
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("job id column");
+        (0..ids.len())
+            .map(|idx| ids.value(idx).to_string())
+            .collect()
     }
 
     fn query_result_contains_string(result: &QueryResult, expected: &str) -> bool {
@@ -5341,6 +5722,7 @@ mysql_port = 47892
         let query = parse_query_for_engine_test("select 1");
         let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
+        let query_execution = super::legacy_test_query_execution_service();
 
         let err = super::execute_query_with_options(
             &query,
@@ -5349,6 +5731,7 @@ mysql_port = 47892
             "default",
             0,
             None,
+            &query_execution,
             None,
             None,
             None,
@@ -5368,6 +5751,7 @@ mysql_port = 47892
         let query = parse_query_for_engine_test("select 1");
         let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
+        let query_execution = super::legacy_test_query_execution_service();
 
         let result = super::execute_query_with_options(
             &query,
@@ -5376,6 +5760,7 @@ mysql_port = 47892
             "default",
             backend.exchange_port,
             None,
+            &query_execution,
             None,
             None,
             None,
@@ -5528,6 +5913,7 @@ mysql_port = 47892
             .expect("register base table");
         let connectors = crate::connector::ConnectorRegistry::default();
         let mv_ctx = dummy_mv_refresh_context_for_validator_test();
+        let query_execution = super::legacy_test_query_execution_service();
         let validator =
             |_outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome| {
                 Err("sentinel IMV validator error".to_string())
@@ -5540,6 +5926,7 @@ mysql_port = 47892
             "default",
             0,
             None,
+            &query_execution,
             None,
             None,
             Some(&mv_ctx),
@@ -5557,6 +5944,7 @@ mysql_port = 47892
         let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
         let mv_ctx = dummy_mv_refresh_context_for_validator_test();
+        let query_execution = super::legacy_test_query_execution_service();
 
         let rewrite_err = super::execute_query_with_options(
             &query,
@@ -5565,6 +5953,7 @@ mysql_port = 47892
             "default",
             0,
             None,
+            &query_execution,
             None,
             None,
             Some(&mv_ctx),
@@ -5585,6 +5974,7 @@ mysql_port = 47892
             "default",
             backend.exchange_port,
             None,
+            &query_execution,
             None,
             None,
             Some(&mv_ctx),
@@ -6014,7 +6404,8 @@ mysql_port = 47892
 
     #[test]
     fn embedded_query_executes_inline_values_cte_without_catalog_table() {
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
+            .expect("open engine");
 
         let session = engine.session();
         let result = session
@@ -6025,7 +6416,8 @@ mysql_port = 47892
 
     #[test]
     fn embedded_query_math_function_accepts_negative_decimal_literal() {
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
+            .expect("open engine");
 
         let session = engine.session();
         let result = session
@@ -6090,7 +6482,8 @@ mysql_port = 47892
 
     #[test]
     fn embedded_query_rejects_unknown_table() {
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
+            .expect("open engine");
         let session = engine.session();
         let err = session
             .query("select * from missing")
@@ -6351,9 +6744,12 @@ mysql_port = 47892
         let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
 
         {
-            let engine = StandaloneNovaRocks::open(StandaloneOptions {
-                config_path: Some(config_path.clone()),
-            })
+            let engine = StandaloneNovaRocks::open(
+                StandaloneOptions {
+                    config_path: Some(config_path.clone()),
+                },
+                test_open_services(),
+            )
             .expect("open engine");
             let session = engine.session();
 
@@ -6395,9 +6791,12 @@ mysql_port = 47892
             assert!(matches!(insert, StatementResult::Ok));
         }
 
-        let restored = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: Some(config_path),
-        })
+        let restored = StandaloneNovaRocks::open(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            test_open_services(),
+        )
         .expect("reopen engine");
         let entry = {
             let registry = restored
@@ -6422,9 +6821,12 @@ mysql_port = 47892
         let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
 
         let entry = {
-            let engine = StandaloneNovaRocks::open(StandaloneOptions {
-                config_path: Some(config_path.clone()),
-            })
+            let engine = StandaloneNovaRocks::open(
+                StandaloneOptions {
+                    config_path: Some(config_path.clone()),
+                },
+                test_open_services(),
+            )
             .expect("open engine");
             let session = engine.session();
             let sql = format!(
@@ -6454,9 +6856,12 @@ mysql_port = 47892
         crate::connector::iceberg::catalog::registry::drop_namespace(&entry, "db1")
             .expect("external namespace drop");
 
-        let restored = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: Some(config_path),
-        })
+        let restored = StandaloneNovaRocks::open(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            test_open_services(),
+        )
         .expect("reopen without replay");
         let restored_entry = restored
             .inner
@@ -6479,9 +6884,12 @@ mysql_port = 47892
         let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
 
         {
-            let engine = StandaloneNovaRocks::open(StandaloneOptions {
-                config_path: Some(config_path.clone()),
-            })
+            let engine = StandaloneNovaRocks::open(
+                StandaloneOptions {
+                    config_path: Some(config_path.clone()),
+                },
+                test_open_services(),
+            )
             .expect("open engine");
             let session = engine.session();
 
@@ -6570,9 +6978,12 @@ mysql_port = 47892
             );
         }
 
-        let restored = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: Some(config_path),
-        })
+        let restored = StandaloneNovaRocks::open(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            test_open_services(),
+        )
         .expect("reopen engine");
         let session = restored.session();
         let show = session
@@ -6693,9 +7104,12 @@ path = "meta/operations.sqlite"
 "#,
         )
         .expect("write metadata config");
-        StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: Some(config_path),
-        })
+        StandaloneNovaRocks::open(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            test_open_services(),
+        )
         .expect("open engine")
     }
 
@@ -8357,7 +8771,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn select_row_id_fails_on_v2_iceberg_table() {
         let warehouse = TempDir::new().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default())
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
             .expect("open standalone engine");
         let session = engine.session();
         let create_catalog_sql = format!(
@@ -8391,7 +8805,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn select_row_id_fails_on_v3_table_without_row_lineage() {
         let warehouse = TempDir::new().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default())
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
             .expect("open standalone engine");
         let session = engine.session();
         let create_catalog_sql = format!(
@@ -8428,7 +8842,7 @@ path = "meta/operations.sqlite"
         // table without write.row-lineage=true (same fail-fast path as non-iceberg
         // tables, verified without needing StarRocks table config).
         let warehouse = TempDir::new().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default())
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
             .expect("open standalone engine");
         let session = engine.session();
         let create_catalog_sql = format!(
@@ -8460,90 +8874,6 @@ path = "meta/operations.sqlite"
         );
 
         drop(engine);
-    }
-
-    // -----------------------------------------------------------------------
-    // I1: dispatcher_for_role role-guard tests
-    // -----------------------------------------------------------------------
-
-    /// AllInOne role produces a dispatcher without error.
-    #[test]
-    fn dispatcher_for_role_all_in_one_ok() {
-        use crate::common::app_config::ClusterRole;
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
-        crate::engine::backend_ops::install_all_in_one_backend_registry(
-            "127.0.0.1:19070".parse().unwrap(),
-            3,
-        )
-        .expect("install loopback registry");
-        let result = super::dispatcher_for_role(ClusterRole::AllInOne);
-        assert!(result.is_ok(), "AllInOne should produce a dispatcher");
-    }
-
-    #[test]
-    fn all_in_one_dispatcher_uses_remote_registry() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
-        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        let mut cfg = NovaRocksConfig::default();
-        cfg.cluster.role = ClusterRole::AllInOne;
-        cfg.cluster.backends.clear();
-        crate::common::app_config::install_preloaded_config(cfg);
-
-        let endpoint = "127.0.0.1:19070".parse().unwrap();
-        crate::engine::backend_ops::install_all_in_one_backend_registry(endpoint, 3)
-            .expect("install loopback registry");
-
-        let dispatcher = super::dispatcher_for_role(ClusterRole::AllInOne).expect("dispatcher");
-
-        assert_eq!(dispatcher.backend_count(), 1);
-    }
-
-    #[test]
-    fn coordinated_execution_services_use_one_live_backend_snapshot() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
-        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        use crate::coordinator::cluster::{BackendRegistry, BackendState};
-        let mut cfg = NovaRocksConfig::default();
-        cfg.cluster.role = ClusterRole::Fe;
-        cfg.cluster.backends.clear();
-        crate::common::app_config::install_preloaded_config(cfg);
-
-        let endpoint = "127.0.0.1:19072".parse().unwrap();
-        let registry = Arc::new(BackendRegistry::new(3));
-        registry.restore_backend(2, endpoint, BackendState::Live);
-        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
-
-        let (execution_ports, scheduler) =
-            super::coordinated_execution_services().expect("coordinated services");
-
-        assert_eq!(execution_ports.dispatcher.backend_count(), 1);
-        assert_eq!(
-            scheduler.live_backend_snapshot().entries(),
-            &[(2usize, endpoint)]
-        );
-    }
-
-    #[test]
-    fn coordinated_execution_services_preserve_exact_snapshot_entries() {
-        let first = "127.0.0.1:19073".parse().unwrap();
-        let second = "127.0.0.1:19079".parse().unwrap();
-        let entries = vec![(2usize, first), (11usize, second)];
-        let snapshot = crate::coordinator::cluster::LiveBackendSnapshot::new(entries.clone());
-
-        let (dispatcher, scheduler) =
-            super::dispatch_and_scheduler_from_live_backend_snapshot(snapshot)
-                .expect("construct dispatcher and scheduler from one snapshot");
-
-        assert_eq!(dispatcher.addr_of(2), Some(first));
-        assert_eq!(dispatcher.addr_of(11), Some(second));
-        assert_eq!(dispatcher.addr_of(0), None);
-        assert_eq!(
-            scheduler.live_backend_snapshot().entries(),
-            entries.as_slice()
-        );
     }
 
     fn install_optimizer_backend_count_config(
@@ -8619,96 +8949,6 @@ path = "meta/operations.sqlite"
         install_optimizer_backend_count_config(0, Vec::new());
 
         assert_eq!(super::live_effective_backend_count(), 1.0);
-    }
-
-    #[test]
-    fn dispatcher_for_role_fe_no_backend_configured_returns_error() {
-        let _guard = super::acquire_standalone_test_guard();
-        use crate::common::app_config::ClusterRole;
-        crate::common::app_config::install_default_for_test();
-        let result = super::dispatcher_for_role(ClusterRole::Fe);
-        assert!(
-            result.is_err(),
-            "Fe role with no backends must return an error"
-        );
-        let msg = result.err().expect("expected error");
-        assert!(
-            msg.contains("role=fe"),
-            "error must mention role=fe, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn dispatcher_for_role_be_returns_error_instead_of_panicking() {
-        use crate::common::app_config::ClusterRole;
-        let result = super::dispatcher_for_role(ClusterRole::Be);
-        assert!(result.is_err(), "Be role must return a recoverable error");
-        let msg = result.err().expect("expected error");
-        assert!(
-            msg.contains("role=be") && msg.contains("coordinator"),
-            "error must mention role=be and coordinator, got: {msg}"
-        );
-    }
-
-    // --- PR-4 spec compliance tests ---
-
-    /// Issue 2: FE role with a valid backend address returns a dispatcher.
-    #[test]
-    fn dispatcher_for_role_fe_valid_backend_returns_dispatcher() {
-        let _guard = super::acquire_standalone_test_guard();
-        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        let mut cfg = NovaRocksConfig::default();
-        cfg.cluster.backends = vec!["127.0.0.1:9070".to_string()];
-        crate::common::app_config::install_preloaded_config(cfg);
-        let result = super::dispatcher_for_role(ClusterRole::Fe);
-        assert!(
-            result.is_ok(),
-            "Fe with valid backend must return a dispatcher, got: {:?}",
-            result.err()
-        );
-    }
-
-    /// Issue 2: FE role with a malformed backend address returns an error that
-    /// names both the role and the bad address value.
-    #[test]
-    fn dispatcher_for_role_fe_malformed_backend_returns_error_with_role_and_value() {
-        let _guard = super::acquire_standalone_test_guard();
-        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        let mut cfg = NovaRocksConfig::default();
-        cfg.cluster.backends = vec!["not-an-addr".to_string()];
-        crate::common::app_config::install_preloaded_config(cfg);
-        let result = super::dispatcher_for_role(ClusterRole::Fe);
-        assert!(result.is_err(), "malformed backend must return an error");
-        let msg = result.err().expect("error");
-        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
-        assert!(
-            msg.contains("not-an-addr"),
-            "must include the bad value: {msg}"
-        );
-    }
-
-    /// D2: FE role with more than one backend builds a multi-backend
-    /// `RemoteDispatcher`. The dispatcher reports a backend count equal to the
-    /// number of configured backends.
-    #[test]
-    fn dispatcher_for_role_fe_multiple_backends_ok() {
-        let _guard = super::acquire_standalone_test_guard();
-        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        let mut cfg = NovaRocksConfig::default();
-        cfg.cluster.backends = vec!["127.0.0.1:9070".to_string(), "127.0.0.1:9071".to_string()];
-        crate::common::app_config::install_preloaded_config(cfg);
-        let result = super::dispatcher_for_role(ClusterRole::Fe);
-        assert!(
-            result.is_ok(),
-            "Fe with multiple backends must build a dispatcher, got: {:?}",
-            result.err()
-        );
-        let dispatcher = result.expect("dispatcher");
-        assert_eq!(
-            dispatcher.backend_count(),
-            2,
-            "dispatcher must route to both configured backends"
-        );
     }
 
     #[test]
@@ -8910,25 +9150,6 @@ path = "meta/operations.sqlite"
             observation.writer_fragment_ids[0].is_some(),
             "fragment builder must assign the writer fragment before execution"
         );
-    }
-
-    #[test]
-    fn dispatcher_for_role_fe_uses_live_registry_backend_ids() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
-        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        use crate::coordinator::cluster::{BackendRegistry, BackendState};
-        let mut cfg = NovaRocksConfig::default();
-        cfg.cluster.role = ClusterRole::Fe;
-        cfg.cluster.backends.clear();
-        crate::common::app_config::install_preloaded_config(cfg);
-
-        let registry = Arc::new(BackendRegistry::new(3));
-        registry.restore_backend(2, "127.0.0.1:19072".parse().unwrap(), BackendState::Live);
-        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
-
-        let dispatcher = super::dispatcher_for_role(ClusterRole::Fe).expect("dispatcher");
-        assert_eq!(dispatcher.backend_count(), 1);
     }
 
     #[test]

@@ -2041,6 +2041,13 @@ fn start_standalone_grpc_server(
             return Err(error);
         }
     };
+    let bound_port = std_listener
+        .local_addr()
+        .map_err(|error| {
+            clear_grpc_server_startup_reservation();
+            format!("read {} bound address failed: {error}", mode.label())
+        })?
+        .port();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (failure_tx, failure_rx) = mpsc::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
@@ -2051,7 +2058,7 @@ fn start_standalone_grpc_server(
             info!(
                 target: "novarocks::grpc",
                 host = %host,
-                port = port,
+                port = bound_port,
                 mode = ?mode,
                 "starting standalone grpc server"
             );
@@ -2112,7 +2119,7 @@ fn start_standalone_grpc_server(
     debug_assert!(state.starting, "standalone grpc start lost its reservation");
     state.starting = false;
     state.started = true;
-    state.bound_port = Some(port);
+    state.bound_port = Some(bound_port);
     state.shutdown_tx = Some(shutdown_tx);
     state.join_handle = Some(join_handle);
     state.stop_requested = Some(stop_requested);

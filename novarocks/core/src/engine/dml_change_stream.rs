@@ -280,6 +280,7 @@ pub(crate) fn execute_dml_change_stream_write(
         return dml_change_stream_write_execution(result, commit_plan);
     }
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
+        state,
         prepared,
         native_bundle,
         query_opts.cloned(),

@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::query_execution::artifact::{
+    BackendPlacement, FragmentScheduleDraft, NativeSubmissionContext, RuntimeFilterDeploymentEpoch,
+    RuntimeFilterDeploymentOptions, RuntimeFilterInstallBarrier, RuntimeFilterInstallLease,
+    RuntimeFilterInstallLeaseGuard, ValidatedFragmentSchedule,
+};
 use crate::query_execution::cancellation::QueryCancellationView;
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
@@ -32,6 +37,58 @@ use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+struct RecordingRuntimeFilterLease {
+    releases: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+impl RuntimeFilterInstallLeaseGuard for RecordingRuntimeFilterLease {
+    fn release(mut self: Box<Self>) {
+        self.armed = false;
+        self.releases.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> String {
+        self.armed = false;
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        format!("{primary_error}; test rollback completed")
+    }
+}
+
+impl Drop for RecordingRuntimeFilterLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+struct RecordingRuntimeFilterBarrier {
+    calls: Arc<AtomicUsize>,
+    participants: Arc<AtomicUsize>,
+    releases: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+}
+
+impl RuntimeFilterInstallBarrier for RecordingRuntimeFilterBarrier {
+    fn install_all(
+        &self,
+        plan: crate::query_execution::artifact::RuntimeFilterInstallPlan,
+    ) -> Result<RuntimeFilterInstallLease, DistributedQueryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.participants
+            .store(plan.participant_count(), Ordering::SeqCst);
+        Ok(RuntimeFilterInstallLease::new(Box::new(
+            RecordingRuntimeFilterLease {
+                releases: self.releases.clone(),
+                aborts: self.aborts.clone(),
+                armed: true,
+            },
+        )))
+    }
+}
 
 fn real_execution_artifacts() -> (
     crate::query_execution::preparation::PreparedFragmentSet,
@@ -117,6 +174,200 @@ fn request_owns_prepared_and_native_artifacts() {
     let completion = parts.completion;
     assert!(!cancellation.is_cancelled());
     assert_eq!(completion.intent(), DistributedQueryIntent::Result);
+}
+
+#[test]
+fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let participants = Arc::new(AtomicUsize::new(usize::MAX));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let barrier = RecordingRuntimeFilterBarrier {
+        calls: calls.clone(),
+        participants: participants.clone(),
+        releases: releases.clone(),
+        aborts: aborts.clone(),
+    };
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let request = build_distributed_query_request(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Result,
+        QueryCancellationView::never_cancelled(),
+    )
+    .expect("build request");
+    let parts = request.into_parts();
+    let query_id = crate::query_execution::contract::QueryId::new(41, 73);
+    let mut draft = FragmentScheduleDraft::new();
+    let endpoint = "127.0.0.1:19031".parse().unwrap();
+    draft
+        .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
+        .unwrap();
+    let schedule =
+        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), query_id, draft)
+            .unwrap();
+    let scheduled = parts.artifacts.bind_schedule(schedule).unwrap();
+    let deployment_options = RuntimeFilterDeploymentOptions::new(
+        RuntimeFilterDeploymentEpoch::new(9).unwrap(),
+        vec![(3, endpoint)],
+        2,
+        parts.options.runtime_filter_lifecycle(),
+    )
+    .unwrap();
+
+    let ready = scheduled
+        .prepare_runtime_filters(deployment_options, &barrier)
+        .expect("empty graph still crosses the explicit barrier");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(participants.load(Ordering::SeqCst), 0);
+
+    let execution = ready
+        .assemble(NativeSubmissionContext::new(
+            query_id,
+            &parts.options,
+            crate::query_execution::backend::CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().unwrap(),
+            ),
+            false,
+        ))
+        .expect("barrier-ready query assembles");
+    let execution = execution.into_parts();
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+    assert_eq!(aborts.load(Ordering::SeqCst), 0);
+    execution.runtime_filter_lease.release();
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn assembly_failure_aborts_the_lease_and_preserves_rollback_context() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let participants = Arc::new(AtomicUsize::new(0));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let barrier = RecordingRuntimeFilterBarrier {
+        calls,
+        participants,
+        releases: releases.clone(),
+        aborts: aborts.clone(),
+    };
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let request = build_distributed_query_request(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Result,
+        QueryCancellationView::never_cancelled(),
+    )
+    .expect("build request");
+    let parts = request.into_parts();
+    let scheduled_query_id = crate::query_execution::contract::QueryId::new(41, 73);
+    let endpoint = "127.0.0.1:19031".parse().unwrap();
+    let mut draft = FragmentScheduleDraft::new();
+    draft
+        .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
+        .unwrap();
+    let schedule = ValidatedFragmentSchedule::validate(
+        parts.artifacts.scheduling_view(),
+        scheduled_query_id,
+        draft,
+    )
+    .unwrap();
+    let ready = parts
+        .artifacts
+        .bind_schedule(schedule)
+        .unwrap()
+        .prepare_runtime_filters(
+            RuntimeFilterDeploymentOptions::new(
+                RuntimeFilterDeploymentEpoch::new(9).unwrap(),
+                vec![(3, endpoint)],
+                2,
+                parts.options.runtime_filter_lifecycle(),
+            )
+            .unwrap(),
+            &barrier,
+        )
+        .unwrap();
+
+    let error = match ready.assemble(NativeSubmissionContext::new(
+        crate::query_execution::contract::QueryId::new(41, 74),
+        &parts.options,
+        crate::query_execution::backend::CoordinatorReportEndpoint::from_socket_addr(
+            "127.0.0.1:19030".parse().unwrap(),
+        ),
+        false,
+    )) {
+        Ok(_) => panic!("query-id drift must fail assembly"),
+        Err(error) => error,
+    };
+
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+    assert_eq!(aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        error.message(),
+        "native submission context query id does not match validated schedule; test rollback completed"
+    );
+}
+
+#[test]
+#[cfg(feature = "query-execution-contract-test-support")]
+fn nonempty_runtime_filter_graph_is_compiled_before_the_install_barrier() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let participants = Arc::new(AtomicUsize::new(0));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let barrier = RecordingRuntimeFilterBarrier {
+        calls: calls.clone(),
+        participants: participants.clone(),
+        releases: releases.clone(),
+        aborts: aborts.clone(),
+    };
+    let fixture =
+        crate::query_execution::contract_test_support::non_empty_runtime_filter_contract_fixture();
+    let live_backends = fixture.backends().to_vec();
+    let request = fixture.into_request();
+    let parts = request.into_parts();
+    let query_id = crate::query_execution::contract::QueryId::new(41, 73);
+    let mut draft = FragmentScheduleDraft::new();
+    draft
+        .assign_fragment(
+            11,
+            live_backends
+                .iter()
+                .map(|(backend_idx, endpoint)| BackendPlacement::new(*backend_idx, *endpoint))
+                .collect(),
+        )
+        .unwrap();
+    draft
+        .assign_fragment(
+            19,
+            vec![BackendPlacement::new(
+                live_backends[0].0,
+                live_backends[0].1,
+            )],
+        )
+        .unwrap();
+    let schedule =
+        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), query_id, draft)
+            .unwrap();
+    let scheduled = parts.artifacts.bind_schedule(schedule).unwrap();
+    let options = RuntimeFilterDeploymentOptions::new(
+        RuntimeFilterDeploymentEpoch::new(17).unwrap(),
+        live_backends,
+        2,
+        parts.options.runtime_filter_lifecycle(),
+    )
+    .unwrap();
+
+    let ready = scheduled
+        .prepare_runtime_filters(options, &barrier)
+        .expect("compiled participant plan crosses the barrier");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(participants.load(Ordering::SeqCst), 2);
+    drop(ready);
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+    assert_eq!(aborts.load(Ordering::SeqCst), 1);
 }
 
 #[test]

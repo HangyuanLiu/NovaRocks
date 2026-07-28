@@ -50,7 +50,9 @@ use crate::engine::mv_scheduler::RefreshCoordinatorConfig;
 use crate::engine::statement::{
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
 };
-use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
+use crate::engine::{
+    StandaloneNovaRocks, StandaloneOpenServices, StandaloneOptions, StatementResult,
+};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::optimizer::options::SessionOptimizerSettings;
 use crate::sql::parser::dialect::StarRocksDialect;
@@ -148,9 +150,12 @@ pub(crate) fn test_resolve_fe_server_options(
 #[deprecated(
     note = "prefer run_standalone_server_with_config when a validated config is available"
 )]
-pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String> {
+pub fn run_standalone_server(
+    opts: StandaloneServerOptions,
+    services: StandaloneOpenServices,
+) -> Result<(), String> {
     let resolved = resolve_server_options(&opts)?;
-    run_with_resolved_options(resolved)
+    run_with_resolved_options(resolved, services)
 }
 
 /// Run the standalone server using an already-loaded, validated [`NovaRocksConfig`].
@@ -165,6 +170,7 @@ pub fn run_standalone_server_with_config(
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
+    services: StandaloneOpenServices,
 ) -> Result<(), String> {
     let resolved = resolve_server_options_from_config(&cfg, port_override)?;
     let resolved = ResolvedStandaloneServerOptions {
@@ -173,7 +179,7 @@ pub fn run_standalone_server_with_config(
         grpc_endpoint: StandaloneGrpcEndpointOwnership::HostedReportOnly,
         ..resolved
     };
-    run_with_resolved_options(resolved)
+    run_with_resolved_options(resolved, services)
 }
 
 /// Run the standalone server until the supplied shutdown future resolves.
@@ -187,14 +193,7 @@ pub async fn run_standalone_server_with_config_until_shutdown<F>(
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
     grpc_endpoint: StandaloneGrpcEndpointOwnership,
-    system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
-    view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
-    statistics_service: std::sync::Arc<dyn crate::engine::statistics::StatisticsService>,
-    table_maintenance_service: std::sync::Arc<
-        dyn crate::engine::table_maintenance::TableMaintenanceService,
-    >,
-    mv_repository: std::sync::Arc<dyn crate::mv::repository::MvRepository>,
-    mv_application_service: std::sync::Arc<dyn crate::mv::application::MvApplicationService>,
+    services: StandaloneOpenServices,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -207,17 +206,7 @@ where
         grpc_endpoint,
         ..resolved
     };
-    run_with_resolved_options_until_shutdown(
-        resolved,
-        system_catalog,
-        view_service,
-        statistics_service,
-        table_maintenance_service,
-        mv_repository,
-        mv_application_service,
-        shutdown,
-    )
-    .await
+    run_with_resolved_options_until_shutdown(resolved, services, shutdown).await
 }
 
 /// Run the standalone server for `role=fe`.
@@ -229,6 +218,7 @@ pub fn run_standalone_fe_server_with_config(
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
+    services: StandaloneOpenServices,
 ) -> Result<(), String> {
     let resolved = resolve_server_options_from_config(&cfg, port_override)?;
     let resolved = ResolvedStandaloneServerOptions {
@@ -237,14 +227,17 @@ pub fn run_standalone_fe_server_with_config(
         grpc_endpoint: StandaloneGrpcEndpointOwnership::HostedReportOnly,
         ..resolved
     };
-    run_with_resolved_options(resolved)
+    run_with_resolved_options(resolved, services)
 }
 
 pub fn configure_standalone_internal_rpc_transport() {
     crate::service::internal_rpc_transport::use_grpc_internal_rpc_transport();
 }
 
-fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Result<(), String> {
+fn run_with_resolved_options(
+    resolved: ResolvedStandaloneServerOptions,
+    services: StandaloneOpenServices,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
@@ -253,26 +246,14 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
 
     runtime.block_on(run_with_resolved_options_until_shutdown(
         resolved,
-        std::sync::Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-        std::sync::Arc::new(crate::engine::view::EmptyViewService),
-        std::sync::Arc::new(crate::engine::statistics::EmptyStatisticsService),
-        std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-        std::sync::Arc::new(crate::mv::repository::UnavailableMvRepository),
-        std::sync::Arc::new(crate::mv::application::UnavailableMvApplicationService),
+        services,
         std::future::pending(),
     ))
 }
 
 async fn run_with_resolved_options_until_shutdown<F>(
     resolved: ResolvedStandaloneServerOptions,
-    system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
-    view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
-    statistics_service: std::sync::Arc<dyn crate::engine::statistics::StatisticsService>,
-    table_maintenance_service: std::sync::Arc<
-        dyn crate::engine::table_maintenance::TableMaintenanceService,
-    >,
-    mv_repository: std::sync::Arc<dyn crate::mv::repository::MvRepository>,
-    mv_application_service: std::sync::Arc<dyn crate::mv::application::MvApplicationService>,
+    services: StandaloneOpenServices,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -284,18 +265,15 @@ where
         config_path: resolved.config_path.clone(),
     };
     let engine = match resolved.preloaded_config {
-        Some(cfg) => StandaloneNovaRocks::open_with_config(
-            opts,
-            cfg,
-            system_catalog,
-            view_service,
-            statistics_service,
-            table_maintenance_service,
-            mv_repository,
-            mv_application_service,
-        )?,
-        None => StandaloneNovaRocks::open(opts)?,
+        Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg, services)?,
+        None => StandaloneNovaRocks::open(opts, services)?,
     };
+    let owns_grpc_endpoint =
+        start_standalone_grpc_endpoint(&resolved.grpc_bind_host, resolved.grpc_endpoint)?;
+    if owns_grpc_endpoint {
+        let bound_port = crate::service::grpc_server::grpc_server_bound_port()?;
+        engine.publish_coordinator_report_bound_port(bound_port);
+    }
     let coordinator_handles = (
         crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
             &engine,
@@ -308,9 +286,6 @@ where
     );
 
     let server = async move {
-        let owns_grpc_endpoint =
-            start_standalone_grpc_endpoint(&resolved.grpc_bind_host, resolved.grpc_endpoint)?;
-
         let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, resolved.mysql_port));
         let ready_user = resolved.user.clone();
         let session_engine = engine;

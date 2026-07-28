@@ -20,11 +20,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod lifecycle;
+#[cfg(test)]
 mod query_cleanup;
 
 #[cfg(not(test))]
-pub(crate) use lifecycle::spawn_heartbeat_manager;
+pub(crate) use lifecycle::{HeartbeatManagerHandle, spawn_heartbeat_manager};
 pub(crate) use lifecycle::{RegistryEventSink, run_heartbeat_round};
+#[cfg(test)]
 pub(crate) use query_cleanup::QueryCleanupSink;
 
 static GLOBAL_REGISTRY: OnceLock<Mutex<Option<Arc<BackendRegistry>>>> = OnceLock::new();
@@ -124,6 +126,7 @@ pub(crate) struct BackendRegistry {
 struct RegistryInner {
     timeout_retries: u32,
     next_be_id: BeId,
+    topology_revision: u64,
     entries: BTreeMap<BeId, BackendEntry>,
     endpoint_to_id: HashMap<SocketAddr, BeId>,
 }
@@ -134,6 +137,7 @@ impl BackendRegistry {
             inner: Mutex::new(RegistryInner {
                 timeout_retries: timeout_retries.max(1),
                 next_be_id: 0,
+                topology_revision: 0,
                 entries: BTreeMap::new(),
                 endpoint_to_id: HashMap::new(),
             }),
@@ -171,6 +175,7 @@ impl BackendRegistry {
             },
         );
         inner.endpoint_to_id.insert(endpoint, be_id);
+        inner.topology_revision = inner.topology_revision.saturating_add(1);
         be_id
     }
 
@@ -199,6 +204,7 @@ impl BackendRegistry {
             },
         );
         inner.endpoint_to_id.insert(endpoint, be_id);
+        inner.topology_revision = inner.topology_revision.saturating_add(1);
     }
 
     pub(crate) fn seed_from_config(&self, endpoints: &[SocketAddr]) {
@@ -221,7 +227,9 @@ impl BackendRegistry {
             return Vec::new();
         }
 
-        match outcome {
+        let previous_state = entry.state;
+        let previous_start_epoch = entry.start_epoch;
+        let events = match outcome {
             HeartbeatOutcome::Ok {
                 start_epoch,
                 version,
@@ -255,19 +263,47 @@ impl BackendRegistry {
                     Vec::new()
                 }
             }
+        };
+        if entry.state != previous_state || entry.start_epoch != previous_start_epoch {
+            inner.topology_revision = inner.topology_revision.saturating_add(1);
         }
+        events
     }
 
     pub(crate) fn live_endpoints(&self) -> Vec<(BeId, SocketAddr)> {
-        self.inner
-            .lock()
-            .unwrap()
-            .entries
-            .iter()
-            .filter_map(|(be_id, entry)| {
-                (entry.state == BackendState::Live).then_some((*be_id, entry.endpoint))
-            })
-            .collect()
+        self.live_snapshot().1
+    }
+
+    pub(crate) fn live_snapshot(&self) -> (u64, Vec<(BeId, SocketAddr)>) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.topology_revision,
+            inner
+                .entries
+                .iter()
+                .filter_map(|(be_id, entry)| {
+                    (entry.state == BackendState::Live).then_some((*be_id, entry.endpoint))
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn live_query_snapshot(&self) -> (u64, Vec<(BeId, SocketAddr, u64)>) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.topology_revision,
+            inner
+                .entries
+                .iter()
+                .filter_map(|(be_id, entry)| {
+                    (entry.state == BackendState::Live).then_some((
+                        *be_id,
+                        entry.endpoint,
+                        entry.start_epoch,
+                    ))
+                })
+                .collect(),
+        )
     }
 
     pub(crate) fn snapshot(&self) -> Vec<BackendEntry> {
@@ -298,7 +334,10 @@ impl BackendRegistry {
             return Err(format!("backend {endpoint} not found"));
         };
         if let Some(entry) = inner.entries.get_mut(&be_id) {
-            entry.state = BackendState::Decommissioning;
+            if entry.state != BackendState::Decommissioning {
+                entry.state = BackendState::Decommissioning;
+                inner.topology_revision = inner.topology_revision.saturating_add(1);
+            }
         }
         Ok(be_id)
     }
@@ -308,6 +347,7 @@ impl BackendRegistry {
         if let Some(entry) = inner.entries.remove(&be_id) {
             // A removed endpoint may be added again, but logical ids are never reused.
             inner.endpoint_to_id.remove(&entry.endpoint);
+            inner.topology_revision = inner.topology_revision.saturating_add(1);
         }
     }
 

@@ -259,6 +259,7 @@ pub(crate) fn execute_delta_source_query(
         input.current_database,
         input.state.exchange_port,
         None,
+        &input.state.query_execution,
     )
 }
 

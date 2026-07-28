@@ -15,7 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod backend_events;
 mod contract_probe;
+mod execution;
+mod query_registry;
+mod report;
+mod runtime_filter;
 mod scheduler;
 
+pub use backend_events::BackendQueryActivity;
+pub use execution::FrontendDistributedQueryCoordinator;
+pub use report::FrontendCoordinatorReportHandler;
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

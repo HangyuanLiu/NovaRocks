@@ -46,6 +46,13 @@ use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
 };
 
+pub use crate::query_execution::runtime_filter::{
+    RuntimeFilterAbortEnvelope, RuntimeFilterDeploymentDispatcher, RuntimeFilterDeploymentEpoch,
+    RuntimeFilterDeploymentOptions, RuntimeFilterInstallBarrier, RuntimeFilterInstallEnvelope,
+    RuntimeFilterInstallLease, RuntimeFilterInstallLeaseGuard, RuntimeFilterInstallPlan,
+    RuntimeFilterParticipantInstallPlan, new_grpc_runtime_filter_deployment_dispatcher,
+};
+
 pub type FragmentId = u32;
 pub type PlanNodeId = i32;
 
@@ -80,22 +87,119 @@ impl PreparedDistributedQuery {
         }
     }
 
-    pub fn assemble(
+    pub fn bind_schedule(
         self,
         schedule: ValidatedFragmentSchedule,
-        context: NativeSubmissionContext,
-    ) -> Result<PreparedNativeExecution, DistributedQueryError> {
+    ) -> Result<ScheduleBoundDistributedQuery, DistributedQueryError> {
         if self.handoff_id != schedule.handoff_id {
             return Err(contract_error(
                 "validated fragment schedule belongs to a different prepared query handoff",
             ));
         }
-        if context.query_id != schedule.query_id {
-            return Err(contract_error(
+        Ok(ScheduleBoundDistributedQuery {
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_legacy_test_parts(self) -> (PreparedFragmentSet, NativeFragmentBundle) {
+        (self.prepared, self.native_bundle)
+    }
+}
+
+/// A core artifact bound to one validated schedule. This type deliberately has
+/// no `assemble` method: runtime-filter compilation and the frontend-owned
+/// install/ACK barrier must first produce `RuntimeFilterReadyDistributedQuery`.
+///
+/// ```compile_fail
+/// use novarocks::query_execution::artifact::{
+///     NativeSubmissionContext, ScheduleBoundDistributedQuery,
+/// };
+///
+/// fn assemble_too_early(
+///     scheduled: ScheduleBoundDistributedQuery,
+///     context: NativeSubmissionContext,
+/// ) {
+///     let _ = scheduled.assemble(context);
+/// }
+/// ```
+pub struct ScheduleBoundDistributedQuery {
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    schedule: ValidatedFragmentSchedule,
+}
+
+impl ScheduleBoundDistributedQuery {
+    pub fn prepare_runtime_filters(
+        self,
+        options: RuntimeFilterDeploymentOptions,
+        barrier: &dyn RuntimeFilterInstallBarrier,
+    ) -> Result<RuntimeFilterReadyDistributedQuery, DistributedQueryError> {
+        let plan = crate::query_execution::runtime_filter::compile_install_plan(
+            self.schedule.query_id,
+            self.prepared.runtime_filter_graph(),
+            self.prepared.runtime_filter_join_progress(),
+            self.prepared.scheduling_view().edges(),
+            &self.schedule.inner,
+            options,
+        )?;
+        let runtime_filter_lease = barrier.install_all(plan)?;
+        Ok(RuntimeFilterReadyDistributedQuery {
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            runtime_filter_lease,
+        })
+    }
+}
+
+/// The only typestate that can assemble native submissions.
+pub struct RuntimeFilterReadyDistributedQuery {
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    schedule: ValidatedFragmentSchedule,
+    runtime_filter_lease: RuntimeFilterInstallLease,
+}
+
+impl RuntimeFilterReadyDistributedQuery {
+    pub fn assemble(
+        self,
+        context: NativeSubmissionContext,
+    ) -> Result<PreparedNativeExecution, DistributedQueryError> {
+        if context.query_id != self.schedule.query_id {
+            let error = contract_error(
                 "native submission context query id does not match validated schedule",
-            ));
+            );
+            let kind = error.kind();
+            let message = self
+                .runtime_filter_lease
+                .abort_preserving(error.message().to_string());
+            return Err(DistributedQueryError::new(kind, message));
         }
-        assemble_native_execution(self.prepared, self.native_bundle, schedule.inner, context)
+        let assembled = assemble_native_execution(
+            self.prepared,
+            self.native_bundle,
+            self.schedule.inner,
+            context,
+        );
+        match assembled {
+            Ok(assembled) => Ok(PreparedNativeExecution {
+                submissions: assembled.submissions,
+                root_fetch: assembled.root_fetch,
+                writer_registrations: assembled.writer_registrations,
+                expected_output: assembled.expected_output,
+                runtime_filter_lease: self.runtime_filter_lease,
+            }),
+            Err(error) => {
+                let kind = error.kind();
+                let message = self
+                    .runtime_filter_lease
+                    .abort_preserving(error.message().to_string());
+                Err(DistributedQueryError::new(kind, message))
+            }
+        }
     }
 }
 
@@ -383,6 +487,17 @@ impl ValidatedFragmentSchedule {
             inner,
         })
     }
+
+    pub fn backend_ids(&self) -> Vec<usize> {
+        self.inner
+            .by_fragment
+            .values()
+            .flatten()
+            .map(|placement| placement.backend_idx)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 fn populate_destinations(
@@ -440,13 +555,13 @@ impl NativeSubmissionContext {
     pub fn new(
         query_id: QueryId,
         options: &ResolvedQueryOptions,
-        report_endpoint: SocketAddr,
+        report_endpoint: crate::query_execution::backend::CoordinatorReportEndpoint,
         needs_fragment_status_report: bool,
     ) -> Self {
         Self {
             query_id,
             options: options.runtime_options().clone(),
-            report_endpoint: RuntimeEndpoint::from_socket_addr(report_endpoint),
+            report_endpoint: report_endpoint.into_runtime_endpoint(),
             needs_fragment_status_report,
         }
     }
@@ -516,20 +631,23 @@ impl WriterRegistrationSet {
         self.registrations.len()
     }
 
+    pub fn fragment_instance_ids(&self) -> Vec<UniqueId> {
+        self.registrations
+            .iter()
+            .map(|registration| registration.fragment_instance_id)
+            .collect()
+    }
+
+    pub fn writer_identities(&self) -> Vec<(UniqueId, i32)> {
+        self.registrations
+            .iter()
+            .map(|registration| (registration.fragment_instance_id, registration.backend_num))
+            .collect()
+    }
+
     pub(crate) fn into_registrations(self) -> Vec<WriterRegistration> {
         self.registrations
     }
-}
-
-pub struct RuntimeFilterDeploymentInput {
-    #[allow(dead_code)]
-    graph: crate::runtime_filter::model::graph::RuntimeFilterGraph,
-    #[allow(dead_code)]
-    join_progress: crate::sql::planner::distributed::JoinBuildProgressCatalog,
-    #[allow(dead_code)]
-    edges: Vec<crate::sql::planner::distributed::FragmentEdge>,
-    #[allow(dead_code)]
-    schedule: SchedulingPlan,
 }
 
 pub struct ExpectedOutputSchema {
@@ -576,7 +694,14 @@ pub struct PreparedNativeExecution {
     root_fetch: RootFetchMetadata,
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
-    runtime_filter_deployment: RuntimeFilterDeploymentInput,
+    runtime_filter_lease: RuntimeFilterInstallLease,
+}
+
+struct AssembledNativeExecution {
+    submissions: Vec<ValidatedNativeSubmission>,
+    root_fetch: RootFetchMetadata,
+    writer_registrations: WriterRegistrationSet,
+    expected_output: ExpectedOutputSchema,
 }
 
 impl PreparedNativeExecution {
@@ -586,7 +711,7 @@ impl PreparedNativeExecution {
             root_fetch: self.root_fetch,
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
-            runtime_filter_deployment: self.runtime_filter_deployment,
+            runtime_filter_lease: self.runtime_filter_lease,
         }
     }
 }
@@ -598,7 +723,7 @@ pub struct PreparedNativeExecutionParts {
     pub root_fetch: RootFetchMetadata,
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
-    pub runtime_filter_deployment: RuntimeFilterDeploymentInput,
+    pub runtime_filter_lease: RuntimeFilterInstallLease,
 }
 
 fn assemble_native_execution(
@@ -606,7 +731,7 @@ fn assemble_native_execution(
     native_bundle: NativeFragmentBundle,
     schedule: SchedulingPlan,
     context: NativeSubmissionContext,
-) -> Result<PreparedNativeExecution, DistributedQueryError> {
+) -> Result<AssembledNativeExecution, DistributedQueryError> {
     crate::coordinator::execution::validate_prepared_native_payloads(&prepared, &native_bundle)
         .map_err(contract_error)?;
     crate::coordinator::execution::validate_artifact_fragment_sets(
@@ -830,20 +955,13 @@ fn assemble_native_execution(
         ));
     }
 
-    let (graph, join_progress, edges) = prepared.into_runtime_filter_inputs();
-    Ok(PreparedNativeExecution {
+    Ok(AssembledNativeExecution {
         submissions,
         root_fetch,
         writer_registrations: WriterRegistrationSet {
             registrations: writer_registrations,
         },
         expected_output,
-        runtime_filter_deployment: RuntimeFilterDeploymentInput {
-            graph,
-            join_progress,
-            edges,
-            schedule,
-        },
     })
 }
 

@@ -25,7 +25,10 @@ use novarocks::engine::view::{
     ViewRequestContext, ViewSqlDialect, ViewTarget,
 };
 use novarocks_frontend::view::repository::database_key;
-use novarocks_frontend::{FrontendApplicationErrorKind, FrontendApplicationHost};
+use novarocks_frontend::{
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig,
+};
 use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
 use novarocks_state_store::{
     SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
@@ -36,6 +39,16 @@ use sqlparser::parser::Parser;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+fn execution_config() -> FrontendExecutionConfig {
+    FrontendExecutionConfig::new("127.0.0.1", 19090, std::num::NonZeroUsize::new(1).unwrap())
+}
+
+async fn open_host(
+    config: Option<StateStoreHostConfig>,
+) -> Result<FrontendApplicationHost, FrontendApplicationError> {
+    FrontendApplicationHost::open(config, execution_config()).await
+}
 
 struct SessionViewEngine;
 
@@ -146,7 +159,7 @@ fn sqlite_config(temp: &TempDir) -> StateStoreHostConfig {
 
 #[tokio::test]
 async fn host_exposes_one_statistics_service_identity() {
-    let host = FrontendApplicationHost::open(None).await.expect("host");
+    let host = open_host(None).await.expect("host");
     let first = host.statistics_service();
     let second = host.statistics_service();
     assert!(Arc::ptr_eq(&first, &second));
@@ -155,7 +168,7 @@ async fn host_exposes_one_statistics_service_identity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_config_opens_disabled_host() {
-    let host = FrontendApplicationHost::open(None)
+    let host = open_host(None)
         .await
         .expect("absent state store configuration must open a disabled host");
 
@@ -174,6 +187,10 @@ async fn absent_config_opens_disabled_host() {
             .expect("ordinary SQL must pass through the maintenance service")
             .is_none()
     );
+    let _query_execution = host.query_execution_service();
+    let _report_handler = host.coordinator_report_handler();
+    let _backend_activity = host.backend_query_activity();
+    let _backend_event_sink = host.backend_query_event_sink();
     assert!(
         host.view_service()
             .try_handle_statement(
@@ -191,7 +208,7 @@ async fn absent_config_opens_disabled_host() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_host_opens_store_with_single_fe_view() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
-    let host = FrontendApplicationHost::open(Some(sqlite_config(&temp)))
+    let host = open_host(Some(sqlite_config(&temp)))
         .await
         .expect("SQLite host must open its state store");
 
@@ -244,7 +261,7 @@ async fn unsupported_provider_fails_before_store_open() {
     };
 
     for config in [mysql_config, foundationdb_config] {
-        let error = match FrontendApplicationHost::open(Some(config)).await {
+        let error = match open_host(Some(config)).await {
             Ok(_) => panic!("deferred provider must be rejected before runtime or store I/O"),
             Err(error) => error,
         };
@@ -275,13 +292,13 @@ async fn failed_open_releases_partial_resources() {
         foundationdb_client: None,
     };
 
-    let error = match FrontendApplicationHost::open(Some(config.clone())).await {
+    let error = match open_host(Some(config.clone())).await {
         Ok(_) => panic!("unopenable SQLite path must fail host initialization"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), FrontendApplicationErrorKind::StateStoreHost);
 
-    let host = FrontendApplicationHost::open(Some(sqlite_config(&temp)))
+    let host = open_host(Some(sqlite_config(&temp)))
         .await
         .expect("failed open must not retain partial runtime resources");
     host.shutdown()
@@ -293,14 +310,14 @@ async fn failed_open_releases_partial_resources() {
 async fn shutdown_releases_sqlite_deployment_lock() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("first SQLite host must open");
 
     host.shutdown()
         .await
         .expect("host shutdown must release the SQLite deployment lock");
-    let reopened = FrontendApplicationHost::open(Some(config))
+    let reopened = open_host(Some(config))
         .await
         .expect("SQLite deployment must reopen after shutdown");
     reopened
@@ -313,11 +330,11 @@ async fn shutdown_releases_sqlite_deployment_lock() {
 async fn shutdown_is_required_to_reopen_same_deployment() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("first SQLite host must open");
 
-    let error = match FrontendApplicationHost::open(Some(config.clone())).await {
+    let error = match open_host(Some(config.clone())).await {
         Ok(_) => panic!("second live SQLite host must be rejected"),
         Err(error) => error,
     };
@@ -326,7 +343,7 @@ async fn shutdown_is_required_to_reopen_same_deployment() {
     host.shutdown()
         .await
         .expect("first host shutdown must succeed");
-    let reopened = FrontendApplicationHost::open(Some(config))
+    let reopened = open_host(Some(config))
         .await
         .expect("same SQLite deployment must reopen after explicit shutdown");
     reopened
@@ -339,7 +356,7 @@ async fn shutdown_is_required_to_reopen_same_deployment() {
 async fn configured_host_restores_views_through_its_service_after_reopen() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open");
     host.view_service()
@@ -351,7 +368,7 @@ async fn configured_host_restores_views_through_its_service_after_reopen() {
         .expect("host view service must persist the view");
     host.shutdown().await.expect("first host shutdown");
 
-    let reopened = FrontendApplicationHost::open(Some(config))
+    let reopened = open_host(Some(config))
         .await
         .expect("configured host must reopen");
     let mut query = parse_query("SELECT * FROM durable_view");
@@ -370,7 +387,7 @@ async fn configured_host_restores_views_through_its_service_after_reopen() {
 async fn corrupt_view_record_fails_host_open_at_the_view_service_boundary() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open");
     let store = host.state_store().expect("configured host state store");
@@ -396,7 +413,7 @@ async fn corrupt_view_record_fails_host_open_at_the_view_service_boundary() {
     drop(store);
     host.shutdown().await.expect("seed host shutdown");
 
-    let error = match FrontendApplicationHost::open(Some(config)).await {
+    let error = match open_host(Some(config)).await {
         Ok(_) => panic!("corrupt durable view metadata must reject host open"),
         Err(error) => error,
     };
@@ -408,7 +425,7 @@ async fn corrupt_view_record_fails_host_open_at_the_view_service_boundary() {
 async fn view_open_failure_precedes_table_maintenance_open_failure() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open");
     let store = host.state_store().expect("configured host state store");
@@ -445,7 +462,7 @@ async fn view_open_failure_precedes_table_maintenance_open_failure() {
     drop(store);
     host.shutdown().await.expect("seed host shutdown");
 
-    let error = match FrontendApplicationHost::open(Some(config)).await {
+    let error = match open_host(Some(config)).await {
         Ok(_) => panic!("corrupt durable application metadata must reject host open"),
         Err(error) => error,
     };
@@ -457,7 +474,7 @@ async fn view_open_failure_precedes_table_maintenance_open_failure() {
 async fn corrupt_table_maintenance_record_fails_open_and_releases_partial_resources() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open");
     let store = host.state_store().expect("configured host state store");
@@ -487,7 +504,7 @@ async fn corrupt_table_maintenance_record_fails_open_and_releases_partial_resour
     host.shutdown().await.expect("seed host shutdown");
 
     for _ in 0..2 {
-        let error = match FrontendApplicationHost::open(Some(config.clone())).await {
+        let error = match open_host(Some(config.clone())).await {
             Ok(_) => panic!("corrupt maintenance metadata must reject host open"),
             Err(error) => error,
         };

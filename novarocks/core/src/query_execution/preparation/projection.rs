@@ -168,8 +168,6 @@ impl PreparedFragmentSet {
         self.by_fragment.get(&fragment_id)
     }
 
-    // Task 4 consumes this accessor when it wires compiler/barrier installation.
-    #[allow(dead_code)]
     pub(crate) fn runtime_filter_graph(&self) -> &RuntimeFilterGraph {
         &self.runtime_filter_graph
     }
@@ -178,20 +176,6 @@ impl PreparedFragmentSet {
         &self,
     ) -> &crate::sql::planner::distributed::JoinBuildProgressCatalog {
         &self.projection.runtime_filter_join_progress
-    }
-
-    pub(crate) fn into_runtime_filter_inputs(
-        self,
-    ) -> (
-        RuntimeFilterGraph,
-        crate::sql::planner::distributed::JoinBuildProgressCatalog,
-        Vec<FragmentEdge>,
-    ) {
-        (
-            self.runtime_filter_graph,
-            self.projection.runtime_filter_join_progress,
-            self.projection.edges,
-        )
     }
 }
 
@@ -313,4 +297,28 @@ pub(crate) fn prepared_fragment_set_for_test(
         RuntimeFilterGraph::default(),
         Default::default(),
     )
+}
+
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub(crate) fn prepared_fragment_set_with_runtime_filter_for_test(
+    fragments: Vec<(
+        FragmentId,
+        PreparedFragmentRole,
+        Vec<(i32, Vec<ScanRangeParams>)>,
+    )>,
+    topological_fragment_order: Vec<FragmentId>,
+    execution_anchor_fragment_id: FragmentId,
+    edges: Vec<FragmentEdge>,
+    runtime_filter_graph: RuntimeFilterGraph,
+    runtime_filter_join_progress: crate::sql::planner::distributed::JoinBuildProgressCatalog,
+) -> PreparedFragmentSet {
+    let mut prepared = prepared_fragment_set_for_test(
+        fragments,
+        topological_fragment_order,
+        execution_anchor_fragment_id,
+        edges,
+    );
+    prepared.runtime_filter_graph = runtime_filter_graph;
+    prepared.projection.runtime_filter_join_progress = runtime_filter_join_progress;
+    prepared
 }

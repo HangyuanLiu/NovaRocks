@@ -71,6 +71,12 @@ pub struct WriteAbortInput {
     pub(crate) incomplete_writers: Vec<WriterKey>,
 }
 
+impl WriteAbortInput {
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 /// Neutral frontend-facing report value decoded by core from native wire data.
 /// Native protobuf fields and runtime cleanup capabilities are not exposed.
 pub struct NativeExecutionReport {
@@ -79,12 +85,39 @@ pub struct NativeExecutionReport {
 }
 
 impl NativeExecutionReport {
+    pub fn query_id(&self) -> crate::query_execution::contract::QueryId {
+        crate::query_execution::contract::QueryId::new(
+            self.write.query_id.hi,
+            self.write.query_id.lo,
+        )
+    }
+
     pub fn fragment_instance_id(&self) -> UniqueId {
         self.write.fragment_instance_id
     }
 
+    pub fn backend_num(&self) -> i32 {
+        self.write.backend_num
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.write.done
+    }
+
     pub fn is_failed(&self) -> bool {
         self.write.status.code != 0
+    }
+
+    pub fn has_profile(&self) -> bool {
+        self.profile.is_some()
+    }
+
+    pub fn has_write_metadata(&self) -> bool {
+        !self.write.iceberg_commits.is_empty()
+    }
+
+    pub fn same_write_report(&self, other: &Self) -> bool {
+        self.write == other.write
     }
 
     pub fn failure_message(&self) -> Option<&str> {
@@ -124,6 +157,31 @@ impl NativeExecutionReport {
             profile,
         }
     }
+
+    #[cfg(feature = "query-execution-contract-test-support")]
+    pub(crate) fn for_contract_test_with_write_metadata(
+        query_id: UniqueId,
+        fragment_instance_id: UniqueId,
+        backend_num: i32,
+        done: bool,
+    ) -> Self {
+        let mut report = Self::for_contract_test(
+            query_id,
+            fragment_instance_id,
+            backend_num,
+            common::Status {
+                code: 0,
+                message: String::new(),
+            },
+            None,
+        );
+        report
+            .write
+            .iceberg_commits
+            .push(novarocks::IcebergCommitInfo::default());
+        report.write.done = done;
+        report
+    }
 }
 
 pub struct WriteReportOutcome {
@@ -132,6 +190,10 @@ pub struct WriteReportOutcome {
 }
 
 impl WriteReportOutcome {
+    pub fn abort_reason(&self) -> Option<&str> {
+        self.abort.as_ref().map(|abort| abort.reason.as_str())
+    }
+
     pub fn into_payloads(self) -> (Option<WriteCommitInput>, Option<WriteAbortInput>) {
         (self.commit, self.abort)
     }
@@ -186,16 +248,19 @@ impl WriteReportBuilder {
             fragment_instance_id: report.fragment_instance_id,
             backend_num: report.backend_num,
         };
-        let writer_id = self.expected.get(&key).copied().ok_or_else(|| {
-            contract_violation(format!(
-                "native report references an unregistered writer {}/{}",
-                key.fragment_instance_id.hi, key.fragment_instance_id.lo
-            ))
-        })?;
+        let Some(writer_id) = self.expected.get(&key).copied() else {
+            self.failure.get_or_insert_with(|| {
+                format!(
+                    "native report references an unregistered writer {}/{}",
+                    key.fragment_instance_id.hi, key.fragment_instance_id.lo
+                )
+            });
+            return Ok(());
+        };
         if !report.done {
-            return Err(contract_violation(
-                "write report builder requires final native reports",
-            ));
+            self.failure
+                .get_or_insert_with(|| "write report builder requires final native reports".into());
+            return Ok(());
         }
         if report.status.code != 0 {
             self.failure.get_or_insert_with(|| {
@@ -216,12 +281,21 @@ impl WriteReportBuilder {
             loaded_bytes: report.loaded_bytes,
             filtered_rows: report.filtered_rows,
         };
-        if self.completed.insert(key, output).is_some() {
-            return Err(contract_violation(
-                "write report builder received a duplicate final writer report",
-            ));
+        if let Some(existing) = self.completed.get(&key) {
+            if existing == &output {
+                return Ok(());
+            }
+            self.failure.get_or_insert_with(|| {
+                "write report builder received conflicting final writer output".into()
+            });
+            return Ok(());
         }
+        self.completed.insert(key, output);
         Ok(())
+    }
+
+    pub fn latch_failure(&mut self, message: impl Into<String>) {
+        self.failure.get_or_insert_with(|| message.into());
     }
 
     pub fn finish(self) -> Result<WriteReportOutcome, DistributedQueryError> {

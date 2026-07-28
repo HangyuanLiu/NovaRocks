@@ -32,11 +32,13 @@ use crate::sql::planner::table::ScanSource;
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
 
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub(crate) use projection::prepared_fragment_set_for_test;
 pub(crate) use projection::{
     PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedFragmentSet,
     PreparedOutputColumn,
+};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub(crate) use projection::{
+    prepared_fragment_set_for_test, prepared_fragment_set_with_runtime_filter_for_test,
 };
 #[cfg(test)]
 pub(crate) use scan_preparation::build_iceberg_metadata_scan_range_params;

@@ -1095,6 +1095,7 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
             return Ok(result);
         }
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
+            &self.state,
             prepared,
             native_bundle,
             None,
@@ -1170,6 +1171,7 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
             return Ok(result);
         }
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
+            &self.state,
             prepared,
             native_bundle,
             None,

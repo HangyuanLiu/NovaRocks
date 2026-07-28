@@ -13447,6 +13447,7 @@ fn execute_imv_change_stream_writer(
         return executed_change_stream_write_from_result(result, planned.commit_plan);
     }
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
+        state,
         planned.prepared,
         planned.native_bundle,
         None,

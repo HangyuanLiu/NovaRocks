@@ -17,14 +17,32 @@
 
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::{BackendRegistry, BeId, HeartbeatOutcome, RegistryEvent};
 
 pub(crate) trait RegistryEventSink: Send + Sync + 'static {
     fn on_event(&self, event: RegistryEvent);
+
+    fn on_live_backends(&self, _revision: u64, _backends: Vec<(BeId, SocketAddr, u64)>) {}
+}
+
+pub(crate) struct HeartbeatManagerHandle {
+    shutdown: Arc<(Mutex<bool>, Condvar)>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for HeartbeatManagerHandle {
+    fn drop(&mut self) {
+        let (lock, wake) = self.shutdown.as_ref();
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_all();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 pub(crate) fn run_heartbeat_round<F>(registry: &BackendRegistry, send: &F) -> Vec<RegistryEvent>
@@ -44,25 +62,61 @@ fn dispatch_event(sink: &dyn RegistryEventSink, event: RegistryEvent) {
     let _ = catch_unwind(AssertUnwindSafe(|| sink.on_event(event)));
 }
 
+fn dispatch_live_backends(
+    sink: &dyn RegistryEventSink,
+    revision: u64,
+    backends: Vec<(BeId, SocketAddr, u64)>,
+) {
+    // Sink failures must not terminate the permanent heartbeat manager thread.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        sink.on_live_backends(revision, backends)
+    }));
+}
+
 pub(crate) fn spawn_heartbeat_manager<F>(
     registry: Arc<BackendRegistry>,
     interval: Duration,
     send: F,
     sink: Arc<dyn RegistryEventSink>,
-) where
+) -> Result<HeartbeatManagerHandle, String>
+where
     F: Fn(BeId, SocketAddr) -> HeartbeatOutcome + Send + Sync + 'static,
 {
-    thread::Builder::new()
+    let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
+    let shutdown_for_thread = Arc::clone(&shutdown);
+    let join = thread::Builder::new()
         .name("heartbeat-mgr".to_string())
         .spawn(move || {
             loop {
-                for event in run_heartbeat_round(&registry, &send) {
+                let (shutdown_lock, shutdown_wake) = shutdown_for_thread.as_ref();
+                if *shutdown_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                {
+                    return;
+                }
+                let events = run_heartbeat_round(&registry, &send);
+                let (revision, live) = registry.live_query_snapshot();
+                dispatch_live_backends(sink.as_ref(), revision, live);
+                for event in events {
                     dispatch_event(sink.as_ref(), event);
                 }
-                thread::sleep(interval);
+                let shutdown = shutdown_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (shutdown, _) = shutdown_wake
+                    .wait_timeout_while(shutdown, interval, |shutdown| !*shutdown)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *shutdown {
+                    return;
+                }
             }
         })
-        .expect("failed to spawn heartbeat-mgr thread");
+        .map_err(|error| format!("spawn heartbeat manager failed: {error}"))?;
+    Ok(HeartbeatManagerHandle {
+        shutdown,
+        join: Some(join),
+    })
 }
 
 #[cfg(test)]

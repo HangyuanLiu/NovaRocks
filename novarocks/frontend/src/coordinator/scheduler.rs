@@ -22,16 +22,44 @@ use novarocks::query_execution::artifact::{
     BackendPlacement, FragmentId, FragmentScheduleDraft, FragmentSchedulingView,
     SchedulingStreamKind, ValidatedFragmentSchedule,
 };
+use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, QueryId,
 };
 
+#[derive(Clone)]
 pub struct FrontendBackendSnapshot {
     entries: Vec<(usize, SocketAddr)>,
+    generations: BTreeMap<usize, u64>,
 }
 
 impl FrontendBackendSnapshot {
     pub fn new(entries: Vec<(usize, SocketAddr)>) -> Result<Self, DistributedQueryError> {
+        let generations = entries
+            .iter()
+            .map(|(backend_idx, _)| (*backend_idx, 0))
+            .collect();
+        Self::validate(entries, generations)
+    }
+
+    pub(crate) fn from_live_targets(
+        targets: Vec<LiveBackendTarget>,
+    ) -> Result<Self, DistributedQueryError> {
+        let entries = targets
+            .iter()
+            .map(|target| (target.backend_idx(), target.endpoint()))
+            .collect();
+        let generations = targets
+            .into_iter()
+            .map(|target| (target.backend_idx(), target.start_epoch()))
+            .collect();
+        Self::validate(entries, generations)
+    }
+
+    fn validate(
+        entries: Vec<(usize, SocketAddr)>,
+        generations: BTreeMap<usize, u64>,
+    ) -> Result<Self, DistributedQueryError> {
         if entries.is_empty() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::Rejected,
@@ -45,14 +73,28 @@ impl FrontendBackendSnapshot {
                 "frontend backend snapshot contains duplicate backend ids",
             ));
         }
-        Ok(Self { entries })
+        if generations.len() != entries.len() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "frontend backend snapshot contains duplicate backend generations",
+            ));
+        }
+        Ok(Self {
+            entries,
+            generations,
+        })
     }
 
     pub fn entries(&self) -> &[(usize, SocketAddr)] {
         &self.entries
     }
+
+    fn generation(&self, backend_idx: usize) -> Option<u64> {
+        self.generations.get(&backend_idx).copied()
+    }
 }
 
+#[derive(Clone)]
 pub struct FrontendFragmentScheduler {
     backends: FrontendBackendSnapshot,
 }
@@ -60,6 +102,32 @@ pub struct FrontendFragmentScheduler {
 impl FrontendFragmentScheduler {
     pub const fn new(backends: FrontendBackendSnapshot) -> Self {
         Self { backends }
+    }
+
+    pub fn backend_entries(&self) -> &[(usize, SocketAddr)] {
+        self.backends.entries()
+    }
+
+    pub(crate) fn scheduled_backend_ownership(
+        &self,
+        backend_ids: &[usize],
+    ) -> Result<Vec<(usize, u64)>, DistributedQueryError> {
+        backend_ids
+            .iter()
+            .map(|&backend_idx| {
+                self.backends
+                    .generation(backend_idx)
+                    .map(|generation| (backend_idx, generation))
+                    .ok_or_else(|| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            format!(
+                                "scheduled backend {backend_idx} is absent from the frontend topology snapshot"
+                            ),
+                        )
+                    })
+            })
+            .collect()
     }
 
     pub fn schedule(

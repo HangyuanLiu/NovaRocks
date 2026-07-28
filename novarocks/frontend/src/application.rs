@@ -16,14 +16,19 @@
 // under the License.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use novarocks::query_execution::service::QueryExecutionService;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use novarocks_state_store::{
     StateStoreHost, StateStoreHostConfig, builtin_state_store_provider_registry,
 };
 
+use crate::coordinator::{
+    BackendQueryActivity, FrontendCoordinatorReportHandler, FrontendDistributedQueryCoordinator,
+};
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::statistics::FrontendStatisticsService;
@@ -40,6 +45,7 @@ pub enum FrontendApplicationErrorKind {
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
     MvServiceOpen,
+    CoordinatorOpen,
     Server,
     Shutdown,
 }
@@ -89,11 +95,35 @@ pub struct FrontendApplicationHost {
     mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
     state_store_host: Option<StateStoreHost>,
+    query_execution: Option<QueryExecutionService>,
+    coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
+}
+
+#[derive(Clone)]
+pub struct FrontendExecutionConfig {
+    advertised_report_host: String,
+    configured_report_port: u16,
+    runtime_filter_worker_count: NonZeroUsize,
+}
+
+impl FrontendExecutionConfig {
+    pub fn new(
+        advertised_report_host: impl Into<String>,
+        configured_report_port: u16,
+        runtime_filter_worker_count: NonZeroUsize,
+    ) -> Self {
+        Self {
+            advertised_report_host: advertised_report_host.into(),
+            configured_report_port,
+            runtime_filter_worker_count,
+        }
+    }
 }
 
 impl FrontendApplicationHost {
     pub async fn open(
         config: Option<StateStoreHostConfig>,
+        execution: FrontendExecutionConfig,
     ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
             statistics_service: None,
@@ -102,6 +132,8 @@ impl FrontendApplicationHost {
             mv_repository: None,
             mv_application_service: None,
             state_store_host: None,
+            query_execution: None,
+            coordinator: None,
         };
 
         if let Some(config) = config {
@@ -164,6 +196,9 @@ impl FrontendApplicationHost {
                 ));
             }
         }
+        if let Err(error) = host.open_coordinator(execution) {
+            return Err(host.cleanup_open_error(error).await);
+        }
 
         Ok(host)
     }
@@ -223,6 +258,42 @@ impl FrontendApplicationHost {
             .map(StateStoreHost::provider_id)
     }
 
+    pub fn query_execution_service(&self) -> QueryExecutionService {
+        self.query_execution
+            .as_ref()
+            .expect("frontend query execution service is installed before host open returns")
+            .clone()
+    }
+
+    pub fn coordinator_report_handler(&self) -> FrontendCoordinatorReportHandler {
+        self.coordinator
+            .as_ref()
+            .expect("frontend coordinator is installed before host open returns")
+            .report_handler()
+    }
+
+    pub fn backend_query_activity(&self) -> BackendQueryActivity {
+        self.coordinator
+            .as_ref()
+            .expect("frontend coordinator is installed before host open returns")
+            .backend_query_activity()
+    }
+
+    pub fn backend_query_event_sink(
+        &self,
+    ) -> Arc<dyn novarocks::query_execution::backend::BackendQueryEventSink> {
+        Arc::new(self.backend_query_activity())
+    }
+
+    pub fn coordinator_report_endpoint_sink(
+        &self,
+    ) -> Arc<dyn novarocks::query_execution::backend::CoordinatorReportEndpointSink> {
+        self.coordinator
+            .as_ref()
+            .expect("frontend coordinator is installed before host open returns")
+            .report_endpoint_sink()
+    }
+
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
         self.release_resources().await.map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
@@ -261,6 +332,20 @@ impl FrontendApplicationHost {
         Ok(())
     }
 
+    fn open_coordinator(
+        &mut self,
+        execution: FrontendExecutionConfig,
+    ) -> Result<(), FrontendApplicationError> {
+        let coordinator = Arc::new(FrontendDistributedQueryCoordinator::new(
+            execution.advertised_report_host,
+            execution.configured_report_port,
+            execution.runtime_filter_worker_count,
+        ));
+        self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
+        self.coordinator = Some(coordinator);
+        Ok(())
+    }
+
     async fn cleanup_open_error(
         &mut self,
         primary: FrontendApplicationError,
@@ -272,6 +357,8 @@ impl FrontendApplicationHost {
     }
 
     async fn release_resources(&mut self) -> Result<(), String> {
+        self.query_execution.take();
+        self.coordinator.take();
         let mut primary_error = self
             .table_maintenance_service
             .as_ref()
