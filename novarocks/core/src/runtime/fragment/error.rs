@@ -73,6 +73,7 @@ pub(crate) struct FragmentLaunchError {
     stage: FragmentLaunchStage,
     kind: FragmentLaunchErrorKind,
     detail: String,
+    cleanup_diagnostics: Vec<String>,
 }
 
 impl FragmentLaunchError {
@@ -85,6 +86,7 @@ impl FragmentLaunchError {
             stage,
             kind,
             detail: detail.into(),
+            cleanup_diagnostics: Vec::new(),
         }
     }
 
@@ -99,6 +101,15 @@ impl FragmentLaunchError {
     pub(crate) fn detail(&self) -> &str {
         &self.detail
     }
+
+    pub(crate) fn cleanup_diagnostics(&self) -> &[String] {
+        &self.cleanup_diagnostics
+    }
+
+    pub(crate) fn with_cleanup_diagnostics(mut self, diagnostics: Vec<String>) -> Self {
+        self.cleanup_diagnostics.extend(diagnostics);
+        self
+    }
 }
 
 impl fmt::Display for FragmentLaunchError {
@@ -107,7 +118,15 @@ impl fmt::Display for FragmentLaunchError {
             f,
             "fragment launch error during {} ({}): {}",
             self.stage, self.kind, self.detail
-        )
+        )?;
+        if !self.cleanup_diagnostics.is_empty() {
+            write!(
+                f,
+                "; cleanup diagnostics: {}",
+                self.cleanup_diagnostics.join("; ")
+            )?;
+        }
+        Ok(())
     }
 }
 

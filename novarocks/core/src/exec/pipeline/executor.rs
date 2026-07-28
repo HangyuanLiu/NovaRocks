@@ -28,6 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::common::app_config;
@@ -77,7 +78,7 @@ impl PreparedPipelineExecution {
             fragment_ctx: self.fragment_ctx,
             runtime_state: self.runtime_state,
             submitted_driver_count,
-            _fragment_wall_timer: fragment_wall_timer,
+            fragment_wall_timer: Mutex::new(fragment_wall_timer),
         }
     }
 }
@@ -88,7 +89,7 @@ pub(crate) struct RunningPipelineExecution {
     fragment_ctx: Arc<FragmentContext>,
     runtime_state: Arc<RuntimeState>,
     submitted_driver_count: usize,
-    _fragment_wall_timer: Option<ScopedTimer>,
+    fragment_wall_timer: Mutex<Option<ScopedTimer>>,
 }
 
 impl RunningPipelineExecution {
@@ -97,14 +98,20 @@ impl RunningPipelineExecution {
     }
 
     /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
-    pub(crate) fn cancel(&self, err: String) {
-        if self.completion.fail(err.clone()) {
+    pub(crate) fn cancel(&self, err: String) -> bool {
+        let won = self.completion.fail(err.clone());
+        if won {
             self.fragment_ctx.set_final_status(err);
         }
+        won
+    }
+
+    pub(crate) fn fail(&self, err: String) -> bool {
+        self.cancel(err)
     }
 
     /// Drain submitted drivers and return their local terminal result.
-    pub(crate) fn join(self) -> Result<(), String> {
+    pub(crate) fn join(&self) -> Result<(), String> {
         let timeout_error = self
             .runtime_state
             .query_options()
@@ -131,6 +138,10 @@ impl RunningPipelineExecution {
         if let Err(err) = &result {
             self.fragment_ctx.set_final_status(err.clone());
         }
+        self.fragment_wall_timer
+            .lock()
+            .expect("fragment wall timer lock")
+            .take();
         result
     }
 }
@@ -276,7 +287,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_pipeline_execution(
+pub(crate) fn prepare_pipeline_execution(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,

@@ -72,7 +72,11 @@ impl FragmentCompletion {
 
     pub fn fail(&self, err: String) -> bool {
         let mut st = self.mu.lock().expect("fragment completion lock");
-        if st.error.is_some() {
+        self.fail_locked(&mut st, err)
+    }
+
+    fn fail_locked(&self, st: &mut FragmentCompletionState, err: String) -> bool {
+        if st.error.is_some() || st.remaining == 0 {
             return false;
         }
         st.error = Some(err);
@@ -128,14 +132,16 @@ impl FragmentCompletion {
         while st.remaining > 0 {
             let now = Instant::now();
             if now >= deadline {
+                let timeout_won = self.fail_locked(&mut st, err.clone());
                 drop(st);
-                self.fail(err.clone());
-                on_timeout.take().expect("timeout callback is available")();
+                if timeout_won {
+                    on_timeout.take().expect("timeout callback is available")();
+                }
                 let mut st = self.mu.lock().expect("fragment completion lock");
                 while st.remaining > 0 {
                     st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
-                return Err(err);
+                return st.error.clone().map(Err).unwrap_or(Ok(()));
             }
 
             let remaining = deadline.saturating_duration_since(now);
@@ -145,14 +151,16 @@ impl FragmentCompletion {
                 .unwrap_or_else(|e| e.into_inner());
             st = guard;
             if result.timed_out() && st.remaining > 0 {
+                let timeout_won = self.fail_locked(&mut st, err.clone());
                 drop(st);
-                self.fail(err.clone());
-                on_timeout.take().expect("timeout callback is available")();
+                if timeout_won {
+                    on_timeout.take().expect("timeout callback is available")();
+                }
                 let mut st = self.mu.lock().expect("fragment completion lock");
                 while st.remaining > 0 {
                     st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
-                return Err(err);
+                return st.error.clone().map(Err).unwrap_or(Ok(()));
             }
         }
 

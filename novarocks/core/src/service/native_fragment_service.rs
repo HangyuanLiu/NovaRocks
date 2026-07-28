@@ -84,6 +84,7 @@ fn spawn_exec_fragment_native(
 ) -> Result<(), FragmentLaunchError> {
     let (readiness, readiness_receiver) = native_execution_readiness_channel();
     let worker_readiness = readiness.clone();
+    crate::runtime::sink_commit::register(finst_id);
     mgr.register_finst(finst_id, query_id);
     std::thread::spawn(move || {
         let wall_start = std::time::Instant::now();

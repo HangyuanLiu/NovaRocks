@@ -130,7 +130,7 @@ impl RuntimeState {
                 .unwrap_or_else(|| "fragment_unknown".to_string());
             Some(MemTracker::new_child(fragment_label, &query_tracker))
         });
-        let state = Self {
+        Self {
             query_options,
             cache_options,
             error_state: std::sync::Arc::new(RuntimeErrorState::default()),
@@ -142,11 +142,7 @@ impl RuntimeState {
             spill_config,
             spill_manager,
             native_runtime_filter_context: None,
-        };
-        if let Some(finst_id) = fragment_instance_id {
-            sink_commit::register(finst_id);
         }
-        state
     }
 
     pub(crate) fn with_native_runtime_filter_context(
@@ -428,6 +424,29 @@ fn monotonic_now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn construction_does_not_register_sink_commit_side_effect() {
+        let query_id = QueryId { hi: 7001, lo: 7002 };
+        let finst_id = UniqueId { hi: 7003, lo: 7004 };
+        sink_commit::unregister(finst_id);
+
+        let _state = RuntimeState::new(
+            None,
+            None,
+            Some(query_id),
+            Some(finst_id),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            !sink_commit::is_registered(finst_id),
+            "RuntimeState construction must not mutate the sink commit registry"
+        );
+    }
 
     #[test]
     fn sink_io_executor_from_default_state_runs_on_sink_runtime() {

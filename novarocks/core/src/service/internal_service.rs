@@ -904,6 +904,7 @@ fn spawn_exec_fragment(
             port: i32::from(target.port()),
         })
         .collect();
+    crate::runtime::sink_commit::register(finst_id);
     if uses_fetch_result_buffer {
         if prepared
             .submission
@@ -1374,6 +1375,7 @@ pub(crate) fn execute_plan_fragment_sync(
         &query_mem_tracker,
     );
 
+    crate::runtime::sink_commit::register(finst_id);
     let exec_result = {
         let _lookup_close_guard = LookupCloseGuard {
             query_id,
