@@ -100,11 +100,13 @@ impl TableMaintenanceEngine for FakeMaintenanceEngine {
         let outcome = match &request {
             MaintenanceActionRequest::RewriteDataFiles { .. } => {
                 MaintenanceActionOutcome::RewriteDataFiles {
+                    target_snapshot_id: Some(900),
                     rewritten_data_files_count: 2,
                     added_data_files_count: 1,
                     rewritten_bytes_count: 4096,
                     failed_data_files_count: 0,
                     removed_delete_files_count: 3,
+                    output_record_count: 88,
                 }
             }
             MaintenanceActionRequest::RewriteManifests { .. } => {

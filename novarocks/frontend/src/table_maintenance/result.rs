@@ -37,6 +37,7 @@ pub fn action_result(
             rewritten_bytes_count,
             failed_data_files_count,
             removed_delete_files_count,
+            ..
         } => build_query_result(
             vec![
                 column("rewritten_data_files_count", DataType::Int32, false),

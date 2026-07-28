@@ -85,11 +85,13 @@ pub enum MaintenanceActionRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaintenanceActionOutcome {
     RewriteDataFiles {
+        target_snapshot_id: Option<i64>,
         rewritten_data_files_count: i32,
         added_data_files_count: i32,
         rewritten_bytes_count: i64,
         failed_data_files_count: i32,
         removed_delete_files_count: i32,
+        output_record_count: i64,
     },
     RewriteManifests {
         rewritten_manifests_count: i32,

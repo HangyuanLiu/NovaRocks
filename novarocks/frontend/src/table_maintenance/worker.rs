@@ -98,6 +98,9 @@ async fn run_worker(
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
+        if engine.upgrade().is_none() {
+            return Ok(());
+        }
 
         let mut pending = repository
             .list_pending()
@@ -119,6 +122,9 @@ async fn run_worker(
                 continue;
             };
             execute_claimed_job(repository.as_ref(), engine, claimed).await?;
+        }
+        if engine.upgrade().is_none() {
+            return Ok(());
         }
 
         tokio::select! {
@@ -170,19 +176,21 @@ async fn execute_claimed_job(
 
 fn optimize_outcome(outcome: MaintenanceActionOutcome) -> Result<OptimizeJobOutcome, String> {
     let MaintenanceActionOutcome::RewriteDataFiles {
+        target_snapshot_id,
         rewritten_data_files_count,
         added_data_files_count,
         removed_delete_files_count,
+        output_record_count,
         ..
     } = outcome
     else {
         return Err("optimize worker expected a RewriteDataFiles outcome".to_string());
     };
     Ok(OptimizeJobOutcome {
-        target_snapshot_id: None,
+        target_snapshot_id,
         rewritten_data_files: i64::from(rewritten_data_files_count),
         deleted_data_files: i64::from(removed_delete_files_count),
         added_data_files: i64::from(added_data_files_count),
-        output_record_count: 0,
+        output_record_count,
     })
 }

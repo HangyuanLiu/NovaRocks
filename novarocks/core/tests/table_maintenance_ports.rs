@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use novarocks::engine::table_maintenance::{
-    MaintenanceActionRequest, MaintenanceTarget, OptimizeJobState,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeJobState,
 };
 
 #[test]
@@ -43,4 +43,26 @@ fn typed_action_variants_cannot_mix_unrelated_options() {
     ));
     assert_eq!(OptimizeJobState::Pending.as_str(), "PENDING");
     let _: BTreeMap<String, String> = BTreeMap::new();
+}
+
+#[test]
+fn rewrite_data_files_outcome_carries_durable_optimize_truth() {
+    let outcome = MaintenanceActionOutcome::RewriteDataFiles {
+        target_snapshot_id: Some(900),
+        rewritten_data_files_count: 4,
+        added_data_files_count: 2,
+        rewritten_bytes_count: 8192,
+        failed_data_files_count: 0,
+        removed_delete_files_count: 3,
+        output_record_count: 88,
+    };
+
+    assert!(matches!(
+        outcome,
+        MaintenanceActionOutcome::RewriteDataFiles {
+            target_snapshot_id: Some(900),
+            output_record_count: 88,
+            ..
+        }
+    ));
 }

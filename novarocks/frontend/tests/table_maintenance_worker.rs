@@ -31,6 +31,7 @@ use novarocks::engine::table_maintenance::{
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
 use novarocks_frontend::table_maintenance::model::{OptimizeJob, OptimizeJobCreate};
 use novarocks_frontend::table_maintenance::repository::OptimizeJobRepository;
+use novarocks_frontend::table_maintenance::worker::OptimizeWorker;
 use novarocks_spi::state_store::{
     CommitOutcome, Key, Precondition, StateStore, TransactionId, Value,
 };
@@ -44,11 +45,13 @@ use uuid::Uuid;
 
 fn rewrite_outcome() -> MaintenanceActionOutcome {
     MaintenanceActionOutcome::RewriteDataFiles {
+        target_snapshot_id: Some(900),
         rewritten_data_files_count: 4,
         added_data_files_count: 2,
         rewritten_bytes_count: 8192,
         failed_data_files_count: 0,
         removed_delete_files_count: 3,
+        output_record_count: 88,
     }
 }
 
@@ -333,11 +336,11 @@ async fn start_reconciles_running_before_processing_pending_in_job_id_order() {
     assert_eq!(
         jobs[1].outcome.as_ref().unwrap(),
         &novarocks_frontend::table_maintenance::model::OptimizeJobOutcome {
-            target_snapshot_id: None,
+            target_snapshot_id: Some(900),
             rewritten_data_files: 4,
             deleted_data_files: 3,
             added_data_files: 2,
-            output_record_count: 0,
+            output_record_count: 88,
         }
     );
     assert_eq!(
@@ -491,6 +494,37 @@ async fn expired_engine_weak_reference_ends_worker_without_a_reference_cycle() {
     service
         .shutdown()
         .expect("join worker after engine expiration");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_worker_exits_autonomously_before_shutdown_when_engine_expires() {
+    let (_temp, _store, repository, _service) = fixture().await;
+    create_job(&repository, "idle-exit", 71, 100).await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let engine = Arc::new(FakeMaintenanceEngine::with_drop_flag(Arc::clone(&dropped)));
+    let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
+    let engine_weak = Arc::downgrade(&engine_port);
+    let mut worker = OptimizeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::clone(&repository),
+        engine_weak,
+    )
+    .expect("start worker");
+
+    let jobs = wait_for_terminal_jobs(&repository, 1).await;
+    assert_eq!(jobs[0].state, OptimizeJobState::Finished);
+    drop(engine_port);
+    drop(engine);
+    timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&repository) != 1 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle worker retained its repository after engine expiration");
+    assert!(dropped.load(Ordering::SeqCst));
+
+    worker.shutdown().expect("join already-finished worker");
 }
 
 #[tokio::test(flavor = "multi_thread")]
