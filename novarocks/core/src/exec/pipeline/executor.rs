@@ -34,7 +34,6 @@ use crate::common::app_config;
 use crate::exec::node::ExecPlan;
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::novarocks_logging::info;
-use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
 
 use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context;
@@ -45,7 +44,91 @@ use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
 use crate::runtime::endpoint::RuntimeEndpoint;
 
-use crate::runtime::profile::Profiler;
+use crate::runtime::profile::{Profiler, ScopedTimer};
+
+/// A fully materialized pipeline that has not submitted any drivers to the global executor.
+pub(crate) struct PreparedPipelineExecution {
+    tasks: Vec<DriverTask>,
+    completion: Arc<FragmentCompletion>,
+    fragment_ctx: Arc<FragmentContext>,
+    runtime_state: Arc<RuntimeState>,
+    fragment_profiler: Option<Profiler>,
+}
+
+impl PreparedPipelineExecution {
+    pub(crate) fn driver_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub(crate) const fn submitted_driver_count(&self) -> usize {
+        0
+    }
+
+    /// Submit this execution exactly once by consuming its dormant task collection.
+    pub(crate) fn start(self) -> RunningPipelineExecution {
+        let submitted_driver_count = self.tasks.len();
+        let fragment_wall_timer = self
+            .fragment_profiler
+            .as_ref()
+            .map(|p| p.scoped_timer("FragmentWallTime"));
+        global_driver_executor().submit(self.tasks);
+        RunningPipelineExecution {
+            completion: self.completion,
+            fragment_ctx: self.fragment_ctx,
+            runtime_state: self.runtime_state,
+            submitted_driver_count,
+            _fragment_wall_timer: fragment_wall_timer,
+        }
+    }
+}
+
+/// A submitted fragment-local pipeline execution.
+pub(crate) struct RunningPipelineExecution {
+    completion: Arc<FragmentCompletion>,
+    fragment_ctx: Arc<FragmentContext>,
+    runtime_state: Arc<RuntimeState>,
+    submitted_driver_count: usize,
+    _fragment_wall_timer: Option<ScopedTimer>,
+}
+
+impl RunningPipelineExecution {
+    pub(crate) const fn submitted_driver_count(&self) -> usize {
+        self.submitted_driver_count
+    }
+
+    /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
+    pub(crate) fn cancel(&self, err: String) {
+        if self.completion.fail(err.clone()) {
+            self.fragment_ctx.set_final_status(err);
+        }
+    }
+
+    /// Drain submitted drivers and return their local terminal result.
+    pub(crate) fn join(self) -> Result<(), String> {
+        let timeout_error = self
+            .runtime_state
+            .query_options()
+            .and_then(|opts| opts.query_timeout)
+            .filter(|secs| *secs > 0)
+            .map(|secs| format!("query timed out after {} ms", secs * 1000));
+        let result = match timeout_error {
+            Some(err) => self.completion.wait_timeout(
+                Duration::from_secs(
+                    self.runtime_state
+                        .query_options()
+                        .and_then(|opts| opts.query_timeout)
+                        .expect("timeout was checked") as u64,
+                ),
+                err,
+            ),
+            None => self.completion.wait(),
+        };
+        if let Err(err) = &result {
+            self.fragment_ctx.set_final_status(err.clone());
+        }
+        result
+    }
+}
 
 /// Execute one plan fragment through pipeline runtime and return the terminal sink outcome.
 pub(crate) fn execute_native_plan_with_pipeline(
@@ -188,7 +271,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_plan_with_pipeline(
+fn prepare_pipeline_execution(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,
@@ -206,8 +289,7 @@ fn execute_plan_with_pipeline(
     runtime_filter_context: Option<
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     >,
-) -> Result<(), String> {
-    let fragment_profiler = profiler.clone();
+) -> Result<PreparedPipelineExecution, String> {
     let dep_manager = DependencyManager::new();
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
@@ -224,9 +306,8 @@ fn execute_plan_with_pipeline(
             runtime_filter_context,
         )?;
 
-    let finst_id = runtime_state.fragment_instance_id();
     let ctx = Arc::new(FragmentContext::new(
-        profiler,
+        profiler.clone(),
         Arc::clone(&runtime_state),
         exchange_finst_id,
         query_id,
@@ -287,47 +368,65 @@ fn execute_plan_with_pipeline(
         time_slice
     };
 
-    let completion = FragmentCompletion::new(all_drivers.len(), Arc::clone(&ctx));
-    let completion_execution = if query_id.is_some()
-        && let Some(finst_id) = finst_id
-    {
-        query_context_manager().register_fragment_completion(finst_id, Arc::clone(&completion))
-    } else {
-        None
-    };
-    if let Some(query_id) = query_id
-        && query_context_manager().is_query_canceled(query_id)
-    {
-        completion.abort_from_query("query canceled".to_string());
-    }
+    let completion = FragmentCompletion::new(all_drivers.len());
     let mut tasks = Vec::with_capacity(all_drivers.len());
     for driver in all_drivers {
-        let task = DriverTask::new(driver, Arc::clone(&completion), effective_time_slice);
+        let task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            Arc::clone(&ctx),
+            effective_time_slice,
+        );
         tasks.push(task);
     }
-    let _fragment_wall_timer = fragment_profiler
-        .as_ref()
-        .map(|p| p.scoped_timer("FragmentWallTime"));
-    global_driver_executor().submit(tasks);
-    let res = runtime_state
-        .query_options()
-        .and_then(|opts| opts.query_timeout)
-        .filter(|secs| *secs > 0)
-        .map(|secs| {
-            let timeout = Duration::from_secs(secs as u64);
-            completion.wait_timeout(timeout, format!("query timed out after {} ms", secs * 1000))
-        })
-        .unwrap_or_else(|| completion.wait());
-    if let Some(finst_id) = finst_id {
-        if let Some(execution) = completion_execution {
-            query_context_manager().unregister_fragment_completion_execution(finst_id, execution);
-        } else {
-            query_context_manager().unregister_fragment_completion(finst_id);
-        }
-    }
-    res?;
+    Ok(PreparedPipelineExecution {
+        tasks,
+        completion,
+        fragment_ctx: ctx,
+        runtime_state,
+        fragment_profiler: profiler,
+    })
+}
 
-    Ok(())
+#[allow(clippy::too_many_arguments)]
+fn execute_plan_with_pipeline(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<RuntimeEndpoint>,
+    backend_num: Option<i32>,
+    root_sink_dop: Option<i32>,
+    runtime_filter_context: Option<
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    >,
+) -> Result<(), String> {
+    prepare_pipeline_execution(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_bindings,
+        scan_bindings,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        root_sink_dop,
+        runtime_filter_context,
+    )?
+    .start()
+    .join()
 }
 
 #[cfg(test)]
@@ -362,6 +461,10 @@ mod tests {
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
+    use crate::exec::pipeline::driver::PipelineDriver;
+    use crate::exec::pipeline::fragment_context::FragmentContext;
+    use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
+    use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
     use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
@@ -371,11 +474,246 @@ mod tests {
     };
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
-    use super::execute_native_plan_with_pipeline;
+    use super::{
+        PreparedPipelineExecution, execute_native_plan_with_pipeline, prepare_pipeline_execution,
+    };
+
+    struct NeverReadyOperator;
+
+    struct PanicOperator;
+
+    impl Operator for NeverReadyOperator {
+        fn name(&self) -> &str {
+            "NeverReadyOperator"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for NeverReadyOperator {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            unreachable!("never-ready source must not receive input")
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            unreachable!("never-ready source must not produce output")
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl Operator for PanicOperator {
+        fn name(&self) -> &str {
+            "PanicOperator"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for PanicOperator {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            panic!("injected pipeline panic")
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            unreachable!("panic source must not receive input")
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            unreachable!("panic source must not produce output")
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn manually_prepared_execution(
+        driver: PipelineDriver,
+        runtime_state: Arc<RuntimeState>,
+        query_id: Option<QueryId>,
+    ) -> PreparedPipelineExecution {
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            Arc::clone(&runtime_state),
+            None,
+            query_id,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1);
+        let task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            Arc::clone(&fragment_ctx),
+            Duration::from_millis(10),
+        );
+        PreparedPipelineExecution {
+            tasks: vec![task],
+            completion,
+            fragment_ctx,
+            runtime_state,
+            fragment_profiler: None,
+        }
+    }
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
             .expect("chunk schema")
+    }
+
+    fn single_values_plan() -> ExecPlan {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+        )
+        .expect("values batch");
+        let chunk =
+            Chunk::try_new_with_chunk_schema(batch, chunk_schema_of(&schema, &[SlotId::new(1)]))
+                .expect("values chunk");
+
+        ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
+            },
+        }
+    }
+
+    #[test]
+    fn prepared_pipeline_defers_submission_until_start_then_joins() {
+        let handle = ResultSinkHandle::new();
+        let prepared = prepare_pipeline_execution(
+            single_values_plan(),
+            false,
+            Duration::from_millis(10),
+            Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            None,
+            None,
+            1,
+            Arc::new(RuntimeState::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("prepare pipeline without submitting drivers");
+
+        assert_eq!(prepared.driver_count(), 1);
+        assert_eq!(prepared.submitted_driver_count(), 0);
+        assert!(handle.take_chunks().is_empty());
+
+        let running = prepared.start();
+        assert_eq!(running.submitted_driver_count(), 1);
+        running
+            .join()
+            .expect("started pipeline must finish locally");
+
+        assert_eq!(
+            handle.take_chunks().iter().map(Chunk::len).sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn running_pipeline_cancel_wakes_local_driver_and_drains() {
+        let runtime_state = Arc::new(RuntimeState::default());
+        let driver = PipelineDriver::new(
+            1,
+            vec![Box::new(NeverReadyOperator)],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            None,
+        );
+        let running = manually_prepared_execution(driver, runtime_state, None).start();
+
+        running.cancel("local cancel".to_string());
+        assert_eq!(
+            running.join(),
+            Err("local cancel".to_string()),
+            "cancel must remain a fragment-local terminal result after the submitted driver drains"
+        );
+    }
+
+    #[test]
+    fn driver_panic_is_a_local_error_and_does_not_cancel_the_query() {
+        let query_id = QueryId {
+            hi: 92_001,
+            lo: 92_002,
+        };
+        let context_manager = query_context_manager();
+        context_manager
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("create independent query context");
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            Some(query_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let driver = PipelineDriver::new(
+            2,
+            vec![Box::new(PanicOperator)],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            None,
+        );
+
+        let error = manually_prepared_execution(driver, runtime_state, Some(query_id))
+            .start()
+            .join()
+            .expect_err("driver panic must become a fragment-local error");
+        assert!(error.contains("panic in driver execution: injected pipeline panic"));
+        assert!(
+            !context_manager.is_query_canceled(query_id),
+            "pipeline completion must not cancel an independently-owned query"
+        );
+        context_manager.cancel_query(query_id, "test cleanup".to_string());
     }
 
     #[test]

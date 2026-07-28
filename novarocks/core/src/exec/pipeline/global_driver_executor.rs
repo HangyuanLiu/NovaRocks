@@ -34,22 +34,17 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::common::app_config;
-use crate::common::types::UniqueId;
-use crate::runtime::exchange;
-use crate::runtime::query_context::query_context_manager;
-use crate::runtime::result_buffer;
-
 use super::blocked_driver_poller::BlockedDriverPoller;
 use super::driver::{DriverState, PipelineDriver};
+use super::fragment_context::FragmentContext;
 use super::operator::BlockedReason;
+use crate::common::app_config;
 use crate::exec::pipeline::schedule::observer::Observable;
 
 /// Completion result payload reported when a fragment finishes execution.
 pub struct FragmentCompletion {
     mu: Mutex<FragmentCompletionState>,
     cv: Condvar,
-    fragment_ctx: Arc<crate::exec::pipeline::fragment_context::FragmentContext>,
 }
 
 #[derive(Debug)]
@@ -60,10 +55,7 @@ struct FragmentCompletionState {
 }
 
 impl FragmentCompletion {
-    pub(crate) fn new(
-        driver_count: usize,
-        fragment_ctx: Arc<crate::exec::pipeline::fragment_context::FragmentContext>,
-    ) -> Arc<Self> {
+    pub(crate) fn new(driver_count: usize) -> Arc<Self> {
         Arc::new(Self {
             mu: Mutex::new(FragmentCompletionState {
                 remaining: driver_count,
@@ -71,68 +63,41 @@ impl FragmentCompletion {
                 error: None,
             }),
             cv: Condvar::new(),
-            fragment_ctx,
         })
-    }
-
-    pub(crate) fn fragment_ctx(
-        &self,
-    ) -> &Arc<crate::exec::pipeline::fragment_context::FragmentContext> {
-        &self.fragment_ctx
     }
 
     pub fn should_abort(&self) -> bool {
         self.mu.lock().expect("fragment completion lock").aborting
     }
 
-    pub fn fail(&self, err: String) {
-        self.fail_internal(err, true);
-    }
-
-    pub(crate) fn abort_from_query(&self, err: String) {
-        self.fail_internal(err, false);
-    }
-
-    fn fail_internal(&self, err: String, notify_query: bool) {
-        let first = self.fragment_ctx.set_final_status(err.clone());
+    pub fn fail(&self, err: String) -> bool {
         let mut st = self.mu.lock().expect("fragment completion lock");
-        if st.error.is_none() {
-            st.error = Some(err.clone());
+        if st.error.is_some() {
+            return false;
         }
+        st.error = Some(err);
         st.aborting = true;
         self.cv.notify_all();
-        drop(st);
-
-        if notify_query && first {
-            let mgr = query_context_manager();
-            let finsts = if let Some((hi, lo)) = self.fragment_ctx.fragment_instance_id() {
-                mgr.cancel_finst(UniqueId { hi, lo }, err.clone()).finsts
-            } else if let Some(query_id) = self.fragment_ctx.query_id() {
-                mgr.cancel_query(query_id, err.clone())
-            } else {
-                Vec::new()
-            };
-            for id in finsts {
-                result_buffer::close_error(id, err.clone());
-                exchange::cancel_fragment(id.hi, id.lo);
-            }
-        }
+        true
     }
 
-    pub fn driver_finished(&self) {
+    /// Compatibility hook for query-side owners that still retain a completion reference.
+    /// The completion itself records only the local fragment result.
+    pub(crate) fn abort_from_query(&self, err: String) {
+        let _ = self.fail(err);
+    }
+
+    pub fn driver_finished(&self) -> bool {
         let mut st = self.mu.lock().expect("fragment completion lock");
         if st.remaining == 0 {
-            return;
+            return false;
         }
         st.remaining -= 1;
-        if st.remaining == 0 {
+        let finished = st.remaining == 0;
+        if finished {
             self.cv.notify_all();
         }
-        let finished = st.remaining == 0;
-        drop(st);
-        if finished {
-            self.fragment_ctx.event_scheduler().shutdown();
-        }
+        finished
     }
 
     pub fn wait(&self) -> Result<(), String> {
@@ -151,7 +116,7 @@ impl FragmentCompletion {
             let now = Instant::now();
             if now >= deadline {
                 drop(st);
-                self.abort_from_query(err.clone());
+                self.fail(err.clone());
                 return Err(err);
             }
 
@@ -163,7 +128,7 @@ impl FragmentCompletion {
             st = guard;
             if result.timed_out() && st.remaining > 0 {
                 drop(st);
-                self.abort_from_query(err.clone());
+                self.fail(err.clone());
                 return Err(err);
             }
         }
@@ -176,6 +141,7 @@ impl FragmentCompletion {
 pub struct DriverTask {
     driver: PipelineDriver,
     completion: Arc<FragmentCompletion>,
+    fragment_ctx: Arc<FragmentContext>,
     time_slice: Duration,
 }
 
@@ -183,11 +149,13 @@ impl DriverTask {
     pub fn new(
         driver: PipelineDriver,
         completion: Arc<FragmentCompletion>,
+        fragment_ctx: Arc<FragmentContext>,
         time_slice: Duration,
     ) -> Self {
         Self {
             driver,
             completion,
+            fragment_ctx,
             time_slice,
         }
     }
@@ -200,10 +168,8 @@ impl DriverTask {
         self.driver.fragment_instance_id()
     }
 
-    pub(crate) fn fragment_ctx(
-        &self,
-    ) -> &Arc<crate::exec::pipeline::fragment_context::FragmentContext> {
-        self.completion.fragment_ctx()
+    pub(crate) fn fragment_ctx(&self) -> &Arc<FragmentContext> {
+        &self.fragment_ctx
     }
 
     pub(crate) fn should_abort(&self) -> bool {
@@ -219,9 +185,20 @@ impl DriverTask {
     }
 
     pub(crate) fn finish_due_to_abort(self) {
-        let completion = Arc::clone(&self.completion);
+        self.driver_finished();
         drop(self);
-        completion.driver_finished();
+    }
+
+    pub(crate) fn fail(&self, err: String) {
+        if self.completion.fail(err.clone()) {
+            self.fragment_ctx.set_final_status(err);
+        }
+    }
+
+    pub(crate) fn driver_finished(&self) {
+        if self.completion.driver_finished() {
+            self.fragment_ctx.event_scheduler().shutdown();
+        }
     }
 
     pub(crate) fn source_observable(&self) -> Option<Arc<Observable>> {
@@ -378,8 +355,8 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
         };
 
         if task.completion.should_abort() && !task.has_pending_finish() {
+            task.driver_finished();
             drop(task.driver);
-            task.completion.driver_finished();
             continue;
         }
 
@@ -410,8 +387,8 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
         match state {
             DriverState::Ready | DriverState::Running => {
                 if task.completion.should_abort() && !task.has_pending_finish() {
+                    task.driver_finished();
                     drop(task.driver);
-                    task.completion.driver_finished();
                     continue;
                 }
                 let mut queue = shared.queue.lock().expect("global executor queue lock");
@@ -435,8 +412,8 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
                                     task.fragment_instance_id(),
                                     task.driver_id()
                                 );
-                                task.completion.fail(err);
-                                task.completion.driver_finished();
+                                task.fail(err);
+                                task.driver_finished();
                             }
                         }
                     }
@@ -450,8 +427,8 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
                                     task.fragment_instance_id(),
                                     task.driver_id()
                                 );
-                                task.completion.fail(err);
-                                task.completion.driver_finished();
+                                task.fail(err);
+                                task.driver_finished();
                             }
                         }
                     }
@@ -461,15 +438,15 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
                 poller.add_pending_finish(task);
             }
             DriverState::Finished => {
-                task.completion.driver_finished();
+                task.driver_finished();
             }
             DriverState::Canceled => {
-                task.completion.fail("pipeline driver canceled".to_string());
-                task.completion.driver_finished();
+                task.fail("pipeline driver canceled".to_string());
+                task.driver_finished();
             }
             DriverState::Failed(err) => {
-                task.completion.fail(err);
-                task.completion.driver_finished();
+                task.fail(err);
+                task.driver_finished();
             }
         }
     }
@@ -478,20 +455,10 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::pipeline::fragment_context::FragmentContext;
-    use crate::runtime::runtime_state::RuntimeState;
 
     #[test]
     fn fragment_completion_wait_timeout_returns_query_timeout_error() {
-        let ctx = Arc::new(FragmentContext::new(
-            None,
-            Arc::new(RuntimeState::default()),
-            None,
-            None,
-            None,
-            None,
-        ));
-        let completion = FragmentCompletion::new(1, ctx);
+        let completion = FragmentCompletion::new(1);
 
         let err = completion
             .wait_timeout(

@@ -285,8 +285,13 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, Arc::clone(&fragment_ctx));
-        let task = DriverTask::new(driver, Arc::clone(&completion), Duration::from_millis(10));
+        let completion = FragmentCompletion::new(1);
+        let task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            fragment_ctx,
+            Duration::from_millis(10),
+        );
 
         poller.add_pending_finish(task);
         completion.fail("forced abort".to_string());
