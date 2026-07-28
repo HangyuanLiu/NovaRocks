@@ -225,6 +225,74 @@ impl TableMaintenanceService for EmptyTableMaintenanceService {
     }
 }
 
+impl crate::engine::StandaloneState {
+    fn shared_for_table_maintenance(&self) -> Result<Arc<Self>, String> {
+        self.self_weak.upgrade().ok_or_else(|| {
+            "standalone state is not attached to a shared engine instance".to_string()
+        })
+    }
+}
+
+impl TableMaintenanceEngine for crate::engine::StandaloneState {
+    fn resolve_target(
+        &self,
+        name_parts: &[String],
+        context: MaintenanceRequestContext<'_>,
+    ) -> Result<MaintenanceTarget, String> {
+        let state = self.shared_for_table_maintenance()?;
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &state,
+            &crate::sql::parser::ast::ObjectName {
+                parts: name_parts.to_vec(),
+            },
+            context.current_catalog,
+            context.current_database,
+        )?;
+        if target.backend_name != "iceberg" {
+            return Err(format!(
+                "table maintenance only supports iceberg backends, got `{}`",
+                target.backend_name
+            ));
+        }
+        Ok(MaintenanceTarget {
+            catalog: target.catalog,
+            namespace: target.namespace,
+            table: target.table,
+        })
+    }
+
+    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+        let state = self.shared_for_table_maintenance()?;
+        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+            &state,
+            &crate::engine::backend_resolver::TargetBackend {
+                backend_name: "iceberg",
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+        )
+    }
+
+    fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
+        crate::engine::iceberg_maintenance::current_snapshot_id(
+            &self.shared_for_table_maintenance()?,
+            target,
+        )
+    }
+
+    fn execute_action(
+        &self,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        crate::engine::iceberg_maintenance::execute_action(
+            &self.shared_for_table_maintenance()?,
+            request,
+        )
+    }
+}
+
 fn looks_like_maintenance_statement(sql: &str) -> bool {
     let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
         return false;

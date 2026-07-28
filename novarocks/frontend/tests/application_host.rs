@@ -16,13 +16,17 @@
 // under the License.
 
 use bytes::Bytes;
+use novarocks::engine::table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
+    MaintenanceTarget, TableMaintenanceEngine,
+};
 use novarocks::engine::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
     ViewRequestContext, ViewSqlDialect, ViewTarget,
 };
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::{FrontendApplicationErrorKind, FrontendApplicationHost};
-use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
+use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
 use novarocks_state_store::{
     SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig,
@@ -34,6 +38,33 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 struct SessionViewEngine;
+
+struct SessionMaintenanceEngine;
+
+impl TableMaintenanceEngine for SessionMaintenanceEngine {
+    fn resolve_target(
+        &self,
+        _name_parts: &[String],
+        _context: MaintenanceRequestContext<'_>,
+    ) -> Result<MaintenanceTarget, String> {
+        unreachable!("ordinary SQL must not resolve a maintenance target")
+    }
+
+    fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+        unreachable!("ordinary SQL must not run a maintenance MV guard")
+    }
+
+    fn current_snapshot_id(&self, _target: &MaintenanceTarget) -> Result<i64, String> {
+        unreachable!("ordinary SQL must not read a maintenance snapshot")
+    }
+
+    fn execute_action(
+        &self,
+        _request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        unreachable!("ordinary SQL must not execute a maintenance action")
+    }
+}
 
 impl ViewEngine for SessionViewEngine {
     fn validate_iceberg_catalog(&self, _catalog: &str) -> Result<(), String> {
@@ -130,6 +161,19 @@ async fn absent_config_opens_disabled_host() {
 
     assert!(host.state_store().is_none());
     assert_eq!(host.state_store_provider_id(), None);
+    assert!(
+        host.table_maintenance_service()
+            .try_handle_statement(
+                &SessionMaintenanceEngine,
+                "SELECT 1",
+                MaintenanceRequestContext {
+                    current_catalog: None,
+                    current_database: "db",
+                },
+            )
+            .expect("ordinary SQL must pass through the maintenance service")
+            .is_none()
+    );
     assert!(
         host.view_service()
             .try_handle_statement(
@@ -358,4 +402,103 @@ async fn corrupt_view_record_fails_host_open_at_the_view_service_boundary() {
     };
     assert_eq!(error.kind(), FrontendApplicationErrorKind::ViewServiceOpen);
     assert!(error.to_string().contains("decode frontend view database"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_open_failure_precedes_table_maintenance_open_failure() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let config = sqlite_config(&temp);
+    let host = FrontendApplicationHost::open(Some(config.clone()))
+        .await
+        .expect("configured host must open");
+    let store = host.state_store().expect("configured host state store");
+    let mut transaction = store
+        .begin_write(
+            TransactionId::from(Uuid::now_v7()),
+            "seed corrupt frontend application records",
+        )
+        .await
+        .expect("begin corrupt record write");
+    transaction
+        .put(
+            database_key("default_catalog", "db").expect("view database key"),
+            Value::try_from(Bytes::from_static(b"not-json")).expect("corrupt view value"),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage corrupt view record");
+    transaction
+        .put(
+            Key::try_from(Bytes::from_static(
+                b"novarocks/frontend/table-maintenance/v1/jobs/0000000000000001",
+            ))
+            .expect("maintenance job key"),
+            Value::try_from(Bytes::from_static(b"not-json")).expect("corrupt maintenance value"),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage corrupt maintenance record");
+    assert!(matches!(
+        transaction.commit().await,
+        CommitOutcome::Committed(_)
+    ));
+    drop(store);
+    host.shutdown().await.expect("seed host shutdown");
+
+    let error = match FrontendApplicationHost::open(Some(config)).await {
+        Ok(_) => panic!("corrupt durable application metadata must reject host open"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::ViewServiceOpen);
+    assert!(error.to_string().contains("decode frontend view database"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_table_maintenance_record_fails_open_and_releases_partial_resources() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let config = sqlite_config(&temp);
+    let host = FrontendApplicationHost::open(Some(config.clone()))
+        .await
+        .expect("configured host must open");
+    let store = host.state_store().expect("configured host state store");
+    let mut transaction = store
+        .begin_write(
+            TransactionId::from(Uuid::now_v7()),
+            "seed corrupt frontend table-maintenance record",
+        )
+        .await
+        .expect("begin corrupt record write");
+    transaction
+        .put(
+            Key::try_from(Bytes::from_static(
+                b"novarocks/frontend/table-maintenance/v1/jobs/0000000000000001",
+            ))
+            .expect("maintenance job key"),
+            Value::try_from(Bytes::from_static(b"not-json")).expect("corrupt maintenance value"),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage corrupt maintenance record");
+    assert!(matches!(
+        transaction.commit().await,
+        CommitOutcome::Committed(_)
+    ));
+    drop(store);
+    host.shutdown().await.expect("seed host shutdown");
+
+    for _ in 0..2 {
+        let error = match FrontendApplicationHost::open(Some(config.clone())).await {
+            Ok(_) => panic!("corrupt maintenance metadata must reject host open"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            FrontendApplicationErrorKind::TableMaintenanceServiceOpen
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("open frontend optimize job repository")
+        );
+    }
 }

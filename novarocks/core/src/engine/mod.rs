@@ -366,6 +366,12 @@ pub(crate) struct StandaloneState {
     >,
     /// Frontend-owned view application service, injected at engine open.
     pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+    /// Frontend-owned table-maintenance application service, injected at engine open.
+    pub(crate) table_maintenance_service:
+        std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
+    /// Instance-local weak handle used by the borrowed maintenance engine port
+    /// to enter connector execution paths that require the shared state Arc.
+    pub(crate) self_weak: Weak<StandaloneState>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -394,6 +400,10 @@ impl Default for StandaloneState {
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
             view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
+            table_maintenance_service: std::sync::Arc::new(
+                crate::engine::table_maintenance::EmptyTableMaintenanceService,
+            ),
+            self_weak: Weak::new(),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,
@@ -462,6 +472,7 @@ impl StandaloneNovaRocks {
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
             std::sync::Arc::new(statistics::EmptyStatisticsService),
+            std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
             _test_guard,
         );
         #[cfg(not(test))]
@@ -470,6 +481,7 @@ impl StandaloneNovaRocks {
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
             std::sync::Arc::new(statistics::EmptyStatisticsService),
+            std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
         )
     }
 
@@ -485,6 +497,9 @@ impl StandaloneNovaRocks {
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
+        table_maintenance_service: std::sync::Arc<
+            dyn crate::engine::table_maintenance::TableMaintenanceService,
+        >,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -497,10 +512,17 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            table_maintenance_service,
             _test_guard,
         );
         #[cfg(not(test))]
-        Self::open_body(opts, system_catalog, view_service, statistics_service)
+        Self::open_body(
+            opts,
+            system_catalog,
+            view_service,
+            statistics_service,
+            table_maintenance_service,
+        )
     }
 
     /// Common engine-open body.  Called after the process-wide config has
@@ -510,6 +532,9 @@ impl StandaloneNovaRocks {
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
+        table_maintenance_service: std::sync::Arc<
+            dyn crate::engine::table_maintenance::TableMaintenanceService,
+        >,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -550,7 +575,7 @@ impl StandaloneNovaRocks {
             None => None,
         };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
-        let inner = Arc::new(StandaloneState {
+        let inner = Arc::new_cyclic(|self_weak| StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
                 starrocks_table_config.clone(),
@@ -568,6 +593,8 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            table_maintenance_service,
+            self_weak: self_weak.clone(),
             #[cfg(test)]
             _test_guard,
             ..Default::default()
@@ -578,11 +605,17 @@ impl StandaloneNovaRocks {
             backend_ops::ensure_backend_registry(&inner)?;
             backend_ops::wait_for_configured_backends_live(&inner)?;
         }
-        #[cfg(not(test))]
-        if inner.metadata_provider.is_some() {
-            crate::connector::spawn_iceberg_optimize_worker(Arc::clone(&inner));
+        let engine = Self { inner };
+        let engine_port =
+            Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
+        if let Err(error) = engine.inner.table_maintenance_service.start(engine_port) {
+            let primary = format!("start table maintenance service failed: {error}");
+            return match engine.inner.table_maintenance_service.shutdown() {
+                Ok(()) => Err(primary),
+                Err(cleanup_error) => Err(format!("{primary}; cleanup failed: {cleanup_error}")),
+            };
         }
-        Ok(Self { inner })
+        Ok(engine)
     }
 
     pub fn session(&self) -> StandaloneSession {
@@ -784,6 +817,23 @@ impl StandaloneSession {
                 }
             });
         }
+        if let Some(result) = self.inner.table_maintenance_service.try_handle_statement(
+            self.inner.as_ref(),
+            &normalized,
+            crate::engine::table_maintenance::MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+        )? {
+            return Ok(match result {
+                crate::engine::table_maintenance::MaintenanceStatementResult::Ok => {
+                    StatementResult::Ok
+                }
+                crate::engine::table_maintenance::MaintenanceStatementResult::Query(result) => {
+                    StatementResult::Query(result)
+                }
+            });
+        }
         if let Some(result) = self.inner.statistics_service.try_handle_statement(
             &self.inner,
             &normalized,
@@ -803,56 +853,6 @@ impl StandaloneSession {
             return self.handle_create_table_like(
                 target,
                 source,
-                current_catalog,
-                current_database,
-            );
-        }
-        if looks_like_call_procedure(&normalized) {
-            let stmt = parse_call_procedure_sql(&normalized)?;
-            if stmt.procedure == crate::engine::mv::stateless_rebuild::PROCEDURE_NAME {
-                return crate::engine::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
-                    &self.inner,
-                    &stmt,
-                    current_database,
-                );
-            }
-            let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(
-                &stmt,
-                current_database,
-            )?;
-            return crate::engine::iceberg_maintenance::execute_maintenance_action(
-                &self.inner,
-                request,
-            );
-        }
-        if looks_like_show_alter_table_optimize(&normalized) {
-            let stmt = parse_show_alter_table_optimize_sql(&normalized)?;
-            return self.handle_show_alter_table_optimize(stmt, current_catalog, current_database);
-        }
-        if looks_like_alter_table_optimize(&normalized) {
-            let stmt = parse_alter_table_optimize_sql(&normalized)?;
-            return self.handle_alter_table_optimize(stmt, current_catalog, current_database);
-        }
-        if looks_like_alter_table_rewrite_manifests(&normalized) {
-            let stmt = parse_alter_table_rewrite_manifests_sql(&normalized)?;
-            return self.handle_alter_table_rewrite_manifests(
-                stmt,
-                current_catalog,
-                current_database,
-            );
-        }
-        if looks_like_alter_table_expire_snapshots(&normalized) {
-            let stmt = parse_alter_table_expire_snapshots_sql(&normalized)?;
-            return self.handle_alter_table_expire_snapshots(
-                stmt,
-                current_catalog,
-                current_database,
-            );
-        }
-        if looks_like_alter_table_remove_orphan_files(&normalized) {
-            let stmt = parse_alter_table_remove_orphan_files_sql(&normalized)?;
-            return self.handle_alter_table_remove_orphan_files(
-                stmt,
                 current_catalog,
                 current_database,
             );

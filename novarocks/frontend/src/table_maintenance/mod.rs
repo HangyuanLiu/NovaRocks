@@ -261,6 +261,9 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 self.execute_user_action(engine, target, action, is_spark_maintenance_call(sql))?
             }
             ParsedMaintenanceStatement::SubmitOptimize { name_parts } => {
+                if self.repository.is_none() {
+                    return Err(OPTIMIZE_STATE_STORE_REQUIRED.to_string());
+                }
                 let target = engine.resolve_target(&name_parts, context)?;
                 self.submit_user_optimize(engine, target)?
             }

@@ -629,8 +629,14 @@ async fn missing_state_store_only_blocks_repository_backed_operations() {
         )
         .unwrap();
 
+    let resolved_before_optimize = engine.resolved_name_parts().len();
+    let guarded_before_optimize = engine.guarded_targets().len();
     let optimize = service
-        .try_handle_statement(&engine, "ALTER TABLE ice.db.orders OPTIMIZE", context())
+        .try_handle_statement(
+            &engine,
+            "ALTER TABLE too.many.name.parts OPTIMIZE",
+            context(),
+        )
         .unwrap_err();
     let show = service
         .try_handle_statement(&engine, "SHOW ALTER TABLE OPTIMIZE", context())
@@ -638,7 +644,12 @@ async fn missing_state_store_only_blocks_repository_backed_operations() {
     let automatic = service
         .submit_automatic_optimize(&engine, target("ice", "db", "orders"))
         .unwrap_err();
-    assert!(optimize.contains("StateStore"), "{optimize}");
+    assert_eq!(
+        optimize,
+        "ALTER TABLE OPTIMIZE requires frontend StateStore"
+    );
+    assert_eq!(engine.resolved_name_parts().len(), resolved_before_optimize);
+    assert_eq!(engine.guarded_targets().len(), guarded_before_optimize);
     assert!(show.contains("StateStore"), "{show}");
     assert!(automatic.contains("StateStore"), "{automatic}");
 }
