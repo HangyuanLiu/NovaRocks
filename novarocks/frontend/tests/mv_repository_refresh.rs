@@ -378,6 +378,15 @@ fn dropping_paged_mv_records_removes_all_dependencies_and_refresh_history() {
             max_entries: 10,
         })
         .expect("persist paged partition states");
+    assert_eq!(
+        repository
+            .list_partition_states(definition.mv_id)
+            .expect("list persisted partition states")
+            .into_iter()
+            .map(|state| state.partition_key)
+            .collect::<Vec<_>>(),
+        vec!["p1".to_string(), "p2".to_string(), "p3".to_string()]
+    );
     assert!(repository.drop_by_id(definition.mv_id).expect("drop MV"));
     drop(repository);
     let reopened = runtime
