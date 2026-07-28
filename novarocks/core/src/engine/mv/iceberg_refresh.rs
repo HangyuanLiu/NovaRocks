@@ -450,6 +450,8 @@ pub(crate) fn create_iceberg_mv(
         partition_fields,
         &target_properties,
     )?;
+    #[cfg(test)]
+    run_after_create_target_hook();
     let post_create = (|| {
         entry.invalidate_table_cache(&target.namespace, &target.table);
         let target_loaded = crate::connector::iceberg::catalog::load_table(
@@ -6032,6 +6034,45 @@ fn record_definition_load() {
     DEFINITION_LOAD_COUNTER.with(|slot| {
         if let Some(counter) = slot.borrow().as_ref() {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_CREATE_TARGET_HOOK: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct AfterCreateTargetHookGuard;
+
+#[cfg(test)]
+impl AfterCreateTargetHookGuard {
+    fn install(hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        AFTER_CREATE_TARGET_HOOK.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "after-create target hook already installed"
+            );
+            *slot.borrow_mut() = Some(hook);
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for AfterCreateTargetHookGuard {
+    fn drop(&mut self) {
+        AFTER_CREATE_TARGET_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn run_after_create_target_hook() {
+    AFTER_CREATE_TARGET_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook();
         }
     });
 }
@@ -21856,6 +21897,104 @@ mod tests {
             crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
                 .is_err(),
             "target table should never have been created"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_target_create_failure_leaves_no_target_or_metadata() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let blocked_namespace = env._warehouse_dir.path().join("analytics");
+        std::fs::write(&blocked_namespace, b"not a directory")
+            .expect("block target namespace creation");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("target create must fail");
+        let canonical_warehouse = env
+            ._warehouse_dir
+            .path()
+            .canonicalize()
+            .expect("canonical warehouse path");
+        let metadata_location = format!(
+            "file://{}/analytics/mv_orders/metadata/v1.metadata.json",
+            canonical_warehouse.display()
+        );
+        assert_eq!(
+            err,
+            format!(
+                "create iceberg table failed: Unexpected => write metadata to {metadata_location}: DataInvalid => fs write({metadata_location}) resolve path: init opendal fs operator"
+            )
+        );
+        assert!(blocked_namespace.is_file());
+        assert!(!blocked_namespace.join("mv_orders").exists());
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("repository read");
+        assert!(
+            env.state
+                .mv_repo
+                .list_definitions(read.as_ref())
+                .expect("definitions")
+                .is_empty(),
+            "target creation fails before repository persistence"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_target_inspection_failure_cleans_target_and_metadata() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let hook_entry = entry.clone();
+        let _after_create_hook = AfterCreateTargetHookGuard::install(Arc::new(move || {
+            hook_entry.poison_table_cache_for_test();
+        }));
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("post-create target inspection must fail");
+        assert_eq!(
+            err,
+            "table cache lock: poisoned lock: another task failed inside; target cleanup=Ok(())"
+        );
+        assert!(
+            !env._warehouse_dir
+                .path()
+                .join("analytics")
+                .join("mv_orders")
+                .exists(),
+            "inspection failure must clean the created target"
+        );
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("repository read");
+        assert!(
+            env.state
+                .mv_repo
+                .list_definitions(read.as_ref())
+                .expect("definitions")
+                .is_empty(),
+            "inspection fails before repository persistence"
         );
     }
 
