@@ -223,7 +223,7 @@ struct FakeIncrementalSplitAdapter {
 }
 
 impl IncrementalConnectorSplitAdapter for FakeIncrementalSplitAdapter {
-    fn append_incremental_ranges(
+    fn prepare_incremental_ranges(
         &self,
         _ranges: &[IncrementalScanRange],
     ) -> Result<ConnectorSplitAppend, String> {
@@ -240,7 +240,7 @@ struct CountingIncrementalSplitAdapter {
 }
 
 impl IncrementalConnectorSplitAdapter for CountingIncrementalSplitAdapter {
-    fn append_incremental_ranges(
+    fn prepare_incremental_ranges(
         &self,
         _ranges: &[IncrementalScanRange],
     ) -> Result<ConnectorSplitAppend, String> {
@@ -249,6 +249,25 @@ impl IncrementalConnectorSplitAdapter for CountingIncrementalSplitAdapter {
             splits: Vec::new(),
             has_more: false,
         })
+    }
+}
+
+struct CommitTrackingIncrementalSplitAdapter {
+    append: ConnectorSplitAppend,
+    commit_calls: Arc<Mutex<usize>>,
+}
+
+impl IncrementalConnectorSplitAdapter for CommitTrackingIncrementalSplitAdapter {
+    fn prepare_incremental_ranges(
+        &self,
+        _ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String> {
+        Ok(self.append.clone())
+    }
+
+    fn commit_incremental_ranges(&self, _append: &ConnectorSplitAppend) -> Result<(), String> {
+        *self.commit_calls.lock().expect("commit calls") += 1;
+        Ok(())
     }
 }
 
@@ -495,6 +514,60 @@ fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically(
             .as_slice(),
         [ScanMorsel::ConnectorSplit { index: 0 }]
     ));
+}
+
+#[test]
+fn incremental_connector_source_does_not_commit_a_rejected_append() {
+    let instance_id = ConnectorInstanceId::parse("test.commit.rejected").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let duplicate = ConnectorSplit::try_new(
+        instance_id.clone(),
+        "duplicate",
+        bytes::Bytes::new(),
+        Some(1),
+    )
+    .expect("duplicate split");
+    let commit_calls = Arc::new(Mutex::new(0));
+    let source = ConnectorReadScanSource::new_with_incremental(
+        instance,
+        vec![
+            ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
+                .expect("initial split"),
+        ],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+        Arc::new(CommitTrackingIncrementalSplitAdapter {
+            append: ConnectorSplitAppend::Plain {
+                splits: vec![duplicate.clone(), duplicate],
+                has_more: false,
+            },
+            commit_calls: Arc::clone(&commit_calls),
+        }),
+        true,
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    op.build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
+        .expect_err("duplicate split IDs must fail");
+    assert_eq!(*commit_calls.lock().expect("commit calls"), 0);
 }
 
 #[test]

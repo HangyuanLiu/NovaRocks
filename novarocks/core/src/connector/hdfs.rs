@@ -189,7 +189,7 @@ impl HdfsConnectorInstance {
         })
     }
 
-    fn append_incremental_ranges(
+    fn prepare_incremental_ranges(
         &self,
         scan_ranges: &[IncrementalScanRange],
     ) -> Result<ConnectorSplitAppend, String> {
@@ -197,7 +197,7 @@ impl HdfsConnectorInstance {
             .incremental_lock
             .lock()
             .map_err(|_| "HDFS incremental range lock poisoned".to_string())?;
-        let mut ranges = self
+        let ranges = self
             .ranges
             .lock()
             .map_err(|_| "HDFS range state lock poisoned".to_string())?;
@@ -326,9 +326,6 @@ impl HdfsConnectorInstance {
         }
 
         let start = ranges.len();
-        ranges.extend(appended.iter().cloned());
-        self.next_scan_range_id
-            .store(next_scan_range_id, Ordering::Release);
         let scheduled = appended
             .into_iter()
             .enumerate()
@@ -349,6 +346,53 @@ impl HdfsConnectorInstance {
             has_more,
         })
     }
+
+    fn commit_incremental_ranges(&self, append: &ConnectorSplitAppend) -> Result<(), String> {
+        let scheduled = append.scheduled_file_splits().ok_or_else(|| {
+            "HDFS incremental append must retain scheduled file split sidecars".to_string()
+        })?;
+        let _append = self
+            .incremental_lock
+            .lock()
+            .map_err(|_| "HDFS incremental range lock poisoned".to_string())?;
+        let mut ranges = self
+            .ranges
+            .lock()
+            .map_err(|_| "HDFS range state lock poisoned".to_string())?;
+        let start = ranges.len();
+        let mut next_scan_range_id = self.next_scan_range_id.load(Ordering::Acquire);
+        let mut prepared_ranges = Vec::with_capacity(scheduled.len());
+
+        for (offset, scheduled) in scheduled.iter().enumerate() {
+            let index = start + offset;
+            let expected_payload = bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes());
+            let split = scheduled.split();
+            if split.owner() != &self.instance_id
+                || split.split_id() != format!("hdfs-{index}")
+                || split.payload() != &expected_payload
+            {
+                return Err(
+                    "HDFS incremental append no longer matches provider range state".to_string(),
+                );
+            }
+            let range = scheduled.file_range().ok_or_else(|| {
+                "HDFS incremental append is missing its file range sidecar".to_string()
+            })?;
+            if range.scan_range_id >= 0 {
+                let next = range
+                    .scan_range_id
+                    .checked_add(1)
+                    .ok_or_else(|| "HDFS scan range ID overflowed".to_string())?;
+                next_scan_range_id = next_scan_range_id.max(next);
+            }
+            prepared_ranges.push(range.clone());
+        }
+
+        ranges.extend(prepared_ranges);
+        self.next_scan_range_id
+            .store(next_scan_range_id, Ordering::Release);
+        Ok(())
+    }
 }
 
 struct HdfsIncrementalSplitAdapter {
@@ -356,11 +400,15 @@ struct HdfsIncrementalSplitAdapter {
 }
 
 impl IncrementalConnectorSplitAdapter for HdfsIncrementalSplitAdapter {
-    fn append_incremental_ranges(
+    fn prepare_incremental_ranges(
         &self,
         ranges: &[IncrementalScanRange],
     ) -> Result<ConnectorSplitAppend, String> {
-        self.provider.append_incremental_ranges(ranges)
+        self.provider.prepare_incremental_ranges(ranges)
+    }
+
+    fn commit_incremental_ranges(&self, append: &ConnectorSplitAppend) -> Result<(), String> {
+        self.provider.commit_incremental_ranges(append)
     }
 }
 
@@ -1685,20 +1733,24 @@ mod tests {
         };
 
         let appended = adapter
-            .append_incremental_ranges(&[
+            .prepare_incremental_ranges(&[
                 make_hdfs_range("s3://bucket/path/next.parquet", None),
                 make_end_marker(false),
             ])
-            .expect("append HDFS range");
+            .expect("prepare HDFS range");
         let crate::connector::runtime::ConnectorSplitAppend::Scheduled {
             scheduled,
             has_more,
-        } = appended
+        } = &appended
         else {
             panic!("HDFS adapter must schedule file sidecars");
         };
         assert!(!has_more);
         assert_eq!(scheduled.len(), 1);
+        assert_eq!(provider.range_count().expect("range count"), 1);
+        adapter
+            .commit_incremental_ranges(&appended)
+            .expect("commit HDFS range");
         assert_eq!(provider.range_count().expect("range count"), 2);
         assert_eq!(
             provider.range_for_index(1).expect("registered range").path,

@@ -48,6 +48,7 @@ pub(crate) struct ConnectorBatchReaderIter {
 /// Provider-private conversion result for FE ranges that arrive after a scan
 /// source has already been scheduled. The generic runtime never decodes the
 /// range or split payload.
+#[derive(Clone)]
 pub(crate) enum ConnectorSplitAppend {
     Plain {
         splits: Vec<ConnectorSplit>,
@@ -60,13 +61,20 @@ pub(crate) enum ConnectorSplitAppend {
 }
 
 impl ConnectorSplitAppend {
-    fn into_scheduled(self) -> (Vec<ConnectorScheduledSplit>, bool) {
+    fn scheduled(&self) -> (Vec<ConnectorScheduledSplit>, bool) {
         match self {
-            Self::Plain { splits, has_more } => (plain_scheduled(splits), has_more),
+            Self::Plain { splits, has_more } => (plain_scheduled(splits.clone()), *has_more),
             Self::Scheduled {
                 scheduled,
                 has_more,
-            } => (scheduled, has_more),
+            } => (scheduled.clone(), *has_more),
+        }
+    }
+
+    pub(crate) fn scheduled_file_splits(&self) -> Option<&[ConnectorScheduledSplit]> {
+        match self {
+            Self::Plain { .. } => None,
+            Self::Scheduled { scheduled, .. } => Some(scheduled),
         }
     }
 }
@@ -94,6 +102,14 @@ impl ConnectorScheduledSplit {
         }
     }
 
+    pub(crate) fn split(&self) -> &ConnectorSplit {
+        &self.split
+    }
+
+    pub(crate) fn file_range(&self) -> Option<&FileScanRange> {
+        self.file_range.as_ref()
+    }
+
     fn morsel(&self, index: usize) -> ScanMorsel {
         match &self.file_range {
             Some(range) => ScanMorsel::ConnectorFileSplit {
@@ -108,10 +124,17 @@ impl ConnectorScheduledSplit {
 /// Core-internal adapter used only by compat/native transport adapters that
 /// receive incremental ranges. It deliberately is not part of the SPI trait.
 pub(crate) trait IncrementalConnectorSplitAdapter: Send + Sync {
-    fn append_incremental_ranges(
+    fn prepare_incremental_ranges(
         &self,
         ranges: &[IncrementalScanRange],
     ) -> Result<ConnectorSplitAppend, String>;
+
+    /// Commits provider-private state only after the generic queue has
+    /// validated every opaque split and its core sidecar. Implementations must
+    /// reject a stale or malformed prepared append without partial mutation.
+    fn commit_incremental_ranges(&self, _append: &ConnectorSplitAppend) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Core-private provider hook for opening delete-file data. The core runner
@@ -550,7 +573,8 @@ impl ScanOp for ConnectorReadScanOp {
         if !state.has_more {
             return Err("SPI connector split queue is closed".to_string());
         }
-        let (appended, has_more) = adapter.append_incremental_ranges(ranges)?.into_scheduled();
+        let append = adapter.prepare_incremental_ranges(ranges)?;
+        let (appended, has_more) = append.scheduled();
         let expected_owner = &self.instance.descriptor().instance_id;
         let start = state.scheduled.len();
         let mut appended_ids = BTreeSet::new();
@@ -591,6 +615,7 @@ impl ScanOp for ConnectorReadScanOp {
                 "incremental connector split payloads exceed their total budget".to_string(),
             );
         }
+        adapter.commit_incremental_ranges(&append)?;
         for scheduled in appended {
             state
                 .split_ids
