@@ -460,6 +460,53 @@ pub(crate) fn plan_starrocks_hdfs_read_source(
     )
 }
 
+struct NativeHdfsCancellation {
+    query_id: Option<QueryId>,
+}
+
+impl ConnectorCancellation for NativeHdfsCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.query_id
+            .is_some_and(|query_id| query_context_manager().is_query_canceled(query_id))
+    }
+}
+
+pub(crate) fn plan_native_hdfs_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: Option<QueryId>,
+    node_id: i32,
+    config: HdfsInstanceConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let batch = ConnectorBatchBudget {
+        max_rows: rows,
+        max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+            .expect("SPI handle maximum is nonzero"),
+    };
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(NativeHdfsCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )?;
+    let instance_query_id = query_id
+        .map(|query_id| query_id.to_string())
+        .unwrap_or_else(|| "unidentified".to_string());
+    plan_hdfs_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("hdfs.native.{instance_query_id}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
+}
+
 impl ConnectorRead for HdfsConnectorInstance {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.instance_id

@@ -1317,9 +1317,10 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [ScanMorsel::FileRange { delete_files, .. }] = morsels.morsels.as_slice() else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
+        let delete_files = &morsel.file_range().expect("file sidecar").delete_files;
         assert_eq!(delete_files.len(), 1);
         let dv = &delete_files[0];
         assert_eq!(dv.file_format, IcebergFileFormat::Puffin);
@@ -1356,21 +1357,16 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [
-            ScanMorsel::FileRange {
-                ivm_change_op,
-                iceberg_file_pruning,
-                ..
-            },
-        ] = morsels.morsels.as_slice()
-        else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
+        let range = morsel.file_range().expect("file sidecar");
         assert_eq!(
-            *ivm_change_op,
+            range.ivm_change_op,
             Some(crate::exec::change_op::CHANGE_OP_DELETE)
         );
-        let pruning = iceberg_file_pruning
+        let pruning = range
+            .iceberg_file_pruning
             .as_ref()
             .expect("file pruning metadata");
         let stats = pruning.columns.get("id").expect("id stats");
@@ -1433,16 +1429,12 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [
-            ScanMorsel::FileRange {
-                iceberg_file_pruning,
-                ..
-            },
-        ] = morsels.morsels.as_slice()
-        else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
-        let stats = iceberg_file_pruning
+        let range = morsel.file_range().expect("file sidecar");
+        let stats = range
+            .iceberg_file_pruning
             .as_ref()
             .expect("file pruning metadata")
             .columns
@@ -1507,17 +1499,15 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [
-            ScanMorsel::FileRange {
-                iceberg_file_pruning,
-                ..
-            },
-        ] = morsels.morsels.as_slice()
-        else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
         assert!(
-            iceberg_file_pruning.is_none(),
+            morsel
+                .file_range()
+                .expect("file sidecar")
+                .iceberg_file_pruning
+                .is_none(),
             "one-byte negative Int8 bounds must not reach the untyped shared pruning decoder"
         );
     }
