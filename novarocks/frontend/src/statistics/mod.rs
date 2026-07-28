@@ -2,6 +2,7 @@ mod model;
 mod observation;
 mod provider;
 mod query;
+mod statement;
 
 use std::sync::RwLock;
 
@@ -38,7 +39,7 @@ impl StatisticsService for FrontendStatisticsService {
         sql: &str,
         context: StatisticsRequestContext<'_>,
     ) -> Result<Option<StatisticsStatementResult>, String> {
-        observation::try_handle_statement(self, engine, sql, context)
+        statement::try_handle_statement(self, engine, sql, context)
     }
 
     fn try_query(

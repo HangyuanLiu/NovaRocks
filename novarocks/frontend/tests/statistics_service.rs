@@ -5,7 +5,7 @@ use arrow::datatypes::DataType;
 use novarocks::engine::statistics::{
     CollectedColumnStatistics, StatisticsColumn, StatisticsEngine, StatisticsInsertObservation,
     StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode, StatisticsRequestContext,
-    StatisticsService, StatisticsTableTarget,
+    StatisticsService, StatisticsStatementResult, StatisticsTableTarget,
 };
 use novarocks::runtime::query_result::QueryResult;
 use novarocks_frontend::FrontendStatisticsService;
@@ -276,6 +276,66 @@ fn column_statistics_support_count_projection_filter_and_sort() {
                 "2".to_string(),
             ],
         ]
+    );
+}
+
+#[test]
+fn analyze_collects_requested_columns_and_publishes_status() {
+    let service = FrontendStatisticsService::new();
+    let engine = FakeStatisticsEngine::with_collect_result(vec![CollectedColumnStatistics {
+        column_name: "k".to_string(),
+        row_count: 3,
+        min: "1".to_string(),
+        max: "3".to_string(),
+        ndv: "3".to_string(),
+    }]);
+    let result = service
+        .try_handle_statement(
+            &engine,
+            "ANALYZE TABLE db1.t1(k)",
+            StatisticsRequestContext {
+                current_catalog: None,
+                current_database: "db1",
+            },
+        )
+        .unwrap()
+        .expect("ANALYZE route");
+    assert!(matches!(result, StatisticsStatementResult::Query(_)));
+    assert_eq!(
+        engine.collect_requests(),
+        vec![("db1.t1".to_string(), vec!["k".to_string()])]
+    );
+    assert_eq!(
+        service
+            .catalog_table_statistics("db1", "t1")
+            .unwrap()
+            .unwrap()
+            .columns[0]
+            .ndv,
+        "3"
+    );
+}
+
+#[test]
+fn analyze_engine_error_does_not_publish_partial_memory_rows() {
+    let service = FrontendStatisticsService::new();
+    let engine = FakeStatisticsEngine::failing_collect("aggregate scan failed");
+    let error = service
+        .try_handle_statement(
+            &engine,
+            "ANALYZE TABLE db1.t1",
+            StatisticsRequestContext {
+                current_catalog: None,
+                current_database: "db1",
+            },
+        )
+        .expect_err("collect failure");
+    assert_eq!(error, "aggregate scan failed");
+    assert!(
+        service
+            .catalog_table_statistics("db1", "t1")
+            .unwrap()
+            .is_none()
     );
 }
 

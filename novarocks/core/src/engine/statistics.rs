@@ -133,6 +133,38 @@ pub trait StatisticsEngine: Send + Sync {
     ) -> Result<Vec<CollectedColumnStatistics>, String>;
 }
 
+impl StatisticsEngine for Arc<super::StandaloneState> {
+    fn resolve_table_columns(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<Vec<StatisticsColumn>, String> {
+        let name = object_name_from_parts(&target.name_parts)?;
+        super::query_prep::materialize_external_schema_table_for_statement(
+            self,
+            target.current_catalog.as_deref(),
+            &target.current_database,
+            &name,
+        )?;
+        table_columns_from_local_catalog(self, &target.current_database, name.leaf())
+    }
+
+    fn resolve_local_table_columns(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<Vec<StatisticsColumn>>, String> {
+        optional_table_columns_from_local_catalog(self, database, table)
+    }
+
+    fn collect_table_statistics(
+        &self,
+        target: &StatisticsTableTarget,
+        columns: &[String],
+    ) -> Result<Vec<CollectedColumnStatistics>, String> {
+        collect_statistics_through_engine(self, target, columns)
+    }
+}
+
 pub trait StatisticsService: Send + Sync {
     fn try_handle_statement(
         &self,
@@ -1353,6 +1385,86 @@ fn collect_column_stats_by_query(
         });
     }
     Ok(out)
+}
+
+fn object_name_from_parts(parts: &[String]) -> Result<ObjectName, String> {
+    if !(1..=3).contains(&parts.len()) {
+        return Err(format!(
+            "statistics table name must be table, db.table, or catalog.db.table: {}",
+            parts.join(".")
+        ));
+    }
+    let parts = parts
+        .iter()
+        .map(|part| normalize_name(part))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ObjectName { parts })
+}
+
+fn table_columns_from_local_catalog(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+) -> Result<Vec<StatisticsColumn>, String> {
+    let catalog = state
+        .catalog_service
+        .local()
+        .read()
+        .expect("standalone catalog read lock");
+    let table = catalog.get(database, table)?;
+    Ok(table
+        .columns
+        .iter()
+        .map(|column| StatisticsColumn {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+        })
+        .collect())
+}
+
+fn optional_table_columns_from_local_catalog(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+) -> Result<Option<Vec<StatisticsColumn>>, String> {
+    normalize_name(database)?;
+    normalize_name(table)?;
+    match table_columns_from_local_catalog(state, database, table) {
+        Ok(columns) => Ok(Some(columns)),
+        Err(error)
+            if error.starts_with("unknown database:") || error.starts_with("unknown table:") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn collect_statistics_through_engine(
+    state: &Arc<StandaloneState>,
+    target: &StatisticsTableTarget,
+    columns: &[String],
+) -> Result<Vec<CollectedColumnStatistics>, String> {
+    let name = object_name_from_parts(&target.name_parts)?;
+    let key = table_key(&name, &target.current_database)?;
+    let ndv_by_name = crate::connector::iceberg::analyze::analyze_iceberg_puffin_stats(
+        state,
+        target.current_catalog.as_deref(),
+        &target.current_database,
+        &name,
+        columns,
+    )?;
+    collect_column_stats_by_query(state, &key, columns, &ndv_by_name).map(|rows| {
+        rows.into_iter()
+            .map(|row| CollectedColumnStatistics {
+                column_name: row.column_name,
+                row_count: row.row_count,
+                min: row.min,
+                max: row.max,
+                ndv: row.ndv,
+            })
+            .collect()
+    })
 }
 
 fn result_cell(result: &QueryResult, column_idx: usize, row_idx: usize) -> Option<String> {
