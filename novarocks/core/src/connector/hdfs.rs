@@ -57,6 +57,55 @@ fn apply_parquet_pruning_gate_for_delete_files(
     }
 }
 
+/// Opens one provider-owned file range without depending on the core `ScanOp`
+/// contract. Both the transitional HDFS scan op and the SPI batch reader use
+/// this seam so position-delete pruning behavior stays identical.
+pub(crate) fn build_hdfs_range_iter(
+    cfg: &HdfsScanConfig,
+    range: FileScanRange,
+    profile: Option<RuntimeProfile>,
+    runtime_filters: Option<&RuntimeFilterContext>,
+) -> Result<BoxedExecIter, String> {
+    let external_datacache = range.external_datacache.clone();
+    let scan = FileScanContext::build(
+        vec![range],
+        profile.clone(),
+        cfg.object_store_config.as_ref(),
+    )?;
+    if let Some(profile) = profile.as_ref() {
+        profile.add_info_string(
+            "OriginalRangeCount",
+            format!("{}", cfg.original_range_count),
+        );
+        profile.add_info_string("RangeCount", format!("{}", scan.ranges.len()));
+    }
+    let current_delete_files = scan
+        .ranges
+        .first()
+        .map(|range| range.delete_files.as_slice())
+        .unwrap_or(&[]);
+    let Some(mut format) = cfg.format.clone() else {
+        return Err("hdfs scan missing file format for non-empty morsel".to_string());
+    };
+    format = match format {
+        FileFormatConfig::Parquet(mut parquet_cfg) => {
+            parquet_cfg.datacache = parquet_cfg
+                .datacache
+                .with_external_range_options(external_datacache.as_ref())?;
+            parquet_cfg.query_global_dicts = cfg.query_global_dicts.clone();
+            apply_parquet_pruning_gate_for_delete_files(&mut parquet_cfg, current_delete_files);
+            FileFormatConfig::Parquet(parquet_cfg)
+        }
+        FileFormatConfig::Orc(mut orc_cfg) => {
+            orc_cfg.datacache = orc_cfg
+                .datacache
+                .with_external_range_options(external_datacache.as_ref())?;
+            FileFormatConfig::Orc(orc_cfg)
+        }
+    };
+    build_format_iter(scan, format, None, profile, runtime_filters)
+}
+
 fn exact_ordered_file_candidates(
     stats: &crate::connector::iceberg::scan_model::IcebergColumnStats,
     explicit_null_state: Option<IcebergFileNullState>,
@@ -482,75 +531,10 @@ impl ScanOp for HdfsScanOp {
         profile: Option<RuntimeProfile>,
         runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
-        let ScanMorsel::FileRange {
-            path,
-            file_len,
-            offset,
-            length,
-            scan_range_id,
-            first_row_id,
-            data_sequence_number,
-            ivm_change_op,
-            included_positions,
-            external_datacache,
-            delete_files,
-            iceberg_file_pruning,
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
             return Err("hdfs scan received unexpected morsel".to_string());
         };
-        let ranges = vec![FileScanRange {
-            path,
-            file_len,
-            offset,
-            length,
-            scan_range_id,
-            first_row_id,
-            data_sequence_number,
-            ivm_change_op,
-            included_positions,
-            external_datacache: external_datacache.clone(),
-            delete_files,
-            iceberg_file_pruning,
-        }];
-        let scan = FileScanContext::build(
-            ranges,
-            profile.clone(),
-            self.cfg.object_store_config.as_ref(),
-        )?;
-        if let Some(profile) = profile.as_ref() {
-            profile.add_info_string(
-                "OriginalRangeCount",
-                format!("{}", self.cfg.original_range_count),
-            );
-            profile.add_info_string("RangeCount", format!("{}", scan.ranges.len()));
-        }
-        let current_delete_files = scan
-            .ranges
-            .first()
-            .map(|range| range.delete_files.as_slice())
-            .unwrap_or(&[]);
-
-        let Some(mut format) = self.cfg.format.clone() else {
-            return Err("hdfs scan missing file format for non-empty morsel".to_string());
-        };
-        format = match format {
-            FileFormatConfig::Parquet(mut parquet_cfg) => {
-                parquet_cfg.datacache = parquet_cfg
-                    .datacache
-                    .with_external_range_options(external_datacache.as_ref())?;
-                parquet_cfg.query_global_dicts = self.cfg.query_global_dicts.clone();
-                apply_parquet_pruning_gate_for_delete_files(&mut parquet_cfg, current_delete_files);
-                FileFormatConfig::Parquet(parquet_cfg)
-            }
-            FileFormatConfig::Orc(mut orc_cfg) => {
-                orc_cfg.datacache = orc_cfg
-                    .datacache
-                    .with_external_range_options(external_datacache.as_ref())?;
-                FileFormatConfig::Orc(orc_cfg)
-            }
-        };
-        build_format_iter(scan, format, None, profile, runtime_filters)
+        build_hdfs_range_iter(&self.cfg, range, profile, runtime_filters)
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
