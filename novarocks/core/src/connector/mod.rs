@@ -353,7 +353,6 @@ mod scan_planning_registry_tests {
 #[derive(Clone, Debug)]
 pub enum ScanConfig {
     Jdbc(JdbcScanConfig),
-    Hdfs(Box<HdfsScanConfig>),
     IcebergMetadata(IcebergMetadataScanConfig),
     #[cfg(feature = "compat")]
     StarRocks(Box<StarRocksScanConfig>),
@@ -562,11 +561,9 @@ impl Default for ConnectorRegistry {
         let mut reg = ConnectorRegistry::new();
         let jdbc = Arc::new(JdbcConnector { name: "jdbc" });
         let mysql = Arc::new(JdbcConnector { name: "mysql" });
-        let hdfs = Arc::new(HdfsConnector { name: "hdfs" });
         let iceberg = Arc::new(IcebergConnector { name: "iceberg" });
         reg.register_scan_connector(jdbc);
         reg.register_scan_connector(mysql);
-        reg.register_scan_connector(hdfs);
         reg.register_scan_connector(iceberg);
         #[cfg(feature = "compat")]
         let starrocks = Arc::new(StarRocksConnector { name: "starrocks" });
@@ -619,58 +616,6 @@ impl ScanConnector for JdbcConnector {
             ScanConfig::Jdbc(cfg) => {
                 let source: Arc<dyn ScanSource> = Arc::new(jdbc::JdbcScanSource::new(cfg));
                 Ok((source, BoundScanRanges::None))
-            }
-            _ => Err(format!(
-                "unsupported scan config for connector {}",
-                self.name
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct HdfsConnector {
-    name: &'static str,
-}
-
-impl ScanConnector for HdfsConnector {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn create_scan_node(
-        &self,
-        cfg: ScanConfig,
-    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
-        match cfg {
-            ScanConfig::Hdfs(cfg) => {
-                // Split the decoder-built config into a static source plus its
-                // file ranges. The ranges travel to the instance assignment;
-                // `bind` happens at materialize time.
-                let HdfsScanConfig {
-                    ranges,
-                    // `original_range_count` is recomputed from `ranges` in
-                    // `bind`; it equals `ranges.len()` at every decode site.
-                    original_range_count: _,
-                    has_more,
-                    limit,
-                    profile_label,
-                    format,
-                    object_store_config,
-                    iceberg_table_locations,
-                    query_global_dicts,
-                    iceberg_runtime_pruning,
-                } = *cfg;
-                let source: Arc<dyn ScanSource> = Arc::new(hdfs::HdfsScanSource::new(
-                    limit,
-                    profile_label,
-                    format,
-                    object_store_config,
-                    iceberg_table_locations,
-                    query_global_dicts,
-                    iceberg_runtime_pruning,
-                ));
-                Ok((source, BoundScanRanges::File { ranges, has_more }))
             }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
