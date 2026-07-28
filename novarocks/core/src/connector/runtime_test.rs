@@ -245,7 +245,7 @@ impl IncrementalConnectorSplitAdapter for CountingIncrementalSplitAdapter {
         _ranges: &[IncrementalScanRange],
     ) -> Result<ConnectorSplitAppend, String> {
         *self.calls.lock().expect("incremental calls") += 1;
-        Ok(ConnectorSplitAppend {
+        Ok(ConnectorSplitAppend::Plain {
             splits: Vec::new(),
             has_more: false,
         })
@@ -274,7 +274,7 @@ fn incremental_connector_source_appends_only_new_connector_morsels() {
     let next = ConnectorSplit::try_new(instance_id, "next", bytes::Bytes::new(), Some(1))
         .expect("next split");
     let adapter = Arc::new(FakeIncrementalSplitAdapter {
-        append: Mutex::new(Some(ConnectorSplitAppend {
+        append: Mutex::new(Some(ConnectorSplitAppend::Plain {
             splits: vec![next],
             has_more: false,
         })),
@@ -310,6 +310,79 @@ fn incremental_connector_source_appends_only_new_connector_morsels() {
         [ScanMorsel::ConnectorSplit { index: 1 }]
     ));
     assert!(!appended.has_more);
+}
+
+#[test]
+fn incremental_connector_source_preserves_file_range_sidecars() {
+    let instance_id = ConnectorInstanceId::parse("test.incremental.file").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let appended = ConnectorScheduledSplit::file(
+        ConnectorSplit::try_new(
+            instance_id.clone(),
+            "next-file",
+            bytes::Bytes::new(),
+            Some(1),
+        )
+        .expect("file split"),
+        FileScanRange {
+            path: "s3://bucket/path/next.parquet".to_string(),
+            file_len: 32,
+            offset: 0,
+            length: 32,
+            scan_range_id: 9,
+            first_row_id: Some(42),
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        },
+    );
+    let source = ConnectorReadScanSource::new_with_incremental(
+        instance,
+        vec![
+            ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
+                .expect("initial split"),
+        ],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+        Arc::new(FakeIncrementalSplitAdapter {
+            append: Mutex::new(Some(ConnectorSplitAppend::Scheduled {
+                scheduled: vec![appended],
+                has_more: false,
+            })),
+        }),
+        true,
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    let appended = op
+        .build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
+        .expect("append file split");
+    assert!(matches!(
+        appended.morsels.as_slice(),
+        [ScanMorsel::ConnectorFileSplit { index: 1, range }]
+            if range.scan_range_id == 9 && range.first_row_id == Some(42)
+    ));
 }
 
 #[test]
@@ -403,7 +476,7 @@ fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically(
         },
         chunk_schema(),
         Arc::new(FakeIncrementalSplitAdapter {
-            append: Mutex::new(Some(ConnectorSplitAppend {
+            append: Mutex::new(Some(ConnectorSplitAppend::Plain {
                 splits: vec![next.clone(), next],
                 has_more: false,
             })),

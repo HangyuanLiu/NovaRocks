@@ -46,9 +46,27 @@ pub(crate) struct ConnectorBatchReaderIter {
 /// Provider-private conversion result for FE ranges that arrive after a scan
 /// source has already been scheduled. The generic runtime never decodes the
 /// range or split payload.
-pub(crate) struct ConnectorSplitAppend {
-    pub(crate) splits: Vec<ConnectorSplit>,
-    pub(crate) has_more: bool,
+pub(crate) enum ConnectorSplitAppend {
+    Plain {
+        splits: Vec<ConnectorSplit>,
+        has_more: bool,
+    },
+    Scheduled {
+        scheduled: Vec<ConnectorScheduledSplit>,
+        has_more: bool,
+    },
+}
+
+impl ConnectorSplitAppend {
+    fn into_scheduled(self) -> (Vec<ConnectorScheduledSplit>, bool) {
+        match self {
+            Self::Plain { splits, has_more } => (plain_scheduled(splits), has_more),
+            Self::Scheduled {
+                scheduled,
+                has_more,
+            } => (scheduled, has_more),
+        }
+    }
 }
 
 /// A queued provider split plus the optional file metadata that remains owned
@@ -462,11 +480,12 @@ impl ScanOp for ConnectorReadScanOp {
         if !state.has_more {
             return Err("SPI connector split queue is closed".to_string());
         }
-        let appended = adapter.append_incremental_ranges(ranges)?;
+        let (appended, has_more) = adapter.append_incremental_ranges(ranges)?.into_scheduled();
         let expected_owner = &self.instance.descriptor().instance_id;
         let start = state.scheduled.len();
         let mut appended_ids = BTreeSet::new();
-        let append_payload_bytes = appended.splits.iter().try_fold(0usize, |total, split| {
+        let append_payload_bytes = appended.iter().try_fold(0usize, |total, scheduled| {
+            let split = &scheduled.split;
             if split.owner() != expected_owner {
                 return Err(
                     "incremental connector split owner does not match its instance".to_string(),
@@ -502,12 +521,14 @@ impl ScanOp for ConnectorReadScanOp {
                 "incremental connector split payloads exceed their total budget".to_string(),
             );
         }
-        for split in appended.splits {
-            state.split_ids.insert(split.split_id().to_string());
-            state.scheduled.push(ConnectorScheduledSplit::plain(split));
+        for scheduled in appended {
+            state
+                .split_ids
+                .insert(scheduled.split.split_id().to_string());
+            state.scheduled.push(scheduled);
         }
         state.total_payload_bytes = total_payload_bytes;
-        state.has_more = appended.has_more;
+        state.has_more = has_more;
         let end = state.scheduled.len();
         Ok(ScanMorsels::new(
             (start..end)
