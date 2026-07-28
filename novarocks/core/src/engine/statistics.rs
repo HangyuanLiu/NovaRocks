@@ -240,7 +240,6 @@ fn is_statistics_statement(sql: &str) -> bool {
         || lower.starts_with("drop stats ")
         || (lower.starts_with("update ") && lower.contains("test_update_stats "))
         || lower.starts_with("analyze ")
-        || lower.starts_with("explain costs ")
 }
 
 fn is_statistics_query(sql: &str, query: &sqlparser::ast::Query) -> Result<bool, String> {
@@ -2653,6 +2652,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn empty_service_leaves_non_statistics_explain_costs_unhandled() {
+        let service = EmptyStatisticsService;
+        let engine = FakeStatisticsEngine::default();
+        let context = StatisticsRequestContext {
+            current_catalog: None,
+            current_database: "db1",
+        };
+
+        assert!(matches!(
+            service.try_handle_statement(&engine, "EXPLAIN COSTS SELECT 3", context),
+            Ok(None)
+        ));
     }
 
     #[test]
