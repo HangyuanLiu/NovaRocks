@@ -528,22 +528,21 @@ impl FrontendTopologyController {
     }
 
     fn remove_backend(&self, backend_idx: usize, endpoint: SocketAddr) -> Result<(), String> {
-        let metadata_store = {
-            let mut state = self.state.lock().expect("frontend topology lock");
-            let removed = state
-                .entries
-                .remove(&backend_idx)
-                .is_some_and(|entry| entry.endpoint == endpoint);
-            if !removed {
-                return Ok(());
-            }
-            state.topology_revision = state.topology_revision.saturating_add(1);
-            state.metadata_store.clone()
-        };
-        self.publish_snapshot();
-        if let Some(store) = metadata_store {
+        let mut state = self.state.lock().expect("frontend topology lock");
+        let matches = state
+            .entries
+            .get(&backend_idx)
+            .is_some_and(|entry| entry.endpoint == endpoint);
+        if !matches {
+            return Ok(());
+        }
+        if let Some(store) = state.metadata_store.clone() {
             store.delete_backend(endpoint)?;
         }
+        state.entries.remove(&backend_idx);
+        state.topology_revision = state.topology_revision.saturating_add(1);
+        drop(state);
+        self.publish_snapshot();
         Ok(())
     }
 
@@ -741,6 +740,15 @@ impl BackendTopologyPort for FrontendTopologyController {
             .iter()
             .find_map(|(idx, entry)| (entry.endpoint == endpoint).then_some(*idx))
             .ok_or_else(|| format!("backend {endpoint} not found"))?;
+        if force {
+            drop(state);
+            self.remove_backend(backend_idx, endpoint)?;
+            self.dispatch_event(BackendQueryEvent::Unavailable {
+                backend_idx,
+                reason: format!("backend {backend_idx} dropped forcefully"),
+            });
+            return Ok(());
+        }
         let entry = state
             .entries
             .get_mut(&backend_idx)
@@ -754,13 +762,6 @@ impl BackendTopologyPort for FrontendTopologyController {
         drop(state);
         self.publish_snapshot();
 
-        if force {
-            self.dispatch_event(BackendQueryEvent::Unavailable {
-                backend_idx,
-                reason: format!("backend {backend_idx} dropped forcefully"),
-            });
-            return self.remove_backend(backend_idx, endpoint);
-        }
         if !self.backend_has_active_queries(backend_idx) {
             return self.remove_backend(backend_idx, endpoint);
         }
@@ -863,6 +864,7 @@ mod tests {
         loaded: Mutex<Vec<PersistedBackendTopology>>,
         upserts: Mutex<Vec<PersistedBackendTopology>>,
         deletes: Mutex<Vec<SocketAddr>>,
+        fail_deletes: AtomicBool,
     }
 
     impl BackendTopologyMetadataStore for RecordingMetadataStore {
@@ -876,6 +878,9 @@ mod tests {
         }
 
         fn delete_backend(&self, endpoint: SocketAddr) -> Result<(), String> {
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return Err("injected backend metadata delete failure".to_string());
+            }
             self.deletes.lock().unwrap().push(endpoint);
             Ok(())
         }
@@ -1083,6 +1088,42 @@ mod tests {
                 reason: "backend 0 dropped forcefully".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn force_drop_delete_failure_preserves_live_topology_and_queries() {
+        let controller = FrontendTopologyController::new(3);
+        let events = Arc::new(RecordingQueryEvents::default());
+        events.active.store(true, Ordering::SeqCst);
+        controller.attach_query_events(events.clone());
+        let store = Arc::new(RecordingMetadataStore::default());
+        controller.install_metadata_store(store.clone()).unwrap();
+        let endpoint: SocketAddr = "127.0.0.1:9082".parse().unwrap();
+        controller.add_backend(endpoint).unwrap();
+        controller.record_heartbeat_success(0, 11, "v", 1, 1);
+        store.fail_deletes.store(true, Ordering::SeqCst);
+
+        let error = controller
+            .drop_backend(endpoint, true)
+            .expect_err("durable delete failure must reject force DROP");
+
+        assert!(
+            error.contains("injected backend metadata delete failure"),
+            "{error}"
+        );
+        assert_eq!(controller.backend_count_for_test(), 1);
+        assert_eq!(
+            controller.live_backends(),
+            [LiveBackendTarget::new(0, endpoint, 11)],
+            "failed durable deletion must roll the backend back into the schedulable topology"
+        );
+        assert!(
+            events.events.lock().unwrap().is_empty(),
+            "queries must not fail before the durable DROP commits"
+        );
+        let rows = controller.rows();
+        assert_eq!(rows[0].1.state, BackendLifecycleState::Live);
+        assert!(rows[0].1.decommission_started.is_none());
     }
 
     #[test]
