@@ -71,7 +71,6 @@ struct MysqlRuntimeShared {
 
 enum MysqlRuntimeLifecycle {
     Running,
-    Failed(StateStoreError),
     Stopped,
 }
 
@@ -559,7 +558,6 @@ impl MysqlRuntime {
                 )
             })?;
             match &*lifecycle {
-                MysqlRuntimeLifecycle::Failed(error) => return Err(error.clone()),
                 MysqlRuntimeLifecycle::Stopped => return Ok(()),
                 MysqlRuntimeLifecycle::Running => {}
             }
@@ -608,15 +606,7 @@ impl MysqlRuntime {
                 }
             };
             if let Err(native) = disconnect {
-                let error = native.into_public();
-                let mut lifecycle = self.lifecycle.lock().map_err(|_| {
-                    StateStoreError::new(
-                        StateStoreErrorKind::Internal,
-                        "MySQL runtime lifecycle is poisoned",
-                    )
-                })?;
-                *lifecycle = MysqlRuntimeLifecycle::Failed(error.clone());
-                return Err(error);
+                return Err(native.into_public());
             }
         }
         self.shared
@@ -768,7 +758,7 @@ impl MysqlRuntimeShared {
 }
 
 #[cfg(all(test, feature = "state-store-test-hooks"))]
-fn test_mysql_runtime_with_pool(pool: Arc<dyn PoolLifecycle>) -> MysqlRuntime {
+pub(super) fn test_mysql_runtime_with_pool(pool: Arc<dyn PoolLifecycle>) -> MysqlRuntime {
     const PASSWORD_ENV: &str = "NOVAROCKS_SS3_DISCONNECT_TEST_PASSWORD";
     unsafe {
         std::env::set_var(PASSWORD_ENV, "test-secret");
@@ -817,6 +807,10 @@ mod mysql_tests {
         disconnects: Arc<AtomicUsize>,
     }
 
+    struct FailOncePool {
+        disconnects: Arc<AtomicUsize>,
+    }
+
     impl PoolLifecycle for FailingPool {
         fn get_conn<'a>(
             &'a self,
@@ -841,10 +835,38 @@ mod mysql_tests {
         }
     }
 
+    impl PoolLifecycle for FailOncePool {
+        fn get_conn<'a>(
+            &'a self,
+            _deadline: Instant,
+        ) -> BoxFuture<
+            'a,
+            Result<
+                super::super::client::MysqlPoolConnection,
+                super::super::error::MysqlNativeError,
+            >,
+        > {
+            Box::pin(async { Err(super::super::error::MysqlNativeError::provider_unavailable()) })
+        }
+
+        fn disconnect(
+            self: Arc<Self>,
+        ) -> BoxFuture<'static, Result<(), super::super::error::MysqlNativeError>> {
+            Box::pin(async move {
+                let attempt = self.disconnects.fetch_add(1, Ordering::AcqRel);
+                if attempt == 0 {
+                    Err(super::super::error::MysqlNativeError::provider_unavailable())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn mysql_disconnect_failure_is_stable_and_not_stopped() {
+    async fn mysql_disconnect_failure_retains_pool_and_retries_to_stopped() {
         let disconnects = Arc::new(AtomicUsize::new(0));
-        let pool: Arc<dyn PoolLifecycle> = Arc::new(FailingPool {
+        let pool: Arc<dyn PoolLifecycle> = Arc::new(FailOncePool {
             disconnects: Arc::clone(&disconnects),
         });
         let mut runtime = test_mysql_runtime_with_pool(pool);
@@ -853,17 +875,26 @@ mod mysql_tests {
             .shutdown_until(StdInstant::now() + Duration::from_secs(1))
             .await
             .expect_err("disconnect failure must surface");
-        let repeated = runtime
-            .shutdown_until(StdInstant::now() + Duration::from_secs(1))
-            .await
-            .expect_err("disconnect failure must remain stable");
-
-        assert_eq!(first, repeated);
+        assert_eq!(first.kind(), StateStoreErrorKind::ProviderUnavailable);
         assert_eq!(disconnects.load(Ordering::Acquire), 1);
         assert_eq!(runtime.pool_count().expect("pool ownership"), 1);
+        assert!(!runtime.is_accepting());
+        let blocked = match runtime.acquire_operation() {
+            Ok(_) => panic!("draining runtime must not accept new work"),
+            Err(error) => error,
+        };
+        assert_eq!(blocked.kind(), StateStoreErrorKind::ProviderUnavailable);
+
+        runtime
+            .shutdown_until(StdInstant::now() + Duration::from_secs(1))
+            .await
+            .expect("disconnect retry must complete");
+
+        assert_eq!(disconnects.load(Ordering::Acquire), 2);
+        assert_eq!(runtime.pool_count().expect("pool ownership"), 0);
         assert!(matches!(
             *runtime.lifecycle.lock().expect("lifecycle"),
-            MysqlRuntimeLifecycle::Failed(_)
+            MysqlRuntimeLifecycle::Stopped
         ));
     }
 

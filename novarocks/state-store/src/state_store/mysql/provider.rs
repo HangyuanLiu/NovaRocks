@@ -118,7 +118,29 @@ impl StateStoreProviderInstance for MysqlStateStoreProviderInstance {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "state-store-test-hooks")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "state-store-test-hooks")]
+    use std::time::Duration;
+
+    #[cfg(feature = "state-store-test-hooks")]
+    use futures::future::BoxFuture;
     use novarocks_spi::state_store::StateStoreProviderInstance;
+    #[cfg(feature = "state-store-test-hooks")]
+    use novarocks_spi::state_store::{
+        ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStoreErrorKind,
+        StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
+        WriteTransaction,
+    };
+
+    #[cfg(feature = "state-store-test-hooks")]
+    use super::*;
+    #[cfg(feature = "state-store-test-hooks")]
+    use crate::state_store::mysql::client::{MysqlPoolConnection, PoolLifecycle};
+    #[cfg(feature = "state-store-test-hooks")]
+    use crate::state_store::mysql::error::MysqlNativeError;
+    #[cfg(feature = "state-store-test-hooks")]
+    use crate::state_store::mysql::runtime::test_mysql_runtime_with_pool;
 
     use crate::state_store::{
         MYSQL_STATE_STORE_PROVIDER_ID, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
@@ -127,6 +149,83 @@ mod tests {
     };
 
     const PASSWORD_ENV: &str = "NOVAROCKS_SPI2_MYSQL_BIND_TEST_PASSWORD";
+
+    #[cfg(feature = "state-store-test-hooks")]
+    struct FailOncePool {
+        disconnects: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    impl PoolLifecycle for FailOncePool {
+        fn get_conn<'a>(
+            &'a self,
+            _deadline: tokio::time::Instant,
+        ) -> BoxFuture<'a, Result<MysqlPoolConnection, MysqlNativeError>> {
+            Box::pin(async { Err(MysqlNativeError::provider_unavailable()) })
+        }
+
+        fn disconnect(self: Arc<Self>) -> BoxFuture<'static, Result<(), MysqlNativeError>> {
+            Box::pin(async move {
+                let attempt = self.disconnects.fetch_add(1, Ordering::AcqRel);
+                if attempt == 0 {
+                    Err(MysqlNativeError::provider_unavailable())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    struct FakeStore;
+
+    #[cfg(feature = "state-store-test-hooks")]
+    #[async_trait]
+    impl StateStore for FakeStore {
+        fn provider_name(&self) -> &'static str {
+            "mysql-test"
+        }
+
+        fn limits(&self) -> &StateStoreLimits {
+            static LIMITS: std::sync::LazyLock<StateStoreLimits> =
+                std::sync::LazyLock::new(StateStoreLimits::default);
+            &LIMITS
+        }
+
+        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+            panic!("unused fake store operation")
+        }
+
+        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+            panic!("unused fake store operation")
+        }
+
+        async fn begin_write(
+            &self,
+            _transaction_id: TransactionId,
+            _purpose: &str,
+        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+            panic!("unused fake store operation")
+        }
+
+        async fn poll_changes(
+            &self,
+            _request: &ChangePollRequest,
+        ) -> Result<ChangePage, StateStoreError> {
+            panic!("unused fake store operation")
+        }
+
+        async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+            panic!("unused fake store operation")
+        }
+
+        async fn resolve_commit(
+            &self,
+            _transaction_id: &TransactionId,
+        ) -> Result<CommitResolution, StateStoreError> {
+            panic!("unused fake store operation")
+        }
+    }
 
     fn mysql_host_config() -> StateStoreHostConfig {
         StateStoreHostConfig {
@@ -168,6 +267,53 @@ mod tests {
             .unwrap();
         assert_eq!(bound.factory.descriptor().id, MYSQL_STATE_STORE_PROVIDER_ID);
         assert_mysql_instance_contract::<super::MysqlStateStoreProviderInstance>();
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnect_failure_keeps_instance_draining_and_retryable() {
+        let disconnects = Arc::new(AtomicUsize::new(0));
+        let pool: Arc<dyn PoolLifecycle> = Arc::new(FailOncePool {
+            disconnects: Arc::clone(&disconnects),
+        });
+        let runtime = test_mysql_runtime_with_pool(pool);
+        let mut instance = MysqlStateStoreProviderInstance {
+            descriptor: StateStoreProviderDescriptor::new(MYSQL_STATE_STORE_PROVIDER_ID),
+            lifecycle: StateStoreProviderLifecycle::Ready,
+            state_store: Some(Arc::new(FakeStore)),
+            runtime: Some(runtime),
+        };
+        assert!(instance.state_store().is_some());
+
+        let first = instance
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect_err("first disconnect must surface its native error");
+
+        assert_eq!(first.kind(), StateStoreErrorKind::ProviderUnavailable);
+        assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Draining);
+        assert!(instance.state_store().is_none());
+        let runtime = instance
+            .runtime
+            .as_ref()
+            .expect("runtime retained for retry");
+        assert_eq!(runtime.pool_count().expect("pool ownership"), 1);
+        assert!(!runtime.is_accepting());
+        let blocked = match runtime.acquire_operation() {
+            Ok(_) => panic!("draining instance must not admit new work"),
+            Err(error) => error,
+        };
+        assert_eq!(blocked.kind(), StateStoreErrorKind::ProviderUnavailable);
+
+        instance
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("second disconnect must finish shutdown");
+
+        assert_eq!(disconnects.load(Ordering::Acquire), 2);
+        assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Stopped);
+        assert!(instance.state_store().is_none());
+        assert!(instance.runtime.is_none());
     }
 
     fn assert_mysql_instance_contract<T: StateStoreProviderInstance>() {}
