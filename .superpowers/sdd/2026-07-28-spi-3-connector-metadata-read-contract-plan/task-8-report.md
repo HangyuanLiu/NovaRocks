@@ -379,3 +379,96 @@ The complete gate sequence was rerun after the final live-test fixture migration
 ### Planned commit
 
 - Message: `fix(connector): preserve refresh context and cache split validation`
+
+## Code-review fix follow-up 5
+
+### Changed files/behavior
+
+- Propagated the caller's `ConnectorRequestContext` through custom CREATE
+  MATERIALIZED VIEW and refresh planning. Iceberg MV analysis and StarRocks MV
+  DDL metadata registration now use that context, and the request-owned
+  analysis adapter no longer constructs a replacement cancellation source.
+- Made refresh planning context-aware at the `MvBackend` boundary. Iceberg
+  refresh planning validates cancellation/deadline immediately before
+  `recover_iceberg_mv_refreshes`, so a cancelled request cannot mutate an
+  unfinished refresh ledger during recovery. Scheduler-owned refreshes still
+  create an explicit background context at their operation-owner boundary.
+- Bound Iceberg scan handles, split payloads, and snapshot-membership cache
+  entries to the table metadata UUID in addition to namespace, table, and
+  snapshot ID. Planning and reader open both reject a UUID mismatch as
+  `ConnectorErrorKind::CorruptData`, preventing numeric snapshot-ID reuse
+  after DROP/CREATE from authorizing a stale split.
+- Statistics capability work remains owned by Task 9 and was not changed.
+
+### RED evidence
+
+- `cargo test -p novarocks --lib
+  engine::tests::create_materialized_view_observes_cancellation_after_dispatch
+  --profile dev-opt -- --exact --nocapture` initially reached MV storage-engine
+  resolution and returned `storage_engine='iceberg' requires current catalog
+  to be an Iceberg catalog` instead of `connector request was cancelled`.
+- `cargo test -p novarocks --lib
+  engine::mv::iceberg_refresh::tests::cancelled_refresh_plan_does_not_run_recovery_mutations
+  --profile dev-opt -- --exact --nocapture` initially failed to compile with
+  `E0425` because refresh planning had no context-taking entrypoint.
+- `cargo test -p novarocks --lib
+  connector::iceberg_provider_test::drop_recreate_with_same_snapshot_id_rejects_stale_split
+  --profile dev-opt -- --exact --nocapture` initially panicked with
+  `stale split from the dropped table incarnation must be rejected`: the old
+  split was accepted when the recreated table reused the same numeric snapshot
+  ID.
+
+### Focused GREEN evidence
+
+- `cargo test -p novarocks --lib
+  engine::tests::create_materialized_view_observes_cancellation_after_dispatch
+  --profile dev-opt -- --exact --nocapture`: PASS (1 passed, 0 failed, 7610
+  filtered).
+- `cargo test -p novarocks --lib
+  engine::mv::iceberg_refresh::tests::cancelled_refresh_plan_does_not_run_recovery_mutations
+  --profile dev-opt -- --exact --nocapture`: PASS (1 passed, 0 failed, 7610
+  filtered). The unfinished refresh remains `IntentCreated`, retains the same
+  active refresh ID, and remains in progress.
+- `cargo test -p novarocks --lib
+  connector::iceberg_provider_test::drop_recreate_with_same_snapshot_id_rejects_stale_split
+  --profile dev-opt -- --exact --nocapture`: PASS (1 passed, 0 failed, 7610
+  filtered). The stale split returns `CorruptData`; a newly planned split from
+  the recreated table opens and reads one row.
+- `cargo test -p novarocks --lib
+  connector::iceberg::provider::tests::snapshot_membership_cache_is_bounded_and_reloads_evicted_snapshot
+  --profile dev-opt -- --exact --nocapture`: PASS (1 passed, 0 failed, 7610
+  filtered).
+- `cargo test -p novarocks --lib
+  connector::iceberg_provider_test::iceberg_instance_resolves_metadata_and_plans_a_snapshot_split
+  --profile dev-opt -- --exact --nocapture`: PASS (1 passed, 0 failed, 7610
+  filtered).
+
+### Final GREEN evidence
+
+- `cargo fmt --all -- --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p novarocks --all-targets --profile dev-opt`: PASS
+- `cargo check -p novarocks --features compat --lib --profile dev-opt`: PASS
+- `cargo check -p novarocks-server --all-targets --profile dev-opt`: PASS
+- `cargo test -p novarocks-spi --features connector-conformance --profile
+  dev-opt`: PASS (6 connector conformance, 8 connector contract, 8 state-store
+  contract)
+- `cargo test -p novarocks --lib connector --profile dev-opt`: PASS (843
+  passed, 0 failed, 6768 filtered)
+
+### Follow-up audit
+
+- Request-owned CREATE MV and refresh analysis paths contain no fresh
+  `AtomicBool(false)` cancellation source. Test helpers use explicit test
+  contexts, while the scheduler remains the explicit background operation
+  owner.
+- `recover_iceberg_mv_refreshes` is reached only after validation of the
+  caller's context.
+- Every pinned Iceberg scan/split carries the table UUID. Membership cache keys
+  include that UUID, and both split planning and reader open compare it with
+  freshly loaded table metadata before snapshot membership is trusted.
+- No statistics source file or Task 9 artifact changed in this follow-up.
+
+### Planned commit
+
+- Message: `fix(connector): bind request and table identities`

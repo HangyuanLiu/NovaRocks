@@ -149,11 +149,11 @@ impl IcebergConnectorInstance {
         entry: &IcebergCatalogEntry,
         table: &TablePayload,
         selector: ConnectorReadSelector,
-    ) -> Result<Option<i64>, ConnectorError> {
+    ) -> Result<(Option<i64>, String), ConnectorError> {
         let loaded =
             load_table(entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
         let metadata = loaded.table.metadata();
-        match selector {
+        let snapshot_id = match selector {
             ConnectorReadSelector::Current => Ok(metadata.current_snapshot_id()),
             ConnectorReadSelector::SnapshotId(snapshot_id) => metadata
                 .snapshot_by_id(snapshot_id)
@@ -177,7 +177,8 @@ impl IcebergConnectorInstance {
                         format!("no Iceberg snapshot exists at timestamp {timestamp_micros}"),
                     )
                 }),
-        }
+        }?;
+        Ok((snapshot_id, metadata.uuid().to_string()))
     }
 
     fn chunk_schema_for(&self, schema: &SchemaRef) -> Result<Arc<ChunkSchema>, ConnectorError> {
@@ -210,15 +211,23 @@ impl IcebergConnectorInstance {
         entry: &IcebergCatalogEntry,
         namespace: &str,
         table: &str,
+        table_uuid: &str,
         snapshot_id: i64,
     ) -> Result<Arc<HashSet<SnapshotFileIdentity>>, ConnectorError> {
         let key = SnapshotMembershipKey {
             namespace: namespace.to_string(),
             table: table.to_string(),
+            table_uuid: table_uuid.to_string(),
             snapshot_id,
         };
         self.snapshot_memberships.get_or_try_init(key, || {
             let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
+            if loaded.table.metadata().uuid().to_string() != table_uuid {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg split belongs to a different table incarnation",
+                ));
+            }
             extract_data_files_with_stats_at(&loaded.table, snapshot_id)
                 .map_err(map_iceberg_error)
                 .map(|files| {
@@ -241,6 +250,7 @@ impl IcebergConnectorInstance {
 struct SnapshotMembershipKey {
     namespace: String,
     table: String,
+    table_uuid: String,
     snapshot_id: i64,
 }
 
@@ -447,14 +457,17 @@ impl ConnectorRead for IcebergConnectorInstance {
         let entry = self.entry(self.instance_id.as_str())?;
         let output_schema =
             self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?;
-        let snapshot_id = if table.explicit_files.is_some() {
-            None
+        let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
+            (None, None)
         } else {
-            self.select_snapshot(&entry, &table, request.selector)?
+            let (snapshot_id, table_uuid) =
+                self.select_snapshot(&entry, &table, request.selector)?;
+            (snapshot_id, Some(table_uuid))
         };
         let payload = ScanPayload {
             table,
             snapshot_id,
+            table_uuid,
             projection: request.projection,
             limit: request.limit,
         };
@@ -485,6 +498,18 @@ impl ConnectorRead for IcebergConnectorInstance {
                 let entry = self.entry(self.instance_id.as_str())?;
                 let loaded = load_table(&entry, &scan.table.namespace, &scan.table.table)
                     .map_err(map_iceberg_error)?;
+                let table_uuid = scan.table_uuid.as_deref().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "Iceberg snapshot scan is missing its table incarnation",
+                    )
+                })?;
+                if loaded.table.metadata().uuid().to_string() != table_uuid {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "Iceberg scan belongs to a different table incarnation",
+                    ));
+                }
                 extract_data_files_with_stats_at(&loaded.table, snapshot_id)
                     .map_err(map_iceberg_error)?
                     .into_iter()
@@ -493,10 +518,17 @@ impl ConnectorRead for IcebergConnectorInstance {
             }
         };
         if let Some(snapshot_id) = scan.snapshot_id {
+            let table_uuid = scan.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg snapshot scan is missing its table incarnation",
+                )
+            })?;
             self.snapshot_memberships.insert(
                 SnapshotMembershipKey {
                     namespace: scan.table.namespace.clone(),
                     table: scan.table.table.clone(),
+                    table_uuid: table_uuid.to_string(),
                     snapshot_id,
                 },
                 Arc::new(
@@ -525,6 +557,7 @@ impl ConnectorRead for IcebergConnectorInstance {
                 namespace: scan.table.namespace.clone(),
                 table: scan.table.table.clone(),
                 snapshot_id: scan.snapshot_id,
+                table_uuid: scan.table_uuid.clone(),
                 data_file: file,
                 projection: scan.projection.clone(),
                 limit: scan.limit,
@@ -567,6 +600,18 @@ impl ConnectorRead for IcebergConnectorInstance {
         let loaded =
             load_table(&entry, &split.namespace, &split.table).map_err(map_iceberg_error)?;
         if let Some(snapshot_id) = split.snapshot_id {
+            let table_uuid = split.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg snapshot split is missing its table incarnation",
+                )
+            })?;
+            if loaded.table.metadata().uuid().to_string() != table_uuid {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg split belongs to a different table incarnation",
+                ));
+            }
             if loaded
                 .table
                 .metadata()
@@ -578,8 +623,13 @@ impl ConnectorRead for IcebergConnectorInstance {
                     "Iceberg split references an expired snapshot",
                 ));
             }
-            let membership =
-                self.snapshot_membership(&entry, &split.namespace, &split.table, snapshot_id)?;
+            let membership = self.snapshot_membership(
+                &entry,
+                &split.namespace,
+                &split.table,
+                table_uuid,
+                snapshot_id,
+            )?;
             let belongs_to_snapshot =
                 membership.contains(&SnapshotFileIdentity::from(&split.data_file));
             if !belongs_to_snapshot {
@@ -777,6 +827,8 @@ struct TablePayload {
 struct ScanPayload {
     table: TablePayload,
     snapshot_id: Option<i64>,
+    #[serde(default)]
+    table_uuid: Option<String>,
     projection: Vec<usize>,
     limit: Option<u64>,
 }
@@ -786,6 +838,8 @@ struct SplitPayload {
     namespace: String,
     table: String,
     snapshot_id: Option<i64>,
+    #[serde(default)]
+    table_uuid: Option<String>,
     data_file: IcebergDataFileInfo,
     projection: Vec<usize>,
     limit: Option<u64>,
@@ -1212,6 +1266,7 @@ mod tests {
             SnapshotMembershipKey {
                 namespace: "db".to_string(),
                 table: "orders".to_string(),
+                table_uuid: "table-uuid".to_string(),
                 snapshot_id,
             }
         }
@@ -1273,6 +1328,7 @@ mod tests {
             namespace: table.namespace,
             table: table.table,
             snapshot_id: Some(7),
+            table_uuid: Some("table-uuid".to_string()),
             data_file: IcebergDataFileInfo::for_test(
                 "s3://warehouse/db/orders/data-1.parquet",
                 1024,
@@ -1302,6 +1358,7 @@ mod tests {
             namespace: "db".to_string(),
             table: "orders".to_string(),
             snapshot_id: Some(7),
+            table_uuid: Some("table-uuid".to_string()),
             data_file: IcebergDataFileInfo::for_test(
                 &format!(
                     "s3://warehouse/db/orders/{}-{suffix}.parquet",
@@ -1372,6 +1429,7 @@ mod tests {
                 namespace: "db".to_string(),
                 table: "orders".to_string(),
                 snapshot_id: None,
+                table_uuid: None,
                 data_file,
                 projection: vec![0],
                 limit: None,
@@ -1400,6 +1458,7 @@ mod tests {
                         explicit_files: Some(files),
                     },
                     snapshot_id: None,
+                    table_uuid: None,
                     projection: vec![0],
                     limit: None,
                 },
@@ -1489,6 +1548,7 @@ pub(crate) fn register_planned_table_files_fixture(
                         &ScanPayload {
                             table,
                             snapshot_id: None,
+                            table_uuid: None,
                             projection: request.projection,
                             limit: request.limit,
                         },
@@ -1527,6 +1587,7 @@ pub(crate) fn register_planned_table_files_fixture(
                                 namespace: scan.table.namespace.clone(),
                                 table: scan.table.table.clone(),
                                 snapshot_id: None,
+                                table_uuid: None,
                                 data_file,
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,

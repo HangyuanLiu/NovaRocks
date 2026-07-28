@@ -306,25 +306,6 @@ fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result
         .join(", "))
 }
 
-pub(crate) fn analyze_mv_select(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-) -> Result<MvAnalysis, String> {
-    let connector_context = crate::connector::connector_request_context(
-        None,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )?;
-    analyze_mv_select_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        query,
-        &connector_context,
-    )
-}
-
 pub(crate) fn analyze_mv_select_with_connector_context(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,

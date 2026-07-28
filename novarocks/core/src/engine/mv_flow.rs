@@ -112,7 +112,11 @@ mod lifecycle_tests {
             Ok(vec![])
         }
 
-        fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError> {
+        fn plan_refresh(
+            &self,
+            req: RefreshRequest,
+            _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<RefreshPlan, RefreshError> {
             self.calls.lock().unwrap().plan += 1;
             if let Some(err) = &self.plan_err {
                 return Err(err.clone());
@@ -469,7 +473,9 @@ fn run_refresh_lifecycle(
 ) -> Result<(), String> {
     crate::connector::validate_request_context(connector_context)?;
     let mut ctx = RefreshCtx::new(connector_context.clone());
-    let plan = backend.plan_refresh(req).map_err(|err| err.to_string())?;
+    let plan = backend
+        .plan_refresh(req, connector_context)
+        .map_err(|err| err.to_string())?;
     crate::connector::validate_request_context(&ctx.connector_context)?;
     let outcome = match backend.execute_refresh(&plan, &mut ctx) {
         Ok(outcome) => outcome,
@@ -512,12 +518,15 @@ pub(crate) fn create_mv(
     current_catalog: Option<&str>,
     db: &str,
     stmt: &CreateMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let engine = storage_engine_for_create(state, stmt)?;
     backend_by_engine(state, engine)?.create_mv(CreateMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
+        connector_context: connector_context.clone(),
     })?;
     Ok(StatementResult::Ok)
 }

@@ -2758,8 +2758,10 @@ pub(crate) fn dispatch_statement(
 
     match statement {
         Statement::CreateMaterializedView(stmt) => {
-            let engine =
-                crate::engine::mv::iceberg_refresh::StandaloneMvEngine::new(Arc::clone(state));
+            let engine = crate::engine::mv::iceberg_refresh::StandaloneMvEngine::new(
+                Arc::clone(state),
+                connector_context.clone(),
+            );
             let statement = crate::mv::application::MvApplicationStatement::Create(
                 crate::mv::application::MvCreateStatement::from(&stmt),
             );
@@ -2780,6 +2782,7 @@ pub(crate) fn dispatch_statement(
                     current_catalog,
                     current_database,
                     &stmt,
+                    connector_context,
                 ),
                 Err(error) => Err(error.to_string()),
             }
@@ -7841,6 +7844,31 @@ mysql_port = 47892
     }
 
     #[test]
+    fn create_materialized_view_observes_cancellation_after_dispatch() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+        let statement = crate::sql::parser::parse_sql(
+            "CREATE MATERIALIZED VIEW orders_mv
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id FROM ice.analytics.orders",
+        )
+        .expect("parse CREATE MATERIALIZED VIEW")
+        .remove(0);
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            statement,
+            &cancel_after_dispatch_context(),
+        )
+        .expect_err("CREATE MV work dispatched by a cancelled caller must stop");
+
+        assert_eq!(error, "connector request was cancelled");
+    }
+
+    #[test]
     fn iceberg_ref_dispatch_observes_cancellation_after_entry() {
         let state = Arc::new(StandaloneState::default());
         register_connector_backends(&state);
@@ -7951,7 +7979,8 @@ path = "meta/operations.sqlite"
     #[test]
     fn iceberg_catalog_lifecycle_registers_and_unregisters_its_connector_instance() {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
+            .expect("open engine");
         let session = engine.session();
         let create_catalog_sql = format!(
             r#"create external catalog Ice_One properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,

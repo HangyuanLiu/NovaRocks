@@ -25,7 +25,7 @@ use novarocks_spi::connector::{
     ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
 };
 
-use super::iceberg::catalog::registry::{create_table, insert_rows};
+use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
 use super::iceberg::catalog::{IcebergCatalogRegistry, create_namespace};
 use super::iceberg::provider::IcebergConnectorInstance;
 use crate::sql::{Literal, TableColumnDef};
@@ -113,6 +113,64 @@ fn remove_snapshot_manifest_files(path: &std::path::Path) -> usize {
         }
     }
     removed
+}
+
+fn replace_json_number(value: &mut serde_json::Value, from: i64, to: i64) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                replace_json_number(value, from, to);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                replace_json_number(value, from, to);
+            }
+        }
+        serde_json::Value::Number(number) if number.as_i64() == Some(from) => {
+            *number = serde_json::Number::from(to);
+        }
+        _ => {}
+    }
+}
+
+fn force_current_snapshot_id(
+    warehouse: &std::path::Path,
+    namespace: &str,
+    table: &str,
+    from: i64,
+    to: i64,
+) {
+    let metadata_dir = warehouse
+        .join("warehouse")
+        .join(namespace)
+        .join(table)
+        .join("metadata");
+    let metadata_path = std::fs::read_dir(&metadata_dir)
+        .expect("read recreated table metadata")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            let version = name
+                .strip_prefix('v')?
+                .strip_suffix(".metadata.json")?
+                .parse::<u64>()
+                .ok()?;
+            Some((version, path))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+        .expect("latest recreated table metadata");
+    let mut metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&metadata_path).expect("read recreated table metadata JSON"),
+    )
+    .expect("decode recreated table metadata JSON");
+    replace_json_number(&mut metadata, from, to);
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_vec(&metadata).expect("encode recreated table metadata JSON"),
+    )
+    .expect("rewrite recreated table snapshot ID");
 }
 
 #[test]
@@ -235,4 +293,191 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
         assert!(reader.next_batch().expect("read EOS").is_none());
         reader.close().expect("close reader");
     }
+}
+
+#[test]
+fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
+    let (registry, warehouse) = registry_with_table();
+    let entry = registry
+        .read()
+        .expect("iceberg catalog read lock")
+        .get("ice")
+        .expect("catalog entry");
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let instance = IcebergConnectorInstance::new(instance_id.clone(), Arc::clone(&registry))
+        .expect("iceberg connector instance");
+    let table_identity = ConnectorTableIdentity {
+        instance_id: instance_id.clone(),
+        namespace: Arc::from("db"),
+        table: Arc::from("orders"),
+    };
+    let resolved = instance
+        .metadata()
+        .expect("metadata capability")
+        .load_table(ConnectorTableRequest {
+            table: table_identity.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(),
+        })
+        .expect("load original table");
+    let scan = instance
+        .read()
+        .begin_scan(
+            &resolved.table,
+            ConnectorBeginScanRequest {
+                projection: vec![0],
+                selector: ConnectorReadSelector::Current,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+                },
+                context: context(),
+            },
+        )
+        .expect("begin original scan");
+    let stale_split = instance
+        .read()
+        .plan_splits(
+            &scan.handle,
+            ConnectorSplitPlanningRequest {
+                target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
+                max_split_bytes: None,
+                context: context(),
+            },
+        )
+        .expect("plan original splits")
+        .remove(0);
+    let original = load_table(&entry, "db", "orders").expect("load original table");
+    let reused_snapshot_id = original
+        .table
+        .metadata()
+        .current_snapshot_id()
+        .expect("original snapshot");
+    let original_uuid = original.table.metadata().uuid().to_string();
+
+    drop_table(&entry, "db", "orders").expect("drop original table");
+    create_table(
+        &entry,
+        "db",
+        "orders",
+        &[TableColumnDef {
+            name: "id".to_string(),
+            data_type: SqlType::Int,
+            nullable: false,
+            aggregation: None,
+            default: None,
+        }],
+        None,
+        &[],
+        &[],
+    )
+    .expect("recreate table");
+    insert_rows(&entry, "db", "orders", &[vec![Literal::Int(9)]])
+        .expect("insert recreated table row");
+    entry.invalidate_table_cache("db", "orders");
+    let recreated = load_table(&entry, "db", "orders").expect("load recreated table");
+    let generated_snapshot_id = recreated
+        .table
+        .metadata()
+        .current_snapshot_id()
+        .expect("recreated snapshot");
+    let recreated_uuid = recreated.table.metadata().uuid().to_string();
+    assert_ne!(
+        recreated_uuid, original_uuid,
+        "drop/recreate must produce a new table incarnation"
+    );
+    force_current_snapshot_id(
+        warehouse.path(),
+        "db",
+        "orders",
+        generated_snapshot_id,
+        reused_snapshot_id,
+    );
+    entry.invalidate_table_cache("db", "orders");
+    let recreated = load_table(&entry, "db", "orders").expect("reload recreated table");
+    assert_eq!(
+        recreated.table.metadata().current_snapshot_id(),
+        Some(reused_snapshot_id),
+        "fixture must reproduce numeric snapshot-ID reuse"
+    );
+
+    let error = match instance.read().open_reader(
+        &stale_split,
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::clone(&resolved.schema),
+            batch: ConnectorBatchBudget {
+                max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+            },
+            context: context(),
+        },
+    ) {
+        Ok(_) => panic!("stale split from the dropped table incarnation must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        novarocks_spi::connector::ConnectorErrorKind::CorruptData
+    );
+
+    let current = instance
+        .metadata()
+        .expect("metadata capability")
+        .load_table(ConnectorTableRequest {
+            table: table_identity,
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(),
+        })
+        .expect("load current table");
+    let current_scan = instance
+        .read()
+        .begin_scan(
+            &current.table,
+            ConnectorBeginScanRequest {
+                projection: vec![0],
+                selector: ConnectorReadSelector::Current,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+                },
+                context: context(),
+            },
+        )
+        .expect("begin current scan");
+    let current_split = instance
+        .read()
+        .plan_splits(
+            &current_scan.handle,
+            ConnectorSplitPlanningRequest {
+                target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
+                max_split_bytes: None,
+                context: context(),
+            },
+        )
+        .expect("plan current splits")
+        .remove(0);
+    let mut reader = instance
+        .read()
+        .open_reader(
+            &current_split,
+            ConnectorOpenReaderRequest {
+                expected_schema: Arc::clone(&current.schema),
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+                },
+                context: context(),
+            },
+        )
+        .expect("open current split");
+    assert_eq!(
+        reader
+            .next_batch()
+            .expect("read current batch")
+            .expect("current batch")
+            .num_rows(),
+        1
+    );
 }

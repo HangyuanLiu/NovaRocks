@@ -106,6 +106,7 @@ impl MvBackend for StarRocksTableMvBackend {
             req.current_catalog.as_deref(),
             &req.current_database,
             &req.stmt,
+            &req.connector_context,
         )
         .map(|_| ())
     }
@@ -131,7 +132,13 @@ impl MvBackend for StarRocksTableMvBackend {
         )
     }
 
-    fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError> {
+    fn plan_refresh(
+        &self,
+        req: RefreshRequest,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<RefreshPlan, RefreshError> {
+        crate::connector::validate_request_context(connector_context)
+            .map_err(RefreshError::pre_commit)?;
         let (database, name) =
             crate::mv::analysis::resolve_mv_name(&req.statement.name, &req.current_database)
                 .map_err(RefreshError::pre_commit)?;

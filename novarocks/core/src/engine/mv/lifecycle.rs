@@ -28,11 +28,12 @@ use crate::sql::parser::ast::{
     ShowMaterializedViewsStmt,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct CreateMvRequest {
     pub stmt: CreateMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
+    pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 #[derive(Clone, Debug)]

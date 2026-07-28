@@ -137,7 +137,11 @@ pub(crate) trait MvBackend: Send + Sync {
     fn drop_mv(&self, req: DropMvRequest) -> Result<(), String>;
     fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String>;
 
-    fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError>;
+    fn plan_refresh(
+        &self,
+        req: RefreshRequest,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<RefreshPlan, RefreshError>;
     fn execute_refresh(
         &self,
         plan: &RefreshPlan,
