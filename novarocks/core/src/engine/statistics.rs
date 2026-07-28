@@ -31,6 +31,230 @@ use crate::sql::parser::ast::{
     ArithmeticOp, Expr, InsertSource, Literal, ObjectName, OverwriteMode,
 };
 
+pub struct StatisticsRequestContext<'a> {
+    pub current_catalog: Option<&'a str>,
+    pub current_database: &'a str,
+}
+
+#[derive(Debug)]
+pub enum StatisticsStatementResult {
+    Ok,
+    Query(QueryResult),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatisticsOverwriteMode {
+    Append,
+    FullTable,
+    DynamicPartitions,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StatisticsLiteral {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Date(String),
+    Array(Vec<StatisticsLiteral>),
+    Map(Vec<(StatisticsLiteral, StatisticsLiteral)>),
+    Struct(Vec<StatisticsLiteral>),
+}
+
+#[derive(Clone, Debug)]
+pub enum StatisticsInsertSource {
+    Values(Vec<Vec<StatisticsLiteral>>),
+    SelectLiteralRow(Vec<StatisticsLiteral>),
+    UnionAll(Vec<StatisticsInsertSource>),
+    FromQuery(Box<sqlparser::ast::Query>),
+}
+
+pub struct StatisticsInsertObservation<'a> {
+    pub database: &'a str,
+    pub table: &'a str,
+    pub insert_columns: &'a [String],
+    pub source: &'a StatisticsInsertSource,
+    pub overwrite_mode: StatisticsOverwriteMode,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogColumnStatistics {
+    pub column_name: String,
+    pub row_count: i64,
+    pub min: String,
+    pub max: String,
+    pub ndv: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogTableStatistics {
+    pub columns: Vec<CatalogColumnStatistics>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsTableTarget {
+    pub current_catalog: Option<String>,
+    pub current_database: String,
+    pub name_parts: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatisticsColumn {
+    pub name: String,
+    pub data_type: DataType,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollectedColumnStatistics {
+    pub column_name: String,
+    pub row_count: i64,
+    pub min: String,
+    pub max: String,
+    pub ndv: String,
+}
+
+pub trait StatisticsEngine: Send + Sync {
+    fn resolve_table_columns(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<Vec<StatisticsColumn>, String>;
+
+    fn resolve_local_table_columns(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<Vec<StatisticsColumn>>, String>;
+
+    fn collect_table_statistics(
+        &self,
+        target: &StatisticsTableTarget,
+        columns: &[String],
+    ) -> Result<Vec<CollectedColumnStatistics>, String>;
+}
+
+pub trait StatisticsService: Send + Sync {
+    fn try_handle_statement(
+        &self,
+        engine: &dyn StatisticsEngine,
+        sql: &str,
+        context: StatisticsRequestContext<'_>,
+    ) -> Result<Option<StatisticsStatementResult>, String>;
+
+    fn try_query(
+        &self,
+        sql: &str,
+        query: &sqlparser::ast::Query,
+        context: StatisticsRequestContext<'_>,
+    ) -> Result<Option<QueryResult>, String>;
+
+    fn observe_query(
+        &self,
+        query: &sqlparser::ast::Query,
+        current_database: &str,
+    ) -> Result<(), String>;
+
+    fn observe_insert(
+        &self,
+        engine: &dyn StatisticsEngine,
+        observation: StatisticsInsertObservation<'_>,
+    ) -> Result<(), String>;
+
+    fn observe_update(&self, sql: &str, current_database: &str) -> Result<(), String>;
+    fn drop_table(&self, database: &str, table: &str);
+    fn drop_database(&self, database: &str);
+
+    fn catalog_table_statistics(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<CatalogTableStatistics>, String>;
+}
+
+pub struct EmptyStatisticsService;
+
+impl StatisticsService for EmptyStatisticsService {
+    fn try_handle_statement(
+        &self,
+        _engine: &dyn StatisticsEngine,
+        sql: &str,
+        _context: StatisticsRequestContext<'_>,
+    ) -> Result<Option<StatisticsStatementResult>, String> {
+        if is_statistics_statement(sql) {
+            return Err("statistics service is not injected".to_string());
+        }
+        Ok(None)
+    }
+
+    fn try_query(
+        &self,
+        sql: &str,
+        query: &sqlparser::ast::Query,
+        _context: StatisticsRequestContext<'_>,
+    ) -> Result<Option<QueryResult>, String> {
+        if is_statistics_query(sql, query)? {
+            return Err("statistics service is not injected".to_string());
+        }
+        Ok(None)
+    }
+
+    fn observe_query(
+        &self,
+        _query: &sqlparser::ast::Query,
+        _current_database: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn observe_insert(
+        &self,
+        _engine: &dyn StatisticsEngine,
+        _observation: StatisticsInsertObservation<'_>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn observe_update(&self, _sql: &str, _current_database: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn drop_table(&self, _database: &str, _table: &str) {}
+
+    fn drop_database(&self, _database: &str) {}
+
+    fn catalog_table_statistics(
+        &self,
+        _database: &str,
+        _table: &str,
+    ) -> Result<Option<CatalogTableStatistics>, String> {
+        Ok(None)
+    }
+}
+
+fn is_statistics_statement(sql: &str) -> bool {
+    let lower = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
+    lower.starts_with("admin ")
+        || (lower.starts_with("alter table ")
+            && lower.contains("enable_statistic_collect_on_first_load"))
+        || lower.starts_with("drop multiple columns stats ")
+        || lower.starts_with("drop stats ")
+        || (lower.starts_with("update ") && lower.contains("test_update_stats "))
+        || lower.starts_with("analyze ")
+        || lower.starts_with("explain costs ")
+}
+
+fn is_statistics_query(sql: &str, query: &sqlparser::ast::Query) -> Result<bool, String> {
+    let lower = sql.to_ascii_lowercase();
+    Ok(lower.contains("_statistics_.column_statistics")
+        || lower.contains("_statistics_.histogram_statistics")
+        || lower.contains("_statistics_.multi_column_statistics")
+        || lower.contains("information_schema.column_stats_usage")
+        || lower.contains("information_schema.analyze_status")
+        || is_select_from_view(query, "statistic_verify")
+        || is_select_from_view(query, "analyze_status_verify")
+        || is_select_from_view(query, "last_analyze_id_view"))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct TableKey {
     db: String,
@@ -2368,6 +2592,68 @@ fn string_result(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<QueryRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeStatisticsEngine;
+
+    impl StatisticsEngine for FakeStatisticsEngine {
+        fn resolve_table_columns(
+            &self,
+            _target: &StatisticsTableTarget,
+        ) -> Result<Vec<StatisticsColumn>, String> {
+            Ok(Vec::new())
+        }
+
+        fn resolve_local_table_columns(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<Vec<StatisticsColumn>>, String> {
+            Ok(None)
+        }
+
+        fn collect_table_statistics(
+            &self,
+            _target: &StatisticsTableTarget,
+            _columns: &[String],
+        ) -> Result<Vec<CollectedColumnStatistics>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn statistics_ports_are_object_safe() {
+        fn accept_service(_: Arc<dyn StatisticsService>) {}
+        fn accept_engine(_: &dyn StatisticsEngine) {}
+
+        accept_service(Arc::new(EmptyStatisticsService));
+        let engine = FakeStatisticsEngine::default();
+        accept_engine(&engine);
+    }
+
+    #[test]
+    fn empty_service_rejects_analyze_but_keeps_observation_noop() {
+        let service = EmptyStatisticsService;
+        let engine = FakeStatisticsEngine::default();
+        let ctx = StatisticsRequestContext {
+            current_catalog: None,
+            current_database: "db1",
+        };
+        let error = service
+            .try_handle_statement(&engine, "ANALYZE TABLE t1", ctx)
+            .expect_err("statistics statement must fail without injection");
+        assert_eq!(error, "statistics service is not injected");
+
+        service
+            .observe_update("UPDATE t1 SET k = 1", "db1")
+            .expect("ordinary observation is a no-op");
+        assert!(
+            service
+                .catalog_table_statistics("db1", "t1")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn drop_stats_clears_virtual_column_statistics() {
