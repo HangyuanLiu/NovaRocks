@@ -19,10 +19,18 @@
 //! Providers own handle codecs and `ConnectorBatchReader`; this module is the
 //! sole conversion boundary into core's `Chunk` execution representation.
 
-use novarocks_spi::connector::ConnectorBatchReader;
+use std::sync::Arc;
+
+use novarocks_spi::connector::{
+    ConnectorBatchReader, ConnectorInstance, ConnectorOpenReaderRequest, ConnectorSplit,
+};
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
+use crate::exec::node::scan::{
+    BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp, ScanSource,
+};
+use crate::runtime::profile::RuntimeProfile;
 
 pub(crate) struct ConnectorBatchReaderIter {
     reader: Option<Box<dyn ConnectorBatchReader>>,
@@ -89,5 +97,80 @@ impl Drop for ConnectorBatchReaderIter {
             let _ = self.close();
             self.finished = true;
         }
+    }
+}
+
+/// A generic physical source for one already-assigned SPI split.
+///
+/// The source owns no provider-specific type.  Wire decoders resolve the
+/// opaque split to its typed host instance, while core owns scheduling and
+/// adapts the returned Arrow batches into `Chunk`s.
+pub(crate) struct ConnectorReadScanSource {
+    instance: Arc<ConnectorInstance>,
+    split: ConnectorSplit,
+    request: ConnectorOpenReaderRequest,
+    chunk_schema: ChunkSchemaRef,
+}
+
+impl ConnectorReadScanSource {
+    pub(crate) fn new(
+        instance: Arc<ConnectorInstance>,
+        split: ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        Self {
+            instance,
+            split,
+            request,
+            chunk_schema,
+        }
+    }
+}
+
+impl ScanSource for ConnectorReadScanSource {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        if !matches!(ranges, BoundScanRanges::None) {
+            return Err("SPI connector scan source requires an empty range binding".to_string());
+        }
+        Ok(Arc::new(ConnectorReadScanOp {
+            instance: Arc::clone(&self.instance),
+            split: self.split.clone(),
+            request: self.request.clone(),
+            chunk_schema: Arc::clone(&self.chunk_schema),
+        }))
+    }
+}
+
+struct ConnectorReadScanOp {
+    instance: Arc<ConnectorInstance>,
+    split: ConnectorSplit,
+    request: ConnectorOpenReaderRequest,
+    chunk_schema: ChunkSchemaRef,
+}
+
+impl ScanOp for ConnectorReadScanOp {
+    fn execute_iter(
+        &self,
+        morsel: ScanMorsel,
+        _profile: Option<RuntimeProfile>,
+        _runtime_filters: Option<&RuntimeFilterContext>,
+    ) -> Result<crate::exec::node::BoxedExecIter, String> {
+        if !matches!(morsel, ScanMorsel::Empty) {
+            return Err("SPI connector scan received an unexpected morsel".to_string());
+        }
+        let reader = self
+            .instance
+            .read()
+            .open_reader(&self.split, self.request.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(Box::new(ConnectorBatchReaderIter::new(
+            reader,
+            Arc::clone(&self.chunk_schema),
+        )))
+    }
+
+    fn build_morsels(&self) -> Result<ScanMorsels, String> {
+        Ok(ScanMorsels::new(vec![ScanMorsel::Empty], false))
     }
 }
