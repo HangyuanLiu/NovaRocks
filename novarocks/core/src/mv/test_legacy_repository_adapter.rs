@@ -51,6 +51,7 @@ use uuid::Uuid;
 pub(crate) enum TestMvRepositoryFailurePoint {
     CreateWithId,
     DropById,
+    FinalizeRefresh,
     UpdateStarRocksRefreshSummary,
 }
 
@@ -353,6 +354,7 @@ impl MvRepository for LegacyMvRepositoryAdapter {
     }
 
     fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError> {
+        fail_if_requested(TestMvRepositoryFailurePoint::FinalizeRefresh)?;
         self.write("legacy adapter finalize MV refresh", |legacy, txn| {
             legacy.finalize_refresh(txn, request)
         })

@@ -6663,6 +6663,13 @@ fn refresh_error_from_commit_error(err: CommitServiceError) -> RefreshError {
     }
 }
 
+fn iceberg_mv_post_publish_finalize_error(message: String) -> IcebergMvRefreshExecutionError {
+    let engine_error = EngineError::commit_known_committed_finalize_failed(message);
+    IcebergMvRefreshExecutionError::commit(RefreshError::commit_known_committed_finalize_failed(
+        engine_error.to_bracketed_user_message(),
+    ))
+}
+
 fn mark_iceberg_mv_refresh_commit_error(
     state: &Arc<StandaloneState>,
     refresh_id: i64,
@@ -8158,114 +8165,69 @@ fn finalize_iceberg_mv_refresh_with_metadata_update(
         txn.commit()
             .map_err(|e| format!("commit iceberg mv operation finalizing failed: {e}"))?;
     }
-    let refresh = state
-        .mv_repository
-        .load_refresh(refresh_id)
-        .map_err(|e| format!("load iceberg mv refresh for partition state failed: {e}"))?
-        .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
-    let mv_id = refresh.mv_id;
-    let partition_state_base_snapshots = base_snapshots.clone();
-    state
-        .mv_repository
-        .finalize_refresh(MvRefreshFinalizeRequest {
-            refresh_id,
-            rows,
-            base_snapshots,
-            base_table_uuids,
-            target_snapshot_id: Some(target_snapshot_id),
-        })
-        .map_err(|e| format!("finalize iceberg mv refresh failed: {e}"))?;
-    if let Some(partition_contract) = partition_contract {
+    let finalize_result: Result<(), String> = (|| {
+        let refresh = state
+            .mv_repository
+            .load_refresh(refresh_id)
+            .map_err(|e| format!("load iceberg mv refresh for partition state failed: {e}"))?
+            .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
+        let mv_id = refresh.mv_id;
+        let partition_state_base_snapshots = base_snapshots.clone();
         state
             .mv_repository
-            .update_partition_contract(UpdateMvPartitionContractRequest {
-                mv_id,
-                partition_spec: partition_contract.clone(),
-            })
-            .map_err(|e| format!("update iceberg mv partition contract failed: {e}"))?;
-    }
-    finalize_iceberg_mv_partition_state(
-        state,
-        mv_id,
-        refresh_id,
-        &partition_state_base_snapshots,
-        Some(target_snapshot_id),
-        partition_state,
-    )?;
-    if let Some(operation_id) = operation_id {
-        let provider = state.metadata_provider.as_ref().ok_or_else(|| {
-            "metadata provider required to finalize iceberg MV operation".to_string()
-        })?;
-        let mut txn = provider
-            .begin_write("finalize iceberg mv operation")
-            .map_err(|e| format!("open iceberg mv operation finalize transaction failed: {e}"))?;
-        state
-            .iceberg_operation_repo
-            .transition_operation(
-                txn.as_mut(),
-                operation_id,
-                IcebergOperationState::Finalized,
-                now_ms(),
-            )
-            .map_err(|e| format!("mark iceberg mv operation finalized failed: {e}"))?;
-        txn.commit().map_err(|e| {
-            format!(
-                "iceberg MV refresh {refresh_id} is finalized but operation finalize failed: {e}"
-            )
-        })?;
-    }
-    return Ok(());
-
-    /*
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "metadata provider required for iceberg mv refresh".to_string())?;
-    let mut txn = provider
-        .begin_write("finalize iceberg materialized view refresh")
-        .map_err(|e| format!("open iceberg mv refresh finalize transaction failed: {e}"))?;
-    let operation_id = load_iceberg_mv_refresh_operation_id(state, txn.as_ref(), refresh_id)?;
-    let operation_id_for_failure = operation_id;
-    if let Some(operation_id) = operation_id {
-        let operation = state
-            .iceberg_operation_repo
-            .load_operation(txn.as_ref(), operation_id)
-            .map_err(|e| format!("load iceberg mv operation for finalize failed: {e}"))?
-            .ok_or_else(|| format!("iceberg operation {operation_id} not found"))?;
-        if operation.state != IcebergOperationState::Finalized {
-            state
-                .iceberg_operation_repo
-                .transition_operation(
-                    txn.as_mut(),
-                    operation_id,
-                    IcebergOperationState::Finalizing,
-                    now_ms(),
-                )
-                .map_err(|e| format!("mark iceberg mv operation finalizing failed: {e}"))?;
-        }
-    }
-    let refresh = state
-        .mv_repository
-        .load_refresh(txn.as_ref(), refresh_id)
-        .map_err(|e| format!("load iceberg mv refresh for partition state failed: {e}"))?
-        .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
-    let mv_id = refresh.mv_id;
-    let partition_state_base_snapshots = base_snapshots.clone();
-    let finalize_result = state
-        .mv_repository
-        .finalize_refresh(
-            txn.as_mut(),
-            MvRefreshFinalizeRequest {
+            .finalize_refresh(MvRefreshFinalizeRequest {
                 refresh_id,
                 rows,
                 base_snapshots,
                 base_table_uuids,
                 target_snapshot_id: Some(target_snapshot_id),
-            },
-        )
-        .map_err(|e| format!("finalize iceberg mv refresh failed: {e}"));
+            })
+            .map_err(|e| format!("finalize iceberg mv refresh failed: {e}"))?;
+        if let Some(partition_contract) = partition_contract {
+            state
+                .mv_repository
+                .update_partition_contract(UpdateMvPartitionContractRequest {
+                    mv_id,
+                    partition_spec: partition_contract.clone(),
+                })
+                .map_err(|e| format!("update iceberg mv partition contract failed: {e}"))?;
+        }
+        finalize_iceberg_mv_partition_state(
+            state,
+            mv_id,
+            refresh_id,
+            &partition_state_base_snapshots,
+            Some(target_snapshot_id),
+            partition_state,
+        )?;
+        if let Some(operation_id) = operation_id {
+            let provider = state.metadata_provider.as_ref().ok_or_else(|| {
+                "metadata provider required to finalize iceberg MV operation".to_string()
+            })?;
+            let mut txn = provider
+                .begin_write("finalize iceberg mv operation")
+                .map_err(|e| {
+                    format!("open iceberg mv operation finalize transaction failed: {e}")
+                })?;
+            state
+                .iceberg_operation_repo
+                .transition_operation(
+                    txn.as_mut(),
+                    operation_id,
+                    IcebergOperationState::Finalized,
+                    now_ms(),
+                )
+                .map_err(|e| format!("mark iceberg mv operation finalized failed: {e}"))?;
+            txn.commit().map_err(|e| {
+                format!(
+                    "iceberg MV refresh {refresh_id} is finalized but operation finalize failed: {e}"
+                )
+            })?;
+        }
+        Ok(())
+    })();
     if let Err(err) = finalize_result {
-        if let Some(operation_id) = operation_id_for_failure
+        if let Some(operation_id) = operation_id
             && let Err(mark_err) =
                 record_iceberg_mv_operation_finalize_failure(state, operation_id, err.clone())
         {
@@ -8275,42 +8237,7 @@ fn finalize_iceberg_mv_refresh_with_metadata_update(
         }
         return Err(err);
     }
-    if let Some(partition_contract) = partition_contract {
-        state
-            .mv_repository
-            .update_partition_contract(
-                txn.as_mut(),
-                UpdateMvPartitionContractRequest {
-                    mv_id,
-                    partition_spec: partition_contract.clone(),
-                },
-            )
-            .map_err(|e| format!("update iceberg mv partition contract failed: {e}"))?;
-    }
-    finalize_iceberg_mv_partition_state(
-        state,
-        txn.as_mut(),
-        mv_id,
-        refresh_id,
-        &partition_state_base_snapshots,
-        Some(target_snapshot_id),
-        partition_state,
-    )?;
-    if let Some(operation_id) = operation_id {
-        state
-            .iceberg_operation_repo
-            .transition_operation(
-                txn.as_mut(),
-                operation_id,
-                IcebergOperationState::Finalized,
-                now_ms(),
-            )
-            .map_err(|e| format!("mark iceberg mv operation finalized failed: {e}"))?;
-    }
-    txn.commit()
-        .map_err(|e| format!("commit iceberg mv refresh finalize failed: {e}"))?;
     Ok(())
-    */
 }
 
 fn finalize_iceberg_mv_partition_state(
@@ -8657,7 +8584,8 @@ fn commit_first_refresh_iceberg_mv(
         snapshots.clone(),
         table_uuids.clone(),
         published_snapshot_id,
-    )?;
+    )
+    .map_err(iceberg_mv_post_publish_finalize_error)?;
 
     tracing::info!(
         "iceberg mv {}.{}.{}: first refresh complete: \
@@ -8931,7 +8859,8 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
         snapshots,
         table_uuids,
         published_snapshot_id,
-    )?;
+    )
+    .map_err(iceberg_mv_post_publish_finalize_error)?;
     tracing::info!(
         "iceberg {refresh_label} mv {}.{}.{}: first refresh complete: \
          rows={total_rows} iceberg_snapshot={published_snapshot_id}",
@@ -9350,7 +9279,8 @@ fn commit_rebuild_payload(
             published_snapshot_id,
             partition_contract,
             IcebergMvPartitionStateFinalize::Clear,
-        )?;
+        )
+        .map_err(iceberg_mv_post_publish_finalize_error)?;
     } else {
         finalize_iceberg_mv_refresh(
             state,
@@ -9359,7 +9289,8 @@ fn commit_rebuild_payload(
             prepared.base_snapshots,
             prepared.base_table_uuids,
             published_snapshot_id,
-        )?;
+        )
+        .map_err(iceberg_mv_post_publish_finalize_error)?;
     }
     Ok(StatementResult::Ok)
 }
@@ -10731,7 +10662,8 @@ fn repartition_iceberg_join_mv_overwrite(
         published_snapshot_id,
         partition_contract,
         IcebergMvPartitionStateFinalize::Clear,
-    )?;
+    )
+    .map_err(iceberg_mv_post_publish_finalize_error)?;
     Ok(StatementResult::Ok)
 }
 
@@ -10938,7 +10870,8 @@ fn first_refresh_iceberg_join_mv(
         snapshots,
         table_uuids,
         published_snapshot_id,
-    )?;
+    )
+    .map_err(iceberg_mv_post_publish_finalize_error)?;
     Ok(StatementResult::Ok)
 }
 
@@ -14181,6 +14114,9 @@ mod tests {
     };
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::PartitionPruningPolicy;
+    use crate::mv::test_legacy_repository_adapter::{
+        TestMvRepositoryFailurePoint, fail_next_mv_repository_command,
+    };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
@@ -22833,6 +22769,88 @@ mod tests {
         assert_eq!(
             load_test_operation_for_refresh(&env.state, refresh_id).state,
             crate::meta::repository::iceberg_operation::IcebergOperationState::Finalized
+        );
+    }
+
+    #[test]
+    fn staged_iceberg_mv_refresh_finalize_repository_failure_records_retryable_operation_fact() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let base_snapshots = BTreeMap::from([("ice.sales.orders".to_string(), 20)]);
+        let base_table_uuids =
+            BTreeMap::from([("ice.sales.orders".to_string(), "uuid-orders".to_string())]);
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            Some(10),
+            base_snapshots.clone(),
+            "__nova_mv_refresh_finalize_repository_failure",
+        )
+        .expect("begin staged refresh");
+        record_iceberg_mv_staging_commit(&env.state, refresh_id, 30, 3, base_table_uuids.clone())
+            .expect("record staging");
+        record_iceberg_mv_publish_commit(&env.state, refresh_id, 40).expect("record publish");
+
+        let _failure =
+            fail_next_mv_repository_command(TestMvRepositoryFailurePoint::FinalizeRefresh);
+        let err = finalize_iceberg_mv_refresh(
+            &env.state,
+            refresh_id,
+            3,
+            base_snapshots,
+            base_table_uuids,
+            40,
+        )
+        .expect_err("injected repository finalization failure");
+        assert!(
+            err.contains("test-only injected MV repository failure at FinalizeRefresh"),
+            "err={err}"
+        );
+        let IcebergMvRefreshExecutionError::Commit(mapped) =
+            iceberg_mv_post_publish_finalize_error(err)
+        else {
+            panic!("post-publish finalization failure must be a commit error");
+        };
+        assert_eq!(
+            mapped.kind,
+            crate::engine::mv::lifecycle::RefreshErrorKind::CommitFailedKnownCommitted
+        );
+        assert!(
+            mapped
+                .message
+                .contains("[CommitKnownCommittedFinalizeFailed]"),
+            "mapped={mapped:?}"
+        );
+
+        let operation = load_test_operation_for_refresh(&env.state, refresh_id);
+        assert_eq!(
+            operation.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::FinalizeFailedKnownCommitted
+        );
+        assert!(operation.state.is_finished());
+        let failure = operation.failure.expect("retryable finalize failure fact");
+        assert_eq!(
+            failure.kind,
+            crate::meta::repository::iceberg_operation::IcebergOperationFailureKind::FinalizeKnownCommitted
+        );
+        assert_eq!(
+            failure.next_action,
+            crate::meta::repository::iceberg_operation::IcebergOperationNextAction::RetryFinalize
+        );
+        assert!(
+            failure
+                .message
+                .contains("test-only injected MV repository failure at FinalizeRefresh"),
+            "failure={failure:?}"
         );
     }
 
