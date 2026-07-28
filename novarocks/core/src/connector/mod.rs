@@ -16,6 +16,7 @@
 // under the License.
 pub(crate) mod backend;
 pub mod hdfs;
+pub(crate) mod host;
 pub mod iceberg;
 pub mod jdbc;
 pub(crate) mod scan_model;
@@ -48,6 +49,10 @@ use scan_planning::ConnectorScanPlanner;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use novarocks_spi::connector::{ConnectorInstance, ConnectorInstanceId};
+
+use self::host::{ConnectorHost, ConnectorHostError};
+
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 use crate::exec::node::scan::{BoundScanRanges, ScanSource};
 
@@ -63,6 +68,8 @@ pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, St
 
 #[cfg(test)]
 mod backend_test;
+#[cfg(test)]
+mod host_test;
 
 #[cfg(not(feature = "compat"))]
 mod starrocks_table_stub {
@@ -359,6 +366,7 @@ pub trait ScanConnector: Send + Sync {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
+    connector_host: ConnectorHost,
     scan_connectors: HashMap<&'static str, Arc<dyn ScanConnector>>,
     catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
     table_sources: HashMap<&'static str, Arc<dyn TableSource>>,
@@ -370,6 +378,7 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
+            connector_host: ConnectorHost::default(),
             scan_connectors: HashMap::new(),
             catalog_backends: HashMap::new(),
             table_sources: HashMap::new(),
@@ -381,6 +390,27 @@ impl ConnectorRegistry {
 
     pub fn register_scan_connector(&mut self, connector: Arc<dyn ScanConnector>) {
         self.scan_connectors.insert(connector.name(), connector);
+    }
+
+    pub(crate) fn register_connector_instance(
+        &mut self,
+        instance: ConnectorInstance,
+    ) -> Result<(), ConnectorHostError> {
+        self.connector_host.register(instance)
+    }
+
+    pub(crate) fn unregister_connector_instance(
+        &mut self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
+        self.connector_host.unregister(instance_id)
+    }
+
+    pub(crate) fn connector_instance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
+        self.connector_host.resolve(instance_id)
     }
 
     pub(crate) fn register_catalog_backend(&mut self, backend: Arc<dyn CatalogBackend>) {
