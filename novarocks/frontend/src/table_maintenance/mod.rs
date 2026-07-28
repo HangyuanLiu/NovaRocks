@@ -36,11 +36,13 @@ use self::parser::{
 };
 use self::repository::{OptimizeJobRepository, RepositoryErrorKind};
 use self::result::{action_result, optimize_jobs_result};
+use self::worker::OptimizeWorker;
 
 pub mod model;
 pub mod parser;
 pub mod repository;
 pub mod result;
+pub mod worker;
 
 const OPTIMIZE_STATE_STORE_REQUIRED: &str = "ALTER TABLE OPTIMIZE requires frontend StateStore";
 const SHOW_STATE_STORE_REQUIRED: &str = "SHOW ALTER TABLE OPTIMIZE requires frontend StateStore";
@@ -48,8 +50,9 @@ const AUTOMATIC_OPTIMIZE_STATE_STORE_REQUIRED: &str =
     "automatic optimize requires frontend StateStore";
 
 enum WorkerLifecycle {
-    Stopped,
-    Started(Arc<dyn TableMaintenanceEngine>),
+    NotStarted,
+    Started(Option<OptimizeWorker>),
+    Stopped(Result<(), String>),
 }
 
 // Design: ADR-0009
@@ -69,7 +72,7 @@ impl FrontendTableMaintenanceService {
         };
         Ok(Self {
             repository,
-            worker: Mutex::new(WorkerLifecycle::Stopped),
+            worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
         })
     }
@@ -125,7 +128,10 @@ impl FrontendTableMaintenanceService {
             created_at_ms: now_unix_millis(),
         };
         match self.block_on(repository.create(request)) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.wakeup_worker()?;
+                Ok(())
+            }
             Err(error) if error.kind() == RepositoryErrorKind::AlreadyActive => Err(format!(
                 "ALTER TABLE OPTIMIZE: create iceberg optimize job failed: {error}"
             )),
@@ -151,7 +157,10 @@ impl FrontendTableMaintenanceService {
             base_snapshot_id,
             created_at_ms: now_unix_millis(),
         })) {
-            Ok(job) => Ok(OptimizeSubmission::Submitted { job_id: job.job_id }),
+            Ok(job) => {
+                self.wakeup_worker()?;
+                Ok(OptimizeSubmission::Submitted { job_id: job.job_id })
+            }
             Err(error) if error.kind() == RepositoryErrorKind::AlreadyActive => {
                 Ok(OptimizeSubmission::AlreadyActive)
             }
@@ -193,6 +202,17 @@ impl FrontendTableMaintenanceService {
         }
         optimize_jobs_result(jobs)
     }
+
+    fn wakeup_worker(&self) -> Result<(), String> {
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
+        if let WorkerLifecycle::Started(Some(worker)) = &*worker {
+            worker.wakeup();
+        }
+        Ok(())
+    }
 }
 
 impl TableMaintenanceService for FrontendTableMaintenanceService {
@@ -202,13 +222,26 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .lock()
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
         match &*worker {
-            WorkerLifecycle::Stopped => {
-                *worker = WorkerLifecycle::Started(engine);
+            WorkerLifecycle::NotStarted => {
+                let optimize_worker = self
+                    .repository
+                    .as_ref()
+                    .map(|repository| {
+                        OptimizeWorker::start(
+                            &self.runtime,
+                            Arc::clone(repository),
+                            Arc::downgrade(&engine),
+                        )
+                    })
+                    .transpose()?;
+                *worker = WorkerLifecycle::Started(optimize_worker);
                 Ok(())
             }
-            WorkerLifecycle::Started(current) if Arc::ptr_eq(current, &engine) => Ok(()),
             WorkerLifecycle::Started(_) => {
                 Err("table maintenance service is already started".to_string())
+            }
+            WorkerLifecycle::Stopped(_) => {
+                Err("table maintenance service cannot be restarted after shutdown".to_string())
             }
         }
     }
@@ -257,8 +290,21 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .worker
             .lock()
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
-        *worker = WorkerLifecycle::Stopped;
-        Ok(())
+        let lifecycle = std::mem::replace(&mut *worker, WorkerLifecycle::Stopped(Ok(())));
+        drop(worker);
+
+        let result = match lifecycle {
+            WorkerLifecycle::NotStarted => Ok(()),
+            WorkerLifecycle::Started(Some(mut worker)) => worker.shutdown(),
+            WorkerLifecycle::Started(None) => Ok(()),
+            WorkerLifecycle::Stopped(result) => result,
+        };
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
+        *worker = WorkerLifecycle::Stopped(result.clone());
+        result
     }
 }
 
