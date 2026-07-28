@@ -23,9 +23,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks_spi::state_store::StateStoreErrorKind;
+use novarocks_spi::state_store::{FeDeploymentView, StateStoreErrorKind};
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
+    FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig,
 };
 use tempfile::TempDir;

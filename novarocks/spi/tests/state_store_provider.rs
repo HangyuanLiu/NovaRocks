@@ -59,17 +59,13 @@ fn unused_transaction_error() -> StateStoreError {
 
 #[async_trait]
 impl StateStore for StubStateStore {
-    fn provider_name(&self) -> &'static str {
-        TEST_PROVIDER_ID.as_str()
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }
 
     fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
         StateStoreMetricsSnapshot {
-            provider: TEST_PROVIDER_ID.as_str(),
+            provider: TEST_PROVIDER_ID,
             begin_count: 0,
             get_count: 0,
             range_count: 0,

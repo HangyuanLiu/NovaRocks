@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use novarocks_spi::state_store::StateStoreErrorKind;
+use novarocks_spi::state_store::{FeDeploymentView, StateStoreErrorKind};
 use novarocks_state_store::mysql::test_support::{
     MysqlProviderTestHarness, acquire_operation, acquire_provider_handle, active_readiness,
     begin_shutdown, hold_connection, is_accepting, pollute_session, pool_count, prepare_pool,
@@ -35,7 +35,7 @@ use novarocks_state_store::mysql::test_support::{
     delayed_active_readiness, run_sleep_until_deadline,
 };
 use novarocks_state_store::{
-    FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
+    MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
     StateStoreProviderConfig,
 };
 
@@ -81,7 +81,7 @@ fn deployment() -> FeDeploymentView {
     }
 }
 
-async fn open_state_store(
+async fn open_mysql_store(
     runtime: &MysqlProviderTestHarness,
     config: StateStoreConfig,
     deployment: FeDeploymentView,
@@ -191,7 +191,7 @@ async fn mysql_runtime_rejects_provider_mismatch() {
     let mut runtime =
         MysqlProviderTestHarness::boot(client_config("NOVAROCKS_SS3_RUNTIME_PROVIDER_PASSWORD"))
             .expect("construct MySQL runtime");
-    let error = match open_state_store(&runtime, sqlite_store_config(), deployment()).await {
+    let error = match open_mysql_store(&runtime, sqlite_store_config(), deployment()).await {
         Ok(_) => panic!("MySQL runtime must reject SQLite"),
         Err(error) => error,
     };

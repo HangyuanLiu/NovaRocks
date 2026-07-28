@@ -33,6 +33,21 @@ exactly `async-trait`, `bytes`, `sha2`, and `uuid`; Tokio must remain the sole
 optional normal dependency, owned only by `state-store-conformance`, and absent
 from the default graph.
 
+The SPI owns the provider factory, instance, descriptor, lifecycle, and open
+request contracts. The state-store crate owns the typed provider registry,
+`StateStoreHost`, configuration binding, and provider-private runtimes. Provider
+identity is exposed by the descriptor or host and carried in metrics as a
+`StateStoreProviderId`; it is not a `StateStore` method.
+
+The current SPI-2 release gate is SQLite correctness, frontend lifecycle
+coverage, and the real 1FE+3BE SQLite restart scenario. The MySQL and
+FoundationDB commands below remain authoritative for later live-provider
+runtime validation, but passing those external-service suites is not required
+to merge SPI-2. Feature compilation still covers their complete factory and
+instance abstractions. Test-hook provider harnesses are internal test tools,
+not production composition APIs; production composition must use
+`StateStoreHost`.
+
 Focused contract checks:
 
 ```bash
@@ -85,9 +100,9 @@ Commit-state native error logs may contain only the canonical UUID
 the documented lifecycle/API/readiness/keyspace-hash fields. Never put
 cluster-file contents, TLS passwords, private-key/certificate contents,
 credentials, logical keys/values, secrets, or the raw keyspace UUID in logs or
-goldens. Finish tests by dropping transaction and store handles, then call
-`StateStoreRuntime::shutdown()`, and only after successful runtime shutdown run
-`docker/foundationdb/down.sh --docker`.
+goldens. Finish live-provider tests by dropping transaction and store handles,
+then shut down the provider test harness. Only after successful harness
+shutdown should the test fixture run `docker/foundationdb/down.sh --docker`.
 
 ## MySQL State Store
 
@@ -95,7 +110,7 @@ goldens. Finish tests by dropping transaction and store handles, then call
 `mysql_async 0.37.0` with the minimal Rustls feature set. Default and
 feature-off builds retain the MySQL configuration vocabulary but do not include
 the async driver; selecting MySQL in those builds returns a typed
-`InvalidConfiguration` error and never falls back to SQLite.
+`ProviderNotCompiled` host error and never falls back to SQLite.
 
 The production acceptance fixture is the pinned MySQL 8.4.10 container under
 `docker/mysql-state-store/`. The Homebrew server is auxiliary developer evidence

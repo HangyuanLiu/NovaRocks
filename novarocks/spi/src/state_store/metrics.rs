@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::StateStoreProviderId;
+
 pub const STATE_STORE_OPERATION_COUNT: usize = 6;
 pub const STATE_STORE_OUTCOME_COUNT: usize = 6;
 
@@ -42,7 +44,7 @@ pub enum StateStoreOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateStoreMetricsSnapshot {
-    pub provider: &'static str,
+    pub provider: StateStoreProviderId,
     pub begin_count: u64,
     pub get_count: u64,
     pub range_count: u64,

@@ -21,13 +21,11 @@ use novarocks_spi::state_store::{
     StateRecord, StoreRevision, TransactionId, Value,
 };
 use novarocks_spi::state_store::{
-    FeDeploymentView as SpiFeDeploymentView, Precondition, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreOpenRequest,
+    FeDeploymentView, Precondition, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreOpenRequest,
 };
 
-use super::super::{
-    FeDeploymentView, MySqlClientConfig, StateStoreConfig, StateStoreProviderConfig,
-};
+use super::super::{MySqlClientConfig, StateStoreConfig, StateStoreProviderConfig};
 use super::client::MysqlPoolConnection;
 use super::runtime::MysqlRuntime;
 #[cfg(feature = "state-store-test-hooks")]
@@ -154,10 +152,7 @@ impl MysqlProviderTestHarness {
                 StateStoreOpenRequest {
                     cluster_id: config.cluster_id,
                     limits,
-                    deployment: SpiFeDeploymentView {
-                        active_fe_count: deployment.active_fe_count,
-                        topology_revision: deployment.topology_revision,
-                    },
+                    deployment,
                     deadline,
                 },
             )

@@ -28,13 +28,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
-    Key, KeyRange, MAX_KEY_BYTES, MAX_VALUE_BYTES, Precondition, RangeRequest, StateStore,
-    StateStoreErrorKind, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId,
-    Value,
+    FeDeploymentView, Key, KeyRange, MAX_KEY_BYTES, MAX_VALUE_BYTES, Precondition, RangeRequest,
+    StateStore, StateStoreErrorKind, StateStoreOperation, StateStoreOutcome, StoreRevision,
+    TransactionId, Value,
 };
 use novarocks_state_store::{
-    FeDeploymentView, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
+    SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
+    StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+    builtin_state_store_provider_registry,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -787,7 +788,11 @@ async fn sqlite_pagination_public_api_reads_binary_keys_in_both_directions() {
         .collect::<Vec<_>>();
     let seed_receipt = commit_puts(&store, &rows).await;
 
-    assert_eq!(store.provider_name(), "sqlite");
+    assert_eq!(
+        store.metrics_snapshot().provider,
+        SQLITE_STATE_STORE_PROVIDER_ID
+    );
+    assert_eq!(store.host.provider_id(), SQLITE_STATE_STORE_PROVIDER_ID);
     assert_eq!(store.limits().max_page_size, 1_000);
     let identity = store.identity().await.expect("public identity");
     assert_eq!(store.identity().await.expect("cloned identity"), identity);

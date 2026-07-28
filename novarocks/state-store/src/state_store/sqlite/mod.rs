@@ -37,6 +37,7 @@ use novarocks_spi::state_store::{
 };
 
 use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::provider::SQLITE_STATE_STORE_PROVIDER_ID;
 
 pub(crate) use provider::SqliteStateStoreProviderFactory;
 
@@ -53,10 +54,6 @@ pub(super) struct SqliteStateStore {
 
 #[async_trait]
 impl StateStore for SqliteStateStore {
-    fn provider_name(&self) -> &'static str {
-        "sqlite"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }
@@ -174,7 +171,7 @@ fn open_blocking(
     Ok(SqliteStateStore {
         path,
         limits,
-        metrics: Arc::new(StateStoreMetrics::new("sqlite")),
+        metrics: Arc::new(StateStoreMetrics::new(SQLITE_STATE_STORE_PROVIDER_ID)),
         commit_registry: txn::new_commit_registry(),
         #[cfg(test)]
         test_hooks: txn::new_test_hooks(),
@@ -409,9 +406,9 @@ mod tests {
 
     use super::*;
     use crate::state_store::{
-        FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+        StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
     };
-    use novarocks_spi::state_store::StateStoreErrorKind;
+    use novarocks_spi::state_store::{FeDeploymentView, StateStoreErrorKind};
 
     fn runtime() -> Runtime {
         Builder::new_multi_thread()

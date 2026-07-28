@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,14 +28,14 @@ use novarocks_frontend::view::repository::{
     encode_record,
 };
 use novarocks_spi::state_store::{
-    ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, Precondition, RangePage,
-    RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId, Value, VersionToken,
-    WriteTransaction,
+    ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, FeDeploymentView, Key,
+    Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    StoreIdentity, TransactionId, Value, VersionToken, WriteTransaction,
 };
 use novarocks_state_store::{
-    FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    StateStoreRuntime, open_state_store,
+    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -144,18 +145,27 @@ fn sqlite_config(path: &Path) -> StateStoreConfig {
     }
 }
 
-async fn open_sqlite(path: &Path) -> Arc<dyn StateStore> {
-    let runtime = StateStoreRuntime::local().expect("local state-store runtime");
-    open_state_store(
-        &runtime,
-        sqlite_config(path),
+async fn open_sqlite(path: &Path) -> (StateStoreHost, Arc<dyn StateStore>) {
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    let host = StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: sqlite_config(path),
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).unwrap(),
             topology_revision: Bytes::from_static(b"view-repository-topology"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
-    .expect("open SQLite state store")
+    .expect("open SQLite state store host");
+    let store = host.state_store().expect("SQLite state store exposure");
+    (host, store)
 }
 
 fn create(view: &str, sql: &str, or_replace: bool) -> DatabaseMutation {
@@ -169,7 +179,7 @@ fn create(view: &str, sql: &str, or_replace: bool) -> DatabaseMutation {
 #[tokio::test]
 async fn repository_mutations_are_atomic_and_catalog_isolated() {
     let temp = TempDir::new().unwrap();
-    let store = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let (_host, store) = open_sqlite(&temp.path().join("state.sqlite")).await;
     let repository = ViewRepository::open(Arc::clone(&store), tokio::runtime::Handle::current())
         .await
         .unwrap();
@@ -244,7 +254,7 @@ async fn repository_mutations_are_atomic_and_catalog_isolated() {
 async fn repository_reopens_from_durable_records() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.sqlite");
-    let store = open_sqlite(&path).await;
+    let (mut host, store) = open_sqlite(&path).await;
     let repository = ViewRepository::open(store, tokio::runtime::Handle::current())
         .await
         .unwrap();
@@ -253,8 +263,11 @@ async fn repository_reopens_from_durable_records() {
         .await
         .unwrap();
     drop(repository);
+    host.shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
 
-    let reopened_store = open_sqlite(&path).await;
+    let (_reopened_host, reopened_store) = open_sqlite(&path).await;
     let reopened = ViewRepository::open(reopened_store, tokio::runtime::Handle::current())
         .await
         .unwrap();
@@ -291,10 +304,6 @@ struct DuplicateRangeStore {
 
 #[async_trait]
 impl StateStore for DuplicateRangeStore {
-    fn provider_name(&self) -> &'static str {
-        "duplicate-range-test"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         self.inner.limits()
     }
@@ -361,7 +370,7 @@ impl ReadTransaction for DuplicateRangeTransaction {
 #[tokio::test]
 async fn repository_open_rejects_duplicate_logical_database_identity() {
     let temp = TempDir::new().unwrap();
-    let inner = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let (_host, inner) = open_sqlite(&temp.path().join("state.sqlite")).await;
     let record = StateRecord {
         key: database_key("default_catalog", "db").unwrap(),
         value: encode_record(record("default_catalog", "db")).unwrap(),
@@ -381,10 +390,6 @@ struct CommitUnknownStore {
 
 #[async_trait]
 impl StateStore for CommitUnknownStore {
-    fn provider_name(&self) -> &'static str {
-        "commit-unknown-test"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         self.inner.limits()
     }
@@ -487,7 +492,8 @@ impl WriteTransaction for CommitUnknownTransaction {
 #[tokio::test]
 async fn repository_resolves_commit_unknown_only_from_authoritative_operation_id() {
     let committed_temp = TempDir::new().unwrap();
-    let committed_inner = open_sqlite(&committed_temp.path().join("state.sqlite")).await;
+    let (_committed_host, committed_inner) =
+        open_sqlite(&committed_temp.path().join("state.sqlite")).await;
     let committed_store: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
         inner: committed_inner,
         apply_before_unknown: true,
@@ -502,7 +508,8 @@ async fn repository_resolves_commit_unknown_only_from_authoritative_operation_id
     assert_eq!(record.views.get("v").map(String::as_str), Some("SELECT 7"));
 
     let unresolved_temp = TempDir::new().unwrap();
-    let unresolved_inner = open_sqlite(&unresolved_temp.path().join("state.sqlite")).await;
+    let (_unresolved_host, unresolved_inner) =
+        open_sqlite(&unresolved_temp.path().join("state.sqlite")).await;
     let unresolved_store: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
         inner: unresolved_inner,
         apply_before_unknown: false,
@@ -521,7 +528,7 @@ async fn repository_resolves_commit_unknown_only_from_authoritative_operation_id
 #[tokio::test]
 async fn repository_open_fails_fast_on_corrupt_records() {
     let temp = TempDir::new().unwrap();
-    let store = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let (_host, store) = open_sqlite(&temp.path().join("state.sqlite")).await;
     write_raw(
         store.as_ref(),
         database_key("default_catalog", "db").unwrap(),

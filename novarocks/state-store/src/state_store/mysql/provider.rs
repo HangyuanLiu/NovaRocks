@@ -182,10 +182,6 @@ mod tests {
     #[cfg(feature = "state-store-test-hooks")]
     #[async_trait]
     impl StateStore for FakeStore {
-        fn provider_name(&self) -> &'static str {
-            "mysql-test"
-        }
-
         fn limits(&self) -> &StateStoreLimits {
             static LIMITS: std::sync::LazyLock<StateStoreLimits> =
                 std::sync::LazyLock::new(StateStoreLimits::default);

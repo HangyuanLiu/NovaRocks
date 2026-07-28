@@ -150,10 +150,6 @@ impl FrontendApplicationHost {
         let deployment = source.snapshot().await.map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
         })?;
-        let deployment = novarocks_state_store::FeDeploymentView {
-            active_fe_count: deployment.active_fe_count,
-            topology_revision: deployment.topology_revision,
-        };
         let registry = builtin_state_store_provider_registry().map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, error)
         })?;

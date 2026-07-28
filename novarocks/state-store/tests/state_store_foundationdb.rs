@@ -30,11 +30,11 @@ use bytes::Bytes;
 use foundationdb::Database;
 use foundationdb::options::TransactionOption;
 use novarocks_spi::state_store::{
-    ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange, Precondition,
-    RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
+    ChangePollRequest, CommitOutcome, CommitResolution, Direction, FeDeploymentView, Key, KeyRange,
+    Precondition, RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
 };
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
+    FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig,
 };
 #[cfg(feature = "state-store-test-hooks")]

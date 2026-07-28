@@ -33,8 +33,8 @@ use bytes::Bytes;
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_spi::state_store::ContinuationToken;
 use novarocks_spi::state_store::{
-    CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, StateStore,
-    StateStoreErrorKind, TransactionId, Value,
+    CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, Precondition, RangeRequest,
+    StateStore, StateStoreErrorKind, TransactionId, Value,
 };
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store::mysql::test_support::{
@@ -49,8 +49,8 @@ use novarocks_state_store::mysql::test_support::{
     store_readiness_snapshot,
 };
 use novarocks_state_store::{
-    FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig,
+    MYSQL_STATE_STORE_PROVIDER_ID, MySqlClientConfig, MySqlTlsMode, StateStoreConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig,
 };
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Version};
@@ -160,7 +160,7 @@ fn deployment() -> FeDeploymentView {
     }
 }
 
-async fn open_state_store(
+async fn open_mysql_store(
     runtime: &MysqlProviderTestHarness,
     config: StateStoreConfig,
     deployment: FeDeploymentView,
@@ -176,7 +176,7 @@ async fn open_store(
     cluster_id: &str,
     deadline_ms: u64,
 ) -> Result<std::sync::Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
-    open_state_store(
+    open_mysql_store(
         runtime,
         store_config(database, cluster_id, deadline_ms),
         deployment(),
@@ -318,7 +318,7 @@ fn mysql_conformance_factory(
         databases.borrow_mut().push(database);
         let runtime = Rc::clone(&runtime);
         Box::pin(async move {
-            let store = open_state_store(
+            let store = open_mysql_store(
                 runtime.as_ref(),
                 StateStoreConfig {
                     cluster_id: "mysql-conformance-cluster".to_owned(),
@@ -419,7 +419,10 @@ async fn mysql_schema_bootstraps_exact_four_tables_and_meta() {
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("bootstrap MySQL state store");
-    assert_eq!(store.provider_name(), "mysql");
+    assert_eq!(
+        store.metrics_snapshot().provider,
+        MYSQL_STATE_STORE_PROVIDER_ID
+    );
     assert_eq!(store.limits().max_key_bytes, 3072);
     let identity = store.identity().await.expect("store identity");
     assert_eq!(identity.cluster_id, CLUSTER_ID);
@@ -817,7 +820,10 @@ async fn mysql_store_readiness_validates_inventory_identity_and_transactions() {
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open ready store");
-    assert_eq!(store.provider_name(), "mysql");
+    assert_eq!(
+        store.metrics_snapshot().provider,
+        MYSQL_STATE_STORE_PROVIDER_ID
+    );
     assert_eq!(
         store.identity().await.expect("ready identity").cluster_id,
         CLUSTER_ID
@@ -1421,7 +1427,7 @@ async fn mysql_shared_limits_before_io() {
             runner_max_attempts: Some(2),
         },
     );
-    let store = open_state_store(&runtime, config, deployment())
+    let store = open_mysql_store(&runtime, config, deployment())
         .await
         .expect("open limited MySQL store");
     let factory = shared_factory(store);
@@ -1858,7 +1864,7 @@ async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
     );
     let mut runtime =
         MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
-    let store = open_state_store(
+    let store = open_mysql_store(
         &runtime,
         transaction_store_config(
             &database.name,
@@ -1921,7 +1927,7 @@ async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
     let mut runtime =
         MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
     let envelope = MysqlWriteTestApi::transaction_envelope_bytes();
-    let under = open_state_store(
+    let under = open_mysql_store(
         &runtime,
         transaction_store_config(
             &database.name,
@@ -1948,7 +1954,7 @@ async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
     assert_eq!(MysqlStatementTestApi::statement_count(), before);
     drop(under);
 
-    let exact = open_state_store(
+    let exact = open_mysql_store(
         &runtime,
         transaction_store_config(
             &database.name,
@@ -1991,7 +1997,7 @@ async fn mysql_write_budget_accepts_exact_mutation_and_rejects_plus_one_before_i
             .expect("exact put accounting");
 
     for (value_bytes, should_fit) in [(15_usize, true), (16, true), (17, false)] {
-        let store = open_state_store(
+        let store = open_mysql_store(
             &runtime,
             transaction_store_config(
                 &database.name,

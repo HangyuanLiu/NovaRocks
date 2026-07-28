@@ -831,10 +831,6 @@ mod tests {
 
     #[async_trait]
     impl StateStore for LimitedStore {
-        fn provider_name(&self) -> &'static str {
-            "limited-test"
-        }
-
         fn limits(&self) -> &StateStoreLimits {
             &self.limits
         }
@@ -1009,10 +1005,6 @@ mod tests {
 
     #[async_trait]
     impl StateStore for UnresolvedAbsentBootstrapStore {
-        fn provider_name(&self) -> &'static str {
-            "unresolved-absent-bootstrap"
-        }
-
         fn limits(&self) -> &StateStoreLimits {
             &self.limits
         }

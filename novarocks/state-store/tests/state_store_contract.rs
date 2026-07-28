@@ -18,30 +18,39 @@
 mod common;
 
 use std::collections::VecDeque;
+#[cfg(not(feature = "mysql-state-store-provider"))]
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(not(feature = "mysql-state-store-provider"))]
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+#[cfg(not(feature = "mysql-state-store-provider"))]
+use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     ContinuationToken, Direction, Key, KeyRange, Precondition, RangePage, RangeRequest,
     ReadTransaction, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreOperation, StateStoreOutcome, StoreIdentity, StoreRevision, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    StateStoreOperation, StateStoreOutcome, StateStoreProviderId, StoreIdentity, StoreRevision,
+    TransactionId, Value, VersionToken, WriteTransaction,
 };
 use novarocks_state_store::coordination::{
     AttemptId, ControlPlaneIncarnation, FencingToken, HolderId, ResourceEpoch, ResourceKey,
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, OperationId,
-    RunFailure, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
-    StateStoreHostErrorKind, StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime,
-    derive_transaction_id, open_state_store, run_side_effect_free,
+    FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, OperationId, RunFailure,
+    StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreHostErrorKind,
+    StateStoreLimitOverrides, StateStoreProviderConfig, derive_transaction_id,
+    run_side_effect_free,
+};
+#[cfg(not(feature = "mysql-state-store-provider"))]
+use novarocks_state_store::{
+    MYSQL_STATE_STORE_PROVIDER_ID, StateStoreHost, builtin_state_store_provider_registry,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -49,6 +58,9 @@ use uuid::Uuid;
 use novarocks_spi::state_store::conformance::{
     FaultGate, FaultInjectingStateStore, ScriptedCommitResult,
 };
+
+const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
+    StateStoreProviderId::new("scripted-test");
 
 #[test]
 fn coordination_contract_rejects_invalid_opaque_identities() {
@@ -369,14 +381,18 @@ fn mysql_client_config_debug_redacts_connection_material() {
 async fn mysql_config_feature_off_open_fails_without_fallback() {
     let app = mysql_app_config(valid_mysql_client());
     app.validate().expect("valid static MySQL configuration");
-    let runtime = StateStoreRuntime::local().expect("create feature-off local runtime");
-    let error = match open_state_store(
-        &runtime,
-        app.store,
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    let error = match StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: app,
+            foundationdb_client: None,
+        },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
             topology_revision: Bytes::from_static(b"topology-r1"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
     {
@@ -384,10 +400,11 @@ async fn mysql_config_feature_off_open_fails_without_fallback() {
         Err(error) => error,
     };
 
-    assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert_eq!(error.kind(), StateStoreHostErrorKind::ProviderNotCompiled);
+    assert_eq!(error.provider_id(), Some(MYSQL_STATE_STORE_PROVIDER_ID));
     assert_eq!(
         error.to_string(),
-        "InvalidConfiguration: MySQL provider is not compiled in"
+        "ProviderNotCompiled (mysql): MySQL provider is not compiled in"
     );
 }
 
@@ -576,7 +593,7 @@ impl ScriptedStore {
     fn new(commits: impl IntoIterator<Item = ScriptedCommit>) -> Self {
         Self {
             limits: StateStoreLimits::default(),
-            metrics: Arc::new(StateStoreMetrics::new("scripted")),
+            metrics: Arc::new(StateStoreMetrics::new(TEST_STATE_STORE_PROVIDER_ID)),
             commits: Mutex::new(commits.into_iter().collect()),
             transaction_ids: Mutex::new(Vec::new()),
         }
@@ -588,7 +605,7 @@ impl ScriptedStore {
     ) -> Self {
         Self {
             limits,
-            metrics: Arc::new(StateStoreMetrics::new("scripted")),
+            metrics: Arc::new(StateStoreMetrics::new(TEST_STATE_STORE_PROVIDER_ID)),
             commits: Mutex::new(commits.into_iter().collect()),
             transaction_ids: Mutex::new(Vec::new()),
         }
@@ -686,10 +703,6 @@ impl WriteTransaction for ScriptedWriteTransaction {
 
 #[async_trait]
 impl StateStore for ScriptedStore {
-    fn provider_name(&self) -> &'static str {
-        "scripted"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }

@@ -23,11 +23,12 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::state_store::{
-    CommitOutcome, CommitResolution, Key, KeyRange, Precondition as StorePrecondition,
-    RangeRequest, StateRecord, StateStore, TransactionId, Value, VersionToken, WriteTransaction,
+    CommitOutcome, CommitResolution, FeDeploymentView, Key, KeyRange,
+    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, TransactionId, Value,
+    VersionToken, WriteTransaction,
 };
 use novarocks_state_store::{
-    FeDeploymentView, FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
+    FoundationDbClientConfig, FoundationDbProviderTestHarness, StateStoreConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, arm_next_foundationdb_commit,
 };
 use serde::{Deserialize, Serialize};

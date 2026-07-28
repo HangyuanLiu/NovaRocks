@@ -321,7 +321,7 @@ impl FoundationDbProviderTestHarness {
     pub async fn open_store(
         &self,
         config: crate::state_store::StateStoreConfig,
-        deployment: crate::state_store::FeDeploymentView,
+        deployment: novarocks_spi::state_store::FeDeploymentView,
         deadline: Instant,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
         config.validate().map_err(|_| {
@@ -366,10 +366,7 @@ impl FoundationDbProviderTestHarness {
                 StateStoreOpenRequest {
                     cluster_id: config.cluster_id,
                     limits,
-                    deployment: novarocks_spi::state_store::FeDeploymentView {
-                        active_fe_count: deployment.active_fe_count,
-                        topology_revision: deployment.topology_revision,
-                    },
+                    deployment,
                     deadline,
                 },
             )
@@ -537,10 +534,6 @@ mod tests {
 
     #[async_trait]
     impl StateStore for FakeStore {
-        fn provider_name(&self) -> &'static str {
-            "foundationdb-test"
-        }
-
         fn limits(&self) -> &StateStoreLimits {
             static LIMITS: std::sync::LazyLock<StateStoreLimits> =
                 std::sync::LazyLock::new(StateStoreLimits::default);

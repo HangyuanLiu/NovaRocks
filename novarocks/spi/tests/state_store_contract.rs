@@ -19,9 +19,12 @@ use bytes::Bytes;
 use novarocks_spi::state_store::{
     ChangeCursor, Direction, Key, KeyRange, RangeRequest, StateStore, StateStoreErrorKind,
     StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
-    StoreRevision, Value, VersionToken,
+    StateStoreProviderId, StoreRevision, Value, VersionToken,
 };
 use uuid::Uuid;
+
+const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
+    StateStoreProviderId::new("contract-test");
 
 #[allow(dead_code)]
 fn assert_object_safe(_: &dyn StateStore) {}
@@ -173,12 +176,12 @@ fn default_limits_cover_all_contract_fields() {
 }
 
 #[test]
-fn metrics_snapshot_indexes_operation_and_outcome() {
+fn metrics_snapshot_uses_typed_provider_id_and_indexes_operation_outcome() {
     let mut operation_outcomes = [[0; 6]; 6];
     operation_outcomes[StateStoreOperation::Commit as usize]
         [StateStoreOutcome::Conflict as usize] = 7;
     let snapshot = StateStoreMetricsSnapshot {
-        provider: "test",
+        provider: TEST_STATE_STORE_PROVIDER_ID,
         begin_count: 0,
         get_count: 0,
         range_count: 0,
@@ -201,4 +204,5 @@ fn metrics_snapshot_indexes_operation_and_outcome() {
         snapshot.operation_outcome_count(StateStoreOperation::Commit, StateStoreOutcome::Conflict),
         7
     );
+    assert_eq!(snapshot.provider, TEST_STATE_STORE_PROVIDER_ID);
 }

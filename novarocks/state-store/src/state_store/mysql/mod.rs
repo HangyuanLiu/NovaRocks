@@ -46,39 +46,13 @@ use tokio::time::Instant;
 use self::identity::MysqlIdentitySnapshot;
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
-    StoreIdentity, TransactionId, WriteTransaction,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
+    WriteTransaction,
 };
 
 use self::runtime::MysqlProviderHandle;
 use super::metrics::StateStoreMetrics;
-
-pub(super) struct LegacyMysqlRuntime {
-    inner: runtime::MysqlRuntime,
-}
-
-impl LegacyMysqlRuntime {
-    pub(super) fn boot(config: super::MySqlClientConfig) -> Result<Self, StateStoreError> {
-        Ok(Self {
-            inner: runtime::MysqlRuntime::boot(config)?,
-        })
-    }
-
-    pub(super) async fn open_store(
-        &self,
-        database: String,
-        request: StateStoreOpenRequest,
-    ) -> Result<Arc<dyn StateStore>, StateStoreError> {
-        self.inner.open_store(database, request).await
-    }
-
-    pub(super) async fn shutdown_until(
-        &mut self,
-        deadline: std::time::Instant,
-    ) -> Result<(), StateStoreError> {
-        self.inner.shutdown_until(deadline).await
-    }
-}
+use super::provider::MYSQL_STATE_STORE_PROVIDER_ID;
 
 pub(super) struct MysqlStateStore {
     lease: MysqlProviderHandle,
@@ -123,7 +97,7 @@ impl MysqlStateStore {
             lease,
             identity,
             limits,
-            metrics: Arc::new(StateStoreMetrics::new("mysql")),
+            metrics: Arc::new(StateStoreMetrics::new(MYSQL_STATE_STORE_PROVIDER_ID)),
         })
     }
 }
@@ -152,10 +126,6 @@ impl MysqlOpenCancellation {
 
 #[async_trait]
 impl StateStore for MysqlStateStore {
-    fn provider_name(&self) -> &'static str {
-        "mysql"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }

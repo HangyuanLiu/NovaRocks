@@ -19,13 +19,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_spi::state_store::{
-    FeDeploymentView as SpiFeDeploymentView, StateStore, StateStoreError, StateStoreErrorKind,
-    StateStoreOpenRequest, StateStoreProviderId, StateStoreProviderInstance,
-    StateStoreProviderLifecycle,
+    FeDeploymentView, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
+    StateStoreProviderId, StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 
 use super::config::StateStoreHostConfig;
-use super::deployment::FeDeploymentView;
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
 use super::provider::StateStoreProviderRegistry;
 
@@ -57,10 +55,7 @@ impl StateStoreHost {
         let request = StateStoreOpenRequest {
             cluster_id,
             limits: bound.limits,
-            deployment: SpiFeDeploymentView {
-                active_fe_count: deployment.active_fe_count,
-                topology_revision: deployment.topology_revision,
-            },
+            deployment,
             deadline,
         };
         let mut instance = bound.factory.open(request).await.map_err(|error| {

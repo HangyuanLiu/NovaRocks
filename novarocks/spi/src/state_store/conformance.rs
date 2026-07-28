@@ -1516,10 +1516,6 @@ impl WriteTransaction for FaultWriteTransaction {
 
 #[async_trait]
 impl StateStore for FaultInjectingStateStore {
-    fn provider_name(&self) -> &'static str {
-        self.inner.provider_name()
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         self.inner.limits()
     }

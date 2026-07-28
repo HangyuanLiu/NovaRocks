@@ -22,15 +22,15 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_spi::state_store::{
-    ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
-    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
-    StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity, TransactionId,
-    WriteTransaction,
+    ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderId, StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity,
+    TransactionId, WriteTransaction,
 };
 use novarocks_state_store::{
-    FeDeploymentView, SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig,
-    StateStoreHost, StateStoreHostConfig, StateStoreHostErrorKind, StateStoreHostLifecycle,
+    SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
+    StateStoreHostConfig, StateStoreHostErrorKind, StateStoreHostLifecycle,
     StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreProviderRegistration,
     StateStoreProviderRegistry, builtin_state_store_provider_registry,
 };
@@ -141,10 +141,6 @@ struct FakeStore;
 
 #[async_trait]
 impl StateStore for FakeStore {
-    fn provider_name(&self) -> &'static str {
-        "fake"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         static LIMITS: std::sync::LazyLock<StateStoreLimits> =
             std::sync::LazyLock::new(StateStoreLimits::default);
@@ -359,6 +355,11 @@ async fn sqlite_instance_waits_for_external_store_handles_before_stopping() {
     .await
     .unwrap();
     let held_store = host.state_store().unwrap();
+    assert_eq!(
+        held_store.metrics_snapshot().provider,
+        SQLITE_STATE_STORE_PROVIDER_ID
+    );
+    assert_eq!(host.provider_id(), SQLITE_STATE_STORE_PROVIDER_ID);
 
     let error = host.shutdown(Instant::now()).await.unwrap_err();
 

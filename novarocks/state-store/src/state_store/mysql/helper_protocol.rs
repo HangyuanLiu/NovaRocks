@@ -32,13 +32,14 @@ use novarocks_spi::state_store::MAX_VALUE_BYTES;
 
 use crate::state_store::limits::MYSQL_MAX_KEY_BYTES;
 use crate::state_store::{
-    FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
+    MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreLimitOverrides,
     StateStoreProviderConfig,
 };
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
-    Direction as StoreDirection, Key, KeyRange, Precondition as StorePrecondition, RangeRequest,
-    StateRecord, StateStore, StateStoreError, TransactionId, Value, VersionToken, WriteTransaction,
+    Direction as StoreDirection, FeDeploymentView, Key, KeyRange,
+    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, StateStoreError,
+    TransactionId, Value, VersionToken, WriteTransaction,
 };
 
 const MAX_LINE_BYTES: usize = 160 * 1024;

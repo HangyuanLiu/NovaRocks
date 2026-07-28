@@ -36,81 +36,13 @@ use self::codec::KeyspaceCodec;
 use self::identity::open_identity;
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
-    StoreIdentity, TransactionId, WriteTransaction,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
+    WriteTransaction,
 };
 
 use self::runtime::ProviderHandle;
 use super::metrics::StateStoreMetrics;
-
-pub(super) struct LegacyFoundationDbRuntime {
-    inner: runtime::FoundationDbRuntime,
-}
-
-impl LegacyFoundationDbRuntime {
-    pub(super) fn boot(config: super::FoundationDbClientConfig) -> Result<Self, StateStoreError> {
-        Ok(Self {
-            inner: runtime::FoundationDbRuntime::boot(config)?,
-        })
-    }
-
-    pub(super) async fn open_store(
-        &self,
-        config: &super::StateStoreConfig,
-        deployment: super::FeDeploymentView,
-    ) -> Result<Arc<dyn StateStore>, StateStoreError> {
-        config.validate().map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "FoundationDB state store configuration is invalid",
-            )
-        })?;
-        let (cluster_file, keyspace_id) = match &config.provider {
-            super::StateStoreProviderConfig::Foundationdb {
-                cluster_file,
-                keyspace_id,
-            } => (cluster_file, *keyspace_id),
-            _ => {
-                return Err(StateStoreError::new(
-                    StateStoreErrorKind::InvalidConfiguration,
-                    "operation requires a FoundationDB state store configuration",
-                ));
-            }
-        };
-        let limits = super::limits::resolve_state_store_limits(
-            &config.limits,
-            novarocks_spi::state_store::MAX_KEY_BYTES,
-        )
-        .map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "FoundationDB state store limits are invalid",
-            )
-        })?;
-        self.inner
-            .open_store(
-                cluster_file,
-                keyspace_id,
-                StateStoreOpenRequest {
-                    cluster_id: config.cluster_id.clone(),
-                    limits: limits.clone(),
-                    deployment: novarocks_spi::state_store::FeDeploymentView {
-                        active_fe_count: deployment.active_fe_count,
-                        topology_revision: deployment.topology_revision,
-                    },
-                    deadline: std::time::Instant::now() + limits.transaction_deadline,
-                },
-            )
-            .await
-    }
-
-    pub(super) async fn shutdown_until(
-        &mut self,
-        deadline: std::time::Instant,
-    ) -> Result<(), StateStoreError> {
-        self.inner.shutdown_until(deadline).await
-    }
-}
+use super::provider::FOUNDATIONDB_STATE_STORE_PROVIDER_ID;
 
 pub(super) struct FoundationDbStateStore {
     lease: ProviderHandle,
@@ -181,17 +113,13 @@ impl FoundationDbStateStore {
             codec,
             identity,
             limits,
-            metrics: Arc::new(StateStoreMetrics::new("foundationdb")),
+            metrics: Arc::new(StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID)),
         })
     }
 }
 
 #[async_trait]
 impl StateStore for FoundationDbStateStore {
-    fn provider_name(&self) -> &'static str {
-        "foundationdb"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }
@@ -291,7 +219,7 @@ mod tests {
             None
         );
 
-        let metrics = StateStoreMetrics::new("foundationdb");
+        let metrics = StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID);
         record_provider_error_metric(
             &metrics,
             &StateStoreError::new(StateStoreErrorKind::DeadlineExceeded, "deadline"),
