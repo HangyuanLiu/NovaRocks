@@ -88,16 +88,16 @@ impl NativeFragmentQueryRuntime {
         fragment_instance_id: UniqueId,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<NativeFragmentRegistrationLease, String> {
         self.manager
             .get_or_register_native(query_id, false, delivery_expire, query_expire)?;
         self.manager.register_finst(fragment_instance_id, query_id);
-        Ok(())
-    }
-
-    pub fn rollback_before_start(&self, query_id: QueryId, fragment_instance_id: UniqueId) -> bool {
-        self.manager
-            .rollback_pre_ready_native_fragment(query_id, fragment_instance_id)
+        Ok(NativeFragmentRegistrationLease {
+            runtime: self.clone(),
+            query_id,
+            fragment_instance_id,
+            active: true,
+        })
     }
 
     pub fn cancel_query(&self, query_id: QueryId, reason: String) -> Vec<UniqueId> {
@@ -121,6 +121,31 @@ impl NativeFragmentQueryRuntime {
     ) {
         self.manager
             .cleanup_after_fragment_report(query_id, decision.inner);
+    }
+}
+
+pub struct NativeFragmentRegistrationLease {
+    runtime: NativeFragmentQueryRuntime,
+    query_id: QueryId,
+    fragment_instance_id: UniqueId,
+    active: bool,
+}
+
+impl NativeFragmentRegistrationLease {
+    pub fn into_running(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for NativeFragmentRegistrationLease {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .runtime
+                .manager
+                .rollback_pre_ready_native_fragment(self.query_id, self.fragment_instance_id);
+            self.active = false;
+        }
     }
 }
 
@@ -155,5 +180,49 @@ pub struct NativeFragmentReportDecision {
 impl NativeFragmentReportDecision {
     pub fn include_runtime_filter_profile(&self) -> bool {
         self.inner.include_runtime_filter_profile
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::NativeFragmentQueryRuntime;
+    use crate::common::types::UniqueId;
+    use crate::runtime::query_context::{QueryContextManager, QueryId};
+
+    #[test]
+    fn pre_start_registration_lease_drop_rolls_back_only_its_fragment() {
+        let manager = QueryContextManager::new_for_test();
+        let runtime = NativeFragmentQueryRuntime {
+            manager: manager.clone(),
+        };
+        let query_id = QueryId::new(91_001, 91_002);
+        let first = UniqueId { hi: 91_003, lo: 1 };
+        let second = UniqueId { hi: 91_003, lo: 2 };
+
+        let first_registration = runtime
+            .register_fragment(
+                query_id,
+                first,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("register first fragment");
+        let second_registration = runtime
+            .register_fragment(
+                query_id,
+                second,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("register second fragment");
+
+        drop(second_registration);
+        assert_eq!(manager.fragment_counts_for_test(query_id), Some((1, 1)));
+        assert_eq!(manager.query_id_by_finst(first), Some(query_id));
+        assert_eq!(manager.query_id_by_finst(second), None);
+
+        first_registration.into_running();
     }
 }

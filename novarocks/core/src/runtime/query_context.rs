@@ -2706,9 +2706,9 @@ impl QueryContextManager {
     /// Undo the registration performed before a native worker reports readiness.
     ///
     /// A synchronous pre-ready failure has not exposed a runnable fragment to the
-    /// coordinator, so an otherwise empty query context must not be retained as a
-    /// cancelled runtime-filter query. Deployments are deliberately excluded: once
-    /// one exists, the regular query-cancellation path owns its terminal state.
+    /// coordinator. Remove only that fragment's route and registration count. When
+    /// it was the query's sole registration and no deployment owns the lifecycle,
+    /// remove the otherwise empty query context as well.
     pub(crate) fn rollback_pre_ready_native_fragment(
         &self,
         query_id: QueryId,
@@ -2723,32 +2723,37 @@ impl QueryContextManager {
                 return false;
             };
             if !context.matches_execution(QueryExecutionKey::native(query_id))
-                || context.num_fragments != 1
-                || context.num_active_fragments != 1
-                || context.runtime_filter_deployment.is_some()
+                || context.num_fragments == 0
+                || context.num_active_fragments == 0
             {
                 return false;
             }
 
             guard.finst_to_query.remove(&finst_id);
             guard.fragment_completions.remove(&finst_id);
-            let mut context = guard
-                .active
-                .remove(&query_id)
-                .expect("checked active context");
-            context.rollback_inc_fragments();
-            debug_assert_eq!(context.num_fragments, 0);
-            debug_assert_eq!(context.num_active_fragments, 0);
-            Some(context)
+            let remove_empty_context = {
+                let context = guard
+                    .active
+                    .get_mut(&query_id)
+                    .expect("checked active context");
+                context.rollback_inc_fragments();
+                context.num_fragments == 0
+                    && context.num_active_fragments == 0
+                    && context.runtime_filter_deployment.is_none()
+            };
+            remove_empty_context.then(|| {
+                guard
+                    .active
+                    .remove(&query_id)
+                    .expect("checked empty active context")
+            })
         };
         if let Some(context) = removed {
             context.runtime_filter_service().shutdown();
             drop(context);
             self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
-            true
-        } else {
-            false
         }
+        true
     }
 
     pub(crate) fn unregister_finst_execution(
@@ -3681,7 +3686,7 @@ mod runtime_filter_lifecycle_cleanup_tests {
     }
 
     #[test]
-    fn pre_ready_rollback_preserves_multi_fragment_context_for_normal_cleanup() {
+    fn pre_start_registration_rollback_preserves_other_fragment_and_query_cleanup() {
         let mgr = test_manager();
         let query_id = QueryId {
             hi: 4_131,
@@ -3708,10 +3713,23 @@ mod runtime_filter_lifecycle_cleanup_tests {
             mgr.register_finst(finst_id, query_id);
         }
 
-        assert!(!mgr.rollback_pre_ready_native_fragment(query_id, second));
-        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((2, 2)));
+        assert!(mgr.rollback_pre_ready_native_fragment(query_id, second));
+        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((1, 1)));
         assert_eq!(mgr.query_id_by_finst(first), Some(query_id));
-        assert_eq!(mgr.query_id_by_finst(second), Some(query_id));
+        assert_eq!(mgr.query_id_by_finst(second), None);
+        mgr.inner
+            .lock()
+            .expect("query ctx manager lock")
+            .active
+            .get_mut(&query_id)
+            .expect("remaining fragment query")
+            .total_fragments = Some(1);
+
+        let decision = mgr.finish_fragment_for_report(query_id);
+        mgr.unregister_finst(first);
+        mgr.cleanup_after_fragment_report(query_id, decision);
+        assert_eq!(mgr.fragment_counts_for_test(query_id), None);
+        assert_eq!(mgr.query_id_by_finst(first), None);
         RuntimeFilterLifecycleRegistry::global()
             .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
     }

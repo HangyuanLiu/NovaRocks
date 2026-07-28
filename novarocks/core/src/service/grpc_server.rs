@@ -3106,7 +3106,7 @@ mod pr3_tests {
     }
 
     #[tokio::test]
-    async fn submit_fragment_uses_injected_native_ingress() {
+    async fn submit_fragment_success_response_follows_injected_ingress_acceptance() {
         let ingress = Arc::new(RecordingNativeFragmentIngress::default());
         let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
         let query_id = QueryId {
@@ -3149,7 +3149,8 @@ mod pr3_tests {
                 .submissions
                 .lock()
                 .expect("native fragment submissions"),
-            vec![(query_id, finst_id)]
+            vec![(query_id, finst_id)],
+            "successful tonic response must be observable only after the injected ingress accepts"
         );
     }
 

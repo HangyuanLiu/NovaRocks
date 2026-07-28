@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 
 use novarocks::common::app_config;
@@ -46,6 +48,10 @@ pub struct NativeFragmentService {
     pub(super) controls: Arc<FragmentControlRegistry>,
     queries: NativeFragmentQueryRuntime,
     lifecycle_observer: Option<LifecycleObserver>,
+    #[cfg(test)]
+    fail_worker_spawn_on_submission: Option<usize>,
+    #[cfg(test)]
+    submission_count: AtomicUsize,
 }
 
 impl std::fmt::Debug for NativeFragmentService {
@@ -62,6 +68,10 @@ impl NativeFragmentService {
             controls: Arc::new(FragmentControlRegistry::default()),
             queries: NativeFragmentQueryRuntime::global(),
             lifecycle_observer: None,
+            #[cfg(test)]
+            fail_worker_spawn_on_submission: None,
+            #[cfg(test)]
+            submission_count: AtomicUsize::new(0),
         }
     }
 
@@ -71,6 +81,18 @@ impl NativeFragmentService {
     ) -> Self {
         Self {
             lifecycle_observer: Some(Arc::new(observer)),
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_lifecycle_observer_and_worker_spawn_failure(
+        observer: impl Fn(NativeFragmentLifecycleEvent) + Send + Sync + 'static,
+        fail_worker_spawn_on_submission: usize,
+    ) -> Self {
+        Self {
+            lifecycle_observer: Some(Arc::new(observer)),
+            fail_worker_spawn_on_submission: Some(fail_worker_spawn_on_submission),
             ..Self::new()
         }
     }
@@ -130,7 +152,8 @@ impl NativeFragmentIngress for NativeFragmentService {
             .controls
             .reserve(fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
-        self.queries
+        let registration = self
+            .queries
             .register_fragment(
                 query_id,
                 fragment_instance_id,
@@ -143,6 +166,14 @@ impl NativeFragmentIngress for NativeFragmentService {
         let controls = Arc::clone(&self.controls);
         let queries = self.queries.clone();
         let observer = self.lifecycle_observer.clone();
+        #[cfg(test)]
+        if self.fail_worker_spawn_on_submission.is_some_and(|target| {
+            self.submission_count.fetch_add(1, Ordering::SeqCst) + 1 == target
+        }) {
+            return Err(NativeFragmentIngressError::new(
+                "injected native fragment adapter worker spawn failure",
+            ));
+        }
         std::thread::Builder::new()
             .name(format!(
                 "native-fragment-{:x}-{:x}",
@@ -151,7 +182,6 @@ impl NativeFragmentIngress for NativeFragmentService {
             .spawn(move || {
                 if start_rx.recv().is_err() {
                     let error = "native fragment start signal was dropped".to_string();
-                    let _ = queries.rollback_before_start(query_id, fragment_instance_id);
                     fe_report::report_fragment_done(fragment_instance_id, Some(error), false);
                     return;
                 }
@@ -160,15 +190,13 @@ impl NativeFragmentIngress for NativeFragmentService {
                     handle: running.clone(),
                 });
                 let token = reservation.publish(control);
+                registration.into_running();
                 if let Some(observer) = observer.as_ref() {
                     observer(NativeFragmentLifecycleEvent::Started);
                 }
                 consume_terminal_fact(running, token, controls, queries);
             })
             .map_err(|error| {
-                let _ = self
-                    .queries
-                    .rollback_before_start(query_id, fragment_instance_id);
                 NativeFragmentIngressError::new(format!(
                     "spawn native fragment adapter worker failed: {error}"
                 ))
@@ -296,16 +324,19 @@ fn profile_report_interval_ns(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
+    use novarocks::UniqueId;
     use novarocks::proto;
+    use novarocks::runtime::query_context::QueryId;
     use novarocks::service::native_fragment_ingress::{
         NativeFragmentIngress, NativeFragmentRequest,
     };
 
     use super::{NativeFragmentLifecycleEvent, NativeFragmentService};
 
-    fn values_result_request(query_base: i64) -> NativeFragmentRequest {
+    fn values_result_request(query_base: i64, fragment_base: i64) -> NativeFragmentRequest {
         let fragment_id = 7;
         NativeFragmentRequest::try_decode(
             proto::plan::PlanFragment {
@@ -343,8 +374,8 @@ mod tests {
                     lo: query_base + 1,
                 }),
                 fragment_instance_id: Some(proto::common::UniqueId {
-                    hi: query_base + 2,
-                    lo: query_base + 3,
+                    hi: fragment_base,
+                    lo: fragment_base + 1,
                 }),
                 backend_num: 3,
                 query_options: Some(proto::novarocks::QueryOptions {
@@ -359,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_orders_prepare_registration_ack_before_start() {
+    fn submit_acceptance_point_follows_prepare_and_registration_before_start() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let service = NativeFragmentService::with_lifecycle_observer(move |event| {
@@ -367,7 +398,7 @@ mod tests {
         });
 
         service
-            .submit(values_result_request(81_000))
+            .submit(values_result_request(81_000, 81_002))
             .expect("native fragment submit");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -390,7 +421,7 @@ mod tests {
     #[test]
     fn registration_failure_drops_dormant_resources_before_retry() {
         let service = NativeFragmentService::new();
-        let first = values_result_request(82_000);
+        let first = values_result_request(82_000, 82_002);
         let finst_id = first.fragment_instance_id();
         let reservation = service
             .controls
@@ -404,7 +435,79 @@ mod tests {
 
         drop(reservation);
         service
-            .submit(values_result_request(82_000))
+            .submit(values_result_request(82_000, 82_002))
             .expect("retry must observe rolled-back dormant resources");
+    }
+
+    #[test]
+    fn second_worker_spawn_failure_rolls_back_only_its_pre_start_registration() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let worker_release = Arc::clone(&release_rx);
+        let service = NativeFragmentService::with_lifecycle_observer_and_worker_spawn_failure(
+            move |event| {
+                if event == NativeFragmentLifecycleEvent::Started {
+                    started_tx.send(()).expect("publish first worker start");
+                    worker_release
+                        .lock()
+                        .expect("first worker release")
+                        .recv()
+                        .expect("release first worker");
+                }
+            },
+            2,
+        );
+        let query_id = QueryId::new(83_000, 83_001);
+        let first = UniqueId {
+            hi: 83_002,
+            lo: 83_003,
+        };
+        let second = UniqueId {
+            hi: 83_004,
+            lo: 83_005,
+        };
+
+        service
+            .submit(values_result_request(83_000, 83_002))
+            .expect("first fragment reaches running");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first worker remains registered");
+
+        let error = service
+            .submit(values_result_request(83_000, 83_004))
+            .expect_err("second worker spawn is injected to fail");
+        assert!(error.to_string().contains("spawn failure"), "{error}");
+        assert!(
+            service.controls.reserve(first).is_err(),
+            "first running route must remain registered"
+        );
+        drop(
+            service
+                .controls
+                .reserve(second)
+                .expect("failed second registration must release its route"),
+        );
+
+        release_tx.send(()).expect("release first worker");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match service.controls.reserve(first) {
+                Ok(reservation) => {
+                    drop(reservation);
+                    break;
+                }
+                Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+                Err(error) => panic!("first fragment did not terminate: {error}"),
+            }
+        }
+        assert!(
+            service
+                .queries
+                .cancel_query(query_id, "post-terminal probe".to_string())
+                .is_empty(),
+            "terminated query must not retain either fragment mapping"
+        );
     }
 }
