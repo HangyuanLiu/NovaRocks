@@ -30,6 +30,7 @@ typedef struct NovaRocksCompatConfig {
     uint32_t internal_service_query_rpc_thread_num;
     uint8_t debug_exec_batch_plan_json;
     uint8_t log_level;          // 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
+    const void* fragment_service_context;
 } NovaRocksCompatConfig;
 
 // Starts brpc server only (heartbeat moved to Rust).
@@ -52,10 +53,14 @@ typedef struct NovaRocksUniqueId {
 // --- Rust engine FFI ---
 
 // Executes `TExecBatchPlanFragmentsParams` from request attachment (Thrift BINARY).
-int32_t novarocks_rs_submit_exec_batch_plan_fragments(const uint8_t* ptr, size_t len);
+int32_t novarocks_rs_submit_exec_batch_plan_fragments(const void* fragment_service_context,
+                                                      const uint8_t* ptr,
+                                                      size_t len);
 
 // Executes `TExecPlanFragmentParams` from request attachment (Thrift BINARY).
-int32_t novarocks_rs_submit_exec_plan_fragment(const uint8_t* ptr, size_t len);
+int32_t novarocks_rs_submit_exec_plan_fragment(const void* fragment_service_context,
+                                               const uint8_t* ptr,
+                                               size_t len);
 
 // Returns:
 // - 0: OK (a result batch is returned; may be EOS)
@@ -88,7 +93,9 @@ int64_t novarocks_rs_fetch_wait_timeout_ms(int64_t finst_id_hi, int64_t finst_id
 // Rust result-buffer callback into the brpc shim when a fetch waiter may make progress.
 void novarocks_compat_notify_fetch_ready(int64_t finst_id_hi, int64_t finst_id_lo);
 
-int32_t novarocks_rs_cancel(int64_t finst_id_hi, int64_t finst_id_lo);
+int32_t novarocks_rs_cancel(const void* fragment_service_context,
+                            int64_t finst_id_hi,
+                            int64_t finst_id_lo);
 
 // internal_service.proto PTransmitChunkParams -> PTransmitChunkResult (protobuf bytes).
 int32_t novarocks_rs_transmit_chunk(const uint8_t* ptr,

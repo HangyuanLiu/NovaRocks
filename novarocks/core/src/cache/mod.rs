@@ -73,7 +73,7 @@ pub struct CacheOptions {
 }
 
 impl CacheOptions {
-    pub(crate) fn from_query_options(query_opts: Option<&QueryOptions>) -> Result<Self, String> {
+    pub fn from_query_options(query_opts: Option<&QueryOptions>) -> Result<Self, String> {
         // Align with StarRocks BE semantics: only honor cache switches when FE explicitly
         // carries the corresponding query option field.
         let opts = query_opts;

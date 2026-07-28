@@ -49,7 +49,7 @@ fn rewrite_unique_id_to_uuid(v: &mut serde_json::Value) {
     }
 }
 
-pub(crate) fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> Result<T, String> {
+pub fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> Result<T, String> {
     let mut channel = TBufferChannel::with_capacity(bytes.len(), 1024);
     channel.set_readable_bytes(bytes);
     let (r, _) = channel.split().map_err(|e| e.to_string())?;
@@ -57,7 +57,7 @@ pub(crate) fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> Resul
     T::read_from_in_protocol(&mut prot).map_err(|e| e.to_string())
 }
 
-pub(crate) fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
+pub fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
     const INITIAL_CAPACITY: usize = 256;
     const MAX_CAPACITY: usize = 64 * 1024 * 1024;
 
@@ -313,7 +313,7 @@ impl TOutputProtocol for NamedJsonOutputProtocol {
     }
 }
 
-pub(crate) fn thrift_named_json<T: TSerializable>(v: &T) -> Result<String, String> {
+pub fn thrift_named_json<T: TSerializable>(v: &T) -> Result<String, String> {
     let mut prot = NamedJsonOutputProtocol::default();
     v.write_to_out_protocol(&mut prot)
         .map_err(|e| e.to_string())?;

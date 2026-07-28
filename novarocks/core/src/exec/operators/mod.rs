@@ -71,6 +71,8 @@ pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
 pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
+#[cfg(test)]
+pub(crate) use data_stream_sink::take_eos_be_number_for_test;
 pub(crate) use data_stream_sink::{
     DataStreamPartitionType, DataStreamSinkFactory, DataStreamSinkFactoryInput,
 };

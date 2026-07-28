@@ -24,12 +24,12 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 #[cfg(feature = "compat")]
 use axum::routing::{post, put};
+use axum::{Extension, Router};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -62,7 +62,10 @@ use crate::service::grpc_runtime_filter_install_adapter::{
     RuntimeFilterDeploymentIngress, query_scoped_runtime_filter_deployment_ingress,
 };
 use crate::service::internal_rpc;
+use crate::service::native_fragment_ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
+#[cfg(feature = "compat")]
+use crate::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress;
 #[cfg(feature = "compat")]
 use crate::service::stream_load_http;
 use crate::service::{load_tracking_http, metrics_http};
@@ -84,6 +87,51 @@ static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static STANDALONE_GRPC_STARTUP_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+struct RejectingTestNativeFragmentIngress;
+
+#[cfg(all(test, feature = "compat"))]
+struct RejectingTestStarRocksFragmentSyncIngress;
+
+#[cfg(all(test, feature = "compat"))]
+impl StarRocksFragmentSyncIngress for RejectingTestStarRocksFragmentSyncIngress {
+    fn execute(
+        &self,
+        _request: crate::thrift::internal_service::TExecPlanFragmentParams,
+    ) -> Result<crate::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
+        Err("test StarRocks fragment sync ingress is not configured".to_string())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn rejecting_test_native_fragment_ingress() -> Arc<dyn NativeFragmentIngress> {
+    Arc::new(RejectingTestNativeFragmentIngress)
+}
+
+#[cfg(test)]
+impl NativeFragmentIngress for RejectingTestNativeFragmentIngress {
+    fn submit(
+        &self,
+        _request: crate::service::native_fragment_ingress::NativeFragmentRequest,
+    ) -> Result<
+        crate::service::native_fragment_ingress::NativeFragmentAccepted,
+        crate::service::native_fragment_ingress::NativeFragmentIngressError,
+    > {
+        Err(
+            crate::service::native_fragment_ingress::NativeFragmentIngressError::new(
+                "test native fragment ingress is not configured",
+            ),
+        )
+    }
+
+    fn cancel(
+        &self,
+        _request: NativeFragmentCancelRequest,
+    ) -> Result<(), crate::service::native_fragment_ingress::NativeFragmentIngressError> {
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct GrpcServerState {
@@ -115,11 +163,10 @@ fn pause_standalone_grpc_startup_after_reservation() {
 #[derive(Clone)]
 pub struct GrpcService {
     allow_local_execution: bool,
+    native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
     report_handler: Arc<dyn CoordinatorReportHandler>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
-    #[cfg(test)]
-    execution_query_manager: Option<Arc<crate::runtime::query_context::QueryContextManager>>,
     #[cfg(test)]
     execution_owned_finsts: Option<Arc<Mutex<BTreeSet<crate::common::types::UniqueId>>>>,
     #[cfg(test)]
@@ -134,6 +181,7 @@ impl std::fmt::Debug for GrpcService {
     }
 }
 
+#[cfg(test)]
 impl Default for GrpcService {
     fn default() -> Self {
         Self::full_execution()
@@ -141,18 +189,53 @@ impl Default for GrpcService {
 }
 
 impl GrpcService {
+    #[cfg(test)]
     pub fn full_execution() -> Self {
-        Self::full_execution_with_report_handler(Arc::new(CoordinatorExecStatusReportHandler))
+        Self::full_execution_with_native_fragment_ingress(Arc::new(
+            RejectingTestNativeFragmentIngress,
+        ))
     }
 
-    pub(crate) fn full_execution_with_report_handler(
+    pub fn full_execution_with_native_fragment_ingress(
+        native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    ) -> Self {
+        Self::full_execution_with_native_ingress_and_report_handler(
+            native_fragment_ingress,
+            Arc::new(CoordinatorExecStatusReportHandler),
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    fn execution_without_native_fragment_ingress() -> Self {
+        Self::with_handlers(
+            true,
+            None,
+            Arc::new(CoordinatorExecStatusReportHandler),
+            query_scoped_runtime_filter_envelope_ingress(),
+            query_scoped_runtime_filter_deployment_ingress(),
+        )
+    }
+
+    fn full_execution_with_native_ingress_and_report_handler(
+        native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         report_handler: Arc<dyn CoordinatorReportHandler>,
     ) -> Self {
         Self::with_handlers(
             true,
+            Some(native_fragment_ingress),
             report_handler,
             query_scoped_runtime_filter_envelope_ingress(),
             query_scoped_runtime_filter_deployment_ingress(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_execution_with_report_handler(
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+    ) -> Self {
+        Self::full_execution_with_native_ingress_and_report_handler(
+            Arc::new(RejectingTestNativeFragmentIngress),
+            report_handler,
         )
     }
 
@@ -165,6 +248,7 @@ impl GrpcService {
     ) -> Self {
         Self::with_handlers(
             false,
+            None,
             report_handler,
             query_scoped_runtime_filter_envelope_ingress(),
             query_scoped_runtime_filter_deployment_ingress(),
@@ -173,17 +257,17 @@ impl GrpcService {
 
     fn with_handlers(
         allow_local_execution: bool,
+        native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
         report_handler: Arc<dyn CoordinatorReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
         runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
     ) -> Self {
         Self {
             allow_local_execution,
+            native_fragment_ingress,
             report_handler,
             runtime_filter_envelope_ingress,
             runtime_filter_deployment_ingress,
-            #[cfg(test)]
-            execution_query_manager: None,
             #[cfg(test)]
             execution_owned_finsts: None,
             #[cfg(test)]
@@ -198,6 +282,7 @@ impl GrpcService {
     ) -> Self {
         Self::with_handlers(
             true,
+            Some(Arc::new(RejectingTestNativeFragmentIngress)),
             report_handler,
             runtime_filter_envelope_ingress,
             query_scoped_runtime_filter_deployment_ingress(),
@@ -211,6 +296,7 @@ impl GrpcService {
     ) -> Self {
         Self::with_handlers(
             false,
+            None,
             report_handler,
             runtime_filter_envelope_ingress,
             query_scoped_runtime_filter_deployment_ingress(),
@@ -224,6 +310,7 @@ impl GrpcService {
     ) -> Self {
         let mut service = Self::with_handlers(
             true,
+            Some(Arc::new(RejectingTestNativeFragmentIngress)),
             report_handler,
             crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager(
                 manager.clone(),
@@ -232,7 +319,6 @@ impl GrpcService {
                 manager.clone(),
             ),
         );
-        service.execution_query_manager = Some(manager);
         service.execution_owned_finsts = Some(Arc::new(Mutex::new(BTreeSet::new())));
         service
     }
@@ -418,6 +504,12 @@ impl IndependentGrpcRuntimeFilterNode {
                     proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service)
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                #[cfg(feature = "compat")]
+                let app = build_novarocks_http_app(
+                    Routes::new(service),
+                    Arc::new(RejectingTestStarRocksFragmentSyncIngress),
+                );
+                #[cfg(not(feature = "compat"))]
                 let app = build_novarocks_http_app(Routes::new(service));
                 let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     while !*shutdown_rx.borrow() {
@@ -737,26 +829,18 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             });
         let result = match (plan, instance_params) {
             (Some(plan), Some(instance_params)) => {
-                #[cfg(test)]
-                let execution_query_manager = self.execution_query_manager.clone();
+                let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
+                    tonic::Status::failed_precondition("native fragment ingress is not configured")
+                })?;
                 tokio::task::spawn_blocking(move || {
-                    #[cfg(test)]
-                    if let Some(manager) = execution_query_manager {
-                        return crate::service::native_fragment_service::submit_exec_plan_fragment_native_with_manager(
-                            plan,
-                            instance_params,
-                            manager,
-                        );
-                    }
-                    crate::service::native_fragment_service::submit_exec_plan_fragment_native(
-                        plan,
-                        instance_params,
-                    )
+                    internal_rpc::handle_submit_fragment(ingress.as_ref(), plan, instance_params)
                 })
-            .await
-            .map_err(|e| {
-                tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
-            })?
+                .await
+                .map_err(|e| {
+                    tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
+                })?
+                .map(|_| ())
+                .map_err(|error| error.to_string())
             }
             _ => Err("SubmitFragmentRequest requires native plan and instance_params".to_string()),
         };
@@ -925,18 +1009,21 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 },
             ));
         }
-        for id in &req.finst_ids {
-            let finst_id = crate::UniqueId {
-                hi: id.hi,
-                lo: id.lo,
-            };
-            #[cfg(test)]
-            if let Some(manager) = self.execution_query_manager.clone() {
-                crate::service::fragment_control::cancel_with_manager(finst_id, manager);
-                continue;
-            }
-            crate::cancel(finst_id);
-        }
+        let ingress = self.native_fragment_ingress.as_ref().ok_or_else(|| {
+            tonic::Status::failed_precondition("native fragment ingress is not configured")
+        })?;
+        ingress
+            .cancel(NativeFragmentCancelRequest::new(
+                req.finst_ids
+                    .iter()
+                    .map(|id| crate::UniqueId {
+                        hi: id.hi,
+                        lo: id.lo,
+                    })
+                    .collect(),
+                req.reason.clone(),
+            ))
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
         if crate::common::config::debug_emit_cancel_marker() {
             let count = CANCEL_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
             println!(
@@ -1134,7 +1221,10 @@ where
 }
 
 #[cfg(feature = "compat")]
-fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
+fn build_novarocks_http_app(
+    grpc_routes: Routes,
+    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+) -> Router {
     grpc_routes
         .into_axum_router()
         .route(
@@ -1155,6 +1245,7 @@ fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
             get(load_tracking_http::handle_load_tracking_log),
         )
         .route("/metrics", get(metrics_http::handle_metrics))
+        .layer(Extension(fragment_sync_ingress))
 }
 
 #[cfg(not(feature = "compat"))]
@@ -1325,19 +1416,34 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
     }
 }
 
-pub fn start_grpc_server(host: &str) -> Result<(), String> {
-    #[cfg(feature = "compat")]
-    {
-        return start_grpc_server_on_ports(host, http_port(), grpc_port(), starlet_port());
-    }
-    #[cfg(not(feature = "compat"))]
-    {
-        start_grpc_http_server(host, http_port())
-    }
+#[cfg(feature = "compat")]
+pub fn start_grpc_server(
+    host: &str,
+    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+) -> Result<(), String> {
+    start_grpc_server_on_ports(
+        host,
+        http_port(),
+        grpc_port(),
+        starlet_port(),
+        fragment_sync_ingress,
+    )
 }
 
 #[cfg(not(feature = "compat"))]
-fn start_grpc_http_server(host: &str, grpc_http_port: u16) -> Result<(), String> {
+pub fn start_grpc_server_with_native_fragment_ingress(
+    host: &str,
+    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+) -> Result<(), String> {
+    start_grpc_http_server(host, http_port(), native_fragment_ingress)
+}
+
+#[cfg(not(feature = "compat"))]
+fn start_grpc_http_server(
+    host: &str,
+    grpc_http_port: u16,
+    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+) -> Result<(), String> {
     {
         let state = grpc_server_state()
             .lock()
@@ -1374,7 +1480,9 @@ fn start_grpc_http_server(host: &str, grpc_http_port: u16) -> Result<(), String>
                     .map_err(|error| format!("create grpc/http tokio listener failed: {error}"))?;
                 let mut http_shutdown = shutdown_rx.clone();
 
-                let svc = GrpcService::full_execution();
+                let svc = GrpcService::full_execution_with_native_fragment_ingress(
+                    native_fragment_ingress,
+                );
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -1480,6 +1588,7 @@ fn start_grpc_server_on_ports(
     http_port: u16,
     grpc_port: u16,
     starlet_port: u16,
+    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
 ) -> Result<(), String> {
     {
         let state = grpc_server_state()
@@ -1547,13 +1656,14 @@ fn start_grpc_server_on_ports(
                 );
 
                 let http_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                    GrpcService::full_execution(),
+                    GrpcService::execution_without_native_fragment_ingress(),
                 )
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                let http_app = build_novarocks_http_app(Routes::new(http_svc));
+                let http_app =
+                    build_novarocks_http_app(Routes::new(http_svc), fragment_sync_ingress);
                 let grpc_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                    GrpcService::full_execution(),
+                    GrpcService::execution_without_native_fragment_ingress(),
                 )
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -1849,23 +1959,34 @@ fn bind_tcp_listener(host: &str, port: u16, role: &str) -> Result<TcpListener, S
     Ok(listener)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 enum StandaloneGrpcMode {
-    FullExecution,
+    FullExecution(Arc<dyn NativeFragmentIngress>),
     ReportOnly,
 }
 
-impl StandaloneGrpcMode {
-    fn service(self) -> GrpcService {
+impl std::fmt::Debug for StandaloneGrpcMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StandaloneGrpcMode::FullExecution => GrpcService::full_execution(),
+            Self::FullExecution(_) => formatter.write_str("FullExecution"),
+            Self::ReportOnly => formatter.write_str("ReportOnly"),
+        }
+    }
+}
+
+impl StandaloneGrpcMode {
+    fn service(&self) -> GrpcService {
+        match self {
+            StandaloneGrpcMode::FullExecution(ingress) => {
+                GrpcService::full_execution_with_native_fragment_ingress(Arc::clone(ingress))
+            }
             StandaloneGrpcMode::ReportOnly => GrpcService::report_only(),
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
-            StandaloneGrpcMode::FullExecution => "standalone grpc report/exchange",
+            StandaloneGrpcMode::FullExecution(_) => "standalone grpc report/exchange",
             StandaloneGrpcMode::ReportOnly => "standalone grpc report-only",
         }
     }
@@ -1873,10 +1994,18 @@ impl StandaloneGrpcMode {
 
 /// Start a lightweight gRPC exchange/report server on a specific port.
 ///
-/// Unlike [`start_grpc_server`] this does not require global config to be
-/// initialised — the caller supplies the bind address directly.
-pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
-    start_standalone_grpc_server(host, port, StandaloneGrpcMode::FullExecution)
+/// This does not require global config to be initialised: the caller supplies
+/// the bind address and native fragment ingress directly.
+pub fn start_grpc_exchange_server(
+    host: &str,
+    port: u16,
+    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+) -> Result<(), String> {
+    start_standalone_grpc_server(
+        host,
+        port,
+        StandaloneGrpcMode::FullExecution(native_fragment_ingress),
+    )
 }
 
 /// Start a report-only standalone NovaRocksGrpc endpoint on a specific port.
@@ -2365,8 +2494,13 @@ mod tests {
         super::STANDALONE_GRPC_STARTUP_RESERVATIONS.store(0, Ordering::Release);
         super::PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION.store(true, Ordering::Release);
 
-        let first =
-            std::thread::spawn(move || super::start_grpc_exchange_server("127.0.0.1", first_port));
+        let first = std::thread::spawn(move || {
+            super::start_grpc_exchange_server(
+                "127.0.0.1",
+                first_port,
+                super::rejecting_test_native_fragment_ingress(),
+            )
+        });
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while super::STANDALONE_GRPC_STARTUP_RESERVATIONS.load(Ordering::Acquire) == 0 {
             assert!(
@@ -2376,8 +2510,13 @@ mod tests {
             std::thread::yield_now();
         }
 
-        let second =
-            std::thread::spawn(move || super::start_grpc_exchange_server("127.0.0.1", second_port));
+        let second = std::thread::spawn(move || {
+            super::start_grpc_exchange_server(
+                "127.0.0.1",
+                second_port,
+                super::rejecting_test_native_fragment_ingress(),
+            )
+        });
         let second_deadline = std::time::Instant::now() + Duration::from_millis(100);
         while super::STANDALONE_GRPC_STARTUP_RESERVATIONS.load(Ordering::Acquire) < 2
             && std::time::Instant::now() < second_deadline
@@ -2539,8 +2678,14 @@ mod pr3_tests {
     use crate::runtime_filter::port::transport::{
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
     };
+    use crate::service::native_fragment_ingress::{
+        NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
+        NativeFragmentIngressError, NativeFragmentRequest,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Notify;
     use tonic::Request;
 
     struct CapturingReportHandler {
@@ -2601,6 +2746,97 @@ mod pr3_tests {
         fn accept(&self, _envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingNativeFragmentIngress {
+        submissions: Mutex<Vec<(QueryId, UniqueId)>>,
+        cancellations: Mutex<Vec<NativeFragmentCancelRequest>>,
+    }
+
+    impl NativeFragmentIngress for RecordingNativeFragmentIngress {
+        fn submit(
+            &self,
+            request: NativeFragmentRequest,
+        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+            self.submissions
+                .lock()
+                .expect("native fragment submissions")
+                .push((request.query_id(), request.fragment_instance_id()));
+            Ok(NativeFragmentAccepted::new(
+                request.query_id(),
+                request.fragment_instance_id(),
+            ))
+        }
+
+        fn cancel(
+            &self,
+            request: NativeFragmentCancelRequest,
+        ) -> Result<(), NativeFragmentIngressError> {
+            self.cancellations
+                .lock()
+                .expect("native fragment cancellations")
+                .push(request);
+            Ok(())
+        }
+    }
+
+    struct GatedNativeFragmentIngress {
+        entered: Notify,
+        accepted: Mutex<bool>,
+        acceptance_gate: Condvar,
+    }
+
+    impl GatedNativeFragmentIngress {
+        fn new() -> Self {
+            Self {
+                entered: Notify::new(),
+                accepted: Mutex::new(false),
+                acceptance_gate: Condvar::new(),
+            }
+        }
+
+        async fn wait_until_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn accept(&self) {
+            *self
+                .accepted
+                .lock()
+                .expect("native fragment acceptance gate") = true;
+            self.acceptance_gate.notify_all();
+        }
+    }
+
+    impl NativeFragmentIngress for GatedNativeFragmentIngress {
+        fn submit(
+            &self,
+            request: NativeFragmentRequest,
+        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+            self.entered.notify_one();
+            let mut accepted = self
+                .accepted
+                .lock()
+                .expect("native fragment acceptance gate");
+            while !*accepted {
+                accepted = self
+                    .acceptance_gate
+                    .wait(accepted)
+                    .expect("native fragment acceptance gate");
+            }
+            Ok(NativeFragmentAccepted::new(
+                request.query_id(),
+                request.fragment_instance_id(),
+            ))
+        }
+
+        fn cancel(
+            &self,
+            _request: NativeFragmentCancelRequest,
+        ) -> Result<(), NativeFragmentIngressError> {
+            Ok(())
         }
     }
 
@@ -2965,58 +3201,68 @@ mod pr3_tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn submit_fragment_native_result_sink_precreates_fetch_buffer() {
-        use crate::common::types::UniqueId;
-        use crate::runtime::fragment::native_execution::install_test_result_buffer_creation_gate;
-        use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
-
-        let finst = ProtoUniqueId { hi: 7101, lo: 7102 };
-        let finst_id = UniqueId {
-            hi: finst.hi,
-            lo: finst.lo,
+    #[tokio::test]
+    async fn submit_fragment_success_waits_for_injected_ingress_acceptance() {
+        let ingress = Arc::new(GatedNativeFragmentIngress::new());
+        let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
+        let query_id = QueryId {
+            hi: 7_301,
+            lo: 7_302,
         };
-        let creation_gate = install_test_result_buffer_creation_gate(finst_id);
-        let svc = GrpcService::default();
-        let req = Request::new(SubmitFragmentRequest {
-            plan: Some(empty_values_result_fragment(7, 41)),
-            instance_params: Some(novarocks::InstanceParams {
-                query_id: Some(ProtoUniqueId { hi: 7001, lo: 7002 }),
-                fragment_instance_id: Some(finst.clone()),
-                backend_num: 3,
-                query_options: Some(novarocks::QueryOptions {
-                    batch_size: 1024,
-                    pipeline_dop: 1,
+        let finst_id = UniqueId {
+            hi: 7_303,
+            lo: 7_304,
+        };
+
+        let mut rpc = tokio::spawn(async move {
+            svc.submit_fragment(Request::new(SubmitFragmentRequest {
+                plan: Some(empty_values_result_fragment(7, 41)),
+                instance_params: Some(novarocks::InstanceParams {
+                    query_id: Some(ProtoUniqueId {
+                        hi: query_id.hi,
+                        lo: query_id.lo,
+                    }),
+                    fragment_instance_id: Some(ProtoUniqueId {
+                        hi: finst_id.hi,
+                        lo: finst_id.lo,
+                    }),
+                    backend_num: 3,
+                    query_options: Some(novarocks::QueryOptions {
+                        batch_size: 1024,
+                        pipeline_dop: 1,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
-                ..Default::default()
-            }),
-        });
-        let mut submit = tokio::spawn(async move { svc.submit_fragment(req).await });
-        creation_gate.wait_until_worker_enters();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), &mut submit)
-                .await
-                .is_err(),
-            "submit RPC must wait until the runtime-owned result buffer is registered"
-        );
-        creation_gate.release();
-        let resp = submit
+            }))
             .await
-            .expect("submit task")
-            .expect("RPC level success");
-        let body = resp.into_inner();
-        assert_eq!(body.status_code, 0, "{}", body.message);
+        });
 
-        match result_buffer::try_fetch(finst_id) {
-            TryFetchResult::Error(err) if matches!(err.kind, FetchErrorKind::NotFound) => {
-                panic!(
-                    "successful native result submit must register its fetch buffer before returning"
-                )
-            }
-            _ => {}
+        tokio::time::timeout(Duration::from_secs(1), ingress.wait_until_entered())
+            .await
+            .expect(
+                "submit_fragment must reach the injected ingress before asserting the ACK gate",
+            );
+        let rpc_still_pending = tokio::time::timeout(Duration::from_millis(100), &mut rpc)
+            .await
+            .is_err();
+        if !rpc_still_pending {
+            ingress.accept();
+            panic!("tonic success returned before the injected ingress accepted the fragment");
         }
-        crate::runtime::query_context::query_context_manager().unregister_finst(finst_id);
+        assert!(
+            rpc_still_pending,
+            "RPC must remain pending while the injected ingress has not accepted the fragment"
+        );
+
+        ingress.accept();
+        let response = rpc
+            .await
+            .expect("RPC task must not panic")
+            .expect("RPC level success")
+            .into_inner();
+
+        assert_eq!(response.status_code, 0, "{}", response.message);
     }
 
     #[tokio::test]
@@ -3036,7 +3282,8 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn cancel_fragment_is_idempotent() {
-        let svc = GrpcService::default();
+        let ingress = Arc::new(RecordingNativeFragmentIngress::default());
+        let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
         let req = Request::new(CancelFragmentRequest {
             finst_ids: vec![ProtoUniqueId { hi: 1, lo: 2 }],
             reason: "test".to_string(),
@@ -3052,6 +3299,16 @@ mod pr3_tests {
         });
         let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
         assert_eq!(resp2.into_inner().status_code, super::CANCEL_FRAGMENT_OK);
+        assert_eq!(
+            *ingress
+                .cancellations
+                .lock()
+                .expect("native fragment cancellations"),
+            vec![
+                NativeFragmentCancelRequest::new(vec![UniqueId { hi: 1, lo: 2 }], "test",),
+                NativeFragmentCancelRequest::new(vec![UniqueId { hi: 1, lo: 2 }], "test-2",),
+            ]
+        );
     }
 
     mod cancel_epoch_tests {
@@ -3059,10 +3316,12 @@ mod pr3_tests {
         use super::super::proto::novarocks::CancelFragmentRequest;
         use super::super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
         use super::super::{CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService};
+        use super::RecordingNativeFragmentIngress;
         use crate::common::types::UniqueId;
         use crate::runtime::exchange::{
             self, ExchangeKey, set_expected_senders, snapshot_receiver_state,
         };
+        use std::sync::Arc;
         use tonic::Request;
 
         struct ExchangeCleanup(UniqueId);
@@ -3075,7 +3334,8 @@ mod pr3_tests {
 
         #[tokio::test]
         async fn cancel_with_mismatched_epoch_is_ignored() {
-            let svc = GrpcService::default();
+            let ingress = Arc::new(RecordingNativeFragmentIngress::default());
+            let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
             let finst = ProtoUniqueId { hi: 6201, lo: 6202 };
             let key = ExchangeKey {
                 finst_id_hi: finst.hi,
@@ -3106,6 +3366,14 @@ mod pr3_tests {
 
             assert_eq!(resp.status_code, CANCEL_FRAGMENT_IGNORED_STALE_EPOCH);
             assert!(snapshot_receiver_state(key).is_some());
+            assert!(
+                ingress
+                    .cancellations
+                    .lock()
+                    .expect("native fragment cancellations")
+                    .is_empty(),
+                "stale epoch must be rejected before the native ingress"
+            );
         }
     }
 

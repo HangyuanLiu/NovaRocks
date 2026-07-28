@@ -335,6 +335,10 @@ pub(crate) fn create_sender(finst_id: UniqueId) {
     block.fail_mode_mismatch(ResultBufferMode::Legacy);
 }
 
+pub(crate) fn try_create_sender(finst_id: UniqueId) -> Result<(), String> {
+    try_create_sender_with_mode(finst_id, ResultBufferMode::Legacy)
+}
+
 pub(crate) fn create_typed_sender(finst_id: UniqueId) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
@@ -342,6 +346,34 @@ pub(crate) fn create_typed_sender(finst_id: UniqueId) {
         .entry(finst_id)
         .or_insert_with(BufferControlBlock::new);
     block.fail_mode_mismatch(ResultBufferMode::Typed);
+}
+
+pub(crate) fn try_create_typed_sender(finst_id: UniqueId) -> Result<(), String> {
+    try_create_sender_with_mode(finst_id, ResultBufferMode::Typed)
+}
+
+fn try_create_sender_with_mode(finst_id: UniqueId, mode: ResultBufferMode) -> Result<(), String> {
+    let c = ctx();
+    let mut guard = c.mu.lock().expect("ctx lock");
+    if guard.contains_key(&finst_id) {
+        return Err(format!(
+            "result buffer already registered for fragment instance {finst_id}"
+        ));
+    }
+    let mut block = BufferControlBlock::new();
+    block.set_mode(mode)?;
+    guard.insert(finst_id, block);
+    Ok(())
+}
+
+pub(crate) fn discard(finst_id: UniqueId) {
+    let c = ctx();
+    c.mu.lock().expect("ctx lock").remove(&finst_id);
+    c.cvar.notify_all();
+}
+
+pub(crate) fn is_registered(finst_id: UniqueId) -> bool {
+    ctx().mu.lock().expect("ctx lock").contains_key(&finst_id)
 }
 
 pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {

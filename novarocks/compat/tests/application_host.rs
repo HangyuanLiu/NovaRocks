@@ -9,6 +9,8 @@ struct FakePorts {
     fail_start: Option<&'static str>,
     fail_stops: HashSet<&'static str>,
     polls: Arc<Mutex<VecDeque<Result<Option<String>, String>>>>,
+    grpc_fragment_services: Arc<Mutex<Vec<usize>>>,
+    brpc_fragment_contexts: Arc<Mutex<Vec<usize>>>,
 }
 
 impl FakePorts {
@@ -18,6 +20,8 @@ impl FakePorts {
             fail_start: None,
             fail_stops: HashSet::new(),
             polls: Arc::new(Mutex::new(VecDeque::new())),
+            grpc_fragment_services: Arc::new(Mutex::new(Vec::new())),
+            brpc_fragment_contexts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -49,7 +53,17 @@ impl CompatPorts for FakePorts {
         self.record("init-frontend-rpc");
     }
 
-    fn start_grpc(&mut self, _host: &str) -> Result<(), String> {
+    fn start_grpc(
+        &mut self,
+        _host: &str,
+        fragment_sync_ingress: Arc<
+            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
+        >,
+    ) -> Result<(), String> {
+        self.grpc_fragment_services
+            .lock()
+            .unwrap()
+            .push(Arc::as_ptr(&fragment_sync_ingress) as *const () as usize);
         self.start("grpc")
     }
 
@@ -67,7 +81,11 @@ impl CompatPorts for FakePorts {
         self.start("backend")
     }
 
-    fn start_brpc(&mut self, _config: &crate::brpc::CompatConfig<'_>) -> Result<(), String> {
+    fn start_brpc(&mut self, config: &crate::brpc::CompatConfig<'_>) -> Result<(), String> {
+        self.brpc_fragment_contexts
+            .lock()
+            .unwrap()
+            .push(config.fragment_service_context as usize);
         self.start("brpc")
     }
 
@@ -117,6 +135,8 @@ fn test_config() -> CompatServerConfig {
 fn starts_ports_in_frozen_order_and_preserves_marker_and_summary() {
     let ports = FakePorts::new();
     let events = ports.events.clone();
+    let grpc_fragment_services = ports.grpc_fragment_services.clone();
+    let brpc_fragment_contexts = ports.brpc_fragment_contexts.clone();
     let host = CompatApplicationHost::open_with_ports(test_config(), ports)
         .expect("open compat application");
 
@@ -140,6 +160,11 @@ fn starts_ports_in_frozen_order_and_preserves_marker_and_summary() {
     assert_eq!(
         host.startup_summary(),
         "novarocksd started (bind_host=127.0.0.1, advertise_host=be.example.test, advertise_port=19071, heartbeat_port=19050, be_port=19060, brpc_port=18060, http_port=18040, grpc_port=19080, starlet_port=19070)"
+    );
+    assert_eq!(
+        *grpc_fragment_services.lock().unwrap(),
+        *brpc_fragment_contexts.lock().unwrap(),
+        "gRPC and BRPC must receive the same explicitly composed fragment service"
     );
 
     host.shutdown().expect("shutdown compat application");

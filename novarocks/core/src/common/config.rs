@@ -23,7 +23,7 @@ pub(crate) fn debug_exec_node_output() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn debug_exec_batch_plan_json() -> bool {
+pub fn debug_exec_batch_plan_json() -> bool {
     novarocks_app_config()
         .ok()
         .map(|c| c.debug.exec_batch_plan_json)

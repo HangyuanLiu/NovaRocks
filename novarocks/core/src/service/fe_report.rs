@@ -81,13 +81,26 @@ struct ReportInstance {
 }
 
 static REPORT_REGISTRY: OnceLock<Mutex<HashMap<UniqueId, ReportInstance>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_PROGRESS_REPORT_CALLS: OnceLock<Mutex<HashMap<UniqueId, usize>>> = OnceLock::new();
 
 fn registry() -> &'static Mutex<HashMap<UniqueId, ReportInstance>> {
     REPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+pub(crate) fn progress_report_call_count_for_test(finst_id: UniqueId) -> usize {
+    TEST_PROGRESS_REPORT_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("test progress report calls lock")
+        .get(&finst_id)
+        .copied()
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "compat")]
-pub(crate) fn register_instance(
+pub fn register_instance(
     finst_id: UniqueId,
     query_id: QueryId,
     coord: types::TNetworkAddress,
@@ -111,7 +124,14 @@ pub(crate) fn register_instance(
     );
 }
 
-pub(crate) fn register_novarocks_instance(
+pub fn unregister_instance(finst_id: UniqueId) {
+    registry()
+        .lock()
+        .expect("report registry lock")
+        .remove(&finst_id);
+}
+
+pub fn register_novarocks_instance(
     finst_id: UniqueId,
     query_id: QueryId,
     coord: RuntimeEndpoint,
@@ -211,7 +231,7 @@ pub(crate) fn mark_fe_query_gone(finst_id: UniqueId) {
     }
 }
 
-pub(crate) fn report_fragment_done(
+pub fn report_fragment_done(
     finst_id: UniqueId,
     error: Option<String>,
     include_runtime_filters: bool,
@@ -300,6 +320,14 @@ pub(crate) fn report_fragment_done(
 }
 
 pub(crate) fn report_exec_state(finst_id: UniqueId) {
+    #[cfg(test)]
+    {
+        let mut calls = TEST_PROGRESS_REPORT_CALLS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("test progress report calls lock");
+        *calls.entry(finst_id).or_default() += 1;
+    }
     let instance = {
         let guard = registry().lock().expect("report registry lock");
         guard.get(&finst_id).cloned()

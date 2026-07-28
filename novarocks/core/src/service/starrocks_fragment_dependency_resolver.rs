@@ -24,7 +24,7 @@ use crate::protocol::starrocks::decode::{
 use super::starrocks_fragment_transport::StarRocksPrelaunchCancellationToken;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum StarRocksDependencyResolutionError {
+pub enum StarRocksDependencyResolutionError {
     QueryProfileTransport { dependency_id: u64, source: String },
     LakeMetaStorage { dependency_id: u64, source: String },
     Cancelled { dependency_id: u64 },
@@ -56,7 +56,7 @@ impl fmt::Display for StarRocksDependencyResolutionError {
 
 impl std::error::Error for StarRocksDependencyResolutionError {}
 
-pub(crate) fn resolve_dependencies(
+pub fn resolve_dependencies(
     requirements: &[StarRocksExternalDependency],
     token: &StarRocksPrelaunchCancellationToken,
 ) -> Result<StarRocksResolvedDependencies, StarRocksDependencyResolutionError> {

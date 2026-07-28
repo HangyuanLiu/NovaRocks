@@ -29,25 +29,26 @@ pub(crate) mod sink;
 mod submission;
 pub(crate) mod type_lowering;
 
-pub(crate) use dependency::{
+pub use dependency::{
     DraftDependencyValue, FragmentExprArenaOwner, LakeMetaColumnKind, LakeMetaColumnRequest,
     LakeMetaStorageFacts, LakeMetaStorageRequest, LakeMetaTabletRequest,
     StarRocksExternalDependency, StarRocksExternalDependencyDraft, StarRocksResolvedDependencies,
     StarRocksResolvedDependencyValue,
 };
-pub(crate) use endpoint::{decode_fragment_destination, decode_runtime_endpoint};
-pub(crate) use error::{
+pub(crate) use endpoint::decode_fragment_destination;
+pub use endpoint::decode_runtime_endpoint;
+pub use error::{
     StarRocksDependencyContractError, StarRocksDependencyContractErrorKind,
     StarRocksFragmentDecodeError,
 };
 pub(crate) use instance::{
-    LakeMetaScanRangeFact, LakeScanProgramFacts, StarRocksDecodeFacts, StarRocksJdbcFacts,
-    StarRocksObjectStoreDefaults, StarRocksPathRewriteFacts, decode_incremental_scan_ranges,
-    decode_lake_meta_scan_range_facts, decode_lake_scan_program_facts,
+    LakeMetaScanRangeFact, LakeScanProgramFacts, StarRocksJdbcFacts, StarRocksObjectStoreDefaults,
+    StarRocksPathRewriteFacts, decode_lake_meta_scan_range_facts, decode_lake_scan_program_facts,
     decode_scan_contracts_and_raw_ranges,
 };
+pub use instance::{StarRocksDecodeFacts, decode_incremental_scan_ranges};
 pub(crate) use options::decode_query_options;
-pub(crate) use submission::{
+pub use submission::{
     DecodedStarRocksFragment, StarRocksDecodeInput, StarRocksFragmentDraft,
     StarRocksLookupCloseTarget, StarRocksReportDestination, StarRocksSubmissionMetadata,
     finish_fragment_submission, prepare_fragment_submission,

@@ -125,13 +125,14 @@ impl Pipeline {
             if sink_idx + 1 != operators.len() {
                 return Err("pipeline sink must be the last operator".to_string());
             }
-            drivers.push(PipelineDriver::new(
+            drivers.push(PipelineDriver::new_with_legacy_progress_reporting(
                 driver_id,
                 operators,
                 driver_profiler,
                 operator_profiles,
                 std::sync::Arc::clone(ctx.runtime_state()),
                 ctx.fragment_instance_id(),
+                ctx.legacy_progress_reporting(),
             ));
         }
         Ok(drivers)

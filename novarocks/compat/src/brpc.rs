@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::ffi::c_void;
 use std::fmt;
 use std::os::raw::c_char;
 
@@ -12,6 +13,7 @@ struct NovaRocksCompatConfig {
     internal_service_query_rpc_thread_num: u32,
     debug_exec_batch_plan_json: u8,
     log_level: u8,
+    fragment_service_context: *const c_void,
 }
 
 unsafe extern "C" {
@@ -30,6 +32,7 @@ pub(crate) struct CompatConfig<'a> {
     pub internal_service_query_rpc_thread_num: u32,
     pub debug_exec_batch_plan_json: bool,
     pub log_level: u8,
+    pub fragment_service_context: *const c_void,
 }
 
 #[derive(Debug)]
@@ -76,6 +79,7 @@ fn start_with(
         internal_service_query_rpc_thread_num: config.internal_service_query_rpc_thread_num,
         debug_exec_batch_plan_json: u8::from(config.debug_exec_batch_plan_json),
         log_level: config.log_level,
+        fragment_service_context: config.fragment_service_context,
     };
     let mut error_buffer = vec![0 as c_char; ERROR_BUFFER_LEN];
     let code = native_start(
@@ -118,6 +122,7 @@ mod tests {
             internal_service_query_rpc_thread_num: 17,
             debug_exec_batch_plan_json: true,
             log_level: 2,
+            fragment_service_context: std::ptr::dangling(),
         };
 
         start_with(&config, |native, _, _| {
@@ -130,6 +135,10 @@ mod tests {
             assert_eq!(native.internal_service_query_rpc_thread_num, 17);
             assert_eq!(native.debug_exec_batch_plan_json, 1);
             assert_eq!(native.log_level, 2);
+            assert_eq!(
+                native.fragment_service_context,
+                config.fragment_service_context
+            );
             0
         })
         .expect("native start");
@@ -154,6 +163,10 @@ mod tests {
             offset_of!(NovaRocksCompatConfig, debug_exec_batch_plan_json)
                 < offset_of!(NovaRocksCompatConfig, log_level)
         );
+        assert!(
+            offset_of!(NovaRocksCompatConfig, log_level)
+                < offset_of!(NovaRocksCompatConfig, fragment_service_context)
+        );
     }
 
     #[test]
@@ -166,6 +179,7 @@ mod tests {
             internal_service_query_rpc_thread_num: 1,
             debug_exec_batch_plan_json: false,
             log_level: 0,
+            fragment_service_context: std::ptr::dangling(),
         };
 
         let error = start_with(&config, |_, _, _| {
@@ -188,6 +202,7 @@ mod tests {
             internal_service_query_rpc_thread_num: 1,
             debug_exec_batch_plan_json: false,
             log_level: 0,
+            fragment_service_context: std::ptr::dangling(),
         };
 
         let error = start_with(&config, |_, buffer, buffer_len| {

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,6 @@ use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::node::scan::ScanOp;
 #[cfg(feature = "compat")]
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
-use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
@@ -54,9 +53,23 @@ use crate::runtime_filter::service::{
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct QueryId {
+pub struct QueryId {
     pub(crate) hi: i64,
     pub(crate) lo: i64,
+}
+
+impl QueryId {
+    pub const fn new(hi: i64, lo: i64) -> Self {
+        Self { hi, lo }
+    }
+
+    pub const fn hi(self) -> i64 {
+        self.hi
+    }
+
+    pub const fn lo(self) -> i64 {
+        self.lo
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -120,7 +133,7 @@ enum QueryContextGeneration {
     StarRocks(StarRocksQueryGeneration),
 }
 
-pub(crate) struct QueryCleanupLease {
+pub struct QueryCleanupLease {
     release: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
@@ -179,6 +192,8 @@ pub(crate) struct QueryContext {
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
+    #[cfg(feature = "compat")]
+    starrocks_preparing_admissions: usize,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
 
@@ -324,7 +339,7 @@ impl fmt::Display for RuntimeFilterDeploymentInstallError {
 impl std::error::Error for RuntimeFilterDeploymentInstallError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LookupFetcherLifecycle {
+pub enum LookupFetcherLifecycle {
     Exact(usize),
     Unknown,
 }
@@ -377,6 +392,8 @@ impl QueryContext {
             lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
             mem_tracker,
+            #[cfg(feature = "compat")]
+            starrocks_preparing_admissions: 0,
             cleanup_leases: Vec::new(),
         }
     }
@@ -702,7 +719,6 @@ struct QueryContextManagerInner {
     active: HashMap<QueryId, QueryContext>,
     second_chance: HashMap<QueryId, QueryContext>,
     finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
-    fragment_completions: HashMap<UniqueId, FragmentCompletionEntry>,
     runtime_filter_deployment_terminals: HashMap<QueryId, RuntimeFilterDeploymentTerminalRecord>,
     runtime_filter_query_cancellations: HashMap<QueryId, RuntimeFilterQueryCancellationRecord>,
     runtime_filter_query_cancellation_errors: HashMap<QueryId, String>,
@@ -726,11 +742,6 @@ struct QueryContextManagerInner {
     pending_incremental_scan_ranges: HashMap<UniqueId, HashMap<i32, Vec<IncrementalScanRange>>>,
     #[cfg(feature = "compat")]
     incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
-}
-
-struct FragmentCompletionEntry {
-    execution: QueryExecutionKey,
-    completion: Weak<FragmentCompletion>,
 }
 
 pub(crate) struct QueryContextManager {
@@ -1902,6 +1913,64 @@ impl QueryContextManager {
         )
     }
 
+    #[cfg(feature = "compat")]
+    pub(crate) fn prepare_starrocks_admission(
+        &self,
+        query_id: QueryId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        cache_options: CacheOptions,
+    ) -> Result<Arc<MemTracker>, String> {
+        self.ensure_compat_context(query_id, false, delivery_expire, query_expire)?;
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let context = if guard.active.contains_key(&query_id) {
+            guard.active.get_mut(&query_id).expect("checked active")
+        } else {
+            guard
+                .second_chance
+                .get_mut(&query_id)
+                .ok_or_else(|| "QueryContext disappeared during StarRocks admission".to_string())?
+        };
+        context.set_cache_options(cache_options)?;
+        context.starrocks_preparing_admissions += 1;
+        Ok(context.mem_tracker())
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn release_starrocks_admission(&self, query_id: QueryId) {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let location = if guard.active.contains_key(&query_id) {
+            Some(true)
+        } else if guard.second_chance.contains_key(&query_id) {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(in_active) = location else {
+            return;
+        };
+        let context = if in_active {
+            guard.active.get_mut(&query_id).expect("checked active")
+        } else {
+            guard
+                .second_chance
+                .get_mut(&query_id)
+                .expect("checked second chance")
+        };
+        context.starrocks_preparing_admissions =
+            context.starrocks_preparing_admissions.saturating_sub(1);
+        let remove = context.starrocks_preparing_admissions == 0
+            && context.execution_generation == QueryContextGeneration::StarRocksUnbound
+            && context.num_fragments == 0;
+        if remove {
+            if in_active {
+                guard.active.remove(&query_id);
+            } else {
+                guard.second_chance.remove(&query_id);
+            }
+        }
+    }
+
     fn ensure_context(
         &self,
         query_id: QueryId,
@@ -2680,7 +2749,6 @@ impl QueryContextManager {
     pub(crate) fn unregister_finst(&self, finst_id: UniqueId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
-        guard.fragment_completions.remove(&finst_id);
         #[cfg(feature = "compat")]
         guard.incremental_scan_nodes.remove(&finst_id);
         #[cfg(feature = "compat")]
@@ -2692,9 +2760,9 @@ impl QueryContextManager {
     /// Undo the registration performed before a native worker reports readiness.
     ///
     /// A synchronous pre-ready failure has not exposed a runnable fragment to the
-    /// coordinator, so an otherwise empty query context must not be retained as a
-    /// cancelled runtime-filter query. Deployments are deliberately excluded: once
-    /// one exists, the regular query-cancellation path owns its terminal state.
+    /// coordinator. Remove only that fragment's route and registration count. When
+    /// it was the query's sole registration and no deployment owns the lifecycle,
+    /// remove the otherwise empty query context as well.
     pub(crate) fn rollback_pre_ready_native_fragment(
         &self,
         query_id: QueryId,
@@ -2709,32 +2777,36 @@ impl QueryContextManager {
                 return false;
             };
             if !context.matches_execution(QueryExecutionKey::native(query_id))
-                || context.num_fragments != 1
-                || context.num_active_fragments != 1
-                || context.runtime_filter_deployment.is_some()
+                || context.num_fragments == 0
+                || context.num_active_fragments == 0
             {
                 return false;
             }
 
             guard.finst_to_query.remove(&finst_id);
-            guard.fragment_completions.remove(&finst_id);
-            let mut context = guard
-                .active
-                .remove(&query_id)
-                .expect("checked active context");
-            context.rollback_inc_fragments();
-            debug_assert_eq!(context.num_fragments, 0);
-            debug_assert_eq!(context.num_active_fragments, 0);
-            Some(context)
+            let remove_empty_context = {
+                let context = guard
+                    .active
+                    .get_mut(&query_id)
+                    .expect("checked active context");
+                context.rollback_inc_fragments();
+                context.num_fragments == 0
+                    && context.num_active_fragments == 0
+                    && context.runtime_filter_deployment.is_none()
+            };
+            remove_empty_context.then(|| {
+                guard
+                    .active
+                    .remove(&query_id)
+                    .expect("checked empty active context")
+            })
         };
         if let Some(context) = removed {
             context.runtime_filter_service().shutdown();
             drop(context);
             self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
-            true
-        } else {
-            false
         }
+        true
     }
 
     pub(crate) fn unregister_finst_execution(
@@ -2747,13 +2819,6 @@ impl QueryContextManager {
             return;
         }
         guard.finst_to_query.remove(&finst_id);
-        if guard
-            .fragment_completions
-            .get(&finst_id)
-            .is_some_and(|entry| entry.execution == execution)
-        {
-            guard.fragment_completions.remove(&finst_id);
-        }
         #[cfg(feature = "compat")]
         guard.incremental_scan_nodes.remove(&finst_id);
         #[cfg(feature = "compat")]
@@ -2762,40 +2827,53 @@ impl QueryContextManager {
         guard.incremental_change_op_slots.remove(&finst_id);
     }
 
-    pub(crate) fn register_fragment_completion(
+    /// Undo a StarRocks batch handoff before its shared start gate is released.
+    ///
+    /// The handoff publishes every fragment route and the query context atomically.
+    /// Its adapter-side rollback therefore removes the same complete route set and
+    /// drops the context, including descriptor cleanup leases, as one operation.
+    #[cfg(feature = "compat")]
+    pub(crate) fn rollback_starrocks_handoff(
         &self,
-        finst_id: UniqueId,
-        completion: Arc<FragmentCompletion>,
-    ) -> Option<QueryExecutionKey> {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let execution = guard.finst_to_query.get(&finst_id).copied()?;
-        guard.fragment_completions.insert(
-            finst_id,
-            FragmentCompletionEntry {
-                execution,
-                completion: Arc::downgrade(&completion),
-            },
-        );
-        Some(execution)
-    }
-
-    pub(crate) fn unregister_fragment_completion(&self, finst_id: UniqueId) {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard.fragment_completions.remove(&finst_id);
-    }
-
-    pub(crate) fn unregister_fragment_completion_execution(
-        &self,
-        finst_id: UniqueId,
         execution: QueryExecutionKey,
-    ) {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if guard
-            .fragment_completions
-            .get(&finst_id)
-            .is_some_and(|entry| entry.execution == execution)
-        {
-            guard.fragment_completions.remove(&finst_id);
+        fragment_instance_ids: &[UniqueId],
+    ) -> bool {
+        let query_id = execution.query_id();
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let context_matches = guard
+                .active
+                .get(&query_id)
+                .is_some_and(|context| context.matches_execution(execution));
+            let registered = guard
+                .finst_to_query
+                .iter()
+                .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
+                .collect::<HashSet<_>>();
+            let requested = fragment_instance_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if !context_matches || requested != registered {
+                return false;
+            }
+
+            for finst_id in fragment_instance_ids.iter().rev() {
+                guard.finst_to_query.remove(finst_id);
+                guard.incremental_scan_nodes.remove(finst_id);
+                guard.pending_incremental_scan_ranges.remove(finst_id);
+                guard.incremental_change_op_slots.remove(finst_id);
+            }
+            guard.active.remove(&query_id)
+        };
+
+        if let Some(context) = removed {
+            context.runtime_filter_service().shutdown();
+            drop(context);
+            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -2993,7 +3071,7 @@ impl QueryContextManager {
     }
 
     pub(crate) fn cancel_query(&self, query_id: QueryId, err: String) -> Vec<UniqueId> {
-        let (cancellation, finsts, completions) = {
+        let (cancellation, finsts) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
                 &mut guard,
@@ -3002,33 +3080,18 @@ impl QueryContextManager {
                 Some(&err),
             );
 
-            let mut finsts = Vec::new();
-            let mut completions = Vec::new();
-            let mut stale = Vec::new();
-            for (finst_id, execution) in guard.finst_to_query.iter() {
-                if execution.query_id() != query_id {
-                    continue;
-                }
-                finsts.push(*finst_id);
-                if let Some(entry) = guard.fragment_completions.get(finst_id) {
-                    if let Some(completion) = entry.completion.upgrade() {
-                        completions.push(completion);
-                    } else {
-                        stale.push(*finst_id);
-                    }
-                }
-            }
-            for finst_id in stale {
-                guard.fragment_completions.remove(&finst_id);
-            }
-            (cancellation, finsts, completions)
+            let finsts = guard
+                .finst_to_query
+                .iter()
+                .filter_map(|(finst_id, execution)| {
+                    (execution.query_id() == query_id).then_some(*finst_id)
+                })
+                .collect();
+            (cancellation, finsts)
         };
 
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(query_id, cancellation);
-        for completion in completions {
-            completion.abort_from_query(err.clone());
-        }
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
@@ -3040,7 +3103,7 @@ impl QueryContextManager {
         execution: QueryExecutionKey,
         err: String,
     ) -> Vec<UniqueId> {
-        let (cancellation, finsts, completions) = {
+        let (cancellation, finsts) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let query_id = execution.query_id();
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
@@ -3054,19 +3117,10 @@ impl QueryContextManager {
                 .iter()
                 .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
                 .collect::<Vec<_>>();
-            let completions = finsts
-                .iter()
-                .filter_map(|finst_id| guard.fragment_completions.get(finst_id))
-                .filter(|entry| entry.execution == execution)
-                .filter_map(|entry| entry.completion.upgrade())
-                .collect::<Vec<_>>();
-            (cancellation, finsts, completions)
+            (cancellation, finsts)
         };
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(execution.query_id(), cancellation);
-        for completion in completions {
-            completion.abort_from_query(err.clone());
-        }
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
@@ -3107,20 +3161,11 @@ impl QueryContextManager {
                 .iter()
                 .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
                 .collect::<Vec<_>>();
-            let completions = finsts
-                .iter()
-                .filter_map(|finst_id| guard.fragment_completions.get(finst_id))
-                .filter(|entry| entry.execution == execution)
-                .filter_map(|entry| entry.completion.upgrade())
-                .collect::<Vec<_>>();
-            (query_id, cancellation, finsts, completions)
+            (query_id, cancellation, finsts)
         };
-        let (query_id, cancellation, finsts, completions) = collected;
+        let (query_id, cancellation, finsts) = collected;
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(query_id, cancellation);
-        for completion in completions {
-            completion.abort_from_query(err.clone());
-        }
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
@@ -3295,6 +3340,37 @@ fn map_runtime_filter_install_error(
         _ => RuntimeFilterDeploymentInstallErrorKind::Internal,
     };
     RuntimeFilterDeploymentInstallError::new(kind, detail)
+}
+
+#[cfg(test)]
+mod fragment_cancellation_boundary_tests {
+    use crate::common::types::UniqueId;
+    use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
+
+    use super::{QueryContextManager, QueryId};
+
+    #[test]
+    fn query_cancellation_returns_routes_without_aborting_fragment_local_completion() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = QueryId::new(86_101, 86_102);
+        let finst_id = UniqueId {
+            hi: 86_103,
+            lo: 86_104,
+        };
+        let completion = FragmentCompletion::new(1);
+        manager.register_finst(finst_id, query_id);
+
+        assert_eq!(
+            manager.cancel_query(query_id, "query owner cancellation".to_string()),
+            vec![finst_id]
+        );
+        assert!(
+            !completion.should_abort(),
+            "query owners must route cancellation through the role adapter instead of mutating fragment completion"
+        );
+        assert!(completion.driver_finished());
+        assert_eq!(completion.wait(), Ok(()));
+    }
 }
 
 #[cfg(all(test, feature = "compat"))]
@@ -3667,7 +3743,7 @@ mod runtime_filter_lifecycle_cleanup_tests {
     }
 
     #[test]
-    fn pre_ready_rollback_preserves_multi_fragment_context_for_normal_cleanup() {
+    fn pre_start_registration_rollback_preserves_other_fragment_and_query_cleanup() {
         let mgr = test_manager();
         let query_id = QueryId {
             hi: 4_131,
@@ -3694,10 +3770,23 @@ mod runtime_filter_lifecycle_cleanup_tests {
             mgr.register_finst(finst_id, query_id);
         }
 
-        assert!(!mgr.rollback_pre_ready_native_fragment(query_id, second));
-        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((2, 2)));
+        assert!(mgr.rollback_pre_ready_native_fragment(query_id, second));
+        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((1, 1)));
         assert_eq!(mgr.query_id_by_finst(first), Some(query_id));
-        assert_eq!(mgr.query_id_by_finst(second), Some(query_id));
+        assert_eq!(mgr.query_id_by_finst(second), None);
+        mgr.inner
+            .lock()
+            .expect("query ctx manager lock")
+            .active
+            .get_mut(&query_id)
+            .expect("remaining fragment query")
+            .total_fragments = Some(1);
+
+        let decision = mgr.finish_fragment_for_report(query_id);
+        mgr.unregister_finst(first);
+        mgr.cleanup_after_fragment_report(query_id, decision);
+        assert_eq!(mgr.fragment_counts_for_test(query_id), None);
+        assert_eq!(mgr.query_id_by_finst(first), None);
         RuntimeFilterLifecycleRegistry::global()
             .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
     }

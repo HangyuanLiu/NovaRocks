@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use novarocks::service::{
 };
 
 use crate::brpc;
+use crate::fragment::CompatFragmentService;
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -71,6 +73,7 @@ struct StartedResources {
 pub struct CompatApplicationHost {
     ports: Box<dyn CompatPorts>,
     started: StartedResources,
+    fragment_service: Arc<CompatFragmentService>,
     ready_marker: String,
     startup_summary: String,
 }
@@ -180,6 +183,9 @@ impl CompatApplicationHost {
             host: server.host.clone(),
             be_port: server.be_port,
         };
+        let fragment_service = Arc::new(CompatFragmentService::new(
+            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+        ));
         let brpc_config = brpc::CompatConfig {
             host: &server.host,
             heartbeat_port: server.heartbeat_port,
@@ -187,16 +193,21 @@ impl CompatApplicationHost {
             internal_service_query_rpc_thread_num: query_threads,
             debug_exec_batch_plan_json: config.debug.exec_batch_plan_json,
             log_level,
+            fragment_service_context: Arc::as_ptr(&fragment_service).cast(),
         };
 
         let mut host = Self {
             ports: Box::new(ports),
             started: StartedResources::default(),
+            fragment_service,
             ready_marker,
             startup_summary,
         };
         host.ports.init_frontend_rpc();
-        if let Err(error) = host.ports.start_grpc(&server.host) {
+        let grpc_fragment_service: Arc<
+            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
+        > = host.fragment_service.clone();
+        if let Err(error) = host.ports.start_grpc(&server.host, grpc_fragment_service) {
             return Err(host.start_failure(
                 CompatApplicationErrorKind::GrpcStart,
                 format!("start grpc/http/starlet listeners: {error}"),
@@ -342,7 +353,13 @@ fn compat_log_level(level: &str) -> u8 {
 
 trait CompatPorts: Send {
     fn init_frontend_rpc(&mut self);
-    fn start_grpc(&mut self, host: &str) -> Result<(), String>;
+    fn start_grpc(
+        &mut self,
+        host: &str,
+        fragment_sync_ingress: Arc<
+            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
+        >,
+    ) -> Result<(), String>;
     fn start_heartbeat(&mut self, config: heartbeat_service::HeartbeatConfig)
     -> Result<(), String>;
     fn start_backend(
@@ -365,8 +382,14 @@ impl CompatPorts for LiveCompatPorts {
         frontend_rpc::init_frontend_rpc_manager();
     }
 
-    fn start_grpc(&mut self, host: &str) -> Result<(), String> {
-        grpc_server::start_grpc_server(host)
+    fn start_grpc(
+        &mut self,
+        host: &str,
+        fragment_sync_ingress: Arc<
+            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
+        >,
+    ) -> Result<(), String> {
+        grpc_server::start_grpc_server(host, fragment_sync_ingress)
     }
 
     fn start_heartbeat(

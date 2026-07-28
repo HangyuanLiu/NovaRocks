@@ -18,4 +18,6 @@
 pub(crate) mod common;
 pub(crate) mod native;
 #[cfg(feature = "compat")]
-pub(crate) mod starrocks;
+pub mod starrocks;
+
+pub use common::error::FieldPath;

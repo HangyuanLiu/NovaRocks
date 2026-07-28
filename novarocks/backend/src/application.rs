@@ -1,11 +1,14 @@
 use std::fmt;
 use std::future::Future;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::service::{grpc_server, report_worker};
+
+use crate::fragment::NativeFragmentService;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -60,6 +63,7 @@ impl std::error::Error for BackendApplicationError {}
 #[derive(Debug)]
 pub struct BackendApplicationHost {
     ready_marker: String,
+    _native_fragment_service: Arc<NativeFragmentService>,
 }
 
 impl BackendApplicationHost {
@@ -110,8 +114,14 @@ impl BackendApplicationHost {
             )?;
         let bind_host = config.server.host.clone();
         let grpc_port = config.server.grpc_port;
+        let native_fragment_service = Arc::new(NativeFragmentService::new());
 
-        grpc_server::start_grpc_exchange_server(&bind_host, grpc_port).map_err(|error| {
+        grpc_server::start_grpc_exchange_server(
+            &bind_host,
+            grpc_port,
+            native_fragment_service.clone(),
+        )
+        .map_err(|error| {
             BackendApplicationError::new(
                 BackendApplicationErrorKind::Start,
                 format!("start native backend gRPC server on {bind_host}:{grpc_port}: {error}"),
@@ -131,6 +141,7 @@ impl BackendApplicationHost {
                 advertise_endpoint.host,
                 std::process::id()
             ),
+            _native_fragment_service: native_fragment_service,
         })
     }
 }

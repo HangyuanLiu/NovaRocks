@@ -23,7 +23,7 @@ use crate::thrift::internal_service::{TPlanFragmentExecParams, TScanRangeParams}
 /// `node_to_per_driver_seq_scan_ranges`. A concrete per-node entry always wins;
 /// only an absent or placeholder entry is backfilled. This rule can be removed once
 /// all supported fragment consumers read the per-driver shape directly.
-pub(crate) fn backfill_per_node_scan_ranges(exec_params: &mut TPlanFragmentExecParams) {
+pub fn backfill_per_node_scan_ranges(exec_params: &mut TPlanFragmentExecParams) {
     fn has_concrete_scan_range(ranges: &[TScanRangeParams]) -> bool {
         ranges.iter().any(|range| !range.empty.unwrap_or(false))
     }

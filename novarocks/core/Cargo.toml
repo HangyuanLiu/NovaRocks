@@ -24,13 +24,6 @@ build = "build.rs"
 [lib]
 doctest = false
 
-[[bin]]
-name = "starrocks-compat-probe"
-path = "../../tests/starrocks-compat-probe/main.rs"
-required-features = ["compat"]
-test = false
-bench = false
-
 [dependencies]
 novarocks-catalog = { path = "../catalog" }
 novarocks-types = { path = "../types" }

@@ -28,7 +28,7 @@ use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_context::QueryId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentExprArenaOwner {
+pub enum FragmentExprArenaOwner {
     Plan,
     DataStream,
     MultiCastDataStream,
@@ -73,7 +73,7 @@ impl QueryProfilePatch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum StarRocksExternalDependency {
+pub enum StarRocksExternalDependency {
     QueryProfile {
         id: u64,
         query_id: String,
@@ -94,13 +94,13 @@ impl StarRocksExternalDependency {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LakeMetaColumnKind {
+pub enum LakeMetaColumnKind {
     Dictionary,
     Value(DataType),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LakeMetaColumnRequest {
+pub struct LakeMetaColumnRequest {
     pub(crate) column_id: String,
     pub(crate) kind: LakeMetaColumnKind,
 }
@@ -112,14 +112,14 @@ impl LakeMetaColumnRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LakeMetaTabletRequest {
+pub struct LakeMetaTabletRequest {
     pub(crate) tablet_id: i64,
     pub(crate) version: i64,
     pub(crate) row_count_hint: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LakeMetaStorageRequest {
+pub struct LakeMetaStorageRequest {
     id: u64,
     pub(crate) query_id: QueryId,
     pub(crate) catalog: String,
@@ -168,13 +168,13 @@ impl LakeMetaStorageRequest {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LakeMetaStorageFacts {
+pub struct LakeMetaStorageFacts {
     pub(crate) total_rows: i64,
     pub(crate) column_arrays: BTreeMap<String, Vec<ArrayRef>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum StarRocksResolvedDependencyValue {
+pub enum StarRocksResolvedDependencyValue {
     QueryProfile(String),
     LakeMetaStorage(LakeMetaStorageFacts),
 }
@@ -189,7 +189,7 @@ impl StarRocksResolvedDependencyValue {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct StarRocksResolvedDependencies(BTreeMap<u64, StarRocksResolvedDependencyValue>);
+pub struct StarRocksResolvedDependencies(BTreeMap<u64, StarRocksResolvedDependencyValue>);
 
 impl StarRocksResolvedDependencies {
     pub(crate) fn new(values: BTreeMap<u64, StarRocksResolvedDependencyValue>) -> Self {
@@ -213,7 +213,7 @@ impl StarRocksResolvedDependencies {
     }
 }
 
-pub(crate) struct StarRocksExternalDependencyDraft {
+pub struct StarRocksExternalDependencyDraft {
     frontend_endpoint: Option<RuntimeEndpoint>,
     resolved_query_profiles: BTreeMap<String, String>,
     resolved_lake_meta_storage: BTreeMap<u64, LakeMetaStorageFacts>,
@@ -401,7 +401,7 @@ impl StarRocksExternalDependencyDraft {
     }
 }
 
-pub(crate) enum DraftDependencyValue<T> {
+pub enum DraftDependencyValue<T> {
     Resolved(T),
     Pending(u64),
 }

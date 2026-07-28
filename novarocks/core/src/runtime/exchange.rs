@@ -210,6 +210,11 @@ pub fn remove_fragment(finst_id_hi: i64, finst_id_lo: i64) {
     }
 }
 
+pub(crate) fn remove_exchange_key(key: ExchangeKey) {
+    mark_key_canceled(key);
+    exchange().lock().expect("exchange lock").remove(&key);
+}
+
 /// Cancel all exchange receivers for a fragment instance on error or FE cancel.
 /// Wakes blocked waiters so they can observe the cancellation, then removes
 /// entries from the global map.
@@ -278,13 +283,36 @@ pub fn register_expected_chunk_schema(
     expected_senders: usize,
     chunk_schema: ChunkSchemaRef,
 ) -> Result<(), String> {
+    register_expected_chunk_schema_inner(key, expected_senders, chunk_schema, false)
+}
+
+pub(crate) fn try_register_expected_chunk_schema(
+    key: ExchangeKey,
+    expected_senders: usize,
+    chunk_schema: ChunkSchemaRef,
+) -> Result<(), String> {
+    register_expected_chunk_schema_inner(key, expected_senders, chunk_schema, true)
+}
+
+fn register_expected_chunk_schema_inner(
+    key: ExchangeKey,
+    expected_senders: usize,
+    chunk_schema: ChunkSchemaRef,
+    reject_existing: bool,
+) -> Result<(), String> {
     if is_key_canceled(&key) {
         return Err("exchange canceled".to_string());
     }
     let receiver = get_or_create(key);
     let mut st = receiver.mu.lock().expect("exchange receiver lock");
-    st.expected_senders = st.expected_senders.max(expected_senders);
     match st.expected_chunk_schema.as_ref() {
+        Some(_) if reject_existing => {
+            return Err(format!(
+                "exchange receiver already registered: finst={} node_id={}",
+                key.finst_uuid(),
+                key.node_id
+            ));
+        }
         Some(existing) if existing.as_ref() != chunk_schema.as_ref() => {
             return Err(format!(
                 "exchange expected chunk schema mismatch: finst={} node_id={}",
@@ -298,6 +326,7 @@ pub fn register_expected_chunk_schema(
             st.expected_chunk_schema = Some(chunk_schema);
         }
     }
+    st.expected_senders = st.expected_senders.max(expected_senders);
     receiver.cv.notify_all();
     Ok(())
 }

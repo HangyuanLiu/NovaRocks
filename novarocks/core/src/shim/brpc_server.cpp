@@ -907,7 +907,8 @@ std::unique_ptr<FetchWaiterRegistry> g_fetch_waiter_registry;
 
 class InternalServiceImpl final : public starrocks::PInternalService {
 public:
-    explicit InternalServiceImpl(NovaRocksCompatConfig cfg) : cfg_(cfg) {}
+    explicit InternalServiceImpl(const void* fragment_service_context)
+            : fragment_service_context_(fragment_service_context) {}
 
     void exec_plan_fragment(google::protobuf::RpcController* controller,
                             const starrocks::PExecPlanFragmentRequest* request,
@@ -925,8 +926,12 @@ public:
                 "exec_plan_fragment",
                 response,
                 done,
-                [proto, attachment = std::move(attachment), response]() mutable {
-                    run_exec_plan_fragment(proto, std::move(attachment), response);
+                [fragment_service_context = fragment_service_context_,
+                 proto,
+                 attachment = std::move(attachment),
+                 response]() mutable {
+                    run_exec_plan_fragment(
+                            fragment_service_context, proto, std::move(attachment), response);
                 });
     }
 
@@ -946,8 +951,12 @@ public:
                 "exec_batch_plan_fragments",
                 response,
                 done,
-                [proto, attachment = std::move(attachment), response]() mutable {
-                    run_exec_batch_plan_fragments(proto, std::move(attachment), response);
+                [fragment_service_context = fragment_service_context_,
+                 proto,
+                 attachment = std::move(attachment),
+                 response]() mutable {
+                    run_exec_batch_plan_fragments(
+                            fragment_service_context, proto, std::move(attachment), response);
                 });
     }
 
@@ -1034,8 +1043,12 @@ public:
         submit_query_rpc_task("cancel_plan_fragment",
                               response,
                               done,
-                              [cntl, finst_id, response]() {
-                                  run_cancel_plan_fragment(cntl, finst_id, response);
+                              [fragment_service_context = fragment_service_context_,
+                               cntl,
+                               finst_id,
+                               response]() {
+                                  run_cancel_plan_fragment(
+                                          fragment_service_context, cntl, finst_id, response);
                               });
     }
 
@@ -1190,7 +1203,8 @@ private:
         }
     }
 
-    static void run_exec_plan_fragment(AttachmentProtocol proto,
+    static void run_exec_plan_fragment(const void* fragment_service_context,
+                                       AttachmentProtocol proto,
                                        std::string attachment,
                                        starrocks::PExecPlanFragmentResult* response) {
         if (response == nullptr) {
@@ -1217,7 +1231,9 @@ private:
         }
 
         int32_t rc = novarocks_rs_submit_exec_plan_fragment(
-                reinterpret_cast<const uint8_t*>(attachment.data()), attachment.size());
+                fragment_service_context,
+                reinterpret_cast<const uint8_t*>(attachment.data()),
+                attachment.size());
         if (rc != 0) {
             status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
                        "rust submit_exec_plan_fragment failed");
@@ -1228,7 +1244,8 @@ private:
         status_ok(response->mutable_status());
     }
 
-    static void run_exec_batch_plan_fragments(AttachmentProtocol proto,
+    static void run_exec_batch_plan_fragments(const void* fragment_service_context,
+                                              AttachmentProtocol proto,
                                               std::string attachment,
                                               starrocks::PExecBatchPlanFragmentsResult* response) {
         if (response == nullptr) {
@@ -1250,7 +1267,9 @@ private:
         (void)batch;
 
         int32_t rc = novarocks_rs_submit_exec_batch_plan_fragments(
-                reinterpret_cast<const uint8_t*>(attachment.data()), attachment.size());
+                fragment_service_context,
+                reinterpret_cast<const uint8_t*>(attachment.data()),
+                attachment.size());
         if (rc != 0) {
             status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
                        "rust submit_exec_batch_plan_fragments failed");
@@ -1260,10 +1279,11 @@ private:
         status_ok(response->mutable_status());
     }
 
-    static void run_cancel_plan_fragment(brpc::Controller* cntl,
+    static void run_cancel_plan_fragment(const void* fragment_service_context,
+                                         brpc::Controller* cntl,
                                          UniqueIdKey finst_id,
                                          starrocks::PCancelPlanFragmentResult* response) {
-        novarocks_rs_cancel(finst_id.hi, finst_id.lo);
+        novarocks_rs_cancel(fragment_service_context, finst_id.hi, finst_id.lo);
         if (cntl != nullptr) {
             std::cerr << "[INFO] cancel_plan_fragment called, remote=" << cntl->remote_side()
                       << " finst_id=" << format_unique_id(finst_id) << std::endl;
@@ -1452,7 +1472,7 @@ private:
                                      err);
     }
 
-    NovaRocksCompatConfig cfg_;
+    const void* fragment_service_context_;
 };
 
 class LakeServiceImpl final : public starrocks::LakeService {
@@ -2723,6 +2743,10 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
         if (err) *err = "cfg is null";
         return 1;
     }
+    if (cfg->fragment_service_context == nullptr) {
+        if (err) *err = "fragment service context is null";
+        return 1;
+    }
     if (g_brpc_started.exchange(true)) {
         if (err) *err = "brpc already started";
         return 2;
@@ -2751,7 +2775,7 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
         }
 
         auto server = std::make_unique<brpc::Server>();
-        auto service = std::make_unique<InternalServiceImpl>(*cfg);
+        auto service = std::make_unique<InternalServiceImpl>(cfg->fragment_service_context);
         auto lake_service = std::make_unique<LakeServiceImpl>();
         auto query_rpc_pool = std::make_unique<QueryRpcPool>(query_rpc_threads);
         auto fetch_waiter_registry = std::make_unique<FetchWaiterRegistry>(query_rpc_pool.get());

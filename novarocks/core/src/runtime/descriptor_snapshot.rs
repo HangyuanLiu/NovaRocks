@@ -149,7 +149,7 @@ pub(crate) struct DescriptorTable {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct DescriptorSnapshot {
+pub struct DescriptorSnapshot {
     slots_by_tuple_slot: HashMap<(i32, SlotId), DescriptorSlot>,
     slots_by_tuple: HashMap<i32, Vec<SlotId>>,
     tuple_to_table: HashMap<i32, i64>,

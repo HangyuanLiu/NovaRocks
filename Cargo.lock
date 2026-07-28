@@ -3279,7 +3279,9 @@ dependencies = [
 name = "novarocks-compat"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "novarocks",
+ "prost 0.13.5",
 ]
 
 [[package]]

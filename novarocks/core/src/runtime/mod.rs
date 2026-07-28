@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod backend_id;
-pub(crate) mod descriptor_snapshot;
-pub(crate) mod endpoint;
+pub mod descriptor_snapshot;
+pub mod endpoint;
 pub mod exchange;
 pub mod exec_env;
 pub mod execution_services;
-pub(crate) mod fragment;
+pub mod fragment;
 pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;
 pub mod global_async_runtime;
@@ -28,10 +28,11 @@ pub mod io;
 pub mod load_tracking;
 pub mod lookup;
 pub mod mem_tracker;
+pub mod native_fragment_query;
 pub mod profile;
 pub(crate) mod query_cancel;
 pub mod query_context;
-pub(crate) mod query_options;
+pub mod query_options;
 pub mod query_result;
 pub(crate) mod query_state;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
@@ -43,5 +44,7 @@ pub mod scan_executor;
 pub(crate) mod scan_range;
 pub mod sink_commit;
 pub mod starlet_shard_registry;
+#[cfg(feature = "compat")]
+pub mod starrocks_fragment_query;
 pub mod start_epoch;
 pub mod thread_cpu_time;

@@ -203,6 +203,7 @@ pub struct PipelineDriver {
     operator_counters: Vec<OperatorCounters>,
     runtime_state: Arc<RuntimeState>,
     fragment_instance_id: Option<(i64, i64)>,
+    legacy_progress_reporting: bool,
     state: DriverState,
     blocked_since: Option<(Instant, DriverBlockedKind)>,
     closed: bool,
@@ -263,6 +264,26 @@ impl PipelineDriver {
         operator_profiles: Vec<OperatorProfiles>,
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
+    ) -> Self {
+        Self::new_with_legacy_progress_reporting(
+            driver_id,
+            operators,
+            profiler,
+            operator_profiles,
+            runtime_state,
+            fragment_instance_id,
+            true,
+        )
+    }
+
+    pub(crate) fn new_with_legacy_progress_reporting(
+        driver_id: i32,
+        operators: Vec<Box<dyn Operator>>,
+        profiler: Option<Profiler>,
+        operator_profiles: Vec<OperatorProfiles>,
+        runtime_state: Arc<RuntimeState>,
+        fragment_instance_id: Option<(i64, i64)>,
+        legacy_progress_reporting: bool,
     ) -> Self {
         let mut operators = operators;
         let operator_count = operators.len();
@@ -397,6 +418,7 @@ impl PipelineDriver {
             operator_counters,
             runtime_state,
             fragment_instance_id,
+            legacy_progress_reporting,
             state: DriverState::Ready,
             blocked_since: None,
             closed: false,
@@ -712,6 +734,9 @@ impl PipelineDriver {
     }
 
     pub(crate) fn report_exec_state_if_necessary(&self) {
+        if !self.legacy_progress_reporting {
+            return;
+        }
         if self.is_finished() {
             return;
         }

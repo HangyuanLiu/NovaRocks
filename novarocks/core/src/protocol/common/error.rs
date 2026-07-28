@@ -34,7 +34,7 @@ impl fmt::Display for ProtocolFamily {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FieldPath(Vec<FieldPathSegment>);
+pub struct FieldPath(Vec<FieldPathSegment>);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum FieldPathSegment {
@@ -44,11 +44,11 @@ pub(crate) enum FieldPathSegment {
 }
 
 impl FieldPath {
-    pub(crate) fn root(name: &'static str) -> Self {
+    pub fn root(name: &'static str) -> Self {
         Self(vec![FieldPathSegment::Field(name)])
     }
 
-    pub(crate) fn field(mut self, name: &'static str) -> Self {
+    pub fn field(mut self, name: &'static str) -> Self {
         self.0.push(FieldPathSegment::Field(name));
         self
     }

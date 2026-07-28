@@ -511,8 +511,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, fragment_ctx);
-        let task = DriverTask::new(driver, completion, Duration::from_millis(10));
+        let completion = FragmentCompletion::new(1);
+        let task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared {
             queue: Mutex::new(VecDeque::new()),

@@ -14,12 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
+use crate::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress;
 use crate::service::stream_load::{self, HttpHeaders};
 
 fn normalize_headers(headers: &HeaderMap) -> HttpHeaders {
@@ -33,6 +35,7 @@ fn normalize_headers(headers: &HeaderMap) -> HttpHeaders {
 }
 
 pub(crate) async fn handle_stream_load(
+    Extension(fragment_sync_ingress): Extension<std::sync::Arc<dyn StarRocksFragmentSyncIngress>>,
     Path((db, table)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -40,14 +43,28 @@ pub(crate) async fn handle_stream_load(
     // Stream load execution is synchronous and can block for seconds; run it in
     // Tokio's blocking section so Starlet heartbeat RPCs stay responsive.
     let response = tokio::task::block_in_place(|| {
-        stream_load::handle_stream_load(db, table, normalize_headers(&headers), body.to_vec())
+        stream_load::handle_stream_load(
+            db,
+            table,
+            normalize_headers(&headers),
+            body.to_vec(),
+            fragment_sync_ingress.as_ref(),
+        )
     });
     (StatusCode::OK, Json(response))
 }
 
-pub(crate) async fn handle_transaction_load(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+pub(crate) async fn handle_transaction_load(
+    Extension(fragment_sync_ingress): Extension<std::sync::Arc<dyn StarRocksFragmentSyncIngress>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
     let response = tokio::task::block_in_place(|| {
-        stream_load::handle_transaction_load(normalize_headers(&headers), body.to_vec())
+        stream_load::handle_transaction_load(
+            normalize_headers(&headers),
+            body.to_vec(),
+            fragment_sync_ingress.as_ref(),
+        )
     });
     (StatusCode::OK, Json(response))
 }

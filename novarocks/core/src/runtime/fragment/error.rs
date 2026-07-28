@@ -19,7 +19,7 @@ use std::error::Error;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentLaunchStage {
+pub enum FragmentLaunchStage {
     ValidateSubmission,
     Register,
     BuildRuntimeState,
@@ -44,7 +44,7 @@ impl fmt::Display for FragmentLaunchStage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentLaunchErrorKind {
+pub enum FragmentLaunchErrorKind {
     Binding,
     DuplicateRegistration,
     ResourceUnavailable,
@@ -69,14 +69,15 @@ impl fmt::Display for FragmentLaunchErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentLaunchError {
+pub struct FragmentLaunchError {
     stage: FragmentLaunchStage,
     kind: FragmentLaunchErrorKind,
     detail: String,
+    cleanup_diagnostics: Vec<String>,
 }
 
 impl FragmentLaunchError {
-    pub(crate) fn new(
+    pub fn new(
         stage: FragmentLaunchStage,
         kind: FragmentLaunchErrorKind,
         detail: impl Into<String>,
@@ -85,19 +86,29 @@ impl FragmentLaunchError {
             stage,
             kind,
             detail: detail.into(),
+            cleanup_diagnostics: Vec::new(),
         }
     }
 
-    pub(crate) fn stage(&self) -> FragmentLaunchStage {
+    pub fn stage(&self) -> FragmentLaunchStage {
         self.stage
     }
 
-    pub(crate) fn kind(&self) -> FragmentLaunchErrorKind {
+    pub fn kind(&self) -> FragmentLaunchErrorKind {
         self.kind
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    pub fn cleanup_diagnostics(&self) -> &[String] {
+        &self.cleanup_diagnostics
+    }
+
+    pub(crate) fn with_cleanup_diagnostics(mut self, diagnostics: Vec<String>) -> Self {
+        self.cleanup_diagnostics.extend(diagnostics);
+        self
     }
 }
 
@@ -107,14 +118,22 @@ impl fmt::Display for FragmentLaunchError {
             f,
             "fragment launch error during {} ({}): {}",
             self.stage, self.kind, self.detail
-        )
+        )?;
+        if !self.cleanup_diagnostics.is_empty() {
+            write!(
+                f,
+                "; cleanup diagnostics: {}",
+                self.cleanup_diagnostics.join("; ")
+            )?;
+        }
+        Ok(())
     }
 }
 
 impl Error for FragmentLaunchError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentExecutionErrorKind {
+pub enum FragmentExecutionErrorKind {
     Pipeline,
     Sink,
     Exchange,
@@ -137,24 +156,24 @@ impl fmt::Display for FragmentExecutionErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentExecutionError {
+pub struct FragmentExecutionError {
     kind: FragmentExecutionErrorKind,
     detail: String,
 }
 
 impl FragmentExecutionError {
-    pub(crate) fn new(kind: FragmentExecutionErrorKind, detail: impl Into<String>) -> Self {
+    pub fn new(kind: FragmentExecutionErrorKind, detail: impl Into<String>) -> Self {
         Self {
             kind,
             detail: detail.into(),
         }
     }
 
-    pub(crate) fn kind(&self) -> FragmentExecutionErrorKind {
+    pub fn kind(&self) -> FragmentExecutionErrorKind {
         self.kind
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }

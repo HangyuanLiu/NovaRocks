@@ -203,36 +203,6 @@ where
     0
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn novarocks_rs_submit_exec_batch_plan_fragments(ptr: *const u8, len: usize) -> i32 {
-    if ptr.is_null() {
-        return 2;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    match crate::submit_exec_batch_plan_fragments(bytes) {
-        Ok(_) => 0,
-        Err(e) => {
-            error!(target: "novarocks::ffi", error = %e, "submit_exec_batch_plan_fragments failed");
-            1
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn novarocks_rs_submit_exec_plan_fragment(ptr: *const u8, len: usize) -> i32 {
-    if ptr.is_null() {
-        return 2;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    match crate::submit_exec_plan_fragment(bytes) {
-        Ok(()) => 0,
-        Err(e) => {
-            error!(target: "novarocks::ffi", error = %e, "submit_exec_plan_fragment failed");
-            1
-        }
-    }
-}
-
 /// Returns:
 /// - 0: OK (a result batch is returned; may be EOS)
 /// - 1: NOT_FOUND
@@ -329,12 +299,6 @@ pub extern "C" fn novarocks_rs_try_fetch_result_batch(
 #[unsafe(no_mangle)]
 pub extern "C" fn novarocks_rs_fetch_wait_timeout_ms(finst_id_hi: i64, finst_id_lo: i64) -> i64 {
     crate::runtime::result_buffer::fetch_wait_timeout_ms(unique_id(finst_id_hi, finst_id_lo))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn novarocks_rs_cancel(finst_id_hi: i64, finst_id_lo: i64) -> i32 {
-    crate::cancel(unique_id(finst_id_hi, finst_id_lo));
-    0
 }
 
 #[unsafe(no_mangle)]

@@ -29,16 +29,13 @@ use crate::thrift::{internal_service, types};
 pub(crate) use super::starrocks_fragment_dependency_resolver::StarRocksDependencyResolutionError;
 
 #[derive(Clone)]
-pub(crate) struct StarRocksPrelaunchCancellationToken {
+pub struct StarRocksPrelaunchCancellationToken {
     cancelled: Arc<AtomicBool>,
     frontend_endpoint: Option<RuntimeEndpoint>,
 }
 
 impl StarRocksPrelaunchCancellationToken {
-    pub(crate) fn check(
-        &self,
-        dependency_id: u64,
-    ) -> Result<(), StarRocksDependencyResolutionError> {
+    pub fn check(&self, dependency_id: u64) -> Result<(), StarRocksDependencyResolutionError> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(StarRocksDependencyResolutionError::Cancelled { dependency_id })
         } else {
@@ -46,7 +43,7 @@ impl StarRocksPrelaunchCancellationToken {
         }
     }
 
-    pub(crate) fn frontend_endpoint(&self) -> Option<&RuntimeEndpoint> {
+    pub fn frontend_endpoint(&self) -> Option<&RuntimeEndpoint> {
         self.frontend_endpoint.as_ref()
     }
 }
@@ -59,16 +56,16 @@ struct PrelaunchEntry {
 }
 
 #[derive(Default)]
-pub(crate) struct StarRocksPrelaunchRegistry {
+pub struct StarRocksPrelaunchRegistry {
     entries: Mutex<HashMap<UniqueId, PrelaunchEntry>>,
 }
 
 impl StarRocksPrelaunchRegistry {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn install<I>(
+    pub fn install<I>(
         self: &Arc<Self>,
         query_id: QueryId,
         generation: u64,
@@ -142,7 +139,7 @@ impl StarRocksPrelaunchRegistry {
     }
 }
 
-pub(crate) struct StarRocksPrelaunchGuard {
+pub struct StarRocksPrelaunchGuard {
     registry: Arc<StarRocksPrelaunchRegistry>,
     query_id: QueryId,
     generation: u64,
@@ -153,18 +150,18 @@ pub(crate) struct StarRocksPrelaunchGuard {
 }
 
 impl StarRocksPrelaunchGuard {
-    pub(crate) fn cancellation_token(&self) -> StarRocksPrelaunchCancellationToken {
+    pub fn cancellation_token(&self) -> StarRocksPrelaunchCancellationToken {
         StarRocksPrelaunchCancellationToken {
             cancelled: Arc::clone(&self.cancelled),
             frontend_endpoint: self.frontend_endpoint.clone(),
         }
     }
 
-    pub(crate) fn set_frontend_endpoint(&mut self, endpoint: Option<RuntimeEndpoint>) {
+    pub fn set_frontend_endpoint(&mut self, endpoint: Option<RuntimeEndpoint>) {
         self.frontend_endpoint = endpoint;
     }
 
-    pub(crate) fn handoff<T, F>(mut self, make_runtime_visible: F) -> Result<T, String>
+    pub fn handoff<T, F>(mut self, make_runtime_visible: F) -> Result<T, String>
     where
         F: FnOnce() -> Result<T, String>,
     {
@@ -214,7 +211,7 @@ impl Drop for StarRocksPrelaunchGuard {
     }
 }
 
-pub(crate) fn starrocks_prelaunch_registry() -> &'static Arc<StarRocksPrelaunchRegistry> {
+pub fn starrocks_prelaunch_registry() -> &'static Arc<StarRocksPrelaunchRegistry> {
     static REGISTRY: OnceLock<Arc<StarRocksPrelaunchRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Arc::new(StarRocksPrelaunchRegistry::new()))
 }
@@ -237,21 +234,21 @@ pub(crate) struct StarRocksDescriptorCache {
 }
 
 #[derive(Clone)]
-pub(crate) struct StarRocksDescriptorPreparation {
+pub struct StarRocksDescriptorPreparation {
     query_id: QueryId,
     generation: u64,
     descriptor: Option<Arc<descriptors::TDescriptorTable>>,
     commit_descriptor: bool,
 }
 
-pub(crate) struct StarRocksDescriptorLeaseFactory {
+pub struct StarRocksDescriptorLeaseFactory {
     inner: Arc<Mutex<DescriptorCacheInner>>,
     query_id: QueryId,
     generation: u64,
 }
 
 impl StarRocksDescriptorLeaseFactory {
-    pub(crate) fn into_cleanup_lease(self) -> QueryCleanupLease {
+    pub fn into_cleanup_lease(self) -> QueryCleanupLease {
         QueryCleanupLease::new(move || {
             let mut inner = self.inner.lock().expect("descriptor cache lock");
             if inner
@@ -266,11 +263,11 @@ impl StarRocksDescriptorLeaseFactory {
 }
 
 impl StarRocksDescriptorPreparation {
-    pub(crate) const fn generation(&self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub(crate) fn descriptor(&self) -> Option<&descriptors::TDescriptorTable> {
+    pub fn descriptor(&self) -> Option<&descriptors::TDescriptorTable> {
         self.descriptor.as_deref()
     }
 }
@@ -468,7 +465,7 @@ pub(crate) fn starrocks_descriptor_cache() -> &'static StarRocksDescriptorCache 
     CACHE.get_or_init(StarRocksDescriptorCache::default)
 }
 
-pub(crate) fn prepare_descriptor(
+pub fn prepare_descriptor(
     query_id: QueryId,
     incoming: Option<&descriptors::TDescriptorTable>,
     fallback: Option<&descriptors::TDescriptorTable>,
@@ -476,7 +473,7 @@ pub(crate) fn prepare_descriptor(
     starrocks_descriptor_cache().prepare(query_id, incoming, fallback)
 }
 
-pub(crate) fn prepare_batch_descriptor(
+pub fn prepare_batch_descriptor(
     query_id: QueryId,
     common: Option<&descriptors::TDescriptorTable>,
     unique: &[Option<&descriptors::TDescriptorTable>],
@@ -484,7 +481,7 @@ pub(crate) fn prepare_batch_descriptor(
     starrocks_descriptor_cache().prepare_batch(query_id, common, unique)
 }
 
-pub(crate) fn commit_descriptor_handoff<T, F>(
+pub fn commit_descriptor_handoff<T, F>(
     preparation: &StarRocksDescriptorPreparation,
     make_runtime_visible: F,
 ) -> Result<T, String>
@@ -513,7 +510,7 @@ pub(crate) fn is_desc_tbl_effectively_empty(desc: &descriptors::TDescriptorTable
             .unwrap_or(true)
 }
 
-pub(crate) fn snapshot_decode_facts(
+pub fn snapshot_decode_facts(
     exec_params: &internal_service::TPlanFragmentExecParams,
 ) -> Result<crate::protocol::starrocks::decode::StarRocksDecodeFacts, String> {
     let mut stream_load_paths = BTreeMap::new();
@@ -590,11 +587,6 @@ pub(crate) fn snapshot_decode_facts(
 #[cfg(test)]
 pub(crate) fn descriptor_cache_snapshot_count() -> usize {
     starrocks_descriptor_cache().snapshot_count()
-}
-
-#[cfg(test)]
-pub(crate) fn test_launch_count() -> usize {
-    super::internal_service::test_fragment_launch_count()
 }
 
 #[cfg(test)]
@@ -1278,7 +1270,6 @@ mod tests {
         drop(guard);
         assert_eq!(registry.snapshot_count(), 0);
         assert_eq!(super::descriptor_cache_snapshot_count(), 0);
-        assert_eq!(super::test_launch_count(), 0);
         assert_eq!(
             crate::runtime::query_context::query_context_manager().query_id_by_finst(finst_id),
             None

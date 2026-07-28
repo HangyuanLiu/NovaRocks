@@ -18,9 +18,13 @@
 
 #[cfg(feature = "compat")]
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{Arc, RwLock, Weak};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use arrow::array::StringArray;
@@ -542,7 +546,14 @@ impl StandaloneNovaRocks {
             }
             crate::common::app_config::ClusterRole::Be
             | crate::common::app_config::ClusterRole::AllInOne => {
-                ensure_standalone_exchange_server()?
+                #[cfg(test)]
+                {
+                    ensure_standalone_exchange_server()?
+                }
+                #[cfg(not(test))]
+                {
+                    cfg.server.grpc_port
+                }
             }
         };
         if role == crate::common::app_config::ClusterRole::AllInOne {
@@ -3447,6 +3458,7 @@ pub(crate) fn install_all_in_one_loopback_backend_for_test()
     })
 }
 
+#[cfg(test)]
 fn ensure_standalone_exchange_server() -> Result<u16, String> {
     static STANDALONE_EXCHANGE_PORT: OnceLock<u16> = OnceLock::new();
 
@@ -3455,8 +3467,11 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
     }
 
     let default_port = crate::common::config::grpc_port();
-    let started_port =
-        match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", default_port) {
+    let started_port = match crate::service::grpc_server::start_grpc_exchange_server(
+        "127.0.0.1",
+        default_port,
+        crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+    ) {
             Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
                 .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
             Err(e) if e.contains("Address already in use") || e.contains("os error 48") => {
@@ -3470,7 +3485,11 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
                     })?
                     .port();
                 drop(listener);
-                crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", fallback_port)
+                crate::service::grpc_server::start_grpc_exchange_server(
+                    "127.0.0.1",
+                    fallback_port,
+                    crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+                )
                     .map_err(|start_err| {
                         format!(
                             "start standalone grpc exchange server failed on fallback port {}: {}",
@@ -3494,6 +3513,7 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
     Ok(started_port)
 }
 
+#[cfg(test)]
 fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {

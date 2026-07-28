@@ -20,7 +20,7 @@ use std::time::Duration;
 use crate::exec::spill::SpillConfig;
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct QueryOptions {
+pub struct QueryOptions {
     pub(crate) batch_size: Option<i32>,
     pub(crate) query_timeout: Option<i32>,
     pub(crate) query_delivery_timeout: Option<i32>,
@@ -43,6 +43,16 @@ pub(crate) struct QueryOptions {
     pub(crate) spill: Option<SpillConfig>,
 }
 
+impl QueryOptions {
+    pub const fn enable_profile(&self) -> bool {
+        self.enable_profile
+    }
+
+    pub const fn runtime_profile_report_interval(&self) -> Option<i64> {
+        self.runtime_profile_report_interval
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct QueryCacheOptions {
     pub(crate) enable_scan_datacache: bool,
@@ -56,7 +66,7 @@ pub(crate) struct QueryCacheOptions {
     pub(crate) datacache_sharing_work_period: Option<i64>,
 }
 
-pub(crate) fn query_expire_durations(query_opts: Option<&QueryOptions>) -> (Duration, Duration) {
+pub fn query_expire_durations(query_opts: Option<&QueryOptions>) -> (Duration, Duration) {
     let default_timeout = 300i32;
     let query_timeout = query_opts
         .and_then(|o| o.query_timeout)

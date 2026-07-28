@@ -214,7 +214,7 @@ pub(crate) fn decode_lake_scan_program_facts(
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct StarRocksDecodeFacts {
+pub struct StarRocksDecodeFacts {
     stream_load_paths: BTreeMap<UniqueId, String>,
     path_rewrite: Option<StarRocksPathRewriteFacts>,
     datacache_available: bool,
@@ -914,7 +914,7 @@ pub(crate) fn decode_change_op_extended_column(
     Ok(Some(value))
 }
 
-pub(crate) fn decode_incremental_scan_ranges(
+pub fn decode_incremental_scan_ranges(
     node_id: i32,
     scan_ranges: &[internal_service::TScanRangeParams],
     change_op_slot: Option<SlotId>,

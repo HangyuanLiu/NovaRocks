@@ -86,10 +86,28 @@ pub(crate) fn register(finst_id: UniqueId) {
     guard.entry(finst_id).or_default();
 }
 
+pub(crate) fn try_register(finst_id: UniqueId) -> bool {
+    let store = store();
+    let mut guard = store.mu.lock().expect("sink commit store lock");
+    if guard.contains_key(&finst_id) {
+        return false;
+    }
+    guard.insert(finst_id, SinkCommitEntry::default());
+    true
+}
+
 pub(crate) fn unregister(finst_id: UniqueId) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     guard.remove(&finst_id);
+}
+
+pub(crate) fn is_registered(finst_id: UniqueId) -> bool {
+    store()
+        .mu
+        .lock()
+        .expect("sink commit store lock")
+        .contains_key(&finst_id)
 }
 
 pub(crate) fn add_iceberg_commit(finst_id: UniqueId, info: IcebergCommitInfo) {

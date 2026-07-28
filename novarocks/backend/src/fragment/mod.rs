@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod endpoint;
-pub(crate) mod options;
-pub mod request;
-pub(crate) mod sink;
+mod control;
+mod service;
+
+pub use service::NativeFragmentService;
