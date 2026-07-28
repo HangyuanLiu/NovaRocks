@@ -110,13 +110,31 @@ impl FragmentCompletion {
     }
 
     pub fn wait_timeout(&self, timeout: Duration, err: String) -> Result<(), String> {
+        self.wait_timeout_with_local_cancel(timeout, err, || {})
+    }
+
+    pub(crate) fn wait_timeout_with_local_cancel<F>(
+        &self,
+        timeout: Duration,
+        err: String,
+        on_timeout: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(),
+    {
         let deadline = Instant::now() + timeout;
         let mut st = self.mu.lock().expect("fragment completion lock");
+        let mut on_timeout = Some(on_timeout);
         while st.remaining > 0 {
             let now = Instant::now();
             if now >= deadline {
                 drop(st);
                 self.fail(err.clone());
+                on_timeout.take().expect("timeout callback is available")();
+                let mut st = self.mu.lock().expect("fragment completion lock");
+                while st.remaining > 0 {
+                    st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
                 return Err(err);
             }
 
@@ -129,6 +147,11 @@ impl FragmentCompletion {
             if result.timed_out() && st.remaining > 0 {
                 drop(st);
                 self.fail(err.clone());
+                on_timeout.take().expect("timeout callback is available")();
+                let mut st = self.mu.lock().expect("fragment completion lock");
+                while st.remaining > 0 {
+                    st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
                 return Err(err);
             }
         }
@@ -455,19 +478,45 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
 
     #[test]
-    fn fragment_completion_wait_timeout_returns_query_timeout_error() {
+    fn fragment_completion_wait_timeout_drains_before_returning_timeout_error() {
         let completion = FragmentCompletion::new(1);
+        let waiter = Arc::clone(&completion);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
 
-        let err = completion
-            .wait_timeout(
-                Duration::from_millis(1),
-                "query timed out after 1 ms".to_string(),
-            )
+        let join = thread::spawn(move || {
+            result_tx
+                .send(waiter.wait_timeout(
+                    Duration::from_millis(5),
+                    "query timed out after 5 ms".to_string(),
+                ))
+                .expect("test receiver remains available");
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !completion.should_abort() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            completion.should_abort(),
+            "timeout must initiate local cancellation"
+        );
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "timeout must not return before submitted drivers drain"
+        );
+
+        completion.driver_finished();
+        let err = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter must return after the final driver drains")
             .expect_err("incomplete fragment should time out");
+        join.join().expect("timeout waiter thread must not panic");
 
-        assert_eq!(err, "query timed out after 1 ms");
+        assert_eq!(err, "query timed out after 5 ms");
         assert!(completion.should_abort());
     }
 }

@@ -112,15 +112,20 @@ impl RunningPipelineExecution {
             .filter(|secs| *secs > 0)
             .map(|secs| format!("query timed out after {} ms", secs * 1000));
         let result = match timeout_error {
-            Some(err) => self.completion.wait_timeout(
-                Duration::from_secs(
+            Some(err) => {
+                let timeout = Duration::from_secs(
                     self.runtime_state
                         .query_options()
                         .and_then(|opts| opts.query_timeout)
                         .expect("timeout was checked") as u64,
-                ),
-                err,
-            ),
+                );
+                let fragment_ctx = Arc::clone(&self.fragment_ctx);
+                let timeout_error = err.clone();
+                self.completion
+                    .wait_timeout_with_local_cancel(timeout, err, move || {
+                        fragment_ctx.set_final_status(timeout_error);
+                    })
+            }
             None => self.completion.wait(),
         };
         if let Err(err) = &result {
@@ -432,8 +437,9 @@ fn execute_plan_with_pipeline(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     use arrow::array::{Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -465,8 +471,10 @@ mod tests {
     use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
     use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+    use crate::exec::pipeline::schedule::observer::Observable;
     use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::runtime::query_context::{QueryId, query_context_manager};
+    use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime::runtime_state::RuntimeState;
     use crate::runtime_filter::model::contract::{
@@ -478,13 +486,16 @@ mod tests {
         PreparedPipelineExecution, execute_native_plan_with_pipeline, prepare_pipeline_execution,
     };
 
-    struct NeverReadyOperator;
+    struct ParkedSourceOperator {
+        observable: Arc<Observable>,
+        ready: Arc<AtomicBool>,
+    }
 
     struct PanicOperator;
 
-    impl Operator for NeverReadyOperator {
+    impl Operator for ParkedSourceOperator {
         fn name(&self) -> &str {
-            "NeverReadyOperator"
+            "ParkedSourceOperator"
         }
 
         fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -496,13 +507,13 @@ mod tests {
         }
     }
 
-    impl ProcessorOperator for NeverReadyOperator {
+    impl ProcessorOperator for ParkedSourceOperator {
         fn need_input(&self) -> bool {
             false
         }
 
         fn has_output(&self) -> bool {
-            false
+            self.ready.load(Ordering::Acquire)
         }
 
         fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
@@ -515,6 +526,10 @@ mod tests {
 
         fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
             Ok(())
+        }
+
+        fn source_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
         }
     }
 
@@ -652,21 +667,114 @@ mod tests {
     #[test]
     fn running_pipeline_cancel_wakes_local_driver_and_drains() {
         let runtime_state = Arc::new(RuntimeState::default());
+        let observable = Arc::new(Observable::new());
+        let ready = Arc::new(AtomicBool::new(false));
         let driver = PipelineDriver::new(
             1,
-            vec![Box::new(NeverReadyOperator)],
+            vec![Box::new(ParkedSourceOperator {
+                observable: Arc::clone(&observable),
+                ready,
+            })],
             None,
             Vec::new(),
             Arc::clone(&runtime_state),
             None,
         );
+        let schedule_state = driver.schedule_state();
         let running = manually_prepared_execution(driver, runtime_state, None).start();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while (!schedule_state.is_in_blocked() || observable.num_observers() == 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            schedule_state.is_in_blocked() && observable.num_observers() > 0,
+            "test driver must be genuinely parked behind its controlled source observable before cancellation"
+        );
 
         running.cancel("local cancel".to_string());
         assert_eq!(
             running.join(),
             Err("local cancel".to_string()),
             "cancel must remain a fragment-local terminal result after the submitted driver drains"
+        );
+    }
+
+    #[test]
+    fn running_pipeline_timeout_wakes_parked_driver_then_drains() {
+        let runtime_state = Arc::new(RuntimeState::new(
+            Some(QueryOptions {
+                query_timeout: Some(1),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let observable = Arc::new(Observable::new());
+        let ready = Arc::new(AtomicBool::new(false));
+        let driver = PipelineDriver::new(
+            3,
+            vec![Box::new(ParkedSourceOperator {
+                observable: Arc::clone(&observable),
+                ready: Arc::clone(&ready),
+            })],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            None,
+        );
+        let schedule_state = driver.schedule_state();
+        let running = manually_prepared_execution(driver, Arc::clone(&runtime_state), None).start();
+
+        let park_deadline = Instant::now() + Duration::from_secs(1);
+        while (!schedule_state.is_in_blocked() || observable.num_observers() == 0)
+            && Instant::now() < park_deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            schedule_state.is_in_blocked() && observable.num_observers() > 0,
+            "timeout test driver must be parked before join"
+        );
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let join = std::thread::spawn(move || {
+            result_tx
+                .send(running.join())
+                .expect("test receiver remains available");
+        });
+        let initial_result = result_rx.recv_timeout(Duration::from_millis(1_250));
+        let returned_before_cleanup = initial_result.is_ok();
+
+        if schedule_state.is_in_blocked() {
+            runtime_state
+                .error_state()
+                .set_error("test cleanup after timeout".to_string());
+            ready.store(true, Ordering::Release);
+            let notifier = observable.defer_notify();
+            notifier.arm();
+        }
+
+        let result = initial_result
+            .or_else(|_| result_rx.recv_timeout(Duration::from_secs(1)))
+            .expect("timeout must wake the parked driver and finish join");
+        join.join().expect("join thread must not panic");
+
+        assert!(
+            returned_before_cleanup,
+            "timeout must wake the parked driver without test-side recovery"
+        );
+        assert_eq!(result, Err("query timed out after 1000 ms".to_string()));
+        assert!(
+            !schedule_state.is_in_blocked(),
+            "timeout join must return only after the parked driver drains"
         );
     }
 
