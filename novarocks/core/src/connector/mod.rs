@@ -62,7 +62,6 @@ pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
 pub use crate::fs::scan_context::FileScanRange;
 pub use hdfs::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
-pub use iceberg::IcebergMetadataScanConfig;
 pub use jdbc::JdbcScanConfig;
 #[cfg(feature = "compat")]
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
@@ -351,7 +350,6 @@ mod scan_planning_registry_tests {
 #[derive(Clone, Debug)]
 pub enum ScanConfig {
     Jdbc(JdbcScanConfig),
-    IcebergMetadata(IcebergMetadataScanConfig),
 }
 
 pub trait ScanConnector: Send + Sync {
@@ -557,10 +555,8 @@ impl Default for ConnectorRegistry {
         let mut reg = ConnectorRegistry::new();
         let jdbc = Arc::new(JdbcConnector { name: "jdbc" });
         let mysql = Arc::new(JdbcConnector { name: "mysql" });
-        let iceberg = Arc::new(IcebergConnector { name: "iceberg" });
         reg.register_scan_connector(jdbc);
         reg.register_scan_connector(mysql);
-        reg.register_scan_connector(iceberg);
         reg
     }
 }
@@ -608,54 +604,6 @@ impl ScanConnector for JdbcConnector {
             ScanConfig::Jdbc(cfg) => {
                 let source: Arc<dyn ScanSource> = Arc::new(jdbc::JdbcScanSource::new(cfg));
                 Ok((source, BoundScanRanges::None))
-            }
-            _ => Err(format!(
-                "unsupported scan config for connector {}",
-                self.name
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct IcebergConnector {
-    name: &'static str,
-}
-
-impl ScanConnector for IcebergConnector {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn create_scan_node(
-        &self,
-        cfg: ScanConfig,
-    ) -> Result<(Arc<dyn ScanSource>, BoundScanRanges), String> {
-        match cfg {
-            ScanConfig::IcebergMetadata(cfg) => {
-                // Split the decoder-built config into a static source plus its
-                // metadata split ranges. `bind` happens at materialize time.
-                let IcebergMetadataScanConfig {
-                    metadata_table_type,
-                    serialized_table,
-                    serialized_predicate,
-                    load_column_stats,
-                    ranges,
-                    batch_size,
-                    output_columns,
-                    profile_label,
-                } = cfg;
-                let source: Arc<dyn ScanSource> =
-                    Arc::new(iceberg::metadata::IcebergMetadataScanSource::new(
-                        metadata_table_type,
-                        serialized_table,
-                        serialized_predicate,
-                        load_column_stats,
-                        batch_size,
-                        output_columns,
-                        profile_label,
-                    ));
-                Ok((source, BoundScanRanges::IcebergMetadata { ranges }))
             }
             _ => Err(format!(
                 "unsupported scan config for connector {}",

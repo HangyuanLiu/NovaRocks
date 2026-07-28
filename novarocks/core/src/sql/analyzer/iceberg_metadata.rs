@@ -257,7 +257,7 @@ pub fn metadata_table_schema_for_table(
 
 /// Fixed analyzer-level column schema for each Iceberg metadata table.
 ///
-/// Wire types match `IcebergMetadataScanOp::build_*_array` in
+/// Wire types match the Iceberg metadata SPI reader's `build_*_array` helpers in
 /// `src/connector/iceberg/metadata.rs`. Logical formatting (e.g. converting
 /// the `committed_at` Int64-of-micros into a TIMESTAMPTZ display) is FE's
 /// responsibility; the analyzer surfaces the underlying Arrow type.
