@@ -20,12 +20,10 @@
 //! contain only catalog/table identity and a snapshot pin; core code transports
 //! them as opaque bytes and never downcasts into Iceberg objects.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
@@ -45,10 +43,8 @@ use super::scan_range::plan_iceberg_file_ranges;
 use crate::cache::{CacheOptions, DataCacheContext};
 use crate::common::ids::SlotId;
 use crate::connector::HdfsScanConfig;
-use crate::connector::hdfs::HdfsScanOp;
+use crate::connector::hdfs::HdfsFileBatchReader;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::ScanOp;
 use crate::formats::FileFormatConfig;
 use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
 
@@ -442,28 +438,23 @@ impl ConnectorRead for IcebergConnectorInstance {
             variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
         };
-        let op = Arc::new(HdfsScanOp::new(HdfsScanConfig {
-            original_range_count: ranges.len(),
-            ranges,
-            has_more: false,
-            limit: split.limit.and_then(|limit| usize::try_from(limit).ok()),
-            profile_label: Some("spi_iceberg_reader".to_string()),
-            format: Some(FileFormatConfig::Parquet(parquet)),
-            object_store_config: loaded.object_store_config,
-            iceberg_table_locations: Default::default(),
-            query_global_dicts: Default::default(),
-            iceberg_runtime_pruning: None,
-        }));
-        let morsels = op.build_morsels().map_err(map_iceberg_error)?.morsels;
-        Ok(Box::new(IcebergBatchReader {
-            op,
-            morsels: VecDeque::from(morsels),
-            current: None,
-            context: request.context,
-            max_rows: request.batch.max_rows.get(),
-            max_bytes: request.batch.max_bytes.get(),
-            closed: false,
-        }))
+        Ok(Box::new(HdfsFileBatchReader::new(
+            HdfsScanConfig {
+                original_range_count: ranges.len(),
+                ranges,
+                has_more: false,
+                limit: split.limit.and_then(|limit| usize::try_from(limit).ok()),
+                profile_label: Some("spi_iceberg_reader".to_string()),
+                format: Some(FileFormatConfig::Parquet(parquet)),
+                object_store_config: loaded.object_store_config,
+                iceberg_table_locations: Default::default(),
+                query_global_dicts: Default::default(),
+                iceberg_runtime_pruning: None,
+            },
+            request.context,
+            request.batch.max_rows.get(),
+            request.batch.max_bytes.get(),
+        )))
     }
 }
 
@@ -488,79 +479,6 @@ struct SplitPayload {
     path: String,
     projection: Vec<usize>,
     limit: Option<u64>,
-}
-
-struct IcebergBatchReader {
-    op: Arc<HdfsScanOp>,
-    morsels: VecDeque<crate::exec::node::scan::ScanMorsel>,
-    current: Option<BoxedExecIter>,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    max_rows: usize,
-    max_bytes: usize,
-    closed: bool,
-}
-
-impl IcebergBatchReader {
-    fn validate_context(&self) -> Result<(), ConnectorError> {
-        if self.context.cancellation().is_cancelled() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Cancelled,
-                "connector request was cancelled",
-            ));
-        }
-        if Instant::now() >= self.context.deadline() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::DeadlineExceeded,
-                "connector request deadline elapsed",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl ConnectorBatchReader for IcebergBatchReader {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        self.validate_context()?;
-        if self.closed {
-            return Ok(None);
-        }
-        loop {
-            if let Some(current) = self.current.as_mut() {
-                match current.next() {
-                    Some(Ok(chunk)) => {
-                        let batch = chunk.batch;
-                        if batch.num_rows() > self.max_rows
-                            || batch.get_array_memory_size() > self.max_bytes
-                        {
-                            return Err(ConnectorError::new(
-                                ConnectorErrorKind::ResourceExhausted,
-                                "Iceberg reader exceeded its batch budget",
-                            ));
-                        }
-                        return Ok(Some(batch));
-                    }
-                    Some(Err(error)) => return Err(map_iceberg_error(error)),
-                    None => self.current = None,
-                }
-            }
-            let Some(morsel) = self.morsels.pop_front() else {
-                self.closed = true;
-                return Ok(None);
-            };
-            self.current = Some(
-                self.op
-                    .execute_iter(morsel, None, None)
-                    .map_err(map_iceberg_error)?,
-            );
-        }
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.current = None;
-        self.morsels.clear();
-        self.closed = true;
-        Ok(())
-    }
 }
 
 fn ensure_owner(
