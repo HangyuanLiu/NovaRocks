@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CatalogBackend` / `TableSink` / `MvBackend`
-//! implementations for StarRocks table, wrapping `catalog.rs`, `ddl.rs`,
-//! `txn.rs`, `mv_ddl.rs`, and `mv_refresh.rs`.
+//! `TableSink` / `MvBackend` implementations for StarRocks table, wrapping
+//! `catalog.rs`, `ddl.rs`, `txn.rs`, `mv_ddl.rs`, and `mv_refresh.rs`.
 
 use std::sync::{Arc, Weak};
 
 use arrow::record_batch::RecordBatch;
 
-use crate::connector::backend::{
-    CatalogBackend, CreateTableRequest, MvBackend, ResolvedTable, TableSink,
-};
+use crate::connector::backend::{MvBackend, ResolvedTable, TableSink};
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::{
     BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
@@ -38,138 +35,8 @@ use crate::mv::refresh::execution::{
 };
 use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
-use crate::sql::parser::ast::{Literal, ObjectName};
+use crate::sql::parser::ast::Literal;
 use novarocks_catalog::identifier::TableIdentity;
-
-pub(crate) struct StarRocksTableBackend {
-    state: Weak<StandaloneState>,
-}
-
-impl StarRocksTableBackend {
-    pub(crate) fn new(state: &Arc<StandaloneState>) -> Self {
-        Self {
-            state: Arc::downgrade(state),
-        }
-    }
-
-    fn state(&self) -> Result<Arc<StandaloneState>, String> {
-        self.state
-            .upgrade()
-            .ok_or_else(|| "standalone state dropped".to_string())
-    }
-}
-
-impl CatalogBackend for StarRocksTableBackend {
-    fn name(&self) -> &'static str {
-        "starrocks"
-    }
-
-    fn namespace_exists(&self, _catalog: &str, database: &str) -> Result<bool, String> {
-        let state = self.state()?;
-        let logical = state
-            .catalog_service
-            .local()
-            .read()
-            .expect("standalone catalog read lock");
-        logical.database_exists(database)
-    }
-
-    fn create_namespace(&self, _catalog: &str, database: &str) -> Result<(), String> {
-        let state = self.state()?;
-        let mut logical = state
-            .catalog_service
-            .local()
-            .write()
-            .expect("standalone catalog write lock");
-        logical.create_database(database)
-    }
-
-    fn drop_namespace(&self, _catalog: &str, database: &str, force: bool) -> Result<(), String> {
-        let state = self.state()?;
-        if force {
-            let table_names = state
-                .starrocks_table
-                .read()
-                .expect("standalone StarRocks table read lock")
-                .list_tables_in_database(database)
-                .unwrap_or_default();
-            for table in table_names {
-                super::ddl::drop_starrocks_table(&state, database, &table)?;
-            }
-            if state.starrocks_table_config.is_some() {
-                super::ddl::drop_starrocks_database_entry(&state, database)?;
-            }
-        }
-        let mut logical = state
-            .catalog_service
-            .local()
-            .write()
-            .expect("standalone catalog write lock");
-        logical.drop_database(database)
-    }
-
-    fn create_table(&self, req: CreateTableRequest) -> Result<(), String> {
-        if !req.partition_fields.is_empty() {
-            return Err(
-                "StarRocks table CREATE TABLE does not support Iceberg PARTITION BY".to_string(),
-            );
-        }
-        let state = self.state()?;
-        super::ddl::create_starrocks_table(
-            state.as_ref(),
-            &ObjectName {
-                parts: vec![req.table],
-            },
-            &req.namespace,
-            &req.columns,
-            req.key_desc.as_ref(),
-            req.bucket_count,
-        )
-        .map(|_| ())
-    }
-
-    fn table_exists(&self, _catalog: &str, database: &str, table: &str) -> Result<bool, String> {
-        let state = self.state()?;
-        let logical = state
-            .catalog_service
-            .local()
-            .read()
-            .expect("standalone catalog read lock");
-        Ok(logical.get(database, table).is_ok())
-    }
-
-    fn drop_table(
-        &self,
-        _catalog: &str,
-        database: &str,
-        table: &str,
-        _if_exists: bool,
-    ) -> Result<(), String> {
-        let state = self.state()?;
-        super::ddl::drop_starrocks_table(&state, database, table).map(|_| ())
-    }
-
-    fn load_table(
-        &self,
-        _catalog: &str,
-        database: &str,
-        table: &str,
-    ) -> Result<ResolvedTable, String> {
-        let state = self.state()?;
-        let logical = state
-            .catalog_service
-            .local()
-            .read()
-            .expect("standalone catalog read lock");
-        let table_def = logical.get(database, table)?;
-        Ok(ResolvedTable {
-            catalog: String::new(),
-            namespace: database.to_string(),
-            table: table.to_string(),
-            columns: table_def.columns,
-        })
-    }
-}
 
 pub(crate) struct StarRocksTableSink {
     state: Weak<StandaloneState>,
