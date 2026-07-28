@@ -30,7 +30,7 @@ use crate::connector::iceberg::delete_file::{
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
     IcebergMetadataScanRange, IcebergMetadataTableType,
-    build_projected_output_schema_from_descriptor,
+    build_projected_output_schema_from_descriptor, plan_compat_iceberg_metadata_read_source,
 };
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::fragment::program::ScanAssignmentKind;
@@ -41,7 +41,7 @@ use crate::formats::parquet::{
 };
 use crate::novarocks_connectors::{
     ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsIcebergRuntimePruningConfig,
-    HdfsScanConfig, OrcScanConfig, ParquetScanConfig, ScanConfig,
+    HdfsScanConfig, OrcScanConfig, ParquetScanConfig,
 };
 use crate::novarocks_logging::{debug, warn};
 use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thrift;
@@ -1012,8 +1012,7 @@ pub(crate) fn lower_hdfs_scan_node(
     }
     // The metadata-table scan path used to require an embedded JVM bridge
     // for the Iceberg Java SDK; it now runs natively against
-    // iceberg-rust's `TableMetadata`. The operator constructor itself
-    // (`IcebergMetadataScanOp::new`) rejects flavors the native path does
+    // iceberg-rust's `TableMetadata`. The SPI reader rejects flavors the native path does
     // not yet implement (Files / Manifests / LogicalIcebergMetadata).
     let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
     let mut ranges: Vec<FileScanRange> = Vec::new();
@@ -1309,12 +1308,15 @@ pub(crate) fn lower_hdfs_scan_node(
             output_columns,
             profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         };
-        let (source, bound_ranges) = connectors.create_scan_node(
-            "iceberg",
-            crate::connector::ScanConfig::IcebergMetadata(cfg),
-        )?;
-        // Route the enriched ranges to the instance; bind at materialize time.
-        scan_ranges.capture(node.node_id, bound_ranges);
+        let source = plan_compat_iceberg_metadata_read_source(
+            connectors,
+            query_id,
+            node.node_id,
+            cfg,
+            query_opts,
+        )
+        .map_err(|error| error.to_string())?;
+        scan_ranges.capture(node.node_id, BoundScanRanges::None);
         let scan = ScanNode::new(source)
             .with_node_id(node.node_id)
             .with_output_chunk_schema(chunk_schema_for_snapshot_layout(

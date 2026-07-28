@@ -55,8 +55,11 @@ pub(crate) mod variant_write;
 pub(crate) mod write_descriptor;
 
 pub use metadata::{
-    IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanOp,
-    IcebergMetadataScanRange, IcebergMetadataTableType,
+    IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanRange,
+    IcebergMetadataTableType,
+};
+pub(crate) use metadata::{
+    plan_compat_iceberg_metadata_read_source, plan_native_iceberg_metadata_read_source,
 };
 pub(crate) use scan_planner::IcebergConnectorScanPlanner;
 pub(crate) use schema::build_projected_output_schema_from_descriptor;

@@ -125,7 +125,7 @@ pub struct IcebergTableInfo {
     /// JSON-serialized iceberg `TableMetadata`. Required when the table
     /// is referenced as an Iceberg metadata table (`t$snapshots`,
     /// `t$history`, `t$refs`, `t$partitions`) — the native-Rust
-    /// `IcebergMetadataScanOp` parses this string back via
+    /// The Iceberg metadata SPI reader parses this string back via
     /// `serde_json::from_str::<TableMetadata>` to materialise the
     /// metadata rows. The native scan plan carries this payload directly;
     /// there is no JNI bridge on the NovaRocks side. `None` for tables
