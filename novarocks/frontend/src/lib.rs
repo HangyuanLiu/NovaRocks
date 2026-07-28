@@ -21,10 +21,7 @@ pub mod dml;
 mod server;
 pub mod statistics;
 pub mod system_catalog;
-pub mod table_maintenance {
-    pub mod model;
-    pub mod repository;
-}
+pub mod table_maintenance;
 pub mod view;
 
 pub use application::{
