@@ -440,6 +440,7 @@ mod tests {
                 max_batch_bytes: 4096,
                 max_handle_payload_bytes: 1024,
                 max_total_payload_bytes: 4096,
+                provider_id: "test".to_string(),
             },
         ));
         let context = NativePlanDecodeContext::default()
@@ -473,6 +474,7 @@ mod tests {
                 max_batch_bytes: 4096,
                 max_handle_payload_bytes: 1024,
                 max_total_payload_bytes: 4096,
+                provider_id: "test".to_string(),
             },
         ));
         let context = NativePlanDecodeContext::default()
@@ -520,6 +522,7 @@ mod tests {
                 max_batch_bytes: 4096,
                 max_handle_payload_bytes: 1024,
                 max_total_payload_bytes: 4096,
+                provider_id: "test".to_string(),
             },
         ));
         let context = NativePlanDecodeContext::default()
@@ -544,6 +547,58 @@ mod tests {
                     && range.first_row_id == Some(11)
                     && range.data_sequence_number == Some(12)
                     && range.included_positions == Some(vec![13, 17])
+        ));
+    }
+
+    #[test]
+    fn native_hdfs_carrier_rehydrates_a_be_local_transport_instance() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "hdfs.native.7.12".to_string(),
+                scan_payload: Vec::new(),
+                splits: vec![plan::ConnectorReadSplit {
+                    split_id: "file-1".to_string(),
+                    split_payload: Vec::new(),
+                    estimated_bytes: Some(100),
+                    file_execution: Some(plan::FileExecutionSidecar {
+                        version: 1,
+                        file_format: plan::FileExecutionFormat::Parquet as i32,
+                        path: "s3://bucket/table/data.parquet".to_string(),
+                        file_length: 100,
+                        offset: 0,
+                        length: 100,
+                        delete_files: Vec::new(),
+                        deletion_vector: None,
+                        first_row_id: None,
+                        data_sequence_number: None,
+                        included_positions: Vec::new(),
+                        change_op: None,
+                        file_pruning_min_max_values: Default::default(),
+                    }),
+                }],
+                max_batch_rows: 128,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+                provider_id: "hdfs".to_string(),
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
+        let decoded = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect("rehydrate HDFS transport instance from the BE host");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("expected decoded scan node");
+        };
+        let op = scan
+            .source()
+            .bind(context.captured_ranges_for_test(node.node_id))
+            .expect("bind generic HDFS connector source");
+        assert!(matches!(
+            op.build_morsels().expect("build HDFS connector morsels").morsels.as_slice(),
+            [ScanMorsel::ConnectorFileSplit { range, .. }]
+                if range.path == "s3://bucket/table/data.parquet"
         ));
     }
 

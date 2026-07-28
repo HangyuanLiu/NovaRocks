@@ -52,7 +52,7 @@ use scan_planning::ConnectorScanPlanner;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use novarocks_spi::connector::{ConnectorInstance, ConnectorInstanceId};
+use novarocks_spi::connector::{ConnectorInstance, ConnectorInstanceId, ConnectorProviderId};
 
 use self::host::{ConnectorHost, ConnectorHostError, ConnectorInstanceLease};
 
@@ -400,6 +400,26 @@ impl ConnectorRegistry {
             .resolve(instance_id)
     }
 
+    pub(crate) fn materialize_transport_connector_instance(
+        &self,
+        provider_id: &ConnectorProviderId,
+        instance_id: ConnectorInstanceId,
+        scan_payload: bytes::Bytes,
+        file_ranges: &[crate::fs::scan_context::FileScanRange],
+        output_schema: crate::exec::chunk::ChunkSchemaRef,
+    ) -> Result<ConnectorInstance, ConnectorHostError> {
+        self.connector_host
+            .read()
+            .map_err(|_| ConnectorHostError::unavailable("connector host read lock poisoned"))?
+            .materialize_transport_instance(
+                provider_id,
+                instance_id,
+                scan_payload,
+                file_ranges,
+                output_schema,
+            )
+    }
+
     /// Register a query-local instance and return a lease that removes it once
     /// the physical scan no longer retains it.
     pub(crate) fn register_ephemeral_connector_instance(
@@ -515,7 +535,12 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
 
 impl Default for ConnectorRegistry {
     fn default() -> Self {
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
+        reg.connector_host
+            .write()
+            .expect("connector host write lock poisoned")
+            .register_transport_factory(Arc::new(hdfs::HdfsNativeTransportFactory::new()))
+            .expect("register native HDFS transport factory");
         reg
     }
 }
