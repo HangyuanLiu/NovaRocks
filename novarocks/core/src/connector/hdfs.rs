@@ -39,7 +39,9 @@ use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
 use crate::connector::iceberg::position_delete::load_position_deletes;
-use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
+use crate::connector::runtime::{
+    ConnectorReadAuxiliary, ConnectorReadScanSource, ConnectorScheduledSplit,
+};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
     BoundScanRanges, HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
@@ -142,6 +144,9 @@ pub(crate) fn plan_hdfs_read_source(
     context: ConnectorRequestContext,
 ) -> Result<Arc<dyn ScanSource>, ConnectorError> {
     let provider = Arc::new(HdfsConnectorInstance::new(instance_id, config));
+    let auxiliary = Arc::new(HdfsDeleteAuxiliary::new(
+        provider.config.scan.object_store_config.clone(),
+    ));
     let scheduled = (0..provider.config.scan.ranges.len())
         .map(|index| {
             Ok(ConnectorScheduledSplit::file(
@@ -166,7 +171,7 @@ pub(crate) fn plan_hdfs_read_source(
         },
         chunk_schema,
         lifecycle,
-        None,
+        Some(auxiliary),
     )))
 }
 
@@ -544,6 +549,117 @@ impl ConnectorBatchReader for HdfsFileBatchReader {
         self.ranges.clear();
         self.closed = true;
         Ok(())
+    }
+}
+
+/// Provider-private Iceberg delete-file loader. It keeps credential resolution
+/// in the HDFS provider while the core scan runner owns delete filtering.
+pub(crate) struct HdfsDeleteAuxiliary {
+    object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+}
+
+impl HdfsDeleteAuxiliary {
+    pub(crate) fn new(
+        object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    ) -> Self {
+        Self {
+            object_store_config,
+        }
+    }
+
+    fn normalized_delete_specs(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<
+        (
+            String,
+            Vec<IcebergDeleteFileSpec>,
+            crate::fs::scan_context::FileScanContext,
+        ),
+        String,
+    > {
+        let mut loader_ranges = Vec::with_capacity(1 + range.delete_files.len());
+        loader_ranges.push(FileScanRange {
+            path: range.path.clone(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        });
+        for delete_file in &range.delete_files {
+            loader_ranges.push(FileScanRange {
+                path: delete_file.path.clone(),
+                file_len: delete_file.length.unwrap_or(0),
+                offset: 0,
+                length: delete_file.length.unwrap_or(0),
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: None,
+            });
+        }
+        let context =
+            FileScanContext::build(loader_ranges, None, self.object_store_config.as_ref())?;
+        let delete_specs = context
+            .ranges
+            .iter()
+            .skip(1)
+            .zip(range.delete_files.iter())
+            .map(|(resolved, original)| IcebergDeleteFileSpec {
+                path: resolved.path.clone(),
+                file_format: original.file_format,
+                file_content: original.file_content,
+                length: original.length,
+                content_offset: original.content_offset,
+                content_size_in_bytes: original.content_size_in_bytes,
+            })
+            .collect();
+        Ok((range.path.clone(), delete_specs, context))
+    }
+}
+
+impl ConnectorReadAuxiliary for HdfsDeleteAuxiliary {
+    fn load_iceberg_position_deletes(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        if range.delete_files.is_empty() {
+            return Ok(None);
+        }
+        let (data_file_path, delete_specs, context) = self.normalized_delete_specs(range)?;
+        let deleted = load_position_deletes(&delete_specs, &data_file_path, &context.factory)?;
+        Ok((!deleted.is_empty()).then_some(deleted))
+    }
+
+    fn load_iceberg_equality_deletes(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
+    {
+        if !range
+            .delete_files
+            .iter()
+            .any(|file| file.file_content == IcebergFileContent::EqualityDeletes)
+        {
+            return Ok(None);
+        }
+        let (_, delete_specs, context) = self.normalized_delete_specs(range)?;
+        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+            &delete_specs,
+            &context.factory,
+        )?;
+        Ok((!sets.is_empty()).then_some(sets))
     }
 }
 
@@ -1023,86 +1139,11 @@ impl ScanOp for HdfsScanOp {
         &self,
         morsel: &ScanMorsel,
     ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        let ScanMorsel::FileRange {
-            path, delete_files, ..
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
             return Ok(None);
         };
-        if delete_files.is_empty() {
-            return Ok(None);
-        }
-        // Build a one-off scan context across the data file and all its delete
-        // files so a single OpenDAL operator resolves OSS / HDFS credentials
-        // for the entire set. We reuse `FileScanContext::build` for scheme
-        // classification and credential resolution, passing zero-length
-        // ranges because we never read the data file through this context —
-        // only the delete parquet files are read.
-        let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
-            Vec::with_capacity(1 + delete_files.len());
-        loader_ranges.push(crate::fs::scan_context::FileScanRange {
-            path: path.clone(),
-            file_len: 0,
-            offset: 0,
-            length: 0,
-            scan_range_id: -1,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
-            external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
-        });
-        for del in delete_files {
-            loader_ranges.push(crate::fs::scan_context::FileScanRange {
-                path: del.path.clone(),
-                file_len: del.length.unwrap_or(0),
-                offset: 0,
-                length: del.length.unwrap_or(0),
-                scan_range_id: -1,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            });
-        }
-        let ctx = crate::fs::scan_context::FileScanContext::build(
-            loader_ranges,
-            None,
-            self.cfg.object_store_config.as_ref(),
-        )?;
-        // After credential resolution `ctx.ranges` carries scheme-normalized
-        // paths suitable for the OpenDAL operator, but the delete parquet
-        // files record the data-file path exactly as the Iceberg writer saw
-        // it (`oss://bucket/...`, `hdfs://ns/...`, or an absolute filesystem
-        // path). Compare against the original morsel path so writer-recorded
-        // rows match regardless of how OpenDAL normalized the prefix.
-        let data_file_path = path.clone();
-        let normalized_delete_specs: Vec<IcebergDeleteFileSpec> = ctx
-            .ranges
-            .iter()
-            .skip(1)
-            .zip(delete_files.iter())
-            .map(|(resolved, original)| IcebergDeleteFileSpec {
-                path: resolved.path.clone(),
-                file_format: original.file_format,
-                file_content: original.file_content,
-                length: original.length,
-                content_offset: original.content_offset,
-                content_size_in_bytes: original.content_size_in_bytes,
-            })
-            .collect();
-        let deleted =
-            load_position_deletes(&normalized_delete_specs, &data_file_path, &ctx.factory)?;
-        if deleted.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(deleted))
-        }
+        HdfsDeleteAuxiliary::new(self.cfg.object_store_config.clone())
+            .load_iceberg_position_deletes(&range)
     }
 
     fn load_iceberg_equality_deletes(
@@ -1110,78 +1151,11 @@ impl ScanOp for HdfsScanOp {
         morsel: &ScanMorsel,
     ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
     {
-        let ScanMorsel::FileRange {
-            path, delete_files, ..
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
             return Ok(None);
         };
-        if !delete_files
-            .iter()
-            .any(|file| file.file_content == IcebergFileContent::EqualityDeletes)
-        {
-            return Ok(None);
-        }
-        let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
-            Vec::with_capacity(1 + delete_files.len());
-        loader_ranges.push(crate::fs::scan_context::FileScanRange {
-            path: path.clone(),
-            file_len: 0,
-            offset: 0,
-            length: 0,
-            scan_range_id: -1,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
-            external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
-        });
-        for del in delete_files {
-            loader_ranges.push(crate::fs::scan_context::FileScanRange {
-                path: del.path.clone(),
-                file_len: del.length.unwrap_or(0),
-                offset: 0,
-                length: del.length.unwrap_or(0),
-                scan_range_id: -1,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            });
-        }
-        let ctx = crate::fs::scan_context::FileScanContext::build(
-            loader_ranges,
-            None,
-            self.cfg.object_store_config.as_ref(),
-        )?;
-        let normalized_delete_specs: Vec<IcebergDeleteFileSpec> = ctx
-            .ranges
-            .iter()
-            .skip(1)
-            .zip(delete_files.iter())
-            .map(|(resolved, original)| IcebergDeleteFileSpec {
-                path: resolved.path.clone(),
-                file_format: original.file_format,
-                file_content: original.file_content,
-                length: original.length,
-                content_offset: original.content_offset,
-                content_size_in_bytes: original.content_size_in_bytes,
-            })
-            .collect();
-        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
-            &normalized_delete_specs,
-            &ctx.factory,
-        )?;
-        if sets.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(sets))
-        }
+        HdfsDeleteAuxiliary::new(self.cfg.object_store_config.clone())
+            .load_iceberg_equality_deletes(&range)
     }
 }
 
@@ -1287,9 +1261,10 @@ mod tests {
     use crate::runtime_filter::port::ordered_bound::OrderedScalar;
 
     use super::{
-        HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp, HdfsScanSource,
-        apply_parquet_pruning_gate_for_delete_files,
+        HdfsDeleteAuxiliary, HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp,
+        HdfsScanSource, apply_parquet_pruning_gate_for_delete_files,
     };
+    use crate::connector::runtime::ConnectorReadAuxiliary;
 
     fn plain_file_range(path: &str) -> FileScanRange {
         FileScanRange {
@@ -1306,6 +1281,25 @@ mod tests {
             delete_files: Vec::new(),
             iceberg_file_pruning: None,
         }
+    }
+
+    #[test]
+    fn hdfs_delete_auxiliary_skips_ranges_without_delete_files() {
+        let auxiliary = HdfsDeleteAuxiliary::new(None);
+        let range = plain_file_range("s3://bucket/path/data.parquet");
+
+        assert!(
+            auxiliary
+                .load_iceberg_position_deletes(&range)
+                .expect("no delete files should not open storage")
+                .is_none()
+        );
+        assert!(
+            auxiliary
+                .load_iceberg_equality_deletes(&range)
+                .expect("no delete files should not open storage")
+                .is_none()
+        );
     }
 
     fn hdfs_scan_source_for_test() -> HdfsScanSource {
