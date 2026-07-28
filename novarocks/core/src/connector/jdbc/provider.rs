@@ -38,11 +38,10 @@ use novarocks_spi::connector::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{JdbcScanConfig, read_jdbc_batches};
+use super::{JdbcScanConfig, read_jdbc_batch};
 use crate::connector::ConnectorRegistry;
 use crate::connector::runtime::ConnectorReadScanSource;
 use crate::exec::chunk::ChunkSchema;
-use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::ScanSource;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
@@ -366,9 +365,9 @@ impl ConnectorRead for JdbcConnectorInstance {
                 "JDBC reader expected schema does not match its scan projection",
             ));
         }
-        let iter = read_jdbc_batches(&config).map_err(internal)?;
+        let batch = read_jdbc_batch(&config).map_err(internal)?;
         Ok(Box::new(JdbcBatchReader {
-            iter,
+            batch: Some(batch),
             context: request.context,
             max_rows: request.batch.max_rows.get(),
             max_bytes: request.batch.max_bytes.get(),
@@ -378,7 +377,7 @@ impl ConnectorRead for JdbcConnectorInstance {
 }
 
 struct JdbcBatchReader {
-    iter: BoxedExecIter,
+    batch: Option<RecordBatch>,
     context: novarocks_spi::connector::ConnectorRequestContext,
     max_rows: usize,
     max_bytes: usize,
@@ -402,9 +401,8 @@ impl ConnectorBatchReader for JdbcBatchReader {
                 "connector request deadline elapsed",
             ));
         }
-        match self.iter.next() {
-            Some(Ok(chunk)) => {
-                let batch = chunk.batch;
+        match self.batch.take() {
+            Some(batch) => {
                 if batch.num_rows() > self.max_rows
                     || batch.get_array_memory_size() > self.max_bytes
                 {
@@ -415,7 +413,6 @@ impl ConnectorBatchReader for JdbcBatchReader {
                 }
                 Ok(Some(batch))
             }
-            Some(Err(error)) => Err(internal(error)),
             None => {
                 self.closed = true;
                 Ok(None)

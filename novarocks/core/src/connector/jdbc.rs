@@ -16,9 +16,7 @@
 // under the License.
 pub(crate) mod provider;
 
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource};
+use crate::exec::chunk::ChunkSchemaRef;
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, NullArray, RecordBatch,
     RecordBatchOptions, StringBuilder,
@@ -41,68 +39,18 @@ pub struct JdbcScanConfig {
     pub chunk_schema: ChunkSchemaRef,
 }
 
-#[derive(Clone, Debug)]
-pub struct JdbcScanOp {
-    cfg: JdbcScanConfig,
-}
-
-impl JdbcScanOp {
-    pub fn new(cfg: JdbcScanConfig) -> Self {
-        Self { cfg }
-    }
-}
-
-impl ScanOp for JdbcScanOp {
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        _profile: Option<crate::runtime::profile::RuntimeProfile>,
-        _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        match morsel {
-            ScanMorsel::JdbcSingle => {}
-            _ => return Err("jdbc scan received unexpected morsel".to_string()),
-        }
-        read_jdbc_batches(&self.cfg)
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        Ok(ScanMorsels::new(vec![ScanMorsel::JdbcSingle], false))
-    }
-}
-
-/// Open a provider-owned JDBC batch iterator.
-///
-/// `JdbcScanOp` remains a temporary compatibility adapter while the legacy
-/// scan-source path is being removed. New connector SPI providers call this
-/// directly and never construct a core `ScanOp`.
-pub(crate) fn read_jdbc_batches(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
+/// Read one provider-owned JDBC batch without constructing a core scan
+/// operator. The generic connector runtime adapts the returned Arrow batch to
+/// the execution layer.
+pub(crate) fn read_jdbc_batch(cfg: &JdbcScanConfig) -> Result<RecordBatch, String> {
     let url = cfg.jdbc_url.as_str();
     if url.starts_with("jdbc:sqlite:") {
-        return scan_sqlite_iter(cfg);
+        return scan_sqlite_batch(cfg);
     }
     if url.starts_with("jdbc:mysql:") || url.starts_with("mysql:") {
-        return scan_mysql_iter(cfg);
+        return scan_mysql_batch(cfg);
     }
     Err(format!("unsupported jdbc_url scheme: {url}"))
-}
-
-/// Static [`ScanSource`] for JDBC/MySQL scans. JDBC has no scan ranges, so
-/// `bind` ignores them and materializes a single-morsel [`JdbcScanOp`].
-pub(crate) struct JdbcScanSource {
-    cfg: JdbcScanConfig,
-}
-
-impl JdbcScanSource {
-    pub(crate) fn new(cfg: JdbcScanConfig) -> Self {
-        Self { cfg }
-    }
-}
-
-impl ScanSource for JdbcScanSource {
-    fn bind(&self, _ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
-        Ok(Arc::new(JdbcScanOp::new(self.cfg.clone())))
-    }
 }
 
 fn select_sql(table: &str, columns: &[String], filters: &[String], limit: Option<usize>) -> String {
@@ -124,7 +72,7 @@ fn select_sql(table: &str, columns: &[String], filters: &[String], limit: Option
     sql
 }
 
-fn scan_sqlite_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
+fn scan_sqlite_batch(cfg: &JdbcScanConfig) -> Result<RecordBatch, String> {
     let path = cfg
         .jdbc_url
         .strip_prefix("jdbc:sqlite:")
@@ -145,11 +93,10 @@ fn scan_sqlite_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
         }
         row_count += 1;
     }
-    let chunk = chunk_from_builders(builders, row_count, &cfg.chunk_schema)?;
-    Ok(Box::new(std::iter::once(Ok(chunk))))
+    batch_from_builders(builders, row_count, &cfg.chunk_schema)
 }
 
-fn scan_mysql_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
+fn scan_mysql_batch(cfg: &JdbcScanConfig) -> Result<RecordBatch, String> {
     use mysql::prelude::Queryable;
 
     let jdbc_url = cfg.jdbc_url.as_str();
@@ -192,8 +139,7 @@ fn scan_mysql_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
         }
         row_count += 1;
     }
-    let chunk = chunk_from_builders(builders, row_count, &cfg.chunk_schema)?;
-    Ok(Box::new(std::iter::once(Ok(chunk))))
+    batch_from_builders(builders, row_count, &cfg.chunk_schema)
 }
 
 enum ColumnBuilder {
@@ -311,11 +257,11 @@ fn append_utf8(builder: &mut ColumnBuilder, value: &str) {
     }
 }
 
-fn chunk_from_builders(
+fn batch_from_builders(
     builders: Vec<ColumnBuilder>,
     row_count: usize,
     chunk_schema: &ChunkSchemaRef,
-) -> Result<Chunk, String> {
+) -> Result<RecordBatch, String> {
     if chunk_schema.slot_ids().len() != builders.len() {
         return Err(format!(
             "jdbc scan output columns/chunk schema mismatch: num_columns={} slot_ids={:?}",
@@ -340,8 +286,7 @@ fn chunk_from_builders(
         RecordBatch::try_new(schema, arrays)
     }
     .map_err(|e| e.to_string())?;
-    let chunk_schema = Arc::new(chunk_schema.with_fields_in_order(fields)?);
-    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+    Ok(batch)
 }
 
 fn finish_column(builder: ColumnBuilder, row_count: usize) -> Result<ArrayRef, String> {
@@ -423,38 +368,5 @@ fn mysql_column_type_to_datatype(col_type: ColumnType) -> DataType {
         | ColumnType::MYSQL_TYPE_GEOMETRY
         | ColumnType::MYSQL_TYPE_TYPED_ARRAY
         | ColumnType::MYSQL_TYPE_UNKNOWN => DataType::Utf8,
-    }
-}
-
-// Integration tests are located under tests/ to avoid coupling to this module's internals.
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::chunk::ChunkSchema;
-
-    fn sample_cfg() -> JdbcScanConfig {
-        JdbcScanConfig {
-            jdbc_url: "jdbc:sqlite::memory:".to_string(),
-            jdbc_user: None,
-            jdbc_passwd: None,
-            table: "t".to_string(),
-            columns: vec!["a".to_string()],
-            filters: Vec::new(),
-            limit: None,
-            chunk_schema: Arc::new(ChunkSchema::empty()),
-        }
-    }
-
-    #[test]
-    fn jdbc_scan_source_bind_none_yields_single_jdbc_morsel() {
-        let source = JdbcScanSource::new(sample_cfg());
-        let op = source
-            .bind(BoundScanRanges::None)
-            .expect("jdbc bind should succeed");
-        let morsels = op.build_morsels().expect("build morsels");
-        assert!(!morsels.has_more);
-        assert_eq!(morsels.morsels.len(), 1);
-        assert!(matches!(morsels.morsels[0], ScanMorsel::JdbcSingle));
     }
 }
