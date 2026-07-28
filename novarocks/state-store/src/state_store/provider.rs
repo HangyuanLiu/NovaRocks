@@ -19,12 +19,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::state_store::{
-    StateStoreLimits, StateStoreProviderFactory, StateStoreProviderId,
+    MAX_KEY_BYTES, StateStoreLimits, StateStoreProviderFactory, StateStoreProviderId,
 };
 
-use super::config::StateStoreHostConfig;
+use super::config::{StateStoreHostConfig, StateStoreProviderConfig};
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
-use super::limits::resolve_state_store_limits;
+use super::limits::{MYSQL_MAX_KEY_BYTES, resolve_state_store_limits};
+use super::sqlite::SqliteStateStoreProviderFactory;
 
 pub const SQLITE_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
     StateStoreProviderId::new("sqlite");
@@ -150,6 +151,43 @@ impl StateStoreProviderRegistry {
         }
         Ok(BoundStateStoreProvider { factory, limits })
     }
+}
+
+pub fn builtin_state_store_provider_registry()
+-> Result<StateStoreProviderRegistry, StateStoreHostError> {
+    let mut registry = StateStoreProviderRegistry::new();
+    registry.register(StateStoreProviderRegistration::available(
+        SQLITE_STATE_STORE_PROVIDER_ID,
+        MAX_KEY_BYTES,
+        |config| {
+            let StateStoreProviderConfig::Sqlite {
+                path,
+                deployment_owner,
+            } = &config.state_store.store.provider
+            else {
+                return Err(StateStoreHostError::new(
+                    StateStoreHostErrorKind::Bind,
+                    Some(SQLITE_STATE_STORE_PROVIDER_ID),
+                    "SQLite provider binder requires SQLite provider configuration",
+                ));
+            };
+            Ok(Box::new(SqliteStateStoreProviderFactory::new(
+                path.clone(),
+                deployment_owner.clone(),
+            )))
+        },
+    ))?;
+    registry.register(StateStoreProviderRegistration::unavailable(
+        MYSQL_STATE_STORE_PROVIDER_ID,
+        "MySQL provider is not compiled in",
+        MYSQL_MAX_KEY_BYTES,
+    ))?;
+    registry.register(StateStoreProviderRegistration::unavailable(
+        FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
+        "FoundationDB provider is not compiled in",
+        MAX_KEY_BYTES,
+    ))?;
+    Ok(registry)
 }
 
 #[cfg(test)]

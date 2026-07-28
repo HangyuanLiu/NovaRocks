@@ -16,10 +16,12 @@
 // under the License.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub mod config;
 pub mod coordination;
 mod deployment;
+mod host;
 pub mod host_error;
 pub mod limits;
 pub mod metrics;
@@ -27,7 +29,10 @@ pub mod provider;
 pub mod runner;
 mod runtime;
 
-use novarocks_spi::state_store::{StateStore, StateStoreError, StateStoreErrorKind};
+use novarocks_spi::state_store::{
+    FeDeploymentView as SpiFeDeploymentView, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreOpenRequest, StateStoreProviderFactory,
+};
 
 mod sqlite;
 
@@ -46,11 +51,13 @@ pub use config::{
     StateStoreConfig, StateStoreHostConfig, StateStoreProviderConfig,
 };
 pub use deployment::FeDeploymentView;
+pub use host::{StateStoreHost, StateStoreHostLifecycle};
 pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
 pub use limits::StateStoreLimitOverrides;
 pub use provider::{
     FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MYSQL_STATE_STORE_PROVIDER_ID,
     SQLITE_STATE_STORE_PROVIDER_ID, StateStoreProviderRegistration, StateStoreProviderRegistry,
+    builtin_state_store_provider_registry,
 };
 pub use runner::{
     OperationId, RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free,
@@ -65,9 +72,47 @@ pub async fn open_state_store(
     match &config.provider {
         StateStoreProviderConfig::Sqlite { .. } => {
             runtime.accepts_local()?;
-            Ok(Arc::new(
-                sqlite::SqliteStateStore::open(config, deployment).await?,
-            ))
+            config.validate().map_err(|_| {
+                StateStoreError::new(
+                    StateStoreErrorKind::InvalidConfiguration,
+                    "SQLite state store configuration is invalid",
+                )
+            })?;
+            let StateStoreProviderConfig::Sqlite {
+                path,
+                deployment_owner,
+            } = config.provider
+            else {
+                unreachable!()
+            };
+            let limits = limits::resolve_state_store_limits(
+                &config.limits,
+                novarocks_spi::state_store::MAX_KEY_BYTES,
+            )
+            .map_err(|_| {
+                StateStoreError::new(
+                    StateStoreErrorKind::InvalidConfiguration,
+                    "SQLite state store limits are invalid",
+                )
+            })?;
+            let factory = sqlite::SqliteStateStoreProviderFactory::new(path, deployment_owner);
+            let instance = Box::new(factory)
+                .open(StateStoreOpenRequest {
+                    cluster_id: config.cluster_id,
+                    limits,
+                    deployment: SpiFeDeploymentView {
+                        active_fe_count: deployment.active_fe_count,
+                        topology_revision: deployment.topology_revision,
+                    },
+                    deadline: Instant::now() + Duration::from_secs(30),
+                })
+                .await?;
+            instance.state_store().ok_or_else(|| {
+                StateStoreError::new(
+                    StateStoreErrorKind::Internal,
+                    "SQLite state store provider opened without a store",
+                )
+            })
         }
         StateStoreProviderConfig::Foundationdb { .. } => {
             #[cfg(not(feature = "foundationdb-provider"))]

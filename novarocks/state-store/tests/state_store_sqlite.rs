@@ -19,8 +19,10 @@ mod common;
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,8 +33,8 @@ use novarocks_spi::state_store::{
     Value,
 };
 use novarocks_state_store::{
-    FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    StateStoreRuntime, open_state_store,
+    FeDeploymentView, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -97,7 +99,30 @@ fn assert_failed_operation_observed(
     );
 }
 
-async fn open_store(temp: &TempDir, owner: &str) -> Arc<dyn StateStore> {
+struct HostedStore {
+    host: StateStoreHost,
+    store: Arc<dyn StateStore>,
+}
+
+impl Deref for HostedStore {
+    type Target = Arc<dyn StateStore>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+impl HostedStore {
+    async fn shutdown(self) {
+        let Self { mut host, store } = self;
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite state store host");
+    }
+}
+
+async fn open_store(temp: &TempDir, owner: &str) -> HostedStore {
     open_store_with_limits(temp, owner, StateStoreLimitOverrides::default()).await
 }
 
@@ -105,25 +130,39 @@ async fn open_store_with_limits(
     temp: &TempDir,
     owner: &str,
     limits: StateStoreLimitOverrides,
-) -> Arc<dyn StateStore> {
-    let runtime = StateStoreRuntime::local().expect("create local state store runtime");
-    open_state_store(
-        &runtime,
-        StateStoreConfig {
-            cluster_id: "cluster-a".to_owned(),
-            limits,
-            provider: StateStoreProviderConfig::Sqlite {
-                path: temp.path().join("state-store.sqlite"),
-                deployment_owner: owner.to_owned(),
+) -> HostedStore {
+    let host = open_sqlite_host(StateStoreConfig {
+        cluster_id: "cluster-a".to_owned(),
+        limits,
+        provider: StateStoreProviderConfig::Sqlite {
+            path: temp.path().join("state-store.sqlite"),
+            deployment_owner: owner.to_owned(),
+        },
+    })
+    .await;
+    let store = host.state_store().expect("SQLite host store exposure");
+    HostedStore { host, store }
+}
+
+async fn open_sqlite_host(config: StateStoreConfig) -> StateStoreHost {
+    let registry = builtin_state_store_provider_registry().expect("built-in state store registry");
+    StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: config,
+                mysql_client: None,
             },
+            foundationdb_client: None,
         },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).expect("one FE"),
             topology_revision: Bytes::from_static(b"topology-r1"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
-    .expect("open public SQLite state store")
+    .expect("open SQLite state store host")
 }
 
 async fn read_state_record(
@@ -157,37 +196,33 @@ fn state_store_factory(max_transaction_bytes: usize, max_value_bytes: usize) -> 
                 .expect("conformance temp keepalive")
                 .push(Arc::clone(&temp));
             let path = temp.path().join("state-store.sqlite");
-            let runtime = StateStoreRuntime::local()?;
-            let store = open_state_store(
-                &runtime,
-                StateStoreConfig {
-                    cluster_id: "conformance-cluster".to_owned(),
-                    limits: StateStoreLimitOverrides {
-                        max_key_bytes: Some(64),
-                        max_value_bytes: Some(max_value_bytes),
-                        max_page_size: Some(10),
-                        max_transaction_operations: Some(8),
-                        max_transaction_bytes: Some(max_transaction_bytes),
-                        transaction_deadline_ms: Some(250),
-                        runner_max_attempts: Some(3),
-                    },
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path: path.clone(),
-                        deployment_owner: "conformance-fe".to_owned(),
-                    },
+            let host = open_sqlite_host_result(StateStoreConfig {
+                cluster_id: "conformance-cluster".to_owned(),
+                limits: StateStoreLimitOverrides {
+                    max_key_bytes: Some(64),
+                    max_value_bytes: Some(max_value_bytes),
+                    max_page_size: Some(10),
+                    max_transaction_operations: Some(8),
+                    max_transaction_bytes: Some(max_transaction_bytes),
+                    transaction_deadline_ms: Some(250),
+                    runner_max_attempts: Some(3),
                 },
-                FeDeploymentView {
-                    active_fe_count: NonZeroUsize::new(1).expect("one FE"),
-                    topology_revision: Bytes::from_static(b"conformance-topology"),
+                provider: StateStoreProviderConfig::Sqlite {
+                    path: path.clone(),
+                    deployment_owner: "conformance-fe".to_owned(),
                 },
-            )
+            })
             .await?;
+            let store = host
+                .state_store()
+                .expect("conformance SQLite host store exposure");
             let fault = FaultInjectingStateStore::new(store);
             let controller: Arc<dyn PostDispatchController> =
                 Arc::new(SqlitePostDispatchController {
                     fault: Arc::clone(&fault),
                     path,
                     _temp: temp,
+                    _host: tokio::sync::Mutex::new(host),
                 });
             let store: Arc<dyn StateStore> = fault;
             Ok(StateStoreConformanceFixture::new(store, controller))
@@ -195,10 +230,44 @@ fn state_store_factory(max_transaction_bytes: usize, max_value_bytes: usize) -> 
     })
 }
 
+async fn open_sqlite_host_result(
+    config: StateStoreConfig,
+) -> Result<StateStoreHost, novarocks_spi::state_store::StateStoreError> {
+    let registry = builtin_state_store_provider_registry().map_err(|_| {
+        novarocks_spi::state_store::StateStoreError::new(
+            StateStoreErrorKind::Internal,
+            "failed to construct built-in state store registry",
+        )
+    })?;
+    StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: config,
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+            topology_revision: Bytes::from_static(b"conformance-topology"),
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .map_err(|_| {
+        novarocks_spi::state_store::StateStoreError::new(
+            StateStoreErrorKind::ProviderUnavailable,
+            "failed to open SQLite state store host",
+        )
+    })
+}
+
 struct SqlitePostDispatchController {
     fault: Arc<FaultInjectingStateStore>,
     path: PathBuf,
     _temp: Arc<TempDir>,
+    _host: tokio::sync::Mutex<StateStoreHost>,
 }
 
 #[async_trait]
@@ -570,25 +639,33 @@ mod conformance {
         let temp = TempDir::new().expect("owner lifecycle temp dir");
         let first = open_store(&temp, "fe-a").await;
         let identity = first.identity().await.expect("first owner identity");
-        let runtime = StateStoreRuntime::local().expect("create local state store runtime");
-        let second = open_state_store(
-            &runtime,
-            StateStoreConfig {
-                cluster_id: "cluster-a".to_owned(),
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Sqlite {
-                    path: temp.path().join("state-store.sqlite"),
-                    deployment_owner: "fe-b".to_owned(),
+        let registry =
+            builtin_state_store_provider_registry().expect("built-in state store registry");
+        let second = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "cluster-a".to_owned(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: temp.path().join("state-store.sqlite"),
+                            deployment_owner: "fe-b".to_owned(),
+                        },
+                    },
+                    mysql_client: None,
                 },
+                foundationdb_client: None,
             },
             FeDeploymentView {
                 active_fe_count: NonZeroUsize::new(1).expect("one FE"),
                 topology_revision: Bytes::from_static(b"topology-r1"),
             },
+            Instant::now() + Duration::from_secs(5),
         )
         .await;
         assert!(second.is_err(), "second live SQLite owner must be rejected");
-        drop(first);
+        first.shutdown().await;
         let restarted = open_store(&temp, "fe-a").await;
         assert_eq!(
             restarted
@@ -597,6 +674,7 @@ mod conformance {
                 .expect("restarted owner identity"),
             identity
         );
+        restarted.shutdown().await;
     }
 }
 
@@ -1875,22 +1953,14 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
         let gate = Arc::clone(&gate);
         opens.push(tokio::spawn(async move {
             gate.wait().await;
-            let runtime = StateStoreRuntime::local().expect("create local state store runtime");
-            open_state_store(
-                &runtime,
-                StateStoreConfig {
-                    cluster_id: "race-cluster".to_owned(),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path,
-                        deployment_owner: "race-fe".to_owned(),
-                    },
+            open_sqlite_host_result(StateStoreConfig {
+                cluster_id: "race-cluster".to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Sqlite {
+                    path,
+                    deployment_owner: "race-fe".to_owned(),
                 },
-                FeDeploymentView {
-                    active_fe_count: NonZeroUsize::new(1).expect("one FE"),
-                    topology_revision: Bytes::from_static(b"race-topology"),
-                },
-            )
+            })
             .await
         }));
     }
@@ -1903,7 +1973,8 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
         (Err(first), Err(second)) => panic!("one first open must succeed: {first}; {second}"),
     };
     assert_eq!(loser.kind(), StateStoreErrorKind::ProviderUnavailable);
-    let identity = winner.identity().await.expect("winner identity");
+    let winner_store = winner.state_store().expect("winner store exposure");
+    let identity = winner_store.identity().await.expect("winner identity");
 
     let connection = Connection::open(&path).expect("inspect raced database");
     let tables: HashSet<String> = connection
@@ -1925,28 +1996,30 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
         ])
     );
     drop(connection);
-    drop(winner);
+    drop(winner_store);
+    let mut winner = winner;
+    winner
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown first-open winner");
 
-    let runtime = StateStoreRuntime::local().expect("create local state store runtime");
-    let reopened = open_state_store(
-        &runtime,
-        StateStoreConfig {
-            cluster_id: "race-cluster".to_owned(),
-            limits: StateStoreLimitOverrides::default(),
-            provider: StateStoreProviderConfig::Sqlite {
-                path,
-                deployment_owner: "race-fe".to_owned(),
-            },
+    let mut reopened = open_sqlite_host(StateStoreConfig {
+        cluster_id: "race-cluster".to_owned(),
+        limits: StateStoreLimitOverrides::default(),
+        provider: StateStoreProviderConfig::Sqlite {
+            path,
+            deployment_owner: "race-fe".to_owned(),
         },
-        FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(1).expect("one FE"),
-            topology_revision: Bytes::from_static(b"race-topology-reopen"),
-        },
-    )
-    .await
-    .expect("winner schema must reopen cleanly");
+    })
+    .await;
+    let reopened_store = reopened.state_store().expect("reopened store exposure");
     assert_eq!(
-        reopened.identity().await.expect("reopened identity"),
+        reopened_store.identity().await.expect("reopened identity"),
         identity
     );
+    drop(reopened_store);
+    reopened
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("shutdown reopened host");
 }

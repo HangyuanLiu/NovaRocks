@@ -67,6 +67,26 @@ impl StateStoreHostError {
         )
     }
 
+    pub(crate) fn provider_failure(
+        kind: StateStoreHostErrorKind,
+        provider_id: StateStoreProviderId,
+        message: impl Into<String>,
+        primary: StateStoreError,
+    ) -> Self {
+        Self {
+            kind,
+            provider_id: Some(provider_id),
+            message: message.into(),
+            primary: Some(primary),
+            cleanup: None,
+        }
+    }
+
+    pub(crate) fn with_cleanup(mut self, cleanup: StateStoreError) -> Self {
+        self.cleanup = Some(cleanup);
+        self
+    }
+
     pub const fn kind(&self) -> StateStoreHostErrorKind {
         self.kind
     }
