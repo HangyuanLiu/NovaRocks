@@ -76,7 +76,7 @@ pub(crate) mod mv_scheduler;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
-pub(crate) mod statistics;
+pub mod statistics;
 pub mod system_catalog;
 pub mod view;
 pub(crate) mod virtual_table;
