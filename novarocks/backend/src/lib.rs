@@ -3,6 +3,7 @@ mod fragment;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-    BackendServerConfig, run_backend_server, run_backend_server_until_shutdown,
+    BackendServerConfig, backend_native_report_handler, run_backend_server,
+    run_backend_server_until_shutdown,
 };
 pub use fragment::NativeFragmentService;

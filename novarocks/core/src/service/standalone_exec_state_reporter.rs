@@ -339,9 +339,24 @@ fn run_priority_worker(reporter: &'static StandaloneExecStateReporter) {
             handle_final_report_exhaustion_with(
                 task,
                 err,
-                crate::coordinator::report::mark_query_failed_from_report,
+                fail_local_query_after_report_exhaustion,
             );
         }
+    }
+}
+
+/// Stop only fragment/query resources owned by this backend after its final
+/// report cannot reach the frontend. Frontend query-wide failure ownership
+/// remains behind the report transport boundary.
+fn fail_local_query_after_report_exhaustion(query_id: QueryId, finst_id: UniqueId, error: String) {
+    let manager = crate::runtime::query_context::query_context_manager();
+    let mut local_finsts = manager.cancel_query(query_id, error.clone());
+    if !local_finsts.contains(&finst_id) {
+        local_finsts.push(finst_id);
+    }
+    for local_finst_id in local_finsts {
+        crate::runtime::result_buffer::close_error(local_finst_id, error.clone());
+        crate::runtime::exchange::cancel_fragment(local_finst_id.hi, local_finst_id.lo);
     }
 }
 
@@ -351,7 +366,29 @@ fn send_once(task: &StandaloneExecStateReportTask) -> Result<(), String> {
     let resp = client.blocking_report_exec_status(proto::novarocks::ReportExecStatusRequest {
         report: Some(task.report.clone()),
     })?;
-    interpret_report_exec_status_response(resp)
+    let emit_failed_report_ack = should_emit_failed_report_ack(task, &resp);
+    interpret_report_exec_status_response(resp)?;
+    if crate::common::config::sql_test_fragment_failure_harness_enabled() && emit_failed_report_ack
+    {
+        eprintln!(
+            "NOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi={} query_lo={} finst_hi={} finst_lo={}",
+            task.query_id.hi, task.query_id.lo, task.finst_id.hi, task.finst_id.lo
+        );
+    }
+    Ok(())
+}
+
+fn should_emit_failed_report_ack(
+    task: &StandaloneExecStateReportTask,
+    resp: &proto::novarocks::ReportExecStatusResponse,
+) -> bool {
+    resp.status_code == crate::service::grpc_server::REPORT_EXEC_STATUS_OK
+        && task.report.done
+        && task
+            .report
+            .status
+            .as_ref()
+            .is_some_and(|status| status.code != 0)
 }
 
 fn interpret_report_exec_status_response(
@@ -552,6 +589,46 @@ mod tests {
         assert!(
             err.contains("expected error_code=WriteCoordinatorGone"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_report_ack_evidence_requires_explicit_frontend_ok() {
+        let mut task = test_task();
+        task.report.status = Some(proto::common::Status {
+            code: 1,
+            message: "fragment failed".to_string(),
+        });
+        let accepted = proto::novarocks::ReportExecStatusResponse {
+            status_code: crate::service::grpc_server::REPORT_EXEC_STATUS_OK,
+            message: String::new(),
+            error_code: String::new(),
+        };
+        let query_gone = proto::novarocks::ReportExecStatusResponse {
+            status_code: crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
+            message: "query is gone".to_string(),
+            error_code: "WriteCoordinatorGone".to_string(),
+        };
+
+        assert!(should_emit_failed_report_ack(&task, &accepted));
+        assert!(
+            !should_emit_failed_report_ack(&task, &query_gone),
+            "QUERY_GONE is terminal for retries but must not prove that FE accepted the report"
+        );
+
+        task.report.done = false;
+        assert!(
+            !should_emit_failed_report_ack(&task, &accepted),
+            "a non-final failed report cannot prove final failure acceptance"
+        );
+        task.report.done = true;
+        task.report.status = Some(proto::common::Status {
+            code: 0,
+            message: String::new(),
+        });
+        assert!(
+            !should_emit_failed_report_ack(&task, &accepted),
+            "a successful final report is not failed-fragment ACK evidence"
         );
     }
 

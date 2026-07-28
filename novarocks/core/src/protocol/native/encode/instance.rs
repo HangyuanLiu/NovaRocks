@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 
 use crate::common::types::UniqueId;
-use crate::coordinator::scheduler::FragmentInstancePlacement;
 use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::proto::{common, novarocks};
+use crate::query_execution::schedule::FragmentInstancePlacement;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range;

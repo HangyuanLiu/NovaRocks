@@ -113,8 +113,7 @@ pub(crate) trait RuntimeFilterInstallPort: Send + Sync {
 
 /// RF pre-submit extension. Turns a compiled [`RuntimeFilterDeploymentPlan`]
 /// into per-participant install requests. It does not own query lifecycle —
-/// RFD-6 wires this into `ExecutionCoordinator`'s pre-submit phase
-/// (`coordinator/execution.rs:195`).
+/// The frontend query execution owner wires this into its pre-submit phase.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeFilterDeploymentExtension;
 

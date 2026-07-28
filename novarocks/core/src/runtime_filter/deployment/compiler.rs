@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::types::UniqueId;
-use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::scheduler::SchedulingPlan;
+use crate::query_execution::backend::LiveBackendSnapshot;
+use crate::query_execution::schedule::SchedulingPlan;
 use crate::runtime_filter::deployment::role_graph::{
     ChannelRoleInputs, ConsumerPlacement, ProducerPlacement, RoleGraph, RouteEdgeAllocator,
     build_channel_role_graph,
@@ -282,7 +282,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::coordinator::scheduler::FragmentInstancePlacement;
+    use crate::query_execution::schedule::FragmentInstancePlacement;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
     use crate::runtime_filter::deployment::role_graph::RouteKind;

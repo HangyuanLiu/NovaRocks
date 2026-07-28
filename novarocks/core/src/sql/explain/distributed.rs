@@ -19,7 +19,7 @@ use std::{collections::HashMap, fmt::Write};
 
 use arrow::datatypes::DataType;
 
-use crate::coordinator::profile::correlate::{ActualMetrics, DistributedProfileSummary};
+use crate::query_execution::profile::{ActualMetrics, DistributedProfileSummary};
 use crate::runtime_filter::model::contract::{
     ConsumerActivation, LateApplyGranularity, NullOrder, NullSemantics, RuntimeFilterLogicalDomain,
     SortDirection,
@@ -1599,8 +1599,8 @@ mod tests {
         explain_distributed_plan_analyze, explain_fragment_order,
         format_distributed_shared_plan_node_header,
     };
-    use crate::coordinator::profile::correlate::{ActualMetrics, DistributedProfileSummary};
     use crate::exec::node::sort::SortTopNType;
+    use crate::query_execution::profile::{ActualMetrics, DistributedProfileSummary};
     use crate::sql::analysis::{
         ExprKind, JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };

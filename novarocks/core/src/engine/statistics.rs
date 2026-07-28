@@ -402,6 +402,7 @@ fn collect_statistics_through_engine(
             &database,
             state.exchange_port,
             None,
+            &state.query_execution,
         )?;
         let row_count = result_cell(&result, 0, 0)
             .and_then(|value| value.parse::<i64>().ok())

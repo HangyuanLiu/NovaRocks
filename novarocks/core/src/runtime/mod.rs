@@ -34,7 +34,6 @@ pub(crate) mod query_cancel;
 pub mod query_context;
 pub mod query_options;
 pub mod query_result;
-pub(crate) mod query_state;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
 #[allow(dead_code)]
 pub mod result_buffer;

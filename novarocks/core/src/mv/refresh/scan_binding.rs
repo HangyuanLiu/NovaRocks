@@ -20,14 +20,14 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
-use crate::coordinator::prepare::scan::{
-    IcebergDeltaScanRuntimePlan, ResolvedIcebergDeltaScan, ResolvedIcebergFileScan,
-    ResolvedScanExecution, ScanBindingResolver,
-};
 use crate::exec::node::iceberg_delta_scan::{
     DeltaScanDeleteSidePayload, IcebergDeltaDataColumnPayload,
 };
 use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
+use crate::query_execution::preparation::scan::{
+    IcebergDeltaScanRuntimePlan, ResolvedIcebergDeltaScan, ResolvedIcebergFileScan,
+    ResolvedScanExecution, ScanBindingResolver,
+};
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
 

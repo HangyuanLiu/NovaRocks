@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan;
 use crate::connector::iceberg::commit::{CleanupAttempt, CommitOutcome, CommitServiceError};
-use crate::coordinator::execution::CoordinatedQueryResult;
-use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::StandaloneState;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
 };
+use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::optimizer::OptimizedOperatorNode;
 use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec;
@@ -57,7 +57,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let mut build_input = self
             .build_input
             .lock()
@@ -84,6 +84,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
             .lock()
             .expect("change-stream commit plan lock poisoned") = Some(commit_plan);
         crate::engine::execute_planned_iceberg_change_stream_write(
+            &build_input.state,
             prepared,
             native_bundle,
             build_input.query_opts.clone(),

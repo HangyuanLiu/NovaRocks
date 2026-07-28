@@ -6,12 +6,32 @@ use std::time::{Duration, Instant};
 
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
+use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::{grpc_server, report_worker};
 
 use crate::fragment::NativeFragmentService;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BACKEND_REPORT_ROLE_REJECTION: &str =
+    "native backend role does not own coordinator report ingress";
+
+struct BackendNativeReportHandler;
+
+impl NativeReportHandler for BackendNativeReportHandler {
+    fn handle_native_report(
+        &self,
+        _report: novarocks::proto::novarocks::ExecStatusReport,
+    ) -> Result<(), NativeReportHandlerError> {
+        Err(NativeReportHandlerError::role_rejected(
+            BACKEND_REPORT_ROLE_REJECTION,
+        ))
+    }
+}
+
+pub fn backend_native_report_handler() -> Arc<dyn NativeReportHandler> {
+    Arc::new(BackendNativeReportHandler)
+}
 
 pub struct BackendServerConfig {
     pub config: NovaRocksConfig,
@@ -120,6 +140,7 @@ impl BackendApplicationHost {
             &bind_host,
             grpc_port,
             native_fragment_service.clone(),
+            backend_native_report_handler(),
         )
         .map_err(|error| {
             BackendApplicationError::new(
@@ -282,12 +303,18 @@ fn wait_for_tcp_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
+    use std::sync::{LazyLock, Mutex};
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
         BackendServerConfig, combine_primary_and_shutdown,
     };
     use novarocks::common::app_config::NovaRocksConfig;
+    use novarocks::proto::common::{Status, UniqueId};
+    use novarocks::proto::novarocks::{ExecStatusReport, ReportExecStatusRequest};
+    use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
+
+    static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn unused_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -310,6 +337,7 @@ mod tests {
 
     #[test]
     fn readiness_failure_stops_and_joins_started_listener() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
         let mut config = backend_config(grpc_port, grpc_port);
         config.config.cluster.advertise_host = "127.0.0.2".to_string();
@@ -322,6 +350,40 @@ mod tests {
         assert_eq!(error.kind(), BackendApplicationErrorKind::Readiness);
         TcpListener::bind(("127.0.0.1", grpc_port))
             .expect("readiness cleanup must release the started listener");
+    }
+
+    #[test]
+    fn native_backend_rejects_coordinator_reports_with_role_error() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
+            .expect("native backend host starts");
+        let client = NovaRocksGrpcRemoteClient::new(
+            format!("127.0.0.1:{grpc_port}")
+                .parse()
+                .expect("backend address"),
+        )
+        .expect("gRPC client");
+
+        let response = client
+            .blocking_report_exec_status(ReportExecStatusRequest {
+                report: Some(ExecStatusReport {
+                    query_id: Some(UniqueId { hi: 41, lo: 73 }),
+                    fragment_instance_id: Some(UniqueId { hi: 41, lo: 74 }),
+                    status: Some(Status::default()),
+                    done: true,
+                    ..Default::default()
+                }),
+            })
+            .expect("role rejection is returned as a business response");
+
+        assert_eq!(response.status_code, 1);
+        assert_eq!(response.error_code, "NativeReportRoleRejected");
+        assert_eq!(
+            response.message,
+            "native backend role does not own coordinator report ingress"
+        );
+        host.shutdown().expect("native backend shutdown");
     }
 
     #[test]

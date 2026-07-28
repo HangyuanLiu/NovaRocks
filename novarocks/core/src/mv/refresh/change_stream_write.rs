@@ -14,7 +14,7 @@ use crate::connector::iceberg::change_stream_routing::{
     route_change_stream_writer_reports,
 };
 use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
-use crate::coordinator::write::report::WriteCommitInput;
+use crate::query_execution::write::WriteCommitInput;
 
 pub(crate) struct ExecutedChangeStreamWrite {
     pub(crate) write_commit: WriteCommitInput,
@@ -141,7 +141,7 @@ mod tests {
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
-    use crate::coordinator::write::report::{WriterCommitInput, WriterKey};
+    use crate::query_execution::write::{WriterCommitInput, WriterKey};
     use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
     use crate::sql::common::ChangeStreamBranchKind;
 

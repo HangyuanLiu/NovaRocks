@@ -16,7 +16,7 @@
 // under the License.
 #[cfg(feature = "compat")]
 pub mod backend_service;
-pub(crate) mod cluster_heartbeat;
+pub mod cluster_heartbeat;
 #[cfg(feature = "compat")]
 pub mod disk_report;
 #[cfg(feature = "compat")]
@@ -33,7 +33,6 @@ pub mod fragment_control;
 #[cfg(feature = "compat")]
 pub mod frontend_rpc;
 pub mod grpc_client;
-pub(crate) mod grpc_coordinator_adapter;
 pub(crate) mod grpc_fragment_dispatcher;
 pub(crate) mod grpc_runtime_filter_adapter;
 pub(crate) mod grpc_runtime_filter_install_adapter;

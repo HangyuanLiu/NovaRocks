@@ -17,8 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
-use crate::coordinator::prepare::PreparedFragmentSet;
 use crate::proto::plan::PlanFragment as NativePlanFragment;
+use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::sql::planner::distributed::{DistributedPlan, FragmentId};
 
 pub(crate) struct NativeFragmentBundle {
@@ -45,6 +45,17 @@ impl NativeFragmentBundle {
     pub(crate) fn into_fragments(self) -> btree_map::IntoIter<FragmentId, NativePlanFragment> {
         self.by_fragment.into_iter()
     }
+}
+
+#[cfg(feature = "query-execution-contract-test-support")]
+pub(crate) fn native_fragment_bundle_for_contract_test(
+    fragments: Vec<NativePlanFragment>,
+) -> Result<NativeFragmentBundle, String> {
+    let expected_ids = fragments
+        .iter()
+        .map(|fragment| fragment.fragment_id)
+        .collect::<BTreeSet<_>>();
+    collect_native_fragment_bundle(fragments, &expected_ids)
 }
 
 pub(crate) fn encode_native_fragment_bundle(
@@ -98,36 +109,6 @@ fn fragment_set_error(
     format!(
         "{label} fragment ids mismatch: expected={expected:?} actual={actual:?} missing={missing:?} unknown={unknown:?}"
     )
-}
-
-#[cfg(test)]
-pub(crate) enum NativeBundleTestDrift {
-    Missing(FragmentId),
-    Unknown(FragmentId),
-}
-
-/// Corrupts an already production-encoded bundle for coordinator rejection tests.
-/// This deliberately cannot construct an arbitrary second bundle truth.
-#[cfg(test)]
-pub(crate) fn corrupt_native_fragment_bundle_for_execution_test(
-    mut bundle: NativeFragmentBundle,
-    drift: NativeBundleTestDrift,
-) -> NativeFragmentBundle {
-    match drift {
-        NativeBundleTestDrift::Missing(fragment_id) => {
-            bundle.by_fragment.remove(&fragment_id);
-        }
-        NativeBundleTestDrift::Unknown(fragment_id) => {
-            bundle.by_fragment.insert(
-                fragment_id,
-                NativePlanFragment {
-                    fragment_id,
-                    ..Default::default()
-                },
-            );
-        }
-    }
-    bundle
 }
 
 #[cfg(test)]

@@ -18,10 +18,10 @@
 use std::collections::HashMap;
 
 use super::expr::encode_expr;
-use crate::coordinator::prepare::PreparedFragmentSet;
-use crate::coordinator::prepare::scan::ScanExecutionBindings;
 use crate::proto::{common, plan};
 use crate::protocol::native::type_mapping::encode_type;
+use crate::query_execution::preparation::PreparedFragmentSet;
+use crate::query_execution::preparation::scan::ScanExecutionBindings;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
@@ -135,7 +135,8 @@ pub(super) fn encode_distributed_plan(
     src: &DistributedPlan,
     scan_bindings: &ScanExecutionBindings,
 ) -> Result<plan::DistributedPlan, String> {
-    let prepared = crate::coordinator::prepare::prepared_fragment_set_for_native_encode_test(src)?;
+    let prepared =
+        crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(src)?;
     encode_distributed_plan_from_prepared(src, scan_bindings, &prepared)
 }
 

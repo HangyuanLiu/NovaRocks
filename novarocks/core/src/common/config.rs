@@ -47,6 +47,7 @@ pub(crate) fn debug_emit_cancel_marker() -> bool {
         .ok()
         .map(|c| c.debug.emit_cancel_marker())
         .unwrap_or(false)
+        || sql_test_fragment_failure_harness_enabled()
 }
 
 pub(crate) fn debug_emit_grpc_fragment_marker() -> bool {
@@ -54,6 +55,11 @@ pub(crate) fn debug_emit_grpc_fragment_marker() -> bool {
         .ok()
         .map(|c| c.debug.emit_grpc_fragment_marker())
         .unwrap_or(false)
+        || sql_test_fragment_failure_harness_enabled()
+}
+
+pub(crate) fn sql_test_fragment_failure_harness_enabled() -> bool {
+    std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
 }
 
 pub(crate) fn exchange_wait_ms() -> u64 {

@@ -36,9 +36,9 @@
 //! completely fresh SQLite metadata file (no shared process, no shared
 //! in-memory cache — only the lake is shared). It:
 //!
-//! 1. Launches cluster A (1 FE + N BE) with metadata path A, creates an
-//!    Iceberg-backed MV, inserts data, and refreshes it. Captures the MV's
-//!    read face.
+//! 1. Launches cluster A (1 FE + N BE) with a runtime-local metadata path A,
+//!    creates an Iceberg-backed MV, inserts data, and refreshes it. Captures
+//!    the MV's read face.
 //! 2. Stops cluster A (drops the process handle).
 //! 3. Launches cluster B against the *same* lake config but with the FE's
 //!    `[metadata].path` pointed at a brand new, empty path B (via
@@ -131,9 +131,10 @@ pub(crate) struct ImvStatelessL2Report {
 /// `repo_root` is the NovaRocks repo root (see `config::resolve_repo_root`);
 /// `runner_config` supplies the base standalone config used to derive
 /// both cluster launches (see `cluster::resolve_base_app_config_path`) — the
-/// base config's own `[metadata].path` becomes cluster A's metadata path,
-/// and a freshly-generated path under `repo_root`'s runtime scratch area
-/// becomes cluster B's.
+/// cluster A uses its launch runtime's isolated `[metadata].path`, and a
+/// separately-generated path under `repo_root`'s runtime scratch area becomes
+/// cluster B's. The base config still supplies the shared lake, object-store,
+/// and warehouse settings, but neither cluster reuses its metadata database.
 ///
 /// This function is CI-gated: it spawns real `novarocks standalone`
 /// processes and requires a reachable Iceberg catalog backend (Hadoop-style
@@ -154,12 +155,9 @@ pub(crate) fn run_imv_stateless_l2_case(
     // -----------------------------------------------------------------
     // Phase A: cluster A owns the lake, creates the MV, and refreshes it.
     // -----------------------------------------------------------------
-    let cluster_a = CrossProcessServerHandle::launch(
-        case.cluster_size,
-        repo_root,
-        runner_config,
-    )
-    .context("launch cluster A for L2 statelessness case")?;
+    let cluster_a =
+        CrossProcessServerHandle::launch(case.cluster_size, repo_root, runner_config)
+            .context("launch cluster A for L2 statelessness case")?;
     let conn = connection_config(&cluster_a)?;
     let mut session =
         MysqlSession::new(&conn).context("connect to cluster A for L2 statelessness case")?;

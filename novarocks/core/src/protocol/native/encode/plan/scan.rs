@@ -32,11 +32,11 @@ use crate::connector::iceberg::scan_model as iceberg_scan_model;
 use crate::connector::scan_model::starrocks::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksTabletSchemaDescriptor,
 };
-use crate::coordinator::prepare::scan::{
-    ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
-};
 use crate::proto::{common, plan};
 use crate::protocol::native::type_mapping::encode_type;
+use crate::query_execution::preparation::scan::{
+    ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
+};
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::table as table_model;
@@ -148,7 +148,7 @@ fn encode_bound_required_columns(
 }
 
 fn encode_bound_scan_output_column(
-    column: &crate::coordinator::prepare::scan::ResolvedScanColumn,
+    column: &crate::query_execution::preparation::scan::ResolvedScanColumn,
 ) -> Result<common::OutputColumn, String> {
     Ok(common::OutputColumn {
         column_id: column.planner.column_id.0,

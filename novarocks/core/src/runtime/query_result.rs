@@ -44,7 +44,7 @@ pub struct QueryResult {
     pub chunks: Vec<Chunk>,
 }
 
-pub(crate) fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
+pub fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
     let slot_ids = (1..=batch.num_columns())
         .map(|idx| {
             u32::try_from(idx)

@@ -201,6 +201,18 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     .with_context(|| format!("invalid kill_be_index: {}", raw_value))?;
                 meta.kill_be_index = Some(value);
             }
+            "kill_be_after_fragment_start" => {
+                let value: usize = raw_value.parse().with_context(|| {
+                    format!("invalid kill_be_after_fragment_start: {}", raw_value)
+                })?;
+                meta.kill_be_after_fragment_start = Some(value);
+            }
+            "fail_fragment_after_start_be_index" => {
+                let value: usize = raw_value.parse().with_context(|| {
+                    format!("invalid fail_fragment_after_start_be_index: {}", raw_value)
+                })?;
+                meta.fail_fragment_after_start_be_index = Some(value);
+            }
             "network_partition_be" => {
                 let value: usize = raw_value
                     .parse()
@@ -239,9 +251,7 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             }
             "be_log_count_at_least" => {
                 let (pattern, count) = raw_value.rsplit_once(',').ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "@be_log_count_at_least requires <pattern>,<positive-count>"
-                    )
+                    anyhow::anyhow!("@be_log_count_at_least requires <pattern>,<positive-count>")
                 })?;
                 let pattern = pattern.trim();
                 if pattern.is_empty() {
@@ -259,9 +269,7 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             }
             "be_log_be_count_at_least" => {
                 let (pattern, count) = raw_value.rsplit_once(',').ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "@be_log_be_count_at_least requires <pattern>,<positive-count>"
-                    )
+                    anyhow::anyhow!("@be_log_be_count_at_least requires <pattern>,<positive-count>")
                 })?;
                 let pattern = pattern.trim();
                 if pattern.is_empty() {
@@ -276,6 +284,15 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 }
                 meta.be_log_be_count_at_least
                     .push((pattern.to_string(), count));
+            }
+            "be_log_exact_fragment_cancellation" => {
+                let count = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid @be_log_exact_fragment_cancellation BE count: {raw_value}")
+                })?;
+                if count == 0 {
+                    bail!("@be_log_exact_fragment_cancellation BE count must be positive");
+                }
+                meta.be_log_exact_fragment_cancellation = Some(count);
             }
             "compat_probe" => {
                 meta.compat_probes.push(raw_value);
@@ -338,6 +355,12 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         retry_count: override_meta.retry_count.or(base.retry_count),
         retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
         kill_be_index: override_meta.kill_be_index.or(base.kill_be_index),
+        kill_be_after_fragment_start: override_meta
+            .kill_be_after_fragment_start
+            .or(base.kill_be_after_fragment_start),
+        fail_fragment_after_start_be_index: override_meta
+            .fail_fragment_after_start_be_index
+            .or(base.fail_fragment_after_start_be_index),
         network_partition_be: override_meta
             .network_partition_be
             .or(base.network_partition_be),
@@ -380,6 +403,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         } else {
             override_meta.be_log_be_count_at_least.clone()
         },
+        be_log_exact_fragment_cancellation: override_meta
+            .be_log_exact_fragment_cancellation
+            .or(base.be_log_exact_fragment_cancellation),
         compat_probes: if override_meta.compat_probes.is_empty() {
             base.compat_probes.clone()
         } else {
@@ -756,6 +782,8 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec![
             "-- @kill_be_index=1".to_string(),
+            "-- @kill_be_after_fragment_start=2".to_string(),
+            "-- @fail_fragment_after_start_be_index=0".to_string(),
             "-- @network_partition_be=2".to_string(),
             "-- @heartbeat_delay_ms=250".to_string(),
             "-- @restart_be_delay_ms=500".to_string(),
@@ -764,6 +792,8 @@ mod opt5_directive_tests {
         let meta = parse_meta(&lines, &re).expect("parse ok");
 
         assert_eq!(meta.kill_be_index, Some(1));
+        assert_eq!(meta.kill_be_after_fragment_start, Some(2));
+        assert_eq!(meta.fail_fragment_after_start_be_index, Some(0));
         assert_eq!(meta.network_partition_be, Some(2));
         assert_eq!(meta.heartbeat_delay_ms, Some(250));
         assert_eq!(meta.restart_be_delay_ms, Some(500));
@@ -928,6 +958,7 @@ mod opt5_directive_tests {
             "-- @be_log_contains=compat_ingress method=exec_batch_plan_fragments".to_string(),
             "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
             "-- @be_log_be_count_at_least=compat_exchange_receive eos=true,2".to_string(),
+            "-- @be_log_exact_fragment_cancellation=3".to_string(),
             "-- @compat_probe=malformed-runtime-filter".to_string(),
         ];
 
@@ -945,6 +976,7 @@ mod opt5_directive_tests {
             meta.be_log_be_count_at_least,
             vec![("compat_exchange_receive eos=true".to_string(), 2)]
         );
+        assert_eq!(meta.be_log_exact_fragment_cancellation, Some(3));
         assert_eq!(
             meta.compat_probes,
             vec!["malformed-runtime-filter".to_string()]
@@ -960,6 +992,19 @@ mod opt5_directive_tests {
 
         assert!(
             format!("{error:#}").contains("invalid @be_log_count_at_least count: zero"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_fragment_cancellation_requires_positive_be_count() {
+        let re = meta_re();
+        let lines = vec!["-- @be_log_exact_fragment_cancellation=0".to_string()];
+
+        let error = parse_meta(&lines, &re).expect_err("zero BE coverage must fail");
+
+        assert!(
+            format!("{error:#}").contains("BE count must be positive"),
             "unexpected error: {error:#}"
         );
     }

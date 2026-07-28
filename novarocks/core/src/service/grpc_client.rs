@@ -595,23 +595,75 @@ mod pr3_tests {
     use super::*;
 
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::sync_channel;
     use std::time::Instant;
 
-    use crate::common::engine_error::EngineError;
-    use crate::coordinator::ports::CoordinatorReportHandler;
+    use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
     use crate::service::grpc_server::GrpcService;
 
-    struct DelayedReportHandler(Duration);
+    pub(super) struct DelayedReportHandler(pub(super) Duration);
 
-    impl CoordinatorReportHandler for DelayedReportHandler {
-        fn handle_exec_status_report(
+    impl NativeReportHandler for DelayedReportHandler {
+        fn handle_native_report(
             &self,
             _report: proto::novarocks::ExecStatusReport,
-        ) -> Result<(), EngineError> {
+        ) -> Result<(), NativeReportHandlerError> {
             std::thread::sleep(self.0);
             Ok(())
         }
+    }
+
+    struct CountingReportHandler(Arc<AtomicUsize>);
+
+    impl NativeReportHandler for CountingReportHandler {
+        fn handle_native_report(
+            &self,
+            _report: proto::novarocks::ExecStatusReport,
+        ) -> Result<(), NativeReportHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn spawn_combined_execution_server(report_handler: Arc<dyn NativeReportHandler>) -> SocketAddr {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind combined execution server");
+        let addr = listener
+            .local_addr()
+            .expect("combined execution server address");
+        listener
+            .set_nonblocking(true)
+            .expect("set combined execution listener nonblocking");
+        data_block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener)
+                .expect("create combined execution Tokio listener");
+            let incoming = futures::stream::unfold(listener, |listener| async {
+                let item = listener.accept().await.map(|(stream, _)| stream);
+                Some((item, listener))
+            });
+            let service = GrpcService::with_fragment_execution(
+                crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+                report_handler,
+            );
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(
+                        proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service),
+                    )
+                    .serve_with_incoming(incoming),
+            );
+        })
+        .expect("spawn combined execution server");
+        let ready_deadline = Instant::now() + Duration::from_secs(1);
+        while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_err() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "combined execution server did not become ready at {addr}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        addr
     }
 
     fn spawn_delayed_report_server(delay: Duration) -> SocketAddr {
@@ -630,8 +682,7 @@ mod pr3_tests {
                 let item = listener.accept().await.map(|(stream, _)| stream);
                 Some((item, listener))
             });
-            let service =
-                GrpcService::report_only_with_report_handler(Arc::new(DelayedReportHandler(delay)));
+            let service = GrpcService::report_ingress_only(Arc::new(DelayedReportHandler(delay)));
             tokio::spawn(
                 tonic::transport::Server::builder()
                     .add_service(
@@ -677,6 +728,40 @@ mod pr3_tests {
             .expect("connect wrapper should accept IPv6 SocketAddr");
         assert_eq!(client.host, "::1");
         assert_eq!(client.port, 19030);
+    }
+
+    #[test]
+    fn all_in_one_combined_ingress_routes_reports_and_fragments_over_the_socket() {
+        let report_calls = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_combined_execution_server(Arc::new(CountingReportHandler(Arc::clone(
+            &report_calls,
+        ))));
+        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr)
+            .expect("connect all-in-one loopback client");
+
+        let report_response = client
+            .blocking_report_exec_status(proto::novarocks::ReportExecStatusRequest {
+                report: Some(proto::novarocks::ExecStatusReport {
+                    query_id: Some(proto::common::UniqueId { hi: 61, lo: 71 }),
+                    fragment_instance_id: Some(proto::common::UniqueId { hi: 61, lo: 72 }),
+                    status: Some(proto::common::Status::default()),
+                    done: true,
+                    ..Default::default()
+                }),
+            })
+            .expect("loopback report RPC");
+        assert_eq!(report_response.status_code, 0, "{report_response:?}");
+        assert_eq!(report_calls.load(Ordering::SeqCst), 1);
+
+        let submit_response = client
+            .blocking_submit_fragment(proto::novarocks::SubmitFragmentRequest::default())
+            .expect("loopback fragment RPC");
+        assert_ne!(submit_response.status_code, 0);
+        assert!(
+            submit_response
+                .message
+                .contains("requires native plan and instance_params")
+        );
     }
 
     #[test]
@@ -891,6 +976,9 @@ pub fn lookup(
 #[cfg(test)]
 mod lookup_tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use crate::runtime::global_async_runtime::data_block_on;
     use crate::service::grpc_server::GrpcService;
 
@@ -910,7 +998,11 @@ mod lookup_tests {
                 tonic::transport::Server::builder()
                     .add_service(
                         proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                            GrpcService::full_execution(),
+                            GrpcService::with_fragment_execution(
+                                crate::service::grpc_server::rejecting_test_native_fragment_ingress(
+                                ),
+                                Arc::new(super::pr3_tests::DelayedReportHandler(Duration::ZERO)),
+                            ),
                         ),
                     )
                     .serve_with_incoming(incoming),

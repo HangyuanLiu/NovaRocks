@@ -1414,7 +1414,7 @@ mod tests {
                 let distributed_plan =
                     crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
                         .expect("build DistributedPlan");
-                let prepared = crate::coordinator::prepare::prepare_fragments(
+                let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
                     &connectors,
                     Some(&refresh_ctx),

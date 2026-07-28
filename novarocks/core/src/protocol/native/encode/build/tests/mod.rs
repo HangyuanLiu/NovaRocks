@@ -24,7 +24,6 @@ use super::super::boundary_schema::{BoundaryKind, BoundarySchemaColumn, project_
 use super::*;
 use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
-use crate::coordinator::prepare::build_iceberg_metadata_scan_range_params;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog::PlannerTableProvider;

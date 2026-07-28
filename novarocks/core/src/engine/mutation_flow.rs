@@ -32,8 +32,6 @@ use crate::connector::iceberg::commit::{
     IcebergCommitCollector, IcebergUpdateMode, ensure_iceberg_write_supported,
     select_iceberg_update_mode,
 };
-use crate::coordinator::execution::CoordinatedQueryResult;
-use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
@@ -41,6 +39,8 @@ use crate::engine::write_transaction::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
@@ -1067,7 +1067,7 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let mut plan = self
             .write
             .lock()
@@ -1095,6 +1095,7 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
             return Ok(result);
         }
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
+            &self.state,
             prepared,
             native_bundle,
             None,
@@ -1142,7 +1143,7 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let mut plan = self
             .write
             .lock()
@@ -1170,6 +1171,7 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
             return Ok(result);
         }
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
+            &self.state,
             prepared,
             native_bundle,
             None,
@@ -1221,8 +1223,8 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
 /// part reported a `write_abort`, the first such abort is propagated so the
 /// transaction runner can clean up and discard the partial commit.
 fn merge_all_write_commits(
-    parts: Vec<CoordinatedQueryResult>,
-) -> Result<CoordinatedQueryResult, String> {
+    parts: Vec<QueryExecutionResult>,
+) -> Result<QueryExecutionResult, String> {
     if parts.is_empty() {
         return Err("merge_all_write_commits requires at least one part".to_string());
     }
@@ -1243,7 +1245,7 @@ fn merge_all_write_commits(
             }
         }
     }
-    Ok(CoordinatedQueryResult {
+    Ok(QueryExecutionResult {
         query_result: query_result.expect("non-empty parts => query_result set"),
         write_commit: merged_commit,
         write_abort,
@@ -1381,8 +1383,8 @@ fn run_mor_merge_change_stream_transaction(
     Ok(())
 }
 
-fn no_mutation_write_result() -> CoordinatedQueryResult {
-    CoordinatedQueryResult {
+fn no_mutation_write_result() -> QueryExecutionResult {
+    QueryExecutionResult {
         query_result: QueryResult::empty(),
         write_commit: None,
         write_abort: None,
@@ -1766,7 +1768,7 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let write = self
             .write
             .lock()
@@ -1794,7 +1796,7 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             .lock()
             .expect("COW UPDATE rewrite lock poisoned") = Some(rewrite.rewrite_set);
 
-        Ok(CoordinatedQueryResult {
+        Ok(QueryExecutionResult {
             query_result: QueryResult::empty(),
             write_commit: Some(write_commit),
             write_abort: None,
@@ -3419,7 +3421,7 @@ impl DistributedMergeExecutor {
         sink_spec: &IcebergWriteSinkSpec,
     ) -> Result<
         (
-            CoordinatedQueryResult,
+            QueryExecutionResult,
             Vec<crate::connector::iceberg::commit::WrittenFile>,
         ),
         String,
@@ -3471,7 +3473,7 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         // Matched-branch staged files are recorded in the collector's AbortLog at commit() time
         // (deferred), consistent with the per-mode distributed executors. A mid-fold error here
         // returns Err, the runner skips commit(), and nothing is committed — the fold is atomic;
@@ -3486,7 +3488,7 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
         // Matched-branch writer results that flow through the shared
         // `WriteCommitInput` (reuse channel). INSERT files are routed
         // separately per commit-op kind.
-        let mut commit_parts: Vec<CoordinatedQueryResult> = Vec::new();
+        let mut commit_parts: Vec<QueryExecutionResult> = Vec::new();
 
         match branches.matched {
             MergeMatchedBranch::None => {}
@@ -3513,7 +3515,7 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
                     &self.commit_executor.collector,
                     insert_files,
                 )?;
-                commit_parts.push(CoordinatedQueryResult {
+                commit_parts.push(QueryExecutionResult {
                     query_result: QueryResult::empty(),
                     write_commit: Some(rewrite.write_commit),
                     write_abort: None,

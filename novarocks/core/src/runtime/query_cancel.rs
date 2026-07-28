@@ -45,6 +45,10 @@ pub(crate) fn with_client_disconnect_signal<T>(
     f()
 }
 
+pub(crate) fn current_client_disconnect_signal() -> Option<Arc<AtomicBool>> {
+    CLIENT_DISCONNECT_SIGNAL.with(|cell| cell.borrow().clone())
+}
+
 pub(crate) fn client_disconnected() -> bool {
     CLIENT_DISCONNECT_SIGNAL.with(|cell| {
         cell.borrow()
@@ -68,6 +72,27 @@ mod tests {
         assert!(
             !client_disconnected(),
             "disconnect signal must be restored after unwind"
+        );
+    }
+
+    #[test]
+    fn current_client_disconnect_signal_is_request_scoped_and_keeps_probe_alive() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let captured = with_client_disconnect_signal(signal.clone(), || {
+            let captured =
+                current_client_disconnect_signal().expect("request-scoped signal is available");
+            assert!(Arc::ptr_eq(&captured, &signal));
+            captured
+        });
+
+        assert!(
+            current_client_disconnect_signal().is_none(),
+            "request scope must restore the previous signal"
+        );
+        signal.store(true, Ordering::SeqCst);
+        assert!(
+            captured.load(Ordering::SeqCst),
+            "captured view must keep observing the request probe after scope exit"
         );
     }
 }

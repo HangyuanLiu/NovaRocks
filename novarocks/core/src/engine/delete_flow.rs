@@ -48,8 +48,6 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
 };
-use crate::coordinator::execution::CoordinatedQueryResult;
-use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
@@ -58,6 +56,8 @@ use crate::engine::write_transaction::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::write::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
@@ -223,7 +223,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let mut result = crate::engine::execute_query_as_iceberg_write(
             &self.state,
             Some(&self.target.catalog),
@@ -268,7 +268,7 @@ impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let mut result = crate::engine::execute_query_as_iceberg_write(
             &self.state,
             Some(&self.target.catalog),

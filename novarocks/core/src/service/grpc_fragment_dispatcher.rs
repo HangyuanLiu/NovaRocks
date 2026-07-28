@@ -32,13 +32,10 @@ use std::time::Duration;
 #[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
-use crate::coordinator::ports::RuntimeFilterDeploymentControlPort;
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::chunk::ChunkSchema;
-use crate::exec::chunk::ChunkSchemaRef;
 use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
     CancelFragmentRequest, FetchResultRequest, SubmitFragmentRequest,
@@ -47,6 +44,10 @@ use crate::proto::novarocks::{
 use crate::protocol::native::{
     RuntimeFilterQueryLifecycleOptions, encode_abort_runtime_filter_deployment,
     encode_participant_install,
+};
+use crate::query_execution::contract::QueryId;
+use crate::query_execution::fragment_transport::{
+    FetchOutcome, FetchedQueryBatch, FragmentDispatcher, NativeFragmentEnvelope,
 };
 use crate::runtime_filter::deployment::participant_id_for_backend;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
@@ -109,11 +110,33 @@ impl GrpcRuntimeFilterDeploymentControl {
             .expect("client and endpoint maps have identical keys");
         Ok((client, endpoint))
     }
+
+    fn validate_transport_target(
+        &self,
+        backend_idx: usize,
+        endpoint: SocketAddr,
+        participant_id: u32,
+    ) -> Result<RuntimeFilterParticipantId, String> {
+        let expected = participant_id_for_backend(backend_idx)
+            .map_err(|error| format!("invalid runtime filter backend id: {error}"))?;
+        if expected.get() != participant_id {
+            return Err(format!(
+                "runtime filter transport target mismatch: backend {backend_idx} maps to participant {}, received participant {participant_id}",
+                expected.get()
+            ));
+        }
+        let (_, configured_endpoint) = self.client_and_endpoint(expected)?;
+        if configured_endpoint != endpoint {
+            return Err(format!(
+                "runtime filter transport endpoint mismatch for backend {backend_idx} participant {participant_id}: configured {configured_endpoint}, received {endpoint}"
+            ));
+        }
+        Ok(expected)
+    }
 }
 
-#[async_trait::async_trait]
-impl RuntimeFilterDeploymentControlPort for GrpcRuntimeFilterDeploymentControl {
-    async fn install(
+impl GrpcRuntimeFilterDeploymentControl {
+    async fn install_native(
         &self,
         query_id: UniqueId,
         lifecycle: RuntimeFilterQueryLifecycleOptions,
@@ -149,7 +172,7 @@ impl RuntimeFilterDeploymentControlPort for GrpcRuntimeFilterDeploymentControl {
         )
     }
 
-    async fn abort(
+    async fn abort_native(
         &self,
         query_id: UniqueId,
         epoch: DeploymentEpoch,
@@ -181,6 +204,56 @@ impl RuntimeFilterDeploymentControlPort for GrpcRuntimeFilterDeploymentControl {
             response.status,
             response.rejection.as_ref(),
         )
+    }
+}
+
+impl crate::query_execution::artifact::RuntimeFilterDeploymentDispatcher
+    for GrpcRuntimeFilterDeploymentControl
+{
+    fn install(
+        &self,
+        backend_idx: usize,
+        endpoint: SocketAddr,
+        participant_id: u32,
+        deadline: Duration,
+        envelope: crate::query_execution::artifact::RuntimeFilterInstallEnvelope,
+    ) -> Result<(), String> {
+        let participant = self.validate_transport_target(backend_idx, endpoint, participant_id)?;
+        let (query_id, lifecycle, install) = envelope.into_native();
+        if install.local_participant_id() != participant {
+            return Err(format!(
+                "runtime filter install envelope participant {} differs from transport participant {}",
+                install.local_participant_id().get(),
+                participant.get()
+            ));
+        }
+        crate::runtime::global_async_runtime::data_block_on(self.install_native(
+            query_id,
+            lifecycle,
+            deadline,
+            participant,
+            install,
+        ))
+        .map_err(|error| format!("runtime filter install runtime failed: {error}"))?
+    }
+
+    fn abort(
+        &self,
+        backend_idx: usize,
+        endpoint: SocketAddr,
+        participant_id: u32,
+        deadline: Duration,
+        envelope: crate::query_execution::artifact::RuntimeFilterAbortEnvelope,
+    ) -> Result<(), String> {
+        let participant = self.validate_transport_target(backend_idx, endpoint, participant_id)?;
+        let (query_id, epoch) = envelope.into_native();
+        crate::runtime::global_async_runtime::data_block_on(self.abort_native(
+            query_id,
+            epoch,
+            deadline,
+            participant,
+        ))
+        .map_err(|error| format!("runtime filter abort runtime failed: {error}"))?
     }
 }
 
@@ -377,7 +450,9 @@ impl FragmentDispatcher for RemoteDispatcher {
         backend_idx: usize,
         finst_id: UniqueId,
         max_wait_ms: i64,
-        expected_chunk_schema: Option<&ChunkSchemaRef>,
+        expected_output_schema: Option<
+            crate::query_execution::fragment_transport::ExpectedOutputSchemaView<'_>,
+        >,
     ) -> Result<FetchOutcome, String> {
         let (client, addr) = self.client_and_addr(backend_idx)?;
         // Counter increments only after a successful check_idx, so only valid-index
@@ -424,7 +499,7 @@ impl FragmentDispatcher for RemoteDispatcher {
                 }
                 let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
                     &resp.result_arrow_ipc,
-                    expected_chunk_schema,
+                    expected_output_schema.map(|view| view.chunk_schema()),
                 )?;
                 if chunks.len() != 1 {
                     return Err(format!(
@@ -433,7 +508,7 @@ impl FragmentDispatcher for RemoteDispatcher {
                     ));
                 }
                 let chunk = chunks.remove(0);
-                Ok(FetchOutcome::Ready(chunk))
+                Ok(FetchOutcome::Ready(FetchedQueryBatch::new(chunk)))
             }
             FetchStatus::NotReady => Ok(FetchOutcome::NotReady),
             FetchStatus::Eof => Ok(FetchOutcome::Eof),
@@ -444,12 +519,16 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
     }
 
-    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
+    fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]) {
         if self.check_idx(backend_idx).is_err() {
             return;
         }
         let addr = self.addrs[&backend_idx];
         let req = CancelFragmentRequest {
+            query_id: Some(ProtoUniqueId {
+                hi: query_id.high(),
+                lo: query_id.low(),
+            }),
             finst_ids: finst_ids
                 .iter()
                 .map(|id| ProtoUniqueId {
@@ -520,6 +599,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
     use crate::proto;
+    use crate::query_execution::contract::QueryId;
     use arrow::array::Int32Array;
     use proto::filter::{LookupRequest, LookupResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
@@ -580,6 +660,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_filter_transport_target_requires_exact_backend_participant_and_endpoint() {
+        let endpoint = "127.0.0.1:19031".parse().unwrap();
+        let control =
+            GrpcRuntimeFilterDeploymentControl::new(&[(3, endpoint)]).expect("explicit snapshot");
+
+        assert_eq!(
+            control
+                .validate_transport_target(3, endpoint, 4)
+                .expect("backend 3 maps to participant 4")
+                .get(),
+            4
+        );
+        assert!(
+            control
+                .validate_transport_target(3, endpoint, 3)
+                .unwrap_err()
+                .contains("maps to participant 4")
+        );
+        assert!(
+            control
+                .validate_transport_target(3, "127.0.0.1:19032".parse().unwrap(), 4)
+                .unwrap_err()
+                .contains("endpoint mismatch")
+        );
+        assert!(
+            control
+                .validate_transport_target(8, endpoint, 9)
+                .unwrap_err()
+                .contains("absent from the scheduler snapshot")
+        );
+    }
+
+    #[test]
+    fn runtime_filter_install_rejects_envelope_participant_mismatch_before_rpc() {
+        use crate::query_execution::artifact::{
+            RuntimeFilterDeploymentDispatcher, RuntimeFilterInstallEnvelope,
+        };
+        use crate::runtime_filter::port::install::RuntimeFilterInstallView;
+        use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
+
+        let endpoint = "127.0.0.1:19031".parse().unwrap();
+        let control =
+            GrpcRuntimeFilterDeploymentControl::new(&[(3, endpoint)]).expect("explicit snapshot");
+        let epoch = DeploymentEpoch::new(7);
+        let envelope_participant = RuntimeFilterParticipantId::new(5);
+        let core = RuntimeFilterInstallView::new(epoch, envelope_participant, BTreeMap::new());
+        let routing =
+            RuntimeFilterRoutingShard::new(epoch, envelope_participant, BTreeMap::new()).unwrap();
+        let envelope = RuntimeFilterInstallEnvelope::for_test(
+            UniqueId { hi: 1, lo: 2 },
+            RuntimeFilterQueryLifecycleOptions {
+                delivery_expire: Duration::from_secs(1),
+                query_expire: Duration::from_secs(1),
+                transport_retry_interval: Duration::from_millis(1),
+                transport_max_attempts: 1,
+                transport_deadline: Duration::from_secs(1),
+                transport_max_pending_entries: 1,
+                transport_max_pending_bytes: 1,
+            },
+            RuntimeFilterParticipantInstall::new(core, routing),
+        );
+
+        let error = RuntimeFilterDeploymentDispatcher::install(
+            &control,
+            3,
+            endpoint,
+            4,
+            Duration::from_secs(1),
+            envelope,
+        )
+        .expect_err("transport participant 4 must reject envelope participant 5");
+
+        assert!(
+            error.contains(
+                "runtime filter install envelope participant 5 differs from transport participant 4"
+            ),
+            "{error}"
+        );
+    }
+
     #[derive(Clone)]
     struct MockGrpc(Arc<MockState>);
 
@@ -589,6 +750,7 @@ mod tests {
         fetch_eos: AtomicBool,
         fetch_arrow: Mutex<Vec<u8>>,
         cancel_count: AtomicUsize,
+        cancel_request: Mutex<Option<CancelFragmentRequest>>,
         cancel_delay_ms: AtomicU64,
         report_status_code: AtomicI32,
         report_message: Mutex<String>,
@@ -602,6 +764,7 @@ mod tests {
                 fetch_eos: AtomicBool::new(false),
                 fetch_arrow: Mutex::new(Vec::new()),
                 cancel_count: AtomicUsize::new(0),
+                cancel_request: Mutex::new(None),
                 cancel_delay_ms: AtomicU64::new(0),
                 report_status_code: AtomicI32::new(0),
                 report_message: Mutex::new(String::new()),
@@ -688,12 +851,14 @@ mod tests {
 
         async fn cancel_fragment(
             &self,
-            _request: Request<CancelFragmentRequest>,
+            request: Request<CancelFragmentRequest>,
         ) -> Result<Response<proto::novarocks::CancelFragmentResponse>, Status> {
             let delay_ms = self.0.cancel_delay_ms.load(Ordering::SeqCst);
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
+            *self.0.cancel_request.lock().expect("cancel request lock") =
+                Some(request.into_inner());
             self.0.cancel_count.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(proto::novarocks::CancelFragmentResponse {
                 status_code: 0,
@@ -856,9 +1021,10 @@ mod tests {
             .fetch_result(0, make_finst_id(1, 2), 0, None)
             .expect("fetch");
 
-        let FetchOutcome::Ready(chunk) = outcome else {
+        let FetchOutcome::Ready(batch) = outcome else {
             panic!("expected ready chunk");
         };
+        let chunk = batch.into_chunk();
         assert_eq!(chunk.columns().len(), 1);
         assert_eq!(chunk.len(), 1);
         assert_eq!(chunk.columns()[0].data_type(), &DataType::Int32);
@@ -903,8 +1069,9 @@ mod tests {
         let state = Arc::new(MockState::default());
         let addr = spawn_mock_server(Arc::clone(&state));
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
+        let query_id = QueryId::new(11, 12);
 
-        dispatcher.cancel_fragments(0, &[make_finst_id(1, 2)]);
+        dispatcher.cancel_fragments(0, query_id, &[make_finst_id(1, 2)]);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while state.cancel_count.load(Ordering::SeqCst) == 0 {
@@ -914,6 +1081,13 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let request = state
+            .cancel_request
+            .lock()
+            .expect("cancel request lock")
+            .clone()
+            .expect("cancel request");
+        assert_eq!(request.query_id, Some(ProtoUniqueId { hi: 11, lo: 12 }));
     }
 
     #[test]
@@ -924,7 +1098,7 @@ mod tests {
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let start = std::time::Instant::now();
-        dispatcher.cancel_fragments(0, &[make_finst_id(7, 8)]);
+        dispatcher.cancel_fragments(0, QueryId::new(21, 22), &[make_finst_id(7, 8)]);
         let elapsed = start.elapsed();
 
         assert!(

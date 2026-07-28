@@ -29,7 +29,7 @@ fn column_ref(id: u32, name: &str) -> TypedExpr {
 }
 
 #[test]
-fn planner_broadcast_edge_remains_broadcast_through_builder_and_scheduling() {
+fn planner_broadcast_edge_remains_broadcast_through_builder() {
     use crate::sql::planner::physical::{
         PhysicalPlanKind, PhysicalPlanNode, RedistributeMode, RedistributeNode,
     };
@@ -82,56 +82,6 @@ fn planner_broadcast_edge_remains_broadcast_through_builder_and_scheduling() {
         result.0.scheduling_view().edges()[0].output_partition.kind,
         PartitionKind::Unpartitioned
     ));
-
-    let target_fragment_id = result.0.scheduling_view().edges()[0].target_fragment_id;
-    let prepared = crate::coordinator::prepare::prepared_fragment_set_for_test(
-        planned
-            .fragments()
-            .iter()
-            .map(|fragment| {
-                let is_target = fragment.fragment_id == target_fragment_id;
-                (
-                    fragment.fragment_id,
-                    if is_target {
-                        crate::coordinator::prepare::PreparedFragmentRole::TerminalWrite
-                    } else {
-                        crate::coordinator::prepare::PreparedFragmentRole::NonTerminal
-                    },
-                    if is_target {
-                        vec![(
-                            99,
-                            vec![
-                                build_iceberg_metadata_scan_range_params(),
-                                build_iceberg_metadata_scan_range_params(),
-                                build_iceberg_metadata_scan_range_params(),
-                            ],
-                        )]
-                    } else {
-                        Vec::new()
-                    },
-                )
-            })
-            .collect(),
-        planned.topology().topological_fragment_order().to_vec(),
-        planned.topology().execution_anchor_fragment_id(),
-        planned.edges().to_vec(),
-    );
-    let scheduler = crate::coordinator::scheduler::FragmentScheduler::new(vec![
-        "127.0.0.1:19001".parse().unwrap(),
-        "127.0.0.1:19002".parse().unwrap(),
-        "127.0.0.1:19003".parse().unwrap(),
-    ]);
-    let scheduling = scheduler
-        .schedule(
-            prepared.scheduling_view(),
-            crate::common::types::UniqueId { hi: 1, lo: 7 },
-        )
-        .expect("schedule broadcast plan");
-    assert_eq!(
-        scheduling.by_fragment[&target_fragment_id].len(),
-        3,
-        "broadcast input must not collapse a target with three scan ranges to Gather"
-    );
 }
 
 #[test]
@@ -429,7 +379,7 @@ fn lower_distributed_plan_owns_native_write_sink_shape() {
             .fragment(0)
             .expect("prepared write fragment")
             .execution_role(),
-        crate::coordinator::prepare::PreparedFragmentRole::TerminalWrite
+        crate::query_execution::preparation::PreparedFragmentRole::TerminalWrite
     );
     assert!(
         result

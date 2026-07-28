@@ -167,7 +167,7 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
     let distributed = crate::sql::planner::distributed::build::build_distributed_plan(&physical)
         .expect("build Graph-owned RF plan");
     assert_eq!(distributed.runtime_filter_graph().channel_count(), 1);
-    let prepared = crate::coordinator::prepare::prepare_fragments(
+    let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &crate::connector::ConnectorRegistry::new(),
         None,
@@ -521,7 +521,7 @@ fn native_encoder_rejects_corrupt_ordered_and_topk_digests() {
 fn native_encoder_emits_explicit_empty_fragment_table() {
     let distributed = two_fragment_stream_plan_for_test();
     assert!(distributed.runtime_filter_graph().is_empty());
-    let prepared = crate::coordinator::prepare::prepare_fragments(
+    let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &crate::connector::ConnectorRegistry::new(),
         None,

@@ -332,11 +332,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
-    use crate::coordinator::cluster::LiveBackendSnapshot;
-    use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::FragmentNodeId;
     use crate::exec::node::ExecNodeKind;
+    use crate::query_execution::backend::LiveBackendSnapshot;
+    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::fragment::instance::{
         ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn sealed_pure_cycle_round_trips_batch_activation_and_rejects_forged_blocking() {
         let plan = seal_draft(cycle_draft(JoinKind::Inner)).expect("pure cycle draft seals");
-        let prepared = crate::coordinator::prepare::prepare_fragments(
+        let prepared = crate::query_execution::preparation::prepare_fragments(
             &plan,
             &crate::connector::ConnectorRegistry::new(),
             None,

@@ -1526,6 +1526,7 @@ fn insert_from_query_into_starrocks_table(
             &resolved.database,
             state.exchange_port,
             None,
+            &state.query_execution,
         )?
     };
 

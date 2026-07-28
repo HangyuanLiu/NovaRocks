@@ -21,12 +21,13 @@ struct SentinelDeltaResolver {
     calls: AtomicUsize,
 }
 
-impl crate::coordinator::prepare::scan::ScanBindingResolver for SentinelDeltaResolver {
+impl crate::query_execution::preparation::scan::ScanBindingResolver for SentinelDeltaResolver {
     fn resolve_scan(
         &self,
         node_id: i32,
         scan: &PlanScanNode,
-    ) -> Result<Option<crate::coordinator::prepare::scan::ResolvedScanExecution>, String> {
+    ) -> Result<Option<crate::query_execution::preparation::scan::ResolvedScanExecution>, String>
+    {
         self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(node_id, 10);
         assert!(matches!(
@@ -38,15 +39,16 @@ impl crate::coordinator::prepare::scan::ScanBindingResolver for SentinelDeltaRes
             }
         ));
         Ok(Some(
-            crate::coordinator::prepare::scan::ResolvedScanExecution::IcebergDelta(
-                crate::coordinator::prepare::scan::ResolvedIcebergDeltaScan {
-                    runtime_plan: crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan {
-                        table_location: "s3://bucket/test_table".to_string(),
-                        data_columns: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        change_files: Vec::new(),
-                        delete_side: None,
-                    },
+            crate::query_execution::preparation::scan::ResolvedScanExecution::IcebergDelta(
+                crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
+                    runtime_plan:
+                        crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
+                            table_location: "s3://bucket/test_table".to_string(),
+                            data_columns: Vec::new(),
+                            cloud_properties: BTreeMap::new(),
+                            change_files: Vec::new(),
+                            delete_side: None,
+                        },
                 },
             ),
         ))

@@ -32,8 +32,6 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
     ensure_equality_delete_single_partition_spec,
 };
-use crate::coordinator::execution::CoordinatedQueryResult;
-use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::engine::write_transaction::{
@@ -43,6 +41,8 @@ use crate::engine::write_transaction::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::write::WriteCommitInput;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
@@ -131,7 +131,7 @@ impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor 
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let result = crate::engine::execute_query_as_iceberg_write(
             &self.state,
             Some(&self.target.catalog),

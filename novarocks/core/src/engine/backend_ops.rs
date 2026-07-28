@@ -24,73 +24,115 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::app_config::ClusterRole;
-use crate::coordinator::cluster::{
-    BackendRegistry, BackendState, BeId, HeartbeatOutcome, run_heartbeat_round,
-};
-#[cfg(not(test))]
-use crate::coordinator::cluster::{QueryCleanupSink, spawn_heartbeat_manager};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::MetaStoreProvider;
 use crate::meta::repository::backend::StoredBackend;
+#[cfg(not(test))]
+use crate::query_execution::backend_registry::spawn_heartbeat_manager;
+use crate::query_execution::backend_registry::{
+    BackendRegistry, BackendState, BeId, HeartbeatOutcome, RegistryEvent, RegistryEventSink,
+    run_heartbeat_round,
+};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::runtime::query_state::in_flight_table;
 use crate::sql::parser::ast::{AddBackendStmt, DropBackendStmt};
+
+fn legacy_grpc_heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
+    match crate::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint) {
+        crate::query_execution::backend::HeartbeatOutcome::Ok {
+            start_epoch,
+            version,
+            num_cores,
+            now_ms,
+        } => HeartbeatOutcome::Ok {
+            start_epoch,
+            version,
+            num_cores,
+            now_ms,
+        },
+        crate::query_execution::backend::HeartbeatOutcome::Failed { err } => {
+            HeartbeatOutcome::Failed { err }
+        }
+    }
+}
+
+struct FrontendBackendEventAdapter {
+    sink: Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
+}
+
+impl RegistryEventSink for FrontendBackendEventAdapter {
+    fn on_event(&self, event: RegistryEvent) {
+        forward_registry_event(self.sink.as_ref(), event);
+    }
+
+    fn on_live_backends(&self, revision: u64, backends: Vec<(BeId, SocketAddr, u64)>) {
+        replace_live_backends(self.sink.as_ref(), revision, backends);
+    }
+}
 
 pub(crate) fn ensure_backend_registry(
     state: &Arc<StandaloneState>,
 ) -> Result<Arc<BackendRegistry>, String> {
-    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
-        return Ok(registry);
-    }
-
     let cfg = crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-    let registry = Arc::new(BackendRegistry::new(cfg.cluster.heartbeat_timeout_retries));
+    let registry = if let Some(registry) =
+        crate::query_execution::backend_registry::backend_registry()
+    {
+        registry
+    } else {
+        let registry = Arc::new(BackendRegistry::new(cfg.cluster.heartbeat_timeout_retries));
 
-    if let Some(provider) = state.metadata_provider.as_ref() {
-        let read = provider
-            .begin_read()
-            .map_err(|e| format!("open backend metadata read transaction failed: {e}"))?;
-        for stored in state
-            .backend_repo
-            .list_backends(read.as_ref())
-            .map_err(|e| format!("load backend metadata failed: {e}"))?
-        {
-            let be_id = BeId::try_from(stored.be_id)
-                .map_err(|_| format!("invalid persisted backend id {}", stored.be_id))?;
-            registry.restore_backend(
-                be_id,
-                parse_backend_addr(&stored.endpoint)?,
-                backend_state_from_str(&stored.state)?,
-            );
+        if let Some(provider) = state.metadata_provider.as_ref() {
+            let read = provider
+                .begin_read()
+                .map_err(|e| format!("open backend metadata read transaction failed: {e}"))?;
+            for stored in state
+                .backend_repo
+                .list_backends(read.as_ref())
+                .map_err(|e| format!("load backend metadata failed: {e}"))?
+            {
+                let be_id = BeId::try_from(stored.be_id)
+                    .map_err(|_| format!("invalid persisted backend id {}", stored.be_id))?;
+                registry.restore_backend(
+                    be_id,
+                    parse_backend_addr(&stored.endpoint)?,
+                    backend_state_from_str(&stored.state)?,
+                );
+            }
+        }
+
+        let seed_endpoints = cfg
+            .cluster
+            .backends
+            .iter()
+            .map(|addr| parse_backend_addr(addr))
+            .collect::<Result<Vec<_>, _>>()?;
+        registry.seed_from_config(&seed_endpoints);
+        crate::query_execution::backend_registry::install_backend_registry(Arc::clone(&registry));
+        crate::query_execution::backend_registry::backend_registry().unwrap_or(registry)
+    };
+    #[cfg(not(test))]
+    {
+        let mut manager = state
+            .backend_heartbeat_manager
+            .lock()
+            .map_err(|_| "lock backend heartbeat manager handle failed".to_string())?;
+        if manager.is_none() {
+            *manager = Some(spawn_heartbeat_manager(
+                Arc::clone(&registry),
+                Duration::from_millis(cfg.cluster.heartbeat_interval_ms),
+                legacy_grpc_heartbeat,
+                Arc::new(FrontendBackendEventAdapter {
+                    sink: Arc::clone(&state.backend_query_events),
+                }),
+            )?);
         }
     }
 
-    let seed_endpoints = cfg
-        .cluster
-        .backends
-        .iter()
-        .map(|addr| parse_backend_addr(addr))
-        .collect::<Result<Vec<_>, _>>()?;
-    registry.seed_from_config(&seed_endpoints);
-
-    let installed = crate::coordinator::cluster::install_backend_registry(Arc::clone(&registry));
-    #[cfg(not(test))]
-    if installed {
-        spawn_heartbeat_manager(
-            Arc::clone(&registry),
-            Duration::from_millis(cfg.cluster.heartbeat_interval_ms),
-            crate::service::cluster_heartbeat::grpc_heartbeat,
-            Arc::new(QueryCleanupSink::new()),
-        );
-    }
-    #[cfg(test)]
-    let _ = installed;
-
-    Ok(crate::coordinator::cluster::backend_registry().unwrap_or(registry))
+    publish_registry_snapshot(state.backend_query_events.as_ref(), registry.as_ref());
+    Ok(registry)
 }
 
 pub(crate) fn wait_for_configured_backends_live(
-    _state: &Arc<StandaloneState>,
+    state: &Arc<StandaloneState>,
 ) -> Result<(), String> {
     let cfg = crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
     let configured = cfg
@@ -99,7 +141,7 @@ pub(crate) fn wait_for_configured_backends_live(
         .iter()
         .map(|addr| parse_backend_addr(addr))
         .collect::<Result<Vec<_>, _>>()?;
-    let Some(registry) = crate::coordinator::cluster::backend_registry() else {
+    let Some(registry) = crate::query_execution::backend_registry::backend_registry() else {
         return Err("role=fe backend registry is not initialized".to_string());
     };
 
@@ -108,7 +150,8 @@ pub(crate) fn wait_for_configured_backends_live(
         &configured,
         Duration::from_secs(5),
         Duration::from_millis(cfg.cluster.heartbeat_interval_ms.max(10).min(200)),
-        crate::service::cluster_heartbeat::grpc_heartbeat,
+        legacy_grpc_heartbeat,
+        Some(state.backend_query_events.as_ref()),
     )
 }
 
@@ -118,6 +161,7 @@ fn wait_for_configured_backends_live_with<F>(
     timeout: Duration,
     retry_interval: Duration,
     send: F,
+    event_sink: Option<&dyn crate::query_execution::backend::BackendQueryEventSink>,
 ) -> Result<(), String>
 where
     F: Fn(BeId, SocketAddr) -> HeartbeatOutcome,
@@ -128,7 +172,15 @@ where
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        run_heartbeat_round(registry, &send);
+        let events = run_heartbeat_round(registry, &send);
+        if let Some(sink) = event_sink {
+            publish_registry_snapshot(sink, registry);
+        }
+        for event in events {
+            if let Some(sink) = event_sink {
+                forward_registry_event(sink, event);
+            }
+        }
         if configured_backend_live(registry, configured) {
             return Ok(());
         }
@@ -160,6 +212,65 @@ where
     }
 }
 
+pub(crate) fn publish_live_backends(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let registry = crate::query_execution::backend_registry::backend_registry()
+        .ok_or_else(|| "backend registry is not initialized".to_string())?;
+    publish_registry_snapshot(state.backend_query_events.as_ref(), registry.as_ref());
+    Ok(())
+}
+
+fn publish_registry_snapshot(
+    sink: &dyn crate::query_execution::backend::BackendQueryEventSink,
+    registry: &BackendRegistry,
+) {
+    let (revision, backends) = registry.live_backend_generation_snapshot();
+    replace_live_backends(sink, revision, backends);
+}
+
+fn replace_live_backends(
+    sink: &dyn crate::query_execution::backend::BackendQueryEventSink,
+    revision: u64,
+    backends: Vec<(BeId, SocketAddr, u64)>,
+) {
+    sink.replace_live_backends(
+        revision,
+        backends
+            .into_iter()
+            .map(|(be_id, endpoint, start_epoch)| {
+                crate::query_execution::backend::LiveBackendTarget::new(
+                    be_id as usize,
+                    endpoint,
+                    start_epoch,
+                )
+            })
+            .collect(),
+    );
+}
+
+fn forward_registry_event(
+    sink: &dyn crate::query_execution::backend::BackendQueryEventSink,
+    event: RegistryEvent,
+) {
+    use crate::query_execution::backend::BackendQueryEvent;
+
+    let event = match event {
+        RegistryEvent::BackendLost { be_id } => BackendQueryEvent::Unavailable {
+            backend_idx: be_id as usize,
+            reason: format!("backend {be_id} lost"),
+        },
+        RegistryEvent::BackendRestarted {
+            be_id,
+            old_epoch,
+            new_epoch,
+        } => BackendQueryEvent::Restarted {
+            backend_idx: be_id as usize,
+            old_epoch,
+            new_epoch,
+        },
+    };
+    sink.on_backend_event(event);
+}
+
 fn configured_backend_live(registry: &BackendRegistry, configured: &[SocketAddr]) -> bool {
     registry
         .snapshot()
@@ -171,7 +282,7 @@ pub(crate) fn install_all_in_one_backend_registry(
     endpoint: SocketAddr,
     heartbeat_timeout_retries: u32,
 ) -> Result<Arc<BackendRegistry>, String> {
-    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
+    if let Some(registry) = crate::query_execution::backend_registry::backend_registry() {
         validate_all_in_one_loopback_registry(registry.as_ref(), endpoint)?;
         return Ok(registry);
     }
@@ -195,8 +306,8 @@ pub(crate) fn install_all_in_one_backend_registry(
         },
     );
 
-    crate::coordinator::cluster::install_backend_registry(Arc::clone(&registry));
-    Ok(crate::coordinator::cluster::backend_registry().unwrap_or(registry))
+    crate::query_execution::backend_registry::install_backend_registry(Arc::clone(&registry));
+    Ok(crate::query_execution::backend_registry::backend_registry().unwrap_or(registry))
 }
 
 fn validate_all_in_one_loopback_registry(
@@ -236,8 +347,9 @@ fn current_time_millis() -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
-    if let Some(membership) = crate::coordinator::cluster::cluster_membership() {
+    if let Some(membership) = crate::query_execution::backend_registry::cluster_membership() {
         let live = membership.live_endpoints();
         if live.is_empty() {
             return Err("no live backend available".to_string());
@@ -248,6 +360,7 @@ pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>
     configured_backend_entries()
 }
 
+#[cfg(test)]
 fn configured_backend_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
     let cfg = crate::novarocks_config::config()
         .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
@@ -276,6 +389,7 @@ pub(crate) fn execute_add_backend(
     let registry = ensure_backend_registry(state)?;
     let be_id = registry.add_backend(endpoint);
     persist_backend(state, be_id, endpoint, BackendState::Registering)?;
+    publish_registry_snapshot(state.backend_query_events.as_ref(), registry.as_ref());
     Ok(StatementResult::Ok)
 }
 
@@ -287,8 +401,13 @@ pub(crate) fn execute_drop_backend(
     let endpoint = parse_backend_addr(&stmt.addr)?;
     let registry = ensure_backend_registry(state)?;
     let be_id = registry.mark_decommissioning(endpoint)?;
+    publish_registry_snapshot(state.backend_query_events.as_ref(), registry.as_ref());
 
-    if stmt.force || !in_flight_table().backend_has_inflight(be_id as usize) {
+    if stmt.force
+        || !state
+            .backend_query_events
+            .backend_has_active_queries(be_id as usize)
+    {
         force_remove_backend(state, registry.as_ref(), be_id, endpoint, stmt.force)?;
     } else {
         persist_backend(state, be_id, endpoint, BackendState::Decommissioning)?;
@@ -309,7 +428,7 @@ pub(crate) fn execute_show_backends(
             )?))
         }
         ClusterRole::AllInOne => {
-            let registry = crate::coordinator::cluster::backend_registry()
+            let registry = crate::query_execution::backend_registry::backend_registry()
                 .ok_or_else(|| "all-in-one backend registry is not initialized".to_string())?;
             Ok(StatementResult::Query(show_backends_result(
                 registry.snapshot(),
@@ -320,7 +439,7 @@ pub(crate) fn execute_show_backends(
 }
 
 fn show_backends_result(
-    mut entries: Vec<crate::coordinator::cluster::BackendEntry>,
+    mut entries: Vec<crate::query_execution::backend_registry::BackendEntry>,
 ) -> Result<QueryResult, String> {
     entries.sort_by_key(|entry| entry.be_id);
     let column_names = [
@@ -384,19 +503,26 @@ fn spawn_decommission_watcher(
     let cfg = crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
     let timeout = Duration::from_secs(cfg.cluster.decommission_timeout_secs);
     let provider = state.metadata_provider.clone();
+    let backend_query_events = Arc::clone(&state.backend_query_events);
     std::thread::Builder::new()
         .name(format!("backend-decommission-{be_id}"))
         .spawn(move || {
             let start = std::time::Instant::now();
             loop {
-                if !in_flight_table().backend_has_inflight(be_id as usize) {
+                if !backend_query_events.backend_has_active_queries(be_id as usize) {
                     registry.remove(be_id);
+                    publish_registry_snapshot(backend_query_events.as_ref(), registry.as_ref());
                     let _ = delete_backend_with_provider(provider.as_ref(), &endpoint);
                     return;
                 }
                 if start.elapsed() >= timeout {
-                    fail_backend_queries(be_id, format!("backend {be_id} decommission timed out"));
+                    notify_backend_unavailable(
+                        backend_query_events.as_ref(),
+                        be_id,
+                        format!("backend {be_id} decommission timed out"),
+                    );
                     registry.remove(be_id);
+                    publish_registry_snapshot(backend_query_events.as_ref(), registry.as_ref());
                     let _ = delete_backend_with_provider(provider.as_ref(), &endpoint);
                     return;
                 }
@@ -415,17 +541,29 @@ fn force_remove_backend(
     fail_queries: bool,
 ) -> Result<(), String> {
     if fail_queries {
-        fail_backend_queries(be_id, format!("backend {be_id} dropped forcefully"));
+        notify_backend_unavailable(
+            state.backend_query_events.as_ref(),
+            be_id,
+            format!("backend {be_id} dropped forcefully"),
+        );
     }
     registry.remove(be_id);
+    publish_registry_snapshot(state.backend_query_events.as_ref(), registry);
     delete_backend(state, &endpoint)?;
     Ok(())
 }
 
-fn fail_backend_queries(be_id: BeId, reason: String) {
-    for query_id in in_flight_table().on_backend_failed(be_id as usize, reason.clone()) {
-        crate::cancel_query_by_id(query_id, reason.clone());
-    }
+fn notify_backend_unavailable(
+    sink: &dyn crate::query_execution::backend::BackendQueryEventSink,
+    be_id: BeId,
+    reason: String,
+) {
+    sink.on_backend_event(
+        crate::query_execution::backend::BackendQueryEvent::Unavailable {
+            backend_idx: be_id as usize,
+            reason,
+        },
+    );
 }
 
 fn persist_backend(
@@ -525,7 +663,30 @@ fn backend_state_from_str(state: &str) -> Result<BackendState, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinator::cluster::BackendRegistryTestGuard as BackendRegistryReset;
+    use crate::query_execution::backend::{BackendQueryEvent, BackendQueryEventSink};
+    use crate::query_execution::backend_registry::BackendRegistryTestGuard as BackendRegistryReset;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingBackendBoundary {
+        snapshots: Mutex<Vec<Vec<crate::query_execution::backend::LiveBackendTarget>>>,
+    }
+
+    impl BackendQueryEventSink for RecordingBackendBoundary {
+        fn on_backend_event(&self, _event: BackendQueryEvent) {}
+
+        fn backend_has_active_queries(&self, _backend_idx: usize) -> bool {
+            false
+        }
+
+        fn replace_live_backends(
+            &self,
+            _revision: u64,
+            backends: Vec<crate::query_execution::backend::LiveBackendTarget>,
+        ) {
+            self.snapshots.lock().unwrap().push(backends);
+        }
+    }
 
     #[test]
     fn all_in_one_loopback_registry_installs_live_backend_zero() {
@@ -557,10 +718,12 @@ mod tests {
         let _standalone = crate::engine::acquire_standalone_test_guard();
         let _registry = BackendRegistryReset::new();
         let endpoint: std::net::SocketAddr = "127.0.0.1:19080".parse().unwrap();
-        crate::coordinator::cluster::replace_cluster_membership_for_test(Some(
-            std::sync::Arc::new(crate::coordinator::cluster::FakeClusterMembership::new(
-                vec![(0, endpoint)],
-            )),
+        crate::query_execution::backend_registry::replace_cluster_membership_for_test(Some(
+            std::sync::Arc::new(
+                crate::query_execution::backend_registry::FakeClusterMembership::new(vec![(
+                    0, endpoint,
+                )]),
+            ),
         ));
 
         assert_eq!(
@@ -577,7 +740,7 @@ mod tests {
         let requested_endpoint: std::net::SocketAddr = "127.0.0.1:19071".parse().unwrap();
         let registry = Arc::new(BackendRegistry::new(3));
         registry.add_backend_with_state(existing_endpoint, BackendState::Live);
-        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
+        crate::query_execution::backend_registry::replace_backend_registry_for_test(Some(registry));
 
         let err = match install_all_in_one_backend_registry(requested_endpoint, 3) {
             Ok(_) => panic!("mismatched existing registry must fail"),
@@ -601,6 +764,7 @@ mod tests {
             Duration::from_millis(1),
             Duration::from_millis(1),
             |_be_id, _endpoint| HeartbeatOutcome::failed("should not heartbeat"),
+            None,
         )
         .expect("empty configured backend list must not wait");
     }
@@ -610,6 +774,7 @@ mod tests {
         let endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
         let registry = Arc::new(BackendRegistry::new(3));
         let be_id = registry.add_backend(endpoint);
+        let boundary = RecordingBackendBoundary::default();
 
         wait_for_configured_backends_live_with(
             &registry,
@@ -621,9 +786,46 @@ mod tests {
                 assert_eq!(actual_endpoint, endpoint);
                 HeartbeatOutcome::ok(7, 100)
             },
+            Some(&boundary),
         )
         .expect("configured backend should become live");
 
         assert_eq!(registry.live_endpoints(), vec![(be_id, endpoint)]);
+        assert_eq!(
+            boundary.snapshots.lock().unwrap().last(),
+            Some(&vec![
+                crate::query_execution::backend::LiveBackendTarget::new(
+                    be_id as usize,
+                    endpoint,
+                    7,
+                )
+            ]),
+            "startup wait must publish the Live transition before accepting the first query"
+        );
+    }
+
+    #[test]
+    fn decommissioning_backend_is_removed_from_injected_topology_immediately() {
+        let endpoint: SocketAddr = "127.0.0.1:19073".parse().unwrap();
+        let registry = BackendRegistry::new(3);
+        let be_id = registry.add_backend_with_state(endpoint, BackendState::Live);
+        let boundary = RecordingBackendBoundary::default();
+        publish_registry_snapshot(&boundary, &registry);
+
+        assert_eq!(registry.mark_decommissioning(endpoint).unwrap(), be_id);
+        publish_registry_snapshot(&boundary, &registry);
+
+        assert_eq!(
+            boundary.snapshots.lock().unwrap().as_slice(),
+            [
+                vec![crate::query_execution::backend::LiveBackendTarget::new(
+                    be_id as usize,
+                    endpoint,
+                    0,
+                )],
+                vec![]
+            ],
+            "new queries must not see a backend after DROP marks it decommissioning"
+        );
     }
 }

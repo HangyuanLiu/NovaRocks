@@ -25,7 +25,6 @@ pub mod cache;
 pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;
-pub mod coordinator;
 pub mod engine;
 pub mod exec;
 pub mod formats;
@@ -34,6 +33,7 @@ pub mod lower;
 pub mod meta;
 pub mod mv;
 pub mod protocol;
+pub mod query_execution;
 pub mod runtime;
 pub(crate) mod runtime_filter;
 pub mod server;
@@ -59,19 +59,3 @@ pub use service::grpc_server::start_grpc_exchange_server;
 pub use service::grpc_server::start_grpc_server;
 #[cfg(not(feature = "compat"))]
 pub use service::grpc_server::start_grpc_server_with_native_fragment_ingress;
-pub(crate) fn cancel_query_by_id(query_id: crate::runtime::query_context::QueryId, reason: String) {
-    let finsts =
-        crate::runtime::query_context::query_context_manager().cancel_query(query_id, reason);
-    let cleanup: Vec<_> = finsts
-        .into_iter()
-        .map(|id| {
-            std::thread::spawn(move || {
-                crate::runtime::result_buffer::cancel(id);
-                crate::runtime::exchange::cancel_fragment(id.hi, id.lo);
-            })
-        })
-        .collect();
-    for handle in cleanup {
-        let _ = handle.join();
-    }
-}

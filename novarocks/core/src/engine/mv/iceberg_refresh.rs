@@ -13319,7 +13319,7 @@ struct ImvRefreshPlannedChangeStream<'a> {
 #[cfg(test)]
 std::thread_local! {
     static IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST: std::cell::RefCell<
-        Option<crate::coordinator::execution::CoordinatedQueryResult>,
+        Option<crate::query_execution::outcome::QueryExecutionResult>,
     > = const { std::cell::RefCell::new(None) };
 }
 
@@ -13339,7 +13339,7 @@ impl Drop for ImvChangeStreamExecutionResultGuard {
 
 #[cfg(test)]
 fn install_imv_change_stream_execution_result_for_test(
-    result: crate::coordinator::execution::CoordinatedQueryResult,
+    result: crate::query_execution::outcome::QueryExecutionResult,
 ) -> ImvChangeStreamExecutionResultGuard {
     IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| {
         let replaced = slot.borrow_mut().replace(result);
@@ -13355,18 +13355,18 @@ fn install_imv_change_stream_execution_result_for_test(
 
 #[cfg(test)]
 fn take_imv_change_stream_execution_result_for_test()
--> Option<crate::coordinator::execution::CoordinatedQueryResult> {
+-> Option<crate::query_execution::outcome::QueryExecutionResult> {
     IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| slot.borrow_mut().take())
 }
 
 #[cfg(test)]
 fn imv_change_stream_writer_abort_result_for_test(
     reason: &str,
-) -> crate::coordinator::execution::CoordinatedQueryResult {
+) -> crate::query_execution::outcome::QueryExecutionResult {
     let mut abort =
         crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file();
     abort.reason = reason.to_string();
-    crate::coordinator::execution::CoordinatedQueryResult {
+    crate::query_execution::outcome::QueryExecutionResult {
         query_result: crate::runtime::query_result::QueryResult::empty(),
         write_commit: None,
         write_abort: Some(abort),
@@ -13447,6 +13447,7 @@ fn execute_imv_change_stream_writer(
         return executed_change_stream_write_from_result(result, planned.commit_plan);
     }
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
+        state,
         planned.prepared,
         planned.native_bundle,
         None,
@@ -13455,7 +13456,7 @@ fn execute_imv_change_stream_writer(
 }
 
 fn executed_change_stream_write_from_result(
-    result: crate::coordinator::execution::CoordinatedQueryResult,
+    result: crate::query_execution::outcome::QueryExecutionResult,
     commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
 ) -> Result<crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite, String> {
     if let Some(abort) = result.write_abort {
@@ -24077,7 +24078,7 @@ mod tests {
 
     #[test]
     fn change_stream_writer_result_requires_writer_commit() {
-        let result = crate::coordinator::execution::CoordinatedQueryResult {
+        let result = crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: None,

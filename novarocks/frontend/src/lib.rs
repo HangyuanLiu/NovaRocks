@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod application;
+pub mod coordinator;
 pub mod deployment;
 pub mod dml;
 pub mod mv;
@@ -23,10 +24,12 @@ mod server;
 pub mod statistics;
 pub mod system_catalog;
 pub mod table_maintenance;
+mod topology;
 pub mod view;
 
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig,
 };
 pub use mv::FrontendMvService;
 pub use server::{

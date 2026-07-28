@@ -22,14 +22,14 @@ use arrow::datatypes::DataType;
 use super::*;
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
 use crate::connector::scan_model::starrocks as connector_scan;
-use crate::coordinator::prepare::PreparedFragmentSet;
-use crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan;
-use crate::coordinator::prepare::scan::{
+use crate::protocol::native::encode::plan as native_plan;
+use crate::query_execution::preparation::PreparedFragmentSet;
+use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;
+use crate::query_execution::preparation::scan::{
     ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason,
     ResolvedScanBinding, ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution,
     ScanExecutionBindings,
 };
-use crate::protocol::native::encode::plan as native_plan;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::DataPartition;
@@ -37,7 +37,7 @@ use crate::sql::planner::table as table_model;
 
 fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static PreparedFragmentSet {
     Box::leak(Box::new(
-        crate::coordinator::prepare::prepared_fragment_set_for_native_encode_test(plan)
+        crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(plan)
             .expect("materialize native encoder test binding tables"),
     ))
 }

@@ -265,7 +265,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::common::types::UniqueId;
-    use crate::coordinator::cluster::LiveBackendSnapshot;
+    use crate::query_execution::backend::LiveBackendSnapshot;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::deployment::BindingInstanceIndex;
     use crate::runtime_filter::deployment::role_graph::{
