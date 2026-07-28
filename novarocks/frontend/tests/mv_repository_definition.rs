@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,8 +21,9 @@ use novarocks_spi::state_store::{
     StoreIdentity, TransactionId, Value, WriteTransaction,
 };
 use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
+    derive_transaction_id,
 };
 
 pub(crate) fn repository() -> (
@@ -98,7 +100,7 @@ pub(crate) fn create_request(table: &str) -> CreateMvRepositoryRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultMode {
     Committed,
     KnownAborted,
@@ -111,11 +113,16 @@ struct FaultStore {
     inner: Arc<dyn StateStore>,
     mode: FaultMode,
     used: Arc<AtomicBool>,
+    committed_attempts: Arc<Mutex<Vec<TransactionId>>>,
+    terminalized_attempts: Arc<Mutex<Vec<TransactionId>>>,
 }
 struct FaultWrite {
     inner: Box<dyn WriteTransaction>,
+    store: Arc<dyn StateStore>,
     mode: FaultMode,
     used: Arc<AtomicBool>,
+    committed_attempts: Arc<Mutex<Vec<TransactionId>>>,
+    terminalized_attempts: Arc<Mutex<Vec<TransactionId>>>,
 }
 #[async_trait::async_trait]
 impl ReadTransaction for FaultWrite {
@@ -150,11 +157,26 @@ impl WriteTransaction for FaultWrite {
         self.inner.delete(key, precondition).await
     }
     async fn commit(self: Box<Self>) -> CommitOutcome {
+        let transaction_id = *self.inner.transaction_id();
+        self.committed_attempts
+            .lock()
+            .expect("record commit attempt")
+            .push(transaction_id);
         match self.mode {
             FaultMode::Committed => self.inner.commit().await,
             FaultMode::KnownAborted | FaultMode::UnknownAborted => {
                 if !self.used.swap(true, Ordering::SeqCst) {
-                    let _ = self.inner.abort().await;
+                    if self.inner.abort().await.is_ok()
+                        && matches!(
+                            self.store.resolve_commit(&transaction_id).await,
+                            Ok(CommitResolution::NotCommitted)
+                        )
+                    {
+                        self.terminalized_attempts
+                            .lock()
+                            .expect("record terminal transaction")
+                            .push(transaction_id);
+                    }
                     CommitOutcome::CommitUnknown(StateStoreError::new(
                         StateStoreErrorKind::Transient,
                         "injected unknown abort",
@@ -164,7 +186,17 @@ impl WriteTransaction for FaultWrite {
                 }
             }
             FaultMode::UnresolvedMismatch => {
-                let _ = self.inner.abort().await;
+                if self.inner.abort().await.is_ok()
+                    && matches!(
+                        self.store.resolve_commit(&transaction_id).await,
+                        Ok(CommitResolution::NotCommitted)
+                    )
+                {
+                    self.terminalized_attempts
+                        .lock()
+                        .expect("record terminal transaction")
+                        .push(transaction_id);
+                }
                 CommitOutcome::CommitUnknown(StateStoreError::new(
                     StateStoreErrorKind::Transient,
                     "injected unknown abort",
@@ -198,8 +230,11 @@ impl StateStore for FaultStore {
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
         Ok(Box::new(FaultWrite {
             inner: self.inner.begin_write(id, purpose).await?,
+            store: Arc::clone(&self.inner),
             mode: self.mode,
             used: Arc::clone(&self.used),
+            committed_attempts: Arc::clone(&self.committed_attempts),
+            terminalized_attempts: Arc::clone(&self.terminalized_attempts),
         }))
     }
     async fn poll_changes(
@@ -348,20 +383,24 @@ fn concurrent_allocation_has_no_duplicates_and_explicit_bounds_are_checked() {
 }
 
 #[test]
-fn commit_resolution_fault_matrix_is_authoritative() {
-    for (mode, succeeds) in [
-        (FaultMode::Committed, true),
-        (FaultMode::KnownAborted, true),
-        (FaultMode::UnknownCommitted, true),
-        (FaultMode::UnknownAborted, true),
-        (FaultMode::UnresolvedMatching, true),
-        (FaultMode::UnresolvedMismatch, false),
+fn commit_resolution_fault_matrix_terminalizes_real_transactions_and_preserves_side_effects() {
+    for mode in [
+        FaultMode::Committed,
+        FaultMode::KnownAborted,
+        FaultMode::UnknownCommitted,
+        FaultMode::UnknownAborted,
+        FaultMode::UnresolvedMatching,
+        FaultMode::UnresolvedMismatch,
     ] {
         let (_temp, runtime, host, _repository) = repository();
+        let committed_attempts = Arc::new(Mutex::new(Vec::new()));
+        let terminalized_attempts = Arc::new(Mutex::new(Vec::new()));
         let store: Arc<dyn StateStore> = Arc::new(FaultStore {
             inner: host.state_store().expect("host state store"),
             mode,
             used: Arc::new(AtomicBool::new(false)),
+            committed_attempts: Arc::clone(&committed_attempts),
+            terminalized_attempts: Arc::clone(&terminalized_attempts),
         });
         let repository = runtime
             .block_on(StateStoreMvRepository::open(
@@ -369,8 +408,109 @@ fn commit_resolution_fault_matrix_is_authoritative() {
                 runtime.handle().clone(),
             ))
             .expect("open fault repository");
-        let result = repository.create(uuid::Uuid::now_v7(), create_request("fault"));
-        assert_eq!(result.is_ok(), succeeds, "mode={mode:?}");
+        let operation_id = uuid::Uuid::now_v7();
+        let request = create_request("fault");
+        let target = MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "sales".to_string(),
+            name: "fault".to_string(),
+        };
+        let upstream = request.dependencies[0].upstream.clone();
+        let result = repository.create(operation_id, request);
+
+        if mode == FaultMode::UnresolvedMismatch {
+            let error = result.expect_err("unresolved abort must not be recovered as committed");
+            assert_eq!(
+                error.kind(),
+                novarocks::mv::repository::MvRepositoryErrorKind::CommitUnknown,
+                "mode={mode:?}"
+            );
+            assert!(
+                repository
+                    .list_definitions()
+                    .expect("list definitions")
+                    .is_empty(),
+                "mode={mode:?}"
+            );
+            assert!(
+                repository
+                    .find_by_target(&target)
+                    .expect("find target")
+                    .is_none(),
+                "mode={mode:?}"
+            );
+            assert!(
+                repository
+                    .list_downstream_dependencies(&upstream)
+                    .expect("list upstream dependencies")
+                    .is_empty(),
+                "mode={mode:?}"
+            );
+            assert!(
+                repository
+                    .list_dependencies_by_downstream(1)
+                    .expect("list downstream dependencies")
+                    .is_empty(),
+                "mode={mode:?}"
+            );
+        } else {
+            let definition = result.expect("resolved or provably committed create");
+            assert_eq!(definition.mv_id, 1, "mode={mode:?}");
+            assert_eq!(
+                repository
+                    .load_by_id(definition.mv_id)
+                    .expect("load definition"),
+                Some(definition.clone()),
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                repository.find_by_target(&target).expect("find target"),
+                Some(definition.clone()),
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                repository
+                    .list_dependencies_by_downstream(definition.mv_id)
+                    .expect("list downstream dependencies")
+                    .len(),
+                1,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                repository
+                    .list_downstream_dependencies(&upstream)
+                    .expect("list upstream dependencies")
+                    .len(),
+                1,
+                "mode={mode:?}"
+            );
+        }
+
+        let first_attempt = derive_transaction_id(OperationId::from(operation_id), 1);
+        if matches!(
+            mode,
+            FaultMode::KnownAborted | FaultMode::UnknownAborted | FaultMode::UnresolvedMismatch
+        ) {
+            assert!(
+                terminalized_attempts
+                    .lock()
+                    .expect("read terminal transactions")
+                    .contains(&first_attempt),
+                "mode={mode:?} must terminalize the real first transaction"
+            );
+        }
+        if mode == FaultMode::KnownAborted {
+            let second_attempt = derive_transaction_id(OperationId::from(operation_id), 2);
+            let committed_attempts = committed_attempts.lock().expect("read commit attempts");
+            assert!(
+                committed_attempts.contains(&first_attempt),
+                "known abort must first commit the terminalized transaction ID"
+            );
+            assert!(
+                committed_attempts.contains(&second_attempt),
+                "known abort retry must retain the operation ID and use attempt two; observed={committed_attempts:?}"
+            );
+        }
     }
 }
 
@@ -417,6 +557,36 @@ fn sqlite_state_store_reopen_preserves_mv_records() {
         .expect("reopen MV repository");
     assert_eq!(
         reopened.load_by_id(definition.mv_id).expect("load"),
+        Some(definition.clone())
+    );
+    assert_eq!(
+        reopened
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "sales".to_string(),
+                name: "reopen".to_string(),
+            })
+            .expect("find reopened target"),
+        Some(definition.clone())
+    );
+    let dependencies = reopened
+        .list_dependencies_by_downstream(definition.mv_id)
+        .expect("list reopened downstream dependencies");
+    assert_eq!(dependencies.len(), 1);
+    assert_eq!(
+        reopened
+            .list_downstream_dependencies(&dependencies[0].upstream)
+            .expect("list reopened upstream dependencies"),
+        dependencies
+    );
+    let next = reopened
+        .create(uuid::Uuid::now_v7(), create_request("reopen_next"))
+        .expect("create after reopen");
+    assert_eq!(next.mv_id, definition.mv_id + 1);
+    assert_eq!(
+        reopened
+            .load_by_id(definition.mv_id)
+            .expect("load original"),
         Some(definition)
     );
 }

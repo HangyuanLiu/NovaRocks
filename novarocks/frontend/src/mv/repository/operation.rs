@@ -114,7 +114,9 @@ where
     .await
     .map(|success| success.value);
     match result {
-        Err(RunFailure::Begin(error)) if error.kind() == StateStoreErrorKind::InvalidRequest => {
+        Err(RunFailure::Begin(error) | RunFailure::DefiniteFailure(error))
+            if error.kind() == StateStoreErrorKind::InvalidRequest =>
+        {
             // A resolved-aborted commit leaves its derived transaction ID terminal.
             // Continue the same stable operation on its next deterministic attempt.
             run_after_known_abort(store, operation_id, purpose, operation).await

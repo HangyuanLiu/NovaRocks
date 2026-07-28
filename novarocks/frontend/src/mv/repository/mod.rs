@@ -448,17 +448,6 @@ impl StateStoreMvRepository {
             if !matches_definition {
                 continue;
             }
-            let sequence_key = sequence_key().map_err(corruption)?;
-            let Some(sequence_record) = self.read_record(&sequence_key).await? else {
-                continue;
-            };
-            let sequence: DecodedMvRecord<MvSequence> =
-                decode_record(&sequence_key, &sequence_record.value).map_err(corruption)?;
-            if sequence.operation_id != operation_id
-                || sequence.value.last_allocated_id < definition.mv_id
-            {
-                continue;
-            }
             if let Some(target) = definition_target(&definition)? {
                 let target_key = target_lookup_key(
                     &target.catalog.unwrap_or_default(),
@@ -489,14 +478,33 @@ impl StateStoreMvRepository {
             if actual_dependencies.len() != expected_dependencies.len() {
                 continue;
             }
-            let dependencies_match = expected_dependencies.iter().all(|expected| {
-                actual_dependencies.iter().any(|(record, actual)| {
-                    actual == expected
-                        && decode_record::<StoredMvDependency>(&record.key, &record.value)
-                            .map(|decoded| decoded.operation_id == operation_id)
-                            .unwrap_or(false)
-                })
-            });
+            let mut dependencies_match = true;
+            for expected in &expected_dependencies {
+                let downstream_key =
+                    dependency_by_downstream_key(expected.downstream_mv_id, &expected.upstream)
+                        .map_err(corruption)?;
+                let upstream_key =
+                    dependency_by_upstream_key(&expected.upstream, expected.downstream_mv_id)
+                        .map_err(corruption)?;
+                for key in [&downstream_key, &upstream_key] {
+                    let Some(record) = self.read_record(key).await? else {
+                        dependencies_match = false;
+                        break;
+                    };
+                    let matches = decode_record::<StoredMvDependency>(key, &record.value)
+                        .map(|decoded| {
+                            decoded.operation_id == operation_id && decoded.value == *expected
+                        })
+                        .unwrap_or(false);
+                    if !matches {
+                        dependencies_match = false;
+                        break;
+                    }
+                }
+                if !dependencies_match {
+                    break;
+                }
+            }
             if dependencies_match {
                 return Ok(definition);
             }
