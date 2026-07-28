@@ -300,6 +300,25 @@ impl ConnectorReadScanSource {
         }
     }
 
+    pub(crate) fn new_scheduled_ephemeral(
+        instance: Arc<ConnectorInstance>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        lifecycle: Arc<ConnectorInstanceLease>,
+        auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
+    ) -> Self {
+        Self {
+            instance,
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
+            request,
+            chunk_schema,
+            lifecycle: Some(lifecycle),
+            incremental: None,
+            auxiliary,
+        }
+    }
+
     pub(crate) fn new_scheduled_with_auxiliary(
         instance: Arc<ConnectorInstance>,
         scheduled: Vec<ConnectorScheduledSplit>,

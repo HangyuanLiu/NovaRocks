@@ -26,14 +26,20 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError,
+    ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorRequestContext,
+    ConnectorScan, ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest,
+    ConnectorTableHandle,
 };
 
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::RuntimeScanPredicateCounters;
+use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
 use crate::connector::iceberg::position_delete::load_position_deletes;
+use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
     BoundScanRanges, HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
@@ -43,6 +49,198 @@ use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
+
+const HDFS_SPI_PROVIDER_ID: &str = "hdfs";
+
+#[derive(Clone)]
+pub(crate) struct HdfsInstanceConfig {
+    pub(crate) scan: HdfsScanConfig,
+    pub(crate) chunk_schema: crate::exec::chunk::ChunkSchemaRef,
+}
+
+pub(crate) struct HdfsConnectorInstance {
+    instance_id: ConnectorInstanceId,
+    config: HdfsInstanceConfig,
+}
+
+impl HdfsConnectorInstance {
+    pub(crate) fn new(instance_id: ConnectorInstanceId, config: HdfsInstanceConfig) -> Self {
+        Self {
+            instance_id,
+            config,
+        }
+    }
+
+    pub(crate) fn connector_instance(self: Arc<Self>) -> Result<ConnectorInstance, ConnectorError> {
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(HDFS_SPI_PROVIDER_ID)?,
+                instance_id: self.instance_id.clone(),
+            },
+            None,
+            self,
+        )
+    }
+
+    fn validate_context(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
+        if context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn split_for_index(&self, index: usize) -> Result<ConnectorSplit, ConnectorError> {
+        let range = self.config.scan.ranges.get(index).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS split index is out of bounds",
+            )
+        })?;
+        ConnectorSplit::try_new(
+            self.instance_id.clone(),
+            format!("hdfs-{index}"),
+            bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+            Some(range.length),
+        )
+    }
+
+    fn split_index(&self, split: &ConnectorSplit) -> Result<usize, ConnectorError> {
+        if split.owner() != &self.instance_id || split.payload().len() != 8 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid HDFS split payload",
+            ));
+        }
+        let bytes: [u8; 8] = split
+            .payload()
+            .as_ref()
+            .try_into()
+            .expect("payload length checked");
+        usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS split index overflows usize",
+            )
+        })
+    }
+}
+
+pub(crate) fn plan_hdfs_read_source(
+    connectors: &ConnectorRegistry,
+    instance_id: ConnectorInstanceId,
+    config: HdfsInstanceConfig,
+    batch: ConnectorBatchBudget,
+    context: ConnectorRequestContext,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let provider = Arc::new(HdfsConnectorInstance::new(instance_id, config));
+    let scheduled = (0..provider.config.scan.ranges.len())
+        .map(|index| {
+            Ok(ConnectorScheduledSplit::file(
+                provider.split_for_index(index)?,
+                provider.config.scan.ranges[index].clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    let expected_schema = provider.config.chunk_schema.arrow_schema_ref();
+    let chunk_schema = Arc::clone(&provider.config.chunk_schema);
+    let instance = provider.connector_instance()?;
+    let (instance, lifecycle) = connectors
+        .register_ephemeral_connector_instance(instance)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
+    Ok(Arc::new(ConnectorReadScanSource::new_scheduled_ephemeral(
+        instance,
+        scheduled,
+        ConnectorOpenReaderRequest {
+            expected_schema,
+            batch,
+            context,
+        },
+        chunk_schema,
+        lifecycle,
+        None,
+    )))
+}
+
+impl ConnectorRead for HdfsConnectorInstance {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        table: &ConnectorTableHandle,
+        request: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        self.validate_context(&request.context)?;
+        if table.owner() != &self.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS table handle belongs to another instance",
+            ));
+        }
+        Ok(ConnectorScan {
+            handle: ConnectorScanHandle::try_new(self.instance_id.clone(), bytes::Bytes::new())?,
+            output_schema: self.config.chunk_schema.arrow_schema_ref(),
+        })
+    }
+
+    fn plan_splits(
+        &self,
+        scan: &ConnectorScanHandle,
+        request: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        if scan.owner() != &self.instance_id || !scan.payload().is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid HDFS scan handle",
+            ));
+        }
+        (0..self.config.scan.ranges.len())
+            .map(|index| self.split_for_index(index))
+            .collect()
+    }
+
+    fn open_reader(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        if request.expected_schema.as_ref() != self.config.chunk_schema.arrow_schema_ref().as_ref()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS reader expected schema does not match decoded output schema",
+            ));
+        }
+        let index = self.split_index(split)?;
+        let range = self.config.scan.ranges.get(index).cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS split index is out of bounds",
+            )
+        })?;
+        let mut scan = self.config.scan.clone();
+        scan.original_range_count = 1;
+        scan.ranges = vec![range];
+        Ok(Box::new(HdfsFileBatchReader::new(
+            scan,
+            request.context,
+            request.batch.max_rows.get(),
+            request.batch.max_bytes.get(),
+        )))
+    }
+}
 
 fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
     delete_files
