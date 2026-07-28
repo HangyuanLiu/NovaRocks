@@ -20,8 +20,10 @@ use std::sync::Arc;
 pub mod config;
 pub mod coordination;
 mod deployment;
+pub mod host_error;
 pub mod limits;
 pub mod metrics;
+pub mod provider;
 pub mod runner;
 mod runtime;
 
@@ -41,10 +43,15 @@ pub use foundationdb::test_support::{FoundationDbCommitGateControl, arm_next_fou
 
 pub use config::{
     FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
-    StateStoreConfig, StateStoreProviderConfig,
+    StateStoreConfig, StateStoreHostConfig, StateStoreProviderConfig,
 };
 pub use deployment::FeDeploymentView;
+pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
 pub use limits::StateStoreLimitOverrides;
+pub use provider::{
+    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MYSQL_STATE_STORE_PROVIDER_ID,
+    SQLITE_STATE_STORE_PROVIDER_ID, StateStoreProviderRegistration, StateStoreProviderRegistry,
+};
 pub use runner::{
     OperationId, RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free,
 };

@@ -24,11 +24,17 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
+use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
 use super::limits::{
     MYSQL_MAX_KEY_BYTES, MYSQL_MAX_META_VALUE_BYTES, StateStoreLimitOverrides,
     resolve_state_store_limits,
 };
+use super::provider::{
+    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MYSQL_STATE_STORE_PROVIDER_ID,
+    SQLITE_STATE_STORE_PROVIDER_ID,
+};
 use novarocks_spi::state_store::MAX_KEY_BYTES;
+use novarocks_spi::state_store::StateStoreProviderId;
 
 const MYSQL_MAX_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const MYSQL_MAX_INACTIVE_CONNECTION_TTL_MS: u64 = 86_400_000;
@@ -46,6 +52,16 @@ pub enum StateStoreProviderConfig {
     Mysql {
         database: String,
     },
+}
+
+impl StateStoreProviderConfig {
+    pub const fn provider_id(&self) -> StateStoreProviderId {
+        match self {
+            Self::Sqlite { .. } => SQLITE_STATE_STORE_PROVIDER_ID,
+            Self::Foundationdb { .. } => FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
+            Self::Mysql { .. } => MYSQL_STATE_STORE_PROVIDER_ID,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -391,6 +407,38 @@ impl StateStoreAppConfig {
             (_, Some(_)) => bail!(
                 "InvalidStateStoreConfig: [state_store.mysql_client] requires the mysql state store provider"
             ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateStoreHostConfig {
+    pub state_store: StateStoreAppConfig,
+    pub foundationdb_client: Option<FoundationDbClientConfig>,
+}
+
+impl StateStoreHostConfig {
+    pub fn validate(&self) -> Result<(), StateStoreHostError> {
+        let provider_id = self.state_store.store.provider.provider_id();
+        self.state_store
+            .validate()
+            .map_err(|error| StateStoreHostError::invalid_configuration(provider_id, error))?;
+
+        match (&self.state_store.store.provider, &self.foundationdb_client) {
+            (StateStoreProviderConfig::Foundationdb { .. }, Some(client)) => client
+                .validate()
+                .map_err(|error| StateStoreHostError::invalid_configuration(provider_id, error)),
+            (StateStoreProviderConfig::Foundationdb { .. }, None) => Err(StateStoreHostError::new(
+                StateStoreHostErrorKind::InvalidConfiguration,
+                Some(provider_id),
+                "FoundationDB provider requires a foundationdb_client configuration",
+            )),
+            (_, Some(_)) => Err(StateStoreHostError::new(
+                StateStoreHostErrorKind::InvalidConfiguration,
+                Some(provider_id),
+                "foundationdb_client requires the FoundationDB state store provider",
+            )),
+            (_, None) => Ok(()),
         }
     }
 }
