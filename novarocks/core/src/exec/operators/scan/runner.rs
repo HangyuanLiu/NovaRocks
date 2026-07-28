@@ -356,7 +356,7 @@ impl ScanAsyncRunner {
                 };
                 let late_prune = match self.native_ordered_live_consumers.as_ref() {
                     Some(consumers) => {
-                        let is_file_range = matches!(&morsel, ScanMorsel::FileRange { .. });
+                        let is_file_range = morsel.file_range().is_some();
                         consumers.poll_and_prune_morsel(|slot_id, predicate| {
                             if !is_file_range {
                                 return Ok(ScanMorselPruneDecision::Keep);
@@ -548,19 +548,15 @@ impl ScanAsyncRunner {
         let Some(spec) = self.scan.row_position() else {
             return Ok(None);
         };
-        let ScanMorsel::FileRange {
-            scan_range_id,
-            first_row_id,
-            ..
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
             return Err("row position requires file range morsels".to_string());
         };
-        let first_row_id = first_row_id
+        let first_row_id = range
+            .first_row_id
             .ok_or_else(|| "row position requires first_row_id on scan range".to_string())?;
         Ok(Some(RowPositionState {
             spec: spec.clone(),
-            scan_range_id: *scan_range_id,
+            scan_range_id: range.scan_range_id,
             first_row_id,
             next_row_offset: 0,
         }))
@@ -594,23 +590,16 @@ impl ScanAsyncRunner {
         let Some(spec) = self.scan.iceberg_virtual() else {
             return Ok(None);
         };
-        let ScanMorsel::FileRange {
-            path,
-            first_row_id,
-            data_sequence_number,
-            ivm_change_op,
-            ..
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
             return Err("iceberg virtual columns require file range morsels".to_string());
         };
         Ok(Some(IcebergVirtualState {
             spec: spec.clone(),
-            file_path: path.clone(),
+            file_path: range.path,
             next_row_offset: 0,
-            first_row_id: *first_row_id,
-            data_sequence_number: *data_sequence_number,
-            change_op: *ivm_change_op,
+            first_row_id: range.first_row_id,
+            data_sequence_number: range.data_sequence_number,
+            change_op: range.ivm_change_op,
         }))
     }
 
@@ -618,10 +607,10 @@ impl ScanAsyncRunner {
         &self,
         morsel: &ScanMorsel,
     ) -> Result<Option<IcebergDeleteFilterState>, String> {
-        let ScanMorsel::FileRange { delete_files, .. } = morsel else {
+        let Some(range) = morsel.file_range() else {
             return Ok(None);
         };
-        if delete_files.is_empty() {
+        if range.delete_files.is_empty() {
             return Ok(None);
         }
         let deleted = self
@@ -646,13 +635,10 @@ impl ScanAsyncRunner {
         &self,
         morsel: &ScanMorsel,
     ) -> Option<IcebergIncludePositionFilterState> {
-        let ScanMorsel::FileRange {
-            included_positions, ..
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
             return None;
         };
-        let positions = included_positions.as_ref()?;
+        let positions = range.included_positions.as_ref()?;
         let mut included = RoaringTreemap::new();
         for pos in positions {
             if *pos >= 0 {

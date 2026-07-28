@@ -70,6 +70,13 @@ pub enum ScanMorsel {
     ConnectorSplit {
         index: usize,
     },
+    /// A scheduled SPI split with file metadata retained by core. The opaque
+    /// provider payload is selected by `index`; `range` remains available to
+    /// core row-position, virtual-column, and delete filtering logic.
+    ConnectorFileSplit {
+        index: usize,
+        range: FileScanRange,
+    },
     Schema {
         table_name: String,
     },
@@ -118,8 +125,48 @@ impl ScanMorsel {
             ScanMorsel::ConnectorSplit { index } => {
                 format!("connector_split_index={index}")
             }
+            ScanMorsel::ConnectorFileSplit { index, range } => format!(
+                "connector_file_split_index={index} path={} offset={} length={}",
+                range.path, range.offset, range.length
+            ),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),
+        }
+    }
+
+    /// Returns the core-owned file metadata for both legacy and SPI-scheduled
+    /// file morsels. It intentionally excludes every provider payload.
+    pub fn file_range(&self) -> Option<FileScanRange> {
+        match self {
+            Self::FileRange {
+                path,
+                file_len,
+                offset,
+                length,
+                scan_range_id,
+                first_row_id,
+                data_sequence_number,
+                ivm_change_op,
+                included_positions,
+                external_datacache,
+                delete_files,
+                iceberg_file_pruning,
+            } => Some(FileScanRange {
+                path: path.clone(),
+                file_len: *file_len,
+                offset: *offset,
+                length: *length,
+                scan_range_id: *scan_range_id,
+                first_row_id: *first_row_id,
+                data_sequence_number: *data_sequence_number,
+                ivm_change_op: *ivm_change_op,
+                included_positions: included_positions.clone(),
+                external_datacache: external_datacache.clone(),
+                delete_files: delete_files.clone(),
+                iceberg_file_pruning: iceberg_file_pruning.clone(),
+            }),
+            Self::ConnectorFileSplit { range, .. } => Some(range.clone()),
+            _ => None,
         }
     }
 }
@@ -629,8 +676,9 @@ impl std::fmt::Debug for ScanNode {
 mod tests {
     use std::sync::Arc;
 
-    use super::RuntimeFilterContext;
+    use super::{RuntimeFilterContext, ScanMorsel};
     use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
+    use crate::fs::scan_context::FileScanRange;
 
     #[test]
     fn runtime_filter_context_preserves_min_max_filters() {
@@ -647,5 +695,31 @@ mod tests {
         );
 
         assert_eq!(ctx.min_max_filters().len(), 1);
+    }
+
+    #[test]
+    fn connector_file_split_preserves_core_file_metadata() {
+        let morsel = ScanMorsel::ConnectorFileSplit {
+            index: 3,
+            range: FileScanRange {
+                path: "s3://bucket/data.parquet".to_string(),
+                file_len: 99,
+                offset: 7,
+                length: 11,
+                scan_range_id: 5,
+                first_row_id: Some(13),
+                data_sequence_number: Some(17),
+                ivm_change_op: Some(2),
+                included_positions: Some(vec![1, 4]),
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: None,
+            },
+        };
+        let range = morsel.file_range().expect("file metadata");
+        assert_eq!(range.path, "s3://bucket/data.parquet");
+        assert_eq!(range.scan_range_id, 5);
+        assert_eq!(range.first_row_id, Some(13));
+        assert_eq!(range.included_positions, Some(vec![1, 4]));
     }
 }
