@@ -33,6 +33,7 @@ use crate::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
     ScanSource,
 };
+use crate::fs::scan_context::FileScanRange;
 use crate::runtime::profile::RuntimeProfile;
 
 pub(crate) struct ConnectorBatchReaderIter {
@@ -49,6 +50,40 @@ pub(crate) struct ConnectorSplitAppend {
     pub(crate) has_more: bool,
 }
 
+/// A queued provider split plus the optional file metadata that remains owned
+/// by core execution. Provider payloads never contain the sidecar.
+#[derive(Clone)]
+pub(crate) struct ConnectorScheduledSplit {
+    split: ConnectorSplit,
+    file_range: Option<FileScanRange>,
+}
+
+impl ConnectorScheduledSplit {
+    pub(crate) fn plain(split: ConnectorSplit) -> Self {
+        Self {
+            split,
+            file_range: None,
+        }
+    }
+
+    pub(crate) fn file(split: ConnectorSplit, file_range: FileScanRange) -> Self {
+        Self {
+            split,
+            file_range: Some(file_range),
+        }
+    }
+
+    fn morsel(&self, index: usize) -> ScanMorsel {
+        match &self.file_range {
+            Some(range) => ScanMorsel::ConnectorFileSplit {
+                index,
+                range: range.clone(),
+            },
+            None => ScanMorsel::ConnectorSplit { index },
+        }
+    }
+}
+
 /// Core-internal adapter used only by compat/native transport adapters that
 /// receive incremental ranges. It deliberately is not part of the SPI trait.
 pub(crate) trait IncrementalConnectorSplitAdapter: Send + Sync {
@@ -59,26 +94,36 @@ pub(crate) trait IncrementalConnectorSplitAdapter: Send + Sync {
 }
 
 struct ConnectorSplitState {
-    splits: Vec<ConnectorSplit>,
+    scheduled: Vec<ConnectorScheduledSplit>,
     split_ids: BTreeSet<String>,
     total_payload_bytes: usize,
     has_more: bool,
 }
 
 impl ConnectorSplitState {
-    fn new(splits: Vec<ConnectorSplit>, has_more: bool) -> Self {
-        let split_ids = splits
+    fn new(scheduled: Vec<ConnectorScheduledSplit>, has_more: bool) -> Self {
+        let split_ids = scheduled
             .iter()
-            .map(|split| split.split_id().to_string())
+            .map(|scheduled| scheduled.split.split_id().to_string())
             .collect();
-        let total_payload_bytes = splits.iter().map(|split| split.payload().len()).sum();
+        let total_payload_bytes = scheduled
+            .iter()
+            .map(|scheduled| scheduled.split.payload().len())
+            .sum();
         Self {
-            splits,
+            scheduled,
             split_ids,
             total_payload_bytes,
             has_more,
         }
     }
+}
+
+fn plain_scheduled(splits: Vec<ConnectorSplit>) -> Vec<ConnectorScheduledSplit> {
+    splits
+        .into_iter()
+        .map(ConnectorScheduledSplit::plain)
+        .collect()
 }
 
 impl ConnectorBatchReaderIter {
@@ -166,7 +211,10 @@ impl ConnectorReadScanSource {
     ) -> Self {
         Self {
             instance,
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(splits, false))),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(
+                plain_scheduled(splits),
+                false,
+            ))),
             request,
             chunk_schema,
             lifecycle: None,
@@ -183,7 +231,10 @@ impl ConnectorReadScanSource {
     ) -> Self {
         Self {
             instance,
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(splits, false))),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(
+                plain_scheduled(splits),
+                false,
+            ))),
             request,
             chunk_schema,
             lifecycle: Some(lifecycle),
@@ -201,11 +252,30 @@ impl ConnectorReadScanSource {
     ) -> Self {
         Self {
             instance,
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(splits, has_more))),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(
+                plain_scheduled(splits),
+                has_more,
+            ))),
             request,
             chunk_schema,
             lifecycle: None,
             incremental: Some(incremental),
+        }
+    }
+
+    pub(crate) fn new_scheduled(
+        instance: Arc<ConnectorInstance>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        Self {
+            instance,
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
+            request,
+            chunk_schema,
+            lifecycle: None,
+            incremental: None,
         }
     }
 }
@@ -244,16 +314,21 @@ impl ScanOp for ConnectorReadScanOp {
         _profile: Option<RuntimeProfile>,
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<crate::exec::node::BoxedExecIter, String> {
-        let ScanMorsel::ConnectorSplit { index } = morsel else {
-            return Err("SPI connector scan received an unexpected morsel".to_string());
+        let index = match morsel {
+            ScanMorsel::ConnectorSplit { index } | ScanMorsel::ConnectorFileSplit { index, .. } => {
+                index
+            }
+            _ => {
+                return Err("SPI connector scan received an unexpected morsel".to_string());
+            }
         };
         let split = self
             .splits
             .read()
             .map_err(|_| "SPI connector split state lock poisoned".to_string())?
-            .splits
+            .scheduled
             .get(index)
-            .cloned()
+            .map(|scheduled| scheduled.split.clone())
             .ok_or_else(|| format!("SPI connector scan split index {index} is out of bounds"))?;
         let reader = self
             .instance
@@ -272,8 +347,11 @@ impl ScanOp for ConnectorReadScanOp {
             .read()
             .map_err(|_| "SPI connector split state lock poisoned".to_string())?;
         Ok(ScanMorsels::new(
-            (0..state.splits.len())
-                .map(|index| ScanMorsel::ConnectorSplit { index })
+            state
+                .scheduled
+                .iter()
+                .enumerate()
+                .map(|(index, scheduled)| scheduled.morsel(index))
                 .collect(),
             state.has_more,
         ))
@@ -300,7 +378,7 @@ impl ScanOp for ConnectorReadScanOp {
         }
         let appended = adapter.append_incremental_ranges(ranges)?;
         let expected_owner = &self.instance.descriptor().instance_id;
-        let start = state.splits.len();
+        let start = state.scheduled.len();
         let mut appended_ids = BTreeSet::new();
         let append_payload_bytes = appended.splits.iter().try_fold(0usize, |total, split| {
             if split.owner() != expected_owner {
@@ -340,14 +418,14 @@ impl ScanOp for ConnectorReadScanOp {
         }
         for split in appended.splits {
             state.split_ids.insert(split.split_id().to_string());
-            state.splits.push(split);
+            state.scheduled.push(ConnectorScheduledSplit::plain(split));
         }
         state.total_payload_bytes = total_payload_bytes;
         state.has_more = appended.has_more;
-        let end = state.splits.len();
+        let end = state.scheduled.len();
         Ok(ScanMorsels::new(
             (start..end)
-                .map(|index| ScanMorsel::ConnectorSplit { index })
+                .map(|index| state.scheduled[index].morsel(index))
                 .collect(),
             state.has_more,
         ))

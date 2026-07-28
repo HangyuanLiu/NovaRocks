@@ -28,14 +28,15 @@ use novarocks_spi::connector::{
 };
 
 use super::runtime::{
-    ConnectorBatchReaderIter, ConnectorReadScanSource, ConnectorSplitAppend,
-    IncrementalConnectorSplitAdapter,
+    ConnectorBatchReaderIter, ConnectorReadScanSource, ConnectorScheduledSplit,
+    ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanOp, ScanSource,
 };
+use crate::fs::scan_context::FileScanRange;
 
 struct FakeReader {
     batches: Vec<Result<Option<RecordBatch>, ConnectorError>>,
@@ -421,4 +422,65 @@ fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically(
             .as_slice(),
         [ScanMorsel::ConnectorSplit { index: 0 }]
     ));
+}
+
+#[test]
+fn connector_file_split_opens_opaque_split_and_preserves_range_sidecar() {
+    let instance_id = ConnectorInstanceId::parse("test.file").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let source = ConnectorReadScanSource::new_scheduled(
+        instance,
+        vec![ConnectorScheduledSplit::file(
+            ConnectorSplit::try_new(instance_id, "file-0", bytes::Bytes::new(), Some(1))
+                .expect("split"),
+            FileScanRange {
+                path: "file:///tmp/provider-owned.parquet".to_string(),
+                file_len: 12,
+                offset: 2,
+                length: 8,
+                scan_range_id: 6,
+                first_row_id: Some(10),
+                data_sequence_number: Some(11),
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: None,
+            },
+        )],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    let morsels = op.build_morsels().expect("file morsel");
+    assert!(matches!(
+        morsels.morsels.as_slice(),
+        [ScanMorsel::ConnectorFileSplit { index: 0, range }]
+            if range.scan_range_id == 6 && range.first_row_id == Some(10)
+    ));
+    let chunks = op
+        .execute_iter(morsels.morsels[0].clone(), None, None)
+        .expect("open opaque split")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reader chunks");
+    assert_eq!(chunks.len(), 1);
 }
