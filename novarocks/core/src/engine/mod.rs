@@ -50,7 +50,7 @@ use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered}
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::{
-    IcebergOptimizeJobState, JobMetaRepository, StoredIcebergOptimizeJob,
+    JobMetaRepository,
 };
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
