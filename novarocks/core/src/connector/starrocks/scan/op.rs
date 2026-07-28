@@ -15,13 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCancellation,
+    ConnectorError, ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+    ConnectorSplitPlanningRequest, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
 use serde_json::Value;
 
 use crate::common::types::UniqueId;
+use crate::connector::ConnectorRegistry;
 use crate::connector::MinMaxPredicate;
+use crate::connector::runtime::ConnectorReadScanSource;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, lake_scan_execution_properties,
 };
@@ -36,6 +47,8 @@ use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, 
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::starlet_shard_registry;
 
 use super::reader::StarRocksNativeReader;
@@ -155,6 +168,311 @@ pub struct StarRocksScanConfig {
     /// `RuntimeMinMaxFilter` instances into `MinMaxPredicate` values
     /// for storage-level segment pruning.
     pub topn_filter_column_map: HashMap<i32, String>,
+}
+
+const STARROCKS_SPI_PROVIDER_ID: &str = "starrocks";
+
+/// Typed read instance for one decoder-planned StarRocks tablet scan. The
+/// FE-derived schema and storage configuration stay in this BE-local object;
+/// split payloads carry only a checked range index.
+struct StarRocksConnectorInstance {
+    instance_id: ConnectorInstanceId,
+    config: StarRocksScanConfig,
+    ranges: Mutex<Vec<StarRocksScanRange>>,
+}
+
+impl StarRocksConnectorInstance {
+    fn new(instance_id: ConnectorInstanceId, config: StarRocksScanConfig) -> Self {
+        Self {
+            instance_id,
+            ranges: Mutex::new(config.ranges.clone()),
+            config,
+        }
+    }
+
+    fn split_for_index(&self, index: usize) -> Result<ConnectorSplit, ConnectorError> {
+        let range = self
+            .ranges
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "StarRocks range lock poisoned",
+                )
+            })?
+            .get(index)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "StarRocks split index is out of bounds",
+                )
+            })?;
+        ConnectorSplit::try_new(
+            self.instance_id.clone(),
+            format!("starrocks-{}", range.tablet_id),
+            bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+            None,
+        )
+    }
+
+    fn range_for_split(
+        &self,
+        split: &ConnectorSplit,
+    ) -> Result<StarRocksScanRange, ConnectorError> {
+        if split.owner() != &self.instance_id || split.payload().len() != 8 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid StarRocks split payload",
+            ));
+        }
+        let bytes: [u8; 8] = split
+            .payload()
+            .as_ref()
+            .try_into()
+            .expect("payload length checked");
+        let index = usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "StarRocks split index overflows usize",
+            )
+        })?;
+        self.ranges
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "StarRocks range lock poisoned",
+                )
+            })?
+            .get(index)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "StarRocks split index is out of bounds",
+                )
+            })
+    }
+
+    fn connector_instance(self: Arc<Self>) -> Result<ConnectorInstance, ConnectorError> {
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(STARROCKS_SPI_PROVIDER_ID)?,
+                instance_id: self.instance_id.clone(),
+            },
+            None,
+            self,
+        )
+    }
+}
+
+impl ConnectorRead for StarRocksConnectorInstance {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        _: &ConnectorTableHandle,
+        _: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "StarRocks reads are decoder-planned",
+        ))
+    }
+
+    fn plan_splits(
+        &self,
+        _: &ConnectorScanHandle,
+        _: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "StarRocks reads are decoder-planned",
+        ))
+    }
+
+    fn open_reader(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        let range = self.range_for_split(split)?;
+        let mut config = self.config.clone();
+        config.ranges = vec![range];
+        config.limit = None;
+        let context = StarRocksExecutionContext::from_scan_config(&config)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
+        Ok(Box::new(StarRocksBatchReader {
+            iter: StarRocksScanIter::new(config, context, None),
+            context: request.context,
+            closed: false,
+        }))
+    }
+}
+
+struct StarRocksBatchReader {
+    iter: StarRocksScanIter,
+    context: ConnectorRequestContext,
+    closed: bool,
+}
+
+impl ConnectorBatchReader for StarRocksBatchReader {
+    fn next_batch(&mut self) -> Result<Option<arrow::record_batch::RecordBatch>, ConnectorError> {
+        if self.closed {
+            return Ok(None);
+        }
+        if self.context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= self.context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        match self.iter.next() {
+            Some(Ok(chunk)) => Ok(Some(chunk.batch)),
+            Some(Err(error)) => Err(ConnectorError::new(ConnectorErrorKind::Internal, error)),
+            None => {
+                self.closed = true;
+                Ok(None)
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.iter.close_scanner();
+        self.closed = true;
+        Ok(())
+    }
+}
+
+pub(crate) fn plan_starrocks_read_source(
+    connectors: &ConnectorRegistry,
+    instance_id: ConnectorInstanceId,
+    config: StarRocksScanConfig,
+    batch: ConnectorBatchBudget,
+    context: ConnectorRequestContext,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let provider = Arc::new(StarRocksConnectorInstance::new(instance_id, config));
+    let range_count = provider
+        .ranges
+        .lock()
+        .map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "StarRocks range lock poisoned",
+            )
+        })?
+        .len();
+    let scheduled = (0..range_count)
+        .map(|index| {
+            provider
+                .split_for_index(index)
+                .map(crate::connector::runtime::ConnectorScheduledSplit::plain)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_schema = provider.config.output_chunk_schema.arrow_schema_ref();
+    let chunk_schema = Arc::clone(&provider.config.output_chunk_schema);
+    let has_more = provider.config.has_more;
+    let instance = Arc::clone(&provider).connector_instance()?;
+    let (instance, lifecycle) = connectors
+        .register_ephemeral_connector_instance(instance)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
+    Ok(Arc::new(
+        ConnectorReadScanSource::new_scheduled_ephemeral_with_incremental(
+            instance,
+            scheduled,
+            ConnectorOpenReaderRequest {
+                expected_schema,
+                batch,
+                context,
+            },
+            chunk_schema,
+            lifecycle,
+            None,
+            has_more,
+            None,
+        ),
+    ))
+}
+
+struct StarRocksQueryCancellation {
+    query_id: Option<QueryId>,
+}
+
+impl ConnectorCancellation for StarRocksQueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.query_id
+            .is_some_and(|query_id| query_context_manager().is_query_canceled(query_id))
+    }
+}
+
+fn starrocks_read_budget_and_context(
+    query_id: Option<QueryId>,
+    query_options: &QueryOptions,
+) -> Result<(ConnectorBatchBudget, ConnectorRequestContext), ConnectorError> {
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let batch = ConnectorBatchBudget {
+        max_rows: rows,
+        max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+            .expect("SPI handle maximum is nonzero"),
+    };
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(StarRocksQueryCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )?;
+    Ok((batch, context))
+}
+
+pub(crate) fn plan_compat_starrocks_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: QueryId,
+    node_id: i32,
+    config: StarRocksScanConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let (batch, context) = starrocks_read_budget_and_context(Some(query_id), query_options)?;
+    plan_starrocks_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("starrocks.{query_id}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
+}
+
+pub(crate) fn plan_native_starrocks_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: Option<QueryId>,
+    node_id: i32,
+    config: StarRocksScanConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let (batch, context) = starrocks_read_budget_and_context(query_id, query_options)?;
+    let instance_query_id = query_id
+        .map(|query_id| query_id.to_string())
+        .unwrap_or_else(|| "unidentified".to_string());
+    plan_starrocks_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("starrocks.native.{instance_query_id}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
 }
 
 #[derive(Clone, Debug)]

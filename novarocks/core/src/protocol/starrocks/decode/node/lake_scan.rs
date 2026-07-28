@@ -21,6 +21,7 @@ use crate::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, find_cached_table_identity_names,
     lake_scan_execution_properties,
 };
+use crate::connector::starrocks::plan_compat_starrocks_read_source;
 use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::fragment::program::ScanAssignmentKind;
@@ -32,7 +33,7 @@ use crate::exec::row_position::{
     LakeRowPositionSpec, is_lake_row_id, is_lake_rss_id, is_lake_source_id, is_lake_tablet_id,
 };
 use crate::novarocks_connectors::{
-    ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
+    ConnectorRegistry, LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange,
 };
 use crate::novarocks_logging::debug;
 use crate::protocol::starrocks::decode::expr::parse_min_max_conjuncts;
@@ -503,10 +504,10 @@ pub(crate) fn lower_lake_scan_node(
         lake_schema_meta: cfg.lake_schema_meta.clone(),
     });
 
-    let (source, bound_ranges) =
-        connectors.create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?;
-    // Route the enriched ranges to the instance; bind at materialize time.
-    scan_ranges.capture(node.node_id, bound_ranges);
+    let source =
+        plan_compat_starrocks_read_source(connectors, query_id, node.node_id, cfg, query_opts)
+            .map_err(|error| error.to_string())?;
+    scan_ranges.capture(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
     let scan = ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(scan_output_chunk_schema.clone())

@@ -34,7 +34,7 @@ use crate::connector::iceberg::{
 };
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::fragment::program::ScanAssignmentKind;
-use crate::exec::node::scan::ScanNode;
+use crate::exec::node::scan::{BoundScanRanges, ScanNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
