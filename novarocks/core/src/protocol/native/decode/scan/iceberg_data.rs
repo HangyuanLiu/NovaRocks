@@ -25,7 +25,8 @@ use super::common::{
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{ScanReadPlan, maybe_project_data_scan_output};
 use crate::cache::{CacheOptions, DataCacheContext};
-use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig, ScanConfig};
+use crate::connector::hdfs::{HdfsInstanceConfig, plan_starrocks_hdfs_read_source};
+use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::FileFormatConfig;
@@ -111,14 +112,28 @@ pub(super) fn lower_iceberg_data_files_scan(
         iceberg_runtime_pruning,
     };
     let predicate = lower_scan_predicate(scan, arena, &read_plan.read_layout)?;
-    let (source, bound_ranges) = ctx
-        .connectors()?
-        .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "files", error)
-        })?;
-    // Route the enriched ranges to the instance; bind happens at materialize.
-    ctx.capture_scan_ranges(node.node_id, bound_ranges);
+    let query_id = ctx.query_id().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "query_id",
+            "IcebergDataFiles requires a query identity for connector cancellation",
+        )
+    })?;
+    let query_options = ctx.query_options().cloned().unwrap_or_default();
+    let source = plan_starrocks_hdfs_read_source(
+        ctx.connectors()?,
+        query_id,
+        node.node_id,
+        HdfsInstanceConfig {
+            scan: cfg,
+            chunk_schema: read_plan.read_schema.clone(),
+        },
+        &query_options,
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "files", error)
+    })?;
+    ctx.capture_scan_ranges(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
     let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(read_plan.read_schema.clone())
