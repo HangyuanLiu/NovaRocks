@@ -47,6 +47,7 @@ enum FailurePoint {
 struct FakeEngine {
     failures: Vec<FailurePoint>,
     calls: Mutex<Vec<&'static str>>,
+    create_operation_ids: Mutex<Vec<Uuid>>,
 }
 
 impl FakeEngine {
@@ -54,6 +55,7 @@ impl FakeEngine {
         Self {
             failures,
             calls: Mutex::new(Vec::new()),
+            create_operation_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -82,6 +84,13 @@ impl FakeEngine {
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().expect("calls").clone()
     }
+
+    fn create_operation_ids(&self) -> Vec<Uuid> {
+        self.create_operation_ids
+            .lock()
+            .expect("create operation ids")
+            .clone()
+    }
 }
 
 impl MvEngine for FakeEngine {
@@ -97,8 +106,12 @@ impl MvEngine for FakeEngine {
     fn create_target(
         &self,
         _plan: &PreparedMvCreate,
-        _operation_id: Uuid,
+        operation_id: Uuid,
     ) -> Result<CreatedMvTarget, MvEngineError> {
+        self.create_operation_ids
+            .lock()
+            .expect("create operation ids")
+            .push(operation_id);
         self.call("create")?;
         Ok(CreatedMvTarget {
             target: target(),
@@ -467,6 +480,9 @@ fn create_success_sequences_one_repository_command_before_sync_and_register() {
     );
     let operation_ids = repository.calls.lock().expect("calls").clone();
     assert_eq!(operation_ids.len(), 1);
+    let target_operation_ids = engine.create_operation_ids();
+    assert_eq!(target_operation_ids.len(), 1);
+    assert_eq!(target_operation_ids, operation_ids);
     assert_eq!(
         operation_ids[0].get_version(),
         Some(uuid::Version::SortRand)

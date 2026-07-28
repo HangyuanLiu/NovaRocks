@@ -455,21 +455,17 @@ impl MvEngine for StandaloneMvEngine {
 
     fn sync_target_descriptor(
         &self,
-        target: &CreatedMvTarget,
-        _definition: &StoredMvDefinition,
+        _target: &CreatedMvTarget,
+        definition: &StoredMvDefinition,
     ) -> Result<(), MvEngineError> {
-        let target = IcebergMvTarget {
-            catalog: target.target.catalog.clone().ok_or_else(|| {
-                MvEngineError::new(
-                    MvEngineErrorKind::DescriptorSync,
-                    "Iceberg MV target has no catalog",
-                )
-            })?,
-            namespace: target.target.database.clone(),
-            table: target.target.name.clone(),
-        };
-        sync_iceberg_mv_descriptor_for_target(&self.state, &target)
-            .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
+        sync_iceberg_mv_descriptor(
+            &self.state,
+            definition,
+            &definition.refresh_policy,
+            definition.refresh_paused,
+            definition.refresh_interval_ms,
+        )
+        .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
     }
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
@@ -912,16 +908,25 @@ pub(crate) fn create_iceberg_mv(
         }
     };
     if let Err(error) = engine.sync_target_descriptor(&target, &definition) {
-        return Err(legacy_cleanup_created_target(
-            &engine,
-            &target,
-            error.to_string(),
+        return Err(known_committed_create_finalize_error(
+            "descriptor sync",
+            error,
         ));
     }
-    engine
-        .register_target(&target)
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = engine.register_target(&target) {
+        return Err(known_committed_create_finalize_error(
+            "catalog registration",
+            error,
+        ));
+    }
     Ok(StatementResult::Ok)
+}
+
+fn known_committed_create_finalize_error(phase: &str, error: impl std::fmt::Display) -> String {
+    EngineError::commit_known_committed_finalize_failed(format!(
+        "Iceberg MV repository create committed but {phase} failed: {error}"
+    ))
+    .to_bracketed_user_message()
 }
 
 fn legacy_cleanup_created_target(
@@ -17443,7 +17448,6 @@ mod tests {
     struct TestMetaStoreProvider {
         inner: Arc<crate::meta::SqliteMetaStoreProvider>,
         reject_write_message: Option<&'static str>,
-        fail_reads: Option<(Arc<std::sync::atomic::AtomicBool>, &'static str)>,
         after_commit: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
@@ -17455,24 +17459,7 @@ mod tests {
             Self {
                 inner,
                 reject_write_message: Some(message),
-                fail_reads: None,
                 after_commit: None,
-            }
-        }
-
-        fn fail_reads_after_commit(
-            inner: Arc<crate::meta::SqliteMetaStoreProvider>,
-            fail_reads: Arc<std::sync::atomic::AtomicBool>,
-            message: &'static str,
-        ) -> Self {
-            let flag = Arc::clone(&fail_reads);
-            Self {
-                inner,
-                reject_write_message: None,
-                fail_reads: Some((fail_reads, message)),
-                after_commit: Some(Arc::new(move || {
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                })),
             }
         }
 
@@ -17483,7 +17470,6 @@ mod tests {
             Self {
                 inner,
                 reject_write_message: None,
-                fail_reads: None,
                 after_commit: Some(after_commit),
             }
         }
@@ -17499,11 +17485,6 @@ mod tests {
         }
 
         fn begin_read(&self) -> Result<Box<dyn MetaReadTxn>, MetaError> {
-            if let Some((flag, message)) = &self.fail_reads
-                && flag.load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(MetaError::new(MetaErrorKind::Transient, *message));
-            }
             self.inner.begin_read()
         }
 
@@ -17883,6 +17864,36 @@ mod tests {
         })
         .map_err(|e| format!("descriptor package-id test update runtime failed: {e}"))?
         .map_err(|e| format!("descriptor package-id test update failed: {e}"))?;
+        entry.invalidate_table_cache(namespace, table);
+        Ok(())
+    }
+
+    fn corrupt_mv_descriptor_for_test(
+        state: &Arc<StandaloneState>,
+        catalog_name: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<(), String> {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog_name).expect("catalog")
+        };
+        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)?;
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
+        let tx = iceberg::transaction::Transaction::new(&loaded.table);
+        let tx = tx
+            .update_table_properties()
+            .set(
+                crate::mv::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP.to_string(),
+                "injected-invalid-descriptor-json".to_string(),
+            )
+            .apply(tx)
+            .map_err(|e| format!("apply descriptor corruption test update failed: {e}"))?;
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+            tx.commit(catalog.as_ref()).await
+        })
+        .map_err(|e| format!("descriptor corruption test update runtime failed: {e}"))?
+        .map_err(|e| format!("descriptor corruption test update failed: {e}"))?;
         entry.invalidate_table_cache(namespace, table);
         Ok(())
     }
@@ -22663,8 +22674,8 @@ mod tests {
         assert!(definition.schema_contract.is_some());
         assert_eq!(
             definition_loads.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "descriptor sync must reload the committed repository definition exactly once"
+            0,
+            "descriptor sync must use the committed definition supplied by the application shell"
         );
         let descriptor =
             MvDescriptorV1::from_storage_properties(target.table.metadata().properties())
@@ -22750,7 +22761,7 @@ mod tests {
     }
 
     #[test]
-    fn create_iceberg_mv_descriptor_sync_failure_cleans_target_but_keeps_committed_metadata() {
+    fn create_iceberg_mv_descriptor_sync_failure_retains_target_and_committed_metadata() {
         let metadata_dir = TempDir::new().expect("metadata tempdir");
         let sqlite = Arc::new(
             crate::meta::SqliteMetaStoreProvider::open(
@@ -22758,11 +22769,20 @@ mod tests {
             )
             .expect("open meta provider"),
         );
-        let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let provider = Arc::new(TestMetaStoreProvider::fail_reads_after_commit(
+        let state_slot = Arc::new(std::sync::Mutex::new(None::<Arc<StandaloneState>>));
+        let hook_slot = Arc::clone(&state_slot);
+        let provider = Arc::new(TestMetaStoreProvider::after_commit(
             Arc::clone(&sqlite),
-            Arc::clone(&fail_reads),
-            "injected descriptor read failure",
+            Arc::new(move || {
+                let state = hook_slot
+                    .lock()
+                    .expect("state slot")
+                    .as_ref()
+                    .expect("test state installed")
+                    .clone();
+                corrupt_mv_descriptor_for_test(&state, "ice", "analytics", "mv_orders")
+                    .expect("corrupt descriptor after repository commit");
+            }),
         ));
         let env = open_test_state_with_custom_metadata_provider(
             "ice",
@@ -22770,6 +22790,7 @@ mod tests {
             metadata_dir,
             provider,
         );
+        *state_slot.lock().expect("state slot") = Some(Arc::clone(&env.state));
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW mv_orders
@@ -22779,21 +22800,17 @@ mod tests {
         );
 
         let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("descriptor definition reload must fail");
-        assert_eq!(
-            err,
-            "load iceberg mv definition failed: Transient: injected descriptor read failure; target cleanup=Ok(())"
+            .expect_err("descriptor sync must fail after repository create");
+        assert!(
+            err.starts_with("[CommitKnownCommittedFinalizeFailed] Iceberg MV repository create committed but descriptor sync failed:"),
+            "unexpected error: {err}"
         );
-        assert!(fail_reads.load(std::sync::atomic::Ordering::SeqCst));
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        assert!(
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
-                .is_err(),
-            "descriptor sync failure must clean the target"
-        );
+        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+            .expect("descriptor sync failure must retain the committed target");
         let read = sqlite.begin_read().expect("underlying repository read");
         let definitions = env
             .state
@@ -22862,7 +22879,7 @@ mod tests {
         let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect_err("catalog register must fail");
         assert!(
-            err.starts_with("standalone catalog write lock: "),
+            err.starts_with("[CommitKnownCommittedFinalizeFailed] Iceberg MV repository create committed but catalog registration failed: standalone catalog write lock: "),
             "unexpected error: {err}"
         );
         let entry = {
