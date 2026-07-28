@@ -336,22 +336,17 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
     Ok(batch)
 }
 
-/// Compat-only Statistic row encoding. The caller owns the presentation
-/// decision; this remains a temporary shared codec while the generated Thrift
-/// model is still hosted by the Core crate.
-#[cfg(feature = "compat")]
+/// Builds the neutral Statistic batch envelope. The role adapter supplies the
+/// protocol-specific row encoder.
 pub fn build_statistic_result_batch_for_chunk(
     chunk: &Chunk,
     projections: &[ResultProjection],
+    encoder: StatisticRowEncoder,
 ) -> Result<ResultBatch, String> {
     build_fetch_result_batch_for_chunk(
         chunk,
         Some(projections),
-        ResultSinkConfig::statistic(|version, fields| {
-            crate::protocol::starrocks::decode::sink::fragment::thrift_statistic_row_encoder(
-                version, fields,
-            )
-        }),
+        ResultSinkConfig::statistic(encoder),
     )
 }
 

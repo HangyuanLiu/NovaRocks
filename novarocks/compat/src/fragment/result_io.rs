@@ -78,6 +78,7 @@ impl FragmentResultSession for CompatFragmentResultSession {
                 novarocks::service::result_batch_wire::build_statistic_result_batch_for_chunk(
                     &chunk,
                     projections,
+                    super::statistic_result::thrift_statistic_row_encoder,
                 )
             }
             presentation => build_result_batch(&chunk, self.spec.projections(), presentation),

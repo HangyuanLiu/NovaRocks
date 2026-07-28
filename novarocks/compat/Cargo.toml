@@ -17,3 +17,7 @@ bench = false
 novarocks = { path = "../core", features = ["compat"] }
 anyhow = "1"
 prost = "0.13"
+base64 = "0.22"
+hex = "0.4"
+thrift = "0.17"
+serde_json = "1"
