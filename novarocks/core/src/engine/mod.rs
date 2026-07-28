@@ -78,6 +78,7 @@ mod query_stats;
 pub(crate) mod statement;
 pub mod statistics;
 pub mod system_catalog;
+pub mod table_maintenance;
 pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;

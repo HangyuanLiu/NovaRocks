@@ -87,3 +87,12 @@ code-anchors:
 
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
 - ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（active）
+
+### table-maintenance
+
+领域哲学：表维护的 application/lifecycle 由 frontend host 统一拥有，core 只提供一对一、consumer-owned 的 typed
+engine port，connector 保留 catalog、snapshot、file 与 commit 等 external-system truth。Optimize job 以 StateStore
+为唯一 durable truth；单 FE 恢复与未来多 FE lease/fence/takeover 分阶段决策，不以 SPI、service locator、双写或
+内存 fallback 模糊 owner 和故障语义。
+
+- ADR-0009 — 表维护为何由 frontend 拥有 application/lifecycle，并通过 core domain port 调用 connector truth（active）
