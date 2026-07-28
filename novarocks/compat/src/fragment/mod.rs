@@ -18,7 +18,4 @@
 mod ffi;
 mod service;
 
-pub use service::{
-    CompatFragmentService, execute_plan_fragment_sync, install_process_fragment_service,
-    submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
-};
+pub use service::CompatFragmentService;

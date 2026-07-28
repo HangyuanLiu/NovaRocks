@@ -10,7 +10,7 @@ use novarocks::service::{
 };
 
 use crate::brpc;
-use crate::fragment::{CompatFragmentService, install_process_fragment_service};
+use crate::fragment::CompatFragmentService;
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -73,6 +73,7 @@ struct StartedResources {
 pub struct CompatApplicationHost {
     ports: Box<dyn CompatPorts>,
     started: StartedResources,
+    fragment_service: Arc<CompatFragmentService>,
     ready_marker: String,
     startup_summary: String,
 }
@@ -182,6 +183,9 @@ impl CompatApplicationHost {
             host: server.host.clone(),
             be_port: server.be_port,
         };
+        let fragment_service = Arc::new(CompatFragmentService::new(
+            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+        ));
         let brpc_config = brpc::CompatConfig {
             host: &server.host,
             heartbeat_port: server.heartbeat_port,
@@ -189,28 +193,26 @@ impl CompatApplicationHost {
             internal_service_query_rpc_thread_num: query_threads,
             debug_exec_batch_plan_json: config.debug.exec_batch_plan_json,
             log_level,
+            fragment_service_context: Arc::as_ptr(&fragment_service).cast(),
         };
 
         let mut host = Self {
             ports: Box::new(ports),
             started: StartedResources::default(),
+            fragment_service,
             ready_marker,
             startup_summary,
         };
         host.ports.init_frontend_rpc();
-        let fragment_service = Arc::new(CompatFragmentService::new(
-            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
-        ));
         let grpc_fragment_service: Arc<
             dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
-        > = fragment_service.clone();
+        > = host.fragment_service.clone();
         if let Err(error) = host.ports.start_grpc(&server.host, grpc_fragment_service) {
             return Err(host.start_failure(
                 CompatApplicationErrorKind::GrpcStart,
                 format!("start grpc/http/starlet listeners: {error}"),
             ));
         }
-        install_process_fragment_service(fragment_service);
         host.started.grpc = true;
         if let Err(error) = host.ports.start_heartbeat(heartbeat_config) {
             return Err(host.start_failure(

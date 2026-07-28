@@ -102,38 +102,6 @@ impl novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncI
     }
 }
 
-fn process_fragment_service_slot() -> &'static Mutex<Option<Arc<CompatFragmentService>>> {
-    static SERVICE: OnceLock<Mutex<Option<Arc<CompatFragmentService>>>> = OnceLock::new();
-    SERVICE.get_or_init(|| Mutex::new(None))
-}
-
-pub fn install_process_fragment_service(service: Arc<CompatFragmentService>) {
-    *process_fragment_service_slot()
-        .lock()
-        .expect("compat fragment service slot lock") = Some(service);
-}
-
-fn process_fragment_service() -> Result<Arc<CompatFragmentService>, String> {
-    if let Some(service) = process_fragment_service_slot()
-        .lock()
-        .expect("compat fragment service slot lock")
-        .clone()
-    {
-        return Ok(service);
-    }
-    #[cfg(test)]
-    {
-        static TEST_SERVICE: OnceLock<Arc<CompatFragmentService>> = OnceLock::new();
-        return Ok(Arc::clone(TEST_SERVICE.get_or_init(|| {
-            Arc::new(CompatFragmentService::new(
-                StarRocksFragmentQueryRuntime::new(),
-            ))
-        })));
-    }
-    #[cfg(not(test))]
-    Err("compat fragment service is not installed".to_string())
-}
-
 #[cfg(test)]
 static TEST_FRAGMENT_LAUNCH_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1389,12 +1357,6 @@ impl Drop for PendingFragmentRoutes {
     }
 }
 
-pub fn cancel_fragment(finst_id: UniqueId) {
-    if let Ok(service) = process_fragment_service() {
-        service.cancel_fragment(finst_id);
-    }
-}
-
 fn spawn_dormant_workers(
     launches: Vec<PreparedLaunchResources>,
     execution: StarRocksFragmentExecution,
@@ -1547,10 +1509,6 @@ fn run_async_cleanup_sequence<T>(
     remove_exchange();
     unregister_finst();
     cleanup_after_report(decision);
-}
-
-pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, String> {
-    process_fragment_service()?.submit_exec_batch_plan_fragments(thrift_bytes)
 }
 
 fn submit_exec_batch_plan_fragments_with(
@@ -1714,10 +1672,6 @@ fn submit_exec_batch_plan_fragments_with(
     launch_prepared_fragments(service, prepared, descriptor_preparation, guard)
 }
 
-pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
-    process_fragment_service()?.submit_exec_plan_fragment(thrift_bytes)
-}
-
 fn submit_exec_plan_fragment_with(
     service: &CompatFragmentService,
     thrift_bytes: &[u8],
@@ -1793,12 +1747,6 @@ fn submit_exec_plan_fragment_with(
     let prepared = finish_starrocks_draft(draft, resolved)?;
     launch_prepared_fragments(service, vec![prepared], descriptor_preparation, guard)?;
     Ok(())
-}
-
-pub fn execute_plan_fragment_sync(
-    one: internal_service::TExecPlanFragmentParams,
-) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
-    process_fragment_service()?.execute_plan_fragment_sync(one)
 }
 
 fn execute_plan_fragment_sync_with(
@@ -1979,7 +1927,6 @@ mod tests {
         AdapterFailurePlan, AdapterFailureStage, AdapterPausePlan, CompatFragmentService,
         TEST_AFTER_HANDOFF_PAUSE, TEST_FRAGMENT_LAUNCH_COUNT, fragment_launch_count_for_query,
         registered_reports_for_query, run_async_cleanup_sequence, set_adapter_failure,
-        submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
     };
 
     static FAILURE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -2007,6 +1954,12 @@ mod tests {
 
     fn runtime_query_id(query: UniqueId) -> QueryId {
         QueryId::new(query.hi, query.lo)
+    }
+
+    fn fragment_service() -> CompatFragmentService {
+        CompatFragmentService::new(
+            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+        )
     }
 
     fn empty_set_node() -> plan_nodes::TPlanNode {
@@ -2383,8 +2336,9 @@ mod tests {
         };
         let request = request(query, finst, fragment(None));
         let before = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
+        let service = fragment_service();
 
-        let result = submit_exec_plan_fragment(
+        let result = service.submit_exec_plan_fragment(
             &thrift_binary_serialize(&request).expect("serialize malformed request"),
         );
         let after = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
@@ -2421,8 +2375,9 @@ mod tests {
             Some(vec![valid, malformed]),
         );
         let before = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
+        let service = fragment_service();
 
-        let result = submit_exec_batch_plan_fragments(
+        let result = service.submit_exec_batch_plan_fragments(
             &thrift_binary_serialize(&batch).expect("serialize malformed batch"),
         );
         let after = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
@@ -2459,8 +2414,9 @@ mod tests {
         let batch =
             internal_service::TExecBatchPlanFragmentsParams::new(None, Some(vec![first, second]));
         let before = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
+        let service = fragment_service();
 
-        let result = submit_exec_batch_plan_fragments(
+        let result = service.submit_exec_batch_plan_fragments(
             &thrift_binary_serialize(&batch).expect("serialize cache-conflict batch"),
         );
         let after = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
@@ -2499,8 +2455,9 @@ mod tests {
         let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, false))
             .expect("serialize prepare failure batch");
         let reset = inject_failure(query, AdapterFailureStage::Prepare, 2);
+        let service = fragment_service();
 
-        let result = submit_exec_batch_plan_fragments(&bytes);
+        let result = service.submit_exec_batch_plan_fragments(&bytes);
 
         assert!(
             result
@@ -2516,7 +2473,7 @@ mod tests {
         drop(reset);
 
         assert_eq!(
-            submit_exec_batch_plan_fragments(&bytes),
+            service.submit_exec_batch_plan_fragments(&bytes),
             Ok(2),
             "compensated prepare failure must leave the batch retryable"
         );
@@ -2545,8 +2502,9 @@ mod tests {
         let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, true))
             .expect("serialize report registration failure batch");
         let reset = inject_failure(query, AdapterFailureStage::ReportRegistration, 2);
+        let service = fragment_service();
 
-        let result = submit_exec_batch_plan_fragments(&bytes);
+        let result = service.submit_exec_batch_plan_fragments(&bytes);
 
         assert!(
             result
@@ -2567,7 +2525,7 @@ mod tests {
         drop(reset);
 
         assert_eq!(
-            submit_exec_batch_plan_fragments(&bytes),
+            service.submit_exec_batch_plan_fragments(&bytes),
             Ok(2),
             "report-registration rollback must leave the batch retryable"
         );

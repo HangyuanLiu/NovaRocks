@@ -17,16 +17,29 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::ffi::c_void;
+
 use novarocks::common::types::UniqueId;
 use novarocks::novarocks_logging::error;
 
+use super::service::CompatFragmentService;
+
+/// # Safety
+///
+/// `fragment_service_context` must point to a live `CompatFragmentService` owned by the compat
+/// application host for the duration of this call. `ptr` must reference `len` readable bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn novarocks_rs_submit_exec_batch_plan_fragments(ptr: *const u8, len: usize) -> i32 {
-    if ptr.is_null() {
+pub unsafe extern "C" fn novarocks_rs_submit_exec_batch_plan_fragments(
+    fragment_service_context: *const c_void,
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    if fragment_service_context.is_null() || ptr.is_null() {
         return 2;
     }
+    let service = unsafe { &*fragment_service_context.cast::<CompatFragmentService>() };
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    match super::service::submit_exec_batch_plan_fragments(bytes) {
+    match service.submit_exec_batch_plan_fragments(bytes) {
         Ok(_) => 0,
         Err(error) => {
             error!(
@@ -39,13 +52,22 @@ pub extern "C" fn novarocks_rs_submit_exec_batch_plan_fragments(ptr: *const u8, 
     }
 }
 
+/// # Safety
+///
+/// `fragment_service_context` must point to a live `CompatFragmentService` owned by the compat
+/// application host for the duration of this call. `ptr` must reference `len` readable bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn novarocks_rs_submit_exec_plan_fragment(ptr: *const u8, len: usize) -> i32 {
-    if ptr.is_null() {
+pub unsafe extern "C" fn novarocks_rs_submit_exec_plan_fragment(
+    fragment_service_context: *const c_void,
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    if fragment_service_context.is_null() || ptr.is_null() {
         return 2;
     }
+    let service = unsafe { &*fragment_service_context.cast::<CompatFragmentService>() };
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    match super::service::submit_exec_plan_fragment(bytes) {
+    match service.submit_exec_plan_fragment(bytes) {
         Ok(()) => 0,
         Err(error) => {
             error!(
@@ -58,13 +80,25 @@ pub extern "C" fn novarocks_rs_submit_exec_plan_fragment(ptr: *const u8, len: us
     }
 }
 
+/// # Safety
+///
+/// `fragment_service_context` must point to a live `CompatFragmentService` owned by the compat
+/// application host for the duration of this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn novarocks_rs_cancel(finst_id_hi: i64, finst_id_lo: i64) -> i32 {
+pub unsafe extern "C" fn novarocks_rs_cancel(
+    fragment_service_context: *const c_void,
+    finst_id_hi: i64,
+    finst_id_lo: i64,
+) -> i32 {
+    if fragment_service_context.is_null() {
+        return 2;
+    }
+    let service = unsafe { &*fragment_service_context.cast::<CompatFragmentService>() };
     let finst_id = UniqueId {
         hi: finst_id_hi,
         lo: finst_id_lo,
     };
-    super::service::cancel_fragment(finst_id);
+    service.cancel_fragment(finst_id);
     novarocks::cancel(finst_id);
     0
 }
@@ -75,17 +109,44 @@ mod tests {
         novarocks_rs_cancel, novarocks_rs_submit_exec_batch_plan_fragments,
         novarocks_rs_submit_exec_plan_fragment,
     };
+    use crate::fragment::CompatFragmentService;
 
     #[test]
-    fn null_fragment_payloads_keep_the_existing_invalid_argument_status() {
+    fn fragment_ffi_requires_an_explicit_service_context() {
+        let service = CompatFragmentService::new(
+            novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
+        );
+        let context = std::ptr::from_ref(&service).cast();
+        let malformed_payload = [0_u8];
+
         assert_eq!(
-            novarocks_rs_submit_exec_plan_fragment(std::ptr::null(), 0),
+            unsafe { novarocks_rs_submit_exec_plan_fragment(context, std::ptr::null(), 0) },
             2
         );
         assert_eq!(
-            novarocks_rs_submit_exec_batch_plan_fragments(std::ptr::null(), 0),
+            unsafe { novarocks_rs_submit_exec_batch_plan_fragments(context, std::ptr::null(), 0) },
             2
         );
-        assert_eq!(novarocks_rs_cancel(0, 0), 0);
+        assert_eq!(
+            unsafe {
+                novarocks_rs_submit_exec_plan_fragment(
+                    std::ptr::null(),
+                    malformed_payload.as_ptr(),
+                    malformed_payload.len(),
+                )
+            },
+            2
+        );
+        assert_eq!(
+            unsafe {
+                novarocks_rs_submit_exec_plan_fragment(
+                    context,
+                    malformed_payload.as_ptr(),
+                    malformed_payload.len(),
+                )
+            },
+            1
+        );
+        assert_eq!(unsafe { novarocks_rs_cancel(context, 0, 0) }, 0);
     }
 }
