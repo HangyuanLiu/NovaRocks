@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use arrow::array::StringArray;
@@ -45,9 +45,7 @@ use crate::connector::{
 use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
-use crate::meta::repository::job::{
-    IcebergOptimizeJobState, JobMetaRepository, StoredIcebergOptimizeJob,
-};
+use crate::meta::repository::job::JobMetaRepository;
 use crate::meta::repository::mv::MvMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
@@ -78,6 +76,7 @@ mod query_stats;
 pub(crate) mod statement;
 pub mod statistics;
 pub mod system_catalog;
+pub mod table_maintenance;
 pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
@@ -91,14 +90,8 @@ use self::statement::{
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
     looks_like_add_legacy_range_partition, looks_like_alter_iceberg_properties,
     looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
-    looks_like_alter_table_expire_snapshots, looks_like_alter_table_optimize,
-    looks_like_alter_table_remove_orphan_files, looks_like_alter_table_rewrite_manifests,
-    looks_like_show_alter_table_optimize, looks_like_show_create_table,
-    parse_add_legacy_range_partition_sql, parse_alter_iceberg_properties_sql,
-    parse_alter_partition_column_sql, parse_alter_table_expire_snapshots_sql,
-    parse_alter_table_optimize_sql, parse_alter_table_remove_orphan_files_sql,
-    parse_alter_table_rewrite_manifests_sql, parse_show_alter_table_optimize_sql,
-    parse_show_create_table,
+    looks_like_show_create_table, parse_add_legacy_range_partition_sql,
+    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql, parse_show_create_table,
 };
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 #[cfg(test)]
@@ -365,6 +358,12 @@ pub(crate) struct StandaloneState {
     >,
     /// Frontend-owned view application service, injected at engine open.
     pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+    /// Frontend-owned table-maintenance application service, injected at engine open.
+    pub(crate) table_maintenance_service:
+        std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
+    /// Instance-local weak handle used by the borrowed maintenance engine port
+    /// to enter connector execution paths that require the shared state Arc.
+    pub(crate) self_weak: Weak<StandaloneState>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -393,6 +392,10 @@ impl Default for StandaloneState {
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
             view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
+            table_maintenance_service: std::sync::Arc::new(
+                crate::engine::table_maintenance::EmptyTableMaintenanceService,
+            ),
+            self_weak: Weak::new(),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,
@@ -461,6 +464,7 @@ impl StandaloneNovaRocks {
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
             std::sync::Arc::new(statistics::EmptyStatisticsService),
+            std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
             _test_guard,
         );
         #[cfg(not(test))]
@@ -469,6 +473,7 @@ impl StandaloneNovaRocks {
             std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             std::sync::Arc::new(crate::engine::view::EmptyViewService),
             std::sync::Arc::new(statistics::EmptyStatisticsService),
+            std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
         )
     }
 
@@ -484,6 +489,9 @@ impl StandaloneNovaRocks {
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
+        table_maintenance_service: std::sync::Arc<
+            dyn crate::engine::table_maintenance::TableMaintenanceService,
+        >,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -496,10 +504,17 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            table_maintenance_service,
             _test_guard,
         );
         #[cfg(not(test))]
-        Self::open_body(opts, system_catalog, view_service, statistics_service)
+        Self::open_body(
+            opts,
+            system_catalog,
+            view_service,
+            statistics_service,
+            table_maintenance_service,
+        )
     }
 
     /// Common engine-open body.  Called after the process-wide config has
@@ -509,6 +524,9 @@ impl StandaloneNovaRocks {
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
+        table_maintenance_service: std::sync::Arc<
+            dyn crate::engine::table_maintenance::TableMaintenanceService,
+        >,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
         // role=fe dispatches all fragments to registered BEs and must not
@@ -549,7 +567,7 @@ impl StandaloneNovaRocks {
             None => None,
         };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
-        let inner = Arc::new(StandaloneState {
+        let inner = Arc::new_cyclic(|self_weak| StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
                 starrocks_table_config.clone(),
@@ -567,6 +585,8 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            table_maintenance_service,
+            self_weak: self_weak.clone(),
             #[cfg(test)]
             _test_guard,
             ..Default::default()
@@ -577,22 +597,23 @@ impl StandaloneNovaRocks {
             backend_ops::ensure_backend_registry(&inner)?;
             backend_ops::wait_for_configured_backends_live(&inner)?;
         }
-        #[cfg(not(test))]
-        if inner.metadata_provider.is_some() {
-            crate::connector::spawn_iceberg_optimize_worker(Arc::clone(&inner));
+        let engine = Self { inner };
+        let engine_port =
+            Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
+        if let Err(error) = engine.inner.table_maintenance_service.start(engine_port) {
+            let primary = format!("start table maintenance service failed: {error}");
+            return match engine.inner.table_maintenance_service.shutdown() {
+                Ok(()) => Err(primary),
+                Err(cleanup_error) => Err(format!("{primary}; cleanup failed: {cleanup_error}")),
+            };
         }
-        Ok(Self { inner })
+        Ok(engine)
     }
 
     pub fn session(&self) -> StandaloneSession {
         StandaloneSession {
             inner: Arc::clone(&self.inner),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn run_pending_optimize_jobs_for_test(&self) -> Result<(), String> {
-        crate::connector::iceberg::compact::run_optimize_jobs_once(&self.inner)
     }
 
     #[cfg(test)]
@@ -783,6 +804,23 @@ impl StandaloneSession {
                 }
             });
         }
+        if let Some(result) = self.inner.table_maintenance_service.try_handle_statement(
+            self.inner.as_ref(),
+            &normalized,
+            crate::engine::table_maintenance::MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+        )? {
+            return Ok(match result {
+                crate::engine::table_maintenance::MaintenanceStatementResult::Ok => {
+                    StatementResult::Ok
+                }
+                crate::engine::table_maintenance::MaintenanceStatementResult::Query(result) => {
+                    StatementResult::Query(result)
+                }
+            });
+        }
         if let Some(result) = self.inner.statistics_service.try_handle_statement(
             &self.inner,
             &normalized,
@@ -802,56 +840,6 @@ impl StandaloneSession {
             return self.handle_create_table_like(
                 target,
                 source,
-                current_catalog,
-                current_database,
-            );
-        }
-        if looks_like_call_procedure(&normalized) {
-            let stmt = parse_call_procedure_sql(&normalized)?;
-            if stmt.procedure == crate::engine::mv::stateless_rebuild::PROCEDURE_NAME {
-                return crate::engine::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
-                    &self.inner,
-                    &stmt,
-                    current_database,
-                );
-            }
-            let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(
-                &stmt,
-                current_database,
-            )?;
-            return crate::engine::iceberg_maintenance::execute_maintenance_action(
-                &self.inner,
-                request,
-            );
-        }
-        if looks_like_show_alter_table_optimize(&normalized) {
-            let stmt = parse_show_alter_table_optimize_sql(&normalized)?;
-            return self.handle_show_alter_table_optimize(stmt, current_catalog, current_database);
-        }
-        if looks_like_alter_table_optimize(&normalized) {
-            let stmt = parse_alter_table_optimize_sql(&normalized)?;
-            return self.handle_alter_table_optimize(stmt, current_catalog, current_database);
-        }
-        if looks_like_alter_table_rewrite_manifests(&normalized) {
-            let stmt = parse_alter_table_rewrite_manifests_sql(&normalized)?;
-            return self.handle_alter_table_rewrite_manifests(
-                stmt,
-                current_catalog,
-                current_database,
-            );
-        }
-        if looks_like_alter_table_expire_snapshots(&normalized) {
-            let stmt = parse_alter_table_expire_snapshots_sql(&normalized)?;
-            return self.handle_alter_table_expire_snapshots(
-                stmt,
-                current_catalog,
-                current_database,
-            );
-        }
-        if looks_like_alter_table_remove_orphan_files(&normalized) {
-            let stmt = parse_alter_table_remove_orphan_files_sql(&normalized)?;
-            return self.handle_alter_table_remove_orphan_files(
-                stmt,
                 current_catalog,
                 current_database,
             );
@@ -1300,154 +1288,6 @@ impl StandaloneSession {
         }
         catalog.add_legacy_range_partition(&target.namespace, &target.table, partition)?;
         Ok(StatementResult::Ok)
-    }
-
-    fn handle_alter_table_optimize(
-        &self,
-        stmt: crate::engine::statement::AlterTableOptimizeStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        if self.inner.metadata_provider.is_none() {
-            return Err("ALTER TABLE OPTIMIZE requires metadata provider".to_string());
-        }
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "ALTER TABLE OPTIMIZE only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest {
-            source: crate::engine::iceberg_maintenance::MaintenanceActionSource::LegacyAlter,
-            kind: crate::engine::iceberg_maintenance::MaintenanceActionKind::RewriteDataFiles,
-            catalog: target.catalog,
-            namespace: target.namespace,
-            table: target.table,
-            options: crate::engine::iceberg_maintenance::MaintenanceActionOptions::default(),
-            older_than_ms: None,
-            retain_last: None,
-            use_caching: None,
-            spec_id: None,
-            branch: None,
-            where_clause: None,
-        };
-        crate::engine::iceberg_maintenance::execute_maintenance_action(&self.inner, request)
-    }
-
-    fn handle_alter_table_rewrite_manifests(
-        &self,
-        stmt: crate::engine::statement::AlterTableRewriteManifestsStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "REWRITE MANIFESTS only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        crate::engine::iceberg_rewrite_manifests::execute_iceberg_rewrite_manifests(
-            &self.inner,
-            &target,
-        )
-    }
-
-    fn handle_alter_table_expire_snapshots(
-        &self,
-        stmt: crate::engine::statement::AlterTableExpireSnapshotsStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "EXPIRE SNAPSHOTS only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        crate::engine::iceberg_expire_snapshots::execute_iceberg_expire_snapshots(
-            &self.inner,
-            &target,
-            &stmt,
-        )
-    }
-
-    fn handle_alter_table_remove_orphan_files(
-        &self,
-        stmt: crate::engine::statement::AlterTableRemoveOrphanFilesStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "REMOVE ORPHAN FILES only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        crate::engine::iceberg_remove_orphan_files::execute_iceberg_remove_orphan_files(
-            &self.inner,
-            &target,
-            &stmt,
-        )
-    }
-
-    fn handle_show_alter_table_optimize(
-        &self,
-        stmt: crate::engine::statement::ShowAlterTableOptimizeStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let Some(provider) = self.inner.metadata_provider.as_ref() else {
-            return Err("SHOW ALTER TABLE OPTIMIZE requires metadata provider".to_string());
-        };
-        let read = provider
-            .begin_read()
-            .map_err(|e| format!("open iceberg optimize job read transaction failed: {e}"))?;
-        let mut jobs = self
-            .inner
-            .job_repo
-            .show_iceberg_optimize_jobs(read.as_ref())
-            .map_err(|e| format!("show iceberg optimize jobs failed: {e}"))?;
-        let catalog_filter = stmt.catalog.as_deref().or(current_catalog);
-        let database_filter = stmt.database.as_deref().unwrap_or(current_database);
-        if let Some(catalog) = catalog_filter {
-            jobs.retain(|job| job.catalog == catalog);
-        }
-        jobs.retain(|job| job.namespace == database_filter);
-        if let Some(table_name) = stmt.table_name.as_deref() {
-            jobs.retain(|job| job.table == table_name);
-        }
-        jobs.sort_by_key(|job| (job.created_at_ms, job.id));
-        if stmt.order_by_create_time_desc {
-            jobs.reverse();
-        }
-        if let Some(limit) = stmt.limit {
-            jobs.truncate(limit);
-        }
-        build_show_alter_table_optimize_result(jobs).map(StatementResult::Query)
     }
 
     fn handle_show_create_table(
@@ -1945,109 +1785,6 @@ fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::Obje
     Ok(crate::sql::parser::ast::ObjectName { parts })
 }
 
-fn build_show_alter_table_optimize_result(
-    jobs: Vec<StoredIcebergOptimizeJob>,
-) -> Result<QueryResult, String> {
-    let column_names = [
-        "JobId",
-        "TableName",
-        "State",
-        "CreateTime",
-        "FinishTime",
-        "Msg",
-        "BaseSnapshotId",
-        "TargetSnapshotId",
-        "InputDataFiles",
-        "OutputDataFiles",
-        "InputDeleteFiles",
-        "OutputDeleteFiles",
-    ];
-    let mut columns = column_names
-        .iter()
-        .map(|_| Vec::with_capacity(jobs.len()))
-        .collect::<Vec<Vec<String>>>();
-    for job in jobs {
-        let outcome = job.outcome.as_ref();
-        columns[0].push(job.id.to_string());
-        columns[1].push(job.table);
-        columns[2].push(iceberg_optimize_state_name(job.state).to_string());
-        columns[3].push(job.created_at_ms.to_string());
-        columns[4].push(
-            job.finished_at_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-        columns[5].push(job.error_message.unwrap_or_else(|| {
-            outcome
-                .map(|value| {
-                    format!(
-                        "rewrote {} data files and {} delete files into {} data files ({} rows)",
-                        value.rewritten_data_files,
-                        value.deleted_data_files,
-                        value.added_data_files,
-                        value.output_record_count
-                    )
-                })
-                .unwrap_or_default()
-        }));
-        columns[6].push(job.base_snapshot_id.to_string());
-        columns[7].push(
-            outcome
-                .and_then(|value| value.target_snapshot_id)
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-        columns[8].push(
-            outcome
-                .map(|value| value.rewritten_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        columns[9].push(
-            outcome
-                .map(|value| value.added_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        columns[10].push(
-            outcome
-                .map(|value| value.deleted_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        columns[11].push(outcome.map(|_| "0".to_string()).unwrap_or_default());
-    }
-
-    let fields = column_names
-        .iter()
-        .map(|name| Field::new(*name, DataType::Utf8, false))
-        .collect::<Vec<_>>();
-    let arrays = columns
-        .into_iter()
-        .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| format!("build SHOW ALTER TABLE OPTIMIZE result failed: {e}"))?;
-    Ok(QueryResult {
-        columns: column_names
-            .iter()
-            .map(|name| QueryResultColumn {
-                name: (*name).to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                logical_type: None,
-            })
-            .collect(),
-        chunks: vec![record_batch_to_chunk(batch)?],
-    })
-}
-
-fn iceberg_optimize_state_name(state: IcebergOptimizeJobState) -> &'static str {
-    match state {
-        IcebergOptimizeJobState::Pending => "PENDING",
-        IcebergOptimizeJobState::Running => "RUNNING",
-        IcebergOptimizeJobState::Finished => "FINISHED",
-        IcebergOptimizeJobState::Failed => "FAILED",
-    }
-}
-
 /// Generate a `CREATE TABLE` DDL string from a loaded Iceberg table's current
 /// schema.  Column doc strings are emitted as `COMMENT '...'` clauses.
 fn build_iceberg_create_table_ddl(
@@ -2144,9 +1881,6 @@ fn build_iceberg_create_table_ddl(
 pub(crate) mod delete_flow;
 pub(crate) mod delete_predicate_translate;
 pub(crate) mod equality_delete_flow;
-pub(crate) mod iceberg_expire_snapshots;
-pub(crate) mod iceberg_remove_orphan_files;
-pub(crate) mod iceberg_rewrite_manifests;
 pub(crate) mod iceberg_truncate;
 pub(crate) mod iceberg_writer;
 
@@ -4282,7 +4016,6 @@ mod tests {
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
-    use crate::meta::MetaStoreProvider;
     use crate::runtime::query_options::QueryOptions;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -7857,8 +7590,6 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn iceberg_row_lineage_optimize_does_not_advance_next_row_id() {
-        use crate::meta::repository::job::{IcebergOptimizeJobState, StoredIcebergOptimizeJob};
-
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
 
@@ -7873,8 +7604,8 @@ path = "meta/operations.sqlite"
         }
         let (next_row_id_before, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
 
-        // Locate the current snapshot id so the OPTIMIZE job's base_snapshot_id
-        // matches the table's live state — that's the precondition for
+        // Locate the current snapshot id so the rewrite target matches the
+        // table's live state — that's the precondition for
         // `validate_base_snapshot` inside the rewrite executor.
         let base_snapshot_id = {
             let registry = engine.inner.iceberg_catalogs.read().expect("registry");
@@ -7890,21 +7621,18 @@ path = "meta/operations.sqlite"
                 .snapshot_id()
         };
 
-        let job = StoredIcebergOptimizeJob {
-            id: 1,
+        let target = crate::connector::iceberg::compact::WholeTableRewriteTarget {
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
             table: "t".to_string(),
             base_snapshot_id,
-            state: IcebergOptimizeJobState::Pending,
-            created_at_ms: 0,
-            started_at_ms: None,
-            finished_at_ms: None,
-            error_message: None,
-            outcome: None,
+            job_id: None,
         };
-        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(&engine.inner, &job)
-            .expect("run optimize job");
+        let outcome = crate::connector::iceberg::compact::execute_whole_table_rewrite_for_target(
+            &engine.inner,
+            &target,
+        )
+        .expect("rewrite whole table");
         assert!(
             outcome.target_snapshot_id.is_some(),
             "OPTIMIZE on a non-empty row-lineage table must commit a Replace snapshot"
@@ -7939,8 +7667,6 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn iceberg_row_lineage_optimize_preserves_row_identity() {
-        use crate::meta::repository::job::{IcebergOptimizeJobState, StoredIcebergOptimizeJob};
-
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
         session
@@ -7976,21 +7702,18 @@ path = "meta/operations.sqlite"
 
         let base_snapshot_id =
             current_iceberg_snapshot_id(&engine, "ice", "db1", "t").expect("base snapshot");
-        let job = StoredIcebergOptimizeJob {
-            id: 2,
+        let target = crate::connector::iceberg::compact::WholeTableRewriteTarget {
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
             table: "t".to_string(),
             base_snapshot_id,
-            state: IcebergOptimizeJobState::Pending,
-            created_at_ms: 0,
-            started_at_ms: None,
-            finished_at_ms: None,
-            error_message: None,
-            outcome: None,
+            job_id: None,
         };
-        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(&engine.inner, &job)
-            .expect("run optimize job");
+        let outcome = crate::connector::iceberg::compact::execute_whole_table_rewrite_for_target(
+            &engine.inner,
+            &target,
+        )
+        .expect("rewrite whole table");
         assert!(
             outcome.target_snapshot_id.is_some(),
             "OPTIMIZE on a non-empty row-lineage table must commit"

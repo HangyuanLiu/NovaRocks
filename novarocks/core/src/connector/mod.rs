@@ -33,8 +33,6 @@ pub(crate) use iceberg::catalog::{
 };
 #[cfg(test)]
 pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
-#[cfg(not(test))]
-pub(crate) use iceberg::compact::spawn_optimize_worker as spawn_iceberg_optimize_worker;
 #[cfg(feature = "compat")]
 pub(crate) use starrocks::table::{
     StarRocksTableCatalog, StarRocksTableConfig, register_starrocks_tables_in_catalog,

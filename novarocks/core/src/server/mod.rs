@@ -190,6 +190,9 @@ pub async fn run_standalone_server_with_config_until_shutdown<F>(
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
     view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     statistics_service: std::sync::Arc<dyn crate::engine::statistics::StatisticsService>,
+    table_maintenance_service: std::sync::Arc<
+        dyn crate::engine::table_maintenance::TableMaintenanceService,
+    >,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -207,6 +210,7 @@ where
         system_catalog,
         view_service,
         statistics_service,
+        table_maintenance_service,
         shutdown,
     )
     .await
@@ -248,6 +252,7 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         std::sync::Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
         std::sync::Arc::new(crate::engine::view::EmptyViewService),
         std::sync::Arc::new(crate::engine::statistics::EmptyStatisticsService),
+        std::sync::Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
         std::future::pending(),
     ))
 }
@@ -257,6 +262,9 @@ async fn run_with_resolved_options_until_shutdown<F>(
     system_catalog: std::sync::Arc<dyn crate::engine::system_catalog::SystemCatalog>,
     view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     statistics_service: std::sync::Arc<dyn crate::engine::statistics::StatisticsService>,
+    table_maintenance_service: std::sync::Arc<
+        dyn crate::engine::table_maintenance::TableMaintenanceService,
+    >,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -274,6 +282,7 @@ where
             system_catalog,
             view_service,
             statistics_service,
+            table_maintenance_service,
         )?,
         None => StandaloneNovaRocks::open(opts)?,
     };

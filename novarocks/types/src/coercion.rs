@@ -331,15 +331,15 @@ pub fn comparison_common_type(
     if is_decimal(left) && is_decimal(right) {
         return Ok(Some(decimal_compare_type(left, right)?));
     }
-    if let Some(left_decimal) = int_as_zero_scale_decimal(left) {
-        if is_decimal(right) {
-            return Ok(Some(decimal_compare_type(&left_decimal, right)?));
-        }
+    if let Some(left_decimal) = int_as_zero_scale_decimal(left)
+        && is_decimal(right)
+    {
+        return Ok(Some(decimal_compare_type(&left_decimal, right)?));
     }
-    if let Some(right_decimal) = int_as_zero_scale_decimal(right) {
-        if is_decimal(left) {
-            return Ok(Some(decimal_compare_type(left, &right_decimal)?));
-        }
+    if let Some(right_decimal) = int_as_zero_scale_decimal(right)
+        && is_decimal(left)
+    {
+        return Ok(Some(decimal_compare_type(left, &right_decimal)?));
     }
     if (is_float(left) && is_decimal(right)) || (is_decimal(left) && is_float(right)) {
         return Ok(Some(DataType::Float64));
@@ -365,13 +365,13 @@ fn comparison_common_complex_type(
             let Some((item, changed)) = comparison_common_field(left_item, right_item)? else {
                 return Ok(None);
             };
-            Ok(changed.then(|| DataType::List(item)))
+            Ok(changed.then_some(DataType::List(item)))
         }
         (DataType::LargeList(left_item), DataType::LargeList(right_item)) => {
             let Some((item, changed)) = comparison_common_field(left_item, right_item)? else {
                 return Ok(None);
             };
-            Ok(changed.then(|| DataType::LargeList(item)))
+            Ok(changed.then_some(DataType::LargeList(item)))
         }
         (
             DataType::FixedSizeList(left_item, left_size),
@@ -380,7 +380,7 @@ fn comparison_common_complex_type(
             let Some((item, changed)) = comparison_common_field(left_item, right_item)? else {
                 return Ok(None);
             };
-            Ok(changed.then(|| DataType::FixedSizeList(item, *left_size)))
+            Ok(changed.then_some(DataType::FixedSizeList(item, *left_size)))
         }
         (DataType::Struct(left_fields), DataType::Struct(right_fields))
             if left_fields.len() == right_fields.len() =>
@@ -395,7 +395,7 @@ fn comparison_common_complex_type(
             else {
                 return Ok(None);
             };
-            Ok(changed.then(|| DataType::Map(entries, *left_ordered)))
+            Ok(changed.then_some(DataType::Map(entries, *left_ordered)))
         }
         _ => Ok(None),
     }

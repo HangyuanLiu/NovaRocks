@@ -24720,18 +24720,21 @@ mod tests {
             "REFRESH MATERIALIZED VIEW mv_fact",
         );
 
-        // Second append snapshot on the base, then compact the base table.
+        // Second append snapshot on the base, then rewrite the base table.
         insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 5)]);
-        execute_iceberg_sql(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            "ALTER TABLE ice.sales.fact OPTIMIZE",
-        );
-        // The optimize worker thread is not spawned under cfg(test); drive the
-        // pending job synchronously so the base table gains a REPLACE snapshot.
-        crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
-            .expect("run optimize job");
+        let base_snapshot_id = read_target_current_snapshot_id(&env.state, "ice", "sales", "fact")
+            .expect("base snapshot before rewrite");
+        let target = crate::connector::iceberg::compact::WholeTableRewriteTarget {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "fact".to_string(),
+            base_snapshot_id,
+            job_id: None,
+        };
+        crate::connector::iceberg::compact::execute_whole_table_rewrite_for_target(
+            &env.state, &target,
+        )
+        .expect("rewrite base table");
 
         // Third append after the replace snapshot, then refresh incrementally.
         insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(3, "east", 7)]);

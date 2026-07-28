@@ -72,7 +72,7 @@ pub struct ExpireOutcome {
     pub deleted_file_count: usize,
 }
 
-/// Top-level entry point called from `engine::iceberg_expire_snapshots`.
+/// Top-level entry point called from `engine::iceberg_maintenance`.
 ///
 /// Wraps `commit_with_retry` for OCC retries (spec §2.2). The outcome
 /// (expired / deleted counts) is captured via shared state since

@@ -19,26 +19,68 @@ under the License.
 
 # 维护 / 治理
 
-> Iceberg 的运维操作：压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 等。NovaRocks 支持 OPTIMIZE TABLE（whole-table 压缩）、EXPIRE SNAPSHOTS、REMOVE ORPHAN FILES、REWRITE MANIFESTS；增量压缩、自动调度等高级治理能力仍待补。
+> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REMOVE ORPHAN FILES、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；增量压缩、sort-order rewrite 和通用定时调度仍待补。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `OPTIMIZE TABLE`（whole-table 文件压缩） | ✅ | `src/connector/iceberg/compact.rs` |
-| `OPTIMIZE TABLE` 增量（仅小文件 / 仅 partition） | ❌ | |
-| `EXPIRE SNAPSHOTS` | ✅ | `src/connector/iceberg/commit/expire_snapshots.rs` |
-| `REMOVE ORPHAN FILES` | ✅ | `src/connector/iceberg/commit/remove_orphan_files.rs` |
-| `REWRITE MANIFESTS` | ✅ | `src/connector/iceberg/commit/rewrite_manifests.rs` |
-| `REWRITE POSITION DELETES`（v2→DV） | ❌ | |
+| `ALTER TABLE ... OPTIMIZE`（whole-table 文件压缩） | ✅ | 异步 job |
+| `OPTIMIZE` 增量（仅小文件 / 仅 partition） | ❌ | |
+| `EXPIRE SNAPSHOTS` | ✅ | 同步 action |
+| `REMOVE ORPHAN FILES` | ✅ | 同步 action |
+| `REWRITE MANIFESTS` | ✅ | 同步 action |
+| `rewrite_position_delete_files`（V3 Puffin DV repack） | ✅ | 同步 Spark-style `CALL` |
+| V2 Parquet position delete → V3 DV 升级 | ❌ | |
 | `REWRITE DATA FILES BY SORT ORDER` | ❌ | |
 | 自动 maintenance 调度器 | ❌ | |
 
 ---
 
-## ✅ OPTIMIZE TABLE
+## Owner、执行边界与 StateStore
+
+maintenance 的三层职责是固定的：
+
+- `novarocks-frontend` 的 `TableMaintenanceService` 是 application owner，负责 SQL
+  路由、异步 optimize job repository/worker 与生命周期。
+- core 通过 consumer-owned `TableMaintenanceEngine` port 提供 target resolve 与执行能力，
+  不再拥有第二套 maintenance job service。
+- Iceberg connector 仍是 catalog、snapshot/file、rewrite/expire/orphan、commit、cache
+  invalidation 与 MV target snapshot adopt 的唯一执行 truth。
+
+异步 optimize job 只持久化到 frontend StateStore。单 FE 部署的最小配置如下：
+
+```toml
+[state_store]
+provider = "sqlite"
+path = "/absolute/path/frontend-state.sqlite"
+cluster_id = "cluster-a"
+deployment_owner = "fe-1"
+```
+
+重启 FE 时复用同一绝对 `path`、`cluster_id` 与 `deployment_owner`，已完成的
+`SHOW ALTER TABLE OPTIMIZE` 历史仍可见，新 job 也可继续提交。未配置 StateStore 时，
+`ALTER TABLE ... OPTIMIZE`、`SHOW ALTER TABLE OPTIMIZE` 与 automatic optimize 会返回明确的
+unavailable error；`REWRITE MANIFESTS`、`EXPIRE SNAPSHOTS`、`REMOVE ORPHAN FILES` 和
+Spark-style maintenance `CALL` 等同步 action 仍可直接执行。
+
+当前 lifecycle 只支持单 FE owner。关闭 FE 时会先停止并 join maintenance worker，再释放
+StateStore；它不提供多 FE lease、takeover 或 fencing。多 FE active/standby 的 claim 与
+destructive-action fencing 属于后续 CP-4。
+
+## ✅ Whole-table OPTIMIZE
 
 ```sql
 ALTER TABLE orders OPTIMIZE;
+SHOW ALTER TABLE OPTIMIZE
+  FROM iceberg_catalog.database
+  WHERE TableName = 'orders'
+  ORDER BY CreateTime DESC
+  LIMIT 10;
 ```
+
+`ALTER TABLE ... OPTIMIZE` 在 job 成功写入 StateStore 后返回，rewrite 在 frontend worker
+中异步执行。调用方必须轮询 `SHOW ALTER TABLE OPTIMIZE`，并以 `FINISHED` 或 `FAILED`
+作为终态。Spark-style `CALL ...rewrite_data_files(...)` 则保持同步，并直接返回 action
+结果。
 
 行为：
 
@@ -46,8 +88,9 @@ ALTER TABLE orders OPTIMIZE;
 - 同时合并 V2 position-delete / V3 DV：被删行不出现在新 file 中，DV blob 在重写完成后失效
 - 跨历史 partition spec：所有老文件按其 spec 解释，重写到当前 spec
 - 写出新 manifest，老文件由 EXPIRE SNAPSHOTS 路径回收
+- V3 row-lineage 表保留现有 `_row_id` 与 `_last_updated_sequence_number`，rewrite 不分配新 row ID
 
-> ⚠️ 当前 OPTIMIZE 重写后**会重新分配 `_row_id`**（详见 [row-lineage](row-lineage.md)）。spec 允许保留 / 重新分配，NovaRocks 还没决定最终策略。
+实现入口：`novarocks/core/src/connector/iceberg/compact.rs`。
 
 ## ❌ OPTIMIZE 增量
 
@@ -85,7 +128,7 @@ ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00' RETAIN LAST
 
 ### 入口
 
-`src/connector/iceberg/commit/expire_snapshots.rs`
+`novarocks/core/src/connector/iceberg/commit/expire_snapshots.rs`
 
 ## ✅ REMOVE ORPHAN FILES
 
@@ -109,7 +152,7 @@ ALTER TABLE orders REMOVE ORPHAN FILES OLDER THAN '2026-04-01 00:00:00';
 
 ### 入口
 
-`src/connector/iceberg/commit/remove_orphan_files.rs`
+`novarocks/core/src/connector/iceberg/commit/remove_orphan_files.rs`
 
 ## ✅ REWRITE MANIFESTS
 
@@ -133,13 +176,23 @@ ALTER TABLE orders REWRITE MANIFESTS;
 
 ### 入口
 
-`src/connector/iceberg/commit/rewrite_manifests.rs`
+`novarocks/core/src/connector/iceberg/commit/rewrite_manifests.rs`
 
-## ❌ REWRITE POSITION DELETES
+## ✅ REWRITE POSITION DELETE FILES
 
-Spec：把 V2 position-delete 重写成 V3 deletion vector（升级路径）。
+```sql
+CALL iceberg_catalog.system.rewrite_position_delete_files(
+  table => 'database.orders',
+  options => map('rewrite-all', 'true')
+);
+```
 
-**TODO**：未实现。如果你要从 V2 迁移到 V3，目前需要 DELETE 全部数据再重写，或借助外部工具。
+该同步 action 重写 Iceberg V3 表中现有 Puffin deletion-vector 文件，保持可见 row set、
+`_row_id` 与 live data files 不变，并返回 rewritten/added file 与 byte counts。当前不支持
+`where`、`target-file-size-bytes` 或 V2 Parquet position delete → V3 DV 的格式升级。
+
+实现入口：
+`novarocks/core/src/connector/iceberg/commit/rewrite_position_delete_files.rs`。
 
 ## ❌ REWRITE DATA FILES BY SORT ORDER
 
@@ -156,4 +209,6 @@ ALTER TABLE orders REWRITE DATA FILES BY SORT ORDER (user_id, ts DESC);
 
 Spec / 工程实践：基于 schedule 自动跑 OPTIMIZE / EXPIRE / ORPHAN，类似 Snowflake auto-clustering 或 Databricks `OPTIMIZE` cron。
 
-**TODO**：未实现。运维方需要自己用外部 cron / Airflow 调度。
+frontend service 已承接 MV policy 发出的 typed automatic action/optimize submission，但尚未提供
+面向普通表的通用 schedule。运维方仍需用外部 cron / Airflow 调度；其中异步
+`ALTER TABLE ... OPTIMIZE` 必须继续轮询 `SHOW ALTER TABLE OPTIMIZE` 到终态。

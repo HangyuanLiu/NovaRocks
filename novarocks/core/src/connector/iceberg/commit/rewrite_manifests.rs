@@ -53,7 +53,7 @@ pub struct RewriteManifestsOutcome {
     pub added_manifests_count: i32,
 }
 
-/// Top-level entry called from `engine::iceberg_rewrite_manifests`.
+/// Top-level entry called from `engine::iceberg_maintenance`.
 /// Loads the table, groups manifests, merges, and commits.
 ///
 /// Noop cases (returns Ok immediately):

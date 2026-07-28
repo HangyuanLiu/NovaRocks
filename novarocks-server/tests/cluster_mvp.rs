@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
-use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 
 static CLUSTER_MVP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -387,6 +387,9 @@ struct MultiBeClusterHarness {
     #[allow(dead_code)]
     _be_configs: Vec<NamedTempFile>,
     fe_config: NamedTempFile,
+    be_log_dirs: Vec<PathBuf>,
+    fe_log_dir: PathBuf,
+    _log_root: TempDir,
 }
 
 impl MultiBeClusterHarness {
@@ -414,6 +417,14 @@ impl MultiBeClusterHarness {
         let fe_mysql_port = fe_mysql.port();
         let fe_http_port = fe_http.port();
         let fe_grpc_port = fe_grpc.port();
+        let log_root = TempFileBuilder::new()
+            .prefix("cluster-logs-")
+            .tempdir_in(runtime_dir())
+            .expect("create cluster log root");
+        let be_log_dirs = (0..n)
+            .map(|index| log_root.path().join(format!("be-{index}")))
+            .collect::<Vec<_>>();
+        let fe_log_dir = log_root.path().join("fe");
 
         // Write all BE configs (while ports are still reserved).
         let be_configs: Vec<NamedTempFile> = be_port_sets
@@ -426,6 +437,8 @@ impl MultiBeClusterHarness {
                     &format!("be{i}"),
                     &format!(
                         r#"
+sys_log_dir = "{}"
+
 [server]
 host = "127.0.0.1"
 http_port = {http_port}
@@ -434,7 +447,8 @@ grpc_port = {grpc_port}
 [cluster]
 role = "be"
 {be_debug}
-"#
+"#,
+                        be_log_dirs[i].display()
                     ),
                 )
             })
@@ -450,6 +464,8 @@ role = "be"
             "fe",
             &format!(
                 r#"
+sys_log_dir = "{}"
+
 [server]
 host = "127.0.0.1"
 http_port = {fe_http_port}
@@ -462,7 +478,8 @@ mysql_port = {fe_mysql_port}
 role = "fe"
 backends = [{backends_list}]
 {fe_extra}
-"#
+"#,
+                fe_log_dir.display()
             ),
         );
 
@@ -491,10 +508,21 @@ backends = [{backends_list}]
             fe_mysql: fe_mysql_port,
             _be_configs: be_configs,
             fe_config,
+            be_log_dirs,
+            fe_log_dir,
+            _log_root: log_root,
         }
     }
 
     fn start_three_be_sqlite_state_store(state_store_path: &Path, cluster_id: &str) -> Self {
+        Self::start_three_be_sqlite_state_store_with_extra(state_store_path, cluster_id, "")
+    }
+
+    fn start_three_be_sqlite_state_store_with_extra(
+        state_store_path: &Path,
+        cluster_id: &str,
+        fe_extra: &str,
+    ) -> Self {
         assert!(
             state_store_path.is_absolute(),
             "SQLite StateStore path must be absolute: {}",
@@ -507,6 +535,8 @@ provider = "sqlite"
 path = "{}"
 cluster_id = "{cluster_id}"
 deployment_owner = "fe-1"
+
+{fe_extra}
 "#,
             state_store_path.display()
         );
@@ -515,6 +545,17 @@ deployment_owner = "fe-1"
 
     fn fe_mysql_port(&self) -> u16 {
         self.fe_mysql
+    }
+
+    fn log_diagnostics(&self) -> String {
+        format!(
+            "FE log dir={}; BE log dirs={:?}",
+            self.fe_log_dir.display(),
+            self.be_log_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        )
     }
 
     #[cfg(unix)]
@@ -708,6 +749,65 @@ fn assert_exact_live_backends(conn: &mut MysqlConn, expected: usize) {
         assert!(
             Instant::now() < deadline,
             "expected exactly {expected} Live backends; rows={rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn show_optimize_jobs(
+    conn: &mut MysqlConn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Vec<Row> {
+    conn.query(format!(
+        "SHOW ALTER TABLE OPTIMIZE FROM {catalog}.{database} \
+         WHERE TableName = '{table}' ORDER BY CreateTime DESC"
+    ))
+    .expect("SHOW ALTER TABLE OPTIMIZE")
+}
+
+fn wait_for_latest_optimize_finished(
+    conn: &mut MysqlConn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+    minimum_job_count: usize,
+    diagnostics: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = show_optimize_jobs(conn, catalog, database, table);
+        let row_summaries = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, usize>(0),
+                    row.get::<String, usize>(2),
+                    row.get::<String, usize>(5),
+                )
+            })
+            .collect::<Vec<_>>();
+        if rows.len() >= minimum_job_count {
+            let job_id = rows[0].get::<String, usize>(0).expect("optimize JobId");
+            let state = rows[0].get::<String, usize>(2).expect("optimize State");
+            match state.as_str() {
+                "FINISHED" => {
+                    println!(
+                        "SHOW ALTER TABLE OPTIMIZE latest job {job_id} FINISHED ({}/{minimum_job_count} jobs)",
+                        rows.len()
+                    );
+                    return job_id;
+                }
+                "FAILED" => {
+                    panic!("optimize job {job_id} failed; rows={row_summaries:?}; {diagnostics}");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for latest optimize job to finish; rows={row_summaries:?}; {diagnostics}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1444,6 +1544,154 @@ deployment_owner = "fe-1"
         .query(multi_submit_query_sql())
         .expect("distributed query must succeed after immediate FE restart");
     assert_eq!(rows, vec![1i64, 2i64]);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_table_maintenance_lifecycle() {
+    let _guard = lock_cluster_mvp();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create state store tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
+    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create fixture warehouse");
+    let metadata_config = format!(
+        r#"[metadata]
+provider = "sqlite"
+path = "{}"
+"#,
+        metadata_path.display()
+    );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_extra(
+        &state_store_path,
+        "table-maintenance",
+        &metadata_config,
+    );
+    let diagnostics = cluster.log_diagnostics();
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG maintenance_ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create maintenance fixture catalog");
+    conn.query_drop("CREATE DATABASE maintenance_ice.maintenance_db")
+        .expect("create maintenance fixture database");
+    conn.query_drop(
+        "CREATE TABLE maintenance_ice.maintenance_db.orders (id INT, amount INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+    )
+    .expect("create maintenance fixture table");
+    conn.query_drop("INSERT INTO maintenance_ice.maintenance_db.orders VALUES (1, 10), (2, 20)")
+        .expect("insert first maintenance fixture data file");
+    conn.query_drop("INSERT INTO maintenance_ice.maintenance_db.orders VALUES (3, 30), (4, 40)")
+        .expect("insert second maintenance fixture data file");
+    conn.query_drop("DELETE FROM maintenance_ice.maintenance_db.orders WHERE id = 2")
+        .expect("create deletion vector before optimize");
+
+    let before_optimize: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("SELECT id, _row_id FROM maintenance_ice.maintenance_db.orders ORDER BY id")
+        .expect("query fixture row lineage before optimize");
+    conn.query_drop("ALTER TABLE maintenance_ice.maintenance_db.orders OPTIMIZE")
+        .expect("submit first optimize job");
+    let first_job_id = wait_for_latest_optimize_finished(
+        &mut conn,
+        "maintenance_ice",
+        "maintenance_db",
+        "orders",
+        1,
+        &diagnostics,
+    );
+    let after_optimize: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("SELECT id, _row_id FROM maintenance_ice.maintenance_db.orders ORDER BY id")
+        .expect("query fixture row lineage after optimize");
+    assert_eq!(
+        after_optimize, before_optimize,
+        "OPTIMIZE must preserve visible rows and row lineage"
+    );
+
+    conn.query_drop("ALTER TABLE maintenance_ice.maintenance_db.orders REWRITE MANIFESTS")
+        .expect("rewrite manifests through frontend maintenance route");
+    conn.query_drop(
+        "ALTER TABLE maintenance_ice.maintenance_db.orders \
+         EXPIRE SNAPSHOTS RETAIN LAST 1",
+    )
+    .expect("expire snapshots through frontend maintenance route");
+    conn.query_drop(
+        "ALTER TABLE maintenance_ice.maintenance_db.orders \
+         REMOVE ORPHAN FILES OLDER THAN '2000-01-01 00:00:00'",
+    )
+    .expect("remove orphan files through frontend maintenance route");
+    conn.query_drop("DELETE FROM maintenance_ice.maintenance_db.orders WHERE id = 3")
+        .expect("create deletion vector before position-delete rewrite");
+    let position_delete_result: Vec<Row> = conn
+        .query(
+            "CALL maintenance_ice.system.rewrite_position_delete_files(\
+             table => 'maintenance_db.orders', options => map('rewrite-all', 'true'))",
+        )
+        .expect("rewrite position delete files through frontend maintenance route");
+    assert_eq!(
+        position_delete_result.len(),
+        1,
+        "rewrite position delete files must return one outcome row"
+    );
+    println!(
+        "TABLE MAINTENANCE direct actions completed: REWRITE MANIFESTS, \
+         EXPIRE SNAPSHOTS, REMOVE ORPHAN FILES, rewrite_position_delete_files"
+    );
+    assert_exact_live_backends(&mut conn, 3);
+
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    assert!(
+        state_store_path.is_file(),
+        "SQLite StateStore must survive the first FE lifecycle"
+    );
+
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let restored_jobs =
+        show_optimize_jobs(&mut conn, "maintenance_ice", "maintenance_db", "orders");
+    assert!(
+        restored_jobs.iter().any(|row| {
+            row.get::<String, usize>(0).as_deref() == Some(first_job_id.as_str())
+                && row.get::<String, usize>(2).as_deref() == Some("FINISHED")
+        }),
+        "terminal optimize history must survive FE restart; rows={restored_jobs:?}; {diagnostics}"
+    );
+    println!(
+        "SHOW ALTER TABLE OPTIMIZE restored job {first_job_id} FINISHED after clean FE restart"
+    );
+
+    conn.query_drop("INSERT INTO maintenance_ice.maintenance_db.orders VALUES (5, 50), (6, 60)")
+        .expect("persisted catalog must accept inserts after FE restart");
+    conn.query_drop("ALTER TABLE maintenance_ice.maintenance_db.orders OPTIMIZE")
+        .expect("submit second optimize job after FE restart");
+    let second_job_id = wait_for_latest_optimize_finished(
+        &mut conn,
+        "maintenance_ice",
+        "maintenance_db",
+        "orders",
+        2,
+        &diagnostics,
+    );
+    assert_ne!(
+        second_job_id, first_job_id,
+        "FE restart must enqueue a distinct optimize job"
+    );
+    let final_rows: Vec<Option<i32>> = conn
+        .query("SELECT id FROM maintenance_ice.maintenance_db.orders ORDER BY id")
+        .expect("query maintenance fixture after second optimize");
+    assert_eq!(
+        final_rows,
+        vec![Some(1), Some(4), Some(5), Some(6)],
+        "maintenance lifecycle must preserve the expected visible row set"
+    );
+    assert_exact_live_backends(&mut conn, 3);
+
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }

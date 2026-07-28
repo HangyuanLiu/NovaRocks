@@ -21,12 +21,12 @@ use std::time::{Duration, Instant};
 
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use novarocks_state_store::{
-    StateStoreHost, StateStoreHostConfig, StateStoreHostError,
-    builtin_state_store_provider_registry,
+    StateStoreHost, StateStoreHostConfig, builtin_state_store_provider_registry,
 };
 
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::statistics::FrontendStatisticsService;
+use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::view::FrontendViewService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,6 +37,7 @@ pub enum FrontendApplicationErrorKind {
     DeploymentSource,
     StateStoreHost,
     ViewServiceOpen,
+    TableMaintenanceServiceOpen,
     Server,
     Shutdown,
 }
@@ -81,6 +82,8 @@ impl std::error::Error for FrontendApplicationError {}
 pub struct FrontendApplicationHost {
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
+    table_maintenance_service:
+        Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
     state_store_host: Option<StateStoreHost>,
 }
 
@@ -91,6 +94,7 @@ impl FrontendApplicationHost {
         let mut host = Self {
             statistics_service: None,
             view_service: None,
+            table_maintenance_service: None,
             state_store_host: None,
         };
 
@@ -106,6 +110,21 @@ impl FrontendApplicationHost {
             Err(error) => {
                 let error = FrontendApplicationError::new(
                     FrontendApplicationErrorKind::ViewServiceOpen,
+                    error,
+                );
+                return Err(host.cleanup_open_error(error).await);
+            }
+        }
+        match FrontendTableMaintenanceService::open(
+            host.state_store(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        {
+            Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),
+            Err(error) => {
+                let error = FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
                     error,
                 );
                 return Err(host.cleanup_open_error(error).await);
@@ -128,6 +147,16 @@ impl FrontendApplicationHost {
             .as_ref()
             .expect("frontend statistics service is installed before host open returns")
             .clone()
+    }
+
+    pub fn table_maintenance_service(
+        &self,
+    ) -> Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService> {
+        Arc::clone(
+            self.table_maintenance_service
+                .as_ref()
+                .expect("frontend table-maintenance service is installed before host open returns"),
+        )
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -190,17 +219,30 @@ impl FrontendApplicationHost {
         }
     }
 
-    async fn release_resources(&mut self) -> Result<(), StateStoreHostError> {
+    async fn release_resources(&mut self) -> Result<(), String> {
+        let mut primary_error = self
+            .table_maintenance_service
+            .as_ref()
+            .and_then(|service| service.shutdown().err())
+            .map(|error| format!("shutdown frontend table-maintenance service failed: {error}"));
+        self.table_maintenance_service.take();
         self.statistics_service.take();
         self.view_service.take();
         if let Some(host) = self.state_store_host.as_mut() {
-            host.shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
-                .await?;
+            if let Err(error) = host
+                .shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+                .await
+            {
+                let host_error = format!("shutdown frontend StateStore host failed: {error}");
+                if let Some(primary) = primary_error.as_mut() {
+                    primary.push_str(&format!("; cleanup failed: {host_error}"));
+                } else {
+                    primary_error = Some(host_error);
+                }
+            }
             self.state_store_host.take();
-            Ok(())
-        } else {
-            Ok(())
         }
+        primary_error.map_or(Ok(()), Err)
     }
 }
 
