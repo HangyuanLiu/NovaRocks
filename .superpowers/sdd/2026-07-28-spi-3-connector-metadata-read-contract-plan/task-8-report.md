@@ -197,3 +197,99 @@ The complete gate sequence was rerun after the final live-test fixture migration
 ### Commit
 
 - Message: `fix(connector): propagate request context and bound splits`
+
+## Code-review fix follow-up 3
+
+### Changed files/behavior
+
+- Kept the MySQL request's `ConnectorRequestContext` intact after
+  `execute_in_context_with_connector_context`. Custom statement dispatch,
+  CREATE/CREATE LIKE/DROP/TRUNCATE metadata checks, INSERT/CTAS,
+  DELETE/UPDATE/MERGE/equality-delete planning, and their coordinated write
+  scans now receive the caller's cancellation signal, deadline, and payload
+  budgets explicitly.
+- Added context-taking query and Iceberg write helpers for request-owned work.
+  The existing context-owning wrappers remain only for visible direct or
+  background operation owners with no client request.
+- Reworked Iceberg split construction into an incremental admission loop.
+  Each candidate payload is bounded by the per-handle limit, aggregate bytes
+  are checked with `checked_add`, and only an admitted candidate is converted
+  into and pushed as a `ConnectorSplit`. Thus rejection retains at most the
+  already-admitted bounded vector plus one bounded candidate payload.
+- Restored pinned-snapshot membership validation in `open_reader`. The
+  provider reloads the pinned snapshot manifest and requires the split's file
+  path, size, and row count to match a live snapshot file before any reader is
+  opened. An expired snapshot remains `NotFound`; a mismatched split is
+  `CorruptData`.
+- Statistics capability work remains owned by SPI-4 and was not changed.
+
+### RED evidence
+
+- `cargo test -p novarocks --lib
+  mysql_request_cancellation_reaches_insert_metadata_lookup --profile dev-opt
+  -- --nocapture` failed against the round-2 implementation because the
+  cancelled caller context was replaced inside INSERT:
+  `cancelled MySQL request must abort INSERT metadata lookup: Ok`.
+- Code review found that aggregate budget admission occurred only after
+  collecting the complete split vector. The new boundary regression directly
+  observes the production admission helper and requires the output vector and
+  consumed-byte counter to remain unchanged on the rejected candidate.
+- Code review found that `open_reader` accepted any file when the referenced
+  snapshot still existed. The integration regression mutates a valid planned
+  split to a path outside that snapshot and requires a `CorruptData` failure
+  before reader construction.
+
+### Focused GREEN evidence
+
+- `cargo test -p novarocks --lib
+  mysql_request_cancellation_reaches_insert_metadata_lookup --profile dev-opt
+  -- --nocapture`: PASS (1 passed, 0 failed, 7604 filtered).
+- `cargo test -p novarocks --lib
+  custom_statement_dispatch_honors_caller_cancellation --profile dev-opt --
+  --nocapture`: PASS (1 passed, 0 failed, 7604 filtered).
+- `cargo test -p novarocks --lib
+  aggregate_budget_rejects_candidate_before_split_is_pushed --profile dev-opt
+  -- --nocapture`: PASS (1 passed, 0 failed, 7604 filtered). The regression
+  asserts `ConnectorErrorKind::ResourceExhausted`, one previously admitted
+  split, and an unchanged aggregate-byte counter.
+- `cargo test -p novarocks --lib
+  plan_splits_enforces_aggregate_budget_incrementally --profile dev-opt --
+  --nocapture`: PASS (1 passed, 0 failed, 7604 filtered). The full provider
+  entrypoint returns `ConnectorErrorKind::ResourceExhausted`.
+- `cargo test -p novarocks --lib
+  iceberg_instance_resolves_metadata_and_plans_a_snapshot_split --profile
+  dev-opt -- --nocapture`: PASS (1 passed, 0 failed, 7604 filtered). A mutated
+  split returns `ConnectorErrorKind::CorruptData` with `does not belong`; the
+  original split still opens and reads one row.
+
+### Final GREEN evidence
+
+- `cargo fmt --all -- --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p novarocks --all-targets --profile dev-opt`: PASS
+- `cargo check -p novarocks --features compat --lib --profile dev-opt`: PASS
+- `cargo check -p novarocks-server --all-targets --profile dev-opt`: PASS
+- `cargo test -p novarocks-spi --features connector-conformance --profile
+  dev-opt`: PASS (6 connector conformance, 8 connector contract, 8 state-store
+  contract)
+- `cargo test -p novarocks --lib connector --profile dev-opt`: PASS
+  (841 passed, 0 failed, 6764 filtered)
+
+### Follow-up audit
+
+- `statement.rs`, `insert_flow.rs`, `delete_flow.rs`, `mutation_flow.rs`,
+  `equality_delete_flow.rs`, `iceberg_ctas.rs`, and `iceberg_writer.rs` contain
+  no `connector_request_context(...)` construction. Request-owned DML and
+  coordinated write scans use the context supplied by the session boundary.
+- Request-owned DML modules contain no call to the context-owning
+  `execute_query_as_iceberg_write` wrapper; they call the explicit
+  `execute_query_as_iceberg_write_with_connector_context` path.
+- Aggregate split accounting happens before `ConnectorSplit::try_new` and
+  `Vec::push`; the post-collection total-budget check is gone.
+- Pinned-snapshot reader validation checks file path, size, and row count and
+  reports corrupt split identity as `ConnectorErrorKind::CorruptData`.
+- No statistics source file or Task 9 artifact changed in this follow-up.
+
+### Planned commit
+
+- Message: `fix(connector): enforce request and split integrity`

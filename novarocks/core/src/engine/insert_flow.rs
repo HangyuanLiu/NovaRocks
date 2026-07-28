@@ -50,6 +50,7 @@ pub(crate) fn run_insert(
     current_database: &str,
     query_opts: Option<&QueryOptions>,
     execution: Option<&QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let is_overwrite = matches!(
         overwrite_mode,
@@ -83,10 +84,7 @@ pub(crate) fn run_insert(
         (
             crate::connector::metadata_load_table(
                 &reg,
-                crate::connector::connector_request_context(
-                    None,
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                )?,
+                connector_context.clone(),
                 &target.catalog,
                 &target.namespace,
                 &target.table,
@@ -161,6 +159,7 @@ pub(crate) fn run_insert(
             overwrite_mode,
             &target_ref,
             execution.cloned(),
+            connector_context,
         );
     }
 
@@ -186,6 +185,7 @@ pub(crate) fn run_insert(
                     current_database,
                     query_opts,
                     execution,
+                    connector_context,
                 )?;
             }
         }
@@ -204,6 +204,7 @@ pub(crate) fn run_insert(
                 columns,
                 query,
                 query_opts,
+                connector_context,
             )?;
             if batch.num_rows() > 0 {
                 sink.append_batch(&resolved, batch)?;
@@ -282,13 +283,15 @@ pub(crate) fn execute_insert_from_query_on_pipeline(
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
     query_opts: Option<&QueryOptions>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RecordBatch, String> {
-    let query_result = crate::engine::execute_query_with_catalog_service(
+    let query_result = crate::engine::execute_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         &target.namespace,
         query,
         query_opts.cloned(),
+        connector_context,
     )?;
 
     align_query_result_to_target(&query_result, insert_columns, &resolved.columns)

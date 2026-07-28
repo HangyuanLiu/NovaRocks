@@ -833,6 +833,7 @@ pub(crate) fn execute_create_database_statement(
     name: &ObjectName,
     if_not_exists: bool,
     current_catalog: Option<&str>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
         crate::engine::backend_resolver::resolve_namespace_target(state, name, current_catalog)?;
@@ -845,10 +846,7 @@ pub(crate) fn execute_create_database_statement(
     if if_not_exists
         && crate::connector::metadata_namespace_exists(
             &state.connectors.read().expect("connector registry read"),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
         )?
@@ -864,6 +862,7 @@ pub(crate) fn execute_create_table_statement(
     stmt: crate::sql::parser::ast::CreateTableStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let legacy_range_partitions = stmt.legacy_range_partitions.clone();
     // CTAS dispatch: when the statement carries an AS SELECT clause, route
@@ -882,6 +881,7 @@ pub(crate) fn execute_create_table_statement(
             stmt,
             current_catalog,
             current_database,
+            connector_context,
         );
     }
     match stmt.kind {
@@ -931,10 +931,7 @@ pub(crate) fn execute_create_table_statement(
             if stmt.if_not_exists
                 && crate::connector::metadata_table_exists(
                     &state.connectors.read().expect("connector registry read"),
-                    crate::connector::connector_request_context(
-                        None,
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    )?,
+                    connector_context.clone(),
                     &target.catalog,
                     &target.namespace,
                     &target.table,
@@ -1002,6 +999,7 @@ pub(crate) fn execute_drop_database_statement(
     current_catalog: Option<&str>,
     if_exists: bool,
     force: bool,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
         crate::engine::backend_resolver::resolve_namespace_target(state, name, current_catalog)?;
@@ -1013,10 +1011,7 @@ pub(crate) fn execute_drop_database_statement(
     if target.backend_name == "iceberg"
         && !crate::connector::metadata_namespace_exists(
             &state.connectors.read().expect("connector registry read"),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
         )?
@@ -1203,6 +1198,7 @@ pub(crate) fn execute_truncate_table_statement(
     target_ref: &str,
     current_catalog: Option<&str>,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target = crate::engine::backend_resolver::resolve_existing_table_target(
         state,
@@ -1220,10 +1216,7 @@ pub(crate) fn execute_truncate_table_statement(
         let reg = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &reg,
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
             &target.table,
@@ -1254,6 +1247,7 @@ pub(crate) fn execute_insert_statement(
     current_database: &str,
     query_opts: Option<&crate::runtime::query_options::QueryOptions>,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::engine::insert_flow::run_insert(
         state,
@@ -1265,6 +1259,7 @@ pub(crate) fn execute_insert_statement(
         current_database,
         query_opts,
         execution,
+        connector_context,
     )
 }
 

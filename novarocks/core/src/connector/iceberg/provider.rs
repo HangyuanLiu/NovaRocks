@@ -352,56 +352,41 @@ impl ConnectorRead for IcebergConnectorInstance {
             }
         };
         let mut remaining = scan.limit;
-        let splits = files
-            .into_iter()
-            .enumerate()
-            .map(|(index, file)| {
-                if let Some(remaining_rows) = remaining.as_mut() {
-                    if *remaining_rows == 0 {
-                        return Ok(None);
-                    }
-                    if let Some(row_count) =
-                        file.row_count.and_then(|count| u64::try_from(count).ok())
-                    {
-                        *remaining_rows = remaining_rows.saturating_sub(row_count);
-                    }
+        let mut splits = Vec::new();
+        let mut total_payload_bytes = 0usize;
+        for (index, file) in files.into_iter().enumerate() {
+            if let Some(remaining_rows) = remaining.as_mut() {
+                if *remaining_rows == 0 {
+                    break;
                 }
-                let estimated_bytes = u64::try_from(file.size).ok();
-                let payload = SplitPayload {
-                    namespace: scan.table.namespace.clone(),
-                    table: scan.table.table.clone(),
-                    snapshot_id: scan.snapshot_id,
-                    data_file: file,
-                    projection: scan.projection.clone(),
-                    limit: scan.limit,
-                };
-                Ok(Some(ConnectorSplit::try_new(
-                    self.instance_id.clone(),
-                    format!(
-                        "{}-{index}",
-                        scan.snapshot_id
-                            .map(|snapshot_id| snapshot_id.to_string())
-                            .unwrap_or_else(|| "explicit".to_string())
-                    ),
-                    encode_payload(
-                        &payload,
-                        "split",
-                        request.context.max_handle_payload_bytes(),
-                    )?,
-                    estimated_bytes,
-                )?))
-            })
-            .filter_map(Result::transpose)
-            .collect::<Result<Vec<_>, ConnectorError>>()?;
-        let total_payload_bytes = splits
-            .iter()
-            .map(|split| split.payload().len())
-            .sum::<usize>();
-        if total_payload_bytes > request.context.max_total_payload_bytes() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg split payloads exceed the request budget",
-            ));
+                if let Some(row_count) = file.row_count.and_then(|count| u64::try_from(count).ok())
+                {
+                    *remaining_rows = remaining_rows.saturating_sub(row_count);
+                }
+            }
+            let estimated_bytes = u64::try_from(file.size).ok();
+            let payload = SplitPayload {
+                namespace: scan.table.namespace.clone(),
+                table: scan.table.table.clone(),
+                snapshot_id: scan.snapshot_id,
+                data_file: file,
+                projection: scan.projection.clone(),
+                limit: scan.limit,
+            };
+            push_split_with_budget(
+                &mut splits,
+                &mut total_payload_bytes,
+                self.instance_id.clone(),
+                format!(
+                    "{}-{index}",
+                    scan.snapshot_id
+                        .map(|snapshot_id| snapshot_id.to_string())
+                        .unwrap_or_else(|| "explicit".to_string())
+                ),
+                &payload,
+                estimated_bytes,
+                &request.context,
+            )?;
         }
         Ok(splits)
     }
@@ -435,6 +420,20 @@ impl ConnectorRead for IcebergConnectorInstance {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     "Iceberg split references an expired snapshot",
+                ));
+            }
+            let belongs_to_snapshot = extract_data_files_with_stats_at(&loaded.table, snapshot_id)
+                .map_err(map_iceberg_error)?
+                .into_iter()
+                .any(|file| {
+                    file.path == split.data_file.path
+                        && file.size == split.data_file.size
+                        && file.record_count == split.data_file.row_count
+                });
+            if !belongs_to_snapshot {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg split data file does not belong to its pinned snapshot",
                 ));
             }
         }
@@ -937,6 +936,36 @@ fn ensure_owner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_split_with_budget(
+    splits: &mut Vec<ConnectorSplit>,
+    total_payload_bytes: &mut usize,
+    owner: ConnectorInstanceId,
+    split_id: String,
+    payload: &SplitPayload,
+    estimated_bytes: Option<u64>,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    // Encoding one candidate is bounded by the per-handle budget. Admit its
+    // bytes against the aggregate budget before allocating/pushing the opaque
+    // split, so a rejected high-cardinality plan never builds the full split
+    // vector transiently.
+    let payload = encode_payload(payload, "split", context.max_handle_payload_bytes())?;
+    let next_total = total_payload_bytes
+        .checked_add(payload.len())
+        .filter(|total| *total <= context.max_total_payload_bytes())
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg split payloads exceed the request budget",
+            )
+        })?;
+    let split = ConnectorSplit::try_new(owner, split_id, payload, estimated_bytes)?;
+    splits.push(split);
+    *total_payload_bytes = next_total;
+    Ok(())
+}
+
 fn encode_payload(
     payload: &impl Serialize,
     subject: &str,
@@ -981,9 +1010,49 @@ fn internal(message: String) -> ConnectorError {
 }
 
 #[cfg(test)]
+pub(crate) fn replace_split_path_for_test(
+    split: &ConnectorSplit,
+    path: &str,
+) -> Result<ConnectorSplit, ConnectorError> {
+    let mut payload: SplitPayload = decode_payload(split.payload(), "split")?;
+    payload.data_file.path = path.to_string();
+    ConnectorSplit::try_new(
+        split.owner().clone(),
+        split.split_id(),
+        encode_payload(
+            &payload,
+            "split",
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        )?,
+        split.estimated_bytes(),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
+
+    struct NotCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NotCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context_with_payload_budgets(
+        max_handle_payload_bytes: usize,
+        max_total_payload_bytes: usize,
+    ) -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            Instant::now() + std::time::Duration::from_secs(30),
+            Arc::new(NotCancelled),
+            max_handle_payload_bytes,
+            max_total_payload_bytes,
+        )
+        .expect("connector request context")
+    }
 
     #[test]
     fn split_payload_does_not_repeat_serialized_table_metadata() {
@@ -1032,6 +1101,139 @@ mod tests {
                 <= novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             "ordinary 512-split planning exceeds the total payload budget"
         );
+    }
+
+    #[test]
+    fn aggregate_budget_rejects_candidate_before_split_is_pushed() {
+        let owner = ConnectorInstanceId::parse("ice").expect("owner");
+        let payload = |suffix: &str| SplitPayload {
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            snapshot_id: Some(7),
+            data_file: IcebergDataFileInfo::for_test(
+                &format!(
+                    "s3://warehouse/db/orders/{}-{suffix}.parquet",
+                    "x".repeat(512)
+                ),
+                1024,
+                10,
+            ),
+            projection: vec![0],
+            limit: None,
+        };
+        let first = payload("first");
+        let second = payload("second");
+        let first_len = serde_json::to_vec(&first).expect("encode first").len();
+        let second_len = serde_json::to_vec(&second).expect("encode second").len();
+        let context =
+            context_with_payload_budgets(first_len.max(second_len), first_len + second_len - 1);
+        let mut splits = Vec::new();
+        let mut total = 0;
+
+        push_split_with_budget(
+            &mut splits,
+            &mut total,
+            owner.clone(),
+            "first".to_string(),
+            &first,
+            Some(1024),
+            &context,
+        )
+        .expect("first split fits");
+        let admitted_total = total;
+        let error = push_split_with_budget(
+            &mut splits,
+            &mut total,
+            owner,
+            "second".to_string(),
+            &second,
+            Some(1024),
+            &context,
+        )
+        .expect_err("second split must exceed aggregate budget");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(splits.len(), 1, "rejected split must not be pushed");
+        assert_eq!(total, admitted_total, "rejection must not consume budget");
+    }
+
+    #[test]
+    fn plan_splits_enforces_aggregate_budget_incrementally() {
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let files = ["first", "second"]
+            .into_iter()
+            .map(|suffix| {
+                IcebergDataFileInfo::for_test(
+                    &format!(
+                        "s3://warehouse/db/orders/{}-{suffix}.parquet",
+                        "x".repeat(512)
+                    ),
+                    1024,
+                    10,
+                )
+            })
+            .collect::<Vec<_>>();
+        let split_payloads = files
+            .iter()
+            .cloned()
+            .map(|data_file| SplitPayload {
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                snapshot_id: None,
+                data_file,
+                projection: vec![0],
+                limit: None,
+            })
+            .collect::<Vec<_>>();
+        let lengths = split_payloads
+            .iter()
+            .map(|payload| serde_json::to_vec(payload).expect("encode split").len())
+            .collect::<Vec<_>>();
+        let context = context_with_payload_budgets(
+            *lengths.iter().max().expect("split length"),
+            lengths.iter().sum::<usize>() - 1,
+        );
+        let scan = ConnectorScanHandle::try_new(
+            instance_id.clone(),
+            encode_payload(
+                &ScanPayload {
+                    table: TablePayload {
+                        namespace: "db".to_string(),
+                        table: "orders".to_string(),
+                        table_info: None,
+                        cloud_properties: BTreeMap::new(),
+                        metadata_columns: Vec::new(),
+                        metadata_table_type: None,
+                        prepared_files: Vec::new(),
+                        explicit_files: Some(files),
+                    },
+                    snapshot_id: None,
+                    projection: vec![0],
+                    limit: None,
+                },
+                "scan handle",
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            )
+            .expect("scan payload"),
+        )
+        .expect("scan handle");
+        let provider = IcebergConnectorInstance {
+            instance_id,
+            registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+        };
+
+        let error = provider
+            .plan_splits(
+                &scan,
+                ConnectorSplitPlanningRequest {
+                    target_parallelism: std::num::NonZeroUsize::new(1).expect("parallelism"),
+                    max_split_bytes: None,
+                    context,
+                },
+            )
+            .expect_err("aggregate split budget must reject the plan");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
     }
 }
 

@@ -65,6 +65,7 @@ pub(crate) fn execute_iceberg_ctas(
     stmt: CreateTableStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     debug_assert!(stmt.as_select.is_some(), "CTAS dispatch requires AS SELECT");
 
@@ -111,8 +112,12 @@ pub(crate) fn execute_iceberg_ctas(
         .as_ref()
         .expect("CTAS requires AS SELECT")
         .as_ref();
-    let (_, schema_cols) =
-        crate::engine::iceberg_writer::run_select_to_chunks_and_schema(state, &target, query)?;
+    let (_, schema_cols) = crate::engine::iceberg_writer::run_select_to_chunks_and_schema(
+        state,
+        &target,
+        query,
+        connector_context,
+    )?;
 
     if schema_cols.is_empty() {
         return Err(
@@ -162,7 +167,7 @@ pub(crate) fn execute_iceberg_ctas(
     // by dropping the just-created table.
     //
     // Error quadrant comments are inline below (see module doc).
-    let write_result = drive_data_write(state, &target, query);
+    let write_result = drive_data_write(state, &target, query, connector_context);
 
     match write_result {
         Ok(()) => {
@@ -386,6 +391,7 @@ fn drive_data_write(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
     query: &sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // Load the just-created table via the connector registry's CatalogBackend
     // path — this is the same path used by run_insert and returns the
@@ -394,10 +400,7 @@ fn drive_data_write(
         let reg = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &reg,
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
             &target.table,
@@ -415,6 +418,7 @@ fn drive_data_write(
         OverwriteMode::None,
         "main",
         None,
+        connector_context,
     )
     .map(|_| ())
 }

@@ -1571,6 +1571,7 @@ impl StandaloneSession {
                 source,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
         // For MV DDL (CREATE/DROP/REFRESH/SHOW MATERIALIZED VIEW) we must
@@ -1612,6 +1613,7 @@ impl StandaloneSession {
                         current_catalog,
                         current_database,
                         statement,
+                        &connector_context,
                     );
                 }
             }
@@ -1620,7 +1622,13 @@ impl StandaloneSession {
             let statement = statements
                 .pop()
                 .ok_or_else(|| "custom parser returned no statements".to_string())?;
-            return dispatch_statement(&self.inner, current_catalog, current_database, statement);
+            return dispatch_statement(
+                &self.inner,
+                current_catalog,
+                current_database,
+                statement,
+                &connector_context,
+            );
         }
         let (parse_sql, forced_explain_level, force_logical_explain) =
             if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
@@ -1667,6 +1675,7 @@ impl StandaloneSession {
                 result,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
         if looks_like_create_catalog(&parser) {
@@ -1684,11 +1693,12 @@ impl StandaloneSession {
                 &db_name,
                 if_not_exists,
                 current_catalog,
+                &connector_context,
             );
         }
         if looks_like_drop_statement(&parser) {
             let drop = crate::sql::parser::dialect::drop::parse_drop_statement(&mut parser)?;
-            return self.handle_drop(drop, current_catalog, current_database);
+            return self.handle_drop(drop, current_catalog, current_database, &connector_context);
         }
 
         // ALTER TABLE ... SET / UNSET TBLPROPERTIES
@@ -1722,7 +1732,12 @@ impl StandaloneSession {
 
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
-            return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
+            return self.handle_add_equality_delete(
+                &normalized,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // ALTER TABLE ... ADD FILES FROM '...'
@@ -1931,6 +1946,7 @@ impl StandaloneSession {
                 current_database,
                 query_opts.as_ref(),
                 Some(request_context.execution()),
+                &connector_context,
             ),
             sqlast::Statement::Delete(ref delete) => {
                 let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
@@ -1940,6 +1956,7 @@ impl StandaloneSession {
                     current_catalog,
                     current_database,
                     request_context.execution(),
+                    &connector_context,
                 )
             }
             ref update_stmt @ sqlast::Statement::Update(_) => {
@@ -1955,6 +1972,7 @@ impl StandaloneSession {
                     current_catalog,
                     current_database,
                     request_context.execution(),
+                    &connector_context,
                 )?;
                 self.inner
                     .statistics_service
@@ -1969,6 +1987,7 @@ impl StandaloneSession {
                     current_catalog,
                     current_database,
                     request_context.execution(),
+                    &connector_context,
                 )
             }
             sqlast::Statement::Truncate(truncate) => {
@@ -1982,6 +2001,7 @@ impl StandaloneSession {
                         "main",
                         current_catalog,
                         current_database,
+                        &connector_context,
                     )?;
                 }
                 Ok(StatementResult::Ok)
@@ -2256,6 +2276,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let stmt = crate::engine::statement::parse_add_equality_delete_sql(sql)?;
         crate::engine::equality_delete_flow::execute_add_equality_delete_statement(
@@ -2263,6 +2284,7 @@ impl StandaloneSession {
             &stmt,
             current_catalog,
             current_database,
+            connector_context,
         )
     }
 
@@ -2329,6 +2351,7 @@ impl StandaloneSession {
         source: crate::sql::parser::ast::ObjectName,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let source_target = crate::engine::backend_resolver::resolve_existing_table_target(
             &self.inner,
@@ -2343,10 +2366,7 @@ impl StandaloneSession {
             .expect("connector registry read");
         let source_table = crate::connector::metadata_load_table(
             &connectors,
-            crate::connector::connector_request_context(
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &source_target.catalog,
             &source_target.namespace,
             &source_target.table,
@@ -2386,6 +2406,7 @@ impl StandaloneSession {
             },
             current_catalog,
             current_database,
+            connector_context,
         )
     }
 
@@ -2395,6 +2416,7 @@ impl StandaloneSession {
         drop: crate::sql::parser::dialect::drop::DropResult,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::drop::DropResult;
         match drop {
@@ -2421,6 +2443,7 @@ impl StandaloneSession {
                     current_catalog,
                     stmt.if_exists,
                     stmt.force,
+                    connector_context,
                 )?;
                 self.inner
                     .view_service
@@ -2465,6 +2488,7 @@ impl StandaloneSession {
         current_database: &str,
         query_opts: Option<&QueryOptions>,
         execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         self.execute_insert_via_custom_parser(
             insert,
@@ -2472,6 +2496,7 @@ impl StandaloneSession {
             current_database,
             query_opts,
             execution,
+            connector_context,
         )
     }
 
@@ -2484,6 +2509,7 @@ impl StandaloneSession {
         current_database: &str,
         query_opts: Option<&QueryOptions>,
         execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -2496,6 +2522,7 @@ impl StandaloneSession {
             current_database,
             query_opts,
             execution,
+            connector_context,
         )
     }
 }
@@ -2718,8 +2745,16 @@ pub(crate) fn dispatch_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     statement: crate::sql::parser::ast::Statement,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     use crate::sql::parser::ast::Statement;
+
+    if connector_context.cancellation().is_cancelled() {
+        return Err("connector request was cancelled".to_string());
+    }
+    if std::time::Instant::now() >= connector_context.deadline() {
+        return Err("connector request deadline elapsed".to_string());
+    }
 
     match statement {
         Statement::CreateMaterializedView(stmt) => {
@@ -2771,6 +2806,7 @@ pub(crate) fn dispatch_statement(
                 &target_ref,
                 current_catalog,
                 current_database,
+                connector_context,
             )
         }
         Statement::AddBackend(stmt) => {
@@ -3434,6 +3470,24 @@ pub(crate) fn execute_query_with_catalog_service(
         query_opts.as_ref(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
+    execute_query_with_catalog_service_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        query_opts,
+        &connector_context,
+    )
+}
+
+pub(crate) fn execute_query_with_catalog_service_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    query_opts: Option<QueryOptions>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<QueryResult, String> {
     let catalog_service_snapshot = catalog_service_snapshot(state);
     let catalog_snapshot = catalog_service_snapshot
         .local()
@@ -3460,7 +3514,7 @@ pub(crate) fn execute_query_with_catalog_service(
         state.exchange_port,
         query_opts,
         &state.query_execution,
-        &connector_context,
+        connector_context,
         Some(state),
     )
 }
@@ -3543,6 +3597,29 @@ pub(crate) fn execute_query_as_iceberg_write(
         query_opts.as_ref(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
+    execute_query_as_iceberg_write_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink_spec,
+        query_opts,
+        root_distribution_resolver,
+        &connector_context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -3558,7 +3635,7 @@ pub(crate) fn execute_query_as_iceberg_write(
             current_catalog,
             current_database,
             &mut prepared,
-            &connector_context,
+            connector_context,
         )?;
     }
 
@@ -5120,7 +5197,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     struct AlwaysUnavailableMvApplicationService;
@@ -7599,6 +7676,7 @@ mysql_port = 47892
                     full: false,
                 },
             ),
+            &crate::connector::test_request_context(),
         )
         .expect_err("refresh should fail without MV runtime prerequisites");
         assert!(
@@ -7626,8 +7704,14 @@ mysql_port = 47892
         .expect("parse materialized-view create")
         .pop()
         .expect("one materialized-view statement");
-        let err = dispatch_statement(&state, None, "analytics", statement)
-            .expect_err("frontend unavailable error must surface directly");
+        let err = dispatch_statement(
+            &state,
+            None,
+            "analytics",
+            statement,
+            &crate::connector::test_request_context(),
+        )
+        .expect_err("frontend unavailable error must surface directly");
 
         assert_eq!(err, "injected frontend MV service is unavailable");
         assert!(
@@ -7642,6 +7726,33 @@ mysql_port = 47892
                 .is_none(),
             "frontend service errors must not fall back to legacy target creation or metadata writes"
         );
+    }
+
+    #[test]
+    fn custom_statement_dispatch_honors_caller_cancellation() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let context =
+            crate::connector::connector_request_context(None, cancellation).expect("context");
+
+        let error = dispatch_statement(
+            &state,
+            None,
+            "analytics",
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(
+                crate::sql::parser::ast::RefreshMaterializedViewStmt {
+                    name: crate::sql::parser::ast::ObjectName {
+                        parts: vec!["analytics".to_string(), "orders_mv".to_string()],
+                    },
+                    full: false,
+                },
+            ),
+            &context,
+        )
+        .expect_err("cancelled caller must stop custom statement dispatch");
+
+        assert_eq!(error, "connector request was cancelled");
     }
 
     // -----------------------------------------------------------------------
@@ -7692,6 +7803,30 @@ path = "meta/operations.sqlite"
             .execute_in_database(&create_table_sql, "default")
             .expect("create table");
         (engine, session)
+    }
+
+    #[test]
+    fn mysql_request_cancellation_reaches_insert_metadata_lookup() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let connector_context =
+            crate::connector::connector_request_context(None, cancellation).expect("context");
+
+        let error = session
+            .execute_in_context_with_connector_context(
+                "insert into ice.db1.t values (1, 'cancelled')",
+                None,
+                "default",
+                None,
+                connector_context,
+            )
+            .expect_err("cancelled MySQL request must abort INSERT metadata lookup");
+
+        assert!(
+            error.contains("cancel"),
+            "unexpected cancellation error: {error}"
+        );
     }
 
     #[test]

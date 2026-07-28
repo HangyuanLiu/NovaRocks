@@ -70,6 +70,7 @@ pub(crate) fn execute_delete_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
@@ -161,6 +162,7 @@ pub(crate) fn execute_delete_statement(
             &target_ref,
             &stmt.where_clause,
             execution.clone(),
+            connector_context,
         )?;
         return Ok(StatementResult::Ok);
     }
@@ -169,10 +171,7 @@ pub(crate) fn execute_delete_statement(
         let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &registry,
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
             &target.table,
@@ -220,6 +219,7 @@ pub(crate) fn execute_delete_statement(
         delete_query,
         sink_spec,
         execution.clone(),
+        connector_context,
     )?;
 
     Ok(StatementResult::Ok)
@@ -232,6 +232,7 @@ struct DistributedDeleteWriteExecutor {
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
     execution: QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
@@ -239,7 +240,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        let mut result = crate::engine::execute_query_as_iceberg_write(
+        let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -248,6 +249,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
             None,
             None,
             Some(&self.execution),
+            &self.connector_context,
         )?;
         if result
             .write_commit
@@ -279,6 +281,7 @@ struct DistributedDvDeleteWriteExecutor {
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
     execution: QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
@@ -286,7 +289,7 @@ impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        let mut result = crate::engine::execute_query_as_iceberg_write(
+        let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -295,6 +298,7 @@ impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
             None,
             Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
             Some(&self.execution),
+            &self.connector_context,
         )?;
         if result
             .write_commit
@@ -330,15 +334,13 @@ fn run_delete_dv_write_transaction(
     target_ref: &str,
     where_clause: &sqlast::Expr,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
             &registry,
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
             &target.table,
@@ -429,6 +431,7 @@ fn run_delete_dv_write_transaction(
         sink_spec,
         commit_executor,
         execution,
+        connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -448,6 +451,7 @@ fn run_delete_write_transaction(
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -497,6 +501,7 @@ fn run_delete_write_transaction(
         sink_spec,
         commit_executor,
         execution,
+        connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;

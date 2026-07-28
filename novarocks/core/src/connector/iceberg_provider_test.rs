@@ -163,6 +163,33 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     assert_eq!(splits.len(), 1);
     assert_eq!(splits[0].owner(), &instance_id);
     assert!(splits[0].estimated_bytes().is_some_and(|bytes| bytes > 0));
+    let corrupt_split = super::iceberg::provider::replace_split_path_for_test(
+        &splits[0],
+        "file:///warehouse/db/orders/not-in-snapshot.parquet",
+    )
+    .expect("corrupt split fixture");
+    let error = match instance.read().open_reader(
+        &corrupt_split,
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::clone(&resolved.schema),
+            batch: ConnectorBatchBudget {
+                max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+            },
+            context: context(),
+        },
+    ) {
+        Ok(_) => panic!("split file outside pinned snapshot must fail before reading"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        novarocks_spi::connector::ConnectorErrorKind::CorruptData
+    );
+    assert!(
+        error.to_string().contains("does not belong"),
+        "unexpected corrupt split error: {error}"
+    );
     let mut reader = instance
         .read()
         .open_reader(
