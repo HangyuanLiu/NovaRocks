@@ -367,6 +367,17 @@ fn dropping_paged_mv_records_removes_all_dependencies_and_refresh_history() {
             .expect("finalize refresh");
         refresh_ids.push(refresh.refresh_id);
     }
+    repository
+        .replace_partition_states(ReplaceMvPartitionStatesRequest {
+            mv_id: definition.mv_id,
+            partition_keys: ["p1".to_string(), "p2".to_string(), "p3".to_string()].into(),
+            last_refresh_ms: 3,
+            base_snapshots: BTreeMap::new(),
+            target_snapshot_id: Some(3),
+            last_refresh_id: *refresh_ids.last().expect("finalized refresh"),
+            max_entries: 10,
+        })
+        .expect("persist paged partition states");
     assert!(repository.drop_by_id(definition.mv_id).expect("drop MV"));
     drop(repository);
     let reopened = runtime
@@ -379,6 +390,12 @@ fn dropping_paged_mv_records_removes_all_dependencies_and_refresh_history() {
         reopened
             .list_dependencies_by_downstream(definition.mv_id)
             .expect("list removed dependencies")
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .list_partition_states(definition.mv_id)
+            .expect("list removed partition states")
             .is_empty()
     );
     for upstream in &upstreams {
