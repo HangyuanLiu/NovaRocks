@@ -36,8 +36,8 @@ use crate::runtime::fragment::instance::{
     FragmentRuntimeOptions, ScanAssignments,
 };
 use crate::runtime::fragment::io::{
-    FragmentResultWriter, ResultPresentation, ResultProjection as FragmentResultProjection,
-    ResultWriteSpec,
+    FragmentEventSink, FragmentResultWriter, ResultPresentation,
+    ResultProjection as FragmentResultProjection, ResultWriteSpec,
 };
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::LookupFetcherLifecycle;
@@ -232,6 +232,7 @@ impl StarRocksSubmissionMetadata {
             dyn crate::runtime::fragment::io::ExchangeFrameTransmitter,
         >,
         result_writer: std::sync::Arc<dyn FragmentResultWriter>,
+        event_sink: std::sync::Arc<dyn FragmentEventSink>,
         fragment_instance_id: crate::common::types::UniqueId,
     ) -> crate::runtime::fragment::FragmentPrepareContext {
         crate::runtime::fragment::FragmentPrepareContext::new_with_execution_overrides(
@@ -242,6 +243,7 @@ impl StarRocksSubmissionMetadata {
             self.group_execution_scan_dop,
             exchange_transmitter,
             result_writer,
+            event_sink,
         )
     }
 }

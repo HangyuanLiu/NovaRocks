@@ -30,7 +30,8 @@ use crate::runtime::fragment::error::{
 use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentResultWriter, ResultPresentation, ResultWriteSpec,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter, NoopFragmentEventSink,
+    ResultPresentation, ResultWriteSpec,
 };
 use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaults};
 use crate::runtime::fragment::runtime_state::{
@@ -50,6 +51,7 @@ pub struct FragmentPrepareContext {
     runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     result_writer: Arc<dyn FragmentResultWriter>,
+    event_sink: Arc<dyn FragmentEventSink>,
     result_spec: Option<ResultWriteSpec>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
@@ -71,6 +73,7 @@ impl Default for FragmentPrepareContext {
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
+            event_sink: Arc::new(NoopFragmentEventSink),
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -91,6 +94,7 @@ impl FragmentPrepareContext {
         runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn FragmentResultWriter>,
+        event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
         Self {
             profiler,
@@ -98,6 +102,7 @@ impl FragmentPrepareContext {
             runtime_filter,
             exchange_transmitter,
             result_writer,
+            event_sink,
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -118,6 +123,7 @@ impl FragmentPrepareContext {
         group_execution_scan_dop: Option<i32>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn FragmentResultWriter>,
+        event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
         Self {
             profiler,
@@ -125,6 +131,7 @@ impl FragmentPrepareContext {
             runtime_filter: None,
             exchange_transmitter,
             result_writer,
+            event_sink,
             result_spec,
             root_sink_dop,
             group_execution_scan_dop,
@@ -441,6 +448,7 @@ pub fn prepare_fragment(
             runtime_state,
             context.root_sink_dop,
             context.runtime_filter.clone(),
+            Arc::clone(&context.event_sink),
         )
         .map_err(|error| {
             FragmentLaunchError::new(

@@ -117,6 +117,7 @@ mod tests {
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
             crate::fragment::compat_result_writer(),
+            crate::fragment::compat_fragment_event_sink(),
         );
         let context = std::ptr::from_ref(&service).cast();
         let malformed_payload = [0_u8];

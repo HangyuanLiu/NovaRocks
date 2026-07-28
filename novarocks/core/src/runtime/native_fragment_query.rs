@@ -27,7 +27,9 @@ use std::time::Duration;
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::runtime::fragment::FragmentPrepareContext;
-use crate::runtime::fragment::io::{ExchangeFrameTransmitter, FragmentResultWriter};
+use crate::runtime::fragment::io::{
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter,
+};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
@@ -170,6 +172,7 @@ impl NativeFragmentAdmissionResources {
         profiler: Option<Profiler>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn FragmentResultWriter>,
+        event_sink: Arc<dyn FragmentEventSink>,
     ) -> FragmentPrepareContext {
         FragmentPrepareContext::new(
             profiler,
@@ -177,6 +180,7 @@ impl NativeFragmentAdmissionResources {
             self.runtime_filter,
             exchange_transmitter,
             result_writer,
+            event_sink,
         )
     }
 }

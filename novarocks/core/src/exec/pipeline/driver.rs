@@ -40,11 +40,13 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, error};
+use crate::runtime::fragment::io::{
+    FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink,
+};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::profile::{CounterRef, OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeState;
-use crate::service::fe_report;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Runtime state for a single pipeline driver.
@@ -203,7 +205,7 @@ pub struct PipelineDriver {
     operator_counters: Vec<OperatorCounters>,
     runtime_state: Arc<RuntimeState>,
     fragment_instance_id: Option<(i64, i64)>,
-    legacy_progress_reporting: bool,
+    event_sink: Arc<dyn FragmentEventSink>,
     state: DriverState,
     blocked_since: Option<(Instant, DriverBlockedKind)>,
     closed: bool,
@@ -265,25 +267,25 @@ impl PipelineDriver {
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
     ) -> Self {
-        Self::new_with_legacy_progress_reporting(
+        Self::new_with_event_sink(
             driver_id,
             operators,
             profiler,
             operator_profiles,
             runtime_state,
             fragment_instance_id,
-            true,
+            Arc::new(NoopFragmentEventSink),
         )
     }
 
-    pub(crate) fn new_with_legacy_progress_reporting(
+    pub(crate) fn new_with_event_sink(
         driver_id: i32,
         operators: Vec<Box<dyn Operator>>,
         profiler: Option<Profiler>,
         operator_profiles: Vec<OperatorProfiles>,
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
-        legacy_progress_reporting: bool,
+        event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
         let mut operators = operators;
         let operator_count = operators.len();
@@ -418,7 +420,7 @@ impl PipelineDriver {
             operator_counters,
             runtime_state,
             fragment_instance_id,
-            legacy_progress_reporting,
+            event_sink,
             state: DriverState::Ready,
             blocked_since: None,
             closed: false,
@@ -734,9 +736,6 @@ impl PipelineDriver {
     }
 
     pub(crate) fn report_exec_state_if_necessary(&self) {
-        if !self.legacy_progress_reporting {
-            return;
-        }
         if self.is_finished() {
             return;
         }
@@ -746,7 +745,18 @@ impl PipelineDriver {
         let Some((hi, lo)) = self.fragment_instance_id else {
             return;
         };
-        fe_report::report_exec_state(UniqueId { hi, lo });
+        // Progress is observability only. A buggy role adapter must not be
+        // able to terminate the driver or turn a successful fragment into a
+        // failed one.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.event_sink
+                .record(FragmentEvent::Progress(FragmentProgress::new(
+                    UniqueId { hi, lo },
+                    0,
+                    0,
+                    0,
+                )));
+        }));
     }
 
     fn block_or_fail(&mut self, reason: BlockedReason) -> DriverState {

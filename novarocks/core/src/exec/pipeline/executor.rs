@@ -44,6 +44,7 @@ use super::global_driver_executor::{DriverTask, FragmentCompletion, global_drive
 use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
 use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime::fragment::io::FragmentEventSink;
 
 use crate::runtime::profile::{Profiler, ScopedTimer};
 
@@ -305,6 +306,7 @@ pub(crate) fn prepare_pipeline_execution(
     runtime_filter_context: Option<
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     >,
+    event_sink: Arc<dyn FragmentEventSink>,
 ) -> Result<PreparedPipelineExecution, String> {
     prepare_pipeline_execution_inner(
         plan,
@@ -322,6 +324,7 @@ pub(crate) fn prepare_pipeline_execution(
         backend_num,
         root_sink_dop,
         runtime_filter_context,
+        event_sink,
         false,
     )
 }
@@ -342,6 +345,7 @@ pub(crate) fn prepare_report_neutral_pipeline_execution(
     runtime_filter_context: Option<
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     >,
+    event_sink: Arc<dyn FragmentEventSink>,
 ) -> Result<PreparedPipelineExecution, String> {
     prepare_pipeline_execution_inner(
         plan,
@@ -359,6 +363,7 @@ pub(crate) fn prepare_report_neutral_pipeline_execution(
         None,
         root_sink_dop,
         runtime_filter_context,
+        event_sink,
         true,
     )
 }
@@ -382,6 +387,7 @@ fn prepare_pipeline_execution_inner(
     runtime_filter_context: Option<
         crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
     >,
+    event_sink: Arc<dyn FragmentEventSink>,
     report_neutral: bool,
 ) -> Result<PreparedPipelineExecution, String> {
     let dep_manager = DependencyManager::new();
@@ -405,6 +411,7 @@ fn prepare_pipeline_execution_inner(
             profiler.clone(),
             Arc::clone(&runtime_state),
             exchange_finst_id,
+            event_sink,
         )
     } else {
         FragmentContext::new(
@@ -526,6 +533,7 @@ fn execute_plan_with_pipeline(
         backend_num,
         root_sink_dop,
         runtime_filter_context,
+        Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
     )?
     .start()
     .join()

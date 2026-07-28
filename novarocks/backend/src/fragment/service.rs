@@ -21,7 +21,9 @@ use std::sync::{Arc, mpsc};
 
 use novarocks::common::app_config;
 use novarocks::novarocks_logging::{error, info, warn};
-use novarocks::runtime::fragment::io::{ExchangeFrameTransmitter, FragmentResultWriter};
+use novarocks::runtime::fragment::io::{
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter,
+};
 use novarocks::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
@@ -50,6 +52,7 @@ pub struct NativeFragmentService {
     queries: NativeFragmentQueryRuntime,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     result_writer: Arc<dyn FragmentResultWriter>,
+    event_sink: Arc<dyn FragmentEventSink>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     fail_worker_spawn_on_submission: Option<usize>,
@@ -69,12 +72,14 @@ impl NativeFragmentService {
     pub fn new(
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn FragmentResultWriter>,
+        event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
         Self {
             controls: Arc::new(FragmentControlRegistry::default()),
             queries: NativeFragmentQueryRuntime::global(),
             exchange_transmitter,
             result_writer,
+            event_sink,
             lifecycle_observer: None,
             #[cfg(test)]
             fail_worker_spawn_on_submission: None,
@@ -92,6 +97,7 @@ impl NativeFragmentService {
             ..Self::new(
                 crate::fragment::grpc_exchange_transmitter(),
                 crate::fragment::native_result_writer(),
+                crate::fragment::native_fragment_event_sink(),
             )
         }
     }
@@ -107,6 +113,7 @@ impl NativeFragmentService {
             ..Self::new(
                 crate::fragment::grpc_exchange_transmitter(),
                 crate::fragment::native_result_writer(),
+                crate::fragment::native_fragment_event_sink(),
             )
         }
     }
@@ -155,6 +162,7 @@ impl NativeFragmentIngress for NativeFragmentService {
                 profiler.clone(),
                 Arc::clone(&self.exchange_transmitter),
                 Arc::clone(&self.result_writer),
+                Arc::clone(&self.event_sink),
             ),
         )
         .map_err(NativeFragmentIngressError::new)?;
@@ -435,6 +443,7 @@ mod tests {
         let service = NativeFragmentService::new(
             crate::fragment::grpc_exchange_transmitter(),
             crate::fragment::native_result_writer(),
+            crate::fragment::native_fragment_event_sink(),
         );
         let first = values_result_request(82_000, 82_002);
         let finst_id = first.fragment_instance_id();

@@ -319,7 +319,11 @@ pub fn report_fragment_done(
     sink_commit::unregister(finst_id);
 }
 
-pub(crate) fn report_exec_state(finst_id: UniqueId) {
+/// Enqueues a best-effort progress report for a fragment instance.
+///
+/// Runtime I/O adapters decide whether to emit progress; this retains the
+/// protocol-specific registry and queue lifecycle behind that adapter.
+pub fn report_exec_state(finst_id: UniqueId) {
     #[cfg(test)]
     {
         let mut calls = TEST_PROGRESS_REPORT_CALLS
