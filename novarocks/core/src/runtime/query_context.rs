@@ -54,9 +54,23 @@ use crate::runtime_filter::service::{
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct QueryId {
+pub struct QueryId {
     pub(crate) hi: i64,
     pub(crate) lo: i64,
+}
+
+impl QueryId {
+    pub const fn new(hi: i64, lo: i64) -> Self {
+        Self { hi, lo }
+    }
+
+    pub const fn hi(self) -> i64 {
+        self.hi
+    }
+
+    pub const fn lo(self) -> i64 {
+        self.lo
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -35,7 +35,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
 
 #[derive(Debug)]
-pub(crate) struct FragmentSubmission {
+pub struct FragmentSubmission {
     program: Arc<FragmentProgram>,
     instance: FragmentInstanceSpec,
 }

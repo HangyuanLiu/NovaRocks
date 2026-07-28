@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Legacy native orchestration retained only as a core test fixture.
+//!
+//! Production native fragment orchestration is owned by `novarocks-backend`.
+
 #[cfg(test)]
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::CacheOptions;

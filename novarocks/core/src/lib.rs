@@ -55,7 +55,10 @@ pub use fs::opendal as novarocks_fs_opendal;
 pub use common::types::{FetchResult, UniqueId};
 pub use service::fragment_control::cancel;
 pub use service::grpc_server::start_grpc_exchange_server;
+#[cfg(feature = "compat")]
 pub use service::grpc_server::start_grpc_server;
+#[cfg(not(feature = "compat"))]
+pub use service::grpc_server::start_grpc_server_with_native_fragment_ingress;
 #[cfg(feature = "compat")]
 pub use service::internal_service::{submit_exec_batch_plan_fragments, submit_exec_plan_fragment};
 

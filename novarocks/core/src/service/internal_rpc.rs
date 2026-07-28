@@ -24,7 +24,13 @@ use crate::runtime::exchange;
 use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
 };
-use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_context::QueryId;
+#[cfg(feature = "compat")]
+use crate::runtime::query_context::query_context_manager;
+use crate::service::native_fragment_ingress::{
+    NativeFragmentAccepted, NativeFragmentIngress, NativeFragmentIngressError,
+    NativeFragmentRequest,
+};
 
 #[cfg(feature = "compat")]
 type CompatTransmitChunkRequest = proto::starrocks::PTransmitChunkParams; // cfg(feature = "compat")
@@ -298,6 +304,17 @@ pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter:
     response
 }
 
+pub(crate) fn handle_submit_fragment(
+    ingress: &dyn NativeFragmentIngress,
+    fragment: proto::plan::PlanFragment,
+    instance_params: proto::novarocks::InstanceParams,
+) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+    ingress.submit(NativeFragmentRequest::try_decode(
+        fragment,
+        instance_params,
+    )?)
+}
+
 #[cfg(feature = "compat")]
 pub(crate) fn handle_lookup_compat(req: CompatLookupRequest) -> CompatLookupResponse {
     let mut request_columns = Vec::with_capacity(req.request_columns.len());
@@ -401,7 +418,7 @@ mod native_runtime_filter_mode_tests {
 
     fn submit_native_fragment(query_id: QueryId) -> Result<(), String> {
         let fragment_id = 8;
-        crate::service::native_fragment_service::submit_exec_plan_fragment_native(
+        crate::service::native_fragment_service_test_fixture::submit_exec_plan_fragment_native(
             crate::proto::plan::PlanFragment {
                 fragment_id,
                 root: Some(crate::proto::plan::DistributedNode {

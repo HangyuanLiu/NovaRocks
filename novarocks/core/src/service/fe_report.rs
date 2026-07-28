@@ -124,7 +124,7 @@ pub(crate) fn register_instance(
     );
 }
 
-pub(crate) fn register_novarocks_instance(
+pub fn register_novarocks_instance(
     finst_id: UniqueId,
     query_id: QueryId,
     coord: RuntimeEndpoint,
@@ -224,7 +224,7 @@ pub(crate) fn mark_fe_query_gone(finst_id: UniqueId) {
     }
 }
 
-pub(crate) fn report_fragment_done(
+pub fn report_fragment_done(
     finst_id: UniqueId,
     error: Option<String>,
     include_runtime_filters: bool,

@@ -15,26 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod error;
-pub(crate) mod exchange;
-pub(crate) mod fact;
-pub(crate) mod handle;
-pub(crate) mod instance;
-pub(crate) mod native_execution;
-pub(crate) mod resources;
-pub(crate) mod runtime_state;
-pub(crate) mod scan;
-pub(crate) mod sink;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks_execution;
-pub(crate) mod submission;
+mod control;
+mod service;
 
-pub use error::{
-    FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
-    FragmentLaunchErrorKind, FragmentLaunchStage,
-};
-pub use fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
-pub use handle::{
-    DormantFragmentHandle, FragmentPrepareContext, RunningFragmentHandle, prepare_fragment,
-};
-pub use submission::FragmentSubmission;
+pub use service::NativeFragmentService;

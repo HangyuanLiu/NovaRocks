@@ -21,31 +21,31 @@ use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_context::QueryId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentCancelReason {
+pub struct FragmentCancelReason {
     detail: String,
 }
 
 impl FragmentCancelReason {
-    pub(crate) fn new(detail: impl Into<String>) -> Self {
+    pub fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
         }
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentOutcome {
+pub enum FragmentOutcome {
     Succeeded,
     Failed(FragmentExecutionError),
     Cancelled { reason: FragmentCancelReason },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentTerminalFact {
+pub struct FragmentTerminalFact {
     query_id: QueryId,
     fragment_instance_id: UniqueId,
     outcome: FragmentOutcome,
@@ -67,19 +67,19 @@ impl FragmentTerminalFact {
         }
     }
 
-    pub(crate) const fn query_id(&self) -> QueryId {
+    pub const fn query_id(&self) -> QueryId {
         self.query_id
     }
 
-    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
+    pub const fn fragment_instance_id(&self) -> UniqueId {
         self.fragment_instance_id
     }
 
-    pub(crate) const fn outcome(&self) -> &FragmentOutcome {
+    pub const fn outcome(&self) -> &FragmentOutcome {
         &self.outcome
     }
 
-    pub(crate) const fn profile(&self) -> Option<&RuntimeProfileTree> {
+    pub const fn profile(&self) -> Option<&RuntimeProfileTree> {
         self.profile.as_ref()
     }
 }

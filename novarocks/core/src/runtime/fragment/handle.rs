@@ -41,7 +41,7 @@ use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
-pub(crate) struct FragmentPrepareContext {
+pub struct FragmentPrepareContext {
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
@@ -175,7 +175,7 @@ impl StartFailurePoint {
     }
 }
 
-pub(crate) struct DormantFragmentHandle {
+pub struct DormantFragmentHandle {
     prepared: PreparedPipelineExecution,
     resources: FragmentResources,
     query_id: QueryId,
@@ -185,11 +185,11 @@ pub(crate) struct DormantFragmentHandle {
 }
 
 impl DormantFragmentHandle {
-    pub(crate) const fn submitted_driver_count(&self) -> usize {
+    pub const fn submitted_driver_count(&self) -> usize {
         self.prepared.submitted_driver_count()
     }
 
-    pub(crate) fn start(self) -> RunningFragmentHandle {
+    pub fn start(self) -> RunningFragmentHandle {
         let pipeline = self.prepared.start();
         if let Some(failure) = self.start_failure {
             pipeline.fail(failure.detail().to_string());
@@ -211,7 +211,7 @@ impl DormantFragmentHandle {
 }
 
 #[derive(Clone)]
-pub(crate) struct RunningFragmentHandle {
+pub struct RunningFragmentHandle {
     inner: Arc<RunningFragmentInner>,
 }
 
@@ -230,11 +230,11 @@ struct RunningFragmentState {
 }
 
 impl RunningFragmentHandle {
-    pub(crate) fn submitted_driver_count(&self) -> usize {
+    pub fn submitted_driver_count(&self) -> usize {
         self.inner.pipeline.submitted_driver_count()
     }
 
-    pub(crate) fn cancel(&self, reason: FragmentCancelReason) {
+    pub fn cancel(&self, reason: FragmentCancelReason) {
         let mut state = self
             .inner
             .state
@@ -248,7 +248,7 @@ impl RunningFragmentHandle {
         }
     }
 
-    pub(crate) fn join(&self) -> FragmentTerminalFact {
+    pub fn join(&self) -> FragmentTerminalFact {
         let result = self.inner.pipeline.join();
         self.inner.freeze_terminal(result)
     }
@@ -302,7 +302,7 @@ impl Drop for RunningFragmentInner {
     }
 }
 
-pub(crate) fn prepare_fragment(
+pub fn prepare_fragment(
     submission: FragmentSubmission,
     context: FragmentPrepareContext,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {

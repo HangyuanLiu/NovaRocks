@@ -49,7 +49,9 @@ pub(crate) mod internal_rpc_transport;
 pub mod internal_service;
 pub mod load_tracking_http;
 pub(crate) mod metrics_http;
-pub(crate) mod native_fragment_service;
+pub mod native_fragment_ingress;
+#[cfg(test)]
+pub(crate) mod native_fragment_service_test_fixture;
 pub mod report_worker;
 pub(crate) mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
