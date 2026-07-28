@@ -195,6 +195,10 @@ impl MvRepository for DomainOnlyMvRepository {
         Ok(None)
     }
 
+    fn list_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        Ok(Vec::new())
+    }
+
     fn list_unfinished_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
         Ok(Vec::new())
     }

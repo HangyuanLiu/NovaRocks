@@ -250,6 +250,7 @@ pub trait MvRepository: Send + Sync {
     ) -> Result<(), MvRepositoryError>;
     fn clear_refresh_progress(&self, mv_id: i64) -> Result<bool, MvRepositoryError>;
     fn load_refresh(&self, refresh_id: i64) -> Result<Option<StoredMvRefresh>, MvRepositoryError>;
+    fn list_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError>;
     fn list_unfinished_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError>;
     fn list_unfinished_branch_staged_iceberg_refreshes(
         &self,
@@ -454,6 +455,10 @@ impl MvRepository for UnavailableMvRepository {
     }
 
     fn load_refresh(&self, _refresh_id: i64) -> Result<Option<StoredMvRefresh>, MvRepositoryError> {
+        unavailable!()
+    }
+
+    fn list_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
         unavailable!()
     }
 

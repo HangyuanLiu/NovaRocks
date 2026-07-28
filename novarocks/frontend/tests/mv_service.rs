@@ -295,6 +295,9 @@ impl MvRepository for FakeRepository {
     fn load_refresh(&self, _: i64) -> Result<Option<StoredMvRefresh>, MvRepositoryError> {
         unused_repository_method!()
     }
+    fn list_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        unused_repository_method!()
+    }
     fn list_unfinished_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
         unused_repository_method!()
     }

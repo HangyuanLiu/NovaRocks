@@ -144,7 +144,7 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
     let maintenance_service = Arc::new(InlineTableMaintenanceService::default());
     let service_port: Arc<dyn TableMaintenanceService> = maintenance_service.clone();
     let state = Arc::new_cyclic(|self_weak| StandaloneState {
-        mv_repository: crate::engine::test_mv_repository(Arc::clone(&metadata_provider)),
+        mv_repository: crate::engine::test_mv_repository(),
         metadata_provider: Some(metadata_provider),
         exchange_port: loopback_backend.exchange_port,
         table_maintenance_service: Arc::clone(&service_port),
@@ -484,8 +484,8 @@ fn scenario_1_auto_optimize_skips_sequence_isolated_row_lineage_files() {
         let provider = env.state.metadata_provider.as_ref().expect("provider");
         let read = provider.begin_read().expect("read txn");
         env.state
-            .mv_repo
-            .list_definitions(read.as_ref())
+            .mv_repository
+            .list_definitions()
             .expect("list definitions before optimize")
     };
     let stats_before = stats::collect_table_stats(
@@ -526,8 +526,8 @@ fn scenario_1_auto_optimize_skips_sequence_isolated_row_lineage_files() {
         let provider2 = env.state.metadata_provider.as_ref().expect("provider");
         let read2 = provider2.begin_read().expect("read txn");
         env.state
-            .mv_repo
-            .list_definitions(read2.as_ref())
+            .mv_repository
+            .list_definitions()
             .expect("list definitions after optimize")
     };
     let stats_after =
@@ -611,8 +611,8 @@ fn scenario_2_auto_expire_keeps_min_snapshots() {
         let read = provider.begin_read().expect("read txn");
         let definitions = env
             .state
-            .mv_repo
-            .list_definitions(read.as_ref())
+            .mv_repository
+            .list_definitions()
             .expect("list definitions");
         drop(read);
         let stats =
@@ -787,8 +787,8 @@ fn scenario_4_escape_hatch_disables_table() {
         let read = provider.begin_read().expect("read txn");
         let definitions = env
             .state
-            .mv_repo
-            .list_definitions(read.as_ref())
+            .mv_repository
+            .list_definitions()
             .expect("list definitions");
         drop(read);
         let stats =
@@ -1183,8 +1183,8 @@ fn dv_compaction_on_aggregate_mv_table() {
         let provider = env.state.metadata_provider.as_ref().expect("provider");
         let read = provider.begin_read().expect("read txn");
         env.state
-            .mv_repo
-            .list_definitions(read.as_ref())
+            .mv_repository
+            .list_definitions()
             .expect("list definitions")
     };
     let stats_before_maintenance =
@@ -1227,8 +1227,8 @@ fn dv_compaction_on_aggregate_mv_table() {
                 let provider = env.state.metadata_provider.as_ref().expect("provider");
                 let read = provider.begin_read().expect("read txn");
                 env.state
-                    .mv_repo
-                    .list_definitions(read.as_ref())
+                    .mv_repository
+                    .list_definitions()
                     .expect("list definitions after DV compaction")
             };
             let stats_after_maintenance = stats::collect_table_stats(

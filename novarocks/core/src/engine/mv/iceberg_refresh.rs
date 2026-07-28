@@ -14815,7 +14815,7 @@ mod tests {
     };
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::PartitionPruningPolicy;
-    use crate::mv::test_legacy_repository_adapter::{
+    use crate::mv::test_repository::{
         TestMvRepositoryFailurePoint, fail_next_mv_repository_command,
     };
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -17571,7 +17571,7 @@ mod tests {
             .expect("install all-in-one loopback backend");
         let warehouse_dir = TempDir::new().expect("warehouse tempdir");
         let state = Arc::new(StandaloneState {
-            mv_repository: crate::engine::test_mv_repository(Arc::clone(&metadata_provider)),
+            mv_repository: crate::engine::test_mv_repository(),
             metadata_provider: Some(metadata_provider),
             exchange_port: loopback_backend.exchange_port,
             ..StandaloneState::default()
@@ -17667,7 +17667,7 @@ mod tests {
             crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider"),
         );
         let state = Arc::new(StandaloneState {
-            mv_repository: crate::engine::test_mv_repository(Arc::clone(&metadata_provider)),
+            mv_repository: crate::engine::test_mv_repository(),
             metadata_provider: Some(metadata_provider),
             exchange_port: loopback_backend.exchange_port,
             ..StandaloneState::default()
@@ -17770,7 +17770,7 @@ mod tests {
             crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider"),
         );
         let state = Arc::new(StandaloneState {
-            mv_repository: crate::engine::test_mv_repository(Arc::clone(&metadata_provider)),
+            mv_repository: crate::engine::test_mv_repository(),
             metadata_provider: Some(metadata_provider),
             exchange_port: loopback_backend.exchange_port,
             ..StandaloneState::default()
@@ -17817,11 +17817,13 @@ mod tests {
         namespace: &str,
         table: &str,
     ) -> Option<StoredMvDefinition> {
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let read = provider.begin_read().expect("open read txn");
         state
-            .mv_repo
-            .find_by_target(read.as_ref(), catalog, namespace, table)
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some(catalog.to_string()),
+                database: namespace.to_string(),
+                name: table.to_string(),
+            })
             .expect("lookup mv definition")
     }
 
@@ -17905,8 +17907,8 @@ mod tests {
         let provider = state.metadata_provider.as_ref().expect("metadata provider");
         let read = provider.begin_read().expect("open read txn");
         let refresh = state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         let operation_id = refresh.operation_id.expect("operation id");
@@ -17926,27 +17928,19 @@ mod tests {
     ) {
         let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
             .expect("mv definition for uuid-only metadata seed");
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let mut txn = provider
-            .begin_write("seed uuid-only iceberg mv refresh metadata")
-            .expect("write txn");
         let mut table_uuids = BTreeMap::new();
         table_uuids.insert(base_fqn.to_string(), "uuid-without-snapshot".to_string());
         let updated = state
-            .mv_repo
-            .update_starrocks_refresh_summary_if_present(
-                txn.as_mut(),
-                UpdateStarRocksMvRefreshSummaryRequest {
-                    mv_id: mv.mv_id,
-                    last_refresh_ms: now_ms(),
-                    last_refresh_rows: 0,
-                    base_snapshots: BTreeMap::new(),
-                    base_table_uuids: table_uuids,
-                },
-            )
+            .mv_repository
+            .update_starrocks_refresh_summary_if_present(UpdateStarRocksMvRefreshSummaryRequest {
+                mv_id: mv.mv_id,
+                last_refresh_ms: now_ms(),
+                last_refresh_rows: 0,
+                base_snapshots: BTreeMap::new(),
+                base_table_uuids: table_uuids,
+            })
             .expect("seed uuid-only refresh metadata");
         assert!(updated);
-        txn.commit().expect("commit uuid-only metadata seed");
     }
 
     fn seed_mismatched_refresh_uuid_metadata(
@@ -17958,30 +17952,22 @@ mod tests {
     ) {
         let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
             .expect("mv definition for mismatched uuid metadata seed");
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let mut txn = provider
-            .begin_write("seed mismatched iceberg mv refresh uuid metadata")
-            .expect("write txn");
         let mut table_uuids = mv.last_refresh_table_uuids.clone();
         table_uuids.insert(
             mismatched_base_fqn.to_string(),
             "mismatched-table-uuid".to_string(),
         );
         let updated = state
-            .mv_repo
-            .update_starrocks_refresh_summary_if_present(
-                txn.as_mut(),
-                UpdateStarRocksMvRefreshSummaryRequest {
-                    mv_id: mv.mv_id,
-                    last_refresh_ms: now_ms(),
-                    last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
-                    base_snapshots: mv.last_refresh_snapshots.clone(),
-                    base_table_uuids: table_uuids,
-                },
-            )
+            .mv_repository
+            .update_starrocks_refresh_summary_if_present(UpdateStarRocksMvRefreshSummaryRequest {
+                mv_id: mv.mv_id,
+                last_refresh_ms: now_ms(),
+                last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
+                base_snapshots: mv.last_refresh_snapshots.clone(),
+                base_table_uuids: table_uuids,
+            })
             .expect("seed mismatched uuid refresh metadata");
         assert!(updated);
-        txn.commit().expect("commit mismatched uuid metadata seed");
     }
 
     fn seed_union_projection_mismatched_uuid_refresh_metadata(
@@ -18003,30 +17989,22 @@ mod tests {
             2,
             "mismatched uuid seed expects complete previous table uuids"
         );
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let mut txn = provider
-            .begin_write("seed mismatched iceberg mv refresh uuid metadata")
-            .expect("write txn");
         let mut table_uuids = mv.last_refresh_table_uuids.clone();
         table_uuids.insert(
             mismatched_base_fqn.to_string(),
             "mismatched-table-uuid".to_string(),
         );
         let updated = state
-            .mv_repo
-            .update_starrocks_refresh_summary_if_present(
-                txn.as_mut(),
-                UpdateStarRocksMvRefreshSummaryRequest {
-                    mv_id: mv.mv_id,
-                    last_refresh_ms: now_ms(),
-                    last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
-                    base_snapshots: mv.last_refresh_snapshots.clone(),
-                    base_table_uuids: table_uuids,
-                },
-            )
+            .mv_repository
+            .update_starrocks_refresh_summary_if_present(UpdateStarRocksMvRefreshSummaryRequest {
+                mv_id: mv.mv_id,
+                last_refresh_ms: now_ms(),
+                last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
+                base_snapshots: mv.last_refresh_snapshots.clone(),
+                base_table_uuids: table_uuids,
+            })
             .expect("seed mismatched uuid refresh metadata");
         assert!(updated);
-        txn.commit().expect("commit mismatched uuid metadata seed");
     }
 
     fn create_base_table(
@@ -18667,24 +18645,10 @@ mod tests {
     }
 
     fn load_all_mv_refreshes(state: &Arc<StandaloneState>) -> Vec<StoredMvRefresh> {
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let read = provider.begin_read().expect("read txn");
-        let mut refreshes = read
-            .scan(
-                &crate::meta::MetaKeyPrefix::new(crate::meta::keys::NS_MV, ["refresh"])
-                    .expect("refresh key prefix"),
-                None,
-            )
-            .expect("scan refreshes")
-            .into_iter()
-            .map(|record| {
-                crate::meta::repository::decode_payload_for_kind::<StoredMvRefresh>(
-                    "mv.refresh",
-                    &record.payload,
-                )
-                .expect("decode refresh")
-            })
-            .collect::<Vec<_>>();
+        let mut refreshes = state
+            .mv_repository
+            .list_refreshes()
+            .expect("list MV refreshes through repository port");
         refreshes.sort_by_key(|refresh| refresh.refresh_id);
         refreshes
     }
@@ -19216,38 +19180,31 @@ mod tests {
         .expect("count live target data files")
     }
 
-    /// Delete an MV's SQLite definition WITHOUT dropping its lake MV table.
-    /// `drop_by_target` removes the target lookup, definition record,
-    /// dependency edges, and partition states from SQLite but never touches the
-    /// Iceberg table — exactly the "SQLite forgot, lake remembers" state the W4
-    /// rebuild must recover from.
+    /// Delete an MV definition through its port without dropping its lake table.
     fn drop_mv_definition_from_sqlite_only(
         state: &Arc<StandaloneState>,
         catalog: &str,
         namespace: &str,
         table: &str,
     ) {
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let mut txn = provider
-            .begin_write("test: drop mv definition from sqlite only")
-            .expect("open write txn");
         let dropped = state
-            .mv_repo
-            .drop_by_target(txn.as_mut(), catalog, namespace, table)
+            .mv_repository
+            .drop_by_target(&MvTarget {
+                catalog: Some(catalog.to_string()),
+                database: namespace.to_string(),
+                name: table.to_string(),
+            })
             .expect("drop mv definition");
         assert!(dropped, "expected an existing mv definition to drop");
-        txn.commit().expect("commit drop");
     }
 
     fn list_mv_dependency_names(
         state: &Arc<StandaloneState>,
         mv_id: i64,
     ) -> Vec<(Option<String>, String, String)> {
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let read = provider.begin_read().expect("open read txn");
         state
-            .mv_repo
-            .list_dependencies_by_downstream(read.as_ref(), mv_id)
+            .mv_repository
+            .list_dependencies_by_downstream(mv_id)
             .expect("list dependencies")
             .into_iter()
             .map(|dep| {
@@ -19717,30 +19674,18 @@ mod tests {
         let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv definition");
         {
-            let provider = env
-                .state
-                .metadata_provider
-                .as_ref()
-                .expect("metadata provider");
-            let mut txn = provider
-                .begin_write("seed mv partition state before repartition")
-                .expect("write txn");
             env.state
-                .mv_repo
-                .replace_partition_states(
-                    txn.as_mut(),
-                    ReplaceMvPartitionStatesRequest {
-                        mv_id: mv.mv_id,
-                        partition_keys: BTreeSet::from(["spec=0;id_bucket_16=i:1".to_string()]),
-                        last_refresh_ms: now_ms(),
-                        base_snapshots: mv.last_refresh_snapshots.clone(),
-                        target_snapshot_id: mv.last_refreshed_iceberg_snapshot_id,
-                        last_refresh_id: 1,
-                        max_entries: 10,
-                    },
-                )
+                .mv_repository
+                .replace_partition_states(ReplaceMvPartitionStatesRequest {
+                    mv_id: mv.mv_id,
+                    partition_keys: BTreeSet::from(["spec=0;id_bucket_16=i:1".to_string()]),
+                    last_refresh_ms: now_ms(),
+                    base_snapshots: mv.last_refresh_snapshots.clone(),
+                    target_snapshot_id: mv.last_refreshed_iceberg_snapshot_id,
+                    last_refresh_id: 1,
+                    max_entries: 10,
+                })
                 .expect("seed partition state");
-            txn.commit().expect("commit partition state seed");
         }
 
         let alter =
@@ -19786,16 +19731,10 @@ mod tests {
             "name_truncate_2"
         );
         assert!(!definition.partition_state_complete);
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("read txn");
         assert!(
             env.state
-                .mv_repo
-                .list_partition_states(read.as_ref(), definition.mv_id)
+                .mv_repository
+                .list_partition_states(definition.mv_id)
                 .expect("list partition state")
                 .is_empty()
         );
@@ -20450,29 +20389,25 @@ mod tests {
         assert_eq!(after_spec.fields().len(), 1);
         assert_eq!(after_spec.fields()[0].name, "name_truncate_2");
 
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::IntentCreated);
         let definition = env
             .state
-            .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_orders".to_string(),
+            })
             .expect("find mv")
             .expect("mv definition");
         assert_eq!(definition.active_refresh_id, Some(refresh_id));
         assert!(definition.refresh_in_progress);
-        drop(read);
-
         let operation = load_test_operation_for_refresh(&env.state, refresh_id);
         assert_eq!(operation.state, IcebergOperationState::Preparing);
         assert!(operation.commit_request.is_none());
@@ -20609,20 +20544,13 @@ mod tests {
         assert_eq!(after_spec.fields().len(), 1);
         assert_eq!(after_spec.fields()[0].name, "id_bucket_8");
 
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
-        drop(read);
     }
 
     #[test]
@@ -20780,8 +20708,8 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
@@ -22405,22 +22333,22 @@ mod tests {
         let read = provider.begin_read().expect("read metadata");
         assert!(
             env.state
-                .mv_repo
-                .load_by_id(read.as_ref(), mv_id)
+                .mv_repository
+                .load_by_id(mv_id)
                 .expect("load definition")
                 .is_none()
         );
         assert!(
             env.state
-                .mv_repo
-                .list_dependencies_by_downstream(read.as_ref(), mv_id)
+                .mv_repository
+                .list_dependencies_by_downstream(mv_id)
                 .expect("list dependencies")
                 .is_empty()
         );
         assert!(
             env.state
-                .mv_repo
-                .list_partition_states(read.as_ref(), mv_id)
+                .mv_repository
+                .list_partition_states(mv_id)
                 .expect("list partition states")
                 .is_empty()
         );
@@ -22458,8 +22386,12 @@ mod tests {
                 .expect("metadata provider");
             let read = provider.begin_read().expect("open read txn");
             env.state
-                .mv_repo
-                .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+                .mv_repository
+                .find_by_target(&MvTarget {
+                    catalog: Some("ice".to_string()),
+                    database: "analytics".to_string(),
+                    name: "mv_orders".to_string(),
+                })
                 .expect("find mv target")
                 .expect("mv definition")
                 .mv_id
@@ -22474,8 +22406,8 @@ mod tests {
                 .begin_write("begin active mv refresh")
                 .expect("write");
             env.state
-                .mv_repo
-                .begin_refresh_intent(txn.as_mut(), mv_id, std::collections::BTreeMap::new())
+                .mv_repository
+                .begin_refresh_intent(mv_id, std::collections::BTreeMap::new())
                 .expect("begin refresh");
             txn.commit().expect("commit refresh intent");
         }
@@ -22588,8 +22520,8 @@ mod tests {
         let read = provider.begin_read().expect("repository read");
         assert!(
             env.state
-                .mv_repo
-                .list_definitions(read.as_ref())
+                .mv_repository
+                .list_definitions()
                 .expect("definitions")
                 .is_empty(),
             "target creation fails before repository persistence"
@@ -22637,8 +22569,8 @@ mod tests {
         let read = provider.begin_read().expect("repository read");
         assert!(
             env.state
-                .mv_repo
-                .list_definitions(read.as_ref())
+                .mv_repository
+                .list_definitions()
                 .expect("definitions")
                 .is_empty(),
             "inspection fails before repository persistence"
@@ -22692,8 +22624,8 @@ mod tests {
         let read = provider.begin_read().expect("repository read");
         let dependencies = env
             .state
-            .mv_repo
-            .list_dependencies_by_downstream(read.as_ref(), definition.mv_id)
+            .mv_repository
+            .list_dependencies_by_downstream(definition.mv_id)
             .expect("repository dependencies");
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].upstream.display_name(), "ice.sales.orders");
@@ -22753,8 +22685,8 @@ mod tests {
         let read = sqlite.begin_read().expect("underlying repository read");
         assert!(
             env.state
-                .mv_repo
-                .list_definitions(read.as_ref())
+                .mv_repository
+                .list_definitions()
                 .expect("definitions")
                 .is_empty()
         );
@@ -22814,8 +22746,8 @@ mod tests {
         let read = sqlite.begin_read().expect("underlying repository read");
         let definitions = env
             .state
-            .mv_repo
-            .list_definitions(read.as_ref())
+            .mv_repository
+            .list_definitions()
             .expect("definitions");
         assert_eq!(
             definitions.len(),
@@ -22825,8 +22757,8 @@ mod tests {
         assert_eq!(definitions[0].target_table.as_deref(), Some("mv_orders"));
         assert_eq!(
             env.state
-                .mv_repo
-                .list_dependencies_by_downstream(read.as_ref(), definitions[0].mv_id)
+                .mv_repository
+                .list_dependencies_by_downstream(definitions[0].mv_id)
                 .expect("dependencies")
                 .len(),
             1
@@ -22891,15 +22823,19 @@ mod tests {
         let read = sqlite.begin_read().expect("underlying repository read");
         let definition = env
             .state
-            .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_orders".to_string(),
+            })
             .expect("definition lookup")
             .expect("committed definition");
         assert!(definition.schema_contract.is_some());
         assert_eq!(
             env.state
-                .mv_repo
-                .list_dependencies_by_downstream(read.as_ref(), definition.mv_id)
+                .mv_repository
+                .list_dependencies_by_downstream(definition.mv_id)
                 .expect("dependencies")
                 .len(),
             1
@@ -23077,33 +23013,30 @@ mod tests {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         create_base_table(&env.state, "ice", "analytics", "mv_orders");
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let mut txn = provider
-            .begin_write("seed iceberg mv without schema contract")
-            .expect("write txn");
         env.state
-            .mv_repo
-            .create_definition(
-                txn.as_mut(),
-                CreateMvDefinitionRequest {
-                    select_sql: "SELECT id, name FROM ice.sales.orders".to_string(),
-                    base_table_refs: vec!["ice.sales.orders".to_string()],
-                    primary_key_columns: Vec::new(),
-                    storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
-                    target_catalog: Some("ice".to_string()),
-                    target_namespace: Some("analytics".to_string()),
-                    target_table: Some("mv_orders".to_string()),
-                    schema_contract: None,
-                    partition_spec: None,
-                    created_at_ms: now_ms(),
+            .mv_repository
+            .create(
+                uuid::Uuid::new_v4(),
+                CreateMvRepositoryRequest {
+                    definition: CreateMvDefinitionRequest {
+                        select_sql: "SELECT id, name FROM ice.sales.orders".to_string(),
+                        base_table_refs: vec!["ice.sales.orders".to_string()],
+                        primary_key_columns: Vec::new(),
+                        storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
+                        target_catalog: Some("ice".to_string()),
+                        target_namespace: Some("analytics".to_string()),
+                        target_table: Some("mv_orders".to_string()),
+                        schema_contract: None,
+                        partition_spec: None,
+                        created_at_ms: now_ms(),
+                    },
+                    refresh: initial_refresh_configuration_for_create(
+                        &crate::mv::application::MvCreateRefreshPolicy::Manual,
+                    ),
+                    dependencies: Vec::new(),
                 },
             )
             .expect("create mv definition");
-        txn.commit().expect("commit mv definition");
 
         let stmt = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
         let target = crate::mv::model::MvTarget {
@@ -23256,8 +23189,8 @@ mod tests {
         let read = provider.begin_read().expect("read transaction");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
@@ -23265,8 +23198,8 @@ mod tests {
         assert_eq!(refresh.published_snapshot_id, None);
         let definition = env
             .state
-            .mv_repo
-            .load_by_id(read.as_ref(), mv.mv_id)
+            .mv_repository
+            .load_by_id(mv.mv_id)
             .expect("load definition")
             .expect("definition");
         assert_eq!(definition.active_refresh_id, None);
@@ -23398,8 +23331,8 @@ mod tests {
         let read = provider.begin_read().expect("read");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         let operation_id = refresh.operation_id.expect("operation id");
@@ -23699,8 +23632,8 @@ mod tests {
         let read = provider.begin_read().expect("read");
         let states = env
             .state
-            .mv_repo
-            .list_partition_states(read.as_ref(), mv.mv_id)
+            .mv_repository
+            .list_partition_states(mv.mv_id)
             .expect("list partition states");
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].partition_key, "spec=7;region=s:east");
@@ -23710,8 +23643,8 @@ mod tests {
         assert_eq!(states[0].base_snapshots["ice.sales.orders"], 20);
         let definition = env
             .state
-            .mv_repo
-            .load_by_id(read.as_ref(), mv.mv_id)
+            .mv_repository
+            .load_by_id(mv.mv_id)
             .expect("load definition")
             .expect("definition");
         assert!(definition.partition_state_complete);
@@ -23757,15 +23690,15 @@ mod tests {
         let read = provider.begin_read().expect("read");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::CommitUnknown);
         let mv_definition = env
             .state
-            .mv_repo
-            .load_by_id(read.as_ref(), mv.mv_id)
+            .mv_repository
+            .load_by_id(mv.mv_id)
             .expect("load mv")
             .expect("mv");
         assert_eq!(mv_definition.active_refresh_id, Some(refresh_id));
@@ -23883,15 +23816,15 @@ mod tests {
         let read = provider.begin_read().expect("read");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
         let definition = env
             .state
-            .mv_repo
-            .load_by_id(read.as_ref(), mv.mv_id)
+            .mv_repository
+            .load_by_id(mv.mv_id)
             .expect("load mv")
             .expect("mv");
         assert_eq!(definition.active_refresh_id, None);
@@ -23965,15 +23898,15 @@ mod tests {
         let read = provider.begin_read().expect("read");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::IntentCreated);
         let definition = env
             .state
-            .mv_repo
-            .load_by_id(read.as_ref(), mv.mv_id)
+            .mv_repository
+            .load_by_id(mv.mv_id)
             .expect("load mv")
             .expect("mv");
         assert_eq!(definition.active_refresh_id, Some(refresh_id));
@@ -24350,8 +24283,8 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let unfinished = env
             .state
-            .mv_repo
-            .list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())
+            .mv_repository
+            .list_unfinished_branch_staged_iceberg_refreshes()
             .expect("branch staged scan");
         assert!(unfinished.is_empty());
     }
@@ -24751,15 +24684,19 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
         let definition = env
             .state
-            .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_orders".to_string(),
+            })
             .expect("find mv")
             .expect("mv definition");
         assert_eq!(definition.active_refresh_id, None);
@@ -24871,16 +24808,20 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Finalized);
         assert_eq!(refresh.published_snapshot_id, Some(published_snapshot));
         let definition = env
             .state
-            .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_orders".to_string(),
+            })
             .expect("find mv")
             .expect("mv definition");
         assert_eq!(
@@ -24987,15 +24928,19 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
         let definition = env
             .state
-            .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_orders".to_string(),
+            })
             .expect("find mv")
             .expect("mv definition");
         assert_eq!(definition.active_refresh_id, None);
@@ -25088,8 +25033,8 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Finalized);
@@ -25204,8 +25149,8 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Finalized);
@@ -25254,15 +25199,19 @@ mod tests {
         let read = provider.begin_read().expect("read txn");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::CommitUnknown);
         let definition = env
             .state
-            .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_orders".to_string(),
+            })
             .expect("find mv")
             .expect("mv definition");
         assert_eq!(definition.active_refresh_id, Some(refresh_id));
@@ -25295,8 +25244,8 @@ mod tests {
             let read = provider.begin_read().expect("read");
             let unfinished = env
                 .state
-                .mv_repo
-                .list_unfinished_refreshes(read.as_ref())
+                .mv_repository
+                .list_unfinished_refreshes()
                 .expect("unfinished");
             assert_eq!(unfinished.len(), 1);
             (
@@ -25314,21 +25263,25 @@ mod tests {
         let read = provider.begin_read().expect("read");
         let refresh = env
             .state
-            .mv_repo
-            .load_refresh(read.as_ref(), refresh_id)
+            .mv_repository
+            .load_refresh(refresh_id)
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
         let unfinished = env
             .state
-            .mv_repo
-            .list_unfinished_refreshes(read.as_ref())
+            .mv_repository
+            .list_unfinished_refreshes()
             .expect("unfinished");
         assert!(unfinished.is_empty());
         let definition = env
             .state
-            .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .mv_repository
+            .find_by_target(&MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_orders".to_string(),
+            })
             .expect("find mv")
             .expect("mv definition");
         assert_eq!(definition.active_refresh_id, None);

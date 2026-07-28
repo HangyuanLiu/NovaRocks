@@ -23,8 +23,6 @@ use apache_avro::rabin::Rabin;
 use apache_avro::schema_compatibility::SchemaCompatibility;
 
 use crate::meta::repository::{RepositoryError, RepositoryResult};
-use crate::mv::persistence::definition::MV_DEFINITION_SUBJECT;
-use crate::mv::persistence::dependency::MV_DEPENDENCY_SUBJECT;
 
 static SCHEMA_CATALOG: LazyLock<Result<AvroSchemaCatalog, String>> = LazyLock::new(|| {
     AvroSchemaCatalog::from_sources(schema_sources()).map_err(|err| err.to_string())
@@ -260,41 +258,6 @@ fn schema_sources() -> &'static [SchemaSource] {
             subject: "starrocks.txn",
             id: 1,
             raw_schema: include_str!("schemas/starrocks.txn/0001.avsc"),
-        },
-        SchemaSource {
-            subject: MV_DEFINITION_SUBJECT,
-            id: 1,
-            raw_schema: include_str!("../../mv/persistence/schemas/mv.definition/0001.avsc"),
-        },
-        SchemaSource {
-            subject: MV_DEFINITION_SUBJECT,
-            id: 2,
-            raw_schema: include_str!("../../mv/persistence/schemas/mv.definition/0002.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.target_lookup",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.target_lookup/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.refresh",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.refresh/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.refresh",
-            id: 2,
-            raw_schema: include_str!("schemas/mv.refresh/0002.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.partition_state",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.partition_state/0001.avsc"),
-        },
-        SchemaSource {
-            subject: MV_DEPENDENCY_SUBJECT,
-            id: 1,
-            raw_schema: include_str!("../../mv/persistence/schemas/mv.dependency/0001.avsc"),
         },
         SchemaSource {
             subject: "test.evolution",

@@ -26,5 +26,5 @@ pub(crate) mod refresh;
 pub mod repository;
 pub(crate) mod rewrite;
 pub(crate) mod schema_validation;
-#[cfg(test)]
-pub(crate) mod test_legacy_repository_adapter;
+#[doc(hidden)]
+pub mod test_repository;

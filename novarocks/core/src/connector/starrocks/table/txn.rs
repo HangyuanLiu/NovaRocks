@@ -885,7 +885,7 @@ mod mixed_boundary_tests {
     };
     use crate::meta::repository::starrocks_txn::StarRocksTxnState;
     use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
-    use crate::mv::test_legacy_repository_adapter::{
+    use crate::mv::test_repository::{
         TestMvRepositoryFailurePoint, fail_next_mv_repository_command,
     };
 
@@ -906,7 +906,7 @@ mod mixed_boundary_tests {
         );
         let state = Arc::new(StandaloneState {
             metadata_provider: Some(Arc::clone(&provider)),
-            mv_repository: crate::engine::test_mv_repository(Arc::clone(&provider)),
+            mv_repository: crate::engine::test_mv_repository(),
             ..StandaloneState::default()
         });
         let mut write = provider

@@ -1563,9 +1563,7 @@ impl StateStoreMvRepository {
             .transpose()
     }
 
-    async fn list_unfinished_refreshes_async(
-        &self,
-    ) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+    async fn list_refreshes_async(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
         let mut refreshes = self
             .scan_prefix(refresh_prefix().map_err(corruption)?)
             .await?
@@ -1576,6 +1574,14 @@ impl StateStoreMvRepository {
                     .map_err(corruption)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        refreshes.sort_by_key(|refresh| refresh.refresh_id);
+        Ok(refreshes)
+    }
+
+    async fn list_unfinished_refreshes_async(
+        &self,
+    ) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        let mut refreshes = self.list_refreshes_async().await?;
         refreshes.retain(|refresh| {
             !matches!(
                 refresh.state,
@@ -2025,6 +2031,9 @@ impl MvRepository for StateStoreMvRepository {
     }
     fn load_refresh(&self, refresh_id: i64) -> Result<Option<StoredMvRefresh>, MvRepositoryError> {
         self.blocking(self.load_refresh_async(refresh_id))
+    }
+    fn list_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        self.blocking(self.list_refreshes_async())
     }
     fn list_unfinished_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
         self.blocking(self.list_unfinished_refreshes_async())

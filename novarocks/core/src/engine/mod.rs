@@ -49,9 +49,9 @@ use crate::connector::{
 use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
-use crate::meta::repository::job::JobMetaRepository;
-#[cfg(test)]
-use crate::meta::repository::mv::MvMetaRepository;
+use crate::meta::repository::job::{
+    IcebergOptimizeJobState, JobMetaRepository, StoredIcebergOptimizeJob,
+};
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 use crate::mv::application::{MvApplicationService, UnavailableMvApplicationService};
@@ -358,10 +358,6 @@ pub(crate) struct StandaloneState {
     pub(crate) mv_repository: Arc<dyn MvRepository>,
     /// Frontend-owned MV statement application boundary.
     pub(crate) mv_application_service: Arc<dyn MvApplicationService>,
-    /// Test-only characterization fixture. Production code has no legacy MV
-    /// repository handle; all production callers must use `mv_repository`.
-    #[cfg(test)]
-    pub(crate) mv_repo: MvMetaRepository,
     pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
@@ -402,8 +398,6 @@ impl Default for StandaloneState {
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repository: Arc::new(UnavailableMvRepository),
             mv_application_service: Arc::new(UnavailableMvApplicationService),
-            #[cfg(test)]
-            mv_repo: MvMetaRepository,
             catalog_attachment_repo: CatalogAttachmentRepository,
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
@@ -444,10 +438,8 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
 }
 
 #[cfg(test)]
-pub(crate) fn test_mv_repository(
-    provider: Arc<dyn crate::meta::MetaStoreProvider>,
-) -> Arc<dyn MvRepository> {
-    Arc::new(crate::mv::test_legacy_repository_adapter::LegacyMvRepositoryAdapter::new(provider))
+pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
+    Arc::new(crate::mv::test_repository::InMemoryMvRepository::default())
 }
 
 #[derive(Clone)]
@@ -603,15 +595,6 @@ impl StandaloneNovaRocks {
             .as_ref()
             .map(open_metadata_provider)
             .transpose()?;
-        #[cfg(test)]
-        let mv_repository = if mv_repository.availability().is_available() {
-            mv_repository
-        } else {
-            metadata_provider
-                .as_ref()
-                .map(|provider| test_mv_repository(Arc::clone(provider)))
-                .unwrap_or(mv_repository)
-        };
         let starrocks_table_config = match cfg.standalone_server.as_ref() {
             Some(standalone) => standalone
                 .starrocks_table_config()?
@@ -633,8 +616,6 @@ impl StandaloneNovaRocks {
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repository,
             mv_application_service,
-            #[cfg(test)]
-            mv_repo: MvMetaRepository,
             catalog_attachment_repo: CatalogAttachmentRepository,
             job_repo: JobMetaRepository,
             exchange_port,
@@ -4119,7 +4100,7 @@ mod tests {
     use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::meta::MetaStoreProvider;
     use crate::mv::application::UnavailableMvApplicationService;
-    use crate::mv::repository::UnavailableMvRepository;
+    use crate::mv::repository::{MvTarget, UnavailableMvRepository};
     use crate::runtime::query_options::QueryOptions;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -6554,8 +6535,12 @@ mysql_port = 47892
             assert!(
                 engine
                     .inner
-                    .mv_repo
-                    .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+                    .mv_repository
+                    .find_by_target(&MvTarget {
+                        catalog: Some("ice".to_string()),
+                        database: "analytics".to_string(),
+                        name: "mv_orders".to_string()
+                    })
                     .expect("find iceberg mv definition")
                     .is_some()
             );

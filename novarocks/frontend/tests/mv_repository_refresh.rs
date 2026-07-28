@@ -219,6 +219,71 @@ fn unfinished_refreshes_preserve_conflict_and_commit_unknown_guards() {
 }
 
 #[test]
+fn list_refreshes_pages_and_includes_finalized_and_aborted_records() {
+    let (_temp, _runtime, _host, repository) = limited_repository();
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_refresh_history"),
+        )
+        .expect("create definition");
+
+    let finalized = repository
+        .begin_refresh_intent(definition.mv_id, BTreeMap::new())
+        .expect("begin finalized refresh");
+    repository
+        .record_staging_commit(RecordStagingCommitRequest {
+            refresh_id: finalized.refresh_id,
+            staging_snapshot_id: 1,
+            rows: 1,
+            base_table_uuids: BTreeMap::new(),
+        })
+        .expect("stage refresh");
+    repository
+        .record_publish_commit(RecordPublishCommitRequest {
+            refresh_id: finalized.refresh_id,
+            published_snapshot_id: 1,
+        })
+        .expect("publish refresh");
+    repository
+        .finalize_refresh(MvRefreshFinalizeRequest {
+            refresh_id: finalized.refresh_id,
+            rows: 1,
+            base_snapshots: BTreeMap::new(),
+            base_table_uuids: BTreeMap::new(),
+            target_snapshot_id: Some(1),
+        })
+        .expect("finalize refresh");
+
+    let aborted = repository
+        .begin_refresh_intent(definition.mv_id, BTreeMap::new())
+        .expect("begin aborted refresh");
+    assert!(
+        repository
+            .clear_refresh_progress(definition.mv_id)
+            .expect("abort active refresh")
+    );
+
+    let unfinished = repository
+        .begin_refresh_intent(definition.mv_id, BTreeMap::new())
+        .expect("begin unfinished refresh");
+
+    assert_eq!(
+        repository
+            .list_refreshes()
+            .expect("list paged refresh history")
+            .into_iter()
+            .map(|refresh| (refresh.refresh_id, refresh.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (finalized.refresh_id, MvRefreshState::Finalized),
+            (aborted.refresh_id, MvRefreshState::Aborted),
+            (unfinished.refresh_id, MvRefreshState::IntentCreated),
+        ]
+    );
+}
+
+#[test]
 fn refresh_commands_return_not_found_for_missing_definition_and_refresh() {
     let (_temp, _runtime, _host, repository) = repository();
     assert_eq!(
