@@ -365,6 +365,8 @@ pub(crate) struct StandaloneState {
     >,
     /// Frontend-owned view application service, injected at engine open.
     pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
+    /// Frontend-owned statistics service, injected at engine open.
+    pub(crate) statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned system catalog (information_schema). Injected at open;
     /// defaults to a no-op. See `engine::system_catalog`.
     pub(crate) system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
@@ -393,6 +395,7 @@ impl Default for StandaloneState {
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
             view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
+            statistics_service: std::sync::Arc::new(statistics::EmptyStatisticsService),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
             #[cfg(test)]
             _test_guard: None,
@@ -4242,6 +4245,11 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
+    use crate::engine::statistics::{
+        CatalogColumnStatistics, CatalogTableStatistics, StatisticsEngine,
+        StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
+        StatisticsStatementResult,
+    };
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
@@ -4256,6 +4264,66 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct FixedCatalogStatisticsService {
+        tables: std::collections::HashMap<(String, String), CatalogTableStatistics>,
+    }
+
+    impl StatisticsService for FixedCatalogStatisticsService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _sql: &str,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<StatisticsStatementResult>, String> {
+            Ok(None)
+        }
+
+        fn try_query(
+            &self,
+            _sql: &str,
+            _query: &sqlparser::ast::Query,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<QueryResult>, String> {
+            Ok(None)
+        }
+
+        fn observe_query(
+            &self,
+            _query: &sqlparser::ast::Query,
+            _current_database: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_insert(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _observation: StatisticsInsertObservation<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_update(&self, _sql: &str, _current_database: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_table(&self, _database: &str, _table: &str) {}
+
+        fn drop_database(&self, _database: &str) {}
+
+        fn catalog_table_statistics(
+            &self,
+            database: &str,
+            table: &str,
+        ) -> Result<Option<CatalogTableStatistics>, String> {
+            Ok(self
+                .tables
+                .get(&(database.to_string(), table.to_string()))
+                .cloned())
+        }
+    }
 
     #[test]
     fn standalone_state_default_has_empty_system_catalog() {
@@ -5371,23 +5439,35 @@ mysql_port = 47892
                 &mut scalar_arena,
             )
             .expect("logical to opt expr");
-        let stats_state = Arc::new(super::StandaloneState::default());
-        super::statistics::replace_catalog_stats_for_test(
-            &stats_state,
-            "default",
-            "tbl",
-            &[("id", 100_000, "1", "100000", "100000")],
-        )
-        .expect("install tbl stats");
-        super::statistics::replace_catalog_stats_for_test(
-            &stats_state,
-            "default",
-            "date_dim",
-            &[("id", 100, "1", "100", "100")],
-        )
-        .expect("install date_dim stats");
-        let providers =
-            super::query_stats::QueryStatsProviders::from_standalone_state(&stats_state);
+        let service: Arc<dyn StatisticsService> = Arc::new(FixedCatalogStatisticsService {
+            tables: std::collections::HashMap::from([
+                (
+                    ("default".to_string(), "tbl".to_string()),
+                    CatalogTableStatistics {
+                        columns: vec![CatalogColumnStatistics {
+                            column_name: "id".to_string(),
+                            row_count: 100_000,
+                            min: "1".to_string(),
+                            max: "100000".to_string(),
+                            ndv: "100000".to_string(),
+                        }],
+                    },
+                ),
+                (
+                    ("default".to_string(), "date_dim".to_string()),
+                    CatalogTableStatistics {
+                        columns: vec![CatalogColumnStatistics {
+                            column_name: "id".to_string(),
+                            row_count: 100,
+                            min: "1".to_string(),
+                            max: "100".to_string(),
+                            ndv: "100".to_string(),
+                        }],
+                    },
+                ),
+            ]),
+        });
+        let providers = super::query_stats::QueryStatsProviders::from_parts(None, Some(service));
         let query_stats =
             super::query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
         let optimized_tree = crate::sql::optimizer::optimize(
