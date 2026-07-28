@@ -14,15 +14,20 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array,
     TimestampMicrosecondArray, new_null_array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use novarocks_spi::connector::{
+    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+};
 
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::RuntimeScanPredicateCounters;
@@ -248,6 +253,100 @@ pub struct HdfsScanConfig {
     /// column as Utf8 and encodes the strings to ids.
     pub query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
     pub iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
+}
+
+/// Provider-owned pull reader for file ranges. It deliberately has no core
+/// `ScanOp` dependency and returns Arrow batches to the SPI boundary.
+pub(crate) struct HdfsFileBatchReader {
+    cfg: HdfsScanConfig,
+    ranges: VecDeque<FileScanRange>,
+    current: Option<BoxedExecIter>,
+    context: ConnectorRequestContext,
+    max_rows: usize,
+    max_bytes: usize,
+    closed: bool,
+}
+
+impl HdfsFileBatchReader {
+    pub(crate) fn new(
+        mut cfg: HdfsScanConfig,
+        context: ConnectorRequestContext,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Self {
+        let ranges = std::mem::take(&mut cfg.ranges);
+        Self {
+            cfg,
+            ranges: VecDeque::from(ranges),
+            current: None,
+            context,
+            max_rows,
+            max_bytes,
+            closed: false,
+        }
+    }
+
+    fn validate_context(&self) -> Result<(), ConnectorError> {
+        if self.context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= self.context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ConnectorBatchReader for HdfsFileBatchReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        self.validate_context()?;
+        if self.closed {
+            return Ok(None);
+        }
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                match current.next() {
+                    Some(Ok(chunk)) => {
+                        let batch = chunk.batch;
+                        if batch.num_rows() > self.max_rows
+                            || batch.get_array_memory_size() > self.max_bytes
+                        {
+                            return Err(ConnectorError::new(
+                                ConnectorErrorKind::ResourceExhausted,
+                                "HDFS reader exceeded its batch budget",
+                            ));
+                        }
+                        return Ok(Some(batch));
+                    }
+                    Some(Err(error)) => {
+                        return Err(ConnectorError::new(ConnectorErrorKind::Internal, error));
+                    }
+                    None => self.current = None,
+                }
+            }
+            let Some(range) = self.ranges.pop_front() else {
+                self.closed = true;
+                return Ok(None);
+            };
+            self.current = Some(
+                build_hdfs_range_iter(&self.cfg, range, None, None)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?,
+            );
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.current = None;
+        self.ranges.clear();
+        self.closed = true;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
