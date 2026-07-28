@@ -27,5 +27,6 @@ mysql-state-store-provider = ["novarocks/mysql-state-store-provider"]
 [dev-dependencies]
 # E2E tests that spawn the `novarocks` binary and drive it over MySQL / HTTP.
 mysql = "25"
+novarocks-state-store = { path = "../novarocks/state-store" }
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

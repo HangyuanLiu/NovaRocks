@@ -89,12 +89,24 @@ where
         config,
         shutdown,
         |state_store| async move { FrontendApplicationHost::open(state_store).await },
-        |host| (
-            host.view_service(),
-            host.statistics_service(),
-            host.table_maintenance_service(),
+        |host| {
+            (
+                host.view_service(),
+                host.statistics_service(),
+                host.table_maintenance_service(),
+                host.mv_repository(),
+                host.mv_application_service(),
+            )
+        },
+        move |config,
+              (
+            view_service,
+            statistics_service,
+            table_maintenance_service,
+            mv_repository,
+            mv_application_service,
         ),
-        move |config, (view_service, statistics_service, table_maintenance_service), shutdown| async move {
+              shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
@@ -104,6 +116,8 @@ where
                 view_service,
                 statistics_service,
                 table_maintenance_service,
+                mv_repository,
+                mv_application_service,
                 shutdown,
             )
             .await
@@ -130,12 +144,24 @@ where
         config,
         signal,
         FrontendApplicationHost::open,
-        |host| (
-            host.view_service(),
-            host.statistics_service(),
-            host.table_maintenance_service(),
+        |host| {
+            (
+                host.view_service(),
+                host.statistics_service(),
+                host.table_maintenance_service(),
+                host.mv_repository(),
+                host.mv_application_service(),
+            )
+        },
+        move |config,
+              (
+            view_service,
+            statistics_service,
+            table_maintenance_service,
+            mv_repository,
+            mv_application_service,
         ),
-        move |config, (view_service, statistics_service, table_maintenance_service), shutdown| async move {
+              shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
                 config.config_path,
@@ -145,6 +171,8 @@ where
                 view_service,
                 statistics_service,
                 table_maintenance_service,
+                mv_repository,
+                mv_application_service,
                 shutdown,
             )
             .await

@@ -24,6 +24,11 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
+use novarocks_frontend::FrontendApplicationHost;
+use novarocks_state_store::{
+    StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
+    StateStoreProviderConfig,
+};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 
 static CLUSTER_MVP_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -132,7 +137,14 @@ impl ProcessGuard {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("stdout closed before readiness marker `{marker}`; stdout={stdout:?}");
+                    let status = self
+                        .child
+                        .try_wait()
+                        .expect("poll child after stdout close");
+                    panic!(
+                        "stdout closed before readiness marker `{marker}`; status={status:?}; stdout={stdout:?}; stderr={}",
+                        self.read_stderr()
+                    );
                 }
             }
             if Instant::now() >= deadline {
@@ -541,6 +553,39 @@ deployment_owner = "fe-1"
             state_store_path.display()
         );
         Self::start_n_be(3, "", &state_store_config)
+    }
+
+    fn start_three_be_sqlite_state_store_with_metadata(
+        state_store_path: &Path,
+        metadata_path: &Path,
+        cluster_id: &str,
+    ) -> Self {
+        assert!(
+            state_store_path.is_absolute(),
+            "SQLite StateStore path must be absolute: {}",
+            state_store_path.display()
+        );
+        assert!(
+            metadata_path.is_absolute(),
+            "SQLite metadata path must be absolute: {}",
+            metadata_path.display()
+        );
+        let fe_extra = format!(
+            r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "{cluster_id}"
+deployment_owner = "fe-1"
+"#,
+            metadata_path.display(),
+            state_store_path.display(),
+        );
+        Self::start_n_be(3, "", &fe_extra)
     }
 
     fn fe_mysql_port(&self) -> u16 {
@@ -1694,6 +1739,136 @@ path = "{}"
 
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_mv_state_store_restart() {
+    let _guard = lock_cluster_mvp();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-mv.sqlite");
+    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+        &state_store_path,
+        &metadata_path,
+        "mv-state-store-restart",
+    );
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MV warehouse");
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        "CREATE EXTERNAL CATALOG mv_restart_ice PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
+        warehouse.path().display(),
+    ))
+    .expect("create restart Iceberg catalog");
+    conn.query_drop("CREATE DATABASE mv_restart_ice.ns")
+        .expect("create restart namespace");
+    conn.query_drop("SET CATALOG mv_restart_ice")
+        .expect("use restart catalog");
+    conn.query_drop("USE ns").expect("use restart namespace");
+    conn.query_drop(
+        "CREATE TABLE orders (k1 INT, v2 BIGINT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+    )
+    .expect("create restart base table");
+    conn.query_drop("INSERT INTO orders VALUES (1, 10), (2, 20)")
+        .expect("seed restart base table");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 \
+         AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create first MV through frontend StateStore service");
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+        .expect("refresh first MV");
+    let rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
+        .expect("read first MV before FE restart");
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+    drop(conn);
+
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    assert!(
+        state_store_path.is_file(),
+        "MV StateStore persists across FE restart"
+    );
+    cluster.restart_fe();
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop("SET CATALOG mv_restart_ice")
+        .expect("restore restart catalog");
+    conn.query_drop("USE ns")
+        .expect("restore restart namespace");
+    let restored: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
+        .expect("read existing MV after FE restart");
+    assert_eq!(restored, vec![(1, 10), (2, 20)]);
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+        .expect("refresh existing MV after FE restart");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_mv_2 DISTRIBUTED BY HASH(k1) BUCKETS 2 \
+         AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create second MV after FE restart");
+    let rows: Vec<Row> = conn
+        .query("SHOW MATERIALIZED VIEWS FROM ns")
+        .expect("show MVs after restart");
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| row.get::<String, _>(0).expect("MV name column"))
+        .collect();
+    assert_eq!(names, vec!["orders_mv", "orders_mv_2"]);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build StateStore inspection runtime");
+    let host = runtime
+        .block_on(FrontendApplicationHost::open(Some(
+            sqlite_state_store_config(&state_store_path, "mv-state-store-restart"),
+        )))
+        .expect("reopen MV StateStore after clean FE shutdown");
+    let definitions = host
+        .mv_repository()
+        .list_definitions()
+        .expect("list MV definitions from StateStore");
+    let first_id = definitions
+        .iter()
+        .find(|definition| definition.target_table.as_deref() == Some("orders_mv"))
+        .map(|definition| definition.mv_id)
+        .expect("first MV definition persists");
+    let second_id = definitions
+        .iter()
+        .find(|definition| definition.target_table.as_deref() == Some("orders_mv_2"))
+        .map(|definition| definition.mv_id)
+        .expect("second MV definition persists");
+    assert!(
+        second_id > first_id,
+        "StateStore-backed MV IDs must increase across FE restart: first={first_id}, second={second_id}"
+    );
+    runtime
+        .block_on(host.shutdown())
+        .expect("inspection host shutdown");
+}
+
+fn sqlite_state_store_config(state_store_path: &Path, cluster_id: &str) -> StateStoreHostConfig {
+    StateStoreHostConfig {
+        state_store: StateStoreAppConfig {
+            store: StateStoreConfig {
+                cluster_id: cluster_id.to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Sqlite {
+                    path: state_store_path.to_owned(),
+                    deployment_owner: "fe-1".to_owned(),
+                },
+            },
+            mysql_client: None,
+        },
+        foundationdb_client: None,
+    }
 }
 
 #[cfg(unix)]

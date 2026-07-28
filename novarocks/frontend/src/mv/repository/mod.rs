@@ -90,10 +90,7 @@ impl StateStoreMvRepository {
         future: impl Future<Output = Result<T, MvRepositoryError>>,
     ) -> Result<T, MvRepositoryError> {
         if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::InvalidRequest,
-                "MV repository synchronous commands must not run on a Tokio runtime worker",
-            ));
+            return tokio::task::block_in_place(|| self.runtime.block_on(future));
         }
         self.runtime.block_on(future)
     }

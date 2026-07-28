@@ -470,6 +470,10 @@ pub(crate) fn render_cross_process_config(
         }
     }
 
+    if role == ClusterProcessRole::Be {
+        root.remove("state_store");
+    }
+
     toml::to_string(&value).context("serialize cross-process standalone config")
 }
 
@@ -1290,10 +1294,16 @@ mod tests {
         }
     }
 
-    static BASE_CONFIG: &str = r#"
+static BASE_CONFIG: &str = r#"
 [metadata]
 provider = "sqlite"
 path = "tmp/sql-tests.sqlite"
+
+[state_store]
+provider = "sqlite"
+cluster_id = "sql-tests-cross-process"
+path = "tmp/sql-tests-state-store.sqlite"
+deployment_owner = "fe-1"
 
 [standalone_server]
 mysql_port = 9030
@@ -1336,6 +1346,15 @@ exec_node_output = true
             Some("tmp/sql-tests.sqlite")
         );
         assert_eq!(
+            fe_value["state_store"]["path"].as_str(),
+            Some("tmp/sql-tests-state-store.sqlite")
+        );
+        assert_ne!(
+            fe_value["metadata"]["path"].as_str(),
+            fe_value["state_store"]["path"].as_str(),
+            "MV StateStore must not share the legacy metadata SQLite path"
+        );
+        assert_eq!(
             fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
@@ -1367,6 +1386,10 @@ exec_node_output = true
         assert_eq!(
             be_value["metadata"]["path"].as_str(),
             Some("tmp/sql-tests.sqlite")
+        );
+        assert!(
+            be_value.get("state_store").is_none(),
+            "BE rendering must not invent a separate MV StateStore"
         );
         assert_eq!(
             be_value["standalone_server"]["object_store"]["endpoint"].as_str(),

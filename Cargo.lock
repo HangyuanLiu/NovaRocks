@@ -3320,6 +3320,7 @@ dependencies = [
  "novarocks-backend",
  "novarocks-compat",
  "novarocks-frontend",
+ "novarocks-state-store",
  "reqwest",
  "tempfile",
  "tokio",
