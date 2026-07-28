@@ -264,16 +264,18 @@ impl FoundationDbRuntime {
         })();
         Box::pin(async move {
             let (opening, lease, request) = prepared?;
-            let store = FoundationDbStateStore::open(
-                lease,
-                request.limits,
-                request.cluster_id,
-                keyspace_id,
+            let deadline = Instant::from_std(request.deadline);
+            let store = timeout_at(
+                deadline,
+                FoundationDbStateStore::open(
+                    lease,
+                    request.limits,
+                    request.cluster_id,
+                    keyspace_id,
+                ),
             )
-            .await?;
-            if StdInstant::now() >= request.deadline {
-                return Err(shutdown_deadline_error());
-            }
+            .await
+            .map_err(|_| shutdown_deadline_error())??;
             drop(opening);
             Ok(Arc::new(store) as Arc<dyn StateStore>)
         })

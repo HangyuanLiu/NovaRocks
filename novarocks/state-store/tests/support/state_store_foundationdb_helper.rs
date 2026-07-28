@@ -552,10 +552,11 @@ impl HelperState {
         }
         self.store.take();
         if let Some(mut runtime) = self.runtime.take() {
-            runtime
+            let result = runtime
                 .shutdown(test_deadline())
                 .await
-                .map_err(display_error)?;
+                .map_err(display_error);
+            restore_runtime_after_shutdown(&mut self.runtime, runtime, result)?;
         }
         Ok(Response::success("Shutdown"))
     }
@@ -578,6 +579,20 @@ impl HelperState {
 
 fn test_deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+fn restore_runtime_after_shutdown<R>(
+    slot: &mut Option<R>,
+    runtime: R,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            *slot = Some(runtime);
+            Err(error)
+        }
+    }
 }
 
 fn client_config() -> FoundationDbClientConfig {
@@ -690,6 +705,21 @@ mod tests {
             helper_open_failure_error("open failed".to_owned(), Some("shutdown failed".to_owned())),
             "open failed; FoundationDB runtime shutdown after helper open failure also failed: shutdown failed"
         );
+    }
+
+    #[test]
+    fn failed_shutdown_restores_runtime_owner_for_retry() {
+        let mut slot = None;
+
+        let error = restore_runtime_after_shutdown(
+            &mut slot,
+            7_u8,
+            Err("injected shutdown failure".to_owned()),
+        )
+        .expect_err("shutdown failure must surface");
+
+        assert_eq!(error, "injected shutdown failure");
+        assert_eq!(slot, Some(7));
     }
 }
 
