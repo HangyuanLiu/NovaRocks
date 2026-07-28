@@ -49,8 +49,6 @@ use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::starmgr;
-#[cfg(test)]
-use crate::coordinator::report::CoordinatorExecStatusReportHandler;
 #[cfg(feature = "compat")]
 use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
@@ -182,6 +180,19 @@ impl std::fmt::Debug for GrpcService {
     }
 }
 
+#[cfg(test)]
+struct AcceptingTestNativeReportHandler;
+
+#[cfg(test)]
+impl NativeReportHandler for AcceptingTestNativeReportHandler {
+    fn handle_native_report(
+        &self,
+        _report: crate::proto::novarocks::ExecStatusReport,
+    ) -> Result<(), NativeReportHandlerError> {
+        Ok(())
+    }
+}
+
 impl GrpcService {
     pub fn with_fragment_execution(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
@@ -302,54 +313,6 @@ impl GrpcService {
             )))
         }
     }
-}
-
-#[cfg(test)]
-impl Default for GrpcService {
-    fn default() -> Self {
-        legacy_fragment_execution_service()
-    }
-}
-
-#[cfg(test)]
-impl GrpcService {
-    fn full_execution() -> Self {
-        legacy_fragment_execution_service()
-    }
-
-    fn report_only() -> Self {
-        legacy_report_ingress_service()
-    }
-
-    fn full_execution_with_report_handler(report_handler: Arc<dyn NativeReportHandler>) -> Self {
-        Self::with_fragment_execution(Arc::new(RejectingTestNativeFragmentIngress), report_handler)
-    }
-
-    fn report_only_with_report_handler(report_handler: Arc<dyn NativeReportHandler>) -> Self {
-        Self::report_ingress_only(report_handler)
-    }
-
-    fn full_execution_with_native_fragment_ingress(
-        native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
-    ) -> Self {
-        Self::with_fragment_execution(
-            native_fragment_ingress,
-            Arc::new(CoordinatorExecStatusReportHandler),
-        )
-    }
-}
-
-#[cfg(test)]
-fn legacy_fragment_execution_service() -> GrpcService {
-    GrpcService::with_fragment_execution(
-        Arc::new(RejectingTestNativeFragmentIngress),
-        Arc::new(CoordinatorExecStatusReportHandler),
-    )
-}
-
-#[cfg(test)]
-fn legacy_report_ingress_service() -> GrpcService {
-    GrpcService::report_ingress_only(Arc::new(CoordinatorExecStatusReportHandler))
 }
 
 #[cfg(test)]
@@ -508,7 +471,7 @@ impl IndependentGrpcRuntimeFilterNode {
                 let listener = TokioTcpListener::from_std(listener)
                     .expect("create independent runtime-filter Tokio listener");
                 let service = GrpcService::full_execution_with_runtime_filter_manager(
-                    Arc::new(CoordinatorExecStatusReportHandler),
+                    Arc::new(AcceptingTestNativeReportHandler),
                     service_manager,
                 )
                 .with_submit_fragment_entry_probe(submit_fragment_entry_probe);
@@ -2238,7 +2201,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn generated_server_rejects_legacy_instance_tag_before_handler_or_query_state() {
+    async fn generated_server_rejects_legacy_instance_tag_before_handler_or_runtime_state() {
         let node = IndependentGrpcRuntimeFilterNode::start().expect("start generated gRPC server");
         let query_id = QueryId { hi: 42, lo: 43 };
 
@@ -2533,7 +2496,7 @@ mod tests {
                 "127.0.0.1",
                 first_port,
                 super::rejecting_test_native_fragment_ingress(),
-                Arc::new(super::CoordinatorExecStatusReportHandler),
+                Arc::new(super::AcceptingTestNativeReportHandler),
             )
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -2550,7 +2513,7 @@ mod tests {
                 "127.0.0.1",
                 second_port,
                 super::rejecting_test_native_fragment_ingress(),
-                Arc::new(super::CoordinatorExecStatusReportHandler),
+                Arc::new(super::AcceptingTestNativeReportHandler),
             )
         });
         let second_deadline = std::time::Instant::now() + Duration::from_millis(100);
@@ -2691,7 +2654,6 @@ mod tests {
 
 #[cfg(test)]
 mod pr3_tests {
-    use super::GrpcService;
     use super::proto;
     use super::proto::common::{Status as ProtoStatus, UniqueId as ProtoUniqueId};
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
@@ -2702,6 +2664,9 @@ mod pr3_tests {
         IcebergFileContent, ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use super::proto::{novarocks, plan};
+    use super::{
+        AcceptingTestNativeReportHandler, GrpcService, rejecting_test_native_fragment_ingress,
+    };
     use crate::common::engine_error::EngineError;
     use crate::common::types::UniqueId;
     use crate::protocol::native::{
@@ -2763,6 +2728,13 @@ mod pr3_tests {
                 _ => Ok(()),
             }
         }
+    }
+
+    fn fragment_execution_service(report_handler: Arc<dyn NativeReportHandler>) -> GrpcService {
+        GrpcService::with_fragment_execution(
+            rejecting_test_native_fragment_ingress(),
+            report_handler,
+        )
     }
 
     struct RecordingEnvelopeIngress {
@@ -2981,15 +2953,6 @@ mod pr3_tests {
         report
     }
 
-    fn error_report(query: UniqueId, finst: UniqueId, message: &str) -> ExecStatusReport {
-        let mut report = ok_report(query, finst);
-        report.status = Some(ProtoStatus {
-            code: 1,
-            message: message.to_string(),
-        });
-        report
-    }
-
     #[tokio::test]
     async fn runtime_filter_envelope_full_execution_invokes_ingress_and_accepts() {
         let ingress = Arc::new(RecordingEnvelopeIngress::accepting());
@@ -3054,7 +3017,7 @@ mod pr3_tests {
         // producer ingress. An envelope for a query the global manager does not
         // know is a normal query-unavailable rejection, no longer the
         // "ingress is not configured" placeholder.
-        let response = GrpcService::full_execution()
+        let response = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler))
             .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
             .await
             .expect("query-unavailable rejection is a normal response")
@@ -3080,7 +3043,7 @@ mod pr3_tests {
         // report-only rejects at the local-execution gate before the query-scoped
         // ingress is consulted: the response is a gRPC error, not a normal
         // query-unavailable rejection response.
-        let error = GrpcService::report_only()
+        let error = GrpcService::report_ingress_only(Arc::new(AcceptingTestNativeReportHandler))
             .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
             .await
             .expect_err("report-only endpoint must reject local envelope ingress");
@@ -3164,7 +3127,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn exchange_unary_decode_error_returns_native_status_not_rpc_error() {
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let resp = svc
             .exchange_unary(Request::new(ExchangeRequest {
                 finst_id_hi: 11,
@@ -3191,7 +3154,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn submit_fragment_missing_native_payload_returns_business_error() {
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(SubmitFragmentRequest {
             plan: None,
             instance_params: None,
@@ -3209,7 +3172,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn submit_fragment_native_payload_validates_instance_params() {
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(SubmitFragmentRequest {
             plan: Some(plan::PlanFragment::default()),
             instance_params: Some(novarocks::InstanceParams::default()),
@@ -3226,7 +3189,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn submit_fragment_rejects_partial_native_payload() {
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(SubmitFragmentRequest {
             plan: Some(plan::PlanFragment::default()),
             instance_params: None,
@@ -3245,7 +3208,10 @@ mod pr3_tests {
     #[tokio::test]
     async fn submit_fragment_success_waits_for_injected_ingress_acceptance() {
         let ingress = Arc::new(GatedNativeFragmentIngress::new());
-        let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
+        let svc = GrpcService::with_fragment_execution(
+            ingress.clone(),
+            Arc::new(AcceptingTestNativeReportHandler),
+        );
         let query_id = QueryId {
             hi: 7_301,
             lo: 7_302,
@@ -3308,7 +3274,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_only_submit_fragment_is_rejected_before_payload_handling() {
-        let svc = GrpcService::report_only();
+        let svc = GrpcService::report_ingress_only(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(SubmitFragmentRequest {
             plan: None,
             instance_params: None,
@@ -3324,7 +3290,10 @@ mod pr3_tests {
     #[tokio::test]
     async fn cancel_fragment_is_idempotent() {
         let ingress = Arc::new(RecordingNativeFragmentIngress::default());
-        let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
+        let svc = GrpcService::with_fragment_execution(
+            ingress.clone(),
+            Arc::new(AcceptingTestNativeReportHandler),
+        );
         let req = Request::new(CancelFragmentRequest {
             finst_ids: vec![ProtoUniqueId { hi: 1, lo: 2 }],
             reason: "test".to_string(),
@@ -3356,7 +3325,9 @@ mod pr3_tests {
         use super::super::proto::common::UniqueId as ProtoUniqueId;
         use super::super::proto::novarocks::CancelFragmentRequest;
         use super::super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
-        use super::super::{CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService};
+        use super::super::{
+            AcceptingTestNativeReportHandler, CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService,
+        };
         use super::RecordingNativeFragmentIngress;
         use crate::common::types::UniqueId;
         use crate::runtime::exchange::{
@@ -3376,7 +3347,10 @@ mod pr3_tests {
         #[tokio::test]
         async fn cancel_with_mismatched_epoch_is_ignored() {
             let ingress = Arc::new(RecordingNativeFragmentIngress::default());
-            let svc = GrpcService::full_execution_with_native_fragment_ingress(ingress.clone());
+            let svc = GrpcService::with_fragment_execution(
+                ingress.clone(),
+                Arc::new(AcceptingTestNativeReportHandler),
+            );
             let finst = ProtoUniqueId { hi: 6201, lo: 6202 };
             let key = ExchangeKey {
                 finst_id_hi: finst.hi,
@@ -3420,7 +3394,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn heartbeat_returns_local_start_epoch_and_capacity() {
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let resp = svc
             .heartbeat(tonic::Request::new(HeartbeatRequest {
                 assigned_be_id: 7,
@@ -3436,7 +3410,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_exec_status_missing_report_returns_business_error() {
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(ReportExecStatusRequest { report: None });
         let resp = svc
             .report_exec_status(req)
@@ -3452,7 +3426,7 @@ mod pr3_tests {
     async fn report_exec_status_forwards_complete_report_to_injected_handler() {
         let report = write_report(id(901, 902), id(903, 904));
         let handler = Arc::new(CapturingReportHandler::accepting());
-        let svc = GrpcService::full_execution_with_report_handler(handler.clone());
+        let svc = fragment_execution_service(handler.clone());
 
         let body = svc
             .report_exec_status(Request::new(ReportExecStatusRequest {
@@ -3473,7 +3447,7 @@ mod pr3_tests {
         let first = ok_report(id(911, 912), id(913, 914));
         let second = write_report(id(921, 922), id(923, 924));
         let handler = Arc::new(CapturingReportHandler::accepting());
-        let svc = GrpcService::report_only_with_report_handler(handler.clone());
+        let svc = GrpcService::report_ingress_only(handler.clone());
 
         let body = svc
             .batch_report_exec_status(Request::new(BatchReportExecStatusRequest {
@@ -3495,7 +3469,7 @@ mod pr3_tests {
         let third = ok_report(id(971, 972), id(973, 974));
         let expected = EngineError::write_coordinator_gone(id(961, 962));
         let handler = Arc::new(CapturingReportHandler::failing_on_call(2, expected.clone()));
-        let svc = GrpcService::report_only_with_report_handler(handler.clone());
+        let svc = GrpcService::report_ingress_only(handler.clone());
 
         let body = svc
             .batch_report_exec_status(Request::new(BatchReportExecStatusRequest {
@@ -3517,7 +3491,7 @@ mod pr3_tests {
         let query_id = id(931, 932);
         let expected = EngineError::write_coordinator_gone(query_id);
         let handler = Arc::new(CapturingReportHandler::failing(expected.clone()));
-        let svc = GrpcService::full_execution_with_report_handler(handler.clone());
+        let svc = fragment_execution_service(handler.clone());
         let report = ok_report(query_id, id(933, 934));
 
         let body = svc
@@ -3537,7 +3511,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_only_report_exec_status_missing_report_reaches_report_handler() {
-        let svc = GrpcService::report_only();
+        let svc = GrpcService::report_ingress_only(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(ReportExecStatusRequest { report: None });
         let resp = svc
             .report_exec_status(req)
@@ -3550,234 +3524,8 @@ mod pr3_tests {
     }
 
     #[tokio::test]
-    async fn report_exec_status_updates_registered_write_coordinator() {
-        let mut guard = crate::coordinator::write::write_registry_test_guard();
-        let query = id(701, 801);
-        let finst = id(702, 802);
-        guard
-            .register_query(
-                query,
-                vec![crate::query_execution::write::WriterKey {
-                    query_id: query,
-                    fragment_instance_id: finst,
-                    backend_num: 0,
-                }],
-            )
-            .expect("register write coordinator");
-        let report = ok_report(query, finst);
-        let svc = GrpcService::default();
-        let req = Request::new(ReportExecStatusRequest {
-            report: Some(report),
-        });
-        let resp = svc
-            .report_exec_status(req)
-            .await
-            .expect("RPC level success");
-        let body = resp.into_inner();
-        assert_eq!(body.status_code, 0, "{}", body.message);
-        assert_eq!(body.error_code, "");
-    }
-
-    #[tokio::test]
-    async fn report_exec_status_ignores_non_writer_ok_for_registered_write_query() {
-        let mut guard = crate::coordinator::write::write_registry_test_guard();
-        let query = id(711, 811);
-        let writer_finst = id(712, 812);
-        let ordinary_finst = id(713, 813);
-        let coord = guard
-            .register_query(
-                query,
-                vec![crate::query_execution::write::WriterKey {
-                    query_id: query,
-                    fragment_instance_id: writer_finst,
-                    backend_num: 0,
-                }],
-            )
-            .expect("register write coordinator");
-        let report = ok_report(query.clone(), ordinary_finst);
-        let svc = GrpcService::default();
-        let req = Request::new(ReportExecStatusRequest {
-            report: Some(report),
-        });
-        let resp = svc
-            .report_exec_status(req)
-            .await
-            .expect("RPC level success");
-        let body = resp.into_inner();
-        assert_eq!(body.status_code, 0, "{}", body.message);
-        assert_eq!(body.error_code, "");
-        assert!(
-            !coord.lock().expect("write coordinator lock").has_failed(),
-            "ordinary OK fragment reports must not fail the write coordinator"
-        );
-
-        let req = Request::new(ReportExecStatusRequest {
-            report: Some(ok_report(query, writer_finst)),
-        });
-        let resp = svc
-            .report_exec_status(req)
-            .await
-            .expect("RPC level success");
-        let body = resp.into_inner();
-        assert_eq!(body.status_code, 0, "{}", body.message);
-        assert_eq!(body.error_code, "");
-        coord
-            .lock()
-            .expect("write coordinator lock")
-            .commit_input()
-            .expect("writer report should still commit");
-    }
-
-    #[tokio::test]
-    async fn report_exec_status_rejects_unknown_writer_with_write_metadata() {
-        let mut guard = crate::coordinator::write::write_registry_test_guard();
-        let query = id(714, 814);
-        let writer_finst = id(715, 815);
-        let unknown_writer_finst = id(716, 816);
-        let coord = guard
-            .register_query(
-                query,
-                vec![crate::query_execution::write::WriterKey {
-                    query_id: query,
-                    fragment_instance_id: writer_finst,
-                    backend_num: 0,
-                }],
-            )
-            .expect("register write coordinator");
-        let report = write_report(query, unknown_writer_finst);
-        let svc = GrpcService::default();
-        let req = Request::new(ReportExecStatusRequest {
-            report: Some(report),
-        });
-        let resp = svc
-            .report_exec_status(req)
-            .await
-            .expect("RPC level success");
-        let body = resp.into_inner();
-        assert_ne!(body.status_code, 0);
-        assert_eq!(body.error_code, "DistributedWriteOutputMismatch");
-        assert!(
-            body.message.contains("unknown writer"),
-            "unexpected message: {}",
-            body.message
-        );
-        assert!(
-            coord.lock().expect("write coordinator lock").has_failed(),
-            "unknown writer commit metadata must fail the registered write query"
-        );
-    }
-
-    #[tokio::test]
-    async fn report_exec_status_non_writer_error_fails_registered_write_query() {
-        let mut guard = crate::coordinator::write::write_registry_test_guard();
-        let query = id(721, 821);
-        let writer_finst = id(722, 822);
-        let ordinary_finst = id(723, 823);
-        let coord = guard
-            .register_query(
-                query,
-                vec![crate::query_execution::write::WriterKey {
-                    query_id: query,
-                    fragment_instance_id: writer_finst,
-                    backend_num: 0,
-                }],
-            )
-            .expect("register write coordinator");
-        let message = "remote non-writer fragment failed";
-        let report = error_report(query, ordinary_finst, message);
-        let svc = GrpcService::default();
-        let req = Request::new(ReportExecStatusRequest {
-            report: Some(report),
-        });
-        let resp = svc
-            .report_exec_status(req)
-            .await
-            .expect("RPC level success");
-        let body = resp.into_inner();
-        assert_eq!(body.status_code, 0, "{}", body.message);
-        assert_eq!(body.error_code, "");
-        let abort = coord
-            .lock()
-            .expect("write coordinator lock")
-            .abort_input()
-            .expect("non-writer failure should abort the write query");
-        assert!(abort.reason.contains(message), "{}", abort.reason);
-    }
-
-    #[tokio::test]
-    async fn report_exec_status_query_gone_returns_terminal_code() {
-        let _guard = crate::coordinator::write::write_registry_test_guard();
-        let query = id(801, 901);
-        let finst = id(802, 902);
-        let report = write_report(query, finst);
-        let svc = GrpcService::default();
-        let req = Request::new(ReportExecStatusRequest {
-            report: Some(report),
-        });
-
-        let resp = svc
-            .report_exec_status(req)
-            .await
-            .expect("RPC level success");
-        let body = resp.into_inner();
-
-        assert_eq!(
-            body.status_code,
-            crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
-            "{}",
-            body.message
-        );
-        assert_eq!(body.error_code, "WriteCoordinatorGone");
-        assert!(body.message.contains("not found"), "{}", body.message);
-    }
-
-    #[tokio::test]
-    async fn report_exec_status_error_without_write_coordinator_marks_query_failed() {
-        use crate::common::types::UniqueId;
-        use crate::runtime::query_context::{QueryId, query_context_manager};
-        use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
-
-        let _guard = crate::coordinator::write::write_registry_test_guard();
-        let query = id(811, 911);
-        let finst = id(812, 912);
-        let query_id = QueryId {
-            hi: query.hi,
-            lo: query.lo,
-        };
-        let finst_id = UniqueId {
-            hi: finst.hi,
-            lo: finst.lo,
-        };
-        let message = "remote fragment failed before exchange eos";
-
-        result_buffer::create_sender(finst_id);
-        query_context_manager().register_finst(finst_id, query_id);
-
-        let report = error_report(query, finst, message);
-        let svc = GrpcService::default();
-        let req = Request::new(ReportExecStatusRequest {
-            report: Some(report),
-        });
-        let resp = svc
-            .report_exec_status(req)
-            .await
-            .expect("RPC level success");
-        let body = resp.into_inner();
-        assert_eq!(body.status_code, 0, "{}", body.message);
-        assert_eq!(body.error_code, "");
-
-        let TryFetchResult::Error(err) = result_buffer::try_fetch(finst_id) else {
-            panic!("remote fragment error must close the root result buffer");
-        };
-        assert!(matches!(err.kind, FetchErrorKind::Failed));
-        assert!(err.message.contains(message), "{}", err.message);
-
-        query_context_manager().unregister_finst(finst_id);
-    }
-
-    #[tokio::test]
     async fn fetch_result_missing_finst_id_returns_error_status() {
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(FetchResultRequest {
             finst_id: None,
             max_wait_ms: 0,
@@ -3806,7 +3554,7 @@ mod pr3_tests {
         let finst_id = UniqueId { hi: 8801, lo: 8802 };
         create_typed_sender(finst_id);
 
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(FetchResultRequest {
             finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
@@ -3840,7 +3588,7 @@ mod pr3_tests {
             insert_typed(finst_id, vec![1, 2, 3, 4]).expect("insert typed payload");
         });
 
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(FetchResultRequest {
             finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
@@ -3869,7 +3617,7 @@ mod pr3_tests {
         create_typed_sender(finst_id);
         insert_typed(finst_id, vec![1, 2, 3, 4]).expect("insert typed payload");
 
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(FetchResultRequest {
             finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
@@ -3895,7 +3643,7 @@ mod pr3_tests {
         create_typed_sender(finst_id);
         close_error(finst_id, "boom".to_string());
 
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(FetchResultRequest {
             finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,
@@ -3928,7 +3676,7 @@ mod pr3_tests {
         create_typed_sender(finst_id);
         close_ok(finst_id);
 
-        let svc = GrpcService::default();
+        let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(FetchResultRequest {
             finst_id: Some(ProtoUniqueId {
                 hi: finst_id.hi,

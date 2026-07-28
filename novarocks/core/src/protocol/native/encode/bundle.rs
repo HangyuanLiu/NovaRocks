@@ -112,36 +112,6 @@ fn fragment_set_error(
 }
 
 #[cfg(test)]
-pub(crate) enum NativeBundleTestDrift {
-    Missing(FragmentId),
-    Unknown(FragmentId),
-}
-
-/// Corrupts an already production-encoded bundle for coordinator rejection tests.
-/// This deliberately cannot construct an arbitrary second bundle truth.
-#[cfg(test)]
-pub(crate) fn corrupt_native_fragment_bundle_for_execution_test(
-    mut bundle: NativeFragmentBundle,
-    drift: NativeBundleTestDrift,
-) -> NativeFragmentBundle {
-    match drift {
-        NativeBundleTestDrift::Missing(fragment_id) => {
-            bundle.by_fragment.remove(&fragment_id);
-        }
-        NativeBundleTestDrift::Unknown(fragment_id) => {
-            bundle.by_fragment.insert(
-                fragment_id,
-                NativePlanFragment {
-                    fragment_id,
-                    ..Default::default()
-                },
-            );
-        }
-    }
-    bundle
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

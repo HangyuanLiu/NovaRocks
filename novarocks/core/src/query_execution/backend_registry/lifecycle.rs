@@ -96,7 +96,7 @@ where
                     return;
                 }
                 let events = run_heartbeat_round(&registry, &send);
-                let (revision, live) = registry.live_query_snapshot();
+                let (revision, live) = registry.live_backend_generation_snapshot();
                 dispatch_live_backends(sink.as_ref(), revision, live);
                 for event in events {
                     dispatch_event(sink.as_ref(), event);
@@ -122,7 +122,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinator::cluster::{BackendState, HeartbeatOutcome, RegistryEvent};
+    use crate::query_execution::backend_registry::{BackendState, HeartbeatOutcome, RegistryEvent};
     use std::sync::Mutex;
 
     fn ep(port: u16) -> SocketAddr {

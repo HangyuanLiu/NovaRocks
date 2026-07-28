@@ -339,9 +339,24 @@ fn run_priority_worker(reporter: &'static StandaloneExecStateReporter) {
             handle_final_report_exhaustion_with(
                 task,
                 err,
-                crate::coordinator::report::mark_query_failed_from_report,
+                fail_local_query_after_report_exhaustion,
             );
         }
+    }
+}
+
+/// Stop only fragment/query resources owned by this backend after its final
+/// report cannot reach the frontend. Frontend query-wide failure ownership
+/// remains behind the report transport boundary.
+fn fail_local_query_after_report_exhaustion(query_id: QueryId, finst_id: UniqueId, error: String) {
+    let manager = crate::runtime::query_context::query_context_manager();
+    let mut local_finsts = manager.cancel_query(query_id, error.clone());
+    if !local_finsts.contains(&finst_id) {
+        local_finsts.push(finst_id);
+    }
+    for local_finst_id in local_finsts {
+        crate::runtime::result_buffer::close_error(local_finst_id, error.clone());
+        crate::runtime::exchange::cancel_fragment(local_finst_id.hi, local_finst_id.lo);
     }
 }
 

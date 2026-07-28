@@ -26,7 +26,6 @@ use arrow::datatypes::Field;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::contract::{
@@ -38,6 +37,7 @@ use crate::query_execution::fragment_transport::{
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
 };
+use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::analysis::cte::CteId;
@@ -101,11 +101,6 @@ impl PreparedDistributedQuery {
             native_bundle: self.native_bundle,
             schedule,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_legacy_test_parts(self) -> (PreparedFragmentSet, NativeFragmentBundle) {
-        (self.prepared, self.native_bundle)
     }
 }
 
@@ -668,7 +663,7 @@ impl ExpectedOutputSchema {
             .into_iter()
             .map(FetchedQueryBatch::into_chunk)
             .collect();
-        let chunks = crate::coordinator::execution::align_fetch_chunks_to_output_columns(
+        let chunks = crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
             chunks,
             &self.output_columns,
         )
@@ -732,15 +727,15 @@ fn assemble_native_execution(
     schedule: SchedulingPlan,
     context: NativeSubmissionContext,
 ) -> Result<AssembledNativeExecution, DistributedQueryError> {
-    crate::coordinator::execution::validate_prepared_native_payloads(&prepared, &native_bundle)
+    crate::query_execution::assembly::validate_prepared_native_payloads(&prepared, &native_bundle)
         .map_err(contract_error)?;
-    crate::coordinator::execution::validate_artifact_fragment_sets(
+    crate::query_execution::assembly::validate_artifact_fragment_sets(
         &prepared,
         &native_bundle,
         &schedule,
     )
     .map_err(contract_error)?;
-    crate::coordinator::execution::validate_scheduling_placements(&schedule)
+    crate::query_execution::assembly::validate_scheduling_placements(&schedule)
         .map_err(contract_error)?;
 
     let prepared_ids = prepared.fragment_ids();
@@ -766,11 +761,12 @@ fn assemble_native_execution(
     };
 
     let edges = prepared.scheduling_view().edges().to_vec();
-    let stream_edge_by_source = crate::coordinator::execution::build_stream_edge_by_source(&edges);
+    let stream_edge_by_source =
+        crate::query_execution::assembly::build_stream_edge_by_source(&edges);
     let router_edges_by_source: BTreeMap<
         FragmentId,
         (i32, Vec<&crate::sql::planner::distributed::FragmentEdge>),
-    > = crate::coordinator::execution::group_router_edges_by_source(&edges)
+    > = crate::query_execution::assembly::group_router_edges_by_source(&edges)
         .into_iter()
         .map(|((source_fragment_id, router_group_id), branch_edges)| {
             (source_fragment_id, (router_group_id, branch_edges))
@@ -861,7 +857,7 @@ fn assemble_native_execution(
         let is_producer = stream_edge.is_some()
             || router_edges.is_some()
             || fragment.boundary_projection().cte_id().is_some();
-        crate::coordinator::execution::validate_fragment_output_kind(
+        crate::query_execution::assembly::validate_fragment_output_kind(
             fragment_id,
             is_root,
             is_writer,
@@ -869,7 +865,7 @@ fn assemble_native_execution(
             fragment.execution_role(),
         )
         .map_err(contract_error)?;
-        crate::coordinator::execution::ensure_native_fragment_sink_supported(
+        crate::query_execution::assembly::ensure_native_fragment_sink_supported(
             fragment_id,
             is_root,
             is_writer,
@@ -893,7 +889,7 @@ fn assemble_native_execution(
                 let mut native_fragment = template.clone();
                 if !is_root && !is_writer && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
-                        crate::coordinator::execution::
+                        crate::query_execution::assembly::
                             patch_native_iceberg_change_stream_router_sink(
                                 &mut native_fragment,
                                 fragment_id,
@@ -904,7 +900,7 @@ fn assemble_native_execution(
                             .map_err(contract_error)?;
                     } else if let Some(cte_id) = fragment.boundary_projection().cte_id() {
                         let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
-                        crate::coordinator::execution::patch_native_cte_multicast_sink(
+                        crate::query_execution::assembly::patch_native_cte_multicast_sink(
                             &mut native_fragment,
                             fragment_id,
                             cte_id,

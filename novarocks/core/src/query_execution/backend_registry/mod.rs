@@ -20,14 +20,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod lifecycle;
-#[cfg(test)]
-mod query_cleanup;
 
 #[cfg(not(test))]
 pub(crate) use lifecycle::{HeartbeatManagerHandle, spawn_heartbeat_manager};
 pub(crate) use lifecycle::{RegistryEventSink, run_heartbeat_round};
-#[cfg(test)]
-pub(crate) use query_cleanup::QueryCleanupSink;
 
 static GLOBAL_REGISTRY: OnceLock<Mutex<Option<Arc<BackendRegistry>>>> = OnceLock::new();
 
@@ -72,7 +68,7 @@ pub(crate) struct BackendEntry {
     pub(crate) last_err: Option<String>,
     pub(crate) version: String,
     pub(crate) num_cores: u32,
-    // Incremented by FE/all-in-one dispatchers when fragments are assigned.
+    // Incremented by dispatchers when fragments are assigned.
     pub(crate) scheduled_fragments: u64,
 }
 
@@ -288,7 +284,7 @@ impl BackendRegistry {
         )
     }
 
-    pub(crate) fn live_query_snapshot(&self) -> (u64, Vec<(BeId, SocketAddr, u64)>) {
+    pub(crate) fn live_backend_generation_snapshot(&self) -> (u64, Vec<(BeId, SocketAddr, u64)>) {
         let inner = self.inner.lock().unwrap();
         (
             inner.topology_revision,
@@ -379,7 +375,7 @@ impl BackendRegistry {
     }
 }
 
-/// Install the process registry for FE and all-in-one dispatch. Idempotent: first writer wins.
+/// Install the process-wide backend topology registry. Idempotent: first writer wins.
 pub(crate) fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
     let mut guard = global_registry_cell().lock().unwrap();
     if guard.is_none() {
@@ -389,7 +385,7 @@ pub(crate) fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
     false
 }
 
-/// The process registry, if installed by role=fe or all-in-one startup.
+/// The process-wide backend topology registry, when installed by the composition root.
 pub(crate) fn backend_registry() -> Option<Arc<BackendRegistry>> {
     global_registry_cell().lock().unwrap().clone()
 }
@@ -430,10 +426,9 @@ impl Drop for BackendRegistryTestGuard {
     }
 }
 
-/// Read/write surface the query data plane needs from cluster membership.
-/// FEH-2a: data-plane consumers depend on this trait instead of naming the
-/// concrete `BackendRegistry`. FEH-2b makes it `pub`, moves ownership into the
-/// frontend `ClusterBackendService`, and installs a frontend implementation.
+/// Read/write surface the query data plane needs from backend topology.
+///
+/// Consumers depend on this neutral view rather than the concrete registry.
 pub(crate) trait ClusterMembership: Send + Sync {
     /// Live backends as (dispatch index, endpoint). Empty when none live.
     fn live_endpoints(&self) -> Vec<(usize, SocketAddr)>;
@@ -441,9 +436,10 @@ pub(crate) trait ClusterMembership: Send + Sync {
     fn record_scheduled_fragment(&self, be_id: BeId);
 }
 
-/// Core adapter over the process registry. Stateless; reads the global lazily
-/// because the registry is installed after `StandaloneState` is built and again
-/// lazily by DDL. FEH-2b deletes this together with the registry global.
+/// Stateless adapter over the process registry.
+///
+/// It reads the registry lazily because the composition root can install the
+/// registry after consumers have been constructed.
 struct RegistryClusterMembership;
 
 impl ClusterMembership for RegistryClusterMembership {
@@ -465,10 +461,10 @@ impl ClusterMembership for RegistryClusterMembership {
     }
 }
 
-/// Sole data-plane entry point for cluster membership. In FEH-2a the value is
-/// derived from the registry global, so `Some`/`None` mirrors `backend_registry()`
-/// exactly and every existing fallback branch is preserved. Only tests override
-/// it; FEH-2b adds a production install point that takes precedence here.
+/// Sole data-plane entry point for backend topology.
+///
+/// The production value is derived from the process registry. Tests may
+/// override it with a role-neutral fake.
 pub(crate) fn cluster_membership() -> Option<Arc<dyn ClusterMembership>> {
     #[cfg(test)]
     if let Some(installed) = test_membership_cell().lock().unwrap().clone() {

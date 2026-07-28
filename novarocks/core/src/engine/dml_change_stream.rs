@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::StandaloneState;
+use crate::query_execution::outcome::QueryExecutionResult;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -46,7 +46,7 @@ pub(crate) struct DmlPreExpandKeyedAssert {
 
 #[derive(Debug)]
 pub(crate) struct DmlChangeStreamWriteExecution {
-    pub(crate) result: CoordinatedQueryResult,
+    pub(crate) result: QueryExecutionResult,
     pub(crate) commit_plan:
         crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
 }
@@ -313,7 +313,7 @@ pub(crate) fn plan_dml_change_stream_write(
 }
 
 fn dml_change_stream_write_execution(
-    result: CoordinatedQueryResult,
+    result: QueryExecutionResult,
     commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
 ) -> Result<DmlChangeStreamWriteExecution, String> {
     if let Some(abort) = result.write_abort.as_ref() {

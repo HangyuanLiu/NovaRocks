@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan;
 use crate::connector::iceberg::commit::{CleanupAttempt, CommitOutcome, CommitServiceError};
-use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::StandaloneState;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
 };
+use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::optimizer::OptimizedOperatorNode;
@@ -57,7 +57,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
+    ) -> Result<QueryExecutionResult, String> {
         let mut build_input = self
             .build_input
             .lock()

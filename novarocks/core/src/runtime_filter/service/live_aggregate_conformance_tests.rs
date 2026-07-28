@@ -26,13 +26,13 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::operators::{AggregateFinalDomainSessionBuilder, AggregateProcessorFactory};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::query_execution::backend_registry::LiveBackendSnapshot;
+use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::deployment::{RuntimeFilterDeploymentPolicy, compiler};

@@ -16,7 +16,9 @@
 // under the License.
 
 pub mod artifact;
+pub(crate) mod assembly;
 pub mod backend;
+pub(crate) mod backend_registry;
 pub mod cancellation;
 pub mod contract;
 #[cfg(feature = "query-execution-contract-test-support")]
@@ -27,6 +29,7 @@ pub(crate) mod preparation;
 pub(crate) mod profile;
 pub mod report;
 mod runtime_filter;
+pub(crate) mod schedule;
 pub mod service;
 pub mod write;
 

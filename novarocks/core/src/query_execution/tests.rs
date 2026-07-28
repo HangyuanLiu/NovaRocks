@@ -406,7 +406,7 @@ fn write_outcome_preserves_commit_or_abort() {
         writers: Vec::new(),
     };
     let commit_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
-        .from_coordinated_result(crate::coordinator::execution::CoordinatedQueryResult {
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::build_string_query_result(
                 "status",
                 vec!["committed".to_string()],
@@ -432,7 +432,7 @@ fn write_outcome_preserves_commit_or_abort() {
         incomplete_writers: Vec::new(),
     };
     let abort_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
-        .from_coordinated_result(crate::coordinator::execution::CoordinatedQueryResult {
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: Some(abort.clone()),
@@ -451,7 +451,7 @@ fn write_outcome_preserves_commit_or_abort() {
 fn profile_outcome_preserves_fragment_profiles() {
     let profile = crate::runtime::profile::Profiler::new("fragment-7").to_native_tree();
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
-        .from_coordinated_result(crate::coordinator::execution::CoordinatedQueryResult {
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::build_string_query_result(
                 "status",
                 vec!["profiled".to_string()],
@@ -474,7 +474,7 @@ fn profile_outcome_preserves_fragment_profiles() {
 #[test]
 fn result_outcome_preserves_query_result() {
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Result)
-        .from_coordinated_result(crate::coordinator::execution::CoordinatedQueryResult {
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::build_string_query_result(
                 "value",
                 vec!["kept".to_string()],

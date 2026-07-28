@@ -24,8 +24,8 @@ use std::time::Instant;
 use arrow::datatypes::DataType;
 
 use crate::common::types::UniqueId;
-use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
+use crate::query_execution::backend_registry::LiveBackendSnapshot;
+use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
 use crate::runtime_filter::deployment::compiler;

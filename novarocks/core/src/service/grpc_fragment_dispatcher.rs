@@ -32,7 +32,6 @@ use std::time::Duration;
 #[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::ports::RuntimeFilterDeploymentControlPort;
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
@@ -135,9 +134,8 @@ impl GrpcRuntimeFilterDeploymentControl {
     }
 }
 
-#[async_trait::async_trait]
-impl RuntimeFilterDeploymentControlPort for GrpcRuntimeFilterDeploymentControl {
-    async fn install(
+impl GrpcRuntimeFilterDeploymentControl {
+    async fn install_native(
         &self,
         query_id: UniqueId,
         lifecycle: RuntimeFilterQueryLifecycleOptions,
@@ -173,7 +171,7 @@ impl RuntimeFilterDeploymentControlPort for GrpcRuntimeFilterDeploymentControl {
         )
     }
 
-    async fn abort(
+    async fn abort_native(
         &self,
         query_id: UniqueId,
         epoch: DeploymentEpoch,
@@ -228,16 +226,13 @@ impl crate::query_execution::artifact::RuntimeFilterDeploymentDispatcher
                 participant.get()
             ));
         }
-        crate::runtime::global_async_runtime::data_block_on(
-            <Self as RuntimeFilterDeploymentControlPort>::install(
-                self,
-                query_id,
-                lifecycle,
-                deadline,
-                participant,
-                install,
-            ),
-        )
+        crate::runtime::global_async_runtime::data_block_on(self.install_native(
+            query_id,
+            lifecycle,
+            deadline,
+            participant,
+            install,
+        ))
         .map_err(|error| format!("runtime filter install runtime failed: {error}"))?
     }
 
@@ -251,15 +246,12 @@ impl crate::query_execution::artifact::RuntimeFilterDeploymentDispatcher
     ) -> Result<(), String> {
         let participant = self.validate_transport_target(backend_idx, endpoint, participant_id)?;
         let (query_id, epoch) = envelope.into_native();
-        crate::runtime::global_async_runtime::data_block_on(
-            <Self as RuntimeFilterDeploymentControlPort>::abort(
-                self,
-                query_id,
-                epoch,
-                deadline,
-                participant,
-            ),
-        )
+        crate::runtime::global_async_runtime::data_block_on(self.abort_native(
+            query_id,
+            epoch,
+            deadline,
+            participant,
+        ))
         .map_err(|error| format!("runtime filter abort runtime failed: {error}"))?
     }
 }

@@ -1,0 +1,64 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Role-neutral values produced by a query execution scheduler.
+//!
+//! Scheduling policy belongs to the frontend. Core only consumes this sealed
+//! description while preparing protocol payloads and runtime-filter routes.
+
+use std::collections::BTreeMap;
+
+use crate::common::types::UniqueId;
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::scan_range::ScanRangeParams;
+use crate::sql::planner::distributed::FragmentId;
+
+/// Placement information for one fragment instance.
+#[derive(Clone, Debug)]
+pub(crate) struct FragmentInstancePlacement {
+    pub(crate) fragment_id: FragmentId,
+    pub(crate) instance_index: usize,
+    pub(crate) finst_id: UniqueId,
+    pub(crate) backend_idx: usize,
+    pub(crate) endpoint: RuntimeEndpoint,
+    pub(crate) scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
+    pub(crate) destinations: Vec<FragmentDestination>,
+    pub(crate) per_exch_num_senders: BTreeMap<i32, i32>,
+}
+
+/// A sealed, role-neutral scheduling result.
+#[derive(Clone, Debug)]
+pub(crate) struct SchedulingPlan {
+    pub(crate) root_fragment_id: FragmentId,
+    pub(crate) by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
+    pub(crate) root_finst_id: UniqueId,
+    pub(crate) root_backend_idx: usize,
+}
+
+impl SchedulingPlan {
+    pub(crate) fn fragment_ids(&self) -> impl ExactSizeIterator<Item = FragmentId> + '_ {
+        self.by_fragment.keys().copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn placements_for_fragment_for_test(
+        &self,
+        fragment_id: FragmentId,
+    ) -> Option<&[FragmentInstancePlacement]> {
+        self.by_fragment.get(&fragment_id).map(Vec::as_slice)
+    }
+}

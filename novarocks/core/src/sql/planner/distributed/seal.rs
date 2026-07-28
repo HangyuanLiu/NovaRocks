@@ -332,11 +332,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
-    use crate::coordinator::cluster::LiveBackendSnapshot;
-    use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::FragmentNodeId;
     use crate::exec::node::ExecNodeKind;
+    use crate::query_execution::backend_registry::LiveBackendSnapshot;
+    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::fragment::instance::{
         ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,

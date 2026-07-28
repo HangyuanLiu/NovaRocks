@@ -23,8 +23,10 @@ use crate::runtime::endpoint::RuntimeEndpoint;
 
 pub fn record_successful_fragment_submission(backend_idx: usize) {
     crate::service::metrics_http::observe_fragment_scheduled();
-    if let Some(membership) = crate::coordinator::cluster::cluster_membership() {
-        membership.record_scheduled_fragment(backend_idx as crate::coordinator::cluster::BeId);
+    if let Some(membership) = crate::query_execution::backend_registry::cluster_membership() {
+        membership.record_scheduled_fragment(
+            backend_idx as crate::query_execution::backend_registry::BeId,
+        );
     }
 }
 

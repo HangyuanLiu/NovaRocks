@@ -33,7 +33,6 @@ pub mod fragment_control;
 #[cfg(feature = "compat")]
 pub mod frontend_rpc;
 pub mod grpc_client;
-pub(crate) mod grpc_coordinator_adapter;
 pub(crate) mod grpc_fragment_dispatcher;
 pub(crate) mod grpc_runtime_filter_adapter;
 pub(crate) mod grpc_runtime_filter_install_adapter;

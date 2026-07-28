@@ -1521,7 +1521,7 @@ mod tests {
             },
         )
         .expect("plan native Iceberg scan range");
-        let placement = crate::coordinator::scheduler::FragmentInstancePlacement {
+        let placement = crate::query_execution::schedule::FragmentInstancePlacement {
             fragment_id: 0,
             instance_index: 0,
             finst_id: crate::common::types::UniqueId { hi: 11, lo: 12 },

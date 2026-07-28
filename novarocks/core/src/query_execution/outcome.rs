@@ -17,13 +17,22 @@
 
 //! Intent-bound completion capability.
 
-use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_result::QueryResult;
+
+/// Role-neutral execution data assembled by core engine flows before intent
+/// validation seals the public distributed-query outcome.
+#[derive(Debug)]
+pub(crate) struct QueryExecutionResult {
+    pub(crate) query_result: QueryResult,
+    pub(crate) write_commit: Option<WriteCommitInput>,
+    pub(crate) write_abort: Option<WriteAbortInput>,
+    pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
+}
 
 pub enum DistributedQueryOutcome {
     Result(ResultExecutionOutcome),
@@ -157,11 +166,11 @@ impl QueryOutcomeFactory {
         }))
     }
 
-    pub(crate) fn from_coordinated_result(
+    pub(crate) fn from_execution_result(
         self,
-        result: CoordinatedQueryResult,
+        result: QueryExecutionResult,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let CoordinatedQueryResult {
+        let QueryExecutionResult {
             query_result,
             write_commit,
             write_abort,

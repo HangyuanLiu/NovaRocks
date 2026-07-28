@@ -25,16 +25,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::ports::RuntimeFilterDeploymentPolicyProvider;
-use crate::coordinator::scheduler::SchedulingPlan;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+use crate::query_execution::backend_registry::LiveBackendSnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, QueryId, RuntimeFilterLifecycleView,
 };
+use crate::query_execution::schedule::SchedulingPlan;
+use crate::runtime_filter::deployment::{
+    RuntimeFilterDeploymentPolicy, RuntimeFilterQueryDeploymentPolicy,
+    RuntimeFilterQueryTransportPolicy,
+};
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
+use crate::runtime_filter::port::install::{
+    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
+};
 use crate::sql::planner::distributed::{FragmentEdge, JoinBuildProgressCatalog};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
@@ -43,6 +48,90 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+}
+
+const BLOOM_BITS_PER_KEY: u64 = 8;
+const BLOOM_HASH_COUNT: u32 = 5;
+const BLOOM_SEED: u64 = 17;
+const BLOOM_ALGORITHM_VERSION: u16 = 1;
+const TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_PENDING_ENTRIES: usize = 1 << 16;
+const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+
+fn derive_deployment_policy(
+    graph: &RuntimeFilterGraph,
+    backends: &LiveBackendSnapshot,
+    runtime_worker_count: usize,
+) -> Result<RuntimeFilterQueryDeploymentPolicy, String> {
+    if runtime_worker_count == 0 {
+        return Err("runtime filter deployment worker count must be nonzero".to_string());
+    }
+    if backends.entries().is_empty() {
+        return Err("runtime filter deployment requires at least one live backend".to_string());
+    }
+    let replica_redundancy = u32::try_from(backends.entries().len()).map_err(|_| {
+        "runtime filter live backend count exceeds replica-redundancy width".to_string()
+    })?;
+
+    let mut channel_count = 0usize;
+    let mut total_artifact_bytes = 0u64;
+    let mut max_artifact_bytes = 0u64;
+    let mut minimum_deadline_ms = u64::MAX;
+    let mut minimum_max_retries = u32::MAX;
+    for channel in graph.channels() {
+        channel_count = channel_count
+            .checked_add(1)
+            .ok_or_else(|| "runtime filter channel count overflow".to_string())?;
+        let channel_policy = channel.policy;
+        if channel_policy.max_contribution_bytes == 0
+            || channel_policy.max_artifact_bytes == 0
+            || channel_policy.deadline_ms == 0
+        {
+            return Err(format!(
+                "runtime filter channel {} has a zero resource or deadline limit",
+                channel.channel_id.get()
+            ));
+        }
+        total_artifact_bytes = total_artifact_bytes
+            .checked_add(channel_policy.max_artifact_bytes)
+            .ok_or_else(|| "runtime filter artifact budget overflow".to_string())?;
+        max_artifact_bytes = max_artifact_bytes.max(channel_policy.max_artifact_bytes);
+        minimum_deadline_ms = minimum_deadline_ms.min(channel_policy.deadline_ms);
+        minimum_max_retries = minimum_max_retries.min(channel_policy.max_retries);
+    }
+    if channel_count == 0 {
+        return Err("runtime filter deployment policy requires a nonempty graph".to_string());
+    }
+    let max_attempts = minimum_max_retries
+        .checked_add(1)
+        .ok_or_else(|| "runtime filter transport attempt count overflow".to_string())?;
+    let materialization = MaterializationPolicy::new(
+        BLOOM_BITS_PER_KEY,
+        BLOOM_HASH_COUNT,
+        BLOOM_SEED,
+        BLOOM_ALGORITHM_VERSION,
+        total_artifact_bytes,
+        max_artifact_bytes,
+        channel_count.min(runtime_worker_count),
+    )
+    .map_err(|error| format!("invalid runtime filter materialization policy: {error:?}"))?;
+    let deadline = Duration::from_millis(minimum_deadline_ms);
+
+    Ok(RuntimeFilterQueryDeploymentPolicy {
+        compiler: RuntimeFilterDeploymentPolicy {
+            core_budget: RuntimeFilterCoreBudget::new(total_artifact_bytes),
+            replica_redundancy,
+            materialization,
+        },
+        transport: RuntimeFilterQueryTransportPolicy {
+            retry_interval: TRANSPORT_RETRY_INTERVAL,
+            max_attempts,
+            deadline,
+            max_pending_entries: MAX_PENDING_ENTRIES,
+            max_pending_bytes: MAX_PENDING_BYTES,
+        },
+        install_rpc_deadline: deadline,
+    })
 }
 
 /// Frontend-owned, nonzero deployment epoch represented without exposing the
@@ -188,8 +277,8 @@ pub trait RuntimeFilterDeploymentDispatcher: Send + Sync + 'static {
 }
 
 /// Build the production gRPC transport adapter from one explicit immutable
-/// backend snapshot. The returned port preserves the same wire path in
-/// distributed and all-in-one deployments.
+/// backend snapshot. The returned port preserves the same wire path for every
+/// deployment topology.
 pub fn new_grpc_runtime_filter_deployment_dispatcher(
     backends: &[(usize, SocketAddr)],
 ) -> Result<Arc<dyn RuntimeFilterDeploymentDispatcher>, String> {
@@ -349,12 +438,7 @@ pub(crate) fn compile_install_plan(
     }
 
     let live_snapshot = LiveBackendSnapshot::new(live_backends);
-    let provider =
-        crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider::new(
-            runtime_worker_count,
-        );
-    let policy = provider
-        .policy_for(graph, &live_snapshot)
+    let policy = derive_deployment_policy(graph, &live_snapshot, runtime_worker_count)
         .map_err(|error| failed(format!("runtime filter deployment policy failed: {error}")))?;
     let core_epoch = epoch.into_core();
     let compiled = crate::runtime_filter::deployment::compiler::compile_with_join_progress(

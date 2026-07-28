@@ -31,13 +31,13 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::operation_lifecycle::{
     IcebergOperationFact, operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
-use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergOperationFactUpdate, IcebergOperationKind,
     IcebergOperationState, IcebergOperationTarget,
 };
+use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_result::QueryResult;
 
@@ -93,7 +93,7 @@ pub(crate) trait IcebergWriteTransactionExecutor {
     fn run_coordinated_write(
         &self,
         spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String>;
+    ) -> Result<QueryExecutionResult, String>;
 
     /// Commit the collected writer output through the typed commit service.
     fn commit(
@@ -500,7 +500,7 @@ mod tests {
     }
 
     struct FakeExecutor {
-        write: RefCell<Option<Result<CoordinatedQueryResult, String>>>,
+        write: RefCell<Option<Result<QueryExecutionResult, String>>>,
         commit: RefCell<Option<Result<CommitOutcome, CommitServiceError>>>,
         finalize: Result<(), String>,
     }
@@ -509,7 +509,7 @@ mod tests {
         fn run_coordinated_write(
             &self,
             _spec: &IcebergWriteTransactionSpec,
-        ) -> Result<CoordinatedQueryResult, String> {
+        ) -> Result<QueryExecutionResult, String> {
             self.write
                 .borrow_mut()
                 .take()
@@ -540,7 +540,7 @@ mod tests {
     fn successful_append_drives_operation_to_finalized() {
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
@@ -575,7 +575,7 @@ mod tests {
     fn writer_abort_records_failed_known_uncommitted() {
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: None,
                 write_abort: Some(one_writer_abort()),
@@ -632,7 +632,7 @@ mod tests {
         use crate::connector::iceberg::commit::CleanupAttempt;
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
@@ -671,7 +671,7 @@ mod tests {
         use crate::connector::iceberg::commit::RecoveryEvidence;
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
@@ -712,7 +712,7 @@ mod tests {
     fn finalize_failure_records_finalize_failed_known_committed() {
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
@@ -746,7 +746,7 @@ mod tests {
     fn empty_write_transitions_to_aborted_with_no_committed_outcome() {
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: None,
                 write_abort: None,
@@ -773,7 +773,7 @@ mod tests {
     fn runner_treats_writers_without_files_as_empty_write() {
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_writer_without_files()),
                 write_abort: None,
@@ -803,7 +803,7 @@ mod tests {
     fn runner_commits_fileless_non_fast_append_write_through_op_kind_gate() {
         let env = test_env();
         let exec = FakeExecutor {
-            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+            write: RefCell::new(Some(Ok(QueryExecutionResult {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_writer_without_files()),
                 write_abort: None,

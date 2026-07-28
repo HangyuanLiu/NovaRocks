@@ -2152,7 +2152,6 @@ mod tests {
 
     use crate::runtime::exchange::snapshot_receiver_state;
     use crate::runtime::query_context::query_context_manager;
-    use crate::runtime::query_state::in_flight_table;
     use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
@@ -2167,7 +2166,6 @@ mod tests {
         let manager = query_context_manager();
         assert!(manager.query_mem_tracker(query).is_none());
         assert!(manager.query_id_by_finst(finst).is_none());
-        assert!(in_flight_table().state(query).is_none());
         let TryFetchResult::Error(error) = result_buffer::try_fetch(finst) else {
             panic!("missing result buffer entry must return an error");
         };

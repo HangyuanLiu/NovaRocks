@@ -40,8 +40,6 @@ pub(crate) use projection::{
 pub(crate) use projection::{
     prepared_fragment_set_for_test, prepared_fragment_set_with_runtime_filter_for_test,
 };
-#[cfg(test)]
-pub(crate) use scan_preparation::build_iceberg_metadata_scan_range_params;
 use scan_preparation::prepare_scan_bindings;
 use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_roles};
 

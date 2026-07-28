@@ -389,7 +389,7 @@ pub(crate) struct StandaloneState {
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
     #[cfg(not(test))]
     pub(crate) backend_heartbeat_manager:
-        std::sync::Mutex<Option<crate::coordinator::cluster::HeartbeatManagerHandle>>,
+        std::sync::Mutex<Option<crate::query_execution::backend_registry::HeartbeatManagerHandle>>,
     #[cfg(test)]
     pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
@@ -422,7 +422,7 @@ impl Default for StandaloneState {
             ),
             self_weak: Weak::new(),
             system_catalog: std::sync::Arc::new(system_catalog::EmptySystemCatalog),
-            query_execution: legacy_test_query_execution_service(),
+            query_execution: test_query_execution_service(),
             backend_query_events: std::sync::Arc::new(
                 crate::query_execution::backend::NoopBackendQueryEventSink,
             ),
@@ -436,11 +436,24 @@ impl Default for StandaloneState {
 }
 
 #[cfg(test)]
-struct LegacyTestDistributedQueryCoordinator;
+struct TestDistributedQueryCoordinator;
+
+#[cfg(test)]
+struct TestNativeReportHandler;
+
+#[cfg(test)]
+impl crate::query_execution::report::NativeReportHandler for TestNativeReportHandler {
+    fn handle_native_report(
+        &self,
+        _report: crate::proto::novarocks::ExecStatusReport,
+    ) -> Result<(), crate::query_execution::report::NativeReportHandlerError> {
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 impl crate::query_execution::contract::DistributedQueryCoordinator
-    for LegacyTestDistributedQueryCoordinator
+    for TestDistributedQueryCoordinator
 {
     fn execute(
         &self,
@@ -450,47 +463,31 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
         crate::query_execution::contract::DistributedQueryError,
     > {
         let parts = request.into_parts();
-        let intent = parts.completion.intent();
-        let query_options = Some(parts.options.runtime_options().clone());
-        let (prepared, native_bundle) = parts.artifacts.into_legacy_test_parts();
-        let (execution_ports, scheduler) =
-            coordinated_execution_services_for_test().map_err(|message| {
-                crate::query_execution::contract::DistributedQueryError::new(
-                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                    message,
-                )
-            })?;
-        let coordinator = crate::coordinator::execution::ExecutionCoordinator::new(
-            prepared,
-            native_bundle,
-            execution_ports,
-            scheduler,
-            query_options,
-            parts.cancellation,
-        );
-        let result = match intent {
+        match parts.completion.intent() {
             crate::query_execution::contract::DistributedQueryIntent::Profile => {
-                coordinator.execute_with_profile_outcome()
+                parts.completion.profile(
+                    crate::runtime::query_result::QueryResult::empty(),
+                    crate::query_execution::outcome::FragmentProfileSet::new(Vec::new()),
+                )
             }
-            crate::query_execution::contract::DistributedQueryIntent::Result
-            | crate::query_execution::contract::DistributedQueryIntent::Write => {
-                coordinator.execute_with_write_outcome()
+            crate::query_execution::contract::DistributedQueryIntent::Result => parts
+                .completion
+                .result(crate::runtime::query_result::QueryResult::empty()),
+            crate::query_execution::contract::DistributedQueryIntent::Write => {
+                parts.completion.write(
+                    crate::runtime::query_result::QueryResult::empty(),
+                    None,
+                    None,
+                )
             }
         }
-        .map_err(|message| {
-            crate::query_execution::contract::DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                message,
-            )
-        })?;
-        parts.completion.from_coordinated_result(result)
     }
 }
 
 #[cfg(test)]
-fn legacy_test_query_execution_service() -> crate::query_execution::service::QueryExecutionService {
+fn test_query_execution_service() -> crate::query_execution::service::QueryExecutionService {
     crate::query_execution::service::QueryExecutionService::new(std::sync::Arc::new(
-        LegacyTestDistributedQueryCoordinator,
+        TestDistributedQueryCoordinator,
     ))
 }
 
@@ -593,7 +590,7 @@ impl StandaloneNovaRocks {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
         #[cfg(test)]
-        crate::coordinator::cluster::replace_backend_registry_for_test(None);
+        crate::query_execution::backend_registry::replace_backend_registry_for_test(None);
         match opts.config_path.as_deref() {
             Some(path) => {
                 novarocks_config::init_from_path(path)
@@ -631,7 +628,7 @@ impl StandaloneNovaRocks {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
         #[cfg(test)]
-        crate::coordinator::cluster::replace_backend_registry_for_test(None);
+        crate::query_execution::backend_registry::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
         return Self::open_body(opts, services, _test_guard);
@@ -2323,7 +2320,7 @@ fn ensure_mainline_distributed_execution(
 /// floor (never panics). NOT a standalone-specific branch: all-in-one is a
 /// test shell that registers one loopback BE; goldens pin SET to the real N.
 fn live_effective_backend_count() -> f64 {
-    if let Some(membership) = crate::coordinator::cluster::cluster_membership() {
+    if let Some(membership) = crate::query_execution::backend_registry::cluster_membership() {
         let entries = membership.live_endpoints();
         if !entries.is_empty() {
             return (entries.len() as f64).max(1.0);
@@ -2748,7 +2745,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<QueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
-) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -2910,7 +2907,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
     topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
-) -> Option<crate::coordinator::execution::CoordinatedQueryResult> {
+) -> Option<crate::query_execution::outcome::QueryExecutionResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
         .expect("change-stream write test observer lock");
@@ -2931,7 +2928,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
                 .collect(),
         });
     if observer.short_circuit_after_build {
-        Some(crate::coordinator::execution::CoordinatedQueryResult {
+        Some(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: None,
@@ -3005,7 +3002,7 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_opts: Option<QueryOptions>,
-) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     execute_distributed_write(
         &state.query_execution,
         prepared,
@@ -3024,7 +3021,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     query_opts: Option<QueryOptions>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
-) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write(
         state,
         current_catalog,
@@ -3498,7 +3495,7 @@ fn execute_distributed_write(
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
     cancellation: crate::query_execution::cancellation::QueryCancellationView,
-) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request(
         prepared,
         native_bundle,
@@ -3512,7 +3509,7 @@ fn execute_distributed_write(
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts)
         .map_err(|error| error.to_string())?;
-    Ok(crate::coordinator::execution::CoordinatedQueryResult {
+    Ok(crate::query_execution::outcome::QueryExecutionResult {
         query_result,
         write_commit,
         write_abort,
@@ -3526,7 +3523,7 @@ fn execute_distributed_profile(
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
     cancellation: crate::query_execution::cancellation::QueryCancellationView,
-) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request(
         prepared,
         native_bundle,
@@ -3540,7 +3537,7 @@ fn execute_distributed_profile(
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_profile)
         .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
         .map_err(|error| error.to_string())?;
-    Ok(crate::coordinator::execution::CoordinatedQueryResult {
+    Ok(crate::query_execution::outcome::QueryExecutionResult {
         query_result,
         write_commit: None,
         write_abort: None,
@@ -3549,46 +3546,9 @@ fn execute_distributed_profile(
 }
 
 #[cfg(test)]
-fn coordinated_execution_services_for_test() -> Result<
-    (
-        crate::coordinator::ports::CoordinatorExecutionPorts,
-        Arc<crate::coordinator::scheduler::FragmentScheduler>,
-    ),
-    String,
-> {
-    let entries = backend_ops::live_backend_dispatch_entries()?;
-    let snapshot = crate::coordinator::cluster::LiveBackendSnapshot::new(entries);
-    let runtime_filter_deployment_control = Arc::new(
-        crate::service::grpc_fragment_dispatcher::GrpcRuntimeFilterDeploymentControl::new(
-            snapshot.entries(),
-        )?,
-    );
-    let dispatcher = Arc::new(
-        crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-            snapshot.entries(),
-        )?,
-    );
-    let scheduler = Arc::new(
-        crate::coordinator::scheduler::FragmentScheduler::from_live_backend_snapshot(snapshot),
-    );
-    let report_endpoint = crate::service::grpc_coordinator_adapter::coordinator_report_endpoint()?;
-    let observer =
-        Arc::new(crate::service::grpc_coordinator_adapter::PrometheusCoordinatorObserver);
-    Ok((
-        crate::coordinator::ports::CoordinatorExecutionPorts::new(
-            dispatcher,
-            report_endpoint,
-            observer,
-            runtime_filter_deployment_control,
-        ),
-        scheduler,
-    ))
-}
-
-#[cfg(test)]
 pub(crate) struct StandaloneLoopbackTestBackend {
     pub(crate) exchange_port: u16,
-    _registry_guard: crate::coordinator::cluster::BackendRegistryTestGuard,
+    _registry_guard: crate::query_execution::backend_registry::BackendRegistryTestGuard,
     _test_guard: TestSerializationGuard,
 }
 
@@ -3596,11 +3556,9 @@ pub(crate) struct StandaloneLoopbackTestBackend {
 pub(crate) fn install_all_in_one_loopback_backend_for_test()
 -> Result<StandaloneLoopbackTestBackend, String> {
     let test_guard = acquire_standalone_test_guard();
-    let registry_guard = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+    let registry_guard = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
     let cfg = crate::novarocks_config::install_default_for_test();
-    let exchange_port = ensure_standalone_exchange_server(Arc::new(
-        crate::coordinator::report::CoordinatorExecStatusReportHandler,
-    ))?;
+    let exchange_port = ensure_standalone_exchange_server(Arc::new(TestNativeReportHandler))?;
     let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
         .parse()
         .map_err(|e| format!("parse all-in-one test loopback endpoint failed: {e}"))?;
@@ -4399,10 +4357,10 @@ mod tests {
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
             Arc::new(UnavailableMvRepository),
             Arc::new(UnavailableMvApplicationService),
-            super::legacy_test_query_execution_service(),
+            super::test_query_execution_service(),
             Arc::new(crate::query_execution::backend::NoopBackendQueryEventSink),
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
-            Arc::new(crate::coordinator::report::CoordinatorExecStatusReportHandler),
+            Arc::new(super::TestNativeReportHandler),
         )
     }
 
@@ -5738,7 +5696,7 @@ mysql_port = 47892
         let query = parse_query_for_engine_test("select 1");
         let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
-        let query_execution = super::legacy_test_query_execution_service();
+        let query_execution = super::test_query_execution_service();
 
         let err = super::execute_query_with_options(
             &query,
@@ -5767,7 +5725,7 @@ mysql_port = 47892
         let query = parse_query_for_engine_test("select 1");
         let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
-        let query_execution = super::legacy_test_query_execution_service();
+        let query_execution = super::test_query_execution_service();
 
         let result = super::execute_query_with_options(
             &query,
@@ -5929,7 +5887,7 @@ mysql_port = 47892
             .expect("register base table");
         let connectors = crate::connector::ConnectorRegistry::default();
         let mv_ctx = dummy_mv_refresh_context_for_validator_test();
-        let query_execution = super::legacy_test_query_execution_service();
+        let query_execution = super::test_query_execution_service();
         let validator =
             |_outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome| {
                 Err("sentinel IMV validator error".to_string())
@@ -5960,7 +5918,7 @@ mysql_port = 47892
         let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
         let mv_ctx = dummy_mv_refresh_context_for_validator_test();
-        let query_execution = super::legacy_test_query_execution_service();
+        let query_execution = super::test_query_execution_service();
 
         let rewrite_err = super::execute_query_with_options(
             &query,
@@ -8905,14 +8863,14 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_live_registry_over_runtime_config() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
-        use crate::coordinator::cluster::{BackendRegistry, BackendState};
+        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
+        use crate::query_execution::backend_registry::{BackendRegistry, BackendState};
 
         install_optimizer_backend_count_config(7, vec!["127.0.0.1:19080".to_string()]);
         let registry = Arc::new(BackendRegistry::new(3));
         registry.restore_backend(2, "127.0.0.1:19081".parse().unwrap(), BackendState::Live);
         registry.restore_backend(3, "127.0.0.1:19082".parse().unwrap(), BackendState::Live);
-        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
+        crate::query_execution::backend_registry::replace_backend_registry_for_test(Some(registry));
 
         assert_eq!(super::live_effective_backend_count(), 2.0);
     }
@@ -8920,13 +8878,16 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_reads_injected_membership() {
         let _standalone = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
         let ep1: std::net::SocketAddr = "127.0.0.1:19081".parse().unwrap();
         let ep2: std::net::SocketAddr = "127.0.0.1:19082".parse().unwrap();
-        crate::coordinator::cluster::replace_cluster_membership_for_test(Some(
-            std::sync::Arc::new(crate::coordinator::cluster::FakeClusterMembership::new(
-                vec![(0, ep1), (1, ep2)],
-            )),
+        crate::query_execution::backend_registry::replace_cluster_membership_for_test(Some(
+            std::sync::Arc::new(
+                crate::query_execution::backend_registry::FakeClusterMembership::new(vec![
+                    (0, ep1),
+                    (1, ep2),
+                ]),
+            ),
         ));
 
         assert_eq!(super::live_effective_backend_count(), 2.0);
@@ -8935,7 +8896,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_runtime_config_when_registry_absent() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
 
         install_optimizer_backend_count_config(
             7,
@@ -8948,11 +8909,11 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_runtime_config_when_registry_empty() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
-        let registry = Arc::new(crate::coordinator::cluster::BackendRegistry::new(3));
+        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
+        let registry = Arc::new(crate::query_execution::backend_registry::BackendRegistry::new(3));
 
         install_optimizer_backend_count_config(7, vec!["127.0.0.1:19085".to_string()]);
-        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
+        crate::query_execution::backend_registry::replace_backend_registry_for_test(Some(registry));
 
         assert_eq!(super::live_effective_backend_count(), 7.0);
     }
@@ -8960,7 +8921,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_defaults_to_one_without_registry_or_runtime_config() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
 
         install_optimizer_backend_count_config(0, Vec::new());
 

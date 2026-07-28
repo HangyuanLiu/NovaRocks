@@ -1044,7 +1044,6 @@ mod tests {
     use crate::runtime::endpoint::FragmentDestination;
     use crate::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
     use crate::runtime::query_context::{QueryId, query_context_manager};
-    use crate::runtime::query_state::in_flight_table;
     use crate::runtime::result_buffer::{self, TryFetchResult};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TStringLiteral};
@@ -2253,7 +2252,6 @@ mod tests {
         assert!(prepare_fragment_submission(decode_input(&fragment, &params)).is_err());
         assert!(query_context_manager().query_mem_tracker(query).is_none());
         assert!(query_context_manager().query_id_by_finst(finst).is_none());
-        assert!(in_flight_table().state(query).is_none());
         assert!(matches!(
             result_buffer::try_fetch(finst),
             TryFetchResult::Error(_)

@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::types::UniqueId;
-use crate::coordinator::cluster::LiveBackendSnapshot;
+use crate::query_execution::backend_registry::LiveBackendSnapshot;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime_filter::deployment::role_graph::{
     ChannelRoleGraph, RoleGraph, RouteEdge, RouteKind,
@@ -451,7 +451,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::common::types::UniqueId;
-    use crate::coordinator::cluster::LiveBackendSnapshot;
+    use crate::query_execution::backend_registry::LiveBackendSnapshot;
     use crate::runtime_filter::deployment::role_graph::{
         ChannelRoleGraph, RoleGraph, RouteEdge, RouteEndpoint, RouteKind,
     };
