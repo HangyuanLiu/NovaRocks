@@ -27,6 +27,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::host::ConnectorInstanceLease;
+use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
@@ -91,6 +92,21 @@ pub(crate) trait IncrementalConnectorSplitAdapter: Send + Sync {
         &self,
         ranges: &[IncrementalScanRange],
     ) -> Result<ConnectorSplitAppend, String>;
+}
+
+/// Core-private provider hook for opening delete-file data. The core runner
+/// retains all filtering semantics; a provider only resolves its storage
+/// credentials and decodes its delete files.
+pub(crate) trait ConnectorReadAuxiliary: Send + Sync {
+    fn load_iceberg_position_deletes(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<Option<roaring::RoaringTreemap>, String>;
+
+    fn load_iceberg_equality_deletes(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<Option<Vec<EqualityDeleteSet>>, String>;
 }
 
 struct ConnectorSplitState {
@@ -200,6 +216,7 @@ pub(crate) struct ConnectorReadScanSource {
     chunk_schema: ChunkSchemaRef,
     lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
+    auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
 }
 
 impl ConnectorReadScanSource {
@@ -219,6 +236,7 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: None,
             incremental: None,
+            auxiliary: None,
         }
     }
 
@@ -239,6 +257,7 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: Some(lifecycle),
             incremental: None,
+            auxiliary: None,
         }
     }
 
@@ -260,6 +279,7 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: None,
             incremental: Some(incremental),
+            auxiliary: None,
         }
     }
 
@@ -276,6 +296,25 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: None,
             incremental: None,
+            auxiliary: None,
+        }
+    }
+
+    pub(crate) fn new_scheduled_with_auxiliary(
+        instance: Arc<ConnectorInstance>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        auxiliary: Arc<dyn ConnectorReadAuxiliary>,
+    ) -> Self {
+        Self {
+            instance,
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
+            request,
+            chunk_schema,
+            lifecycle: None,
+            incremental: None,
+            auxiliary: Some(auxiliary),
         }
     }
 }
@@ -292,6 +331,7 @@ impl ScanSource for ConnectorReadScanSource {
             chunk_schema: Arc::clone(&self.chunk_schema),
             _lifecycle: self.lifecycle.clone(),
             incremental: self.incremental.clone(),
+            auxiliary: self.auxiliary.clone(),
         }))
     }
 }
@@ -305,6 +345,7 @@ struct ConnectorReadScanOp {
     // reader derived from this source has drained.
     _lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
+    auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
 }
 
 impl ScanOp for ConnectorReadScanOp {
@@ -355,6 +396,32 @@ impl ScanOp for ConnectorReadScanOp {
                 .collect(),
             state.has_more,
         ))
+    }
+
+    fn load_iceberg_position_deletes(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        let Some(range) = morsel.file_range() else {
+            return Ok(None);
+        };
+        self.auxiliary
+            .as_ref()
+            .map(|auxiliary| auxiliary.load_iceberg_position_deletes(&range))
+            .unwrap_or(Ok(None))
+    }
+
+    fn load_iceberg_equality_deletes(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<Vec<EqualityDeleteSet>>, String> {
+        let Some(range) = morsel.file_range() else {
+            return Ok(None);
+        };
+        self.auxiliary
+            .as_ref()
+            .map(|auxiliary| auxiliary.load_iceberg_equality_deletes(&range))
+            .unwrap_or(Ok(None))
     }
 
     fn supports_incremental_scan_ranges(&self) -> bool {
