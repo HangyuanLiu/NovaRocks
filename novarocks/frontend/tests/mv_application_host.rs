@@ -16,8 +16,12 @@
 // under the License.
 
 use bytes::Bytes;
+use novarocks::mv::repository::MvRepositoryErrorKind;
 use novarocks_frontend::mv::repository::key::definition_by_id_key;
-use novarocks_frontend::{FrontendApplicationErrorKind, FrontendApplicationHost};
+use novarocks_frontend::{
+    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendGrpcEndpointOwnership,
+    FrontendServerConfig, run_frontend_server_until_shutdown,
+};
 use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
@@ -72,6 +76,51 @@ async fn absent_state_store_keeps_host_available_but_mv_unavailable() {
         .expect("host without StateStore remains available");
     assert!(!host.mv_repository().availability().is_available());
     host.shutdown().await.expect("disabled host shutdown");
+}
+
+#[tokio::test]
+async fn current_thread_runtime_rejects_sync_mv_repository_calls_without_panicking() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let host = FrontendApplicationHost::open(Some(sqlite_config(&temp)))
+        .await
+        .expect("configured host");
+    let repository = host.mv_repository();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        repository.list_definitions()
+    }));
+    let error = result
+        .expect("current-thread repository call must not panic")
+        .expect_err("current-thread repository call must return an error");
+    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
+    assert!(error.message().contains("current-thread Tokio runtime"));
+
+    drop(repository);
+    host.shutdown().await.expect("host shutdown");
+}
+
+#[tokio::test]
+async fn current_thread_server_start_returns_mv_repository_error_before_bind() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let mut config = novarocks::common::app_config::NovaRocksConfig::default();
+    config.cluster.role = novarocks::common::app_config::ClusterRole::Fe;
+    config.cluster.backends.clear();
+    config.state_store = Some(sqlite_config(&temp).state_store);
+
+    let error = run_frontend_server_until_shutdown(
+        FrontendServerConfig {
+            config,
+            config_path: None,
+            port_override: Some(0),
+            grpc_endpoint: FrontendGrpcEndpointOwnership::ExternallyHosted,
+        },
+        std::future::pending::<()>(),
+    )
+    .await
+    .expect_err("current-thread startup must reject the synchronous MV repository call");
+
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::Server);
+    assert!(error.to_string().contains("current-thread Tokio runtime"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -89,10 +89,18 @@ impl StateStoreMvRepository {
         &self,
         future: impl Future<Output = Result<T, MvRepositoryError>>,
     ) -> Result<T, MvRepositoryError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return tokio::task::block_in_place(|| self.runtime.block_on(future));
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread =>
+            {
+                Err(MvRepositoryError::new(
+                    MvRepositoryErrorKind::InvalidRequest,
+                    "MV repository synchronous commands cannot run on a current-thread Tokio runtime",
+                ))
+            }
+            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
+            Err(_) => self.runtime.block_on(future),
         }
-        self.runtime.block_on(future)
     }
 
     async fn validate_open_state(&self) -> Result<(), MvRepositoryError> {
