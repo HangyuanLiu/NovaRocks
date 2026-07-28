@@ -273,6 +273,7 @@ impl ViewEngine for StandaloneState {
             Some(catalog),
             &catalog_service_snapshot,
             &connectors_snapshot,
+            &self.iceberg_catalogs,
             crate::sql::catalog::TableLookupMode::SchemaOnly,
         );
         let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, database)

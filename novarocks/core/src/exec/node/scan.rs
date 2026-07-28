@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
-use crate::connector::iceberg::IcebergMetadataScanRange;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 #[cfg(feature = "compat")]
@@ -413,16 +412,6 @@ pub enum BoundScanRanges {
     File {
         ranges: Vec<FileScanRange>,
         has_more: bool,
-    },
-    /// StarRocks lake/tablet ranges (compat mode only).
-    #[cfg(feature = "compat")]
-    StarRocksTablet {
-        ranges: Vec<StarRocksScanRange>,
-        has_more: bool,
-    },
-    /// Iceberg metadata-table ranges.
-    IcebergMetadata {
-        ranges: Vec<IcebergMetadataScanRange>,
     },
 }
 

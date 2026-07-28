@@ -303,12 +303,16 @@ pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a StandaloneCatalogService,
     connectors: &'a crate::connector::ConnectorRegistry,
+    iceberg_catalogs: &'a Arc<
+        RwLock<crate::connector::iceberg::catalog::registry::IcebergCatalogRegistry>,
+    >,
     lookup_mode: TableLookupMode,
 ) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
     crate::sql::catalog::provider::CatalogServiceProvider::new(
         current_catalog,
         catalog_service,
         connectors,
+        iceberg_catalogs,
         lookup_mode,
     )
 }
@@ -1752,6 +1756,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    &self.inner.iceberg_catalogs,
                     TableLookupMode::ExplainStats,
                 );
                 let result = if force_logical_explain {
@@ -1795,6 +1800,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    &self.inner.iceberg_catalogs,
                     TableLookupMode::ExplainStats,
                 );
                 let result = explain_analyze_query(
@@ -1875,6 +1881,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    &self.inner.iceberg_catalogs,
                     TableLookupMode::SchemaOnly,
                 );
                 self.inner
@@ -2260,21 +2267,18 @@ impl StandaloneSession {
             }
             return Err(error);
         }
-        let (backend, source) = {
-            let connectors = self
-                .inner
-                .connectors
-                .read()
-                .expect("connector registry read lock");
-            (
-                connectors.catalog_backend("iceberg")?,
-                connectors.table_source("iceberg")?,
-            )
-        };
+        let connectors = self
+            .inner
+            .connectors
+            .read()
+            .expect("connector registry read lock")
+            .clone();
         self.inner
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                &stmt.name, backend, source,
+                &stmt.name,
+                connectors,
+                Arc::clone(&self.inner.iceberg_catalogs),
             ));
         if let Err(error) = persist_catalog_attachment_if_needed(
             &self.inner,
@@ -2880,16 +2884,11 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
         .catalog_attachment_repo
         .list(read.as_ref())
         .map_err(|e| format!("load catalog attachment metadata failed: {e}"))?;
-    let (backend, source) = {
-        let connectors = state
-            .connectors
-            .read()
-            .expect("connector registry read lock");
-        (
-            connectors.catalog_backend("iceberg")?,
-            connectors.table_source("iceberg")?,
-        )
-    };
+    let connectors = state
+        .connectors
+        .read()
+        .expect("connector registry read lock")
+        .clone();
 
     for catalog in &catalogs {
         {
@@ -2912,8 +2911,8 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                 &catalog.catalog,
-                Arc::clone(&backend),
-                Arc::clone(&source),
+                connectors.clone(),
+                Arc::clone(&state.iceberg_catalogs),
             ));
     }
 
@@ -3404,6 +3403,7 @@ pub(crate) fn execute_query_with_catalog_service(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
+        &state.iceberg_catalogs,
         TableLookupMode::SchemaOnly,
     );
     execute_query_with_catalog_provider(
@@ -3514,6 +3514,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
+        &state.iceberg_catalogs,
         TableLookupMode::SchemaOnly,
     );
 
@@ -6020,220 +6021,6 @@ path = "{metadata_path}"
     }
 
     #[test]
-    fn explain_costs_iceberg_query_uses_schema_lookup_and_live_stats() {
-        struct TestBackend;
-        impl crate::connector::backend::CatalogBackend for TestBackend {
-            fn name(&self) -> &'static str {
-                "iceberg"
-            }
-
-            fn namespace_exists(&self, _: &str, _: &str) -> Result<bool, String> {
-                Err("unused".to_string())
-            }
-
-            fn create_namespace(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn drop_namespace(&self, _: &str, _: &str, _: bool) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn create_table(
-                &self,
-                _: crate::connector::backend::CreateTableRequest,
-            ) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn table_exists(&self, _: &str, _: &str, _: &str) -> Result<bool, String> {
-                Err("unused".to_string())
-            }
-
-            fn drop_table(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn load_table(
-                &self,
-                catalog: &str,
-                namespace: &str,
-                table: &str,
-            ) -> Result<crate::connector::backend::ResolvedTable, String> {
-                Ok(crate::connector::backend::ResolvedTable {
-                    catalog: catalog.to_string(),
-                    namespace: namespace.to_string(),
-                    table: table.to_string(),
-                    columns: vec![novarocks_catalog::schema::ColumnDef {
-                        name: "id".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        write_default: None,
-                        logical_type: None,
-                    }],
-                })
-            }
-        }
-
-        struct FixedStatsProvider {
-            requests: Arc<AtomicUsize>,
-        }
-
-        impl crate::connector::stats::TableStatsProvider for FixedStatsProvider {
-            fn estimate_table_statistics(
-                &self,
-                request: &crate::connector::stats::TableStatsRequest,
-            ) -> Result<
-                crate::sql::optimizer::stats_input::BaseTableStatistics,
-                crate::connector::stats::StatsProviderError,
-            > {
-                assert_eq!(request.catalog.as_deref(), Some("ice"));
-                assert_eq!(request.database, "db");
-                assert_eq!(request.table, "parted");
-                assert_eq!(
-                    request.snapshot,
-                    Some(crate::connector::stats::TableSnapshotRef::Current)
-                );
-                self.requests.fetch_add(1, Ordering::SeqCst);
-                Ok(crate::sql::optimizer::stats_input::BaseTableStatistics {
-                    row_count: crate::sql::optimizer::stats_input::StatValue::known(
-                        73,
-                        crate::sql::optimizer::statistics::Confidence::Exact,
-                        crate::sql::optimizer::stats_input::StatsSource::TestFixture,
-                    ),
-                    columns: Default::default(),
-                    source: crate::sql::optimizer::stats_input::StatsSource::TestFixture,
-                })
-            }
-        }
-
-        struct TestSource {
-            full_calls: Arc<AtomicUsize>,
-            schema_calls: Arc<AtomicUsize>,
-            stats_requests: Arc<AtomicUsize>,
-        }
-
-        impl crate::connector::backend::TableSource for TestSource {
-            fn name(&self) -> &'static str {
-                "iceberg"
-            }
-
-            fn build_table_def(
-                &self,
-                _: &crate::connector::backend::ResolvedTable,
-            ) -> Result<crate::sql::planner::table::TableDef, String> {
-                self.full_calls.fetch_add(1, Ordering::SeqCst);
-                Err("full table builder must not run during EXPLAIN COSTS".to_string())
-            }
-
-            fn build_schema_table_def(
-                &self,
-                table: &crate::connector::backend::ResolvedTable,
-            ) -> Result<crate::sql::planner::table::TableDef, String> {
-                self.schema_calls.fetch_add(1, Ordering::SeqCst);
-                let iceberg = crate::connector::iceberg::scan_model::IcebergTableInfo {
-                    catalog: table.catalog.clone(),
-                    namespace: table.namespace.clone(),
-                    table: table.table.clone(),
-                    table_uuid: Some("uuid-parted".to_string()),
-                    current_snapshot_id: Some(1),
-                    schema_id: 1,
-                    location: "file:///ice/db/parted".to_string(),
-                    schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
-                        fields: vec![],
-                    },
-                    serialized_metadata: None,
-                    serialized_metadata_rows: None,
-                };
-                Ok(crate::sql::planner::table::TableDef {
-                    name: table.table.clone(),
-                    columns: table.columns.clone(),
-                    iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                        table: iceberg,
-                        files: Vec::new(),
-                        cloud_properties: Default::default(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
-                })
-            }
-
-            fn stats_provider(
-                &self,
-            ) -> Option<Arc<dyn crate::connector::stats::TableStatsProvider>> {
-                Some(Arc::new(FixedStatsProvider {
-                    requests: Arc::clone(&self.stats_requests),
-                }))
-            }
-        }
-
-        let state = Arc::new(StandaloneState::default());
-        let full_calls = Arc::new(AtomicUsize::new(0));
-        let schema_calls = Arc::new(AtomicUsize::new(0));
-        let stats_requests = Arc::new(AtomicUsize::new(0));
-        {
-            let mut connectors = state.connectors.write().expect("connectors");
-            connectors.register_catalog_backend(Arc::new(TestBackend));
-            connectors.register_table_source(Arc::new(TestSource {
-                full_calls: Arc::clone(&full_calls),
-                schema_calls: Arc::clone(&schema_calls),
-                stats_requests: Arc::clone(&stats_requests),
-            }));
-        }
-        {
-            let connectors = state.connectors.read().expect("connectors");
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    "ice",
-                    connectors.catalog_backend("iceberg").expect("backend"),
-                    connectors.table_source("iceberg").expect("source"),
-                ));
-        }
-        let session = StandaloneSession {
-            inner: Arc::clone(&state),
-        };
-
-        let StatementResult::Query(result) = session
-            .execute_in_context(
-                "EXPLAIN COSTS SELECT id FROM parted",
-                Some("ice"),
-                "db",
-                None,
-            )
-            .expect("explain costs")
-        else {
-            panic!("EXPLAIN COSTS must return a query result");
-        };
-        let explain_lines = (0..result.row_count())
-            .map(|row| string_cell(&result, row, 0))
-            .collect::<Vec<_>>();
-        assert!(
-            explain_lines.iter().any(|line| {
-                line.contains("TABLE STATS")
-                    && line.contains("table=ice.db.parted")
-                    && line.contains("rows=73")
-                    && line.contains("source=TestFixture")
-            }),
-            "EXPLAIN COSTS must render live connector statistics: {explain_lines:?}"
-        );
-        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(stats_requests.load(Ordering::SeqCst), 1);
-
-        let local = state
-            .catalog_service
-            .local()
-            .read()
-            .expect("catalog service local");
-        assert!(
-            local.get("db", "parted").is_err(),
-            "EXPLAIN analysis must not require global InMemoryCatalog registration"
-        );
-    }
-
-    #[test]
     fn metadata_backend_resolves_metadata_path_relative_to_config_parent() {
         let _runtime_guard = lock_runtime_test_state();
         let dir = TempDir::new().expect("create config dir");
@@ -6385,215 +6172,6 @@ mysql_port = 47892
                     })
             })
         })
-    }
-
-    #[cfg(feature = "compat")]
-    fn build_fragments_for_query(
-        sql: &str,
-    ) -> (
-        crate::query_execution::preparation::PreparedFragmentSet,
-        crate::protocol::native::encode::NativeFragmentBundle,
-    ) {
-        use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
-        use crate::sql::planner::table::{ScanSource, TableDef};
-        use novarocks_catalog::schema::ColumnDef;
-
-        let mut catalog = super::PlannerMemoryCatalog::default();
-        let table = TableDef {
-            name: "tbl".to_string(),
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    write_default: None,
-                    logical_type: None,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: true,
-                    write_default: None,
-                    logical_type: None,
-                },
-            ],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 1,
-                table_id: 2,
-            },
-        };
-        catalog
-            .register("default", table.clone())
-            .expect("register StarRocks tbl");
-        let mut date_dim = table;
-        date_dim.name = "date_dim".to_string();
-        catalog
-            .register("default", date_dim)
-            .expect("register StarRocks date_dim");
-
-        let registry = mock_starrocks_registry_for_engine_test(
-            3,
-            vec![
-                crate::connector::starrocks::table::scan_planner::StarRocksSplit {
-                    tablet_id: 4,
-                    partition_id: 5,
-                    version: 6,
-                },
-            ],
-        );
-
-        let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
-        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql(&normalized)
-            .expect("build parser");
-        let statement = parser.parse_statement().expect("parse statement");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query statement");
-        };
-
-        let (resolved, cte_registry, mut factory) =
-            crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
-        let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
-            .expect("plan query");
-        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let mut optimizer_expr =
-            crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-                &logical_plan,
-                &mut scalar_arena,
-            )
-            .expect("logical to opt expr");
-        let service: Arc<dyn StatisticsService> = Arc::new(FixedCatalogStatisticsService {
-            tables: std::collections::HashMap::from([
-                (
-                    ("default".to_string(), "tbl".to_string()),
-                    CatalogTableStatistics {
-                        columns: vec![CatalogColumnStatistics {
-                            column_name: "id".to_string(),
-                            row_count: 100_000,
-                            min: "1".to_string(),
-                            max: "100000".to_string(),
-                            ndv: "100000".to_string(),
-                        }],
-                    },
-                ),
-                (
-                    ("default".to_string(), "date_dim".to_string()),
-                    CatalogTableStatistics {
-                        columns: vec![CatalogColumnStatistics {
-                            column_name: "id".to_string(),
-                            row_count: 100,
-                            min: "1".to_string(),
-                            max: "100".to_string(),
-                            ndv: "100".to_string(),
-                        }],
-                    },
-                ),
-            ]),
-        });
-        let providers = super::query_stats::QueryStatsProviders::from_parts(None, Some(service));
-        let query_stats =
-            super::query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-        let optimized_tree = crate::sql::optimizer::optimize(
-            optimizer_expr,
-            scalar_arena,
-            &query_stats.snapshot,
-            factory,
-            Vec::new(),
-        )
-        .expect("optimize");
-        let physical_plan =
-            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
-                .expect("convert optimizer physical plan");
-        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
-            .expect("build DistributedPlan");
-        let prepared = crate::query_execution::preparation::prepare_fragments(
-            &distributed_plan,
-            &registry,
-            None,
-        )
-        .expect("prepare fragments");
-        let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-            &distributed_plan,
-            &prepared,
-        )
-        .expect("encode fragments");
-        (prepared, native_bundle)
-    }
-
-    /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
-    /// returns the provided schema_id and tablet splits. Used by
-    /// engine-level tests that build fragments for a StarRocks table but do not
-    /// have a full `StandaloneState` available.
-    #[cfg(feature = "compat")]
-    fn mock_starrocks_registry_for_engine_test(
-        schema_id: i64,
-        splits: Vec<crate::connector::starrocks::table::scan_planner::StarRocksSplit>,
-    ) -> crate::connector::ConnectorRegistry {
-        use crate::connector::scan_planning::{
-            BeginScanContext, ConnectorScanPlanner, SplitPlanningContext,
-        };
-        use crate::connector::starrocks::table::scan_planner::{
-            StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
-        };
-
-        #[derive(Debug)]
-        struct MockPlanner {
-            schema_id: i64,
-            splits: Vec<StarRocksSplit>,
-        }
-
-        impl ConnectorScanPlanner for MockPlanner {
-            fn name(&self) -> &'static str {
-                "starrocks"
-            }
-
-            fn begin_scan(
-                &self,
-                table: crate::connector::scan_planning::TableHandle,
-                _ctx: BeginScanContext,
-            ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
-                let inner = table
-                    .downcast_ref::<StarRocksTableHandle>()
-                    .ok_or_else(|| "MockPlanner expected StarRocksTableHandle".to_string())?
-                    .clone();
-                Ok(crate::connector::scan_planning::ScanHandle::new(
-                    "starrocks",
-                    StarRocksScanHandle {
-                        table: inner,
-                        schema_id: self.schema_id,
-                        storage_columns: vec![
-                            crate::connector::starrocks::table::scan_planner::StarRocksStorageColumn {
-                                name: "id".to_string(),
-                                unique_id: 1,
-                                default_value: None,
-                            },
-                        ],
-                        tablet_schema: crate::connector::starrocks::table::scan_planner::test_native_tablet_schema_for_column(self.schema_id, "id", 1, None),
-                    },
-                ))
-            }
-
-            fn plan_splits(
-                &self,
-                _scan: &crate::connector::scan_planning::ScanHandle,
-                _ctx: SplitPlanningContext,
-            ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
-                Ok(self
-                    .splits
-                    .iter()
-                    .map(|s| crate::connector::scan_planning::Split::new("starrocks", s.clone()))
-                    .collect())
-            }
-        }
-
-        let planner = std::sync::Arc::new(MockPlanner { schema_id, splits });
-        let mut registry = crate::connector::ConnectorRegistry::new();
-        registry.register_scan_planner(planner);
-        registry.register_scan_planner(std::sync::Arc::new(
-            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-        ));
-        registry
     }
 
     fn parse_query_for_engine_test(sql: &str) -> sqlparser::ast::Query {

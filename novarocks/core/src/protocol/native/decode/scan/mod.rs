@@ -1545,54 +1545,34 @@ mod tests {
                 upper_bound: Some(110_i32.to_le_bytes().to_vec()),
             },
         )]));
-        let connector_table = crate::connector::iceberg::scan_planner::IcebergTableHandle {
+        let table = crate::connector::iceberg::scan_model::IcebergTableInfo {
             catalog: "rest".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),
-            snapshot_id: Some(1),
-            table_info: crate::connector::iceberg::scan_model::IcebergTableInfo {
-                catalog: "rest".to_string(),
-                namespace: "db".to_string(),
-                table: "t".to_string(),
-                table_uuid: None,
-                current_snapshot_id: Some(1),
-                schema_id: 7,
-                location: "s3://bucket/warehouse/db/t".to_string(),
-                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
-                    fields: vec![
-                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
-                            field_id: 10,
-                            name: "id".to_string(),
-                            initial_default: None,
-                            write_default: None,
-                            initial_default_json: None,
-                            write_default_json: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                },
-                serialized_metadata: None,
-                serialized_metadata_rows: None,
+            table_uuid: None,
+            current_snapshot_id: Some(1),
+            schema_id: 7,
+            location: "s3://bucket/warehouse/db/t".to_string(),
+            schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                fields: vec![
+                    crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                        field_id: 10,
+                        name: "id".to_string(),
+                        initial_default: None,
+                        write_default: None,
+                        initial_default_json: None,
+                        write_default_json: None,
+                        children: Vec::new(),
+                    },
+                ],
             },
-            split_source:
-                crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(vec![
-                    file.clone(),
-                ]),
-            column_names: vec!["id".to_string()],
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
         };
-        let scan_handle = crate::connector::scan_planning::ScanHandle::new(
-            "iceberg",
-            crate::connector::iceberg::scan_planner::IcebergScanHandle {
-                table: connector_table,
-            },
-        );
-        let split = crate::connector::scan_planning::Split::new(
-            "iceberg",
-            crate::connector::iceberg::scan_planner::IcebergSplit { data_file: file },
-        );
         let planned = crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(
-            &scan_handle,
-            &[split],
+            &table,
+            &[file],
+            &["id".to_string()],
             crate::connector::iceberg::scan_range::IcebergScanRangeContext {
                 min_max_predicates: Vec::new(),
                 columns: vec![novarocks_catalog::schema::ColumnDef {

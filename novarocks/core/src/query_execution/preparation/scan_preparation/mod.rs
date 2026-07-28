@@ -17,7 +17,6 @@
 
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::starrocks::PlannedNativeStarRocksScan;
-use crate::connector::scan_planning::starrocks::plan_native_starrocks_scan;
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
@@ -120,8 +119,18 @@ fn prepare_scan_node(
             );
         }
         ScanSource::StarRocks { .. } => {
-            let planned = plan_native_starrocks_scan(node_id, scan, connectors)?;
-            return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
+            #[cfg(feature = "compat")]
+            {
+                let planned =
+                    crate::connector::starrocks::table::scan_adapter::plan_native_starrocks_scan_with_compat(
+                    node_id, scan, connectors,
+                )?;
+                return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                return Err("StarRocks native scan planning requires feature compat".to_string());
+            }
         }
         source if scan_source_requires_resolver(source) => {
             let source_context = scan_source_context(source);

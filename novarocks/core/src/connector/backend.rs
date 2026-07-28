@@ -24,12 +24,9 @@
 //! can program against `dyn CatalogBackend` without knowing which concrete
 //! connector fulfils the request.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use arrow::record_batch::RecordBatch;
+use std::collections::HashMap;
 
-use crate::connector::stats::TableStatsProvider;
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
     RefreshOutcome, RefreshPlan, RefreshRequest,
@@ -37,7 +34,6 @@ use crate::engine::mv::lifecycle::{
 use crate::sql::parser::ast::{
     AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, Literal, TableColumnDef, TableKeyDesc,
 };
-use crate::sql::planner::table::TableDef;
 use novarocks_catalog::schema::ColumnDef;
 
 /// Request to create a table. Unified shape across all catalog backends;
@@ -191,53 +187,6 @@ pub(crate) trait CatalogBackend: Send + Sync {
 
     fn list_views(&self, _catalog: &str, _namespace: &str) -> Result<Vec<String>, String> {
         Err(format!("{} backend does not support views", self.name()))
-    }
-}
-
-/// Scan-side metadata conversion used to register external connector tables
-/// into the in-memory logical catalog before planning.
-pub(crate) trait TableSource: Send + Sync {
-    fn name(&self) -> &'static str;
-
-    /// Build a `TableDef` suitable for registration in the in-memory logical
-    /// catalog. Different backends pick different `ScanSource` variants
-    /// (IcebergDataFiles / IcebergMetadataTable / IcebergDeltaTable).
-    fn build_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String>;
-
-    /// Build a schema-only `TableDef` for catalog registration. The default
-    /// preserves existing connector behavior. Iceberg overrides this to avoid
-    /// expanding snapshot data files during query-prep registration.
-    fn build_schema_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
-        self.build_table_def(table)
-    }
-
-    /// Build a schema-only `TableDef` that additionally carries the resolved
-    /// `$files` / `$manifests` / `$entries` metadata rows. The default
-    /// preserves existing connector behavior (no metadata-row materialisation);
-    /// iceberg overrides this to walk the current snapshot's manifests.
-    fn build_metadata_rows_table_def(
-        &self,
-        resolved: &ResolvedTable,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-    ) -> Result<crate::sql::planner::table::TableDef, String> {
-        let _ = metadata_table_type;
-        self.build_schema_table_def(resolved)
-    }
-
-    /// Phase-1 entry point for time-travel-aware table-def construction.
-    /// Default impl ignores the snapshot pin and delegates to `build_table_def`,
-    /// which is correct for connectors that do not have time-travel semantics.
-    fn build_table_def_at(
-        &self,
-        table: &ResolvedTable,
-        _snapshot_id: Option<i64>,
-    ) -> Result<TableDef, String> {
-        self.build_table_def(table)
-    }
-
-    #[allow(dead_code)] // Task 5 wires QueryStatsCollector to this staged provider hook.
-    fn stats_provider(&self) -> Option<Arc<dyn TableStatsProvider>> {
-        None
     }
 }
 

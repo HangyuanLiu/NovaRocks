@@ -27,10 +27,6 @@ use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     IcebergTableInfo,
 };
-use crate::connector::iceberg::scan_planner::{
-    IcebergScanHandle, iceberg_scan_handle, iceberg_split,
-};
-use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
 use crate::fs::scan_context::FileScanRange;
 use crate::runtime::scan_range;
 use novarocks_catalog::schema::ColumnDef;
@@ -52,7 +48,7 @@ pub(crate) struct PlannedIcebergScanRanges {
 
 pub(crate) fn equality_delete_required_columns(
     table: &IcebergTableInfo,
-    splits: &[Split],
+    files: &[IcebergDataFileInfo],
 ) -> Result<Vec<String>, String> {
     let mut schema_by_id = BTreeMap::new();
     let mut schema_by_name = BTreeMap::new();
@@ -80,9 +76,8 @@ pub(crate) fn equality_delete_required_columns(
 
     let mut required = Vec::new();
     let mut required_seen = BTreeSet::new();
-    for split in splits {
-        let file = iceberg_split(split)?;
-        for delete in &file.data_file.delete_files {
+    for file in files {
+        for delete in &file.delete_files {
             if delete.file_content != IcebergDeleteFileContent::Equality {
                 continue;
             }
@@ -162,13 +157,12 @@ pub(crate) fn equality_delete_required_columns(
 }
 
 pub(crate) fn plan_iceberg_scan_ranges(
-    scan: &ScanHandle,
-    splits: &[Split],
+    table: &IcebergTableInfo,
+    files: &[IcebergDataFileInfo],
+    column_names: &[String],
     ctx: IcebergScanRangeContext,
 ) -> Result<PlannedIcebergScanRanges, String> {
-    validate_split_connectors(scan, splits)?;
-    let scan = iceberg_scan_handle(scan)?;
-    let scan_ranges = build_iceberg_native_scan_ranges(scan, splits, &ctx)?;
+    let scan_ranges = build_iceberg_native_scan_ranges(table, files, column_names, &ctx)?;
     Ok(PlannedIcebergScanRanges { scan_ranges })
 }
 
@@ -226,8 +220,9 @@ pub(crate) fn plan_iceberg_file_ranges(
 }
 
 fn build_iceberg_native_scan_ranges(
-    scan: &IcebergScanHandle,
-    splits: &[Split],
+    table: &IcebergTableInfo,
+    files: &[IcebergDataFileInfo],
+    column_names: &[String],
     ctx: &IcebergScanRangeContext,
 ) -> Result<Vec<scan_range::ScanRangeParams>, String> {
     let mut ranges = Vec::new();
@@ -237,9 +232,8 @@ fn build_iceberg_native_scan_ranges(
         );
     let mut pruning_counters =
         crate::connector::iceberg::file_pruning::IcebergFilePruningCounters::default();
-    let pruning_columns = pruning_columns_for_scan(scan, &ctx.columns)?;
-    for split in splits {
-        let file = &iceberg_split(split)?.data_file;
+    let pruning_columns = pruning_columns_for_scan(table, column_names, &ctx.columns)?;
+    for file in files {
         if !crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates(
             file,
             &scan_predicates,
@@ -262,18 +256,17 @@ struct PruningColumn {
 }
 
 fn pruning_columns_for_scan(
-    scan: &IcebergScanHandle,
+    table: &IcebergTableInfo,
+    column_names: &[String],
     columns: &[ColumnDef],
 ) -> Result<Vec<PruningColumn>, String> {
-    scan.table
-        .table_info
+    table
         .schema
         .fields
         .iter()
         .enumerate()
         .filter_map(|(schema_ordinal, field)| {
-            scan.table
-                .column_names
+            column_names
                 .iter()
                 .any(|column_name| column_name.eq_ignore_ascii_case(&field.name))
                 .then_some((schema_ordinal, field))
@@ -282,7 +275,7 @@ fn pruning_columns_for_scan(
             let schema_ordinal = i32::try_from(schema_ordinal).map_err(|_| {
                 format!(
                     "Iceberg table {}.{} schema field ordinal overflow for {}",
-                    scan.table.namespace, scan.table.table, field.name
+                    table.namespace, table.table, field.name
                 )
             })?;
             let column = columns
@@ -292,7 +285,7 @@ fn pruning_columns_for_scan(
                 .ok_or_else(|| {
                     format!(
                         "Iceberg table {}.{} scan column {} missing from resolved table columns",
-                        scan.table.namespace, scan.table.table, field.name
+                        table.namespace, table.table, field.name
                     )
                 })?;
             Ok(PruningColumn {
@@ -641,9 +634,6 @@ fn build_native_file_scan_range_params(
 mod tests {
     use super::*;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::connector::iceberg::scan_planner::{
-        IcebergScanHandle, IcebergSplit, IcebergSplitSource, IcebergTableHandle,
-    };
 
     fn delete_file(
         path: &str,
@@ -767,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_adapter_preserves_split_order() {
+    fn typed_file_planning_preserves_order() {
         let table_info = IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
@@ -780,34 +770,14 @@ mod tests {
             serialized_metadata: None,
             serialized_metadata_rows: None,
         };
-        let table = IcebergTableHandle {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "t".to_string(),
-            snapshot_id: Some(7),
-            table_info,
-            split_source: IcebergSplitSource::ExplicitFiles(Vec::new()),
-            column_names: Vec::new(),
-        };
-        let scan = ScanHandle::new("iceberg", IcebergScanHandle { table });
-        let splits = ["first", "second"]
+        let files = ["first", "second"]
             .into_iter()
-            .map(|name| {
-                Split::new(
-                    "iceberg",
-                    IcebergSplit {
-                        data_file: IcebergDataFileInfo::for_test(
-                            &format!("s3://bucket/{name}.parquet"),
-                            1,
-                            1,
-                        ),
-                    },
-                )
-            })
+            .map(|name| IcebergDataFileInfo::for_test(&format!("s3://bucket/{name}.parquet"), 1, 1))
             .collect::<Vec<_>>();
 
-        let planned = plan_iceberg_scan_ranges(&scan, &splits, IcebergScanRangeContext::default())
-            .expect("plan ranges");
+        let planned =
+            plan_iceberg_scan_ranges(&table_info, &files, &[], IcebergScanRangeContext::default())
+                .expect("plan ranges");
         let paths = planned
             .scan_ranges
             .iter()

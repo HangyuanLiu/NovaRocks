@@ -335,16 +335,11 @@ fn register_iceberg_tables_for_mv_analysis(
     state: &Arc<StandaloneState>,
     resolved_refs: &[ResolvedTableRef],
 ) -> Result<(), String> {
-    let (catalog_backend, table_source) = {
-        let registry = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock");
-        (
-            registry.catalog_backend("iceberg")?,
-            registry.table_source("iceberg")?,
-        )
-    };
+    let connectors = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
 
     for table_ref in resolved_refs {
         let ResolvedTableRef::Iceberg {
@@ -356,12 +351,16 @@ fn register_iceberg_tables_for_mv_analysis(
             continue;
         };
         drop_local_table_registration_if_exists(state, namespace, table)?;
-        let resolved = catalog_backend
-            .load_table_for_read(catalog, namespace, table)
-            .map_err(|err| {
-                format!("load iceberg table {catalog}.{namespace}.{table} failed: {err}")
-            })?;
-        let mut table_def = table_source.build_table_def(&resolved)?;
+        let (mut table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
+            &connectors,
+            &state.iceberg_catalogs,
+            catalog,
+            namespace,
+            table,
+            None,
+            false,
+        )
+        .map_err(|err| format!("load iceberg table {catalog}.{namespace}.{table} failed: {err}"))?;
         table_def.name = table.clone();
         let mut local_catalog = state
             .catalog_service

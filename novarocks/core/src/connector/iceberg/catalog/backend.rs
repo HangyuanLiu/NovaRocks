@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CatalogBackend` / `TableSource` / `TableSink` implementations for
-//! Iceberg, wrapping the free functions in `registry.rs`.
+//! `CatalogBackend` / `TableSink` implementations for Iceberg, wrapping the
+//! free functions in `registry.rs`.
 
 use std::sync::{Arc, RwLock};
 
@@ -24,7 +24,6 @@ use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, ResolvedView, TableSink,
-    TableSource,
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::connector::iceberg::scan_model::{
@@ -222,125 +221,104 @@ impl CatalogBackend for IcebergCatalogBackend {
     }
 }
 
-pub(crate) struct IcebergTableSource {
+pub(crate) fn iceberg_table_stats_provider(
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
+) -> Arc<dyn crate::connector::stats::TableStatsProvider> {
+    Arc::new(crate::connector::iceberg::stats::IcebergTableStatsProvider::new(registry))
 }
 
-impl IcebergTableSource {
-    pub(crate) fn new(registry: Arc<RwLock<IcebergCatalogRegistry>>) -> Self {
-        Self { registry }
-    }
+pub(crate) fn resolve_iceberg_schema_table_def(
+    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    table: &ResolvedTable,
+) -> Result<TableDef, String> {
+    let guard = registry.read().expect("iceberg catalog read lock");
+    let entry = guard.get(&table.catalog)?;
+    let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
+    build_iceberg_schema_table_def_from_loaded(
+        &entry,
+        &table.catalog,
+        &table.namespace,
+        &table.table,
+        loaded,
+    )
 }
 
-impl TableSource for IcebergTableSource {
-    fn name(&self) -> &'static str {
-        "iceberg"
-    }
-
-    fn stats_provider(&self) -> Option<Arc<dyn crate::connector::stats::TableStatsProvider>> {
-        Some(Arc::new(
-            crate::connector::iceberg::stats::IcebergTableStatsProvider::new(Arc::clone(
-                &self.registry,
-            )),
-        ))
-    }
-
-    fn build_schema_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
-        let guard = self.registry.read().expect("iceberg catalog read lock");
-        let entry = guard.get(&table.catalog)?;
-        let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
-        build_iceberg_schema_table_def(
-            &entry,
-            &table.catalog,
-            &table.namespace,
-            &table.table,
-            loaded,
+pub(crate) fn resolve_iceberg_metadata_rows_table_def(
+    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    resolved: &ResolvedTable,
+    metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+) -> Result<TableDef, String> {
+    let guard = registry.read().expect("iceberg catalog read lock");
+    let entry = guard.get(&resolved.catalog)?;
+    let loaded = reg_load_table(&entry, &resolved.namespace, &resolved.table)?;
+    // The iceberg-rust `Table` is `Clone`; capture it (and its `FileIO`)
+    // before `build_iceberg_schema_table_def` consumes `loaded`.
+    let iceberg_table = loaded.table.clone();
+    let file_io = iceberg_table.file_io().clone();
+    let mut def = build_iceberg_schema_table_def_from_loaded(
+        &entry,
+        &resolved.catalog,
+        &resolved.namespace,
+        &resolved.table,
+        loaded,
+    )?;
+    drop(guard);
+    let rows = super::registry::block_on_iceberg(async {
+        crate::connector::iceberg::metadata_read::read_metadata_table_rows(
+            &iceberg_table,
+            &file_io,
+            metadata_table_type,
         )
+        .await
+    })??;
+    if let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } = &mut def.source
+    {
+        table.serialized_metadata_rows = Some(rows);
     }
+    Ok(def)
+}
 
-    fn build_metadata_rows_table_def(
-        &self,
-        resolved: &ResolvedTable,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-    ) -> Result<TableDef, String> {
-        let guard = self.registry.read().expect("iceberg catalog read lock");
-        let entry = guard.get(&resolved.catalog)?;
-        let loaded = reg_load_table(&entry, &resolved.namespace, &resolved.table)?;
-        // The iceberg-rust `Table` is `Clone`; capture it (and its `FileIO`)
-        // before `build_iceberg_schema_table_def` consumes `loaded`.
-        let iceberg_table = loaded.table.clone();
-        let file_io = iceberg_table.file_io().clone();
-        let mut def = build_iceberg_schema_table_def(
-            &entry,
-            &resolved.catalog,
-            &resolved.namespace,
-            &resolved.table,
-            loaded,
-        )?;
-        drop(guard);
-        let rows = super::registry::block_on_iceberg(async {
-            crate::connector::iceberg::metadata_read::read_metadata_table_rows(
-                &iceberg_table,
-                &file_io,
-                metadata_table_type,
-            )
-            .await
-        })??;
-        if let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } =
-            &mut def.source
-        {
-            table.serialized_metadata_rows = Some(rows);
-        }
-        Ok(def)
-    }
-
-    fn build_table_def_at(
-        &self,
-        table: &ResolvedTable,
-        snapshot_id: Option<i64>,
-    ) -> Result<TableDef, String> {
-        let guard = self.registry.read().expect("iceberg catalog read lock");
-        let entry = guard.get(&table.catalog)?;
-        let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
-        let effective_snapshot_id =
-            snapshot_id.or_else(|| loaded.table.metadata().current_snapshot_id());
-        let data_files = if let Some(id) = effective_snapshot_id {
-            if let Some(cached) =
-                entry.cached_data_files(&table.namespace, &table.table, Some(id))?
-            {
-                cached
-            } else {
-                let extracted =
-                    super::registry::extract_data_files_with_stats_at(&loaded.table, id)?;
-                entry.cache_data_files(
-                    &table.namespace,
-                    &table.table,
-                    Some(id),
-                    extracted.clone(),
-                )?;
-                extracted
-            }
+pub(crate) fn resolve_iceberg_table_def_at(
+    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    table: &ResolvedTable,
+    snapshot_id: Option<i64>,
+) -> Result<TableDef, String> {
+    let guard = registry.read().expect("iceberg catalog read lock");
+    let entry = guard.get(&table.catalog)?;
+    let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
+    let effective_snapshot_id =
+        snapshot_id.or_else(|| loaded.table.metadata().current_snapshot_id());
+    let data_files = if let Some(id) = effective_snapshot_id {
+        if let Some(cached) = entry.cached_data_files(&table.namespace, &table.table, Some(id))? {
+            cached
         } else {
-            Vec::new()
-        };
-        build_iceberg_table_def_with_data_files(
-            &entry,
-            &table.catalog,
-            &table.namespace,
-            &table.table,
-            loaded,
-            data_files,
-            if snapshot_id.is_some() {
-                crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-            } else {
-                crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot
-            },
-        )
-    }
+            let extracted = super::registry::extract_data_files_with_stats_at(&loaded.table, id)?;
+            entry.cache_data_files(&table.namespace, &table.table, Some(id), extracted.clone())?;
+            extracted
+        }
+    } else {
+        Vec::new()
+    };
+    build_iceberg_table_def_with_data_files(
+        &entry,
+        &table.catalog,
+        &table.namespace,
+        &table.table,
+        loaded,
+        data_files,
+        if snapshot_id.is_some() {
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
+        } else {
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot
+        },
+    )
+}
 
-    fn build_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
-        self.build_table_def_at(table, None)
-    }
+pub(crate) fn resolve_iceberg_table_def(
+    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    table: &ResolvedTable,
+) -> Result<TableDef, String> {
+    resolve_iceberg_table_def_at(registry, table, None)
 }
 
 pub(crate) fn build_iceberg_table_def_with_files(
@@ -481,7 +459,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     })
 }
 
-fn build_iceberg_schema_table_def(
+fn build_iceberg_schema_table_def_from_loaded(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,
     namespace: &str,
@@ -1279,7 +1257,7 @@ mod tests {
 
     #[test]
     fn schema_only_v3_row_lineage_table_def_keeps_metadata_columns_without_files() {
-        let table_def = build_iceberg_schema_table_def(
+        let table_def = build_iceberg_schema_table_def_from_loaded(
             &test_entry(),
             "ice",
             "db",
@@ -1300,16 +1278,21 @@ mod tests {
 
     #[test]
     fn schema_only_v2_table_def_keeps_row_identity_metadata_columns() {
-        let table_def =
-            build_iceberg_schema_table_def(&test_entry(), "ice", "db", "t", loaded_table())
-                .expect("schema-only table def");
+        let table_def = build_iceberg_schema_table_def_from_loaded(
+            &test_entry(),
+            "ice",
+            "db",
+            "t",
+            loaded_table(),
+        )
+        .expect("schema-only table def");
 
         assert_row_identity_metadata_columns(&table_def);
     }
 
     #[test]
     fn schema_only_v3_default_row_lineage_table_def_keeps_metadata_columns_without_files() {
-        let table_def = build_iceberg_schema_table_def(
+        let table_def = build_iceberg_schema_table_def_from_loaded(
             &test_entry(),
             "ice",
             "db",
@@ -1330,7 +1313,7 @@ mod tests {
 
     #[test]
     fn schema_only_v3_row_lineage_false_table_def_keeps_row_identity_metadata_columns() {
-        let table_def = build_iceberg_schema_table_def(
+        let table_def = build_iceberg_schema_table_def_from_loaded(
             &test_entry(),
             "ice",
             "db",
@@ -1383,16 +1366,16 @@ mod tests {
             })
             .expect("create v3 row-lineage table");
 
-        let source = IcebergTableSource::new(registry);
-        let table_source: &dyn TableSource = &source;
-        let table_def = table_source
-            .build_schema_table_def(&ResolvedTable {
+        let table_def = resolve_iceberg_schema_table_def(
+            &registry,
+            &ResolvedTable {
                 catalog: "ice".to_string(),
                 namespace: "db".to_string(),
                 table: "t".to_string(),
                 columns: vec![],
-            })
-            .expect("schema-only table def through table source");
+            },
+        )
+        .expect("schema-only table def through connector metadata adapter");
 
         assert_row_lineage_metadata_columns(&table_def);
         let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {

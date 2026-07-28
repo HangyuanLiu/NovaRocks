@@ -30,9 +30,6 @@ use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
     IcebergTableInfo,
 };
-use crate::connector::scan_planning::{
-    BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext, TableHandle,
-};
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
@@ -45,52 +42,6 @@ use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
-
-#[derive(Debug)]
-struct PlannedIcebergFiles {
-    files: Vec<IcebergDataFileInfo>,
-    seen_column_names: Option<Arc<Mutex<Vec<Vec<String>>>>>,
-}
-
-impl ConnectorScanPlanner for PlannedIcebergFiles {
-    fn name(&self) -> &'static str {
-        "iceberg"
-    }
-
-    fn begin_scan(&self, table: TableHandle, _ctx: BeginScanContext) -> Result<ScanHandle, String> {
-        let table = table
-            .downcast_ref::<crate::connector::iceberg::scan_planner::IcebergTableHandle>()
-            .ok_or_else(|| "expected IcebergTableHandle".to_string())?
-            .clone();
-        if let Some(seen) = &self.seen_column_names {
-            seen.lock()
-                .expect("seen column names lock")
-                .push(table.column_names.clone());
-        }
-        Ok(ScanHandle::new(
-            "iceberg",
-            crate::connector::iceberg::scan_planner::IcebergScanHandle { table },
-        ))
-    }
-
-    fn plan_splits(
-        &self,
-        _scan: &ScanHandle,
-        _ctx: SplitPlanningContext,
-    ) -> Result<Vec<Split>, String> {
-        Ok(self
-            .files
-            .iter()
-            .cloned()
-            .map(|data_file| {
-                Split::new(
-                    "iceberg",
-                    crate::connector::iceberg::scan_planner::IcebergSplit { data_file },
-                )
-            })
-            .collect())
-    }
-}
 
 struct StaticResolver {
     execution: ResolvedScanExecution,
@@ -263,24 +214,28 @@ fn plan(root: DistributedNode) -> DistributedPlan {
 }
 
 fn registry(files: Vec<IcebergDataFileInfo>) -> ConnectorRegistry {
-    let mut registry = ConnectorRegistry::new();
-    registry.register_scan_planner(Arc::new(PlannedIcebergFiles {
+    let registry = ConnectorRegistry::new();
+    crate::connector::iceberg::provider::register_planned_files_fixture(
+        &registry,
+        "test_catalog",
         files,
-        seen_column_names: None,
-    }));
+        None,
+    );
     registry
 }
 
 fn recording_registry(
     files: Vec<IcebergDataFileInfo>,
-) -> (ConnectorRegistry, Arc<Mutex<Vec<Vec<String>>>>) {
-    let seen_column_names = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ConnectorRegistry::new();
-    registry.register_scan_planner(Arc::new(PlannedIcebergFiles {
+) -> (ConnectorRegistry, Arc<Mutex<Vec<Vec<usize>>>>) {
+    let seen_projections = Arc::new(Mutex::new(Vec::new()));
+    let registry = ConnectorRegistry::new();
+    crate::connector::iceberg::provider::register_planned_files_fixture(
+        &registry,
+        "test_catalog",
         files,
-        seen_column_names: Some(Arc::clone(&seen_column_names)),
-    }));
-    (registry, seen_column_names)
+        Some(Arc::clone(&seen_projections)),
+    );
+    (registry, seen_projections)
 }
 
 fn resolved_files(files: Vec<IcebergDataFileInfo>) -> ResolvedScanExecution {

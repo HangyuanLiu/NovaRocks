@@ -227,18 +227,18 @@ fn build_candidate(
     ) else {
         return Ok(None);
     };
-    let (catalog_backend, table_source) = {
-        let registry = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock");
-        (
-            registry.catalog_backend("iceberg")?,
-            registry.table_source("iceberg")?,
-        )
-    };
-    let resolved_tbl = catalog_backend.load_table(cat, ns, tbl)?;
-    let target_table = table_source.build_schema_table_def(&resolved_tbl)?;
+    let connectors = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let (target_table, _) = crate::connector::iceberg::provider::load_schema_table_def(
+        &connectors,
+        &state.iceberg_catalogs,
+        cat,
+        ns,
+        tbl,
+    )?;
 
     // Duplicate output names break the by-name visible-column mapping.
     let mut names: Vec<&str> = mv_desc.outputs.iter().map(|o| o.name.as_str()).collect();

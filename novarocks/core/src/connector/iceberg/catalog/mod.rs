@@ -29,9 +29,11 @@ pub(crate) mod views;
 // offered, so callers only need to update the module prefix, not each
 // imported symbol.
 pub(crate) use backend::{
-    IcebergCatalogBackend, IcebergTableSink, IcebergTableSource,
-    build_iceberg_table_def_for_delta_scan, build_iceberg_table_def_with_files,
-    hidden_internal_column_names_from_metadata, row_lineage_enabled,
+    IcebergCatalogBackend, IcebergTableSink, build_iceberg_table_def_for_delta_scan,
+    build_iceberg_table_def_with_files, hidden_internal_column_names_from_metadata,
+    iceberg_table_stats_provider, resolve_iceberg_metadata_rows_table_def,
+    resolve_iceberg_schema_table_def, resolve_iceberg_table_def, resolve_iceberg_table_def_at,
+    row_lineage_enabled,
 };
 pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace,

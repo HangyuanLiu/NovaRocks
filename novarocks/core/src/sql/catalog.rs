@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::connector::backend::{CatalogBackend, TableSource};
+use crate::connector::ConnectorRegistry;
 use crate::sql::planner::table::TableDef;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_catalog::registry::{Catalog, CatalogRegistry};
@@ -52,10 +52,10 @@ pub(crate) fn build_internal_catalog(
 
 pub(crate) fn build_iceberg_catalog(
     name: &str,
-    backend: Arc<dyn CatalogBackend>,
-    source: Arc<dyn TableSource>,
+    connectors: ConnectorRegistry,
+    registry: Arc<RwLock<crate::connector::iceberg::catalog::registry::IcebergCatalogRegistry>>,
 ) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
-    Arc::new(iceberg::IcebergCatalog::new(name, backend, source))
+    Arc::new(iceberg::IcebergCatalog::new(name, connectors, registry))
 }
 
 pub(crate) fn new_standalone_catalog_service() -> StandaloneCatalogService {

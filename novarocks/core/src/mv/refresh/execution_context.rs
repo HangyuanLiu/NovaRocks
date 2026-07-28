@@ -1403,11 +1403,7 @@ mod tests {
                 let optimized_tree = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_join_refresh_coalesce_plan_for_lowering(
                     &refresh_ctx.rewrite,
                 );
-                let mut connectors = crate::connector::ConnectorRegistry::default();
-                connectors.register_scan_planner(Arc::new(
-                    crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-                ));
-
+                let connectors = crate::connector::ConnectorRegistry::default();
                 let physical_plan =
                     crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
                         .expect("convert optimizer physical plan");

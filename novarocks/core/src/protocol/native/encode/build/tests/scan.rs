@@ -16,49 +16,6 @@
 // under the License.
 
 use super::*;
-#[derive(Debug)]
-struct PlannedIcebergFiles {
-    files: Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>,
-}
-
-impl crate::connector::scan_planning::ConnectorScanPlanner for PlannedIcebergFiles {
-    fn name(&self) -> &'static str {
-        "iceberg"
-    }
-
-    fn begin_scan(
-        &self,
-        table: crate::connector::scan_planning::TableHandle,
-        _ctx: crate::connector::scan_planning::BeginScanContext,
-    ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
-        let table = table
-            .downcast_ref::<crate::connector::iceberg::scan_planner::IcebergTableHandle>()
-            .ok_or_else(|| "PlannedIcebergFiles expected IcebergTableHandle".to_string())?
-            .clone();
-        Ok(crate::connector::scan_planning::ScanHandle::new(
-            "iceberg",
-            crate::connector::iceberg::scan_planner::IcebergScanHandle { table },
-        ))
-    }
-
-    fn plan_splits(
-        &self,
-        _scan: &crate::connector::scan_planning::ScanHandle,
-        _ctx: crate::connector::scan_planning::SplitPlanningContext,
-    ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
-        Ok(self
-            .files
-            .iter()
-            .cloned()
-            .map(|data_file| {
-                crate::connector::scan_planning::Split::new(
-                    "iceberg",
-                    crate::connector::iceberg::scan_planner::IcebergSplit { data_file },
-                )
-            })
-            .collect())
-    }
-}
 
 fn equality_delete_file(
     equality_column_names: Vec<&str>,
@@ -201,8 +158,13 @@ fn id_eq_literal(value: i64) -> TypedExpr {
 fn iceberg_registry(
     files: Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>,
 ) -> ConnectorRegistry {
-    let mut registry = ConnectorRegistry::new();
-    registry.register_scan_planner(std::sync::Arc::new(PlannedIcebergFiles { files }));
+    let registry = ConnectorRegistry::new();
+    crate::connector::iceberg::provider::register_planned_files_fixture(
+        &registry,
+        "test_catalog",
+        files,
+        None,
+    );
     registry
 }
 

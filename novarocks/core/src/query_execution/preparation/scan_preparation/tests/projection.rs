@@ -152,13 +152,7 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
             .expect("seen column names lock")
             .last()
             .cloned(),
-        Some(vec![
-            "id".to_string(),
-            ICEBERG_FILE_PATH_COL.to_string(),
-            ICEBERG_ROW_POS_COL.to_string(),
-            ICEBERG_ROW_ID_COL.to_string(),
-            ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-        ])
+        Some(vec![0])
     );
 }
 
@@ -291,7 +285,7 @@ fn hidden_equality_key_is_sidecar_read_without_plan_mutation() {
             .expect("seen column names lock")
             .last()
             .cloned(),
-        Some(vec!["id".to_string(), "category".to_string()])
+        Some(vec![0, 1])
     );
 }
 
@@ -349,7 +343,7 @@ fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
             .expect("seen column names lock")
             .last()
             .cloned(),
-        Some(vec!["v".to_string()])
+        Some(vec![0])
     );
 }
 

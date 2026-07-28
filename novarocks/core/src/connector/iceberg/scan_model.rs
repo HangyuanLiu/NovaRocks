@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct IcebergColumnStats {
     pub null_count: Option<i64>,
     /// Total value count (including nulls) from manifest `value_counts`. The
@@ -30,7 +30,7 @@ pub struct IcebergColumnStats {
     pub upper_bound: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergPartitionValue {
     Boolean(bool),
     Int32(i32),
@@ -41,7 +41,7 @@ pub enum IcebergPartitionValue {
     Binary(Vec<u8>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergPartitionFieldValue {
     pub source_column: String,
     pub field_name: String,
@@ -61,19 +61,19 @@ impl IcebergPartitionFieldValue {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergDeleteFileFormat {
     Parquet,
     Puffin,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergDeleteFileContent {
     Position,
     Equality,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergDeleteFileInfo {
     pub path: String,
     pub file_format: IcebergDeleteFileFormat,
@@ -138,7 +138,7 @@ pub struct IcebergTableInfo {
     pub serialized_metadata_rows: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct IcebergDataFileInfo {
     pub path: String,
     pub size: i64,

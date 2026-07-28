@@ -174,8 +174,8 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                 catalog,
-                connectors.catalog_backend("iceberg").expect("backend"),
-                connectors.table_source("iceberg").expect("source"),
+                connectors.clone(),
+                std::sync::Arc::clone(&state.iceberg_catalogs),
             ));
     }
     MaintenanceTestEnv {

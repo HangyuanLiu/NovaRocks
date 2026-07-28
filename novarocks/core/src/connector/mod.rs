@@ -21,13 +21,12 @@ pub mod iceberg;
 pub mod jdbc;
 pub(crate) mod runtime;
 pub(crate) mod scan_model;
-pub(crate) mod scan_planning;
 pub mod schema;
 #[cfg(feature = "compat")]
 pub mod starrocks;
 pub(crate) mod stats;
 
-pub(crate) use backend::{CatalogBackend, MvBackend, TableSink, TableSource};
+pub(crate) use backend::{CatalogBackend, MvBackend, TableSink};
 #[cfg(test)]
 pub(crate) use iceberg::catalog::load_table as load_iceberg_table;
 pub(crate) use iceberg::catalog::{
@@ -46,7 +45,6 @@ pub(crate) use starrocks_table_stub::{
     runtime_registered,
 };
 
-use scan_planning::ConnectorScanPlanner;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -224,136 +222,12 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod scan_planning_registry_tests {
-    use std::sync::Arc;
-
-    use super::ConnectorRegistry;
-    use super::scan_planning::{
-        BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
-        TableHandle,
-    };
-
-    #[derive(Debug)]
-    struct NoopPlanner;
-
-    impl ConnectorScanPlanner for NoopPlanner {
-        fn name(&self) -> &'static str {
-            "noop"
-        }
-
-        fn begin_scan(
-            &self,
-            _table: TableHandle,
-            _ctx: BeginScanContext,
-        ) -> Result<ScanHandle, String> {
-            Err("not used".to_string())
-        }
-
-        fn plan_splits(
-            &self,
-            _scan: &ScanHandle,
-            _ctx: SplitPlanningContext,
-        ) -> Result<Vec<Split>, String> {
-            Err("not used".to_string())
-        }
-    }
-
-    #[test]
-    fn connector_registry_returns_registered_scan_planner() {
-        let mut registry = ConnectorRegistry::new();
-        registry.register_scan_planner(Arc::new(NoopPlanner));
-
-        let planner = registry.scan_planner("noop").expect("registered planner");
-
-        assert_eq!(planner.name(), "noop");
-    }
-
-    #[test]
-    fn connector_registry_reports_unknown_scan_planner() {
-        let registry = ConnectorRegistry::new();
-
-        let err = registry
-            .scan_planner("missing")
-            .expect_err("unknown planner should fail");
-
-        assert_eq!(err, "unknown scan planner: missing");
-    }
-
-    #[test]
-    fn default_registry_does_not_register_standalone_scan_planners() {
-        let registry = ConnectorRegistry::default();
-
-        let err = registry
-            .scan_planner("starrocks")
-            .expect_err("standalone planners are registered with state, not Default");
-
-        assert_eq!(err, "unknown scan planner: starrocks");
-    }
-
-    #[test]
-    fn default_registry_does_not_register_standalone_iceberg_scan_planner() {
-        let registry = ConnectorRegistry::default();
-
-        let err = registry
-            .scan_planner("iceberg")
-            .expect_err("standalone planners are registered with state, not Default");
-
-        assert_eq!(err, "unknown scan planner: iceberg");
-    }
-
-    #[test]
-    fn default_connectors_register_stateful_iceberg_scan_planner() {
-        let state = Arc::new(crate::engine::StandaloneState::default());
-        super::register_standalone_backends(&state);
-        let connectors = state
-            .connectors
-            .read()
-            .expect("connector registry read lock");
-        let planner = connectors.scan_planner("iceberg").expect("iceberg planner");
-        let handle =
-            crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
-                "missing_catalog",
-                "db",
-                "t",
-                crate::connector::iceberg::scan_model::IcebergTableInfo {
-                    catalog: "missing_catalog".to_string(),
-                    namespace: "db".to_string(),
-                    table: "t".to_string(),
-                    table_uuid: None,
-                    current_snapshot_id: None,
-                    schema_id: 0,
-                    location: "s3://bucket/t".to_string(),
-                    schema: crate::connector::iceberg::scan_model::IcebergSchemaDef { fields: vec![] },
-                    serialized_metadata: None,
-                    serialized_metadata_rows: None,
-                },
-                vec!["id".to_string()],
-            );
-        let scan = planner
-            .begin_scan(
-                handle,
-                crate::connector::scan_planning::BeginScanContext::default(),
-            )
-            .expect("begin scan");
-        let err = planner
-            .plan_splits(
-                &scan,
-                crate::connector::scan_planning::SplitPlanningContext::default(),
-            )
-            .expect_err("stateful planner should consult registry");
-        assert!(err.contains("unknown catalog"), "{err}");
-    }
-}
-
 #[derive(Clone)]
 pub struct ConnectorRegistry {
     connector_host: Arc<RwLock<ConnectorHost>>,
     catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
-    table_sources: HashMap<&'static str, Arc<dyn TableSource>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
-    scan_planners: HashMap<&'static str, Arc<dyn ConnectorScanPlanner>>,
 }
 
 impl ConnectorRegistry {
@@ -361,10 +235,8 @@ impl ConnectorRegistry {
         Self {
             connector_host: Arc::new(RwLock::new(ConnectorHost::default())),
             catalog_backends: HashMap::new(),
-            table_sources: HashMap::new(),
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
-            scan_planners: HashMap::new(),
         }
     }
 
@@ -450,17 +322,6 @@ impl ConnectorRegistry {
             .ok_or_else(|| format!("unknown catalog backend: {name}"))
     }
 
-    pub(crate) fn register_table_source(&mut self, source: Arc<dyn TableSource>) {
-        self.table_sources.insert(source.name(), source);
-    }
-
-    pub(crate) fn table_source(&self, name: &str) -> Result<Arc<dyn TableSource>, String> {
-        self.table_sources
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("unknown table source: {name}"))
-    }
-
     pub(crate) fn register_table_sink(&mut self, sink: Arc<dyn TableSink>) {
         self.table_sinks.insert(sink.name(), sink);
     }
@@ -491,17 +352,6 @@ impl ConnectorRegistry {
             .map(|(_, backend)| Arc::clone(backend))
             .collect()
     }
-
-    pub(crate) fn register_scan_planner(&mut self, planner: Arc<dyn ConnectorScanPlanner>) {
-        self.scan_planners.insert(planner.name(), planner);
-    }
-
-    pub(crate) fn scan_planner(&self, name: &str) -> Result<Arc<dyn ConnectorScanPlanner>, String> {
-        self.scan_planners
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("unknown scan planner: {name}"))
-    }
 }
 
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
@@ -511,20 +361,19 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
             .connectors
             .write()
             .expect("standalone connector registry write lock");
+        #[cfg(feature = "compat")]
+        connectors
+            .register_connector_instance(
+                starrocks::table::provider::connector_instance(state)
+                    .expect("create standalone StarRocks connector instance"),
+            )
+            .expect("register standalone StarRocks connector instance");
         connectors.register_catalog_backend(Arc::new(
             iceberg::catalog::IcebergCatalogBackend::new(Arc::clone(&iceberg_catalogs)),
         ));
-        connectors.register_table_source(Arc::new(iceberg::catalog::IcebergTableSource::new(
-            Arc::clone(&iceberg_catalogs),
-        )));
         connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
             Arc::clone(&iceberg_catalogs),
         )));
-        connectors.register_scan_planner(Arc::new(
-            iceberg::IcebergConnectorScanPlanner::with_catalog_registry(Arc::clone(
-                &iceberg_catalogs,
-            )),
-        ));
         connectors.register_mv_backend(Arc::new(
             crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
         ));
@@ -547,20 +396,14 @@ impl std::fmt::Debug for ConnectorRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut catalog_backends: Vec<_> = self.catalog_backends.keys().copied().collect();
         catalog_backends.sort();
-        let mut table_sources: Vec<_> = self.table_sources.keys().copied().collect();
-        table_sources.sort();
         let mut table_sinks: Vec<_> = self.table_sinks.keys().copied().collect();
         table_sinks.sort();
         let mut mv_backends: Vec<_> = self.mv_backends.keys().copied().collect();
         mv_backends.sort();
-        let mut scan_planners: Vec<_> = self.scan_planners.keys().copied().collect();
-        scan_planners.sort();
         f.debug_struct("ConnectorRegistry")
             .field("catalog_backends", &catalog_backends)
-            .field("table_sources", &table_sources)
             .field("table_sinks", &table_sinks)
             .field("mv_backends", &mv_backends)
-            .field("scan_planners", &scan_planners)
             .finish()
     }
 }
