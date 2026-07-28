@@ -703,6 +703,7 @@ fn lower_node_with_children_typed(
                 query_global_dict_map,
                 out_layout,
                 context.decode_facts,
+                context.query_id,
             )?,
             t if t == plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE => {
                 if !children.is_empty() {

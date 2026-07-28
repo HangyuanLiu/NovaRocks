@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -26,11 +27,12 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError,
-    ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorRequestContext,
-    ConnectorScan, ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest,
-    ConnectorTableHandle,
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCancellation,
+    ConnectorError, ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+    ConnectorSplitPlanningRequest, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use crate::common::ids::SlotId;
@@ -51,6 +53,8 @@ use crate::exec::node::scan::{
 use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::runtime::profile::RuntimeProfile;
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
 
 const HDFS_SPI_PROVIDER_ID: &str = "hdfs";
@@ -407,6 +411,49 @@ pub(crate) fn plan_hdfs_read_source(
             Some(auxiliary),
         ),
     ))
+}
+
+struct HdfsQueryCancellation {
+    query_id: QueryId,
+}
+
+impl ConnectorCancellation for HdfsQueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        query_context_manager().is_query_canceled(self.query_id)
+    }
+}
+
+pub(crate) fn plan_starrocks_hdfs_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: QueryId,
+    node_id: i32,
+    config: HdfsInstanceConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let batch = ConnectorBatchBudget {
+        max_rows: rows,
+        max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+            .expect("SPI handle maximum is nonzero"),
+    };
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(HdfsQueryCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )?;
+    plan_hdfs_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("hdfs.{query_id}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
 }
 
 impl ConnectorRead for HdfsConnectorInstance {

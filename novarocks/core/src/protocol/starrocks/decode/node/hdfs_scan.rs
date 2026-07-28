@@ -23,6 +23,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::cache::{CacheOptions, DataCacheContext, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::connector::hdfs::{HdfsInstanceConfig, plan_starrocks_hdfs_read_source};
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
@@ -678,6 +679,7 @@ pub(crate) fn lower_hdfs_scan_node(
     query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+    query_id: Option<crate::runtime::query_context::QueryId>,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
@@ -1572,10 +1574,21 @@ pub(crate) fn lower_hdfs_scan_node(
         )
     });
 
-    let (source, bound_ranges) =
-        connectors.create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))?;
-    // Route the enriched ranges to the instance; bind at materialize time.
-    scan_ranges.capture(node.node_id, bound_ranges);
+    let query_id = query_id.ok_or_else(|| {
+        "HDFS_SCAN_NODE requires a query identity for connector cancellation".to_string()
+    })?;
+    let source = plan_starrocks_hdfs_read_source(
+        connectors,
+        query_id,
+        node.node_id,
+        HdfsInstanceConfig {
+            scan: cfg,
+            chunk_schema: output_chunk_schema.clone(),
+        },
+        query_opts,
+    )
+    .map_err(|error| error.to_string())?;
+    scan_ranges.capture(node.node_id, BoundScanRanges::None);
     let scan = ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
