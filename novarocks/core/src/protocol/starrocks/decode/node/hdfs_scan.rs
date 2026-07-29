@@ -48,10 +48,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
 };
-use crate::novarocks_connectors::{
-    ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsIcebergRuntimePruningConfig,
-    HdfsScanConfig, OrcScanConfig, ParquetScanConfig,
-};
+use crate::novarocks_connectors::{ConnectorRegistry, FileFormatConfig, FileScanRange, OrcScanConfig, ParquetScanConfig};
 use crate::novarocks_logging::{debug, warn};
 use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thrift;
 use crate::protocol::starrocks::decode::layout::{Layout, layout_from_slot_ids};

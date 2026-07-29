@@ -16,7 +16,6 @@
 // under the License.
 pub(crate) mod backend;
 pub(crate) mod file_execution;
-pub mod hdfs;
 pub(crate) mod host;
 pub mod iceberg;
 pub mod jdbc;
@@ -244,7 +243,6 @@ pub use crate::connector::file_execution::FileScanRange;
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
-pub use hdfs::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 pub use jdbc::JdbcScanConfig;
 #[cfg(feature = "compat")]
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
