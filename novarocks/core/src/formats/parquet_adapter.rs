@@ -915,7 +915,8 @@ fn validate_batch_slot_count(
 #[cfg(test)]
 mod file_read_contract_tests {
     use super::*;
-    use arrow::array::Int32Array;
+    use arrow::array::{Int32Array, TimestampMicrosecondArray};
+    use arrow::datatypes::TimeUnit;
     use std::collections::HashMap;
 
     fn predicate_config() -> ParquetScanConfig {
@@ -965,7 +966,7 @@ mod file_read_contract_tests {
     }
 
     #[test]
-    fn file_read_schema_adapter_materializes_missing_initial_default() {
+    fn file_read_schema_adapter_materializes_defaults_and_retags_timestamps() {
         let input = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("a", DataType::Int32, true).with_metadata(HashMap::from([(
@@ -998,5 +999,23 @@ mod file_read_contract_tests {
             .downcast_ref::<Int32Array>()
             .expect("int32 default");
         assert_eq!(defaulted.values(), &[99, 99]);
+
+        let target_type = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
+        let target_schema = Schema::new(vec![Field::new("ts", target_type.clone(), true)]);
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&target_schema, &[SlotId::new(1)])
+                .expect("timestamp chunk schema");
+        let physical = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            )])),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![Some(42)])) as ArrayRef],
+        )
+        .expect("physical timestamp batch");
+        let normalized =
+            normalize_batch_to_chunk_schema(physical, &chunk_schema).expect("normalize timestamp");
+        assert_eq!(normalized.column(0).data_type(), &target_type);
     }
 }
