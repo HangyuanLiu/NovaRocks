@@ -330,6 +330,12 @@ pub(crate) enum ScanMorselPruneDecision {
 }
 
 pub trait ScanOp: Send + Sync {
+    /// Starts terminal cleanup for readers owned by this scan operation. The
+    /// default keeps non-connector scan operators source-compatible.
+    fn terminate(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn execute_iter(
         &self,
         morsel: ScanMorsel,

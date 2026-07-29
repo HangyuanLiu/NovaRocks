@@ -668,11 +668,12 @@ impl Operator for ScanSourceOperator {
 
     fn cancel(&mut self) {
         self.async_state.cancel();
+        let _ = self.op.terminate();
     }
 
     fn close(&mut self) -> Result<(), String> {
         self.async_state.cancel();
-        Ok(())
+        self.op.terminate()
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
