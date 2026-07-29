@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -27,11 +29,16 @@ use crate::connector::hdfs::{HdfsInstanceConfig, plan_starrocks_hdfs_read_source
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
+use crate::connector::iceberg::provider::{COMPAT_ICEBERG_INSTANCE_ID, build_compat_read_splits};
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+};
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
     IcebergMetadataScanRange, IcebergMetadataTableType,
     build_projected_output_schema_from_descriptor, plan_compat_iceberg_metadata_read_source,
 };
+use crate::connector::runtime::ConnectorReadScanSource;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::fragment::program::ScanAssignmentKind;
 use crate::exec::node::scan::{BoundScanRanges, ScanNode};
@@ -53,10 +60,127 @@ use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
 use crate::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
-use crate::runtime::query_options::QueryOptions;
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
 use crate::thrift::{descriptors, exprs, plan_nodes, types};
 use novarocks_fs::DataCacheContext;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
+    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+
+struct CompatIcebergQueryCancellation {
+    query_id: QueryId,
+}
+
+impl ConnectorCancellation for CompatIcebergQueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        query_context_manager().is_query_canceled(self.query_id)
+    }
+}
+
+fn compat_iceberg_files_from_ranges(
+    node_id: i32,
+    ranges: Vec<FileScanRange>,
+) -> Result<Vec<IcebergDataFileInfo>, String> {
+    ranges
+        .into_iter()
+        .map(|range| {
+            if range.offset != 0 || (range.length != 0 && range.length != range.file_len) {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={node_id} Iceberg compatibility scan range must cover one complete data file"
+                ));
+            }
+            let delete_files = range
+                .delete_files
+                .into_iter()
+                .map(|delete| Ok(IcebergDeleteFileInfo {
+                    path: delete.path,
+                    file_format: match delete.file_format {
+                        IcebergFileFormat::Parquet => IcebergDeleteFileFormat::Parquet,
+                        IcebergFileFormat::Puffin => IcebergDeleteFileFormat::Puffin,
+                        IcebergFileFormat::Unknown => {
+                            return Err("Iceberg delete file has unknown format".to_string());
+                        }
+                    },
+                    file_content: match delete.file_content {
+                        IcebergFileContent::PositionDeletes => IcebergDeleteFileContent::Position,
+                        IcebergFileContent::EqualityDeletes => IcebergDeleteFileContent::Equality,
+                        IcebergFileContent::Data => {
+                            return Err("Iceberg delete attachment has data-file content".to_string());
+                        }
+                    },
+                    length: delete.length.and_then(|value| i64::try_from(value).ok()),
+                    content_offset: delete.content_offset,
+                    content_size_in_bytes: delete.content_size_in_bytes,
+                    sequence_number: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    equality_column_names: Vec::new(),
+                    equality_field_ids: Vec::new(),
+                }))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(IcebergDataFileInfo {
+                path: range.path,
+                size: i64::try_from(range.file_len).map_err(|_| "Iceberg data file length exceeds Int64")?,
+                row_count: None,
+                column_stats: None,
+                partition_spec_id: None,
+                partition_key: None,
+                first_row_id: range.first_row_id,
+                data_sequence_number: range.data_sequence_number,
+                ivm_change_op: range.ivm_change_op,
+                included_positions: range.included_positions,
+                delete_files,
+                manifest_path: None,
+                partition_values: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+fn plan_compat_iceberg_data_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: QueryId,
+    output_schema: ChunkSchemaRef,
+    files: Vec<IcebergDataFileInfo>,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn crate::exec::node::scan::ScanSource>, String> {
+    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)
+        .map_err(|error| error.to_string())?;
+    let instance = connectors
+        .connector_instance(&instance_id)
+        .map_err(|error| format!("compat Iceberg startup instance is unavailable: {error}"))?;
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(CompatIcebergQueryCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let splits = build_compat_read_splits(files).map_err(|error| error.to_string())?;
+    Ok(Arc::new(ConnectorReadScanSource::new(
+        instance,
+        splits,
+        ConnectorOpenReaderRequest {
+            expected_schema: output_schema.arrow_schema_ref(),
+            batch: ConnectorBatchBudget {
+                max_rows: rows,
+                max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+                    .expect("SPI handle maximum is nonzero"),
+            },
+            context,
+        },
+        output_schema,
+    )))
+}
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
     let max_slot = visible_slot_ids
@@ -731,6 +855,17 @@ pub(crate) fn lower_hdfs_scan_node(
     let iceberg_table_locations = IcebergTableLocationMap::from_snapshot(&desc_snapshot);
     let is_paimon = desc_snapshot.is_paimon_table_for_tuple(tuple_id);
     let is_iceberg_table = desc_snapshot.is_iceberg_table_for_tuple(tuple_id);
+    if !is_iceberg_table {
+        let table_kind = if is_paimon {
+            "Paimon"
+        } else {
+            "unknown external"
+        };
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={} {} scans are unsupported; compat supports only internal tables and explicit Iceberg descriptors",
+            node.node_id, table_kind
+        ));
+    }
     let hive_column_names = hdfs.hive_column_names.clone();
     let orc_use_column_names = query_opts.orc_use_column_names;
 
@@ -1336,6 +1471,39 @@ pub(crate) fn lower_hdfs_scan_node(
     }
     let original_range_count = ranges.len();
     apply_path_rewrite(&mut ranges, decode_facts.path_rewrite())?;
+    if is_iceberg_table {
+        if row_position_spec.is_some() {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={} Iceberg late row-position lookup is not yet carried as an opaque connector split",
+                node.node_id
+            ));
+        }
+        let query_id = query_id.ok_or_else(|| {
+            "HDFS_SCAN_NODE requires a query identity for connector cancellation".to_string()
+        })?;
+        let output_chunk_schema = chunk_schema_for_snapshot_layout(&out_layout, &slot_info_map)?;
+        let files = compat_iceberg_files_from_ranges(node.node_id, ranges)?;
+        let source = plan_compat_iceberg_data_read_source(
+            connectors,
+            query_id,
+            output_chunk_schema.clone(),
+            files,
+            query_opts,
+        )?;
+        scan_ranges.capture(node.node_id, BoundScanRanges::None);
+        let scan = ScanNode::new(source)
+            .with_node_id(node.node_id)
+            .with_output_chunk_schema(output_chunk_schema)
+            .with_limit(limit)
+            .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
+            .with_accept_empty_scan_ranges(true);
+        return Ok(Lowered {
+            node: ExecNode {
+                kind: ExecNodeKind::Scan(scan),
+            },
+            layout: out_layout,
+        });
+    }
     let mut enable_page_index = query_opts.enable_parquet_reader_page_index;
 
     let pruning_predicates = parse_hdfs_scan_pruning_predicates(
@@ -1642,4 +1810,68 @@ fn output_slots_from_layout(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compat_iceberg_normalization_preserves_delete_and_lineage_facts() {
+        let files = compat_iceberg_files_from_ranges(
+            7,
+            vec![FileScanRange {
+                path: "s3://warehouse/data.parquet".to_string(),
+                file_len: 128,
+                offset: 0,
+                length: 128,
+                scan_range_id: -1,
+                first_row_id: Some(100),
+                data_sequence_number: Some(9),
+                ivm_change_op: None,
+                included_positions: Some(vec![4, 8]),
+                external_datacache: None,
+                delete_files: vec![IcebergDeleteFileSpec::puffin_position_delete(
+                    "s3://warehouse/delete.puffin".to_string(),
+                    Some(64),
+                    12,
+                    34,
+                )],
+                iceberg_file_pruning: None,
+            }],
+        )
+        .expect("normalize Iceberg compatibility facts");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].first_row_id, Some(100));
+        assert_eq!(files[0].data_sequence_number, Some(9));
+        assert_eq!(files[0].included_positions, Some(vec![4, 8]));
+        assert_eq!(files[0].delete_files.len(), 1);
+        assert_eq!(
+            files[0].delete_files[0].file_format,
+            IcebergDeleteFileFormat::Puffin
+        );
+    }
+
+    #[test]
+    fn compat_iceberg_normalization_rejects_partial_data_file() {
+        let error = compat_iceberg_files_from_ranges(
+            8,
+            vec![FileScanRange {
+                path: "file:///tmp/data.parquet".to_string(),
+                file_len: 128,
+                offset: 64,
+                length: 64,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: None,
+            }],
+        )
+        .expect_err("partial compatibility range must not bypass Iceberg coordinates");
+        assert!(error.contains("complete data file"));
+    }
 }
