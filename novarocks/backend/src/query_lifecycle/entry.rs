@@ -56,6 +56,7 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
     pub(crate) events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
+    pub(crate) terminal_event_permit: Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
 }
 
 impl QueryLifecycleEntry {
@@ -81,6 +82,7 @@ impl QueryLifecycleEntry {
                 last_heartbeat: None,
                 frontend_owner_epoch: None,
                 events: None,
+                terminal_event_permit: None,
             }),
             init_completed: Condvar::new(),
         }

@@ -303,7 +303,10 @@ pub trait QueryLifecycleIngress: Send + Sync + 'static {
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
 
-    fn abort_query(&self, request: QueryAbortRequest) -> QueryTerminationAck;
+    fn abort_query(
+        &self,
+        request: QueryAbortRequest,
+    ) -> Result<QueryTerminationAck, QueryLifecycleError>;
 
     fn attach_control(
         &self,

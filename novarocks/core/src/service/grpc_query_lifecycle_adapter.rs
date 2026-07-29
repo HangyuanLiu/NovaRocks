@@ -26,8 +26,8 @@ use crate::query_execution::lifecycle::contract::{
     encode_query_init_response,
 };
 use crate::query_execution::lifecycle::{
-    BackendQueryControl, QueryControlCommand, QueryControlEvent, QueryInitOutcome,
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminationReason,
+    BackendQueryControl, QueryControlCommand, QueryControlEvent, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminationReason,
 };
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
@@ -38,39 +38,36 @@ pub(crate) type QueryControlResponseStream =
 pub(crate) fn handle_init_query(
     ingress: &dyn QueryLifecycleIngress,
     request: novarocks::InitQueryRequest,
-) -> novarocks::InitQueryResponse {
-    match decode_query_init_request(&request) {
-        Ok(request) => encode_query_init_response(&ingress.init_query(request)),
-        Err(_) => novarocks::InitQueryResponse {
-            execution_id: request.manifest.and_then(|manifest| manifest.execution_id),
-            init_digest: request.init_digest,
-            outcome: encode_init_outcome(QueryInitOutcome::RejectedInvalidManifest),
-        },
-    }
+) -> Result<novarocks::InitQueryResponse, tonic::Status> {
+    let request = decode_query_init_request(&request).map_err(status_from_lifecycle_error)?;
+    Ok(encode_query_init_response(&ingress.init_query(request)))
 }
 
 pub(crate) fn handle_abort_query(
     ingress: &dyn QueryLifecycleIngress,
     request: novarocks::AbortQueryRequest,
-) -> novarocks::AbortQueryResponse {
-    match decode_abort_query_request(&request) {
-        Ok(request) => encode_abort_query_response(&ingress.abort_query(request)),
-        Err(_) => novarocks::AbortQueryResponse {
-            execution_id: request.execution_id,
-            accepted_reason: novarocks::QueryTerminationReason::Unspecified as i32,
-        },
-    }
+) -> Result<novarocks::AbortQueryResponse, tonic::Status> {
+    let request = decode_abort_query_request(&request).map_err(status_from_lifecycle_error)?;
+    let response = ingress
+        .abort_query(request)
+        .map_err(status_from_lifecycle_error)?;
+    Ok(encode_abort_query_response(&response))
 }
 
 pub(crate) async fn handle_query_control_stream(
     ingress: Arc<dyn QueryLifecycleIngress>,
     mut inbound: tonic::Streaming<novarocks::QueryControlRequest>,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<QueryControlResponseStream, tonic::Status> {
-    let first = inbound
-        .message()
-        .await
-        .map_err(|error| tonic::Status::invalid_argument(format!("read attach frame: {error}")))?
-        .ok_or_else(|| tonic::Status::failed_precondition("first frame must be Attach"))?;
+    let first = tokio::select! {
+        biased;
+        _ = wait_for_query_control_shutdown(&mut shutdown) => {
+            return Err(tonic::Status::unavailable("query control server is shutting down"));
+        }
+        first = inbound.message() => first,
+    }
+    .map_err(|error| tonic::Status::invalid_argument(format!("read attach frame: {error}")))?
+    .ok_or_else(|| tonic::Status::failed_precondition("first frame must be Attach"))?;
     if !matches!(
         first.command,
         Some(novarocks::query_control_request::Command::Attach(_))
@@ -90,6 +87,7 @@ pub(crate) async fn handle_query_control_stream(
         lease,
         attachment.events,
         outbound_tx,
+        shutdown,
     ));
     Ok(ReceiverStream::new(outbound_rx))
 }
@@ -99,27 +97,41 @@ async fn run_attached_control_stream(
     mut lease: CoordinatorLease,
     mut events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
     outbound: tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
-    let Some(first_event) = events.recv().await else {
-        let _ = outbound
-            .send(Err(tonic::Status::internal(
+    let first_event = tokio::select! {
+        biased;
+        _ = wait_for_query_control_shutdown(&mut shutdown) => return,
+        event = events.recv() => event,
+    };
+    let Some(first_event) = first_event else {
+        let _ = send_control_response(
+            &outbound,
+            Err(tonic::Status::internal(
                 "query control event stream closed before ControlReady",
-            )))
-            .await;
+            )),
+            &mut shutdown,
+        )
+        .await;
         return;
     };
     if first_event != QueryControlEvent::ControlReady {
-        let _ = outbound
-            .send(Err(tonic::Status::internal(
+        let _ = send_control_response(
+            &outbound,
+            Err(tonic::Status::internal(
                 "query control event stream did not begin with ControlReady",
-            )))
-            .await;
+            )),
+            &mut shutdown,
+        )
+        .await;
         return;
     }
-    if outbound
-        .send(Ok(encode_query_control_event(&first_event)))
-        .await
-        .is_err()
+    if !send_control_response(
+        &outbound,
+        Ok(encode_query_control_event(&first_event)),
+        &mut shutdown,
+    )
+    .await
     {
         return;
     }
@@ -127,15 +139,22 @@ async fn run_attached_control_stream(
     let mut awaiting_graceful_termination = false;
     loop {
         if awaiting_graceful_termination {
-            let Some(event) = events.recv().await else {
+            let event = tokio::select! {
+                biased;
+                _ = wait_for_query_control_shutdown(&mut shutdown) => break,
+                event = events.recv() => event,
+            };
+            let Some(event) = event else {
                 break;
             };
             let termination_accepted =
                 matches!(event, QueryControlEvent::TerminationAccepted { .. });
-            if outbound
-                .send(Ok(encode_query_control_event(&event)))
-                .await
-                .is_err()
+            if !send_control_response(
+                &outbound,
+                Ok(encode_query_control_event(&event)),
+                &mut shutdown,
+            )
+            .await
             {
                 break;
             }
@@ -146,16 +165,23 @@ async fn run_attached_control_stream(
             continue;
         }
         tokio::select! {
+            biased;
+            _ = wait_for_query_control_shutdown(&mut shutdown) => {
+                break;
+            }
             inbound_message = inbound.message() => {
                 let request = match inbound_message {
                     Ok(Some(request)) => request,
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = outbound
-                            .send(Err(tonic::Status::invalid_argument(format!(
+                        let _ = send_control_response(
+                            &outbound,
+                            Err(tonic::Status::invalid_argument(format!(
                                 "read query control command: {error}"
-                            ))))
-                            .await;
+                            ))),
+                            &mut shutdown,
+                        )
+                        .await;
                         break;
                     }
                 };
@@ -163,17 +189,25 @@ async fn run_attached_control_stream(
                     request.command,
                     Some(novarocks::query_control_request::Command::Attach(_))
                 ) {
-                    let _ = outbound
-                        .send(Err(tonic::Status::already_exists(
+                    let _ = send_control_response(
+                        &outbound,
+                        Err(tonic::Status::already_exists(
                             "Attach may appear exactly once",
-                        )))
-                        .await;
+                        )),
+                        &mut shutdown,
+                    )
+                    .await;
                     break;
                 }
                 let command = match decode_query_control_command(&request) {
                     Ok(command) => command,
                     Err(error) => {
-                        let _ = outbound.send(Err(status_from_lifecycle_error(error))).await;
+                        let _ = send_control_response(
+                            &outbound,
+                            Err(status_from_lifecycle_error(error)),
+                            &mut shutdown,
+                        )
+                        .await;
                         break;
                     }
                 };
@@ -191,7 +225,12 @@ async fn run_attached_control_stream(
                     }
                 };
                 if let Err(error) = result {
-                    let _ = outbound.send(Err(status_from_lifecycle_error(error))).await;
+                    let _ = send_control_response(
+                        &outbound,
+                        Err(status_from_lifecycle_error(error)),
+                        &mut shutdown,
+                    )
+                    .await;
                     break;
                 }
             }
@@ -201,18 +240,49 @@ async fn run_attached_control_stream(
                 };
                 let termination_accepted =
                     matches!(event, QueryControlEvent::TerminationAccepted { .. });
-                if outbound
-                    .send(Ok(encode_query_control_event(&event)))
-                    .await
-                    .is_err()
+                if !send_control_response(
+                    &outbound,
+                    Ok(encode_query_control_event(&event)),
+                    &mut shutdown,
+                )
+                .await
                 {
                     break;
                 }
-                if termination_accepted && awaiting_graceful_termination {
+                if termination_accepted {
                     lease.mark_graceful();
                     break;
                 }
             }
+        }
+    }
+}
+
+async fn send_control_response(
+    outbound: &tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
+    response: Result<novarocks::QueryControlResponse, tonic::Status>,
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = wait_for_query_control_shutdown(shutdown) => false,
+        result = outbound.send(response) => result.is_ok(),
+    }
+}
+
+async fn wait_for_query_control_shutdown(
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let Some(shutdown) = shutdown.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -260,29 +330,5 @@ pub(crate) fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::
         QueryLifecycleErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
         QueryLifecycleErrorCode::Transport => tonic::Status::unavailable(detail),
         QueryLifecycleErrorCode::Internal => tonic::Status::internal(detail),
-    }
-}
-
-fn encode_init_outcome(outcome: QueryInitOutcome) -> i32 {
-    match outcome {
-        QueryInitOutcome::Applied => novarocks::QueryInitOutcome::QueryInitApplied as i32,
-        QueryInitOutcome::AlreadyApplied => {
-            novarocks::QueryInitOutcome::QueryInitAlreadyApplied as i32
-        }
-        QueryInitOutcome::RejectedConflict => {
-            novarocks::QueryInitOutcome::QueryInitRejectedConflict as i32
-        }
-        QueryInitOutcome::RejectedStaleBackend => {
-            novarocks::QueryInitOutcome::QueryInitRejectedStaleBackend as i32
-        }
-        QueryInitOutcome::RejectedCapacity => {
-            novarocks::QueryInitOutcome::QueryInitRejectedCapacity as i32
-        }
-        QueryInitOutcome::RejectedInvalidManifest => {
-            novarocks::QueryInitOutcome::QueryInitRejectedInvalidManifest as i32
-        }
-        QueryInitOutcome::RejectedTerminated => {
-            novarocks::QueryInitOutcome::QueryInitRejectedTerminated as i32
-        }
     }
 }

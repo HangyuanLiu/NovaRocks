@@ -212,8 +212,8 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
-        let sweep_result = self.query_lifecycle_sweep.stop();
         let resource_result = stop_backend_resources();
+        let sweep_result = self.query_lifecycle_sweep.stop();
         combine_shutdown_results(sweep_result, resource_result).map_err(|error| {
             BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
         })
@@ -450,7 +450,8 @@ mod tests {
     use novarocks::common::app_config::NovaRocksConfig;
     use novarocks::proto::common::{Status, UniqueId};
     use novarocks::proto::novarocks::{
-        ExecStatusReport, HeartbeatRequest, ReportExecStatusRequest,
+        AbortQueryRequest as ProtoAbortQueryRequest, ExecStatusReport, HeartbeatRequest,
+        InitQueryRequest as ProtoInitQueryRequest, ReportExecStatusRequest,
     };
     use novarocks::query_execution::contract::QueryId;
     use novarocks::query_execution::lifecycle::contract::{
@@ -723,6 +724,19 @@ mod tests {
             .expect("ControlReady");
 
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            decode_query_control_event(
+                &tokio::time::timeout(std::time::Duration::from_secs(1), events.message())
+                    .await
+                    .expect("timeout termination event arrives")
+                    .expect("read timeout termination event")
+                    .expect("timeout TerminationAccepted")
+            )
+            .expect("decode timeout termination event"),
+            QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorHeartbeatTimeout
+            }
+        );
         let termination = client
             .abort_query(encode_abort_query_request(
                 &QueryAbortRequest::new(
@@ -739,6 +753,194 @@ mod tests {
             termination.accepted_reason,
             novarocks::proto::novarocks::QueryTerminationReason::
                 QueryTerminationCoordinatorHeartbeatTimeout as i32
+        );
+
+        drop(events);
+        drop(commands);
+        host.shutdown().expect("native backend shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_shutdown_closes_live_query_control_stream_and_fails_closed() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
+            .expect("native backend host starts");
+        let registry = Arc::clone(&host._query_lifecycle_registry);
+        let mut client = connect_live_client(grpc_port).await;
+        let heartbeat = client
+            .heartbeat(HeartbeatRequest {
+                assigned_be_id: 7,
+                fe_epoch: 1,
+            })
+            .await
+            .expect("bind backend identity")
+            .into_inner();
+        let init = live_query_init_request(heartbeat.start_epoch, 903);
+        client
+            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .await
+            .expect("InitQuery succeeds");
+        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
+            .expect("valid Attach");
+        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
+        commands
+            .send(encode_query_control_attach(&attach))
+            .await
+            .expect("send Attach");
+        let mut events = client
+            .query_control_stream(ReceiverStream::new(command_rx))
+            .await
+            .expect("attach QueryControlStream")
+            .into_inner();
+        let _ = events
+            .message()
+            .await
+            .expect("read ControlReady")
+            .expect("ControlReady");
+        for sequence in 1..=17 {
+            commands
+                .send(encode_query_control_command(
+                    &QueryControlCommand::Heartbeat {
+                        sequence,
+                        sent_mono_ns: sequence,
+                    },
+                ))
+                .await
+                .expect("send heartbeat without draining ACKs");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown_thread = std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let early_shutdown = shutdown_rx.recv_timeout(std::time::Duration::from_millis(500));
+        let returned_while_stream_live = early_shutdown.is_ok();
+
+        // Always release the old implementation's graceful-shutdown wait so RED
+        // leaves no global listener or detached thread behind.
+        drop(events);
+        drop(commands);
+        let shutdown = match early_shutdown {
+            Ok(result) => result,
+            Err(_) => shutdown_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("shutdown completes after releasing the stream"),
+        };
+        shutdown_thread.join().expect("join shutdown thread");
+        shutdown.expect("native backend shutdown");
+        assert!(
+            returned_while_stream_live,
+            "host shutdown must not wait indefinitely for a live bidi stream"
+        );
+
+        let termination = registry
+            .abort_query(
+                QueryAbortRequest::new(
+                    init.manifest().execution_id(),
+                    init.digest(),
+                    "observe fail-closed shutdown",
+                )
+                .expect("valid abort request"),
+            )
+            .expect("observe latched shutdown termination");
+        assert_eq!(
+            termination.accepted_reason(),
+            QueryTerminationReason::CoordinatorStreamLost
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_malformed_init_query_returns_invalid_argument() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
+            .expect("native backend host starts");
+        let mut client = connect_live_client(grpc_port).await;
+
+        let error = client
+            .init_query(ProtoInitQueryRequest::default())
+            .await
+            .expect_err("malformed InitQuery must be a transport-visible error");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        host.shutdown().expect("native backend shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_malformed_abort_query_returns_invalid_argument() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
+            .expect("native backend host starts");
+        let mut client = connect_live_client(grpc_port).await;
+
+        let error = client
+            .abort_query(ProtoAbortQueryRequest::default())
+            .await
+            .expect_err("malformed AbortQuery must be a transport-visible error");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        host.shutdown().expect("native backend shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_abort_digest_mismatch_is_rejected_without_terminating_entry() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
+            .expect("native backend host starts");
+        let mut client = connect_live_client(grpc_port).await;
+        let heartbeat = client
+            .heartbeat(HeartbeatRequest {
+                assigned_be_id: 7,
+                fe_epoch: 1,
+            })
+            .await
+            .expect("bind backend identity")
+            .into_inner();
+        let init = live_query_init_request(heartbeat.start_epoch, 904);
+        let different = live_query_init_request(heartbeat.start_epoch, 905);
+        client
+            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .await
+            .expect("InitQuery succeeds");
+
+        let mismatch = QueryAbortRequest::new(
+            init.manifest().execution_id(),
+            different.digest(),
+            "mismatched digest",
+        )
+        .expect("valid mismatched abort");
+        let error = client
+            .abort_query(encode_abort_query_request(&mismatch))
+            .await
+            .expect_err("digest mismatch must be rejected");
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+
+        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
+            .expect("valid Attach");
+        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
+        commands
+            .send(encode_query_control_attach(&attach))
+            .await
+            .expect("send Attach");
+        let mut events = client
+            .query_control_stream(ReceiverStream::new(command_rx))
+            .await
+            .expect("mismatched abort leaves entry attachable")
+            .into_inner();
+        assert_eq!(
+            decode_query_control_event(
+                &events
+                    .message()
+                    .await
+                    .expect("read ControlReady")
+                    .expect("ControlReady")
+            )
+            .expect("decode ControlReady"),
+            QueryControlEvent::ControlReady
         );
 
         drop(events);

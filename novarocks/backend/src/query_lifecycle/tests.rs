@@ -23,9 +23,9 @@ use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
     AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-    ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint, QueryExecutionId,
-    QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryTerminationReason, RuntimeFilterContribution,
+    ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
+    QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryTerminationReason, RuntimeFilterContribution,
 };
 use novarocks::runtime::query_options::QueryOptions;
 
@@ -384,6 +384,74 @@ fn query_lifecycle_registry_same_digest_init_is_idempotent_and_installs_once() {
 }
 
 #[test]
+fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = init_request_fixture(101, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let different = init_request_fixture(102, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+
+    assert_eq!(
+        registry
+            .abort_query(
+                QueryAbortRequest::new(
+                    request.manifest().execution_id(),
+                    different.digest(),
+                    "mismatched digest must not terminate",
+                )
+                .expect("valid mismatched abort request"),
+            )
+            .expect_err("digest mismatch is rejected")
+            .code(),
+        QueryLifecycleErrorCode::Conflict
+    );
+
+    registry
+        .attach_control(
+            QueryControlAttach::new(request.manifest().execution_id(), request.digest(), 1)
+                .expect("valid control attach"),
+        )
+        .expect("digest mismatch must leave the live entry attachable");
+}
+
+#[test]
+fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = init_request_fixture(103, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+
+    // ControlReady plus sixteen ACKs saturate the normal event budget while the
+    // dedicated terminal permit remains reserved.
+    for sequence in 1..=16 {
+        attachment
+            .control
+            .heartbeat(sequence)
+            .expect("heartbeat ACK fits the normal event budget");
+    }
+    attachment
+        .control
+        .abort("saturated event queue".to_string())
+        .expect("abort is accepted despite ACK backpressure");
+
+    let mut events = Vec::new();
+    while let Ok(event) = attachment.events.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        events.contains(&QueryControlEvent::TerminationAccepted {
+            reason: QueryTerminationReason::CoordinatorAbort,
+        }),
+        "terminal acceptance must not be dropped behind heartbeat ACKs: {events:?}"
+    );
+}
+
+#[test]
 fn query_lifecycle_registry_different_digest_conflicts() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
@@ -498,10 +566,12 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
     let init_thread = std::thread::spawn(move || init_registry.init_query(request));
     runtime.wait_until_install_enters();
 
-    let termination = registry.abort_query(
-        QueryAbortRequest::new(execution_id, digest, "cancel init race")
-            .expect("valid abort request"),
-    );
+    let termination = registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, digest, "cancel init race")
+                .expect("valid abort request"),
+        )
+        .expect("abort is accepted");
     assert_eq!(
         termination.accepted_reason(),
         QueryTerminationReason::CoordinatorAbort
@@ -542,10 +612,12 @@ fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
     runtime.wait_until_install_enters();
     assert_eq!(metrics.last_snapshot().initializing, 1);
 
-    registry.abort_query(
-        QueryAbortRequest::new(execution_id, digest, "metrics while init blocks")
-            .expect("valid abort"),
-    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, digest, "metrics while init blocks")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
     let terminating = metrics.last_snapshot();
     assert_eq!(terminating.initializing, 0);
     assert_eq!(terminating.terminating, 1);
@@ -668,10 +740,12 @@ fn query_lifecycle_admission_commit_after_abort_returns_terminated() {
         .admit_fragment(execution_id, expected)
         .expect("fragment permit");
 
-    registry.abort_query(
-        QueryAbortRequest::new(execution_id, request.digest(), "abort before permit commit")
-            .expect("valid abort"),
-    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, request.digest(), "abort before permit commit")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
 
     assert_eq!(
         permit
@@ -713,10 +787,12 @@ fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
         panic!("duplicate active attach must conflict");
     };
     assert_eq!(duplicate_error.code(), QueryLifecycleErrorCode::Conflict);
-    registry.abort_query(
-        QueryAbortRequest::new(execution_id, request.digest(), "terminate before attach")
-            .expect("valid abort"),
-    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, request.digest(), "terminate before attach")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
     let Err(terminated_error) = registry.attach_control(attach) else {
         panic!("terminated attach must be terminal");
     };
@@ -748,10 +824,12 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
             registry.init_query(request.clone()).outcome(),
             QueryInitOutcome::Applied
         );
-        registry.abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "bounded tombstone")
-                .expect("valid abort"),
-        );
+        registry
+            .abort_query(
+                QueryAbortRequest::new(execution_id, request.digest(), "bounded tombstone")
+                    .expect("valid abort"),
+            )
+            .expect("abort is accepted");
         terminated.push(execution_id);
     }
 
@@ -769,14 +847,16 @@ fn query_lifecycle_tombstone_releases_active_capacity() {
         registry.init_query(first.clone()).outcome(),
         QueryInitOutcome::Applied
     );
-    registry.abort_query(
-        QueryAbortRequest::new(
-            first.manifest().execution_id(),
-            first.digest(),
-            "release capacity",
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                first.manifest().execution_id(),
+                first.digest(),
+                "release capacity",
+            )
+            .expect("valid abort"),
         )
-        .expect("valid abort"),
-    );
+        .expect("abort is accepted");
 
     assert_eq!(
         registry
@@ -809,10 +889,12 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
         registry.init_query(terminated.clone()).outcome(),
         QueryInitOutcome::Applied
     );
-    registry.abort_query(
-        QueryAbortRequest::new(terminated_id, terminated.digest(), "retention")
-            .expect("valid abort"),
-    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(terminated_id, terminated.digest(), "retention")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
     assert!(registry.contains(terminated_id));
 
     clock.advance(Duration::from_millis(11));
@@ -967,10 +1049,12 @@ fn query_lifecycle_registry_metrics_follow_state_rejection_and_termination() {
     assert_eq!(attached.initialized, 0);
     assert_eq!(attached.control_attached, 1);
 
-    registry.abort_query(
-        QueryAbortRequest::new(execution_id, request.digest(), "metrics termination")
-            .expect("valid abort"),
-    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, request.digest(), "metrics termination")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
     let terminated = registry.metrics_snapshot();
     assert_eq!(terminated.control_attached, 0);
     assert_eq!(terminated.tombstones, 1);
@@ -1087,10 +1171,12 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
     );
     runtime.fail_abort();
 
-    registry.abort_query(
-        QueryAbortRequest::new(execution_id, request.digest(), "abort with cleanup failure")
-            .expect("valid abort"),
-    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, request.digest(), "abort with cleanup failure")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
 
     assert_eq!(
         registry.phase(execution_id),
@@ -1177,6 +1263,7 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_and_clean
                 QueryAbortRequest::new(execution_id, digest, "abort failed install")
                     .expect("valid abort"),
             )
+            .expect("abort is accepted")
             .accepted_reason(),
         QueryTerminationReason::CoordinatorAbort
     );
@@ -1212,10 +1299,12 @@ fn query_lifecycle_registry_abort_before_init_leaves_fail_closed_tombstone() {
     let registry = registry_with(runtime.clone(), 8);
     let request = init_request_fixture(98, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
-    registry.abort_query(
-        QueryAbortRequest::new(execution_id, request.digest(), "abort before init")
-            .expect("valid abort"),
-    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, request.digest(), "abort before init")
+                .expect("valid abort"),
+        )
+        .expect("abort-before-init is accepted");
 
     assert_eq!(
         registry.init_query(request).outcome(),

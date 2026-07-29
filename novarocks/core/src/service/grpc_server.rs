@@ -144,11 +144,14 @@ impl QueryLifecycleIngress for RejectingTestQueryLifecycleIngress {
     fn abort_query(
         &self,
         request: crate::query_execution::lifecycle::QueryAbortRequest,
-    ) -> crate::query_execution::lifecycle::QueryTerminationAck {
-        crate::query_execution::lifecycle::QueryTerminationAck::new(
+    ) -> Result<
+        crate::query_execution::lifecycle::QueryTerminationAck,
+        crate::query_execution::lifecycle::QueryLifecycleError,
+    > {
+        Ok(crate::query_execution::lifecycle::QueryTerminationAck::new(
             request.execution_id(),
             crate::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
-        )
+        ))
     }
 
     fn attach_control(
@@ -269,6 +272,7 @@ pub struct GrpcService {
     allow_local_execution: bool,
     native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
     query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
+    query_control_shutdown: Option<watch::Receiver<bool>>,
     report_handler: Arc<dyn NativeReportHandler>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
@@ -352,6 +356,7 @@ impl GrpcService {
             allow_local_execution,
             native_fragment_ingress,
             query_lifecycle_ingress,
+            query_control_shutdown: None,
             report_handler,
             runtime_filter_envelope_ingress,
             runtime_filter_deployment_ingress,
@@ -437,6 +442,11 @@ impl GrpcService {
         self.query_lifecycle_ingress.clone().ok_or_else(|| {
             tonic::Status::failed_precondition("query lifecycle ingress is not configured")
         })
+    }
+
+    fn with_query_control_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.query_control_shutdown = Some(shutdown);
+        self
     }
 }
 
@@ -1207,7 +1217,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 .await
                 .map_err(|error| {
                     tonic::Status::internal(format!("init_query handler panicked: {error}"))
-                })?;
+                })??;
         Ok(tonic::Response::new(response))
     }
 
@@ -1222,7 +1232,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 .await
                 .map_err(|error| {
                     tonic::Status::internal(format!("abort_query handler panicked: {error}"))
-                })?;
+                })??;
         Ok(tonic::Response::new(response))
     }
 
@@ -1231,8 +1241,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         request: tonic::Request<tonic::Streaming<proto::novarocks::QueryControlRequest>>,
     ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
         let ingress = self.require_query_lifecycle("QueryControlStream")?;
-        let stream: QueryControlResponseStream =
-            handle_query_control_stream(ingress, request.into_inner()).await?;
+        let stream: QueryControlResponseStream = handle_query_control_stream(
+            ingress,
+            request.into_inner(),
+            self.query_control_shutdown.clone(),
+        )
+        .await?;
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 
@@ -1679,12 +1693,14 @@ fn start_grpc_http_server(
                 let listener = TokioTcpListener::from_std(std_listener)
                     .map_err(|error| format!("create grpc/http tokio listener failed: {error}"))?;
                 let mut http_shutdown = shutdown_rx.clone();
+                let query_control_shutdown = shutdown_rx.clone();
 
                 let svc = GrpcService::with_fragment_execution(
                     native_fragment_ingress,
                     query_lifecycle_ingress,
                     report_handler,
-                );
+                )
+                .with_query_control_shutdown(query_control_shutdown);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -2294,8 +2310,11 @@ fn start_standalone_grpc_server(
                     format!("create standalone grpc/http tokio listener failed: {error}")
                 })?;
                 let mut shutdown = shutdown_rx.clone();
+                let query_control_shutdown = shutdown_rx.clone();
 
-                let svc = mode.service(report_handler);
+                let svc = mode
+                    .service(report_handler)
+                    .with_query_control_shutdown(query_control_shutdown);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -3039,11 +3058,14 @@ mod pr3_tests {
             QueryInitAck::new(execution_id, digest, QueryInitOutcome::Applied)
         }
 
-        fn abort_query(&self, request: QueryAbortRequest) -> QueryTerminationAck {
-            QueryTerminationAck::new(
+        fn abort_query(
+            &self,
+            request: QueryAbortRequest,
+        ) -> Result<QueryTerminationAck, QueryLifecycleError> {
+            Ok(QueryTerminationAck::new(
                 request.execution_id(),
                 QueryTerminationReason::CoordinatorAbort,
-            )
+            ))
         }
 
         fn attach_control(

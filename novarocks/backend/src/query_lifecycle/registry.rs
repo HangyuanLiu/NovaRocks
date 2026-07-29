@@ -32,6 +32,8 @@ use novarocks::query_execution::lifecycle::{
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 
+const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
+
 pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
     fn install_runtime_filter(
         &self,
@@ -423,7 +425,10 @@ impl QueryLifecycleRegistry {
         QueryInitAck::new(execution_id, digest, outcome)
     }
 
-    pub(crate) fn abort_query(&self, request: QueryAbortRequest) -> QueryTerminationAck {
+    pub(crate) fn abort_query(
+        &self,
+        request: QueryAbortRequest,
+    ) -> Result<QueryTerminationAck, QueryLifecycleError> {
         let execution_id = request.execution_id();
         let entry = {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
@@ -465,14 +470,18 @@ impl QueryLifecycleRegistry {
                     "backend query lifecycle terminated before init"
                 );
                 self.publish_metrics();
-                return QueryTerminationAck::new(execution_id, reason);
+                return Ok(QueryTerminationAck::new(execution_id, reason));
             }
         };
-        let reason = self.request_termination(
-            entry.expect("existing entry"),
-            QueryTerminationReason::CoordinatorAbort,
-        );
-        QueryTerminationAck::new(execution_id, reason)
+        let entry = entry.expect("existing entry");
+        if entry.digest != request.digest() {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "abort digest conflicts with initialized manifest",
+            ));
+        }
+        let reason = self.request_termination(entry, QueryTerminationReason::CoordinatorAbort);
+        Ok(QueryTerminationAck::new(execution_id, reason))
     }
 
     pub(crate) fn attach_control(
@@ -502,7 +511,21 @@ impl QueryLifecycleRegistry {
                 "digest_mismatch",
             ));
         }
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(CONTROL_EVENT_BUFFER_CAPACITY + 2);
+        events_tx
+            .try_send(QueryControlEvent::ControlReady)
+            .map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Internal,
+                    format!("publish ControlReady failed: {error}"),
+                )
+            })?;
+        let terminal_event_permit = events_tx.clone().try_reserve_owned().map_err(|error| {
+            QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Internal,
+                format!("reserve terminal control event failed: {error}"),
+            )
+        })?;
         {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             match state.phase {
@@ -532,6 +555,7 @@ impl QueryLifecycleRegistry {
             state.frontend_owner_epoch = Some(attach.frontend_owner_epoch());
             state.last_heartbeat = Some(self.clock.now());
             state.events = Some(events_tx.clone());
+            state.terminal_event_permit = Some(terminal_event_permit);
             if !entry
                 .manifest
                 .roles()
@@ -540,14 +564,6 @@ impl QueryLifecycleRegistry {
                 state.pre_start_deadline = None;
             }
         }
-        events_tx
-            .try_send(QueryControlEvent::ControlReady)
-            .map_err(|error| {
-                QueryLifecycleError::new(
-                    QueryLifecycleErrorCode::Internal,
-                    format!("publish ControlReady failed: {error}"),
-                )
-            })?;
         info!(
             target: "novarocks::query_lifecycle",
             query_id = ?attach.execution_id().query_id(),
@@ -754,7 +770,7 @@ impl QueryLifecycleRegistry {
         entry: Arc<QueryLifecycleEntry>,
         requested_reason: QueryTerminationReason,
     ) -> QueryTerminationReason {
-        let (execution_id, expected_instances, initializing) = {
+        let (execution_id, expected_instances, initializing, terminal_event_permit) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if let Some(reason) = state.termination_reason {
                 return reason;
@@ -774,9 +790,15 @@ impl QueryLifecycleRegistry {
                     .copied()
                     .collect::<Vec<_>>(),
                 initializing,
+                state.terminal_event_permit.take(),
             )
         };
 
+        if let Some(permit) = terminal_event_permit {
+            drop(permit.send(QueryControlEvent::TerminationAccepted {
+                reason: requested_reason,
+            }));
+        }
         self.publish_metrics();
         self.local_runtime
             .terminate_query(execution_id, &expected_instances, requested_reason);
@@ -983,6 +1005,12 @@ impl QueryLifecycleRegistry {
         reason: QueryTerminationReason,
     ) -> Result<(), QueryLifecycleError> {
         let entry = self.active_entry(execution_id)?;
+        let repeated = entry
+            .state
+            .lock()
+            .expect("query lifecycle entry lock")
+            .termination_reason
+            .is_some();
         if matches!(
             reason,
             QueryTerminationReason::CoordinatorStreamLost
@@ -1001,14 +1029,17 @@ impl QueryLifecycleRegistry {
             );
         }
         let accepted = self.request_termination(Arc::clone(&entry), reason);
-        let events = entry
-            .state
-            .lock()
-            .expect("query lifecycle entry lock")
-            .events
-            .clone();
-        if let Some(events) = events {
-            let _ = events.try_send(QueryControlEvent::TerminationAccepted { reason: accepted });
+        if repeated {
+            let events = entry
+                .state
+                .lock()
+                .expect("query lifecycle entry lock")
+                .events
+                .clone();
+            if let Some(events) = events {
+                let _ =
+                    events.try_send(QueryControlEvent::TerminationAccepted { reason: accepted });
+            }
         }
         Ok(())
     }
@@ -1305,7 +1336,10 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
         QueryLifecycleRegistry::init_query(self, request)
     }
 
-    fn abort_query(&self, request: QueryAbortRequest) -> QueryTerminationAck {
+    fn abort_query(
+        &self,
+        request: QueryAbortRequest,
+    ) -> Result<QueryTerminationAck, QueryLifecycleError> {
         QueryLifecycleRegistry::abort_query(self, request)
     }
 

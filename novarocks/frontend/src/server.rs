@@ -494,10 +494,15 @@ mod tests {
         fn abort_query(
             &self,
             request: novarocks::query_execution::lifecycle::QueryAbortRequest,
-        ) -> novarocks::query_execution::lifecycle::QueryTerminationAck {
-            novarocks::query_execution::lifecycle::QueryTerminationAck::new(
-                request.execution_id(),
-                novarocks::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
+        ) -> Result<
+            novarocks::query_execution::lifecycle::QueryTerminationAck,
+            novarocks::query_execution::lifecycle::QueryLifecycleError,
+        > {
+            Ok(
+                novarocks::query_execution::lifecycle::QueryTerminationAck::new(
+                    request.execution_id(),
+                    novarocks::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
+                ),
             )
         }
 
