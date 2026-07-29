@@ -198,7 +198,7 @@ fn delta_scan_uses_resolved_payload_and_sentinel_range() {
 }
 
 #[test]
-fn explicit_files_preserve_native_split_ranges() {
+fn explicit_files_plan_opaque_connector_splits() {
     let plan = plan(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
     let bindings = prepare_scan_bindings(
         &plan,
@@ -207,17 +207,19 @@ fn explicit_files_preserve_native_split_ranges() {
     )
     .expect("prepare explicit scan");
     let ranges = bindings.scan_ranges(0, 10).expect("ranges");
-
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected file range");
-    };
+    assert!(ranges.is_empty());
+    let planned = bindings.connector_read(0, 10).expect("connector read");
     assert_eq!(
-        file.full_path.as_deref(),
-        Some("s3://bucket/explicit.parquet")
+        planned.declaration.descriptor().provider_id.as_str(),
+        "iceberg"
     );
-    assert_eq!(file.offset, 0);
-    assert_eq!(file.length, 128);
+    assert_eq!(
+        planned.declaration.descriptor().instance_id.as_str(),
+        "test_catalog"
+    );
+    assert_eq!(planned.splits.len(), 1);
+    assert_eq!(planned.splits[0].split_id(), "fixture-0");
+    assert_eq!(planned.splits[0].owner().as_str(), "test_catalog");
 }
 
 #[test]

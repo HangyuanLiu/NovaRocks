@@ -1858,18 +1858,20 @@ pub(crate) fn register_planned_table_files_fixture(
         files_by_table,
         seen_projections,
     });
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .expect("fixture provider ID"),
+        instance_id,
+    };
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
     registry
         .register_connector_instance(
-            ConnectorInstance::try_new(
-                ConnectorInstanceDescriptor {
-                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                        .expect("fixture provider ID"),
-                    instance_id,
-                },
-                None,
-                read,
-            )
-            .expect("fixture connector instance"),
+            ConnectorInstance::try_new(descriptor.clone(), None, read)
+                .expect("fixture connector instance")
+                .with_distribution(Arc::new(IcebergInstanceDistribution {
+                    descriptor,
+                    incarnation,
+                })),
         )
         .expect("register planned-files fixture");
 }
