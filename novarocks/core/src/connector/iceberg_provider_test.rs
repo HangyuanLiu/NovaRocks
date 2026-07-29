@@ -148,6 +148,87 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
     );
 }
 
+#[test]
+fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
+    let (registry, _warehouse) = registry_with_table();
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let planning = IcebergConnectorInstance::new(instance_id.clone(), registry)
+        .expect("planning Iceberg connector instance");
+    let resolved = planning
+        .metadata()
+        .expect("planning instance metadata")
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(),
+        })
+        .expect("load table");
+    let scan = planning
+        .read()
+        .begin_scan(
+            &resolved.table,
+            ConnectorBeginScanRequest {
+                projection: vec![0],
+                selector: ConnectorReadSelector::Current,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+                },
+                context: context(),
+            },
+        )
+        .expect("begin scan");
+    let split = planning
+        .read()
+        .plan_splits(
+            &scan.handle,
+            ConnectorSplitPlanningRequest {
+                target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
+                max_split_bytes: None,
+                context: context(),
+            },
+        )
+        .expect("plan split")
+        .remove(0);
+    let declaration = planning
+        .distribution()
+        .expect("distributable planning instance")
+        .declaration(&context())
+        .expect("declaration");
+    let installed = IcebergConnectorInstaller::new(IcebergReadBinding::default_binding(None))
+        .install(&declaration, &context())
+        .expect("install read-only instance");
+
+    let mut reader = installed
+        .read()
+        .open_reader(
+            &split,
+            ConnectorOpenReaderRequest {
+                expected_schema: resolved.schema,
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
+                },
+                context: context(),
+            },
+        )
+        .expect("read-only instance opens planned split");
+    assert_eq!(
+        reader
+            .next_batch()
+            .expect("read batch")
+            .expect("one batch")
+            .num_rows(),
+        1
+    );
+    reader.close().expect("close reader");
+}
+
 fn remove_snapshot_manifest_files(path: &std::path::Path) -> usize {
     let mut removed = 0;
     for entry in std::fs::read_dir(path).expect("read fixture directory") {

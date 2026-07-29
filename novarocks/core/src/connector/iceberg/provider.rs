@@ -108,7 +108,7 @@ impl ConnectorInstanceDistribution for IcebergInstanceDistribution {
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergReadBinding {
     access_binding: String,
-    _object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
 }
 
 impl IcebergReadBinding {
@@ -117,7 +117,7 @@ impl IcebergReadBinding {
     ) -> Self {
         Self {
             access_binding: DEFAULT_ACCESS_BINDING.to_string(),
-            _object_store_config: object_store_config,
+            object_store_config,
         }
     }
 }
@@ -174,6 +174,7 @@ impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
         }
         let reader = Arc::new(IcebergReadOnlyConnectorInstance {
             instance_id: declaration.descriptor().instance_id.clone(),
+            incarnation: declaration.incarnation(),
             binding: self.binding.clone(),
         });
         ConnectorInstance::try_new(declaration.descriptor().clone(), None, reader)
@@ -185,6 +186,7 @@ impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
 /// `open_reader` will consume the opaque, fully planned Iceberg split.
 struct IcebergReadOnlyConnectorInstance {
     instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
     binding: IcebergReadBinding,
 }
 
@@ -217,20 +219,50 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
 
     fn open_reader(
         &self,
-        _split: &ConnectorSplit,
-        _request: ConnectorOpenReaderRequest,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        let _ = &self.binding;
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "BE Iceberg opaque split reader is not installed",
-        ))
+        if request.context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= request.context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        ensure_owner(split.owner(), &self.instance_id)?;
+        let payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
+        if payload.version != ICEBERG_SPLIT_V1 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!("unsupported Iceberg split version {}", payload.version),
+            ));
+        }
+        if payload.owner_instance_id != self.instance_id.as_str()
+            || payload.incarnation != self.incarnation.to_bytes()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg split does not belong to this installed instance incarnation",
+            ));
+        }
+        IcebergBatchReader::try_new(
+            &payload.data_file,
+            self.binding.object_store_config.as_ref(),
+            request,
+        )
+        .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct IcebergConnectorInstance {
     instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
     snapshot_memberships: Arc<SnapshotMembershipCache>,
 }
@@ -244,8 +276,10 @@ impl IcebergConnectorInstance {
             provider_id: novarocks_spi::connector::ConnectorProviderId::parse(PROVIDER_ID)?,
             instance_id: instance_id.clone(),
         };
+        let incarnation = ConnectorInstanceIncarnation::new();
         let provider = Arc::new(Self {
             instance_id: instance_id.clone(),
+            incarnation,
             registry,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
@@ -255,7 +289,7 @@ impl IcebergConnectorInstance {
             |instance| {
                 instance.with_distribution(Arc::new(IcebergInstanceDistribution {
                     descriptor,
-                    incarnation: ConnectorInstanceIncarnation::new(),
+                    incarnation,
                 }))
             },
         )
@@ -708,10 +742,14 @@ impl ConnectorRead for IcebergConnectorInstance {
             }
             let estimated_bytes = u64::try_from(file.size).ok();
             let payload = SplitPayload {
+                version: ICEBERG_SPLIT_V1,
+                owner_instance_id: self.instance_id.as_str().to_string(),
+                incarnation: self.incarnation.to_bytes(),
                 namespace: scan.table.namespace.clone(),
                 table: scan.table.table.clone(),
                 snapshot_id: scan.snapshot_id,
                 table_uuid: scan.table_uuid.clone(),
+                schema_id: scan.table.table_info.as_ref().map(|table| table.schema_id),
                 data_file: file,
                 projection: scan.projection.clone(),
                 limit: scan.limit,
@@ -949,14 +987,28 @@ struct ScanPayload {
 
 #[derive(Deserialize, Serialize)]
 struct SplitPayload {
+    #[serde(default = "default_iceberg_split_version")]
+    version: u16,
+    #[serde(default)]
+    owner_instance_id: String,
+    #[serde(default)]
+    incarnation: [u8; 16],
     namespace: String,
     table: String,
     snapshot_id: Option<i64>,
     #[serde(default)]
     table_uuid: Option<String>,
+    #[serde(default)]
+    schema_id: Option<i32>,
     data_file: IcebergDataFileInfo,
     projection: Vec<usize>,
     limit: Option<u64>,
+}
+
+const ICEBERG_SPLIT_V1: u16 = 1;
+
+fn default_iceberg_split_version() -> u16 {
+    ICEBERG_SPLIT_V1
 }
 
 pub(crate) fn load_schema_table_def(
@@ -1439,10 +1491,14 @@ mod tests {
             explicit_files: None,
         };
         let payload = SplitPayload {
+            version: ICEBERG_SPLIT_V1,
+            owner_instance_id: "ice".to_string(),
+            incarnation: [0; 16],
             namespace: table.namespace,
             table: table.table,
             snapshot_id: Some(7),
             table_uuid: Some("table-uuid".to_string()),
+            schema_id: Some(1),
             data_file: IcebergDataFileInfo::for_test(
                 "s3://warehouse/db/orders/data-1.parquet",
                 1024,
@@ -1469,10 +1525,14 @@ mod tests {
     fn aggregate_budget_rejects_candidate_before_split_is_pushed() {
         let owner = ConnectorInstanceId::parse("ice").expect("owner");
         let payload = |suffix: &str| SplitPayload {
+            version: ICEBERG_SPLIT_V1,
+            owner_instance_id: "ice".to_string(),
+            incarnation: [0; 16],
             namespace: "db".to_string(),
             table: "orders".to_string(),
             snapshot_id: Some(7),
             table_uuid: Some("table-uuid".to_string()),
+            schema_id: Some(1),
             data_file: IcebergDataFileInfo::for_test(
                 &format!(
                     "s3://warehouse/db/orders/{}-{suffix}.parquet",
@@ -1540,10 +1600,14 @@ mod tests {
             .iter()
             .cloned()
             .map(|data_file| SplitPayload {
+                version: ICEBERG_SPLIT_V1,
+                owner_instance_id: instance_id.as_str().to_string(),
+                incarnation: [0; 16],
                 namespace: "db".to_string(),
                 table: "orders".to_string(),
                 snapshot_id: None,
                 table_uuid: None,
+                schema_id: None,
                 data_file,
                 projection: vec![0],
                 limit: None,
@@ -1584,6 +1648,7 @@ mod tests {
         .expect("scan handle");
         let provider = IcebergConnectorInstance {
             instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes([0; 16]),
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
@@ -1698,10 +1763,14 @@ pub(crate) fn register_planned_table_files_fixture(
                         format!("fixture-{index}"),
                         encode_payload(
                             &SplitPayload {
+                                version: ICEBERG_SPLIT_V1,
+                                owner_instance_id: self.instance_id.as_str().to_string(),
+                                incarnation: [0; 16],
                                 namespace: scan.table.namespace.clone(),
                                 table: scan.table.table.clone(),
                                 snapshot_id: None,
                                 table_uuid: None,
+                                schema_id: None,
                                 data_file,
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,
