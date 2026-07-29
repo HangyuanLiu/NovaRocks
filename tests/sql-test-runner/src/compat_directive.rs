@@ -36,6 +36,8 @@ const COMPAT_PROBES: &[&str] = &[
     "malformed-runtime-filter",
     "malformed-lookup",
     "terminal-fetch",
+    "stream-load",
+    "transaction-load",
 ];
 
 pub(crate) fn has_directives(meta: &QueryMeta) -> bool {

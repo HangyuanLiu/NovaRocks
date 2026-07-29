@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use axum::Router;
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
@@ -14,7 +15,10 @@ use crate::fragment::{
     CompatFragmentService, brpc_exchange_transmitter, brpc_fragment_lookup_client,
     compat_result_writer,
 };
-use crate::report::{CompatReportService, new_report_service};
+use crate::load::{
+    CompatLoadRegistry, CompatLoadService, LoadTrackingStore, router as load_router,
+};
+use crate::report::{CompatReportService, new_report_service_with_tracking};
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const COMPAT_REPORT_ROLE_REJECTION: &str =
@@ -100,6 +104,8 @@ pub struct CompatApplicationHost {
     started: StartedResources,
     fragment_service: Arc<CompatFragmentService>,
     report_service: Arc<CompatReportService>,
+    load_service: Arc<CompatLoadService>,
+    tracking: Arc<LoadTrackingStore>,
     ready_marker: String,
     startup_summary: String,
 }
@@ -216,14 +222,24 @@ impl CompatApplicationHost {
             host: server.host.clone(),
             be_port: server.be_port,
         };
-        let report_service = new_report_service();
-        let fragment_service = Arc::new(CompatFragmentService::new(
+        let load_registry = Arc::new(CompatLoadRegistry::default());
+        let tracking = Arc::new(LoadTrackingStore::default());
+        let report_service = new_report_service_with_tracking(Arc::clone(&tracking));
+        let fragment_service = Arc::new(CompatFragmentService::new_with_load_dependencies(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             brpc_exchange_transmitter(),
             brpc_fragment_lookup_client(),
             compat_result_writer(),
             Arc::clone(&report_service),
+            Arc::clone(&load_registry),
+            tracking.clone(),
         ));
+        let fragment_sync_executor: Arc<dyn SyncFragmentExecutor> = fragment_service.clone();
+        let load_service = Arc::new(CompatLoadService::new(
+            load_registry,
+            fragment_sync_executor,
+        ));
+        let compat_routes = load_router(Arc::clone(&load_service), Arc::clone(&tracking));
         let brpc_config = brpc::CompatConfig {
             host: &server.host,
             heartbeat_port: server.heartbeat_port,
@@ -239,6 +255,8 @@ impl CompatApplicationHost {
             started: StartedResources::default(),
             fragment_service,
             report_service,
+            load_service,
+            tracking,
             ready_marker,
             startup_summary,
         };
@@ -250,12 +268,10 @@ impl CompatApplicationHost {
             ));
         }
         host.started.report = true;
-        let grpc_fragment_service: Arc<dyn SyncFragmentExecutor> = host.fragment_service.clone();
-        if let Err(error) = host.ports.start_grpc(
-            &server.host,
-            grpc_fragment_service,
-            compat_native_report_handler(),
-        ) {
+        if let Err(error) =
+            host.ports
+                .start_grpc(&server.host, compat_routes, compat_native_report_handler())
+        {
             return Err(host.start_failure(
                 CompatApplicationErrorKind::GrpcStart,
                 format!("start grpc/http/starlet listeners: {error}"),
@@ -269,7 +285,12 @@ impl CompatApplicationHost {
             ));
         }
         host.started.heartbeat = true;
-        if let Err(error) = host.ports.start_backend(backend_config) {
+        let load_channel_finisher: Arc<dyn backend_service::LoadChannelFinisher> =
+            host.load_service.clone();
+        if let Err(error) = host
+            .ports
+            .start_backend(backend_config, load_channel_finisher)
+        {
             return Err(host.start_failure(
                 CompatApplicationErrorKind::BackendServiceStart,
                 format!("start backend listener: {error}"),
@@ -304,6 +325,7 @@ impl CompatApplicationHost {
             self.ports.stop_brpc();
             self.started.brpc = false;
         }
+        self.load_service.begin_shutdown();
         if self.started.backend {
             if let Err(error) = self.ports.stop_backend() {
                 failures.push(format!("stop backend service failed: {error}"));
@@ -322,6 +344,8 @@ impl CompatApplicationHost {
             }
             self.started.grpc = false;
         }
+        self.load_service.finish_shutdown();
+        self.tracking.clear();
         if self.started.report {
             self.report_service.stop();
             self.started.report = false;
@@ -401,7 +425,7 @@ trait CompatPorts: Send {
     fn start_grpc(
         &mut self,
         host: &str,
-        fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
+        compat_routes: Router,
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Result<(), String>;
     fn start_heartbeat(&mut self, config: heartbeat_service::HeartbeatConfig)
@@ -409,6 +433,7 @@ trait CompatPorts: Send {
     fn start_backend(
         &mut self,
         config: backend_service::BackendServiceConfig,
+        load_channel_finisher: Arc<dyn backend_service::LoadChannelFinisher>,
     ) -> Result<(), String>;
     fn start_brpc(&mut self, config: &brpc::CompatConfig<'_>) -> Result<(), String>;
     fn poll_grpc_failure(&mut self) -> Result<Option<String>, String>;
@@ -428,10 +453,10 @@ impl CompatPorts for LiveCompatPorts {
     fn start_grpc(
         &mut self,
         host: &str,
-        fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
+        compat_routes: Router,
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Result<(), String> {
-        grpc_server::start_grpc_server(host, fragment_sync_executor, report_handler)
+        grpc_server::start_grpc_server(host, compat_routes, report_handler)
     }
 
     fn start_heartbeat(
@@ -444,8 +469,9 @@ impl CompatPorts for LiveCompatPorts {
     fn start_backend(
         &mut self,
         config: backend_service::BackendServiceConfig,
+        load_channel_finisher: Arc<dyn backend_service::LoadChannelFinisher>,
     ) -> Result<(), String> {
-        backend_service::start_backend_service(config)
+        backend_service::start_backend_service(config, load_channel_finisher)
     }
 
     fn start_brpc(&mut self, config: &brpc::CompatConfig<'_>) -> Result<(), String> {

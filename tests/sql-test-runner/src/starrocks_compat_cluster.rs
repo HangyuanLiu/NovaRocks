@@ -1215,6 +1215,8 @@ impl ServerHandle for StarRocksCompatServerHandle {
         command
             .args(["--host", endpoint.host.as_str(), "--brpc-port"])
             .arg(endpoint.brpc_port.to_string())
+            .arg("--http-port")
+            .arg(endpoint.http_port.to_string())
             .args(["--probe", probe]);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

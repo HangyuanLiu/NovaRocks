@@ -3,6 +3,7 @@ pub mod events;
 pub mod exchange;
 pub(crate) mod exchange_metrics;
 pub(crate) mod exchange_queue;
+pub mod load_tracking;
 pub mod lookup;
 pub mod report;
 pub mod result;
@@ -15,6 +16,7 @@ pub use events::{
     NoopFragmentEventSink,
 };
 pub use exchange::{ExchangeFrame, ExchangeFrameTransmitter};
+pub use load_tracking::LoadTrackingLogSink;
 pub use lookup::{
     FragmentLookupClient, LookupBatch, LookupColumn, LookupKind, LookupRequest, LookupTarget,
     UnavailableFragmentLookupClient,

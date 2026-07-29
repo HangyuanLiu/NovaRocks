@@ -17,6 +17,8 @@ use novarocks::thrift::{data_cache, status as thrift_status, status_code, types}
 use reporter::{ExecStateReportTask, StarRocksReporter};
 use status::{ExecStatusReportInput, build_report_params};
 
+use crate::load::LoadTrackingStore;
+
 /// Compat-owned StarRocks execution-status registry and worker lifecycle.
 pub(crate) struct CompatReportService {
     instances: Arc<Mutex<HashMap<UniqueId, StarRocksReportInstance>>>,
@@ -24,6 +26,7 @@ pub(crate) struct CompatReportService {
     reporter: Arc<StarRocksReporter>,
     periodic_stop: Arc<AtomicBool>,
     periodic_worker: Mutex<Option<JoinHandle<()>>>,
+    tracking: Arc<LoadTrackingStore>,
 }
 
 #[derive(Clone)]
@@ -34,6 +37,10 @@ struct StarRocksReportInstance {
 
 impl CompatReportService {
     pub(crate) fn new() -> Self {
+        Self::new_with_tracking(Arc::new(LoadTrackingStore::default()))
+    }
+
+    pub(crate) fn new_with_tracking(tracking: Arc<LoadTrackingStore>) -> Self {
         let query_gone = Arc::new(Mutex::new(HashSet::new()));
         let on_query_gone = {
             let query_gone = Arc::clone(&query_gone);
@@ -50,6 +57,7 @@ impl CompatReportService {
             reporter: Arc::new(StarRocksReporter::new(on_query_gone)),
             periodic_stop: Arc::new(AtomicBool::new(false)),
             periodic_worker: Mutex::new(None),
+            tracking,
         }
     }
 
@@ -66,11 +74,14 @@ impl CompatReportService {
         let instances = Arc::clone(&self.instances);
         let query_gone = Arc::clone(&self.query_gone);
         let reporter = Arc::clone(&self.reporter);
+        let tracking = Arc::clone(&self.tracking);
         let stop = Arc::clone(&self.periodic_stop);
         *worker = Some(
             std::thread::Builder::new()
                 .name("compat-profile-report".to_string())
-                .spawn(move || run_periodic_report_worker(instances, query_gone, reporter, stop))
+                .spawn(move || {
+                    run_periodic_report_worker(instances, query_gone, reporter, tracking, stop)
+                })
                 .map_err(|error| format!("start compat profile report worker: {error}"))?,
         );
         Ok(())
@@ -133,7 +144,7 @@ impl CompatReportService {
             novarocks::query_execution::native_fragment_report::report_progress(finst_id);
             return;
         };
-        enqueue_progress(&self.reporter, finst_id, instance);
+        enqueue_progress(&self.reporter, &self.tracking, finst_id, instance);
     }
 
     pub(crate) fn unregister(&self, finst_id: UniqueId) {
@@ -168,7 +179,8 @@ impl CompatReportService {
             sink_commit::unregister(finst_id);
             return;
         }
-        let params = build_starrocks_report_params(&instance.registration, Some(&terminal));
+        let params =
+            build_starrocks_report_params(&self.tracking, &instance.registration, Some(&terminal));
         self.reporter.enqueue_final(ExecStateReportTask {
             finst_id,
             query_id: instance.registration.query_id(),
@@ -181,10 +193,11 @@ impl CompatReportService {
 
 fn enqueue_progress(
     reporter: &StarRocksReporter,
+    tracking: &LoadTrackingStore,
     finst_id: UniqueId,
     instance: StarRocksReportInstance,
 ) {
-    let params = build_starrocks_report_params(&instance.registration, None);
+    let params = build_starrocks_report_params(tracking, &instance.registration, None);
     if let Err(error) = reporter.enqueue_non_final(ExecStateReportTask {
         finst_id,
         query_id: instance.registration.query_id(),
@@ -196,6 +209,7 @@ fn enqueue_progress(
 }
 
 fn build_starrocks_report_params(
+    tracking: &LoadTrackingStore,
     registration: &FragmentReportRegistration,
     terminal: Option<&FragmentTerminalReport>,
 ) -> novarocks::thrift::frontend_service::TReportExecStatusParams {
@@ -215,7 +229,7 @@ fn build_starrocks_report_params(
         status: thrift_status_from_error(error),
         done,
         profile,
-        tracking_url: build_tracking_url(registration.query_id()),
+        tracking_url: build_tracking_url(tracking, registration.query_id()),
         load_datacache_metrics,
     })
 }
@@ -230,8 +244,11 @@ fn thrift_status_from_error(error: Option<String>) -> thrift_status::TStatus {
     }
 }
 
-fn build_tracking_url(query_id: novarocks::runtime::query_context::QueryId) -> Option<String> {
-    if !novarocks::runtime::load_tracking::has_tracking_log(query_id) {
+fn build_tracking_url(
+    tracking: &LoadTrackingStore,
+    query_id: novarocks::runtime::query_context::QueryId,
+) -> Option<String> {
+    if !tracking.has_tracking_log(query_id) {
         return None;
     }
     let config = novarocks::novarocks_config::config().ok()?;
@@ -299,6 +316,7 @@ fn run_periodic_report_worker(
     instances: Arc<Mutex<HashMap<UniqueId, StarRocksReportInstance>>>,
     query_gone: Arc<Mutex<HashSet<UniqueId>>>,
     reporter: Arc<StarRocksReporter>,
+    tracking: Arc<LoadTrackingStore>,
     stop: Arc<AtomicBool>,
 ) {
     let mut last_report = HashMap::<UniqueId, Instant>::new();
@@ -324,7 +342,7 @@ fn run_periodic_report_worker(
                 .get(&finst_id)
                 .is_none_or(|last| now.duration_since(*last) >= interval)
             {
-                enqueue_progress(&reporter, finst_id, instance);
+                enqueue_progress(&reporter, &tracking, finst_id, instance);
                 last_report.insert(finst_id, now);
             }
         }
@@ -362,6 +380,12 @@ pub(crate) fn report_novarocks_terminal(finst_id: UniqueId, terminal: FragmentTe
 
 pub(crate) fn new_report_service() -> Arc<CompatReportService> {
     Arc::new(CompatReportService::new())
+}
+
+pub(crate) fn new_report_service_with_tracking(
+    tracking: Arc<LoadTrackingStore>,
+) -> Arc<CompatReportService> {
+    Arc::new(CompatReportService::new_with_tracking(tracking))
 }
 
 #[cfg(test)]

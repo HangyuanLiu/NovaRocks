@@ -235,6 +235,7 @@ pub(crate) fn execute_native_submission(
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker.clone(),
             native_runtime_filter_context: context.runtime_filter.clone(),
+            load_tracking_sink: None,
         },
         context.profiler.as_ref(),
     )
