@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use novarocks::query_execution::artifact::{
-    NativeSubmissionContext, PreparedNativeExecutionParts, RuntimeFilterDeploymentDispatcher,
+    LegacyPreparedNativeExecutionParts, NativeSubmissionContext, RuntimeFilterDeploymentDispatcher,
     RuntimeFilterDeploymentEpoch, RuntimeFilterDeploymentOptions,
     new_grpc_runtime_filter_deployment_dispatcher,
 };
@@ -39,7 +39,7 @@ use novarocks::query_execution::contract::{
 use novarocks::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
 };
-use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId, QueryLifecycleLease};
+use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks::query_execution::write::WriteReportBuilder;
 
 use super::backend_events::BackendQueryActivity;
@@ -454,16 +454,17 @@ impl FrontendDistributedQueryCoordinator {
             self.report_endpoint.resolve()?,
             dispatcher.needs_fragment_status_report() || intent == DistributedQueryIntent::Profile,
         );
-        let ready = scheduled.prepare_runtime_filters(runtime_filter_options, &runtime_filters)?;
+        let ready =
+            scheduled.prepare_legacy_runtime_filters(runtime_filter_options, &runtime_filters)?;
         let execution = ready.assemble(context)?;
-        let PreparedNativeExecutionParts {
+        let LegacyPreparedNativeExecutionParts {
             submissions,
             root_fetch,
             writer_registrations,
             expected_output,
-            query_lifecycle_lease,
+            runtime_filter_lease,
         } = execution.into_parts();
-        let mut runtime_filter_lease = Some(query_lifecycle_lease);
+        let mut runtime_filter_lease = Some(runtime_filter_lease);
         let submitted_instance_ids = submissions
             .iter()
             .map(|submission| submission.fragment_instance_id())
@@ -551,7 +552,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_lease
                 .take()
                 .expect("runtime-filter lease is present through fragment submission")
-                .finalize()?;
+                .release();
         } else {
             let message = submission_failure.unwrap_or_else(|| {
                 if parts.cancellation.is_cancelled() {
@@ -765,7 +766,7 @@ impl FrontendDistributedQueryCoordinator {
     fn fail_cancel_then_abort_runtime_filters(
         &self,
         query_id: QueryId,
-        lease: &mut Option<QueryLifecycleLease>,
+        lease: &mut Option<novarocks::query_execution::artifact::RuntimeFilterInstallLease>,
         message: impl Into<String>,
     ) -> DistributedQueryError {
         let primary = self.fail_and_cancel(query_id, message);
@@ -791,7 +792,7 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
 }
 
 fn abort_runtime_filters(
-    lease: &mut Option<QueryLifecycleLease>,
+    lease: &mut Option<novarocks::query_execution::artifact::RuntimeFilterInstallLease>,
     message: impl Into<String>,
 ) -> String {
     let message = message.into();

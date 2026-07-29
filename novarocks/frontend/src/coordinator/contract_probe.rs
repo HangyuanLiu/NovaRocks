@@ -595,7 +595,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(41, 73), scheduler, dispatcher.clone());
 
         let outcome = coordinator
@@ -632,7 +632,7 @@ mod tests {
         }
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
             QueryId::new(41, 73),
             report_endpoint(),
@@ -670,7 +670,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(41, 73), scheduler, dispatcher.clone());
         dispatcher.native_wire_report_on_submit(2, report, &coordinator);
 
@@ -699,7 +699,9 @@ mod tests {
             .iter()
             .copied()
             .map(|backend| {
-                FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(vec![backend]).unwrap())
+                FrontendFragmentScheduler::new(
+                    FrontendBackendSnapshot::for_test(vec![backend]).unwrap(),
+                )
             })
             .collect();
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence(
@@ -735,7 +737,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.delayed_reports_on_submit(2, reports, &coordinator);
 
@@ -760,7 +762,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.reports_on_submit(2, reports, &coordinator);
 
@@ -781,7 +783,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.accepted_then_rejected_reports_on_submit(
             2,
@@ -903,7 +905,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.rejected_report_on_submit(2, report, &coordinator);
 
@@ -926,7 +928,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.reports_on_submit(2, reports, &coordinator);
 
@@ -946,7 +948,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.rejected_report_on_submit(2, report, &coordinator);
 
@@ -965,7 +967,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.rejected_report_on_submit(2, report, &coordinator);
 
@@ -983,7 +985,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.backend_loss_on_submit(1, 3, &coordinator);
 
@@ -1007,7 +1009,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator =
             test_coordinator(QueryId::new(51, 91), scheduler, Arc::clone(&dispatcher));
 
@@ -1034,7 +1036,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_cancellation(cancellation, 1));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
 
         let outcome = coordinator
@@ -1055,7 +1057,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(61, 101), scheduler, dispatcher.clone());
         dispatcher.delayed_reports_on_submit(1, reports, &coordinator);
 
@@ -1077,7 +1079,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator =
             test_coordinator(QueryId::new(61, 101), scheduler, Arc::clone(&dispatcher));
 
@@ -1226,7 +1228,7 @@ mod tests {
         ));
         let local_cleanup_calls = AtomicUsize::new(0);
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(41, 73), scheduler, dispatcher.clone());
 
         let error = match coordinator.execute(request) {
@@ -1254,7 +1256,7 @@ mod tests {
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let local_cleanup_calls = AtomicUsize::new(0);
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(41, 73), scheduler, dispatcher.clone());
         dispatcher.report_on_submit(2, report, &coordinator);
 
@@ -1278,7 +1280,7 @@ mod tests {
         let request = write_fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.report_on_submit(2, report, &coordinator);
 
@@ -1300,7 +1302,7 @@ mod tests {
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(41, 73),
             report_endpoint(),
@@ -1354,7 +1356,7 @@ mod tests {
             Arc::clone(&events),
         ));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(71, 111),
             report_endpoint(),
@@ -1398,7 +1400,7 @@ mod tests {
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let runtime_filters = Arc::new(ConcurrentInstallGate::new(2));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(71, 115),
             report_endpoint(),
@@ -1424,7 +1426,7 @@ mod tests {
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let runtime_filters = Arc::new(ConcurrentAbortGate::new(4, 2));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(71, 116),
             report_endpoint(),
@@ -1465,7 +1467,7 @@ mod tests {
             Arc::clone(&events),
         ));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(71, 112),
             report_endpoint(),
@@ -1517,7 +1519,7 @@ mod tests {
             Arc::clone(&events),
         ));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(71, 113),
             report_endpoint(),
@@ -1574,7 +1576,7 @@ mod tests {
             Arc::clone(&events),
         ));
         let scheduler =
-            FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(71, 114),
             report_endpoint(),

@@ -33,10 +33,18 @@ pub struct FrontendBackendSnapshot {
 }
 
 impl FrontendBackendSnapshot {
-    pub fn new(entries: Vec<(usize, SocketAddr)>) -> Result<Self, DistributedQueryError> {
+    #[cfg(test)]
+    pub fn for_test(entries: Vec<(usize, SocketAddr)>) -> Result<Self, DistributedQueryError> {
         let generations = entries
             .iter()
-            .map(|(backend_idx, _)| (*backend_idx, 0))
+            .map(|(backend_idx, _)| {
+                (
+                    *backend_idx,
+                    u64::try_from(*backend_idx)
+                        .expect("test backend index fits u64")
+                        .saturating_add(1),
+                )
+            })
             .collect();
         Self::validate(entries, generations)
     }
@@ -90,6 +98,15 @@ impl FrontendBackendSnapshot {
 
     fn generation(&self, backend_idx: usize) -> Option<u64> {
         self.generations.get(&backend_idx).copied()
+    }
+
+    fn live_targets(&self) -> Vec<LiveBackendTarget> {
+        self.entries
+            .iter()
+            .map(|&(backend_idx, endpoint)| {
+                LiveBackendTarget::new(backend_idx, endpoint, self.generations[&backend_idx])
+            })
+            .collect()
     }
 }
 
@@ -220,6 +237,7 @@ impl FrontendFragmentScheduler {
 
         let preferred = (execution_id.query_id().low() as usize) % backend_count;
         let mut draft = FragmentScheduleDraft::new();
+        draft.freeze_live_backends(self.backends.live_targets())?;
         for (&fragment_id, &count) in &counts {
             let placements = (0..count)
                 .map(|instance_index| {
@@ -259,7 +277,7 @@ mod tests {
         let fixture =
             novarocks::query_execution::contract_test_support::non_empty_runtime_filter_contract_fixture();
         let snapshot =
-            FrontendBackendSnapshot::new(fixture.backends().to_vec()).expect("valid backends");
+            FrontendBackendSnapshot::for_test(fixture.backends().to_vec()).expect("valid backends");
         let scheduler = FrontendFragmentScheduler::new(snapshot);
         let request = fixture.into_request();
         let parts = request.into_parts();

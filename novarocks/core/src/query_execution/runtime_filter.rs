@@ -440,6 +440,10 @@ impl RuntimeFilterContributionPlan {
         self.participant_id
     }
 
+    pub(crate) const fn lifecycle(&self) -> RuntimeFilterQueryLifecycleOptions {
+        self.lifecycle
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (

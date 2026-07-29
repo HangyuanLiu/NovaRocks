@@ -43,6 +43,30 @@ use crate::sql::planner::distributed::{
     DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
 };
 
+fn initial_fragment_instance_id(
+    query_hi: i64,
+    query_lo: i64,
+    fragment_id: u32,
+) -> crate::common::types::UniqueId {
+    crate::query_execution::artifact::fragment_instance_id_for_contract_test(
+        crate::query_execution::contract::QueryId::new(query_hi, query_lo),
+        fragment_id,
+        0,
+    )
+}
+
+fn initial_fragment_instance_proto(
+    query_hi: i64,
+    query_lo: i64,
+    fragment_id: u32,
+) -> crate::proto::common::UniqueId {
+    let id = initial_fragment_instance_id(query_hi, query_lo, fragment_id);
+    crate::proto::common::UniqueId {
+        hi: id.hi,
+        lo: id.lo,
+    }
+}
+
 pub struct ResultContractFixture {
     request: DistributedQueryRequest,
     backends: Vec<(usize, SocketAddr)>,
@@ -66,10 +90,7 @@ impl ResultContractFixture {
     pub fn failed_fragment_report(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test(
             crate::common::types::UniqueId { hi: 41, lo: 73 },
-            crate::common::types::UniqueId {
-                hi: 41,
-                lo: i64::from(11_u32) << 16,
-            },
+            initial_fragment_instance_id(41, 73, 11),
             0,
             crate::proto::common::Status {
                 code: 1,
@@ -82,10 +103,7 @@ impl ResultContractFixture {
     pub fn successful_fragment_report_proto(&self) -> crate::proto::novarocks::ExecStatusReport {
         crate::proto::novarocks::ExecStatusReport {
             query_id: Some(crate::proto::common::UniqueId { hi: 41, lo: 73 }),
-            fragment_instance_id: Some(crate::proto::common::UniqueId {
-                hi: 41,
-                lo: i64::from(11_u32) << 16,
-            }),
+            fragment_instance_id: Some(initial_fragment_instance_proto(41, 73, 11)),
             backend_num: 0,
             done: true,
             status: Some(crate::proto::common::Status {
@@ -378,10 +396,7 @@ impl WriteContractFixture {
     pub fn successful_writer_report(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(23_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 23),
             0,
             crate::proto::common::Status {
                 code: 0,
@@ -394,10 +409,7 @@ impl WriteContractFixture {
     pub fn failed_writer_report(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(23_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 23),
             0,
             crate::proto::common::Status {
                 code: 1,
@@ -410,10 +422,7 @@ impl WriteContractFixture {
     pub fn wrong_backend_writer_report(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test_with_write_metadata(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(23_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 23),
             99,
             true,
         )
@@ -422,10 +431,7 @@ impl WriteContractFixture {
     pub fn conflicting_writer_report(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test_with_write_metadata(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(23_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 23),
             0,
             true,
         )
@@ -434,10 +440,7 @@ impl WriteContractFixture {
     pub fn successful_non_writer_report(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(22_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 22),
             0,
             crate::proto::common::Status {
                 code: 0,
@@ -450,10 +453,7 @@ impl WriteContractFixture {
     pub fn failed_non_writer_report(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(22_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 22),
             0,
             crate::proto::common::Status {
                 code: 1,
@@ -466,10 +466,7 @@ impl WriteContractFixture {
     pub fn non_writer_report_with_write_metadata(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test_with_write_metadata(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(22_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 22),
             0,
             true,
         )
@@ -478,10 +475,7 @@ impl WriteContractFixture {
     pub fn nonfinal_non_writer_report_with_write_metadata(&self) -> NativeExecutionReport {
         NativeExecutionReport::for_contract_test_with_write_metadata(
             crate::common::types::UniqueId { hi: 51, lo: 91 },
-            crate::common::types::UniqueId {
-                hi: 51,
-                lo: i64::from(22_u32) << 16,
-            },
+            initial_fragment_instance_id(51, 91, 22),
             0,
             false,
         )
@@ -611,10 +605,7 @@ impl ProfileContractFixture {
         vec![
             NativeExecutionReport::for_contract_test(
                 crate::common::types::UniqueId { hi: 61, lo: 101 },
-                crate::common::types::UniqueId {
-                    hi: 61,
-                    lo: i64::from(11_u32) << 16,
-                },
+                initial_fragment_instance_id(61, 101, 11),
                 0,
                 crate::proto::common::Status {
                     code: 0,
@@ -627,10 +618,7 @@ impl ProfileContractFixture {
             ),
             NativeExecutionReport::for_contract_test(
                 crate::common::types::UniqueId { hi: 61, lo: 101 },
-                crate::common::types::UniqueId {
-                    hi: 61,
-                    lo: i64::from(19_u32) << 16,
-                },
+                initial_fragment_instance_id(61, 101, 19),
                 1,
                 crate::proto::common::Status {
                     code: 0,
@@ -651,10 +639,7 @@ impl ProfileContractFixture {
             .map(|(backend_num, fragment_id)| {
                 NativeExecutionReport::for_contract_test(
                     crate::common::types::UniqueId { hi: 61, lo: 101 },
-                    crate::common::types::UniqueId {
-                        hi: 61,
-                        lo: i64::from(fragment_id) << 16,
-                    },
+                    initial_fragment_instance_id(61, 101, fragment_id),
                     backend_num as i32,
                     crate::proto::common::Status {
                         code: 0,

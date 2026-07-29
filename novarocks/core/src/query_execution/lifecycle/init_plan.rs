@@ -159,12 +159,24 @@ impl QueryInitOptions {
 
 pub struct QueryInitPlan {
     execution_id: QueryExecutionId,
+    query_deadline_unix_ms: u64,
+    runtime_filter_strategy: Option<crate::protocol::native::RuntimeFilterQueryLifecycleOptions>,
     participants: Vec<QueryInitParticipant>,
 }
 
 impl QueryInitPlan {
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
+    }
+
+    pub(crate) const fn query_deadline_unix_ms(&self) -> u64 {
+        self.query_deadline_unix_ms
+    }
+
+    pub(crate) const fn runtime_filter_strategy(
+        &self,
+    ) -> Option<crate::protocol::native::RuntimeFilterQueryLifecycleOptions> {
+        self.runtime_filter_strategy
     }
 
     pub fn participant_count(&self) -> usize {
@@ -273,6 +285,11 @@ pub(crate) fn compile_query_init_plan(
         .iter()
         .map(|target| (target.backend_idx(), *target))
         .collect::<BTreeMap<_, _>>();
+    if live_by_backend != fragments.frozen_live_backends {
+        return Err(contract_error(
+            "frozen schedule topology differs from query initialization snapshot",
+        ));
+    }
     for (&backend_idx, endpoint) in &fragments.endpoints_by_backend {
         let target = live_by_backend.get(&backend_idx).ok_or_else(|| {
             contract_error(format!(
@@ -285,6 +302,27 @@ pub(crate) fn compile_query_init_plan(
                 endpoint.as_host_port(),
                 target.endpoint()
             )));
+        }
+    }
+
+    let runtime_filter_strategy = runtime_filters
+        .first()
+        .map(RuntimeFilterContributionPlan::lifecycle);
+    if let Some(strategy) = runtime_filter_strategy {
+        if strategy.delivery_expire != options.runtime_filter_lifecycle.delivery_expire()
+            || strategy.query_expire != options.runtime_filter_lifecycle.query_expire()
+        {
+            return Err(contract_error(
+                "runtime filter lifecycle strategy differs from frozen query options",
+            ));
+        }
+        if runtime_filters
+            .iter()
+            .any(|contribution| contribution.lifecycle() != strategy)
+        {
+            return Err(contract_error(
+                "runtime filter lifecycle strategy differs between init participants",
+            ));
         }
     }
 
@@ -378,6 +416,8 @@ pub(crate) fn compile_query_init_plan(
     }
     Ok(QueryInitPlan {
         execution_id: options.execution_id,
+        query_deadline_unix_ms: options.query_deadline_unix_ms,
+        runtime_filter_strategy,
         participants,
     })
 }
@@ -419,6 +459,13 @@ mod tests {
     }
 
     fn runtime_filter(backend_idx: usize) -> RuntimeFilterContributionPlan {
+        runtime_filter_with_retry_interval(backend_idx, Duration::from_millis(200))
+    }
+
+    fn runtime_filter_with_retry_interval(
+        backend_idx: usize,
+        transport_retry_interval: Duration,
+    ) -> RuntimeFilterContributionPlan {
         let participant =
             RuntimeFilterParticipantId::new(u32::try_from(backend_idx + 1).expect("participant"));
         let epoch = DeploymentEpoch::new(execution_id().attempt_id().get());
@@ -431,9 +478,9 @@ mod tests {
             backend_idx,
             participant.get(),
             crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-                delivery_expire: Duration::from_secs(5),
-                query_expire: Duration::from_secs(30),
-                transport_retry_interval: Duration::from_millis(200),
+                delivery_expire: Duration::from_secs(300),
+                query_expire: Duration::from_secs(300),
+                transport_retry_interval,
                 transport_max_attempts: 3,
                 transport_deadline: Duration::from_secs(2),
                 transport_max_pending_entries: 1024,
@@ -468,7 +515,9 @@ mod tests {
                 ),
             ]),
             Vec::new(),
-        );
+        )
+        .with_frozen_live_backends(vec![backend(0), backend(1), backend(2)])
+        .expect("freeze schedule topology");
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let options = QueryInitOptions::new(
             execution_id(),
@@ -512,7 +561,9 @@ mod tests {
     #[test]
     fn runtime_filter_contribution_is_bound_to_outer_attempt() {
         let fragments =
-            FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new());
+            FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
+                .with_frozen_live_backends(vec![backend(2)])
+                .expect("freeze schedule topology");
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let options = QueryInitOptions::new(
             execution_id(),
@@ -541,6 +592,126 @@ mod tests {
         assert_eq!(
             contribution.install().epoch().get(),
             execution_id().attempt_id().get()
+        );
+    }
+
+    #[test]
+    fn query_init_plan_rejects_backend_restart_at_the_same_endpoint() {
+        let fragments = FragmentLifecycleProjection::new(
+            BTreeMap::from([(0, BTreeSet::from([UniqueId { hi: 10, lo: 1 }]))]),
+            BTreeMap::from([(
+                0,
+                crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr(backend(0).endpoint()),
+            )]),
+            Vec::new(),
+        )
+        .with_frozen_live_backends(vec![backend(0)])
+        .expect("freeze schedule topology");
+        let resolved = ResolvedQueryOptions::from_upstream(None);
+        let restarted = LiveBackendTarget::new(
+            backend(0).backend_idx(),
+            backend(0).endpoint(),
+            backend(0).start_epoch() + 1,
+        );
+        let options = QueryInitOptions::new(
+            execution_id(),
+            vec![restarted],
+            2,
+            resolved.runtime_filter_lifecycle(),
+            &resolved,
+            1_000,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+            false,
+        )
+        .expect("valid restarted snapshot");
+
+        let error = match compile_query_init_plan(&fragments, Vec::new(), &options) {
+            Ok(_) => panic!("same endpoint with a new start epoch must invalidate the schedule"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .message()
+                .contains("frozen schedule topology differs from query initialization snapshot")
+        );
+    }
+
+    #[test]
+    fn query_init_plan_rejects_per_participant_runtime_filter_strategy_drift() {
+        let fragments =
+            FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
+                .with_frozen_live_backends(vec![backend(1), backend(2)])
+                .expect("freeze schedule topology");
+        let resolved = ResolvedQueryOptions::from_upstream(None);
+        let options = QueryInitOptions::new(
+            execution_id(),
+            vec![backend(1), backend(2)],
+            2,
+            resolved.runtime_filter_lifecycle(),
+            &resolved,
+            9_000,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+            false,
+        )
+        .expect("valid init options");
+
+        let error = match compile_query_init_plan(
+            &fragments,
+            vec![
+                runtime_filter_with_retry_interval(1, Duration::from_millis(200)),
+                runtime_filter_with_retry_interval(2, Duration::from_millis(201)),
+            ],
+            &options,
+        ) {
+            Ok(_) => panic!("one immutable init plan must have one runtime-filter strategy"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .message()
+                .contains("runtime filter lifecycle strategy differs")
+        );
+    }
+
+    #[test]
+    fn query_init_plan_freezes_deadline_and_runtime_filter_strategy() {
+        let fragments =
+            FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
+                .with_frozen_live_backends(vec![backend(2)])
+                .expect("freeze schedule topology");
+        let resolved = ResolvedQueryOptions::from_upstream(None);
+        let options = QueryInitOptions::new(
+            execution_id(),
+            vec![backend(2)],
+            2,
+            resolved.runtime_filter_lifecycle(),
+            &resolved,
+            9_000,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+            false,
+        )
+        .expect("valid init options");
+
+        let plan = compile_query_init_plan(&fragments, vec![runtime_filter(2)], &options)
+            .expect("valid init plan");
+
+        assert_eq!(plan.query_deadline_unix_ms(), 9_000);
+        assert_eq!(
+            plan.runtime_filter_strategy()
+                .expect("nonempty RF plan has one strategy")
+                .transport_retry_interval,
+            Duration::from_millis(200)
         );
     }
 }

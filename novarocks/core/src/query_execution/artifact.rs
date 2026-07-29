@@ -29,6 +29,7 @@ use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::protocol::native::encode::NativeFragmentBundle;
+use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, QueryId, ResolvedQueryOptions,
 };
@@ -37,7 +38,7 @@ use crate::query_execution::fragment_transport::{
 };
 use crate::query_execution::lifecycle::{
     ExchangeRouteManifest, QueryExecutionId, QueryInitBarrier, QueryInitOptions,
-    QueryLifecycleLease, QueryLifecycleLeaseGuard,
+    QueryLifecycleLease,
 };
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
@@ -166,11 +167,14 @@ impl ScheduleBoundDistributedQuery {
         })
     }
 
-    pub fn prepare_runtime_filters(
+    /// Transitional Task 7 dependency for the production coordinator.
+    ///
+    /// This legacy RF-only path is deliberately not a query-lifecycle owner.
+    pub fn prepare_legacy_runtime_filters(
         self,
         options: RuntimeFilterDeploymentOptions,
         barrier: &dyn RuntimeFilterInstallBarrier,
-    ) -> Result<RuntimeFilterReadyDistributedQuery, DistributedQueryError> {
+    ) -> Result<LegacyRuntimeFilterReadyDistributedQuery, DistributedQueryError> {
         let plan = crate::query_execution::runtime_filter::compile_install_plan(
             self.schedule.execution_id.query_id(),
             self.prepared.runtime_filter_graph(),
@@ -180,7 +184,7 @@ impl ScheduleBoundDistributedQuery {
             options,
         )?;
         let runtime_filter_lease = barrier.install_all(plan)?;
-        Ok(RuntimeFilterReadyDistributedQuery {
+        Ok(LegacyRuntimeFilterReadyDistributedQuery {
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
@@ -236,19 +240,22 @@ impl ControlReadyDistributedQuery {
     }
 }
 
-/// The only typestate that can assemble native submissions.
-pub struct RuntimeFilterReadyDistributedQuery {
+/// Transitional RF-only production handoff pending the Task 7 cutover.
+///
+/// It owns only a legacy runtime-filter lease and must never be treated as
+/// evidence that query-wide Init/ControlReady completed.
+pub struct LegacyRuntimeFilterReadyDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: ValidatedFragmentSchedule,
     runtime_filter_lease: RuntimeFilterInstallLease,
 }
 
-impl RuntimeFilterReadyDistributedQuery {
+impl LegacyRuntimeFilterReadyDistributedQuery {
     pub fn assemble(
         self,
         context: NativeSubmissionContext,
-    ) -> Result<PreparedNativeExecution, DistributedQueryError> {
+    ) -> Result<LegacyPreparedNativeExecution, DistributedQueryError> {
         if context.query_id != self.schedule.execution_id.query_id() {
             let error = contract_error(
                 "native submission context query id does not match validated schedule",
@@ -267,14 +274,12 @@ impl RuntimeFilterReadyDistributedQuery {
             context,
         );
         match assembled {
-            Ok(assembled) => Ok(PreparedNativeExecution {
+            Ok(assembled) => Ok(LegacyPreparedNativeExecution {
                 submissions: assembled.submissions,
                 root_fetch: assembled.root_fetch,
                 writer_registrations: assembled.writer_registrations,
                 expected_output: assembled.expected_output,
-                query_lifecycle_lease: QueryLifecycleLease::new(Box::new(
-                    RuntimeFilterLeaseAsQueryLifecycleGuard(self.runtime_filter_lease),
-                )),
+                runtime_filter_lease: self.runtime_filter_lease,
             }),
             Err(error) => {
                 let kind = error.kind();
@@ -284,19 +289,6 @@ impl RuntimeFilterReadyDistributedQuery {
                 Err(DistributedQueryError::new(kind, message))
             }
         }
-    }
-}
-
-struct RuntimeFilterLeaseAsQueryLifecycleGuard(RuntimeFilterInstallLease);
-
-impl QueryLifecycleLeaseGuard for RuntimeFilterLeaseAsQueryLifecycleGuard {
-    fn finalize(self: Box<Self>) -> Result<(), DistributedQueryError> {
-        self.0.release();
-        Ok(())
-    }
-
-    fn abort_preserving(self: Box<Self>, primary_error: String) -> String {
-        self.0.abort_preserving(primary_error)
     }
 }
 
@@ -431,13 +423,55 @@ impl BackendPlacement {
 /// Unvalidated frontend policy output.
 pub struct FragmentScheduleDraft {
     by_fragment: BTreeMap<FragmentId, Vec<BackendPlacement>>,
+    frozen_live_backends: Option<BTreeMap<usize, LiveBackendTarget>>,
 }
 
 impl FragmentScheduleDraft {
     pub fn new() -> Self {
         Self {
             by_fragment: BTreeMap::new(),
+            frozen_live_backends: None,
         }
+    }
+
+    pub fn freeze_live_backends(
+        &mut self,
+        live_backends: Vec<LiveBackendTarget>,
+    ) -> Result<(), DistributedQueryError> {
+        if self.frozen_live_backends.is_some() {
+            return Err(contract_error(
+                "frontend schedule live-backend topology was frozen more than once",
+            ));
+        }
+        if live_backends.is_empty() {
+            return Err(contract_error(
+                "frontend schedule requires a nonempty live-backend topology",
+            ));
+        }
+        let mut by_backend = BTreeMap::new();
+        let mut endpoints = BTreeSet::new();
+        for target in live_backends {
+            if target.start_epoch() == 0 {
+                return Err(contract_error(format!(
+                    "frontend schedule live backend {} has zero start epoch",
+                    target.backend_idx()
+                )));
+            }
+            if !endpoints.insert(target.endpoint()) {
+                return Err(contract_error(format!(
+                    "frontend schedule live topology repeats endpoint {}",
+                    target.endpoint()
+                )));
+            }
+            if by_backend.insert(target.backend_idx(), target).is_some() {
+                return Err(contract_error(format!(
+                    "frontend schedule live topology repeats backend {}",
+                    target.backend_idx()
+                )));
+            }
+        }
+        self.frozen_live_backends = Some(by_backend);
+        Ok(())
     }
 
     pub fn assign_fragment(
@@ -475,8 +509,15 @@ impl ValidatedFragmentSchedule {
         execution_id: QueryExecutionId,
         draft: FragmentScheduleDraft,
     ) -> Result<Self, DistributedQueryError> {
+        let FragmentScheduleDraft {
+            by_fragment: draft_by_fragment,
+            frozen_live_backends,
+        } = draft;
+        let frozen_live_backends = frozen_live_backends.ok_or_else(|| {
+            contract_error("frontend schedule did not freeze its live-backend topology")
+        })?;
         let expected = view.fragment_ids().collect::<BTreeSet<_>>();
-        let received = draft.by_fragment.keys().copied().collect::<BTreeSet<_>>();
+        let received = draft_by_fragment.keys().copied().collect::<BTreeSet<_>>();
         if expected != received {
             return Err(contract_error(format!(
                 "frontend schedule fragment set mismatch: expected={expected:?}, received={received:?}"
@@ -484,7 +525,7 @@ impl ValidatedFragmentSchedule {
         }
 
         let mut by_fragment = BTreeMap::new();
-        for (fragment_id, placements) in draft.by_fragment {
+        for (fragment_id, placements) in draft_by_fragment {
             if placements.is_empty() {
                 return Err(contract_error(format!(
                     "frontend schedule fragment {fragment_id} has no placements"
@@ -504,6 +545,20 @@ impl ValidatedFragmentSchedule {
                         return Err(contract_error(format!(
                             "frontend schedule fragment {fragment_id} repeats backend {}",
                             placement.backend_idx
+                        )));
+                    }
+                    let frozen = frozen_live_backends
+                        .get(&placement.backend_idx)
+                        .ok_or_else(|| {
+                            contract_error(format!(
+                                "frontend schedule placement backend {} is absent from frozen topology",
+                                placement.backend_idx
+                            ))
+                        })?;
+                    if frozen.endpoint() != placement.endpoint {
+                        return Err(contract_error(format!(
+                            "frontend schedule placement backend {} endpoint {} differs from frozen topology endpoint {}",
+                            placement.backend_idx, placement.endpoint, frozen.endpoint()
                         )));
                     }
                     Ok(FragmentInstancePlacement {
@@ -579,7 +634,8 @@ impl ValidatedFragmentSchedule {
         };
         populate_destinations(&mut inner, view.inner.edges());
         populate_sender_counts(&mut inner, view.inner.edges());
-        let lifecycle = build_fragment_lifecycle_projection(&inner, view.inner.edges())?;
+        let lifecycle =
+            build_fragment_lifecycle_projection(&inner, view.inner.edges(), frozen_live_backends)?;
         Ok(Self {
             handoff_id: view.handoff_id,
             execution_id,
@@ -650,9 +706,26 @@ fn derive_fragment_instance_id(
     Ok(UniqueId { hi, lo })
 }
 
+#[cfg(feature = "query-execution-contract-test-support")]
+pub fn fragment_instance_id_for_contract_test(
+    query_id: QueryId,
+    fragment_id: FragmentId,
+    instance_index: usize,
+) -> UniqueId {
+    let execution_id = QueryExecutionId::new(
+        query_id,
+        crate::query_execution::lifecycle::AttemptId::new(1)
+            .expect("contract fixtures use a nonzero initial attempt"),
+    )
+    .expect("contract fixtures use a nonzero query id");
+    derive_fragment_instance_id(execution_id, fragment_id, instance_index)
+        .expect("contract fixture fragment identity is representable")
+}
+
 fn build_fragment_lifecycle_projection(
     schedule: &SchedulingPlan,
     edges: &[crate::sql::planner::distributed::FragmentEdge],
+    frozen_live_backends: BTreeMap<usize, LiveBackendTarget>,
 ) -> Result<FragmentLifecycleProjection, DistributedQueryError> {
     let mut instances_by_backend = BTreeMap::<usize, BTreeSet<UniqueId>>::new();
     let mut endpoints_by_backend = BTreeMap::<usize, RuntimeEndpoint>::new();
@@ -716,11 +789,8 @@ fn build_fragment_lifecycle_projection(
             }
         }
     }
-    Ok(FragmentLifecycleProjection::new(
-        instances_by_backend,
-        endpoints_by_backend,
-        exchange_routes,
-    ))
+    FragmentLifecycleProjection::new(instances_by_backend, endpoints_by_backend, exchange_routes)
+        .with_frozen_live_backends(frozen_live_backends.into_values().collect())
 }
 
 fn populate_destinations(
@@ -951,6 +1021,36 @@ pub struct PreparedNativeExecutionParts {
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
+}
+
+/// Transitional Task 7 production result. It is intentionally distinct from
+/// `PreparedNativeExecution` and cannot carry a query-wide lifecycle lease.
+pub struct LegacyPreparedNativeExecution {
+    submissions: Vec<ValidatedNativeSubmission>,
+    root_fetch: RootFetchMetadata,
+    writer_registrations: WriterRegistrationSet,
+    expected_output: ExpectedOutputSchema,
+    runtime_filter_lease: RuntimeFilterInstallLease,
+}
+
+impl LegacyPreparedNativeExecution {
+    pub fn into_parts(self) -> LegacyPreparedNativeExecutionParts {
+        LegacyPreparedNativeExecutionParts {
+            submissions: self.submissions,
+            root_fetch: self.root_fetch,
+            writer_registrations: self.writer_registrations,
+            expected_output: self.expected_output,
+            runtime_filter_lease: self.runtime_filter_lease,
+        }
+    }
+}
+
+pub struct LegacyPreparedNativeExecutionParts {
+    pub submissions: Vec<ValidatedNativeSubmission>,
+    pub root_fetch: RootFetchMetadata,
+    pub writer_registrations: WriterRegistrationSet,
+    pub expected_output: ExpectedOutputSchema,
+    pub runtime_filter_lease: RuntimeFilterInstallLease,
 }
 
 fn assemble_native_execution(

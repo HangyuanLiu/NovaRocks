@@ -42,8 +42,8 @@ use crate::sql::planner::distributed::{
 };
 use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 struct RecordingRuntimeFilterLease {
     releases: Arc<AtomicUsize>,
@@ -112,6 +112,28 @@ struct RecordingQueryInitBarrier {
     participants: Arc<AtomicUsize>,
     finalizes: Arc<AtomicUsize>,
     aborts: Arc<AtomicUsize>,
+}
+
+struct CapturingQueryInitBarrier {
+    plan: Arc<Mutex<Option<QueryInitPlan>>>,
+    finalizes: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+}
+
+impl QueryInitBarrier for CapturingQueryInitBarrier {
+    fn initialize_all(
+        &self,
+        plan: QueryInitPlan,
+    ) -> Result<QueryLifecycleLease, DistributedQueryError> {
+        *self.plan.lock().expect("capture plan") = Some(plan);
+        Ok(QueryLifecycleLease::new(Box::new(
+            RecordingQueryLifecycleGuard {
+                finalizes: self.finalizes.clone(),
+                aborts: self.aborts.clone(),
+                armed: true,
+            },
+        )))
+    }
 }
 
 impl QueryInitBarrier for RecordingQueryInitBarrier {
@@ -268,6 +290,11 @@ fn query_control_typestate_initializes_before_native_assembly() {
     let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
     let mut draft = FragmentScheduleDraft::new();
     draft
+        .freeze_live_backends(vec![
+            crate::query_execution::backend::LiveBackendTarget::new(3, endpoint, 11),
+        ])
+        .expect("freeze live topology");
+    draft
         .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
         .expect("assign fragment");
     let schedule =
@@ -337,6 +364,11 @@ fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
     let mut draft = FragmentScheduleDraft::new();
     let endpoint = "127.0.0.1:19031".parse().unwrap();
     draft
+        .freeze_live_backends(vec![
+            crate::query_execution::backend::LiveBackendTarget::new(3, endpoint, 9),
+        ])
+        .unwrap();
+    draft
         .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
         .unwrap();
     let schedule = ValidatedFragmentSchedule::validate(
@@ -355,7 +387,7 @@ fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
     .unwrap();
 
     let ready = scheduled
-        .prepare_runtime_filters(deployment_options, &barrier)
+        .prepare_legacy_runtime_filters(deployment_options, &barrier)
         .expect("empty graph still crosses the explicit barrier");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(participants.load(Ordering::SeqCst), 0);
@@ -373,10 +405,7 @@ fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
     let execution = execution.into_parts();
     assert_eq!(releases.load(Ordering::SeqCst), 0);
     assert_eq!(aborts.load(Ordering::SeqCst), 0);
-    execution
-        .query_lifecycle_lease
-        .finalize()
-        .expect("finalize lifecycle");
+    execution.runtime_filter_lease.release();
     assert_eq!(releases.load(Ordering::SeqCst), 1);
 }
 
@@ -406,6 +435,11 @@ fn assembly_failure_aborts_the_lease_and_preserves_rollback_context() {
     let endpoint = "127.0.0.1:19031".parse().unwrap();
     let mut draft = FragmentScheduleDraft::new();
     draft
+        .freeze_live_backends(vec![
+            crate::query_execution::backend::LiveBackendTarget::new(3, endpoint, 9),
+        ])
+        .unwrap();
+    draft
         .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
         .unwrap();
     let schedule = ValidatedFragmentSchedule::validate(
@@ -418,7 +452,7 @@ fn assembly_failure_aborts_the_lease_and_preserves_rollback_context() {
         .artifacts
         .bind_schedule(schedule)
         .unwrap()
-        .prepare_runtime_filters(
+        .prepare_legacy_runtime_filters(
             RuntimeFilterDeploymentOptions::new(
                 RuntimeFilterDeploymentEpoch::new(9).unwrap(),
                 vec![(3, endpoint)],
@@ -471,6 +505,21 @@ fn nonempty_runtime_filter_graph_is_compiled_before_the_install_barrier() {
     let query_id = crate::query_execution::contract::QueryId::new(41, 73);
     let mut draft = FragmentScheduleDraft::new();
     draft
+        .freeze_live_backends(
+            live_backends
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (backend_idx, endpoint))| {
+                    crate::query_execution::backend::LiveBackendTarget::new(
+                        *backend_idx,
+                        *endpoint,
+                        100 + ordinal as u64,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+    draft
         .assign_fragment(
             11,
             live_backends
@@ -504,7 +553,7 @@ fn nonempty_runtime_filter_graph_is_compiled_before_the_install_barrier() {
     .unwrap();
 
     let ready = scheduled
-        .prepare_runtime_filters(options, &barrier)
+        .prepare_legacy_runtime_filters(options, &barrier)
         .expect("compiled participant plan crosses the barrier");
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -512,6 +561,183 @@ fn nonempty_runtime_filter_graph_is_compiled_before_the_install_barrier() {
     drop(ready);
     assert_eq!(releases.load(Ordering::SeqCst), 0);
     assert_eq!(aborts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[cfg(feature = "query-execution-contract-test-support")]
+fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participant_manifests() {
+    let fixture =
+        crate::query_execution::contract_test_support::non_empty_runtime_filter_contract_fixture();
+    let live_backends = fixture
+        .backends()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (backend_idx, endpoint))| {
+            crate::query_execution::backend::LiveBackendTarget::new(
+                *backend_idx,
+                *endpoint,
+                100 + ordinal as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    let request = fixture.into_request();
+    let parts = request.into_parts();
+    let execution_id = QueryExecutionId::new(
+        crate::query_execution::contract::QueryId::new(41, 73),
+        AttemptId::new(17).expect("nonzero attempt"),
+    )
+    .expect("valid execution id");
+    let mut draft = FragmentScheduleDraft::new();
+    draft
+        .freeze_live_backends(live_backends.clone())
+        .expect("freeze live topology");
+    draft
+        .assign_fragment(
+            11,
+            live_backends
+                .iter()
+                .map(|target| BackendPlacement::new(target.backend_idx(), target.endpoint()))
+                .collect(),
+        )
+        .expect("schedule producer fragment");
+    draft
+        .assign_fragment(
+            19,
+            vec![BackendPlacement::new(
+                live_backends[0].backend_idx(),
+                live_backends[0].endpoint(),
+            )],
+        )
+        .expect("schedule consumer fragment");
+    let schedule =
+        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), execution_id, draft)
+            .expect("validate schedule");
+    let options = QueryInitOptions::new(
+        execution_id,
+        live_backends,
+        2,
+        parts.options.runtime_filter_lifecycle(),
+        &parts.options,
+        5_000,
+        std::time::Duration::from_secs(30),
+        crate::query_execution::backend::CoordinatorReportEndpoint::from_socket_addr(
+            "127.0.0.1:19030".parse().expect("valid report endpoint"),
+        ),
+        false,
+    )
+    .expect("valid init options");
+    let captured = Arc::new(Mutex::new(None));
+    let barrier = CapturingQueryInitBarrier {
+        plan: captured.clone(),
+        finalizes: Arc::new(AtomicUsize::new(0)),
+        aborts: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let ready = parts
+        .artifacts
+        .bind_schedule(schedule)
+        .expect("bind schedule")
+        .initialize_query(options, &barrier)
+        .expect("compile real RF contributions and initialize");
+    {
+        let captured = captured.lock().expect("read captured plan");
+        let plan = captured.as_ref().expect("captured init plan");
+        assert_eq!(plan.backend_ids(), vec![3, 8]);
+        for backend_idx in [3, 8] {
+            let participant = plan.participant(backend_idx).expect("RF participant");
+            let contribution = participant
+                .manifest()
+                .runtime_filter()
+                .expect("real compiled RF contribution");
+            assert_eq!(contribution.install().epoch().get(), 17);
+            assert_ne!(contribution.digest(), &[0; 32]);
+            assert_eq!(participant.digest(), participant.manifest().digest());
+        }
+    }
+    drop(ready);
+}
+
+#[test]
+#[cfg(feature = "query-execution-contract-test-support")]
+fn exchange_route_projection_binds_exact_instances_and_canonical_sender_order() {
+    let fixture =
+        crate::query_execution::contract_test_support::non_empty_result_contract_fixture();
+    let live_backends = fixture
+        .backends()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (backend_idx, endpoint))| {
+            crate::query_execution::backend::LiveBackendTarget::new(
+                *backend_idx,
+                *endpoint,
+                100 + ordinal as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    let request = fixture.into_request();
+    let parts = request.into_parts();
+    let mut draft = FragmentScheduleDraft::new();
+    draft
+        .freeze_live_backends(live_backends.clone())
+        .expect("freeze live topology");
+    draft
+        .assign_fragment(
+            11,
+            live_backends
+                .iter()
+                .map(|target| BackendPlacement::new(target.backend_idx(), target.endpoint()))
+                .collect(),
+        )
+        .expect("schedule source fragment");
+    draft
+        .assign_fragment(
+            19,
+            vec![BackendPlacement::new(
+                live_backends[0].backend_idx(),
+                live_backends[0].endpoint(),
+            )],
+        )
+        .expect("schedule destination fragment");
+    let schedule = ValidatedFragmentSchedule::validate(
+        parts.artifacts.scheduling_view(),
+        execution_id(crate::query_execution::contract::QueryId::new(41, 73)),
+        draft,
+    )
+    .expect("validate schedule");
+
+    let routes = &schedule.lifecycle_projection().exchange_routes;
+    assert_eq!(routes.len(), 2);
+    assert_eq!(
+        routes[0].source_fragment_instance_id(),
+        crate::common::types::UniqueId {
+            hi: -468_035_725_852_328_221,
+            lo: 6_732_931_633_094_041_032,
+        }
+    );
+    assert_eq!(
+        routes[0].destination_fragment_instance_id(),
+        crate::common::types::UniqueId {
+            hi: 2_973_306_339_434_288_066,
+            lo: -8_117_117_705_014_581_208,
+        }
+    );
+    assert_eq!(routes[0].destination_node_id(), 190);
+    assert_eq!(routes[0].sender_ordinal(), 0);
+    assert_eq!(routes[0].sender_count(), 2);
+    assert_eq!(
+        routes[1].source_fragment_instance_id(),
+        crate::common::types::UniqueId {
+            hi: 8_069_940_229_124_169_845,
+            lo: 713_546_644_952_921_691,
+        }
+    );
+    assert_eq!(
+        routes[1].destination_fragment_instance_id(),
+        routes[0].destination_fragment_instance_id()
+    );
+    assert_eq!(routes[1].destination_node_id(), 190);
+    assert_eq!(routes[1].sender_ordinal(), 1);
+    assert_eq!(routes[1].sender_count(), 2);
 }
 
 #[test]
