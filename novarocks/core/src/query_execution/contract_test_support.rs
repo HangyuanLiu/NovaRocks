@@ -27,21 +27,44 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::query_execution::backend::{BackendTopologySnapshot, LiveBackendTarget};
 use crate::query_execution::cancellation::{QueryCancellationSource, QueryCancellationView};
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
-    DistributedQueryOutcome, DistributedQueryRequest, build_distributed_query_request,
+    DistributedQueryOutcome, DistributedQueryRequest,
+    build_distributed_query_request_with_execution,
 };
 use crate::query_execution::fragment_transport::FetchedQueryBatch;
 use crate::query_execution::preparation::{
     PreparedFragmentRole, prepared_fragment_set_for_test,
     prepared_fragment_set_with_runtime_filter_for_test,
 };
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::NativeExecutionReport;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::planner::distributed::{
     DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
 };
+
+fn fixture_execution(
+    backends: &[(usize, SocketAddr)],
+    cancellation: QueryCancellationView,
+) -> QueryExecutionContext {
+    QueryExecutionContext::new(
+        crate::common::app_config::ClusterRole::AllInOne,
+        BackendTopologySnapshot::try_new(
+            0,
+            backends
+                .iter()
+                .map(|(backend_idx, endpoint)| LiveBackendTarget::new(*backend_idx, *endpoint, 0))
+                .collect(),
+        )
+        .expect("contract fixture topology"),
+        None,
+        cancellation,
+        crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    )
+}
 
 pub struct ResultContractFixture {
     request: DistributedQueryRequest,
@@ -132,8 +155,12 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
             },
         ])
         .expect("contract fixture native bundle");
+    let backends = vec![
+        (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
+        (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
+    ];
     let cancellation = QueryCancellationSource::new();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         Some(QueryOptions {
@@ -142,7 +169,7 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
             ..Default::default()
         }),
         DistributedQueryIntent::Result,
-        cancellation.view(),
+        &fixture_execution(&backends, cancellation.view()),
     )
     .expect("contract fixture request");
     let batch = RecordBatch::try_new_with_options(
@@ -155,10 +182,7 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
         .expect("contract result chunk");
     ResultContractFixture {
         request,
-        backends: vec![
-            (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
-            (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
-        ],
+        backends,
         result_chunk,
         cancellation,
     }
@@ -311,8 +335,12 @@ pub fn non_empty_runtime_filter_contract_fixture() -> ResultContractFixture {
             },
         ])
         .expect("contract fixture native bundle");
+    let backends = vec![
+        (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
+        (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
+    ];
     let cancellation = QueryCancellationSource::new();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         Some(QueryOptions {
@@ -321,7 +349,7 @@ pub fn non_empty_runtime_filter_contract_fixture() -> ResultContractFixture {
             ..Default::default()
         }),
         DistributedQueryIntent::Result,
-        cancellation.view(),
+        &fixture_execution(&backends, cancellation.view()),
     )
     .expect("runtime-filter contract fixture request");
     let batch = RecordBatch::try_new_with_options(
@@ -334,10 +362,7 @@ pub fn non_empty_runtime_filter_contract_fixture() -> ResultContractFixture {
         .expect("contract result chunk");
     ResultContractFixture {
         request,
-        backends: vec![
-            (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
-            (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
-        ],
+        backends,
         result_chunk,
         cancellation,
     }
@@ -529,8 +554,9 @@ pub fn non_empty_write_contract_fixture_with_query_timeout_seconds(
             },
         ])
         .expect("write contract native bundle");
+    let backends = vec![(3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031))];
     let cancellation = QueryCancellationSource::new();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         Some(QueryOptions {
@@ -539,12 +565,12 @@ pub fn non_empty_write_contract_fixture_with_query_timeout_seconds(
             ..Default::default()
         }),
         DistributedQueryIntent::Write,
-        cancellation.view(),
+        &fixture_execution(&backends, cancellation.view()),
     )
     .expect("write contract request");
     WriteContractFixture {
         request,
-        backends: vec![(3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031))],
+        backends,
         cancellation,
     }
 }
@@ -708,7 +734,11 @@ pub fn non_empty_profile_contract_fixture_with_query_timeout_seconds(
             },
         ])
         .expect("profile contract native bundle");
-    let request = build_distributed_query_request(
+    let backends = vec![
+        (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
+        (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
+    ];
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         Some(QueryOptions {
@@ -718,7 +748,7 @@ pub fn non_empty_profile_contract_fixture_with_query_timeout_seconds(
             ..Default::default()
         }),
         DistributedQueryIntent::Profile,
-        QueryCancellationView::never_cancelled(),
+        &fixture_execution(&backends, QueryCancellationSource::new().view()),
     )
     .expect("profile contract request");
     let batch = RecordBatch::try_new_with_options(
@@ -731,10 +761,7 @@ pub fn non_empty_profile_contract_fixture_with_query_timeout_seconds(
         .expect("profile contract result chunk");
     ProfileContractFixture {
         request,
-        backends: vec![
-            (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
-            (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
-        ],
+        backends,
         result_chunk,
     }
 }

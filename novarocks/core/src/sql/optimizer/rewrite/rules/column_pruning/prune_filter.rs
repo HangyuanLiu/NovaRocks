@@ -75,7 +75,10 @@ mod tests {
     use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
-        RewriteContext::new(RewriteConsumer::Query)
+        RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        )
     }
 
     fn dummy_input() -> OptExpr {

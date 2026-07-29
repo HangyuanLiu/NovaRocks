@@ -72,10 +72,6 @@ pub struct QueryCancellationView {
 }
 
 impl QueryCancellationView {
-    pub(crate) fn never_cancelled() -> Self {
-        QueryCancellationSource::new().view()
-    }
-
     pub fn is_cancelled(&self) -> bool {
         self.reason.get().is_some()
     }

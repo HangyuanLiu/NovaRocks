@@ -404,6 +404,7 @@ fn drive_data_write(
         &InsertSource::FromQuery(Box::new(query.clone())),
         OverwriteMode::None,
         "main",
+        None,
     )
     .map(|_| ())
 }

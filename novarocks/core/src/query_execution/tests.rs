@@ -20,15 +20,17 @@ use crate::query_execution::artifact::{
     RuntimeFilterDeploymentOptions, RuntimeFilterInstallBarrier, RuntimeFilterInstallLease,
     RuntimeFilterInstallLeaseGuard, ValidatedFragmentSchedule,
 };
+use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
-    build_distributed_query_request,
+    build_distributed_query_request_with_execution,
 };
 use crate::query_execution::outcome::QueryOutcomeFactory;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use crate::runtime::query_options::QueryOptions;
@@ -39,6 +41,16 @@ use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
+    QueryExecutionContext::new(
+        crate::common::app_config::ClusterRole::AllInOne,
+        BackendTopologySnapshot::empty(0),
+        None,
+        cancellation,
+        crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    )
+}
 
 struct RecordingRuntimeFilterLease {
     releases: Arc<AtomicUsize>,
@@ -147,7 +159,7 @@ fn real_execution_artifacts() -> (
 #[test]
 fn request_owns_prepared_and_native_artifacts() {
     let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         Some(QueryOptions {
@@ -155,7 +167,7 @@ fn request_owns_prepared_and_native_artifacts() {
             ..Default::default()
         }),
         DistributedQueryIntent::Result,
-        QueryCancellationView::never_cancelled(),
+        &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("valid production artifacts form an owned request");
 
@@ -191,12 +203,12 @@ fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
         aborts: aborts.clone(),
     };
     let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         None,
         DistributedQueryIntent::Result,
-        QueryCancellationView::never_cancelled(),
+        &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("build request");
     let parts = request.into_parts();
@@ -254,12 +266,12 @@ fn assembly_failure_aborts_the_lease_and_preserves_rollback_context() {
         aborts: aborts.clone(),
     };
     let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         None,
         DistributedQueryIntent::Result,
-        QueryCancellationView::never_cancelled(),
+        &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("build request");
     let parts = request.into_parts();
@@ -549,12 +561,12 @@ fn query_execution_service_uses_explicitly_injected_coordinator() {
         calls: calls.clone(),
     }));
     let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         None,
         DistributedQueryIntent::Result,
-        QueryCancellationView::never_cancelled(),
+        &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("build service request");
 

@@ -23,8 +23,7 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::common::app_config::ClusterRole;
-use crate::engine::{StandaloneState, StatementResult};
+use crate::engine::StandaloneState;
 use crate::meta::MetaStoreProvider;
 use crate::meta::repository::backend::StoredBackend;
 #[cfg(not(test))]
@@ -34,7 +33,6 @@ use crate::query_execution::backend_registry::{
     run_heartbeat_round,
 };
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::sql::parser::ast::{AddBackendStmt, DropBackendStmt};
 
 fn legacy_grpc_heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
     match crate::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint) {
@@ -347,97 +345,6 @@ fn current_time_millis() -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
-    if let Some(membership) = crate::query_execution::backend_registry::cluster_membership() {
-        let live = membership.live_endpoints();
-        if live.is_empty() {
-            return Err("no live backend available".to_string());
-        }
-        return Ok(live);
-    }
-
-    configured_backend_entries()
-}
-
-#[cfg(test)]
-fn configured_backend_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
-    let cfg = crate::novarocks_config::config()
-        .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
-    if cfg.cluster.backends.is_empty() {
-        return Err("no live backend available".to_string());
-    }
-    cfg.cluster
-        .backends
-        .iter()
-        .enumerate()
-        .map(|(idx, backend)| {
-            backend
-                .parse::<SocketAddr>()
-                .map(|endpoint| (idx, endpoint))
-                .map_err(|e| format!("role=fe: invalid backend addr '{backend}': {e}"))
-        })
-        .collect()
-}
-
-pub(crate) fn execute_add_backend(
-    state: &Arc<StandaloneState>,
-    stmt: AddBackendStmt,
-) -> Result<StatementResult, String> {
-    require_role(&[ClusterRole::Fe], "ADD BACKEND")?;
-    let endpoint = parse_backend_addr(&stmt.addr)?;
-    let registry = ensure_backend_registry(state)?;
-    let be_id = registry.add_backend(endpoint);
-    persist_backend(state, be_id, endpoint, BackendState::Registering)?;
-    publish_registry_snapshot(state.backend_query_events.as_ref(), registry.as_ref());
-    Ok(StatementResult::Ok)
-}
-
-pub(crate) fn execute_drop_backend(
-    state: &Arc<StandaloneState>,
-    stmt: DropBackendStmt,
-) -> Result<StatementResult, String> {
-    require_role(&[ClusterRole::Fe], "DROP BACKEND")?;
-    let endpoint = parse_backend_addr(&stmt.addr)?;
-    let registry = ensure_backend_registry(state)?;
-    let be_id = registry.mark_decommissioning(endpoint)?;
-    publish_registry_snapshot(state.backend_query_events.as_ref(), registry.as_ref());
-
-    if stmt.force
-        || !state
-            .backend_query_events
-            .backend_has_active_queries(be_id as usize)
-    {
-        force_remove_backend(state, registry.as_ref(), be_id, endpoint, stmt.force)?;
-    } else {
-        persist_backend(state, be_id, endpoint, BackendState::Decommissioning)?;
-        spawn_decommission_watcher(state, registry, be_id, endpoint)?;
-    }
-
-    Ok(StatementResult::Ok)
-}
-
-pub(crate) fn execute_show_backends(
-    state: &Arc<StandaloneState>,
-) -> Result<StatementResult, String> {
-    match current_role()? {
-        ClusterRole::Fe => {
-            let registry = ensure_backend_registry(state)?;
-            Ok(StatementResult::Query(show_backends_result(
-                registry.snapshot(),
-            )?))
-        }
-        ClusterRole::AllInOne => {
-            let registry = crate::query_execution::backend_registry::backend_registry()
-                .ok_or_else(|| "all-in-one backend registry is not initialized".to_string())?;
-            Ok(StatementResult::Query(show_backends_result(
-                registry.snapshot(),
-            )?))
-        }
-        ClusterRole::Be => Err("SHOW BACKENDS is not available in role=be".to_string()),
-    }
-}
-
 fn show_backends_result(
     mut entries: Vec<crate::query_execution::backend_registry::BackendEntry>,
 ) -> Result<QueryResult, String> {
@@ -616,26 +523,6 @@ fn delete_backend_with_provider(
     Ok(())
 }
 
-fn require_role(allowed: &[ClusterRole], statement: &str) -> Result<(), String> {
-    let role = current_role()?;
-    if allowed.contains(&role) {
-        return Ok(());
-    }
-    match role {
-        ClusterRole::Be => Err(format!(
-            "{statement} is not available in role=be; backend management is owned by StarRocks FE"
-        )),
-        ClusterRole::AllInOne => Err(format!("{statement} requires role=fe")),
-        ClusterRole::Fe => Err(format!("{statement} is not allowed for current role")),
-    }
-}
-
-fn current_role() -> Result<ClusterRole, String> {
-    crate::novarocks_config::config()
-        .map(|cfg| cfg.cluster.role)
-        .map_err(|e| format!("read config failed: {e}"))
-}
-
 fn parse_backend_addr(addr: &str) -> Result<SocketAddr, String> {
     addr.parse::<SocketAddr>()
         .map_err(|e| format!("invalid backend address '{addr}': {e}"))
@@ -707,29 +594,6 @@ mod tests {
         assert_eq!(snapshot[0].version, env!("CARGO_PKG_VERSION"));
         assert!(snapshot[0].num_cores > 0);
         assert!(snapshot[0].last_heartbeat_ms > 0);
-        assert_eq!(
-            live_backend_dispatch_entries().expect("dispatch entries"),
-            vec![(0usize, endpoint)]
-        );
-    }
-
-    #[test]
-    fn live_backend_dispatch_entries_reads_injected_membership() {
-        let _standalone = crate::engine::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
-        let endpoint: std::net::SocketAddr = "127.0.0.1:19080".parse().unwrap();
-        crate::query_execution::backend_registry::replace_cluster_membership_for_test(Some(
-            std::sync::Arc::new(
-                crate::query_execution::backend_registry::FakeClusterMembership::new(vec![(
-                    0, endpoint,
-                )]),
-            ),
-        ));
-
-        assert_eq!(
-            live_backend_dispatch_entries().expect("dispatch entries from injected membership"),
-            vec![(0usize, endpoint)]
-        );
     }
 
     #[test]

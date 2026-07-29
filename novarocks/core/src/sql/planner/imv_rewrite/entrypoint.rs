@@ -60,7 +60,12 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     } = input;
 
     reserve_existing_plan_column_ids(&column_ref_factory, &plan);
-    let mut ctx_rw = RewriteContext::for_mv_refresh(disabled_rules);
+    let mut ctx_rw = RewriteContext::for_mv_refresh_with_settings(
+        crate::sql::optimizer::options::SessionOptimizerSettings {
+            disabled_rules,
+            ..Default::default()
+        },
+    );
     ctx_rw.set_column_ref_factory(Rc::clone(&column_ref_factory));
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
         mv_ctx,
@@ -450,6 +455,7 @@ pub(crate) mod tests {
             &HashMap::new(),
             factory,
             Vec::new(),
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         )
         .expect("physical optimization")
     }

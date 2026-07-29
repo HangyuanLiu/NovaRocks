@@ -68,6 +68,7 @@ fn standalone_open_services(
     host.configure_backend_topology(config)
         .expect("frontend topology configuration is validated before server open");
     novarocks::engine::StandaloneOpenServices::new(
+        config.cluster.role,
         system_catalog,
         host.view_service(),
         host.statistics_service(),
@@ -509,7 +510,9 @@ mod tests {
         let live_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while !services
             .backend_topology
-            .live_backends()
+            .snapshot()
+            .expect("all-in-one topology snapshot")
+            .targets()
             .iter()
             .any(|backend| backend.endpoint() == loopback_endpoint)
         {
@@ -520,6 +523,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
+        let backend_topology = Arc::clone(&services.backend_topology);
         let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
             novarocks::engine::StandaloneOptions::default(),
             config,
@@ -528,11 +532,15 @@ mod tests {
         .expect("open production-composed all-in-one engine");
         report_endpoint.set_bound_port(grpc_port);
 
-        let backends = engine
-            .session()
-            .query("SHOW BACKENDS")
-            .expect("all-in-one publishes its loopback backend");
-        assert_eq!(backends.row_count(), 1);
+        assert_eq!(
+            backend_topology
+                .snapshot()
+                .expect("all-in-one topology snapshot")
+                .targets()
+                .len(),
+            1,
+            "all-in-one publishes its loopback backend"
+        );
 
         let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new(
             format!("127.0.0.1:{grpc_port}")

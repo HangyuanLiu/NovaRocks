@@ -16,12 +16,10 @@
 // under the License.
 
 #[cfg(test)]
-use std::collections::VecDeque;
-#[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use novarocks::query_execution::artifact::{
@@ -83,45 +81,6 @@ impl QueryIdSource for FixedQueryIdSource {
     }
 }
 
-pub(crate) struct FrontendLiveBackendTopology {
-    state: Mutex<FrontendLiveBackendTopologyState>,
-}
-
-struct FrontendLiveBackendTopologyState {
-    revision: u64,
-    live: Vec<LiveBackendTarget>,
-}
-
-impl FrontendLiveBackendTopology {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Mutex::new(FrontendLiveBackendTopologyState {
-                revision: 0,
-                live: Vec::new(),
-            }),
-        }
-    }
-
-    fn snapshot(&self) -> Vec<LiveBackendTarget> {
-        self.state
-            .lock()
-            .expect("frontend live backend topology lock")
-            .live
-            .clone()
-    }
-
-    pub(crate) fn replace(&self, revision: u64, live: Vec<LiveBackendTarget>) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("frontend live backend topology lock");
-        if revision >= state.revision {
-            state.revision = revision;
-            state.live = live;
-        }
-    }
-}
-
 struct FrontendReportEndpointBinding {
     advertised_host: String,
     configured_port: u16,
@@ -173,17 +132,9 @@ impl novarocks::query_execution::backend::CoordinatorReportEndpointSink
     }
 }
 
-enum BackendServicesSource {
-    Live(Arc<FrontendLiveBackendTopology>),
-    #[cfg(test)]
+#[cfg(test)]
+enum BackendTransportOverrides {
     Fixed {
-        scheduler: FrontendFragmentScheduler,
-        dispatcher: Arc<dyn FragmentDispatcher>,
-        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
-    },
-    #[cfg(test)]
-    Sequence {
-        schedulers: Mutex<VecDeque<FrontendFragmentScheduler>>,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
     },
@@ -195,46 +146,21 @@ struct QueryBackendServices {
     runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
 }
 
-impl BackendServicesSource {
-    fn resolve(&self) -> Result<QueryBackendServices, DistributedQueryError> {
+#[cfg(test)]
+impl BackendTransportOverrides {
+    fn resolve(
+        &self,
+        topology: &[LiveBackendTarget],
+    ) -> Result<QueryBackendServices, DistributedQueryError> {
         match self {
-            Self::Live(topology) => {
-                let targets = topology.snapshot();
-                let entries = targets
-                    .iter()
-                    .map(|target| (target.backend_idx(), target.endpoint()))
-                    .collect::<Vec<_>>();
-                let snapshot = FrontendBackendSnapshot::from_live_targets(targets)?;
-                let dispatcher = new_grpc_fragment_dispatcher(&entries).map_err(failed)?;
-                let runtime_filter_dispatcher =
-                    new_grpc_runtime_filter_deployment_dispatcher(&entries).map_err(failed)?;
-                Ok(QueryBackendServices {
-                    scheduler: FrontendFragmentScheduler::new(snapshot),
-                    dispatcher,
-                    runtime_filter_dispatcher,
-                })
-            }
             #[cfg(test)]
             Self::Fixed {
-                scheduler,
                 dispatcher,
                 runtime_filter_dispatcher,
             } => Ok(QueryBackendServices {
-                scheduler: scheduler.clone(),
-                dispatcher: Arc::clone(dispatcher),
-                runtime_filter_dispatcher: Arc::clone(runtime_filter_dispatcher),
-            }),
-            #[cfg(test)]
-            Self::Sequence {
-                schedulers,
-                dispatcher,
-                runtime_filter_dispatcher,
-            } => Ok(QueryBackendServices {
-                scheduler: schedulers
-                    .lock()
-                    .expect("frontend test backend sequence lock")
-                    .pop_front()
-                    .expect("frontend test backend sequence exhausted"),
+                scheduler: FrontendFragmentScheduler::new(
+                    FrontendBackendSnapshot::from_live_targets(topology.to_vec())?,
+                ),
                 dispatcher: Arc::clone(dispatcher),
                 runtime_filter_dispatcher: Arc::clone(runtime_filter_dispatcher),
             }),
@@ -242,11 +168,29 @@ impl BackendServicesSource {
     }
 }
 
+fn production_backend_services(
+    topology: &[LiveBackendTarget],
+) -> Result<QueryBackendServices, DistributedQueryError> {
+    let entries = topology
+        .iter()
+        .map(|target| (target.backend_idx(), target.endpoint()))
+        .collect::<Vec<_>>();
+    let snapshot = FrontendBackendSnapshot::from_live_targets(topology.to_vec())?;
+    let dispatcher = new_grpc_fragment_dispatcher(&entries).map_err(failed)?;
+    let runtime_filter_dispatcher =
+        new_grpc_runtime_filter_deployment_dispatcher(&entries).map_err(failed)?;
+    Ok(QueryBackendServices {
+        scheduler: FrontendFragmentScheduler::new(snapshot),
+        dispatcher,
+        runtime_filter_dispatcher,
+    })
+}
+
 pub struct FrontendDistributedQueryCoordinator {
     report_endpoint: Arc<FrontendReportEndpointBinding>,
-    live_topology: Arc<FrontendLiveBackendTopology>,
     backend_topology: novarocks::query_execution::backend::BackendTopologyService,
-    backend_services: BackendServicesSource,
+    #[cfg(test)]
+    backend_services: Option<BackendTransportOverrides>,
     runtime_filter_worker_count: NonZeroUsize,
     next_runtime_filter_epoch: AtomicU64,
     #[cfg(test)]
@@ -262,15 +206,14 @@ impl FrontendDistributedQueryCoordinator {
         runtime_filter_worker_count: NonZeroUsize,
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     ) -> Self {
-        let live_topology = Arc::new(FrontendLiveBackendTopology::new());
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::new(
                 advertised_report_host,
                 configured_report_port,
             )),
-            live_topology: Arc::clone(&live_topology),
             backend_topology,
-            backend_services: BackendServicesSource::Live(live_topology),
+            #[cfg(test)]
+            backend_services: None,
             runtime_filter_worker_count,
             next_runtime_filter_epoch: AtomicU64::new(1),
             #[cfg(test)]
@@ -292,11 +235,25 @@ impl FrontendDistributedQueryCoordinator {
         Self::new_for_test_with_topology(
             query_id,
             report_endpoint,
-            scheduler,
+            scheduler.clone(),
             dispatcher,
             runtime_filter_worker_count,
             runtime_filter_dispatcher,
-            Arc::new(crate::topology::FrontendTopologyController::new(1)),
+            Arc::new(
+                crate::topology::FrontendTopologyController::from_captured_targets_for_test(
+                    &scheduler
+                        .backend_entries()
+                        .iter()
+                        .map(|(backend_idx, endpoint)| {
+                            novarocks::query_execution::backend::LiveBackendTarget::new(
+                                *backend_idx,
+                                *endpoint,
+                                0,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            ),
         )
     }
 
@@ -304,53 +261,21 @@ impl FrontendDistributedQueryCoordinator {
     pub(crate) fn new_for_test_with_topology(
         query_id: QueryId,
         report_endpoint: SocketAddr,
-        scheduler: FrontendFragmentScheduler,
+        _scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     ) -> Self {
-        let live_topology = Arc::new(FrontendLiveBackendTopology::new());
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
             )),
-            live_topology,
             backend_topology,
-            backend_services: BackendServicesSource::Fixed {
-                scheduler,
+            backend_services: Some(BackendTransportOverrides::Fixed {
                 dispatcher,
                 runtime_filter_dispatcher,
-            },
-            runtime_filter_worker_count,
-            next_runtime_filter_epoch: AtomicU64::new(1),
-            runtime_filter_barrier_calls: Arc::new(AtomicU64::new(0)),
-            query_ids: Arc::new(FixedQueryIdSource(query_id)),
-            registry: Arc::new(FrontendQueryRegistry::default()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test_with_backend_sequence(
-        query_id: QueryId,
-        report_endpoint: SocketAddr,
-        schedulers: Vec<FrontendFragmentScheduler>,
-        dispatcher: Arc<dyn FragmentDispatcher>,
-        runtime_filter_worker_count: NonZeroUsize,
-        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
-    ) -> Self {
-        let live_topology = Arc::new(FrontendLiveBackendTopology::new());
-        Self {
-            report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
-                report_endpoint,
-            )),
-            live_topology,
-            backend_topology: Arc::new(crate::topology::FrontendTopologyController::new(1)),
-            backend_services: BackendServicesSource::Sequence {
-                schedulers: Mutex::new(schedulers.into()),
-                dispatcher,
-                runtime_filter_dispatcher,
-            },
+            }),
             runtime_filter_worker_count,
             next_runtime_filter_epoch: AtomicU64::new(1),
             runtime_filter_barrier_calls: Arc::new(AtomicU64::new(0)),
@@ -364,7 +289,7 @@ impl FrontendDistributedQueryCoordinator {
     }
 
     pub fn backend_query_activity(&self) -> BackendQueryActivity {
-        BackendQueryActivity::new(Arc::clone(&self.registry), Arc::clone(&self.live_topology))
+        BackendQueryActivity::new(Arc::clone(&self.registry))
     }
 
     pub fn report_endpoint_sink(
@@ -409,7 +334,16 @@ impl FrontendDistributedQueryCoordinator {
         let query_id = self.query_ids.next_query_id();
         let parts = request.into_parts();
         let intent = parts.completion.intent();
-        let backend_services = self.backend_services.resolve()?;
+        self.backend_topology
+            .validate_snapshot(&parts.topology)
+            .map_err(|error| failed(error.to_string()))?;
+        #[cfg(test)]
+        let backend_services = match &self.backend_services {
+            Some(services) => services.resolve(parts.topology.targets())?,
+            None => production_backend_services(parts.topology.targets())?,
+        };
+        #[cfg(not(test))]
+        let backend_services = production_backend_services(parts.topology.targets())?;
         let dispatcher = backend_services.dispatcher;
         let _query = self
             .registry
@@ -420,6 +354,9 @@ impl FrontendDistributedQueryCoordinator {
         let scheduled_backend_ownership = backend_services
             .scheduler
             .scheduled_backend_ownership(&schedule.backend_ids())?;
+        self.backend_topology
+            .validate_snapshot(&parts.topology)
+            .map_err(|error| failed(error.to_string()))?;
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
         let scheduled = parts.artifacts.bind_schedule(schedule)?;
@@ -468,7 +405,7 @@ impl FrontendDistributedQueryCoordinator {
                 abort_runtime_filters(&mut runtime_filter_lease, error.message().to_string());
             return Err(DistributedQueryError::new(kind, message));
         }
-        let timeout_ms = parts.options.timeout_ms().max(0);
+        let deadline = parts.deadline;
 
         let submission_count = submissions.len();
         let mut submitted = 0usize;
@@ -573,7 +510,6 @@ impl FrontendDistributedQueryCoordinator {
             return Err(failed(message));
         }
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         let mut batches = Vec::new();
         if root_fetch.uses_result_buffer() {
             loop {
@@ -586,16 +522,16 @@ impl FrontendDistributedQueryCoordinator {
                     return Err(failed(message));
                 }
                 let now = Instant::now();
-                if now >= deadline {
-                    return Err(self.fail_and_cancel(
-                        query_id,
-                        format!("query timed out after {timeout_ms} ms"),
-                    ));
-                }
-                let fetch_wait_ms = deadline
-                    .saturating_duration_since(now)
-                    .as_millis()
-                    .clamp(1, 300) as i64;
+                let fetch_wait_ms = match deadline {
+                    Some(deadline) if now >= deadline => {
+                        return Err(self.fail_and_cancel(query_id, "query deadline exceeded"));
+                    }
+                    Some(deadline) => deadline
+                        .saturating_duration_since(now)
+                        .as_millis()
+                        .clamp(1, 300) as i64,
+                    None => 300,
+                };
                 let fetch = match dispatcher.fetch_result(
                     root_fetch.backend_idx(),
                     root_fetch.fragment_instance_id(),
@@ -623,7 +559,6 @@ impl FrontendDistributedQueryCoordinator {
                     query_id,
                     &writer_instance_ids,
                     deadline,
-                    timeout_ms,
                     &parts.cancellation,
                     true,
                     "write final reports",
@@ -639,7 +574,6 @@ impl FrontendDistributedQueryCoordinator {
                 query_id,
                 &submitted_instance_ids,
                 deadline,
-                timeout_ms,
                 &parts.cancellation,
                 false,
                 "fragment profile reports",
@@ -690,8 +624,7 @@ impl FrontendDistributedQueryCoordinator {
         &self,
         query_id: QueryId,
         expected_instances: &[novarocks::UniqueId],
-        deadline: Instant,
-        timeout_ms: i64,
+        deadline: Option<Instant>,
         cancellation: &QueryCancellationView,
         final_report_failure_completes_wait: bool,
         report_kind: &str,
@@ -723,20 +656,20 @@ impl FrontendDistributedQueryCoordinator {
             }
 
             let now = Instant::now();
-            if now >= deadline {
-                return Err(self.fail_and_cancel(
-                    query_id,
-                    format!(
-                        "query timed out after {timeout_ms} ms waiting for {report_kind}: received {received} of {}",
-                        expected_instances.len()
-                    ),
-                ));
+            match deadline {
+                Some(deadline) if now >= deadline => {
+                    return Err(self.fail_and_cancel(
+                        query_id,
+                        format!("query deadline exceeded waiting for {report_kind}: received {received} of {}", expected_instances.len()),
+                    ));
+                }
+                Some(deadline) => std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(REPORT_POLL_INTERVAL),
+                ),
+                None => std::thread::sleep(REPORT_POLL_INTERVAL),
             }
-            std::thread::sleep(
-                deadline
-                    .saturating_duration_since(now)
-                    .min(REPORT_POLL_INTERVAL),
-            );
         }
     }
 
@@ -791,11 +724,8 @@ fn abort_runtime_filters(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackendServicesSource, FrontendLiveBackendTopology, FrontendReportEndpointBinding,
-    };
-    use novarocks::query_execution::backend::{CoordinatorReportEndpointSink, LiveBackendTarget};
-    use std::sync::Arc;
+    use super::FrontendReportEndpointBinding;
+    use novarocks::query_execution::backend::CoordinatorReportEndpointSink;
 
     #[test]
     fn ephemeral_report_endpoint_is_unavailable_until_the_bound_port_is_published() {
@@ -812,48 +742,5 @@ mod tests {
         binding
             .resolve()
             .expect("bound port publication makes the DNS endpoint available");
-    }
-
-    #[test]
-    fn live_backend_source_resolves_each_query_from_the_latest_injected_snapshot() {
-        let topology = Arc::new(FrontendLiveBackendTopology::new());
-        let source = BackendServicesSource::Live(Arc::clone(&topology));
-        let first: std::net::SocketAddr = "127.0.0.1:19071".parse().unwrap();
-        let second: std::net::SocketAddr = "127.0.0.1:19072".parse().unwrap();
-
-        assert!(
-            source.resolve().is_err(),
-            "an empty injected topology must not fall back to core globals or config"
-        );
-
-        topology.replace(1, vec![LiveBackendTarget::new(7, first, 11)]);
-        assert_eq!(
-            source
-                .resolve()
-                .expect("first injected topology")
-                .scheduler
-                .backend_entries(),
-            &[(7, first)]
-        );
-
-        topology.replace(2, vec![LiveBackendTarget::new(8, second, 12)]);
-        assert_eq!(
-            source
-                .resolve()
-                .expect("replacement injected topology")
-                .scheduler
-                .backend_entries(),
-            &[(8, second)]
-        );
-
-        topology.replace(1, vec![LiveBackendTarget::new(7, first, 11)]);
-        assert_eq!(
-            source
-                .resolve()
-                .expect("stale topology publication is ignored")
-                .scheduler
-                .backend_entries(),
-            &[(8, second)]
-        );
     }
 }

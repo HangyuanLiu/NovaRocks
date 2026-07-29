@@ -731,6 +731,7 @@ mod tests {
             &plan.snapshot,
             ColumnRefFactory::default(),
             Vec::new(),
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         )
         .expect("optimizer should consume bound catalog stats");
         assert_eq!(optimized_tree.stats.output_row_count, 3.0);

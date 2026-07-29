@@ -371,9 +371,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::JoinKind;
-    use crate::sql::optimizer::options::{
-        SessionOptimizerSettings, with_session_optimizer_settings,
-    };
+    use crate::sql::optimizer::options::SessionOptimizerSettings;
     use crate::sql::planner::payload::{
         PlanCTEConsumeNode, PlanCTEProduceNode, PlanFilterNode, PlanProjectNode, PlanValuesNode,
         PlanWindowNode,
@@ -728,7 +726,7 @@ mod tests {
             },
         ] {
             let mut plan = join_with_eligible_topn();
-            with_session_optimizer_settings(settings, || place_runtime_filters(&mut plan));
+            place_runtime_filters(&mut plan, &settings);
 
             assert!(hash_join(&plan).build_runtime_filters.is_empty());
             assert!(aggregate_topn_builds(&plan.children[0]).is_empty());
@@ -744,7 +742,7 @@ mod tests {
             ..SessionOptimizerSettings::default()
         };
 
-        with_session_optimizer_settings(settings, || place_runtime_filters(&mut plan));
+        place_runtime_filters(&mut plan, &settings);
 
         assert_eq!(hash_join(&plan).build_runtime_filters[0].filter_id, 0);
         assert_eq!(aggregate_topn_builds(&plan.children[0])[0].filter_id, 1);

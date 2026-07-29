@@ -60,8 +60,9 @@ pub(crate) fn prepare_mv_rewrite_candidates(
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
     query_stats: &mut QueryStatsPlan,
+    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Vec<MvRewriteCandidate> {
-    if !crate::sql::optimizer::options::current_session_optimizer_settings().mv_rewrite_enabled() {
+    if !optimizer_settings.mv_rewrite_enabled() {
         return Vec::new();
     }
     match try_prepare(

@@ -28,6 +28,7 @@ mod tests {
     use novarocks::query_execution::artifact::{
         RuntimeFilterAbortEnvelope, RuntimeFilterDeploymentDispatcher, RuntimeFilterInstallEnvelope,
     };
+    use novarocks::query_execution::backend::LiveBackendTarget;
     use novarocks::query_execution::contract::QueryId;
     use novarocks::query_execution::contract_test_support::{
         assert_profile_outcome_preserved, assert_result_outcome_preserved,
@@ -622,14 +623,12 @@ mod tests {
         let backends = fixture.backends().to_vec();
         let batch = fixture.result_batch();
         let request = fixture.into_request();
-        let topology = Arc::new(FrontendTopologyController::new(1));
-        for (_, endpoint) in &backends {
-            novarocks::query_execution::backend::BackendTopologyPort::add_backend(
-                topology.as_ref(),
-                *endpoint,
-            )
-            .unwrap();
-        }
+        let topology = Arc::new(FrontendTopologyController::from_captured_targets_for_test(
+            &backends
+                .iter()
+                .map(|(backend_idx, endpoint)| LiveBackendTarget::new(*backend_idx, *endpoint, 0))
+                .collect::<Vec<_>>(),
+        ));
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
             FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(backends).unwrap());
@@ -680,48 +679,6 @@ mod tests {
 
         assert_result_outcome_preserved(outcome, 1).expect("engine consumes Result payload");
         assert_eq!(dispatcher.submissions.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn frontend_resolves_a_fresh_backend_snapshot_for_each_query() {
-        let first = non_empty_result_contract_fixture();
-        let backends = first.backends().to_vec();
-        let first_batch = first.result_batch();
-        let first_request = first.into_request();
-        let second = non_empty_result_contract_fixture();
-        let second_batch = second.result_batch();
-        let second_request = second.into_request();
-        let dispatcher = Arc::new(RecordingDispatcher::with_results(vec![
-            first_batch,
-            second_batch,
-        ]));
-        let schedulers = backends
-            .iter()
-            .copied()
-            .map(|backend| {
-                FrontendFragmentScheduler::new(FrontendBackendSnapshot::new(vec![backend]).unwrap())
-            })
-            .collect();
-        let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence(
-            QueryId::new(41, 73),
-            report_endpoint(),
-            schedulers,
-            dispatcher.clone(),
-            NonZeroUsize::new(1).unwrap(),
-            Arc::new(NoopRuntimeFilterDispatcher),
-        );
-
-        assert_result_outcome_preserved(coordinator.execute(first_request).unwrap(), 1).unwrap();
-        assert_result_outcome_preserved(coordinator.execute(second_request).unwrap(), 1).unwrap();
-
-        let submitted_backends = dispatcher
-            .submissions
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(backend_idx, _)| *backend_idx)
-            .collect::<Vec<_>>();
-        assert_eq!(submitted_backends, vec![3, 3, 8, 8]);
     }
 
     #[test]

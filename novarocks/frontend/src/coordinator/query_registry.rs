@@ -192,12 +192,39 @@ impl FrontendQueryRegistry {
         if topology.initialized && revision < topology.revision {
             return;
         }
+        let previous_revision = topology.revision;
+        let revision_changed = topology.initialized && revision != previous_revision;
         topology.initialized = true;
         topology.revision = revision;
         topology.live_generations = backends
             .iter()
             .map(|target| (target.backend_idx(), target.start_epoch()))
             .collect();
+        drop(topology);
+
+        // A captured statement is only valid for one revision. This includes a
+        // backend join: accepting a new target mid-query would make planning,
+        // scheduling and ownership disagree about the same request.
+        if !revision_changed {
+            return;
+        }
+        let cancellations = {
+            let mut active = self.active.lock().expect("frontend query registry lock");
+            active
+                .values_mut()
+                .filter_map(|query| {
+                    query.first_failure.get_or_insert_with(|| {
+                        format!(
+                            "backend topology revision changed from {previous_revision} to {revision}"
+                        )
+                    });
+                    request_cancellation(query)
+                })
+                .collect::<Vec<_>>()
+        };
+        for cancellation in cancellations {
+            dispatch_cancellation(Some(cancellation));
+        }
     }
 
     #[cfg(test)]

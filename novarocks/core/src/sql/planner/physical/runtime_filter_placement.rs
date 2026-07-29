@@ -10,7 +10,7 @@
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
-use crate::sql::optimizer::options::current_session_optimizer_settings;
+use crate::sql::optimizer::options::SessionOptimizerSettings;
 use crate::sql::planner::physical::runtime_filter::{
     RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
@@ -26,9 +26,8 @@ use std::collections::{HashMap, HashSet};
 /// unchanged. `optimizer::is_known_rule_name` references this (Task 7).
 pub(crate) const RUNTIME_FILTER_RULE: &str = "RuntimeFilterPushDown";
 
-/// RF placement config, derived from the session optimizer settings that the
-/// engine installs before `optimize()` and that remain live on the same thread
-/// through optimizer-to-physical conversion and the planner pipeline.
+/// RF placement config derived from the immutable settings captured at request
+/// admission and carried through optimizer-to-physical conversion.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RuntimeFilterPlacementConfig {
     pub enabled: bool,
@@ -41,8 +40,7 @@ pub(crate) struct RuntimeFilterPlacementConfig {
 }
 
 impl RuntimeFilterPlacementConfig {
-    pub(crate) fn from_current_session() -> Self {
-        let s = current_session_optimizer_settings();
+    pub(crate) fn from_session(s: &SessionOptimizerSettings) -> Self {
         Self {
             enabled: s.global_runtime_filter_enabled()
                 && !s.disabled_rules.iter().any(|r| r == RUNTIME_FILTER_RULE),
@@ -712,12 +710,15 @@ fn push_probe_down(
 }
 
 /// Entry point for the planner-side RF placement pass once the bridge wires it.
-pub(crate) fn place_runtime_filters(root: &mut PhysicalPlanNode) {
+pub(crate) fn place_runtime_filters(
+    root: &mut PhysicalPlanNode,
+    settings: &SessionOptimizerSettings,
+) {
     debug_assert!(
         tree_has_no_runtime_filters(root),
         "optimizer output must not carry runtime filters; RF placement is a planner-only pass (RFP-1)"
     );
-    let config = RuntimeFilterPlacementConfig::from_current_session();
+    let config = RuntimeFilterPlacementConfig::from_session(settings);
     if !config.enabled {
         return;
     }
@@ -881,9 +882,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, ProjectItem, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{BinOp, JoinKind, OutputColumn};
-    use crate::sql::optimizer::options::{
-        SessionOptimizerSettings, with_session_optimizer_settings,
-    };
+    use crate::sql::optimizer::options::SessionOptimizerSettings;
     use crate::sql::planner::payload::{PlanProjectNode, PlanValuesNode};
     use crate::sql::planner::physical::{
         HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition,
@@ -1008,7 +1007,7 @@ mod tests {
                 probe_expr: col_ref(1, "a"),
             });
 
-        place_runtime_filters(&mut join);
+        place_runtime_filters(&mut join, &SessionOptimizerSettings::default());
     }
 
     #[cfg(debug_assertions)]
@@ -1038,16 +1037,12 @@ mod tests {
                 execution_mode: JoinExecutionMode::Broadcast,
             });
 
-        with_session_optimizer_settings(settings, || {
-            place_runtime_filters(&mut join);
-        });
+        place_runtime_filters(&mut join, &settings);
     }
 
     #[test]
     fn config_reads_defaults_when_session_unset() {
-        let cfg = with_session_optimizer_settings(SessionOptimizerSettings::default(), || {
-            RuntimeFilterPlacementConfig::from_current_session()
-        });
+        let cfg = RuntimeFilterPlacementConfig::from_session(&SessionOptimizerSettings::default());
         assert!(cfg.enabled);
         assert_eq!(cfg.build_max_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.build_min_bytes, 128 * 1024);
@@ -1064,9 +1059,7 @@ mod tests {
             disabled_rules: vec![RUNTIME_FILTER_RULE.to_string()],
             ..SessionOptimizerSettings::default()
         };
-        let cfg = with_session_optimizer_settings(settings, || {
-            RuntimeFilterPlacementConfig::from_current_session()
-        });
+        let cfg = RuntimeFilterPlacementConfig::from_session(&settings);
         assert!(!cfg.enabled);
     }
 
@@ -1095,9 +1088,7 @@ mod tests {
             ..SessionOptimizerSettings::default()
         };
         let mut disabled_join = candidate_join();
-        with_session_optimizer_settings(disabled, || {
-            place_runtime_filters(&mut disabled_join);
-        });
+        place_runtime_filters(&mut disabled_join, &disabled);
         assert!(
             expect_hash_join(&disabled_join)
                 .build_runtime_filters
@@ -1115,9 +1106,7 @@ mod tests {
             ..SessionOptimizerSettings::default()
         };
         let mut enabled_join = candidate_join();
-        with_session_optimizer_settings(enabled, || {
-            place_runtime_filters(&mut enabled_join);
-        });
+        place_runtime_filters(&mut enabled_join, &enabled);
         assert_eq!(
             expect_hash_join(&enabled_join).build_runtime_filters.len(),
             1
@@ -1135,9 +1124,7 @@ mod tests {
             allow_cross_exchange_rf: Some(false),
             ..SessionOptimizerSettings::default()
         };
-        let cfg = with_session_optimizer_settings(settings, || {
-            RuntimeFilterPlacementConfig::from_current_session()
-        });
+        let cfg = RuntimeFilterPlacementConfig::from_session(&settings);
 
         assert!(cfg.enabled);
         assert_eq!(cfg.build_max_bytes, 11);

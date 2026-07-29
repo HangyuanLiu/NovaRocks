@@ -32,6 +32,7 @@ use crate::engine::statistics::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::expr::cast_with_special_rules;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
@@ -48,6 +49,7 @@ pub(crate) fn run_insert(
     current_catalog: Option<&str>,
     current_database: &str,
     query_opts: Option<&QueryOptions>,
+    execution: Option<&QueryExecutionContext>,
 ) -> Result<StatementResult, String> {
     let is_overwrite = matches!(
         overwrite_mode,
@@ -148,6 +150,7 @@ pub(crate) fn run_insert(
             source,
             overwrite_mode,
             &target_ref,
+            execution.cloned(),
         );
     }
 
@@ -172,6 +175,7 @@ pub(crate) fn run_insert(
                     current_catalog,
                     current_database,
                     query_opts,
+                    execution,
                 )?;
             }
         }

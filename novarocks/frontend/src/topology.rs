@@ -26,8 +26,9 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks::query_execution::backend::{
-    BackendLifecycleState, BackendQueryEvent, BackendQueryEventSink, BackendTopologyMetadataStore,
-    BackendTopologyMetricsSnapshot, BackendTopologyPort, HeartbeatOutcome, LiveBackendTarget,
+    BackendLifecycleState, BackendQueryEvent, BackendQueryEventSink, BackendTopologyError,
+    BackendTopologyMetadataStore, BackendTopologyMetricsSnapshot, BackendTopologyPort,
+    BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
     PersistedBackendTopology, publish_backend_topology_metrics,
 };
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
@@ -52,6 +53,7 @@ struct TopologyState {
     timeout_retries: Option<u32>,
     decommission_timeout: Duration,
     topology_revision: u64,
+    terminal_error: Option<String>,
     entries: BTreeMap<usize, FrontendBackendEntry>,
     next_backend_idx: usize,
     configured_seed_endpoints: Vec<SocketAddr>,
@@ -92,6 +94,44 @@ impl FrontendTopologyController {
         })
     }
 
+    /// Builds a controller whose only state is the request's captured topology.
+    ///
+    /// Contract tests use this to exercise the same snapshot validation as the
+    /// production coordinator without inventing a second topology sequence.
+    #[cfg(test)]
+    pub(crate) fn from_captured_targets_for_test(targets: &[LiveBackendTarget]) -> Self {
+        let controller = Self::new(1);
+        let mut state = controller.state.lock().expect("frontend topology lock");
+        state.entries = targets
+            .iter()
+            .map(|target| {
+                (
+                    target.backend_idx(),
+                    FrontendBackendEntry {
+                        endpoint: target.endpoint(),
+                        state: BackendLifecycleState::Live,
+                        start_epoch: target.start_epoch(),
+                        version: String::new(),
+                        num_cores: 0,
+                        last_heartbeat_ms: 0,
+                        missed_heartbeats: 0,
+                        scheduled_fragments: 0,
+                        last_err: None,
+                        decommission_started: None,
+                    },
+                )
+            })
+            .collect();
+        state.next_backend_idx = targets
+            .iter()
+            .map(|target| target.backend_idx())
+            .max()
+            .and_then(|backend_idx| backend_idx.checked_add(1))
+            .unwrap_or(0);
+        drop(state);
+        controller
+    }
+
     #[cfg(test)]
     fn new_with_probe<F>(timeout_retries: u32, heartbeat_probe: F) -> Self
     where
@@ -109,6 +149,7 @@ impl FrontendTopologyController {
                 timeout_retries,
                 decommission_timeout: Duration::from_secs(300),
                 topology_revision: 0,
+                terminal_error: None,
                 entries: BTreeMap::new(),
                 next_backend_idx: 0,
                 configured_seed_endpoints: Vec::new(),
@@ -206,6 +247,9 @@ impl FrontendTopologyController {
             .spawn(move || {
                 let mut observed_generation = 0;
                 loop {
+                    if controller.topology_terminal_error().is_some() {
+                        return;
+                    }
                     if controller.heartbeat_is_stopping() {
                         return;
                     }
@@ -359,7 +403,9 @@ impl FrontendTopologyController {
         );
         let metadata_store = state.metadata_store.clone();
         if old_state != BackendLifecycleState::Live || old_epoch != start_epoch {
-            state.topology_revision = state.topology_revision.saturating_add(1);
+            if advance_topology_revision(&mut state).is_err() {
+                return;
+            }
         }
         drop(state);
         if old_state != BackendLifecycleState::Live {
@@ -411,7 +457,9 @@ impl FrontendTopologyController {
             )
         };
         if transitioned {
-            state.topology_revision = state.topology_revision.saturating_add(1);
+            if advance_topology_revision(&mut state).is_err() {
+                return false;
+            }
         }
         let metadata_store = state.metadata_store.clone();
         drop(state);
@@ -445,6 +493,14 @@ impl FrontendTopologyController {
             .collect()
     }
 
+    fn topology_terminal_error(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal_error
+            .clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn backend_count_for_test(&self) -> usize {
         self.state
@@ -452,6 +508,14 @@ impl FrontendTopologyController {
             .expect("frontend topology lock")
             .entries
             .len()
+    }
+
+    #[cfg(test)]
+    fn live_backends(&self) -> Vec<LiveBackendTarget> {
+        self.snapshot()
+            .expect("test topology snapshot is available")
+            .targets()
+            .to_vec()
     }
 
     #[cfg(test)]
@@ -539,8 +603,8 @@ impl FrontendTopologyController {
         if let Some(store) = state.metadata_store.clone() {
             store.delete_backend(endpoint)?;
         }
+        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
         state.entries.remove(&backend_idx);
-        state.topology_revision = state.topology_revision.saturating_add(1);
         drop(state);
         self.publish_snapshot();
         Ok(())
@@ -587,6 +651,7 @@ fn add_backend_entry(state: &mut TopologyState, endpoint: SocketAddr) -> Result<
     {
         return Ok(backend_idx);
     }
+    advance_topology_revision(state).map_err(|error| error.to_string())?;
     let backend_idx = state.next_backend_idx;
     state.next_backend_idx = state
         .next_backend_idx
@@ -607,22 +672,95 @@ fn add_backend_entry(state: &mut TopologyState, endpoint: SocketAddr) -> Result<
             decommission_started: None,
         },
     );
-    state.topology_revision = state.topology_revision.saturating_add(1);
     Ok(backend_idx)
 }
 
+fn advance_topology_revision(state: &mut TopologyState) -> Result<(), BackendTopologyError> {
+    if let Some(message) = &state.terminal_error {
+        return Err(BackendTopologyError::Unavailable {
+            message: message.clone(),
+        });
+    }
+    state.topology_revision = state.topology_revision.checked_add(1).ok_or_else(|| {
+        let message = "frontend topology revision space is exhausted".to_string();
+        state.terminal_error = Some(message);
+        BackendTopologyError::RevisionExhausted
+    })?;
+    Ok(())
+}
+
 impl BackendTopologyPort for FrontendTopologyController {
-    fn live_backends(&self) -> Vec<LiveBackendTarget> {
-        self.rows()
-            .into_iter()
-            .filter_map(|(backend_idx, entry)| {
-                (entry.state == BackendLifecycleState::Live).then_some(LiveBackendTarget::new(
-                    backend_idx,
-                    entry.endpoint,
-                    entry.start_epoch,
-                ))
-            })
-            .collect()
+    fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| BackendTopologyError::Unavailable {
+                message: "frontend topology lock is poisoned".to_string(),
+            })?;
+        if let Some(message) = &state.terminal_error {
+            return Err(BackendTopologyError::Unavailable {
+                message: message.clone(),
+            });
+        }
+        BackendTopologySnapshot::try_new(
+            state.topology_revision,
+            state
+                .entries
+                .iter()
+                .filter_map(|(backend_idx, entry)| {
+                    (entry.state == BackendLifecycleState::Live).then_some(LiveBackendTarget::new(
+                        *backend_idx,
+                        entry.endpoint,
+                        entry.start_epoch,
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    fn validate_snapshot(
+        &self,
+        expected: &BackendTopologySnapshot,
+    ) -> Result<(), BackendTopologyValidationError> {
+        let current = self
+            .snapshot()
+            .map_err(BackendTopologyValidationError::Unavailable)?;
+        if current.revision() != expected.revision() {
+            return Err(BackendTopologyValidationError::RevisionChanged {
+                captured_revision: expected.revision(),
+                current_revision: current.revision(),
+            });
+        }
+        if current == *expected {
+            return Ok(());
+        }
+        for captured in expected.targets() {
+            match current.target(captured.backend_idx()) {
+                None => {
+                    return Err(BackendTopologyValidationError::TargetMissing {
+                        backend_idx: captured.backend_idx(),
+                        captured_generation: captured.start_epoch(),
+                        captured_revision: expected.revision(),
+                        current_revision: current.revision(),
+                    });
+                }
+                Some(current_target) if current_target.start_epoch() != captured.start_epoch() => {
+                    return Err(BackendTopologyValidationError::GenerationChanged {
+                        backend_idx: captured.backend_idx(),
+                        captured_generation: captured.start_epoch(),
+                        current_generation: current_target.start_epoch(),
+                        captured_revision: expected.revision(),
+                        current_revision: current.revision(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        Err(
+            BackendTopologyValidationError::ContentChangedWithoutRevision {
+                revision: expected.revision(),
+            },
+        )
     }
 
     fn record_successful_fragment_submission(&self, backend_idx: usize) {
@@ -694,7 +832,7 @@ impl BackendTopologyPort for FrontendTopologyController {
         for endpoint in state.configured_seed_endpoints.clone() {
             add_backend_entry(&mut state, endpoint)?;
         }
-        state.topology_revision = state.topology_revision.saturating_add(1);
+        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
         drop(state);
         drop(heartbeat_round);
         self.publish_snapshot();
@@ -721,8 +859,8 @@ impl BackendTopologyPort for FrontendTopologyController {
                 BackendLifecycleState::Registering,
             )) {
                 let mut state = self.state.lock().expect("frontend topology lock");
+                let _ = advance_topology_revision(&mut state);
                 state.entries.remove(&backend_idx);
-                state.topology_revision = state.topology_revision.saturating_add(1);
                 drop(state);
                 self.publish_snapshot();
                 return Err(error);
@@ -749,14 +887,18 @@ impl BackendTopologyPort for FrontendTopologyController {
             });
             return Ok(());
         }
-        let entry = state
+        let needs_decommissioning = state
             .entries
-            .get_mut(&backend_idx)
-            .expect("backend index was resolved from the same topology snapshot");
-        if entry.state != BackendLifecycleState::Decommissioning {
+            .get(&backend_idx)
+            .is_some_and(|entry| entry.state != BackendLifecycleState::Decommissioning);
+        if needs_decommissioning {
+            advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
+            let entry = state
+                .entries
+                .get_mut(&backend_idx)
+                .expect("backend index was resolved from the same topology snapshot");
             entry.state = BackendLifecycleState::Decommissioning;
             entry.decommission_started = Some(Instant::now());
-            state.topology_revision = state.topology_revision.saturating_add(1);
         }
         let metadata_store = state.metadata_store.clone();
         drop(state);
@@ -828,7 +970,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks::query_execution::backend::{
-        BackendLifecycleState, BackendQueryEvent, BackendQueryEventSink,
+        BackendLifecycleState, BackendQueryEvent, BackendQueryEventSink, BackendTopologyError,
         BackendTopologyMetadataStore, BackendTopologyPort, HeartbeatOutcome, LiveBackendTarget,
         PersistedBackendTopology,
     };
@@ -921,6 +1063,32 @@ mod tests {
 
         controller.drop_backend(endpoint, true).unwrap();
         assert!(controller.live_backends().is_empty());
+    }
+
+    #[test]
+    fn captured_snapshot_rejects_membership_and_generation_changes() {
+        let controller = FrontendTopologyController::new(1);
+        let first: SocketAddr = "127.0.0.1:9061".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:9062".parse().unwrap();
+        controller.add_backend(first).unwrap();
+        controller.record_heartbeat_success(0, 7, "v1", 1, 1);
+        let captured = controller.snapshot().expect("capture topology");
+        controller
+            .validate_snapshot(&captured)
+            .expect("unchanged snapshot is valid");
+
+        controller.add_backend(second).unwrap();
+        assert!(matches!(
+            controller.validate_snapshot(&captured),
+            Err(novarocks::query_execution::backend::BackendTopologyValidationError::RevisionChanged { .. })
+        ));
+
+        let captured = controller.snapshot().expect("capture changed topology");
+        controller.record_heartbeat_success(0, 8, "v2", 1, 2);
+        assert!(matches!(
+            controller.validate_snapshot(&captured),
+            Err(novarocks::query_execution::backend::BackendTopologyValidationError::RevisionChanged { .. })
+        ));
     }
 
     #[test]
@@ -1234,5 +1402,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(7, restored), (8, configured)]
         );
+    }
+
+    #[test]
+    fn revision_exhaustion_rejects_membership_mutation_and_poisoned_snapshot() {
+        let controller = FrontendTopologyController::new(1);
+        {
+            let mut state = controller.state.lock().unwrap();
+            state.topology_revision = u64::MAX;
+        }
+
+        let endpoint: SocketAddr = "127.0.0.1:9080".parse().unwrap();
+        let error = controller
+            .add_backend(endpoint)
+            .expect_err("revision exhaustion must reject a new backend");
+        assert!(error.contains("revision space is exhausted"), "{error}");
+        assert!(controller.rows().is_empty());
+        assert!(matches!(
+            controller.snapshot(),
+            Err(BackendTopologyError::Unavailable { .. })
+        ));
     }
 }

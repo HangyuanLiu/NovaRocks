@@ -276,6 +276,8 @@ where
     configure_standalone_internal_rpc_transport();
     let native_report_handler = Arc::clone(&services.native_report_handler);
     let query_control = services.query_control.clone();
+    let execution_role = services.execution_role;
+    let admission_topology = Arc::clone(&services.backend_topology);
 
     let grpc_endpoint = start_standalone_grpc_endpoint(
         &resolved.grpc_bind_host,
@@ -318,6 +320,8 @@ where
         let session_engine = engine;
         let session_user = resolved.user;
         let session_query_control = query_control.clone();
+        let session_execution_role = execution_role;
+        let session_admission_topology = admission_topology;
         let cancellation_shutdown = query_control;
         serve_until_shutdown(
             bind_addr,
@@ -330,6 +334,8 @@ where
                     session_engine.clone(),
                     session_user.clone(),
                     session_query_control.clone(),
+                    session_execution_role,
+                    session_admission_topology.clone(),
                     stream,
                     peer_addr,
                 )
@@ -547,8 +553,11 @@ async fn wait_for_local_exchange_backend(
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if topology
-            .live_backends()
-            .into_iter()
+            .snapshot()
+            .map_err(|error| error.to_string())?
+            .targets()
+            .iter()
+            .copied()
             .any(|backend| backend.endpoint() == endpoint)
         {
             return Ok(());
@@ -693,6 +702,8 @@ async fn serve_mysql_connection(
     engine: StandaloneNovaRocks,
     user: String,
     query_control: QueryControlService,
+    execution_role: crate::common::app_config::ClusterRole,
+    admission_topology: crate::query_execution::backend::BackendTopologyService,
     stream: TcpStream,
     peer_addr: SocketAddr,
 ) {
@@ -705,6 +716,8 @@ async fn serve_mysql_connection(
         user,
         connection_id,
         query_control,
+        execution_role,
+        admission_topology,
         session_token,
         disconnect_watcher,
     );
@@ -806,6 +819,8 @@ struct NovaRocksMysqlShim {
     user: String,
     connection_id: u32,
     query_control: QueryControlService,
+    execution_role: crate::common::app_config::ClusterRole,
+    admission_topology: crate::query_execution::backend::BackendTopologyService,
     session_token: Arc<OnceLock<SessionToken>>,
     session_lease: Mutex<Option<QuerySessionLease>>,
     _disconnect_watcher: ClientDisconnectWatcher,
@@ -836,6 +851,8 @@ impl NovaRocksMysqlShim {
         user: String,
         connection_id: u32,
         query_control: QueryControlService,
+        execution_role: crate::common::app_config::ClusterRole,
+        admission_topology: crate::query_execution::backend::BackendTopologyService,
         session_token: Arc<OnceLock<SessionToken>>,
         disconnect_watcher: ClientDisconnectWatcher,
     ) -> Self {
@@ -844,6 +861,8 @@ impl NovaRocksMysqlShim {
             user,
             connection_id,
             query_control,
+            execution_role,
+            admission_topology,
             session_token,
             session_lease: Mutex::new(None),
             _disconnect_watcher: disconnect_watcher,
@@ -1738,25 +1757,43 @@ async fn execute_sql_in_worker(
         .begin_statement(session_token)
         .map_err(map_statement_begin_error)?;
     let cancellation = active_statement.cancellation().clone();
-    let cancellation_for_worker = cancellation.clone();
+    let deadline = match query_timeout.filter(|secs| *secs > 0) {
+        Some(secs) => match Instant::now().checked_add(Duration::from_secs(secs)) {
+            Some(deadline) => Some(deadline),
+            None => {
+                let _ = active_statement.finish();
+                return Err((
+                    ErrorKind::ER_UNKNOWN_ERROR,
+                    "query deadline exceeds monotonic clock range".to_string(),
+                ));
+            }
+        },
+        None => None,
+    };
+    let topology = match shim.admission_topology.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = active_statement.finish();
+            return Err((ErrorKind::ER_UNKNOWN_ERROR, error.to_string()));
+        }
+    };
+    let context = crate::query_execution::request_context::RequestContext::new(
+        crate::query_execution::request_context::RequestSessionContext::new(
+            current_catalog,
+            current_db,
+            optimizer_settings.clone(),
+        ),
+        crate::query_execution::request_context::QueryExecutionContext::new(
+            shim.execution_role,
+            topology,
+            deadline,
+            cancellation.clone(),
+            optimizer_settings.clone(),
+        ),
+    );
 
     let join_handle = task::spawn_blocking(move || {
-        let result = crate::runtime::query_cancel::with_query_cancellation_view(
-            cancellation_for_worker,
-            || {
-                crate::sql::optimizer::options::with_session_optimizer_settings(
-                    optimizer_settings,
-                    || {
-                        session.execute_in_context(
-                            &sql,
-                            current_catalog.as_deref(),
-                            &current_db,
-                            Some(query_options),
-                        )
-                    },
-                )
-            },
-        );
+        let result = session.execute_with_context(&sql, &context, Some(query_options));
         let completion = active_statement.finish();
         (result, completion)
     });

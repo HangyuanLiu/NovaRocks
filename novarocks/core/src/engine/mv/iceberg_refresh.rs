@@ -11890,8 +11890,10 @@ fn run_imv_rewrite_for_refresh_explain(
     // Thread the active session's disable_optimizer_rules into IMV. When
     // refresh runs outside a user session (e.g. background scheduler),
     // the thread-local default is empty, so this is a safe no-op.
-    let disabled_rules =
-        refresh_explain_rewrite_disabled_rules(ctx.rewrite.schema_contract.aggregate.is_some());
+    let disabled_rules = refresh_explain_rewrite_disabled_rules(
+        ctx.rewrite.schema_contract.aggregate.is_some(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    );
     let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
         crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
@@ -11908,10 +11910,11 @@ fn run_imv_rewrite_for_refresh_explain(
     Ok(outcome)
 }
 
-fn refresh_explain_rewrite_disabled_rules(is_aggregate_refresh: bool) -> Vec<String> {
-    let mut disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
-        .disabled_rules
-        .clone();
+fn refresh_explain_rewrite_disabled_rules(
+    is_aggregate_refresh: bool,
+    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+) -> Vec<String> {
+    let mut disabled_rules = optimizer_settings.disabled_rules.clone();
     if is_aggregate_refresh
         && !disabled_rules
             .iter()
@@ -12404,7 +12407,10 @@ mod join_delta_append_only_fast_path_tests {
 
     #[test]
     fn aggregate_refresh_explain_disables_join_refresh_descriptor_recording() {
-        let disabled_rules = refresh_explain_rewrite_disabled_rules(true);
+        let disabled_rules = refresh_explain_rewrite_disabled_rules(
+            true,
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
 
         assert!(
             disabled_rules
@@ -13450,6 +13456,7 @@ fn execute_imv_change_stream_writer(
         state,
         planned.prepared,
         planned.native_bundle,
+        None,
         None,
     )?;
     executed_change_stream_write_from_result(result, planned.commit_plan)

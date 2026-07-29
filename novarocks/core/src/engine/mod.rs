@@ -341,6 +341,10 @@ pub(crate) enum StatementResult {
 }
 
 pub(crate) struct StandaloneState {
+    /// Role supplied by the frontend composition root. Maintenance execution
+    /// captures it with the same topology snapshot instead of reading config
+    /// during a request.
+    pub(crate) execution_role: crate::common::app_config::ClusterRole,
     pub(crate) catalog_service: Arc<StandaloneCatalogService>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
@@ -397,6 +401,7 @@ pub(crate) struct StandaloneState {
 impl Default for StandaloneState {
     fn default() -> Self {
         Self {
+            execution_role: crate::common::app_config::ClusterRole::AllInOne,
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
@@ -535,6 +540,9 @@ pub struct StandaloneSession {
 /// The value has no default: the owning frontend must construct every
 /// application-level service, including distributed query execution.
 pub struct StandaloneOpenServices {
+    /// Deployment role validated by the frontend composition root. Request
+    /// execution must not rediscover it from global process configuration.
+    pub execution_role: crate::common::app_config::ClusterRole,
     pub system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
     pub view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     pub statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
@@ -558,6 +566,7 @@ pub struct StandaloneOpenServices {
 
 impl StandaloneOpenServices {
     pub fn new(
+        execution_role: crate::common::app_config::ClusterRole,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
@@ -581,6 +590,7 @@ impl StandaloneOpenServices {
         exchange_port: u16,
     ) -> Self {
         Self {
+            execution_role,
             system_catalog,
             view_service,
             statistics_service,
@@ -751,6 +761,7 @@ impl StandaloneNovaRocks {
         };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
         let StandaloneOpenServices {
+            execution_role,
             system_catalog,
             view_service,
             statistics_service,
@@ -765,7 +776,7 @@ impl StandaloneNovaRocks {
             query_control: _,
             exchange_port,
         } = services;
-        if cfg.cluster.role == crate::common::app_config::ClusterRole::Fe {
+        if execution_role == crate::common::app_config::ClusterRole::Fe {
             if let Some(provider) = metadata_provider.as_ref() {
                 backend_topology.install_metadata_store(Arc::new(
                     EngineBackendTopologyMetadataStore {
@@ -775,6 +786,7 @@ impl StandaloneNovaRocks {
             }
         }
         let inner = Arc::new_cyclic(|self_weak| StandaloneState {
+            execution_role,
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
                 starrocks_table_config.clone(),
@@ -951,6 +963,7 @@ fn register_connector_backends(state: &Arc<StandaloneState>) {
 }
 
 impl StandaloneSession {
+    #[cfg(test)]
     pub fn execute(&self, sql: &str) -> Result<(), String> {
         match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Ok => Ok(()),
@@ -958,6 +971,7 @@ impl StandaloneSession {
         }
     }
 
+    #[cfg(test)]
     pub fn query(&self, sql: &str) -> Result<QueryResult, String> {
         match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Query(result) => Ok(result),
@@ -965,6 +979,7 @@ impl StandaloneSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_in_database(
         &self,
         sql: &str,
@@ -973,6 +988,19 @@ impl StandaloneSession {
         self.execute_in_context(sql, None, current_database, None)
     }
 
+    /// Executes a statement using the immutable context created at server
+    /// admission. Production callers must use this entrypoint so planning and
+    /// coordinator submission share one topology, deadline and cancellation.
+    pub(crate) fn execute_with_context(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        self.execute_in_context_inner(sql, context, query_opts)
+    }
+
+    #[cfg(test)]
     pub(crate) fn execute_in_context(
         &self,
         sql: &str,
@@ -980,16 +1008,18 @@ impl StandaloneSession {
         current_database: &str,
         query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
-        self.execute_in_context_inner(sql, current_catalog, current_database, query_opts)
+        let context = test_request_context(current_catalog, current_database);
+        self.execute_in_context_inner(sql, &context, query_opts)
     }
 
     fn execute_in_context_inner(
         &self,
         sql: &str,
-        current_catalog: Option<&str>,
-        current_database: &str,
+        request_context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
+        let current_catalog = request_context.session().current_catalog();
+        let current_database = request_context.session().current_database();
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
             looks_like_create_table, looks_like_drop_statement,
@@ -1266,6 +1296,7 @@ impl StandaloneSession {
                         current_database,
                         level,
                         Some(&self.inner),
+                        &optimizer_settings_for_execution(Some(request_context.execution())),
                     )?
                 };
                 Ok(StatementResult::Query(result))
@@ -1306,6 +1337,7 @@ impl StandaloneSession {
                     None,
                     Some(&self.inner),
                     &self.inner.query_execution,
+                    request_context.execution(),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -1379,7 +1411,7 @@ impl StandaloneSession {
                 self.inner
                     .statistics_service
                     .observe_query(&prepared, current_database)?;
-                let result = execute_query_with_catalog_provider(
+                let result = execute_query_with_catalog_provider_with_execution(
                     &prepared,
                     &analyzer_provider,
                     &catalog_snapshot,
@@ -1389,6 +1421,7 @@ impl StandaloneSession {
                     query_opts.clone(),
                     &self.inner.query_execution,
                     Some(&self.inner),
+                    request_context.execution(),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -1397,6 +1430,7 @@ impl StandaloneSession {
                 current_catalog,
                 current_database,
                 query_opts.as_ref(),
+                Some(request_context.execution()),
             ),
             sqlast::Statement::Delete(ref delete) => {
                 let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
@@ -1405,6 +1439,7 @@ impl StandaloneSession {
                     &stmt,
                     current_catalog,
                     current_database,
+                    request_context.execution(),
                 )
             }
             ref update_stmt @ sqlast::Statement::Update(_) => {
@@ -1419,6 +1454,7 @@ impl StandaloneSession {
                     &stmt,
                     current_catalog,
                     current_database,
+                    request_context.execution(),
                 )?;
                 self.inner
                     .statistics_service
@@ -1432,6 +1468,7 @@ impl StandaloneSession {
                     &stmt,
                     current_catalog,
                     current_database,
+                    request_context.execution(),
                 )
             }
             sqlast::Statement::Truncate(truncate) => {
@@ -1890,8 +1927,15 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
         query_opts: Option<&QueryOptions>,
+        execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     ) -> Result<StatementResult, String> {
-        self.execute_insert_via_custom_parser(insert, current_catalog, current_database, query_opts)
+        self.execute_insert_via_custom_parser(
+            insert,
+            current_catalog,
+            current_database,
+            query_opts,
+            execution,
+        )
     }
 
     /// Convert sqlparser INSERT to our custom InsertStmt and delegate to the
@@ -1902,6 +1946,7 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
         query_opts: Option<&QueryOptions>,
+        execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -1913,8 +1958,38 @@ impl StandaloneSession {
             current_catalog,
             current_database,
             query_opts,
+            execution,
         )
     }
+}
+
+#[cfg(test)]
+fn test_request_context(
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> crate::query_execution::request_context::RequestContext {
+    use crate::common::app_config::ClusterRole;
+    use crate::query_execution::backend::BackendTopologySnapshot;
+    use crate::query_execution::cancellation::QueryCancellationSource;
+    use crate::query_execution::request_context::{
+        QueryExecutionContext, RequestContext, RequestSessionContext,
+    };
+
+    let cancellation = QueryCancellationSource::new();
+    RequestContext::new(
+        RequestSessionContext::new(
+            current_catalog.map(str::to_string),
+            current_database.to_string(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        ),
+        QueryExecutionContext::new(
+            ClusterRole::AllInOne,
+            BackendTopologySnapshot::empty(0),
+            None,
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        ),
+    )
 }
 
 fn resolve_default_view_database(
@@ -2420,25 +2495,37 @@ fn ensure_mainline_distributed_execution(
     Ok(())
 }
 
-/// Configured BE count for broadcast fanout. The frontend scheduler owns live
-/// topology; core never lazily locates a process-global registry.
-fn live_effective_backend_count() -> f64 {
-    let configured = crate::common::config::optimizer_effective_backend_count();
-    if configured > 0 {
-        return configured as f64;
+fn optimizer_settings_for_execution(
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+) -> crate::sql::optimizer::options::SessionOptimizerSettings {
+    let mut settings = execution
+        .map(|execution| execution.optimizer_settings().clone())
+        .unwrap_or_default();
+    if settings.cbo_broadcast_backend_count.is_none() {
+        if let Some(execution) = execution {
+            settings.effective_backend_count = Some(execution.topology().targets().len() as f64);
+        }
     }
-    1.0
+    settings
 }
 
-/// Fold the live BE count into the TLS session settings before optimize(),
-/// unless the session explicitly SET cbo_broadcast_backend_count (which wins
-/// in from_session). Idempotent; safe to call before every optimize() site.
-fn snapshot_effective_backend_count_into_session() {
-    let mut snapshot = crate::sql::optimizer::options::current_session_optimizer_settings();
-    if snapshot.cbo_broadcast_backend_count.is_none() {
-        snapshot.effective_backend_count = Some(live_effective_backend_count());
-        crate::sql::optimizer::options::install_session_optimizer_settings(snapshot);
-    }
+fn capture_maintenance_execution(
+    state: &StandaloneState,
+) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+    let topology = state
+        .backend_topology
+        .snapshot()
+        .map_err(|error| error.to_string())?;
+    let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+    Ok(
+        crate::query_execution::request_context::QueryExecutionContext::new(
+            state.execution_role,
+            topology,
+            None,
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        ),
+    )
 }
 
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`.
@@ -2480,6 +2567,7 @@ fn explain_analyze_query(
     query_opts: Option<QueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
     query_execution: &crate::query_execution::service::QueryExecutionService,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::ExplainLevel;
     use crate::sql::explain::distributed::explain_distributed_plan_analyze;
@@ -2498,6 +2586,7 @@ fn explain_analyze_query(
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let mv_candidates = match mv_rewrite_state {
         Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
             state,
@@ -2506,20 +2595,24 @@ fn explain_analyze_query(
             &logical_plan,
             &mut factory,
             &mut query_stats,
+            &optimizer_settings,
         ),
         None => Vec::new(),
     };
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         mv_candidates,
+        &optimizer_settings,
     )?;
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        &optimizer_settings,
+    )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
@@ -2533,12 +2626,12 @@ fn explain_analyze_query(
 
     let query_opts = query_options_for_explain_analyze(query_opts);
     let execution_start = std::time::Instant::now();
-    let outcome = execute_distributed_profile(
+    let outcome = execute_distributed_profile_with_execution(
         query_execution,
         prepared,
         native_bundle,
         Some(query_opts),
-        current_query_cancellation_view(),
+        execution,
     )?;
     let execution_elapsed = execution_start.elapsed();
     if let Some(abort) = outcome.write_abort.as_ref() {
@@ -2665,6 +2758,7 @@ fn explain_query(
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::ExplainLevel;
     use crate::sql::explain::distributed::explain_distributed_plan;
@@ -2692,16 +2786,17 @@ fn explain_query(
             &logical_plan,
             &mut factory,
             &mut query_stats,
+            optimizer_settings,
         ),
         None => Vec::new(),
     };
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         mv_candidates,
+        optimizer_settings,
     )?;
 
     let mut lines = Vec::new();
@@ -2709,7 +2804,10 @@ fn explain_query(
         lines.extend(query_stats.snapshot.display_rows());
     }
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        optimizer_settings,
+    )?;
     lines.extend(explain_distributed_plan(&distributed_plan, level));
 
     build_string_query_result("Explain String", lines)
@@ -2842,7 +2940,9 @@ pub(crate) fn execute_query_as_iceberg_write(
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<QueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    let optimizer_settings = optimizer_settings_for_execution(execution);
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -2883,7 +2983,6 @@ pub(crate) fn execute_query_as_iceberg_write(
     )?;
     let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
             optimizer_expr,
@@ -2891,6 +2990,7 @@ pub(crate) fn execute_query_as_iceberg_write(
             &query_stats.snapshot,
             factory,
             root_distribution,
+            &optimizer_settings,
         )?,
         None => crate::sql::optimizer::optimize(
             optimizer_expr,
@@ -2898,16 +2998,18 @@ pub(crate) fn execute_query_as_iceberg_write(
             &query_stats.snapshot,
             factory,
             Vec::new(),
+            &optimizer_settings,
         )?,
     };
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan(
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
         physical_plan,
         crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
             descriptor_database: current_database.to_string(),
             spec: sink_spec,
             input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
         },
+        &optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
@@ -2918,12 +3020,20 @@ pub(crate) fn execute_query_as_iceberg_write(
         &distributed_plan,
         &prepared,
     )?;
-    execute_distributed_write(
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    execute_distributed_write_with_execution(
         &state.query_execution,
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        execution,
     )
 }
 
@@ -3061,14 +3171,15 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    snapshot_effective_backend_count_into_session();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
-    let planned_dp = crate::sql::planner::pipeline::build_iceberg_change_stream_distributed_plan(
-        physical_plan,
-        current_database,
-        dag.clone(),
-        pre_expand_keyed_assert,
-    )?;
+    let planned_dp =
+        crate::sql::planner::pipeline::build_iceberg_change_stream_distributed_plan_with_settings(
+            physical_plan,
+            current_database,
+            dag.clone(),
+            pre_expand_keyed_assert,
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        )?;
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
     let scan_binding_resolver = mv_refresh_ctx
@@ -3099,13 +3210,22 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_opts: Option<QueryOptions>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    execute_distributed_write(
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    execute_distributed_write_with_execution(
         &state.query_execution,
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        execution,
     )
 }
 
@@ -3137,6 +3257,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         planned.prepared,
         planned.native_bundle,
         query_opts,
+        None,
     )
 }
 
@@ -3167,6 +3288,39 @@ pub(crate) fn execute_query_with_catalog_provider(
         None,
         mv_rewrite_state,
         false,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_query_with_catalog_provider_with_execution(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    codegen_catalog: &PlannerMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<QueryResult, String> {
+    execute_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        analyzer_catalog,
+        codegen_catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        query_execution,
+        None,
+        None,
+        None,
+        None,
+        mv_rewrite_state,
+        false,
+        Some(execution),
     )
 }
 
@@ -3241,6 +3395,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         imv_rewrite_validator,
         mv_rewrite_state,
         mv_refresh_ctx.is_some(),
+        None,
     )
 }
 
@@ -3272,6 +3427,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -3306,10 +3462,8 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
             crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
                 plan: logical_plan,
-                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
-                )
-                .disabled_rules
-                .clone(),
+                disabled_rules: crate::sql::optimizer::options::SessionOptimizerSettings::default()
+                    .disabled_rules,
                 mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
                 deadline: None,
                 column_ref_factory: std::rc::Rc::clone(&factory_cell),
@@ -3335,13 +3489,13 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     )?;
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )?;
     let output_columns = optimized_tree.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
@@ -3367,13 +3521,13 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     )?;
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )?;
     let output_columns = optimized_tree.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
@@ -3399,7 +3553,9 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
     run_imv_rewrite: bool,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<QueryResult, String> {
+    let optimizer_settings = optimizer_settings_for_execution(execution);
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let mut logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
@@ -3412,10 +3568,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
             crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
                 plan: logical_plan,
-                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
-                )
-                .disabled_rules
-                .clone(),
+                disabled_rules: optimizer_settings.disabled_rules.clone(),
                 mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
                 deadline: None,
                 column_ref_factory: std::rc::Rc::clone(&factory_cell),
@@ -3455,17 +3608,18 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                 &logical_plan,
                 &mut factory,
                 &mut query_stats,
+                &optimizer_settings,
             )
         }
         _ => Vec::new(),
     };
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         mv_candidates,
+        &optimizer_settings,
     )?;
 
     ensure_mainline_distributed_execution(
@@ -3475,7 +3629,10 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     )?;
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        &optimizer_settings,
+    )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -3487,12 +3644,23 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         &distributed_plan,
         &prepared,
     )?;
-    execute_distributed_result(
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            let state = mv_rewrite_state.ok_or_else(|| {
+                "distributed execution requires a request execution context".to_string()
+            })?;
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    execute_distributed_result_with_execution(
         query_execution,
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        execution,
     )
 }
 
@@ -3510,7 +3678,9 @@ pub(crate) fn execute_logical_plan_with_options(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
     let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
@@ -3520,13 +3690,13 @@ pub(crate) fn execute_logical_plan_with_options(
         .map(query_stats::QueryStatsProviders::from_standalone_state)
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         Vec::new(),
+        &optimizer_settings,
     )?;
     ensure_mainline_distributed_execution(
         terminal_sink.is_some(),
@@ -3535,7 +3705,10 @@ pub(crate) fn execute_logical_plan_with_options(
     )?;
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        &optimizer_settings,
+    )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -3547,36 +3720,28 @@ pub(crate) fn execute_logical_plan_with_options(
         &distributed_plan,
         &prepared,
     )?;
-    execute_distributed_result(
+    execute_distributed_result_with_execution(
         query_execution,
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        execution,
     )
 }
 
-fn current_query_cancellation_view() -> crate::query_execution::cancellation::QueryCancellationView
-{
-    match crate::runtime::query_cancel::current_query_cancellation_view() {
-        Some(view) => view,
-        None => crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
-    }
-}
-
-fn execute_distributed_result(
+fn execute_distributed_result_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request(
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Result,
-        cancellation,
+        execution,
     )
     .map_err(|error| error.to_string())?;
     query_execution
@@ -3586,19 +3751,19 @@ fn execute_distributed_result(
         .map_err(|error| error.to_string())
 }
 
-fn execute_distributed_write(
+fn execute_distributed_write_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request(
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Write,
-        cancellation,
+        execution,
     )
     .map_err(|error| error.to_string())?;
     let (query_result, write_commit, write_abort) = query_execution
@@ -3614,19 +3779,19 @@ fn execute_distributed_write(
     })
 }
 
-fn execute_distributed_profile(
+fn execute_distributed_profile_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request(
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Profile,
-        cancellation,
+        execution,
     )
     .map_err(|error| error.to_string())?;
     let (query_result, fragment_profiles) = query_execution
@@ -4471,20 +4636,40 @@ mod tests {
     }
 
     impl BackendTopologyPort for TestBackendTopologyPort {
-        fn live_backends(&self) -> Vec<LiveBackendTarget> {
-            self.state
-                .lock()
-                .unwrap()
-                .entries
-                .iter()
-                .filter_map(|(backend_idx, entry)| {
-                    (entry.state == BackendLifecycleState::Live).then_some(LiveBackendTarget::new(
-                        *backend_idx,
-                        entry.endpoint,
-                        1,
-                    ))
+        fn snapshot(
+            &self,
+        ) -> Result<
+            crate::query_execution::backend::BackendTopologySnapshot,
+            crate::query_execution::backend::BackendTopologyError,
+        > {
+            let targets =
+                self.state
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .filter_map(|(backend_idx, entry)| {
+                        (entry.state == BackendLifecycleState::Live)
+                            .then_some(LiveBackendTarget::new(*backend_idx, entry.endpoint, 1))
+                    })
+                    .collect();
+            crate::query_execution::backend::BackendTopologySnapshot::try_new(0, targets)
+        }
+
+        fn validate_snapshot(
+            &self,
+            expected: &crate::query_execution::backend::BackendTopologySnapshot,
+        ) -> Result<(), crate::query_execution::backend::BackendTopologyValidationError> {
+            let current = self.snapshot().map_err(
+                crate::query_execution::backend::BackendTopologyValidationError::Unavailable,
+            )?;
+            if current == *expected {
+                Ok(())
+            } else {
+                Err(crate::query_execution::backend::BackendTopologyValidationError::ContentChangedWithoutRevision {
+                    revision: expected.revision(),
                 })
-                .collect()
+            }
         }
 
         fn record_successful_fragment_submission(&self, backend_idx: usize) {
@@ -4673,6 +4858,7 @@ mod tests {
         backend_topology: Arc<dyn BackendTopologyPort>,
     ) -> StandaloneOpenServices {
         StandaloneOpenServices::new(
+            crate::common::app_config::ClusterRole::AllInOne,
             system_catalog,
             view_service,
             statistics_service,
@@ -5557,249 +5743,6 @@ mysql_port = 47892
             .execute("ALTER TABLE missing.db.t ADD COLUMN c INT")
             .expect_err("unknown catalog");
         assert!(err.contains("unknown catalog"));
-    }
-
-    #[test]
-    fn show_alter_table_optimize_reads_persisted_jobs() {
-        let temp = TempDir::new().expect("metadata temp dir");
-        let config_path = write_test_metadata_config(&temp, "metadata.db");
-        let engine = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("engine");
-        let outcome = crate::meta::repository::job::IcebergOptimizeJobOutcome {
-            target_snapshot_id: Some(124),
-            rewritten_data_files: 3,
-            deleted_data_files: 2,
-            added_data_files: 1,
-            output_record_count: 7,
-        };
-        seed_finished_iceberg_optimize_job(&engine, "ice", "db1", "orders", 123, 1000, outcome);
-
-        let result = engine
-            .session()
-            .query(
-                "SHOW ALTER TABLE OPTIMIZE FROM db1 WHERE TableName = 'orders' \
-                 ORDER BY CreateTime DESC LIMIT 1",
-            )
-            .expect("show optimize jobs");
-
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let table_names = chunk
-            .batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("table name column");
-        let states = chunk
-            .batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("state column");
-        let target_snapshot_ids = chunk
-            .batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("target snapshot column");
-        let input_data_files = chunk
-            .batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("input data files column");
-        let output_data_files = chunk
-            .batch
-            .column(9)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("output data files column");
-        let input_delete_files = chunk
-            .batch
-            .column(10)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("input delete files column");
-        let output_delete_files = chunk
-            .batch
-            .column(11)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("output delete files column");
-        assert_eq!(table_names.value(0), "orders");
-        assert_eq!(states.value(0), "FINISHED");
-        assert_eq!(target_snapshot_ids.value(0), "124");
-        assert_eq!(input_data_files.value(0), "3");
-        assert_eq!(output_data_files.value(0), "1");
-        assert_eq!(input_delete_files.value(0), "2");
-        assert_eq!(output_delete_files.value(0), "0");
-    }
-
-    #[test]
-    fn show_alter_table_optimize_uses_session_catalog_and_database() {
-        let temp = TempDir::new().expect("metadata temp dir");
-        let config_path = write_test_metadata_config(&temp, "metadata.db");
-        let engine = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("engine");
-        seed_pending_iceberg_optimize_job(&engine, "ice1", "db1", "orders", 101, 1_000);
-        seed_pending_iceberg_optimize_job(&engine, "ice2", "db1", "orders", 102, 2_000);
-        seed_pending_iceberg_optimize_job(&engine, "ice1", "db2", "orders", 103, 3_000);
-
-        let session = engine.session();
-        let current = match session
-            .execute_in_context("SHOW ALTER TABLE OPTIMIZE", Some("ice1"), "db1", None)
-            .expect("show current context")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("SHOW returned ok"),
-        };
-        assert_eq!(optimize_show_job_ids(&current), vec!["1"]);
-
-        let from_db = match session
-            .execute_in_context(
-                "SHOW ALTER TABLE OPTIMIZE FROM db1 ORDER BY CreateTime DESC",
-                Some("ice1"),
-                "db2",
-                None,
-            )
-            .expect("show from db under current catalog")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("SHOW returned ok"),
-        };
-        assert_eq!(optimize_show_job_ids(&from_db), vec!["1"]);
-
-        let explicit_catalog = match session
-            .execute_in_context(
-                "SHOW ALTER TABLE OPTIMIZE FROM ice2.db1",
-                Some("ice1"),
-                "db1",
-                None,
-            )
-            .expect("show explicit catalog")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("SHOW returned ok"),
-        };
-        assert_eq!(optimize_show_job_ids(&explicit_catalog), vec!["2"]);
-    }
-
-    fn seed_pending_iceberg_optimize_job(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        base_snapshot_id: i64,
-        created_at_ms: i64,
-    ) -> i64 {
-        let provider = engine
-            .inner
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let mut txn = provider
-            .begin_write("seed pending iceberg optimize job")
-            .expect("write");
-        let job = engine
-            .inner
-            .job_repo
-            .create_iceberg_optimize_job(
-                txn.as_mut(),
-                crate::meta::repository::job::CreateIcebergOptimizeJobRequest {
-                    catalog: catalog.to_string(),
-                    namespace: namespace.to_string(),
-                    table: table.to_string(),
-                    base_snapshot_id,
-                    now_ms: created_at_ms,
-                },
-            )
-            .expect("create optimize job");
-        txn.commit().expect("commit create optimize job");
-        job.id
-    }
-
-    fn seed_finished_iceberg_optimize_job(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        base_snapshot_id: i64,
-        created_at_ms: i64,
-        outcome: crate::meta::repository::job::IcebergOptimizeJobOutcome,
-    ) {
-        let job_id = seed_pending_iceberg_optimize_job(
-            engine,
-            catalog,
-            namespace,
-            table,
-            base_snapshot_id,
-            created_at_ms,
-        );
-        let provider = engine
-            .inner
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-
-        let mut txn = provider
-            .begin_write("claim synthetic optimize job")
-            .expect("claim write");
-        engine
-            .inner
-            .job_repo
-            .claim_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 100)
-            .expect("claim synthetic optimize job");
-        txn.commit().expect("commit claim optimize job");
-
-        let mut txn = provider
-            .begin_write("record synthetic optimize outcome")
-            .expect("outcome write");
-        engine
-            .inner
-            .job_repo
-            .record_iceberg_optimize_job_outcome(
-                txn.as_mut(),
-                job_id,
-                created_at_ms + 200,
-                outcome.clone(),
-            )
-            .expect("record synthetic optimize outcome");
-        txn.commit().expect("commit optimize outcome");
-
-        let mut txn = provider
-            .begin_write("finish synthetic optimize job")
-            .expect("finish write");
-        engine
-            .inner
-            .job_repo
-            .finish_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 300, outcome)
-            .expect("finish synthetic optimize job");
-        txn.commit().expect("commit finish optimize job");
-    }
-
-    fn optimize_show_job_ids(result: &QueryResult) -> Vec<String> {
-        if result.row_count() == 0 {
-            return Vec::new();
-        }
-        let ids = result.chunks[0]
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("job id column");
-        (0..ids.len())
-            .map(|idx| ids.value(idx).to_string())
-            .collect()
     }
 
     fn query_result_contains_string(result: &QueryResult, expected: &str) -> bool {
@@ -9195,84 +9138,6 @@ path = "meta/operations.sqlite"
         drop(engine);
     }
 
-    fn install_optimizer_backend_count_config(
-        optimizer_backend_count: u64,
-        cluster_backends: Vec<String>,
-    ) {
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.cluster.backends = cluster_backends;
-        cfg.runtime.optimizer_effective_backend_count = optimizer_backend_count;
-        crate::common::app_config::install_preloaded_config(cfg);
-    }
-
-    #[test]
-    fn live_effective_backend_count_prefers_live_registry_over_runtime_config() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-        use crate::query_execution::backend_registry::{BackendRegistry, BackendState};
-
-        install_optimizer_backend_count_config(7, vec!["127.0.0.1:19080".to_string()]);
-        let registry = Arc::new(BackendRegistry::new(3));
-        registry.restore_backend(2, "127.0.0.1:19081".parse().unwrap(), BackendState::Live);
-        registry.restore_backend(3, "127.0.0.1:19082".parse().unwrap(), BackendState::Live);
-        crate::query_execution::backend_registry::replace_backend_registry_for_test(Some(registry));
-
-        assert_eq!(super::live_effective_backend_count(), 2.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_reads_injected_membership() {
-        let _standalone = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-        let ep1: std::net::SocketAddr = "127.0.0.1:19081".parse().unwrap();
-        let ep2: std::net::SocketAddr = "127.0.0.1:19082".parse().unwrap();
-        crate::query_execution::backend_registry::replace_cluster_membership_for_test(Some(
-            std::sync::Arc::new(
-                crate::query_execution::backend_registry::FakeClusterMembership::new(vec![
-                    (0, ep1),
-                    (1, ep2),
-                ]),
-            ),
-        ));
-
-        assert_eq!(super::live_effective_backend_count(), 2.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_prefers_runtime_config_when_registry_absent() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-
-        install_optimizer_backend_count_config(
-            7,
-            vec!["127.0.0.1:19083".to_string(), "127.0.0.1:19084".to_string()],
-        );
-
-        assert_eq!(super::live_effective_backend_count(), 7.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_prefers_runtime_config_when_registry_empty() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-        let registry = Arc::new(crate::query_execution::backend_registry::BackendRegistry::new(3));
-
-        install_optimizer_backend_count_config(7, vec!["127.0.0.1:19085".to_string()]);
-        crate::query_execution::backend_registry::replace_backend_registry_for_test(Some(registry));
-
-        assert_eq!(super::live_effective_backend_count(), 7.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_defaults_to_one_without_registry_or_runtime_config() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-
-        install_optimizer_backend_count_config(0, Vec::new());
-
-        assert_eq!(super::live_effective_backend_count(), 1.0);
-    }
-
     #[test]
     fn coordinated_iceberg_insert_requires_exchange_server() {
         let query = parse_query_for_engine_test("SELECT id FROM missing_table");
@@ -9284,7 +9149,7 @@ path = "meta/operations.sqlite"
         );
 
         let result = super::execute_query_as_iceberg_write(
-            &state, None, "default", &query, sink_spec, None, None,
+            &state, None, "default", &query, sink_spec, None, None, None,
         );
 
         let err = result.expect_err("default state should fail before executing the sink");
@@ -9373,6 +9238,7 @@ path = "meta/operations.sqlite"
                 }
                 Err("resolver saw planned _file output".to_string())
             })),
+            None,
         );
 
         let err = match result {

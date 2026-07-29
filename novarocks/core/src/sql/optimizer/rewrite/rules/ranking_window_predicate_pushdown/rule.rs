@@ -386,7 +386,10 @@ mod tests {
     use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId, SortKey};
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext {
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
     }
