@@ -76,7 +76,10 @@ impl IcebergBatchReader {
                 format!("Iceberg data file {} has a negative size", file.path),
             )
         })?;
-        let cancellation = FileCancellation::new();
+        // Keep one cancellation token for delete/DV materialization and the
+        // physical reader. Connector terminal lifecycle must be able to stop
+        // every provider-owned I/O path, not only the data-file decoder.
+        let cancellation = file_context.cancellation.clone();
         let delete_specs = delete_specs(file)?;
         let position_deletes = load_position_deletes_with_context(
             &delete_specs,
