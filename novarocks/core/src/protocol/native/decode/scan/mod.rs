@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_iceberg_data_file_scan_to_scan_node() {
+    fn rejects_legacy_iceberg_data_file_scan_before_provider_binding() {
         let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
             plan::IcebergDataFiles {
                 table: Some(table_info()),
@@ -1006,14 +1006,11 @@ mod tests {
                 ..Default::default()
             }))
             .with_scan_ranges(10, vec![file_range()]);
-        let mut arena = ExprArena::default();
-        let lowered = decode_node(&node, &mut arena, &ctx).expect("lower native scan");
-        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
-            panic!("expected Scan");
-        };
-        assert_eq!(scan.node_id(), Some(10));
-        assert_eq!(scan.connector_io_tasks_per_scan_operator(), Some(1));
-        assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(1)]);
+        let error = decode_node(&node, &mut ExprArena::default(), &ctx)
+            .expect_err("legacy Iceberg source must not bypass ConnectorReadSource");
+        assert!(error.to_string().contains(
+            "legacy IcebergDataFiles must be materialized as ConnectorReadSource"
+        ));
     }
 
     #[test]
