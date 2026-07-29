@@ -42,16 +42,8 @@ use super::catalog::IcebergCatalogEntry;
 use super::catalog::registry::{
     IcebergCatalogRegistry, extract_data_files_with_stats_at, list_tables, load_table,
 };
+use super::reader::IcebergBatchReader;
 use super::scan_model::IcebergDataFileInfo;
-use super::scan_range::plan_iceberg_file_ranges;
-use crate::cache::CacheOptions;
-use crate::common::ids::SlotId;
-use crate::connector::HdfsScanConfig;
-use crate::connector::hdfs::HdfsFileBatchReader;
-use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::formats::FileFormatConfig;
-use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
-use novarocks_fs::DataCacheContext;
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
@@ -366,31 +358,6 @@ impl IcebergConnectorInstance {
                 }),
         }?;
         Ok((snapshot_id, metadata.uuid().to_string()))
-    }
-
-    fn chunk_schema_for(&self, schema: &SchemaRef) -> Result<Arc<ChunkSchema>, ConnectorError> {
-        let slots = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let slot_id = u32::try_from(index + 1).map_err(|_| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "Iceberg projection has too many columns",
-                    )
-                })?;
-                Ok(ChunkSlotSchema::new_with_field(
-                    SlotId::new(slot_id),
-                    field.as_ref().clone(),
-                    None,
-                    None,
-                ))
-            })
-            .collect::<Result<Vec<_>, ConnectorError>>()?;
-        ChunkSchema::try_new(slots)
-            .map(Arc::new)
-            .map_err(|error| internal(format!("build Iceberg chunk schema: {error}")))
     }
 
     fn snapshot_membership(
@@ -826,51 +793,10 @@ impl ConnectorRead for IcebergConnectorInstance {
                 ));
             }
         }
-        let ranges = plan_iceberg_file_ranges(&split.data_file).map_err(map_iceberg_error)?;
-        let chunk_schema = self.chunk_schema_for(&output_schema)?;
-        let columns = output_schema
-            .fields()
-            .iter()
-            .map(|field| field.name().to_string())
-            .collect::<Vec<_>>();
-        let batch_size = request.batch.max_rows.get();
-        let parquet = ParquetScanConfig {
-            columns,
-            chunk_schema: Arc::clone(&chunk_schema),
-            slot_kinds: vec![ParquetSlotKind::Regular; chunk_schema.slots().len()],
-            case_sensitive: true,
-            enable_page_index: false,
-            min_max_predicates: Vec::new(),
-            runtime_min_max_filter_columns: Default::default(),
-            variant_path_predicates: Vec::new(),
-            batch_size: Some(batch_size),
-            datacache: DataCacheContext::external(
-                CacheOptions::from_query_options(None)
-                    .map_err(|error| internal(format!("default cache options: {error}")))?
-                    .to_file_cache_options(),
-            ),
-            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
-            profile_label: Some("spi_iceberg_reader".to_string()),
-            iceberg_output_schema: Some(Arc::clone(&output_schema)),
-            variant_path_columns: Vec::new(),
-            query_global_dicts: Default::default(),
-        };
-        Ok(Box::new(HdfsFileBatchReader::new(
-            HdfsScanConfig {
-                original_range_count: ranges.len(),
-                ranges,
-                has_more: false,
-                limit: split.limit.and_then(|limit| usize::try_from(limit).ok()),
-                profile_label: Some("spi_iceberg_reader".to_string()),
-                format: Some(FileFormatConfig::Parquet(parquet)),
-                object_store_config: loaded.object_store_config,
-                iceberg_table_locations: Default::default(),
-                query_global_dicts: Default::default(),
-                iceberg_runtime_pruning: None,
-            },
-            request.context,
-            request.batch.max_rows.get(),
-            request.batch.max_bytes.get(),
+        Ok(Box::new(IcebergBatchReader::try_new(
+            &split.data_file,
+            loaded.object_store_config.as_ref(),
+            request,
         )?))
     }
 }

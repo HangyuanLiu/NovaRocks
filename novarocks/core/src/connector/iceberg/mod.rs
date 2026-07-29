@@ -38,6 +38,7 @@ pub mod position_delete;
 pub(crate) mod position_delete_descriptor;
 pub(crate) mod provider;
 pub(crate) mod read;
+pub(crate) mod reader;
 pub(crate) mod report;
 pub(crate) mod row_lineage_synth;
 pub mod scan_deletes;
