@@ -956,6 +956,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             println!("{}", grpc_submit_accepted_marker(identity));
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
+        if crate::common::config::debug_emit_grpc_fragment_marker()
+            && let Err(error) = &result
+        {
+            println!("NOVAROCKS_GRPC_SUBMIT_REJECTED error={error}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
         match result {
             Ok(()) => Ok(tonic::Response::new(
                 proto::novarocks::SubmitFragmentResponse {

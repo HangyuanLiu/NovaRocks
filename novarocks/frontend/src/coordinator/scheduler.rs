@@ -214,7 +214,12 @@ impl FrontendFragmentScheduler {
                 fragment
                     .scan_node_ids()
                     .iter()
-                    .filter_map(|&node_id| fragment.scan_range_count(node_id))
+                    .map(|&node_id| {
+                        let file_ranges = fragment.scan_range_count(node_id).unwrap_or_default();
+                        let connector_splits =
+                            fragment.connector_split_count(node_id).unwrap_or_default();
+                        file_ranges.max(connector_splits)
+                    })
                     .max()
                     .unwrap_or_default()
                     .clamp(1, backend_count)

@@ -63,6 +63,7 @@ pub(super) fn encode_scan_node(
             &src.table,
             Some(node_id),
             Some(&src.columns),
+            Some(&required_columns),
             binding,
             ctx,
         )?),
@@ -217,6 +218,7 @@ pub(super) fn encode_table_def_with_context(
     src: &table_model::TableDef,
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
+    scan_required_columns: Option<&[String]>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
@@ -240,7 +242,13 @@ pub(super) fn encode_table_def_with_context(
             .iter()
             .map(encode_column_def)
             .collect::<Result<Vec<_>, _>>()?,
-        source: Some(encode_scan_source(&src.source, scan_node_id, binding, ctx)?),
+        source: Some(encode_scan_source(
+            &src.source,
+            scan_node_id,
+            scan_required_columns,
+            binding,
+            ctx,
+        )?),
     })
 }
 
@@ -605,6 +613,7 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
 fn encode_scan_source(
     src: &table_model::ScanSource,
     scan_node_id: Option<i32>,
+    scan_required_columns: Option<&[String]>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
@@ -636,7 +645,10 @@ fn encode_scan_source(
                     novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
                 )
                 .map_err(|_| "connector total payload budget does not fit u64".to_string())?,
-                expected_schema_ipc: encode_connector_expected_schema_ipc(binding)?,
+                expected_schema_ipc: encode_connector_expected_schema_ipc(
+                    binding,
+                    scan_required_columns.unwrap_or_default().to_vec(),
+                )?,
             })),
         });
     }
@@ -765,6 +777,7 @@ fn encode_scan_source(
 
 fn encode_connector_expected_schema_ipc(
     binding: Option<&ResolvedScanBinding>,
+    required_columns: Vec<String>,
 ) -> Result<Vec<u8>, String> {
     let binding = binding.ok_or_else(|| {
         "ConnectorReadSource requires a resolved scan binding for its expected schema".to_string()
@@ -773,6 +786,12 @@ fn encode_connector_expected_schema_ipc(
         binding
             .physical_columns
             .iter()
+            .filter(|column| {
+                required_columns.is_empty()
+                    || required_columns
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&column.source.name))
+            })
             .map(|column| {
                 Field::new(
                     column.source.name.clone(),

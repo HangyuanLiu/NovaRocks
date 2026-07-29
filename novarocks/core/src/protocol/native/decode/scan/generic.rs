@@ -235,7 +235,11 @@ fn validate_expected_schema_ipc(
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "expected_schema_ipc",
-            "ConnectorReadSource expected Arrow schema does not match scan output columns",
+            format!(
+                "ConnectorReadSource expected Arrow schema does not match scan output columns: \
+                 carrier={:?} decoded={expected:?}",
+                reader.schema()
+            ),
         ));
     }
     Ok(())

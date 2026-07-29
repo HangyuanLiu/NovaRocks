@@ -1494,6 +1494,11 @@ emit_grpc_fragment_marker = true
         "NOVAROCKS_GRPC_SUBMIT_ACCEPTED",
         Duration::from_secs(10),
     );
+    if let Ok(result) = target_done_rx.try_recv() {
+        panic!(
+            "target query completed before KILL QUERY established connector-read cancellation: {result:?}"
+        );
+    }
     control
         .query_drop(format!("KILL QUERY {target_connection_id}"))
         .expect("KILL QUERY must acknowledge the active target statement");

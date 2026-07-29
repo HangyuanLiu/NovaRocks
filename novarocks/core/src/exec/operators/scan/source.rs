@@ -664,7 +664,13 @@ impl Operator for ScanSourceOperator {
 
     fn close(&mut self) -> Result<(), String> {
         self.async_state.cancel();
-        self.op.terminate()
+        // Each driver owns one operator instance, while a connector ScanOp
+        // owns a fragment-wide reader group and a shared morsel queue.  A
+        // normally exhausted driver must not terminate that group: sibling
+        // drivers can still own queued splits.  Cancellation/error reaches
+        // `cancel`, which invokes the terminal hook; normal readers close on
+        // EOF or iterator Drop.
+        Ok(())
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
