@@ -23,10 +23,7 @@ use novarocks::meta::repository::iceberg_operation::{
     IcebergOperationState, IcebergOperationTarget, IcebergRecoveryEvidenceRecord,
     StoredIcebergOperation,
 };
-use novarocks::meta::repository::job::{
-    CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
-    IcebergOptimizeJobState, JobMetaRepository, JobState,
-};
+use novarocks::meta::repository::job::{CreateEraseJobRequest, JobMetaRepository, JobState};
 use novarocks::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksDatabaseRequest,
     CreateStarRocksTableLayoutRequest, CreateStarRocksTableRequest, StageStarRocksMvRefreshRequest,
