@@ -1076,13 +1076,12 @@ fn build_table_payload(
         .iter()
         .map(|column| column.name.clone())
         .collect();
-    let (table_info, cloud_properties, source_files) = match table_def.source {
+    let (table_info, source_files) = match table_def.source {
         crate::sql::planner::table::ScanSource::IcebergDataFiles {
             table,
             files,
-            cloud_properties,
             ..
-        } => (table, cloud_properties, files),
+        } => (table, files),
         _ => {
             return Err(internal(
                 "Iceberg metadata capability produced a non-Iceberg table source".to_string(),
@@ -1096,7 +1095,6 @@ fn build_table_payload(
         namespace: namespace.to_string(),
         table: table.to_string(),
         table_info: Some(table_info),
-        cloud_properties,
         metadata_columns,
         metadata_table_type,
         prepared_files,
@@ -1109,7 +1107,6 @@ struct TablePayload {
     namespace: String,
     table: String,
     table_info: Option<super::scan_model::IcebergTableInfo>,
-    cloud_properties: BTreeMap<String, String>,
     metadata_columns: Vec<String>,
     metadata_table_type: Option<super::IcebergMetadataTableType>,
     prepared_files: Vec<IcebergDataFileInfo>,
@@ -1239,7 +1236,7 @@ pub(crate) fn load_table_def_at(
         source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
             table: table_info,
             files,
-            cloud_properties: payload.cloud_properties,
+            cloud_properties: BTreeMap::new(),
             binding,
         },
     };
@@ -1304,7 +1301,7 @@ fn table_def_from_metadata(
         source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
             table: table_info,
             files: payload.prepared_files,
-            cloud_properties: payload.cloud_properties,
+            cloud_properties: BTreeMap::new(),
             binding: super::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         },
     })
