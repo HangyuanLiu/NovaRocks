@@ -28,8 +28,10 @@ use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest, ConnectorRead,
+    ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceDistribution, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorInstanceInstaller, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
     ConnectorReadSelector, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
     ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution,
@@ -53,6 +55,186 @@ use novarocks_fs::DataCacheContext;
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
+const ICEBERG_DECLARATION_V1: u16 = 1;
+const DEFAULT_ACCESS_BINDING: &str = "default";
+
+/// Provider-owned, secret-free declaration used to install an Iceberg read
+/// instance into a BE.  Catalog clients and credentials deliberately do not
+/// cross this boundary: the installer resolves the named binding from process
+/// startup composition.
+#[derive(Deserialize, Serialize)]
+struct IcebergDeclarationV1 {
+    version: u16,
+    access_binding: String,
+}
+
+#[derive(Clone)]
+struct IcebergInstanceDistribution {
+    descriptor: ConnectorInstanceDescriptor,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl ConnectorInstanceDistribution for IcebergInstanceDistribution {
+    fn declaration(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorInstanceDeclaration, ConnectorError> {
+        if context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        let payload = IcebergDeclarationV1 {
+            version: ICEBERG_DECLARATION_V1,
+            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
+        };
+        ConnectorInstanceDeclaration::try_new(
+            self.descriptor.clone(),
+            self.incarnation,
+            encode_payload(
+                &payload,
+                "Iceberg instance declaration",
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            )?,
+        )
+    }
+}
+
+/// Process-startup binding for a read-only Iceberg execution instance.
+///
+/// This type intentionally owns only a locally-composed access binding.  It
+/// has no catalog registry or metadata capability, because BE execution must
+/// consume the fully planned provider split rather than reconnecting a
+/// catalog.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergReadBinding {
+    access_binding: String,
+    _object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+}
+
+impl IcebergReadBinding {
+    pub(crate) fn default_binding(
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+    ) -> Self {
+        Self {
+            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
+            _object_store_config: object_store_config,
+        }
+    }
+}
+
+/// Startup-composed installer for Iceberg read-only instances.  The payload
+/// identifies the binding but cannot override it with cloud properties.
+pub(crate) struct IcebergConnectorInstaller {
+    provider_id: ConnectorProviderId,
+    binding: IcebergReadBinding,
+}
+
+impl IcebergConnectorInstaller {
+    pub(crate) fn new(binding: IcebergReadBinding) -> Self {
+        Self {
+            provider_id: ConnectorProviderId::parse(PROVIDER_ID)
+                .expect("static Iceberg provider ID is valid"),
+            binding,
+        }
+    }
+}
+
+impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
+    fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
+    }
+
+    fn install(
+        &self,
+        declaration: &ConnectorInstanceDeclaration,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorInstance, ConnectorError> {
+        if declaration.descriptor().provider_id != self.provider_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg installer received a declaration for another provider",
+            ));
+        }
+        let payload: IcebergDeclarationV1 =
+            decode_payload(declaration.payload(), "Iceberg instance declaration")?;
+        if payload.version != ICEBERG_DECLARATION_V1 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!(
+                    "unsupported Iceberg instance declaration version {}",
+                    payload.version
+                ),
+            ));
+        }
+        if payload.access_binding != self.binding.access_binding {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg declaration access binding does not match BE startup binding",
+            ));
+        }
+        let reader = Arc::new(IcebergReadOnlyConnectorInstance {
+            instance_id: declaration.descriptor().instance_id.clone(),
+            binding: self.binding.clone(),
+        });
+        ConnectorInstance::try_new(declaration.descriptor().clone(), None, reader)
+    }
+}
+
+/// BE-only instance installed through the binding control plane.  Metadata and
+/// planning are deliberately unsupported; once the provider reader is wired,
+/// `open_reader` will consume the opaque, fully planned Iceberg split.
+struct IcebergReadOnlyConnectorInstance {
+    instance_id: ConnectorInstanceId,
+    binding: IcebergReadBinding,
+}
+
+impl ConnectorRead for IcebergReadOnlyConnectorInstance {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        _table: &ConnectorTableHandle,
+        _request: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "BE read-only Iceberg instances do not plan scans",
+        ))
+    }
+
+    fn plan_splits(
+        &self,
+        _scan: &ConnectorScanHandle,
+        _request: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "BE read-only Iceberg instances do not plan splits",
+        ))
+    }
+
+    fn open_reader(
+        &self,
+        _split: &ConnectorSplit,
+        _request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        let _ = &self.binding;
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "BE Iceberg opaque split reader is not installed",
+        ))
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct IcebergConnectorInstance {
@@ -66,6 +248,10 @@ impl IcebergConnectorInstance {
         instance_id: ConnectorInstanceId,
         registry: Arc<RwLock<IcebergCatalogRegistry>>,
     ) -> Result<ConnectorInstance, ConnectorError> {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse(PROVIDER_ID)?,
+            instance_id: instance_id.clone(),
+        };
         let provider = Arc::new(Self {
             instance_id: instance_id.clone(),
             registry,
@@ -73,13 +259,13 @@ impl IcebergConnectorInstance {
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
         });
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse(PROVIDER_ID)?,
-                instance_id,
+        ConnectorInstance::try_new(descriptor.clone(), Some(provider.clone()), provider).map(
+            |instance| {
+                instance.with_distribution(Arc::new(IcebergInstanceDistribution {
+                    descriptor,
+                    incarnation: ConnectorInstanceIncarnation::new(),
+                }))
             },
-            Some(provider.clone()),
-            provider,
         )
     }
 

@@ -20,14 +20,17 @@ use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCancellation, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorNamespaceIdentity, ConnectorOpenReaderRequest,
-    ConnectorReadSelector, ConnectorRequestContext, ConnectorSplitPlanningRequest,
-    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorInstanceInstaller, ConnectorListTablesRequest, ConnectorNamespaceIdentity,
+    ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorSplitPlanningRequest, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
 use super::iceberg::catalog::{IcebergCatalogRegistry, create_namespace};
-use super::iceberg::provider::IcebergConnectorInstance;
+use super::iceberg::provider::{
+    IcebergConnectorInstaller, IcebergConnectorInstance, IcebergReadBinding,
+};
 use crate::sql::{Literal, TableColumnDef};
 use novarocks_catalog::schema::SqlType;
 
@@ -95,6 +98,54 @@ fn registry_with_table() -> (Arc<RwLock<IcebergCatalogRegistry>>, tempfile::Temp
     .expect("create table");
     insert_rows(&entry, "db", "orders", &[vec![Literal::Int(7)]]).expect("insert table row");
     (registry, warehouse)
+}
+
+#[test]
+fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
+    let (registry, _warehouse) = registry_with_table();
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let instance = IcebergConnectorInstance::new(instance_id, registry)
+        .expect("planning Iceberg connector instance");
+
+    let declaration = instance
+        .distribution()
+        .expect("Iceberg planning instance is distributable")
+        .declaration(&context())
+        .expect("create secret-free declaration");
+    let declaration_debug = format!("{declaration:?}");
+    assert!(!declaration_debug.contains("warehouse"));
+    assert!(!declaration_debug.contains("access_key"));
+
+    let installer = IcebergConnectorInstaller::new(IcebergReadBinding::default_binding(None));
+    let read_only = installer
+        .install(&declaration, &context())
+        .expect("install read-only Iceberg instance");
+    assert_eq!(read_only.descriptor(), declaration.descriptor());
+    assert!(read_only.metadata().is_none());
+    let error = match read_only.read().begin_scan(
+        &novarocks_spi::connector::ConnectorTableHandle::try_new(
+            declaration.descriptor().instance_id.clone(),
+            bytes::Bytes::new(),
+        )
+        .expect("table handle"),
+        ConnectorBeginScanRequest {
+            projection: Vec::new(),
+            selector: ConnectorReadSelector::Current,
+            limit: None,
+            batch: ConnectorBatchBudget {
+                max_rows: NonZeroUsize::new(1).expect("nonzero rows"),
+                max_bytes: NonZeroUsize::new(1).expect("nonzero bytes"),
+            },
+            context: context(),
+        },
+    ) {
+        Ok(_) => panic!("read-only BE instance must not plan scans"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        novarocks_spi::connector::ConnectorErrorKind::Unsupported
+    );
 }
 
 fn remove_snapshot_manifest_files(path: &std::path::Path) -> usize {
