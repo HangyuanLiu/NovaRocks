@@ -451,6 +451,9 @@ pub(crate) fn read_exact_range(
             range.start, range.end
         ));
     }
+    if range.is_empty() {
+        return Ok(Bytes::new());
+    }
 
     let access = resolve_access_for_location(path, object_store_config)?;
     let file = access

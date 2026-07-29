@@ -21,14 +21,15 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-scan_targets=(src tools/src/bin)
+scan_targets=(novarocks/core/src novarocks-server/src tools/src/bin)
+foundation_target=novarocks/fs/src
 
 deny_pattern='FileIOBuilder::new|S3StorageFactory|build_oss_operator|normalize_oss_path|resolve_oss_operator_and_path_with_config|resolve_object_store_operator_and_path|classify_scan_paths|resolve_opendal_paths|opendal::services::S3::default|opendal::services::Fs::default|(^|[^[:alnum:]_:])(S3|Fs)::default[[:space:]]*\(|use[[:space:]]+opendal::services(::|::\{).*\b(S3|Fs)\b|novarocks_fs_oss|novarocks_fs_path|crate::fs::oss'
 
 hits=()
 while IFS= read -r hit; do
   hits+=("$hit")
-done < <(rg -n --no-heading "$deny_pattern" "${scan_targets[@]}" || true)
+done < <(rg -n --no-heading "$deny_pattern" "${scan_targets[@]}" "$foundation_target" || true)
 
 is_test_line() {
   local file="$1"
@@ -83,12 +84,10 @@ is_allowed_core_hit() {
     return 0
   fi
   case "$file:$text" in
-    src/connector/iceberg/fs_io.rs:*FileIOBuilder::new* ) return 0 ;;
-    src/fs/local.rs:*'opendal::services::Fs::default'* ) return 0 ;;
-    src/fs/object_store.rs:*'opendal::services::S3::default'* ) return 0 ;;
-    src/fs/opendal.rs:*'opendal::services::Fs::default'* ) return 0 ;;
-    src/fs/object_store.rs:*'fn build_object_store_operator'* ) return 0 ;;
-    src/fs/access.rs:*'crate::fs::object_store::build_object_store_operator'* ) return 0 ;;
+    novarocks/fs/src/* ) return 0 ;;
+    novarocks/core/src/connector/iceberg/fs_io.rs:*FileIOBuilder::new* ) return 0 ;;
+    novarocks/core/src/fs/object_store.rs:*'opendal::services::S3::default'* ) return 0 ;;
+    novarocks/core/src/fs/object_store.rs:*'fn build_object_store_operator'* ) return 0 ;;
   esac
   return 1
 }
@@ -203,7 +202,7 @@ collect_opendal_service_import_hits() {
         }
       }
     ' "$file"
-  done < <(rg --files "${scan_targets[@]}" -g '*.rs')
+  done < <(rg --files "${scan_targets[@]}" "$foundation_target" -g '*.rs')
 }
 
 while IFS= read -r hit; do
@@ -227,21 +226,22 @@ is_allowed_aws_hit() {
     return 0
   fi
   case "$file" in
-    src/fs/object_store_credentials.rs) return 0 ;;
-    src/fs/object_store.rs) return 0 ;;
-    src/connector/starrocks/object_store_profile.rs) return 0 ;;
-    src/connector/iceberg/fs_io.rs) return 0 ;;
-    src/connector/iceberg/catalog/registry.rs) return 0 ;;
-    src/connector/iceberg/stats.rs) return 0 ;;
-    src/connector/iceberg/sink_plan.rs) return 0 ;;
+    novarocks/fs/src/*) return 0 ;;
+    novarocks/core/src/fs/object_store_credentials.rs) return 0 ;;
+    novarocks/core/src/fs/object_store.rs) return 0 ;;
+    novarocks/core/src/connector/starrocks/object_store_profile.rs) return 0 ;;
+    novarocks/core/src/connector/iceberg/fs_io.rs) return 0 ;;
+    novarocks/core/src/connector/iceberg/catalog/registry.rs) return 0 ;;
+    novarocks/core/src/connector/iceberg/stats.rs) return 0 ;;
+    novarocks/core/src/connector/iceberg/sink_plan.rs) return 0 ;;
   esac
   case "$file:$text" in
-    src/connector/starrocks/scan/op.rs:*'provide aws.s3.*'* ) return 0 ;;
-    src/runtime/starlet_shard_registry.rs:*'"aws.s3.endpoint"'* ) return 0 ;;
-    src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeyId"'* ) return 0 ;;
-    src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeySecret"'* ) return 0 ;;
-    src/runtime/starlet_shard_registry.rs:*'"aws.s3.region"'* ) return 0 ;;
-    src/runtime/starlet_shard_registry.rs:*'"aws.s3.enable_path_style_access"'* ) return 0 ;;
+    novarocks/core/src/connector/starrocks/scan/op.rs:*'provide aws.s3.*'* ) return 0 ;;
+    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.endpoint"'* ) return 0 ;;
+    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeyId"'* ) return 0 ;;
+    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeySecret"'* ) return 0 ;;
+    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.region"'* ) return 0 ;;
+    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.enable_path_style_access"'* ) return 0 ;;
   esac
   return 1
 }

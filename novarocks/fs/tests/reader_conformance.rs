@@ -20,8 +20,8 @@ mod common;
 use arrow::array::{Array, Int32Array, StringArray};
 use novarocks_fs::{
     CacheOptions, DataCacheManager, DataCachePageCacheOptions, FileErrorKind, FileFormat,
-    FileProjection, FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, ScanPredicate,
-    ScanPredicateDomain, ScanPredicateSource, open_file_reader,
+    FileProjection, FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection,
+    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -147,10 +147,14 @@ fn parquet_predicate_prunes_row_groups() {
 }
 
 #[test]
-fn parquet_honors_explicit_row_group_selection() {
+fn parquet_honors_explicit_page_selection_and_positions() {
     let fixture = Fixture::parquet();
     let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     request.pruning.row_groups = Some(vec![0]);
+    request.pruning.pages.push(PhysicalPageSelection {
+        row_group: 0,
+        page_indices: vec![1],
+    });
     let mut reader = open_file_reader(request).expect("open reader");
     let batches = collect(reader.as_mut()).expect("read Parquet");
     assert_eq!(
@@ -158,11 +162,11 @@ fn parquet_honors_explicit_row_group_selection() {
             .iter()
             .map(|batch| batch.batch.num_rows())
             .sum::<usize>(),
-        4
+        2
     );
     assert_eq!(
         batches[0].physical_row_positions.as_ref().unwrap().value(0),
-        0
+        2
     );
 }
 

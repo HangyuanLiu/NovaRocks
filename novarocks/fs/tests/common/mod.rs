@@ -33,6 +33,7 @@ use novarocks_fs::{
 use orc_rust::ArrowWriterBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 pub struct TestIo {
@@ -148,7 +149,12 @@ pub fn collect(reader: &mut dyn FileBatchReader) -> FileResult<Vec<FileBatch>> {
 fn write_parquet(path: &std::path::Path) {
     let schema = fixture_schema();
     let file = File::create(path).expect("create Parquet");
-    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("Parquet writer");
+    let properties = WriterProperties::builder()
+        .set_data_page_row_count_limit(2)
+        .set_write_batch_size(2)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties)).expect("Parquet writer");
     writer
         .write(&fixture_batch(&schema, 0))
         .expect("row group 0");

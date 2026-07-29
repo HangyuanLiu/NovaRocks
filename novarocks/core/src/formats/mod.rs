@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod orc;
+#[path = "parquet_adapter.rs"]
 pub mod parquet;
 #[cfg(feature = "compat")]
 pub mod starrocks;

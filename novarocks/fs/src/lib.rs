@@ -38,14 +38,15 @@ pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,
     CacheOptions, DataCacheContext, DataCacheIoOptions, DataCacheManager, DataCacheMetricsRecorder,
     DataCachePageCache, DataCachePageCacheOptions, DataCachePageKey, ExternalDataCacheRangeOptions,
-    PageCache, PageCacheStats, PageCacheValue, PageHandle, get_block_cache, init_block_cache,
-    validate_datacache_priority, validate_evict_probability, validate_non_negative_i64,
+    PageCache, PageCacheStats, PageCacheValue, PageHandle, ParquetCacheOptions, get_block_cache,
+    init_block_cache, init_parquet_cache, validate_datacache_priority, validate_evict_probability,
+    validate_non_negative_i64,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
 pub use physical_reader::open_file_reader;
 pub use predicate::{
-    MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain,
-    ScanPredicateSource,
+    MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
+    ScanPredicateDomain, ScanPredicateSource,
 };
 pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,

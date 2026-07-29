@@ -51,6 +51,7 @@ impl OrcPhysicalReader {
             request.file,
             request.context.clone(),
             request.cache,
+            true,
             Arc::clone(&metrics),
         );
         let mut builder = ArrowReaderBuilder::try_new(chunk_reader)

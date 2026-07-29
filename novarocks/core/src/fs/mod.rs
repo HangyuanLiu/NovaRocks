@@ -14,12 +14,5 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod access;
-pub mod coalesce_policy;
-pub mod coalesced_reader;
-pub mod hdfs;
-pub mod local;
 pub mod object_store;
 pub mod object_store_credentials;
-pub mod opendal;
-pub mod range_plan;

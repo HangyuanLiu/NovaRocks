@@ -27,10 +27,10 @@ use crate::novarocks_logging::debug;
 use crate::runtime::profile::RuntimeProfile;
 use bytes::Bytes;
 use novarocks_fs::{
-    BoundFile, FileBatchReader, FileBytesFuture, FileCancellation, FileError, FileErrorKind,
-    FileFormat, FileIdentity, FileIoRuntime, FileProjection, FileReadBudget, FileReadContext,
-    FileReadRange, FileReadRequest, FileResult, FileTask, FileTaskFuture, FileTaskSpawner,
-    FileU64Future, FsAccessHandle, FsAccessResolver, FsScheme, PhysicalPruning,
+    BoundFile, FileBytesFuture, FileCancellation, FileError, FileErrorKind, FileFormat,
+    FileIdentity, FileIoRuntime, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
+    FileReadRequest, FileResult, FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future,
+    FsAccessHandle, FsAccessResolver, FsScheme, PhysicalPruning,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;

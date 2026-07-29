@@ -714,18 +714,16 @@ fn main() {
             }
 
             let parquet_cache_initialized =
-                novarocks::formats::parquet::init_datacache_parquet_cache(
-                    novarocks::formats::parquet::ParquetCacheOptions {
-                        enable_metadata: cfg.runtime.cache.parquet_meta_cache_enable,
-                        metadata_ttl: Duration::from_secs(
-                            cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
-                        ),
-                        enable_page: cfg.runtime.cache.parquet_page_cache_enable,
-                    },
-                );
+                novarocks_fs::init_parquet_cache(novarocks_fs::ParquetCacheOptions {
+                    enable_metadata: cfg.runtime.cache.parquet_meta_cache_enable,
+                    metadata_ttl: Duration::from_secs(
+                        cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
+                    ),
+                    enable_page: cfg.runtime.cache.parquet_page_cache_enable,
+                });
             if parquet_cache_initialized {
                 eprintln!(
-                    "Parquet DataCache policy initialized: meta_enabled={}, meta_ttl={}s, page_enabled={}",
+                    "Parquet physical cache policy initialized: meta_enabled={}, meta_ttl={}s, page_enabled={}",
                     cfg.runtime.cache.parquet_meta_cache_enable,
                     cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
                     cfg.runtime.cache.parquet_page_cache_enable,

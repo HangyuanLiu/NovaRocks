@@ -18,10 +18,11 @@
 
 use crate::common::TestConfig;
 use arrow::datatypes::{DataType, Field};
-use novarocks::cache::{CacheOptions, DataCacheManager};
+use novarocks::cache::CacheOptions;
 use novarocks::connector::{self, FileFormatConfig, ParquetScanConfig};
 use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use novarocks::formats::parquet::{ParquetReadCachePolicy, ParquetSlotKind};
+use novarocks_fs::DataCacheManager;
 use std::sync::Arc;
 
 #[path = "../common/mod.rs"]
@@ -108,7 +109,8 @@ fn test_iceberg_connector_module() {
         runtime_min_max_filter_columns: std::collections::HashMap::new(),
         variant_path_predicates: Vec::new(),
         batch_size: None,
-        datacache: DataCacheManager::instance().external_context(test_cache_options()),
+        datacache: DataCacheManager::instance()
+            .external_context(test_cache_options().to_file_cache_options()),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some("connector_smoke".to_string()),
         iceberg_output_schema: None,

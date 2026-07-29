@@ -74,6 +74,7 @@ pub(crate) struct BoundChunkReader {
     file: BoundFile,
     context: FileReadContext,
     cache: Option<DataCacheContext>,
+    range_cache_enabled: bool,
     metrics: Arc<ReaderMetrics>,
 }
 
@@ -82,12 +83,14 @@ impl BoundChunkReader {
         file: BoundFile,
         context: FileReadContext,
         cache: Option<DataCacheContext>,
+        range_cache_enabled: bool,
         metrics: Arc<ReaderMetrics>,
     ) -> Self {
         Self {
             file,
             context,
             cache,
+            range_cache_enabled,
             metrics,
         }
     }
@@ -150,7 +153,7 @@ impl BoundChunkReader {
 
     fn cache_key(&self, start: u64, length: usize) -> Option<DataCachePageKey> {
         let cache = self.cache.as_ref()?;
-        if !cache.datacache_requested() {
+        if !self.range_cache_enabled || !cache.datacache_requested() {
             return None;
         }
         let identity = self.file.identity();

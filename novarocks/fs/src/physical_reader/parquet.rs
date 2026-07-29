@@ -22,8 +22,11 @@ use std::time::Instant;
 
 use arrow::array::UInt64Array;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder, RowSelection,
+};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
 use super::chunk_reader::{BoundChunkReader, ReaderMetrics};
@@ -50,21 +53,35 @@ struct PositionSpan {
 impl ParquetPhysicalReader {
     pub(crate) fn try_new(request: FileReadRequest) -> FileResult<Self> {
         request.context.check_active()?;
-        if !request.pruning.pages.is_empty() {
-            return Err(FileError::unsupported(
-                "explicit Parquet page selections are not supported by the physical reader",
-            ));
-        }
-
         let metrics = Arc::new(ReaderMetrics::default());
+        let cache_enabled = request
+            .cache
+            .as_ref()
+            .is_some_and(crate::DataCacheContext::datacache_requested);
+        let identity = request.file.identity().clone();
         let chunk_reader = BoundChunkReader::new(
             request.file,
             request.context.clone(),
             request.cache,
+            crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
             Arc::clone(&metrics),
         );
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(chunk_reader)
-            .map_err(|error| parquet_error("open Parquet metadata", error))?;
+        let page_index_policy = if request.pruning.pages.is_empty() {
+            PageIndexPolicy::Skip
+        } else {
+            PageIndexPolicy::Optional
+        };
+        let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
+        let mut builder = if let Some(metadata) =
+            crate::cache::parquet_cache::metadata_get(cache_enabled, &identity)
+        {
+            ParquetRecordBatchReaderBuilder::new_with_metadata(chunk_reader, metadata)
+        } else {
+            let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
+                .map_err(|error| parquet_error("open Parquet metadata", error))?;
+            crate::cache::parquet_cache::metadata_put(cache_enabled, &identity, metadata.clone());
+            ParquetRecordBatchReaderBuilder::new_with_metadata(chunk_reader, metadata)
+        };
         request.context.check_active()?;
 
         let projection = projection_mask(&builder, &request.projection)?;
@@ -79,8 +96,12 @@ impl ParquetPhysicalReader {
             request.pruning.row_groups.as_deref(),
             &request.predicates,
         );
-        let positions = row_position_spans(metadata.as_ref(), &row_groups)?;
+        let (selection, positions) =
+            page_selection(metadata.as_ref(), &row_groups, &request.pruning.pages)?;
         builder = builder.with_row_groups(row_groups);
+        if let Some(selection) = selection {
+            builder = builder.with_row_selection(selection);
+        }
         let reader = builder
             .build()
             .map_err(|error| parquet_error("build Parquet reader", error))?;
@@ -292,6 +313,157 @@ fn row_position_spans(
             .ok_or_else(|| FileError::new(FileErrorKind::Corrupt, "Parquet row count overflow"))?;
     }
     Ok(spans)
+}
+
+fn page_selection(
+    metadata: &ParquetMetaData,
+    selected: &[usize],
+    pages: &[crate::PhysicalPageSelection],
+) -> FileResult<(Option<RowSelection>, VecDeque<PositionSpan>)> {
+    if pages.is_empty() {
+        return Ok((None, row_position_spans(metadata, selected)?));
+    }
+
+    let mut pages_by_row_group = HashMap::<usize, HashSet<usize>>::new();
+    for page in pages {
+        let entry = pages_by_row_group.entry(page.row_group).or_default();
+        entry.extend(page.page_indices.iter().copied());
+    }
+    let Some(offset_index) = metadata.offset_index() else {
+        return Err(FileError::unsupported(
+            "explicit Parquet page selection requires an offset index",
+        ));
+    };
+
+    let first_rows = row_group_first_rows(metadata)?;
+    let mut selected_ranges = Vec::new();
+    let mut positions = VecDeque::new();
+    let mut selection_offset = 0usize;
+
+    for &row_group_index in selected {
+        let row_group = metadata.row_groups().get(row_group_index).ok_or_else(|| {
+            FileError::invalid(format!(
+                "Parquet row-group selection is out of bounds: {row_group_index}"
+            ))
+        })?;
+        let row_count = usize::try_from(row_group.num_rows()).map_err(|_| {
+            FileError::new(
+                FileErrorKind::Corrupt,
+                "negative or overflowing Parquet row-group row count",
+            )
+        })?;
+        let ranges = if let Some(selected_pages) = pages_by_row_group.get(&row_group_index) {
+            let page_locations = offset_index
+                .get(row_group_index)
+                .and_then(|columns| columns.first())
+                .ok_or_else(|| {
+                    FileError::unsupported(format!(
+                        "Parquet row group {row_group_index} has no offset-index column"
+                    ))
+                })?
+                .page_locations();
+            explicit_page_ranges(row_group_index, row_count, page_locations, selected_pages)?
+        } else {
+            vec![0..row_count]
+        };
+
+        for range in ranges {
+            selected_ranges.push(selection_offset + range.start..selection_offset + range.end);
+            positions.push_back(PositionSpan {
+                next: first_rows[row_group_index] + range.start as u64,
+                remaining: range.end - range.start,
+            });
+        }
+        selection_offset = selection_offset.checked_add(row_count).ok_or_else(|| {
+            FileError::new(FileErrorKind::Corrupt, "Parquet row selection overflow")
+        })?;
+    }
+
+    Ok((
+        Some(RowSelection::from_consecutive_ranges(
+            selected_ranges.into_iter(),
+            selection_offset,
+        )),
+        positions,
+    ))
+}
+
+fn row_group_first_rows(metadata: &ParquetMetaData) -> FileResult<Vec<u64>> {
+    let mut first_rows = Vec::with_capacity(metadata.num_row_groups());
+    let mut first_row = 0u64;
+    for row_group in metadata.row_groups() {
+        first_rows.push(first_row);
+        let rows = u64::try_from(row_group.num_rows()).map_err(|_| {
+            FileError::new(
+                FileErrorKind::Corrupt,
+                "negative Parquet row-group row count",
+            )
+        })?;
+        first_row = first_row
+            .checked_add(rows)
+            .ok_or_else(|| FileError::new(FileErrorKind::Corrupt, "Parquet row count overflow"))?;
+    }
+    Ok(first_rows)
+}
+
+fn explicit_page_ranges(
+    row_group_index: usize,
+    row_count: usize,
+    page_locations: &[parquet::file::page_index::offset_index::PageLocation],
+    selected_pages: &HashSet<usize>,
+) -> FileResult<Vec<std::ops::Range<usize>>> {
+    if let Some(index) = selected_pages
+        .iter()
+        .copied()
+        .find(|index| *index >= page_locations.len())
+    {
+        return Err(FileError::invalid(format!(
+            "Parquet page selection is out of bounds for row group {row_group_index}: {index}"
+        )));
+    }
+
+    let mut ranges = selected_pages
+        .iter()
+        .copied()
+        .map(|index| {
+            let start = usize::try_from(page_locations[index].first_row_index).map_err(|_| {
+                FileError::new(
+                    FileErrorKind::Corrupt,
+                    "negative Parquet page first-row index",
+                )
+            })?;
+            let end = page_locations
+                .get(index + 1)
+                .map(|page| usize::try_from(page.first_row_index))
+                .transpose()
+                .map_err(|_| {
+                    FileError::new(
+                        FileErrorKind::Corrupt,
+                        "negative Parquet page first-row index",
+                    )
+                })?
+                .unwrap_or(row_count);
+            if start > end || end > row_count {
+                return Err(FileError::new(
+                    FileErrorKind::Corrupt,
+                    "Parquet page row range exceeds its row group",
+                ));
+            }
+            Ok(start..end)
+        })
+        .collect::<FileResult<Vec<_>>>()?;
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged = Vec::<std::ops::Range<usize>>::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && previous.end == range.start
+        {
+            previous.end = range.end;
+            continue;
+        }
+        merged.push(range);
+    }
+    Ok(merged)
 }
 
 fn row_group_may_match(row_group: &RowGroupMetaData, predicates: &[ScanPredicate]) -> bool {

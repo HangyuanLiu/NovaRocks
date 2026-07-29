@@ -35,8 +35,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use roaring::RoaringTreemap;
 
 use crate::connector::iceberg::changes::{ChangeError, PositionDeleteRef};

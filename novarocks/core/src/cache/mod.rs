@@ -14,11 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod cached_reader;
-
 use crate::runtime::query_options::QueryOptions;
-
-pub use cached_reader::{CachedRangeReader, CachedRead};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExternalDataCacheRangeOptions {

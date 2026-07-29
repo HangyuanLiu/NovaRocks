@@ -51,8 +51,8 @@ use crate::connector::runtime::{
     ConnectorScheduledSplit, ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
 use crate::exec::node::scan::{
-    HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
-    ScanMorselPruneDecision, ScanMorsels, ScanSource,
+    HdfsScanFileFormat, IncrementalScanRange, ScanMorsel, ScanMorselPruneDecision, ScanMorsels,
+    ScanSource,
 };
 use crate::formats::FileFormatConfig;
 use crate::formats::parquet::{
@@ -1042,6 +1042,9 @@ impl HdfsFileBatchReader {
                     .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
                 let adapter = FoundationParquetAdapter::try_new(cfg.clone())
                     .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                let cache = (cfg.cache_policy.enable_metacache
+                    || cfg.cache_policy.enable_pagecache)
+                    .then_some(cfg.datacache);
                 let reader = open_file_reader(FileReadRequest {
                     file,
                     format: FileFormat::Parquet,
@@ -1050,7 +1053,7 @@ impl HdfsFileBatchReader {
                     budget,
                     predicates,
                     pruning: PhysicalPruning::default(),
-                    cache: Some(cfg.datacache),
+                    cache,
                     context: self.file_context.clone(),
                 })
                 .map_err(map_file_error)?;

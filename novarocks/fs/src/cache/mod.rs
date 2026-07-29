@@ -19,6 +19,7 @@ mod block_cache;
 mod cache_input_stream;
 mod data_cache;
 mod page_cache;
+pub(crate) mod parquet_cache;
 
 pub use block_cache::{BlockCache, BlockCacheOptions, CacheKey, get_block_cache, init_block_cache};
 pub use cache_input_stream::{CacheBlockRead, CacheInputStream};
@@ -27,6 +28,7 @@ pub use data_cache::{
     DataCachePageCacheOptions, DataCachePageKey,
 };
 pub use page_cache::{PageCache, PageCacheStats, PageCacheValue, PageHandle};
+pub use parquet_cache::{ParquetCacheOptions, init_parquet_cache};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheDomain {
