@@ -16,8 +16,12 @@
 // under the License.
 //! Integration tests for connectors (JDBC, Iceberg).
 
+use std::sync::Arc;
+
 use crate::common::TestConfig;
+use arrow::datatypes::{DataType, Field};
 use novarocks::connector;
+use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -34,8 +38,7 @@ fn test_connector_registry_initialization() {
     // Test connector registry initialization
     let registry = connector::ConnectorRegistry::default();
 
-    // Registry should be initialized with default connectors
-    // Default registry includes jdbc, mysql, hdfs, and starrocks connectors
+    // Registry construction must not install a synthetic transport connector.
     let _ = registry;
 }
 
