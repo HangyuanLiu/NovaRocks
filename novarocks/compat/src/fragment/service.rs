@@ -560,7 +560,7 @@ fn lookup_close_worker(receiver: Arc<std::sync::Mutex<mpsc::Receiver<LookupClose
                 continue;
             }
         };
-        if let Err(err) = novarocks::service::internal_rpc_client::lookup_close(
+        if let Err(err) = crate::internal_rpc_client::lookup_close(
             &task.target.host,
             port,
             task.query_id,

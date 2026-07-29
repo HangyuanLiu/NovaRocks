@@ -14,15 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use std::ffi::CString;
 
+use novarocks::common::types::UniqueId;
+use novarocks::proto;
+use novarocks::runtime::query_context::QueryId;
+use novarocks::service::engine_ffi::NovaRocksRustBuf;
 use prost::Message;
-
-use crate::common::types::UniqueId;
-use crate::runtime::query_context::QueryId;
-use crate::service::engine_ffi::NovaRocksRustBuf;
-
-pub use crate::proto;
 
 unsafe extern "C" {
     fn novarocks_compat_transmit_chunk(
@@ -149,7 +148,7 @@ where
         .map_err(|e| format!("{rpc_name} decode response failed: {e}"))
 }
 
-pub fn send_chunks(
+pub(crate) fn send_chunks(
     dest_host: &str,
     dest_port: u16,
     finst_id: UniqueId,
@@ -187,7 +186,7 @@ pub fn send_chunks(
     status_error(response.status.as_ref(), "transmit_chunk")
 }
 
-pub fn lookup(
+pub(crate) fn lookup(
     dest_host: &str,
     dest_port: u16,
     params: proto::filter::LookupRequest,
@@ -243,7 +242,7 @@ pub fn lookup(
     Ok(proto::filter::LookupResponse { status, columns })
 }
 
-pub fn lookup_close(
+pub(crate) fn lookup_close(
     dest_host: &str,
     dest_port: u16,
     query_id: QueryId,
@@ -251,8 +250,8 @@ pub fn lookup_close(
 ) -> Result<(), String> {
     let request = proto::starrocks::PLookUpCloseRequest {
         query_id: Some(proto::starrocks::PUniqueId {
-            hi: query_id.hi,
-            lo: query_id.lo,
+            hi: query_id.hi(),
+            lo: query_id.lo(),
         }),
         lookup_node_id: Some(lookup_node_id),
     };
@@ -275,4 +274,65 @@ pub fn lookup_close(
         Err(error) => eprintln!("[WARN] {}", lookup_close_log_line(Err(error.as_str()))),
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lookup_close_log_line, lookup_close_status_error, status_error};
+    use novarocks::proto;
+
+    fn status(status_code: i32, error_msgs: &[&str]) -> proto::starrocks::StatusPb {
+        proto::starrocks::StatusPb {
+            status_code,
+            error_msgs: error_msgs
+                .iter()
+                .map(|message| (*message).to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn status_error_accepts_missing_and_success_status() {
+        assert_eq!(status_error(None, "transmit_chunk"), Ok(()));
+        assert_eq!(
+            status_error(Some(&status(0, &["ignored"])), "transmit_chunk"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn status_error_preserves_code_and_messages() {
+        assert_eq!(
+            status_error(Some(&status(7, &[])), "transmit_chunk"),
+            Err("transmit_chunk returned status_code=7".to_string())
+        );
+        assert_eq!(
+            status_error(Some(&status(8, &["first", "second"])), "lookup"),
+            Err("lookup failed: first; second".to_string())
+        );
+    }
+
+    #[test]
+    fn lookup_close_requires_status_and_propagates_failure() {
+        assert_eq!(
+            lookup_close_status_error(None),
+            Err("lookup_close response missing status".to_string())
+        );
+        assert_eq!(
+            lookup_close_status_error(Some(&status(9, &["close failed"]))),
+            Err("lookup_close failed: close failed".to_string())
+        );
+    }
+
+    #[test]
+    fn lookup_close_log_line_preserves_observable_text() {
+        assert_eq!(
+            lookup_close_log_line(Ok(())),
+            "compat_rpc method=lookup_close direction=send status=ok"
+        );
+        assert_eq!(
+            lookup_close_log_line(Err("network unavailable")),
+            "compat_rpc method=lookup_close direction=send status=error error=network unavailable"
+        );
+    }
 }

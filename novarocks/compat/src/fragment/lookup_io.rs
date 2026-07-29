@@ -47,12 +47,9 @@ impl FragmentLookupClient for BrpcFragmentLookupClient {
                 format!("invalid BRPC lookup port: {error}"),
             )
         })?;
-        let response = novarocks::service::internal_rpc_client::lookup(
-            endpoint.host(),
-            port,
-            remote_request(&request)?,
-        )
-        .map_err(|error| lookup_error(FragmentIoErrorKind::Unavailable, error))?;
+        let response =
+            crate::internal_rpc_client::lookup(endpoint.host(), port, remote_request(&request)?)
+                .map_err(|error| lookup_error(FragmentIoErrorKind::Unavailable, error))?;
         decode_response(response)
     }
 }

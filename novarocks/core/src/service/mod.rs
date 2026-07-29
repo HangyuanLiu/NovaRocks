@@ -40,8 +40,6 @@ pub mod grpc_server;
 #[cfg(feature = "compat")]
 pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
-#[cfg(feature = "compat")]
-pub mod internal_rpc_client;
 pub(crate) mod internal_rpc_transport;
 pub mod load_tracking_http;
 pub(crate) mod metrics_http;
