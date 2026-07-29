@@ -16,8 +16,16 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use bytes::Bytes;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorScan,
+    ConnectorScanHandle,
+};
 
 use super::*;
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
@@ -43,7 +51,7 @@ fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static Prepared
 }
 
 #[test]
-fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
+fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
     let plan = iceberg_delta_distributed_plan_for_test();
     let source_column = novarocks_catalog::schema::ColumnDef {
         name: "physical_order_id".to_string(),
@@ -97,6 +105,9 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
             ],
         })
         .expect("insert prepared delta binding");
+    bindings
+        .insert_connector_read(0, 10, planned_connector_read_for_test())
+        .expect("insert planned delta connector read");
 
     let encoded = native_plan::encode_distributed_plan_with_context(
         &plan,
@@ -134,19 +145,43 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
         vec!["physical_order_id", "tenant_id"]
     );
     assert!(table.iceberg_row_lineage_metadata_columns.is_empty());
-    let Some(crate::proto::plan::scan_source::Kind::IcebergDeltaTable(delta)) = table
+    let Some(crate::proto::plan::scan_source::Kind::ConnectorRead(connector)) = table
         .source
         .as_ref()
         .and_then(|source| source.kind.as_ref())
     else {
-        panic!("expected encoded delta source");
+        panic!("expected encoded connector source");
     };
-    let runtime = delta.delta_plan.as_ref().expect("prepared runtime payload");
-    assert_eq!(runtime.table_location, "s3://prepared/orders");
-    assert!(
-        runtime.cloud_properties.is_empty(),
-        "native delta plans must use each BE's startup connector configuration"
-    );
+    assert_eq!(connector.instance_id, "ice");
+    assert_eq!(connector.scan_payload, b"delta-scan".to_vec());
+    assert!(connector.splits.is_empty());
+}
+
+fn planned_connector_read_for_test()
+-> crate::query_execution::preparation::scan::PlannedConnectorRead {
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let declaration = ConnectorInstanceDeclaration::try_new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: instance_id.clone(),
+        },
+        ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        Bytes::from_static(b"binding"),
+    )
+    .expect("declaration");
+    crate::query_execution::preparation::scan::PlannedConnectorRead {
+        declaration,
+        scan: ConnectorScan {
+            handle: ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"delta-scan"))
+                .expect("scan handle"),
+            output_schema: Arc::new(arrow::datatypes::Schema::empty()),
+        },
+        splits: Vec::new(),
+        batch: ConnectorBatchBudget {
+            max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+            max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
+        },
+    }
 }
 
 #[test]

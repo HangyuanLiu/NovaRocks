@@ -23,7 +23,6 @@ mod boundary_schema;
 mod build;
 mod bundle;
 mod expr;
-mod iceberg_delta_scan;
 mod iceberg_literal_json;
 pub(crate) mod instance;
 pub(crate) mod plan;

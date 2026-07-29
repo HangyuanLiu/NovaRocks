@@ -2492,14 +2492,12 @@ mod tests {
         let mut equality_targets = HashMap::new();
         equality_targets.insert(
             "eq-delete.parquet".to_string(),
-            vec![
-                crate::connector::iceberg::delta::EqualityDeleteTargetData {
-                    data_file_path: "data.parquet".to_string(),
-                    data_file_size: 456,
-                    data_file_first_row_id: Some(1000),
-                    data_file_sequence_number: Some(6),
-                },
-            ],
+            vec![crate::connector::iceberg::delta::EqualityDeleteTargetData {
+                data_file_path: "data.parquet".to_string(),
+                data_file_size: 456,
+                data_file_first_row_id: Some(1000),
+                data_file_sequence_number: Some(6),
+            }],
         );
 
         let files =

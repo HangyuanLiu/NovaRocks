@@ -706,32 +706,13 @@ fn encode_scan_source(
                 cloud_properties: Default::default(),
                 metadata_payload: metadata_payload.clone(),
             }),
-            table_model::ScanSource::IcebergDeltaTable {
-                table,
-                from_snapshot_id,
-                to_snapshot_id,
-            } => {
-                let Some(ResolvedScanExecution::IcebergDelta(delta)) =
-                    binding.map(|binding| &binding.execution)
-                else {
-                    return Err(format!(
-                        "native scan encoder missing prepared IcebergDelta binding for node_id={}",
-                        scan_node_id
-                            .map(|node_id| node_id.to_string())
-                            .unwrap_or_else(|| "<none>".to_string())
-                    ));
-                };
-
-                Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
-                    table: Some(encode_iceberg_table_info(table)?),
-                    from_snapshot_id: *from_snapshot_id,
-                    to_snapshot_id: *to_snapshot_id,
-                    delta_plan: Some(
-                        super::super::iceberg_delta_scan::encode_iceberg_delta_scan_plan_native(
-                            &delta.runtime_plan,
-                        )?,
-                    ),
-                })
+            table_model::ScanSource::IcebergDeltaTable { .. } => {
+                return Err(format!(
+                    "native IcebergDeltaTable node_id={} must be materialized as ConnectorReadSource before encoding",
+                    scan_node_id
+                        .map(|node_id| node_id.to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                ));
             }
             table_model::ScanSource::IcebergVersionTable { table, snapshot_id } => {
                 Kind::IcebergVersionTable(plan::IcebergVersionTable {

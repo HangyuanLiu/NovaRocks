@@ -16,9 +16,7 @@
 // under the License.
 
 mod common;
-mod delete_files;
 mod generic;
-mod iceberg_delta;
 mod iceberg_metadata;
 #[cfg(feature = "compat")]
 mod native_starrocks;
@@ -83,17 +81,11 @@ pub(crate) fn lower_scan_node(
             )
             .map_err(|error| error.into_native(source_path.field("iceberg_metadata_table")))
         }
-        plan::scan_source::Kind::IcebergDeltaTable(source) => {
-            reject_variant_columns_for_source(scan, "IcebergDeltaTable")
-                .map_err(|error| error.into_native(path.clone()))?;
-            iceberg_delta::lower_iceberg_delta_table_scan(
-                node,
-                scan,
-                source,
-                &output_columns,
-                arena,
-            )
-            .map_err(|error| error.into_native(source_path.field("iceberg_delta_table")))
+        plan::scan_source::Kind::IcebergDeltaTable(_) => {
+            Err(NativeFragmentDecodeError::unsupported(
+                source_path.field("iceberg_delta_table"),
+                "legacy IcebergDeltaTable must be materialized as ConnectorReadSource before native decoding",
+            ))
         }
         plan::scan_source::Kind::IcebergVersionTable(_) => {
             Err(NativeFragmentDecodeError::unsupported(
@@ -990,129 +982,19 @@ mod tests {
     }
 
     #[test]
-    fn lowers_iceberg_delta_table_scan_from_native_payload() {
+    fn rejects_legacy_iceberg_delta_table_before_provider_binding() {
         let node = scan_node(iceberg_delta_table_source());
-        let ctx = NativePlanDecodeContext::default();
-        let mut arena = ExprArena::default();
-        let lowered = decode_node(&node, &mut arena, &ctx).expect("lower native delta scan");
-        let ExecNodeKind::IcebergDeltaScan(scan) = lowered.node.kind else {
-            panic!("expected IcebergDeltaScan");
-        };
-        assert_eq!(scan.node_id, 10);
-        assert_eq!(scan.base_table_ident.catalog, "rest");
-        assert_eq!(scan.from_snapshot_id, 1);
-        assert_eq!(scan.to_snapshot_id, 2);
-        assert_eq!(scan.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
-        assert_eq!(scan.change_files.len(), 1);
-        assert_eq!(
-            scan.change_files[0].path,
-            "file:///tmp/novarocks-delta-table/data-1.parquet"
+        let error = decode_node(
+            &node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("legacy delta source must not bypass ConnectorReadSource");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy IcebergDeltaTable must be materialized as ConnectorReadSource")
         );
-        assert!(matches!(
-            scan.change_files[0].role,
-            DeltaSourceRole::DataFile
-        ));
-    }
-
-    #[test]
-    fn lowering_iceberg_delta_table_scan_does_not_open_delete_files() {
-        let mut source = iceberg_delta_table_source();
-        let plan::scan_source::Kind::IcebergDeltaTable(delta_source) = &mut source else {
-            unreachable!();
-        };
-        delta_source.delta_plan.as_mut().unwrap().delete_side =
-            Some(plan::IcebergDeltaDeleteSidePlan {
-                base_data_file_lineage: HashMap::new(),
-                previous_data_file_lineage: HashMap::new(),
-                previous_delete_visibility_data_files: vec![
-                    plan::IcebergDeltaDeleteVisibilityDataFile {
-                        path: "file:///definitely-missing/data.parquet".to_string(),
-                        size: 1,
-                        first_row_id: Some(0),
-                        data_sequence_number: Some(1),
-                        delete_files: vec![plan::IcebergDeltaDeleteVisibilityDeleteFile {
-                            path: "file:///definitely-missing/delete.parquet".to_string(),
-                            file_format: plan::IcebergDeltaDeleteFileFormat::Parquet as i32,
-                            file_content: plan::IcebergDeltaDeleteFileContent::Position as i32,
-                            length: Some(1),
-                            content_offset: None,
-                            content_size_in_bytes: None,
-                        }],
-                    },
-                ],
-                previously_deleted_positions_per_file: HashMap::new(),
-                deleted_data_file_paths: Vec::new(),
-            });
-        let node = scan_node(source);
-        let ctx = NativePlanDecodeContext::default();
-        let mut arena = ExprArena::default();
-
-        let lowered = decode_node(&node, &mut arena, &ctx)
-            .expect("native fragment decoding must not touch Iceberg storage");
-        let ExecNodeKind::IcebergDeltaScan(_scan) = lowered.node.kind else {
-            panic!("expected IcebergDeltaScan");
-        };
-    }
-
-    #[test]
-    fn lowers_iceberg_delta_table_scan_predicates_to_filter() {
-        let node = scan_node_with(
-            vec![output_column(1, "id", DataType::Int64)],
-            vec![greater_than(
-                column_ref(1, "id", DataType::Int64),
-                int_literal(10),
-            )],
-            Vec::new(),
-            iceberg_delta_table_source(),
-        );
-        let ctx = NativePlanDecodeContext::default();
-        let mut arena = ExprArena::default();
-        let lowered =
-            decode_node(&node, &mut arena, &ctx).expect("lower native delta scan with predicate");
-        let ExecNodeKind::Filter(filter) = lowered.node.kind else {
-            panic!("expected Filter wrapper");
-        };
-        assert_eq!(filter.node_id, 10);
-        assert!(matches!(
-            arena.node(filter.predicate),
-            Some(ExprNode::Gt(_, _))
-        ));
-        let ExecNodeKind::IcebergDeltaScan(scan) = filter.input.kind else {
-            panic!("expected Filter input IcebergDeltaScan");
-        };
-        assert_eq!(scan.node_id, 10);
-        assert_eq!(scan.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
-    }
-
-    #[test]
-    fn lowers_iceberg_delta_table_scan_with_leaf_local_dormant_consumer() {
-        let mut node = scan_node(iceberg_delta_table_source());
-        let lowered = lower_delta_scan_with_binding(&mut node);
-        let ExecNodeKind::IcebergDeltaScan(scan) = lowered.node.kind else {
-            panic!("expected IcebergDeltaScan");
-        };
-        assert_eq!(scan.native_runtime_filter_specs().len(), 1);
-    }
-
-    #[test]
-    fn lowers_filtered_iceberg_delta_table_scan_with_leaf_local_dormant_consumer() {
-        let mut node = scan_node_with(
-            vec![output_column(1, "id", DataType::Int64)],
-            vec![greater_than(
-                column_ref(1, "id", DataType::Int64),
-                int_literal(10),
-            )],
-            Vec::new(),
-            iceberg_delta_table_source(),
-        );
-        let lowered = lower_delta_scan_with_binding(&mut node);
-        let ExecNodeKind::Filter(filter) = lowered.node.kind else {
-            panic!("expected Filter wrapper");
-        };
-        let ExecNodeKind::IcebergDeltaScan(scan) = filter.input.kind else {
-            panic!("expected Filter input IcebergDeltaScan");
-        };
-        assert_eq!(scan.native_runtime_filter_specs().len(), 1);
     }
 
     #[test]
