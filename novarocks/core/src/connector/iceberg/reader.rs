@@ -57,9 +57,11 @@ pub(crate) struct IcebergBatchReader {
     ivm_change_op: Option<i8>,
     position_deletes: roaring::RoaringTreemap,
     equality_deletes: Vec<EqualityDeleteSet>,
+    equality_match_only: bool,
     included_positions: Option<roaring::RoaringTreemap>,
     context: novarocks_spi::connector::ConnectorRequestContext,
     cancellation: FileCancellation,
+    cancel_on_close: bool,
     closed: bool,
 }
 
@@ -69,6 +71,49 @@ impl IcebergBatchReader {
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_equality_mode(file, access, request, file_context, false, true)
+    }
+
+    /// Build a reverse-projection reader for an equality-delete delta role.
+    /// Ordinary table scans keep rows not present in an equality-delete set;
+    /// the delta delete side must deliver exactly those matching rows instead.
+    pub(crate) fn try_new_matching_equality(
+        file: &IcebergDataFileInfo,
+        access: FsAccessHandle,
+        request: ConnectorOpenReaderRequest,
+        file_context: FileReadContext,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_equality_mode(file, access, request, file_context, true, true)
+    }
+
+    /// Build one child of a multi-file delta reader.  The parent owns the
+    /// shared cancellation token, so EOF for one file must not cancel later
+    /// data/delete files in the same connector split.
+    pub(crate) fn try_new_delta_child(
+        file: &IcebergDataFileInfo,
+        access: FsAccessHandle,
+        request: ConnectorOpenReaderRequest,
+        file_context: FileReadContext,
+        equality_match_only: bool,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_equality_mode(
+            file,
+            access,
+            request,
+            file_context,
+            equality_match_only,
+            false,
+        )
+    }
+
+    fn try_new_with_equality_mode(
+        file: &IcebergDataFileInfo,
+        access: FsAccessHandle,
+        request: ConnectorOpenReaderRequest,
+        file_context: FileReadContext,
+        equality_match_only: bool,
+        cancel_on_close: bool,
     ) -> Result<Self, ConnectorError> {
         validate_context(&request.context)?;
         let file_size = u64::try_from(file.size).map_err(|_| {
@@ -116,9 +161,11 @@ impl IcebergBatchReader {
             ivm_change_op: file.ivm_change_op,
             position_deletes,
             equality_deletes,
+            equality_match_only,
             included_positions,
             context: request.context,
             cancellation,
+            cancel_on_close,
             closed: false,
         })
     }
@@ -147,6 +194,7 @@ impl ConnectorBatchReader for IcebergBatchReader {
                     file_batch.physical_row_positions,
                     &self.position_deletes,
                     &self.equality_deletes,
+                    self.equality_match_only,
                     self.included_positions.as_ref(),
                     &self.data_file_path,
                 )?;
@@ -176,7 +224,9 @@ impl ConnectorBatchReader for IcebergBatchReader {
             return Ok(());
         }
         self.closed = true;
-        self.cancellation.cancel();
+        if self.cancel_on_close {
+            self.cancellation.cancel();
+        }
         self.reader.close().map_err(map_file_error)
     }
 
@@ -295,6 +345,7 @@ fn apply_delete_filters(
     positions: Option<UInt64Array>,
     position_deletes: &roaring::RoaringTreemap,
     equality_deletes: &[EqualityDeleteSet],
+    equality_match_only: bool,
     included_positions: Option<&roaring::RoaringTreemap>,
     data_file_path: &str,
 ) -> Result<(RecordBatch, Option<UInt64Array>), ConnectorError> {
@@ -319,16 +370,24 @@ fn apply_delete_filters(
     }
     let equality_keep = equality_delete_keep_mask(&batch, equality_deletes)
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
-    let mut changed =
-        equality_keep.is_some() || !position_deletes.is_empty() || included_positions.is_some();
+    let changed = equality_match_only
+        || equality_keep.is_some()
+        || !position_deletes.is_empty()
+        || included_positions.is_some();
     let mut keep = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         let position = positions.value(row);
         let position_keep = !position_deletes.contains(position)
             && included_positions.is_none_or(|included| included.contains(position));
-        let equality_keep = equality_keep
-            .as_ref()
-            .is_none_or(|values| values.get(row).copied().unwrap_or(false));
+        let normal_equality_keep = match equality_keep.as_ref() {
+            Some(values) => values.get(row).copied().unwrap_or(false),
+            None => true,
+        };
+        let equality_keep = if equality_match_only {
+            !normal_equality_keep
+        } else {
+            normal_equality_keep
+        };
         keep.push(position_keep && equality_keep);
     }
     if !changed {
@@ -694,6 +753,7 @@ mod tests {
             Some(UInt64Array::from(vec![5, 6, 7])),
             &deletes,
             &[],
+            false,
             Some(&included),
             "file:///warehouse/data.parquet",
         )

@@ -271,6 +271,24 @@ fn resolved_delta() -> ResolvedScanExecution {
     )
 }
 
+fn resolved_data_delta() -> ResolvedScanExecution {
+    let mut delta = match resolved_delta() {
+        ResolvedScanExecution::IcebergDelta(delta) => delta,
+        ResolvedScanExecution::IcebergFiles(_) => unreachable!("fixture is delta"),
+    };
+    delta.runtime_plan.change_files = vec![crate::connector::iceberg::delta::DeltaSourceFile {
+        path: "s3://bucket/delta-added.parquet".to_string(),
+        size: 128,
+        role: crate::connector::iceberg::delta::DeltaSourceRole::DataFile,
+        partition_spec_id: Some(0),
+        partition_key: Some("Struct([])".to_string()),
+        first_row_id: Some(100),
+        data_sequence_number: Some(7),
+        row_id_allow_list: None,
+    }];
+    ResolvedScanExecution::IcebergDelta(delta)
+}
+
 fn replace_scan_source(root: &mut DistributedNode, source: ScanSource) {
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");

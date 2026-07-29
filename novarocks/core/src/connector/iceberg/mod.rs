@@ -26,6 +26,7 @@ pub(crate) mod data_writer;
 pub(crate) mod default_value;
 pub mod delete_file;
 pub(crate) mod delta;
+pub(crate) mod delta_reader;
 pub mod equality_delete;
 pub(crate) mod file_pruning;
 #[cfg(feature = "compat")]

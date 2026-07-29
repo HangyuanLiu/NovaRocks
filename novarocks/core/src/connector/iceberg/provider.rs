@@ -27,8 +27,8 @@ use std::time::Instant;
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_fs::{
-    FileIoRuntime, FileTaskSpawner, FsAccessHandle, FsAccessResolver, TokioFileIoRuntime,
-    TokioFileTaskSpawner,
+    FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
+    FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
@@ -48,6 +48,13 @@ use super::catalog::registry::{
 };
 use super::reader::IcebergBatchReader;
 use super::scan_model::IcebergDataFileInfo;
+
+#[derive(Clone, Deserialize, Serialize)]
+struct IcebergDeltaSplitPayload {
+    source: super::delta::DeltaSourceFile,
+    #[serde(default)]
+    delete_side: Option<super::delta::DeltaScanDeleteSide>,
+}
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
@@ -173,7 +180,7 @@ impl IcebergReadBinding {
         }
     }
 
-    fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
+    pub(crate) fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
         self.access_resolver
             .resolve_location(location, self.object_store_config.as_ref())
             .map_err(|error| {
@@ -181,17 +188,38 @@ impl IcebergReadBinding {
             })
     }
 
-    fn file_read_context(
+    pub(crate) fn file_read_context(
         &self,
         cancellation: novarocks_fs::FileCancellation,
         deadline: std::time::Instant,
-    ) -> Result<novarocks_fs::FileReadContext, ConnectorError> {
-        Ok(novarocks_fs::FileReadContext {
+    ) -> Result<FileReadContext, ConnectorError> {
+        Ok(FileReadContext {
             cancellation,
             deadline: Some(deadline),
             runtime: Arc::clone(&self.file_runtime),
             task_spawner: Arc::clone(&self.file_task_spawner),
         })
+    }
+
+    pub(crate) fn file_size(
+        &self,
+        path: &str,
+        access: &FsAccessHandle,
+        context: &FileReadContext,
+    ) -> Result<u64, ConnectorError> {
+        let file = access
+            .bind_location(path, FileIdentity::new(path, 0, None))
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })?;
+        let cancellation = context.cancellation.clone();
+        context
+            .runtime
+            .block_on_u64(Box::pin(async move { file.stat(&cancellation).await }))
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
+                    .with_retryable_before_progress()
+            })
     }
 }
 
@@ -258,6 +286,7 @@ pub(crate) fn build_compat_read_splits(
                 data_file,
                 projection: Vec::new(),
                 limit: None,
+                delta: None,
             };
             ConnectorSplit::try_new(
                 owner.clone(),
@@ -383,6 +412,15 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg split does not belong to this installed instance incarnation",
             ));
+        }
+        if let Some(delta) = payload.delta {
+            return super::delta_reader::IcebergDeltaBatchReader::try_new(
+                delta.source,
+                delta.delete_side,
+                self.binding.clone(),
+                request,
+            )
+            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
         }
         let file_context = self.binding.file_read_context(
             novarocks_fs::FileCancellation::new(),
@@ -888,6 +926,7 @@ impl ConnectorRead for IcebergConnectorInstance {
                 data_file: file,
                 projection: scan.projection.clone(),
                 limit: scan.limit,
+                delta: None,
             };
             push_split_with_budget(
                 &mut splits,
@@ -1139,6 +1178,8 @@ struct SplitPayload {
     data_file: IcebergDataFileInfo,
     projection: Vec<usize>,
     limit: Option<u64>,
+    #[serde(default)]
+    delta: Option<IcebergDeltaSplitPayload>,
 }
 
 const ICEBERG_SPLIT_V1: u16 = 1;
@@ -1478,6 +1519,76 @@ pub(crate) fn plan_native_iceberg_read(
     })
 }
 
+/// Plan snapshot-delta physical reads as ordinary opaque Iceberg connector
+/// splits.  Delta retains its logical planner identity; no native carrier or
+/// core scan operator receives a role-specific file/deletion payload.
+pub(crate) fn plan_native_iceberg_delta_read(
+    connectors: &crate::connector::ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    sources: &[super::delta::DeltaSourceFile],
+    delete_side: Option<&super::delta::DeltaScanDeleteSide>,
+) -> Result<PlannedIcebergConnectorRead, String> {
+    let mut planned = plan_native_iceberg_read(
+        connectors,
+        context.clone(),
+        table,
+        super::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        &[],
+        &[],
+    )?;
+    let owner = planned.declaration.descriptor().instance_id.clone();
+    let incarnation = planned.declaration.incarnation().to_bytes();
+    let mut total_payload_bytes = 0usize;
+    let mut splits = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().cloned().enumerate() {
+        let data_file = IcebergDataFileInfo {
+            path: source.path.clone(),
+            size: source.size,
+            row_count: None,
+            column_stats: None,
+            partition_spec_id: source.partition_spec_id,
+            partition_key: source.partition_key.clone(),
+            first_row_id: source.first_row_id,
+            data_sequence_number: source.data_sequence_number,
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: Vec::new(),
+            manifest_path: None,
+            partition_values: Vec::new(),
+        };
+        let payload = SplitPayload {
+            version: ICEBERG_SPLIT_V1,
+            owner_instance_id: owner.as_str().to_string(),
+            incarnation,
+            namespace: table.namespace.clone(),
+            table: table.table.clone(),
+            snapshot_id: table.current_snapshot_id,
+            table_uuid: table.table_uuid.clone(),
+            schema_id: Some(table.schema_id),
+            data_file,
+            projection: Vec::new(),
+            limit: None,
+            delta: Some(IcebergDeltaSplitPayload {
+                source,
+                delete_side: delete_side.cloned(),
+            }),
+        };
+        push_split_with_budget(
+            &mut splits,
+            &mut total_payload_bytes,
+            owner.clone(),
+            format!("delta-{index}"),
+            &payload,
+            u64::try_from(payload.data_file.size).ok(),
+            &context,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    planned.splits = splits;
+    Ok(planned)
+}
+
 pub(crate) struct PlannedIcebergConnectorRead {
     pub(crate) declaration: ConnectorInstanceDeclaration,
     pub(crate) scan: ConnectorScan,
@@ -1696,6 +1807,7 @@ mod tests {
             ),
             projection: vec![0],
             limit: None,
+            delta: None,
         };
 
         let encoded = serde_json::to_vec(&payload).expect("encode split payload");
@@ -1733,6 +1845,7 @@ mod tests {
             ),
             projection: vec![0],
             limit: None,
+            delta: None,
         };
         let first = payload("first");
         let second = payload("second");
@@ -1827,6 +1940,7 @@ mod tests {
                 data_file,
                 projection: vec![0],
                 limit: None,
+                delta: None,
             })
             .collect::<Vec<_>>();
         let lengths = split_payloads
@@ -1989,6 +2103,7 @@ pub(crate) fn register_planned_table_files_fixture(
                                 data_file,
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,
+                                delta: None,
                             },
                             "fixture split",
                             request.context.max_handle_payload_bytes(),

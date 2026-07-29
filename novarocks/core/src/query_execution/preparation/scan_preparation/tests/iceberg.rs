@@ -167,7 +167,7 @@ fn ordinary_iceberg_scan_preserves_min_max_pruning() {
 }
 
 #[test]
-fn data_only_delta_scan_uses_opaque_connector_read() {
+fn delta_scan_uses_opaque_connector_read() {
     let mut root = scan_node(40, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut root,
@@ -178,7 +178,7 @@ fn data_only_delta_scan_uses_opaque_connector_read() {
         },
     );
     let resolver = StaticResolver {
-        execution: resolved_delta(),
+        execution: resolved_data_delta(),
     };
 
     let bindings = prepare_scan_bindings(&plan(root), &registry(Vec::new()), Some(&resolver))
@@ -201,7 +201,8 @@ fn data_only_delta_scan_uses_opaque_connector_read() {
         planned.declaration.descriptor().provider_id.as_str(),
         "iceberg"
     );
-    assert!(planned.splits.is_empty());
+    assert_eq!(planned.splits.len(), 1);
+    assert_eq!(planned.splits[0].split_id(), "delta-0");
 }
 
 #[test]
