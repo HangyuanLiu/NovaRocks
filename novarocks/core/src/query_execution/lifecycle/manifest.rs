@@ -264,16 +264,25 @@ impl RuntimeFilterContribution {
         lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
         install: RuntimeFilterParticipantInstall,
     ) -> Result<Self, QueryLifecycleError> {
+        let digest = Self::canonical_digest(execution_id, lifecycle, &install)?;
+        Self::new(participant_id, lifecycle, install, digest)
+    }
+
+    pub(crate) fn canonical_digest(
+        execution_id: QueryExecutionId,
+        lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
+        install: &RuntimeFilterParticipantInstall,
+    ) -> Result<[u8; 32], QueryLifecycleError> {
         let envelope = crate::protocol::native::encode_participant_install(
             execution_id.query_id().into_unique_id(),
             lifecycle,
-            &install,
+            install,
         )
         .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?;
         let mut digest = Sha256::new();
         digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
         digest.update(envelope.encode_to_vec());
-        Self::new(participant_id, lifecycle, install, digest.finalize().into())
+        Ok(digest.finalize().into())
     }
 
     #[cfg(feature = "query-execution-contract-test-support")]

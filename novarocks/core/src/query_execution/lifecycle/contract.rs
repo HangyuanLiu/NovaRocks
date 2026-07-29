@@ -936,11 +936,21 @@ fn decode_runtime_filter_contribution(
     };
     let decoded = crate::protocol::native::decode_participant_install(&envelope)
         .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?;
+    let canonical_digest = RuntimeFilterContribution::canonical_digest(
+        execution_id,
+        decoded.lifecycle,
+        &decoded.install,
+    )?;
+    if digest != canonical_digest {
+        return Err(QueryLifecycleError::invalid_manifest(
+            "runtime filter contribution digest does not match canonical payload",
+        ));
+    }
     RuntimeFilterContribution::new(
         contribution.participant_id,
         decoded.lifecycle,
         decoded.install,
-        digest,
+        canonical_digest,
     )
 }
 
@@ -1041,8 +1051,9 @@ mod tests {
             transport_max_pending_entries: 1024,
             transport_max_pending_bytes: 1 << 20,
         };
-        let contribution = RuntimeFilterContribution::new(3, lifecycle, install, [0x5a; 32])
-            .expect("valid contribution");
+        let contribution =
+            RuntimeFilterContribution::from_compiled(execution_id(), 3, lifecycle, install)
+                .expect("valid contribution");
         let options = QueryOptions {
             batch_size: Some(4096),
             query_timeout: Some(120),
@@ -1121,6 +1132,34 @@ mod tests {
         assert!(options.enable_file_metacache);
         assert!(options.enable_file_pagecache);
         assert!(options.enable_parquet_reader_page_index);
+    }
+
+    #[test]
+    fn proto_query_lifecycle_rejects_runtime_filter_payload_digest_mismatch() {
+        let mut wire = encode_query_init_request(&service_only_request()).expect("request encodes");
+        let lifecycle = wire
+            .manifest
+            .as_mut()
+            .expect("manifest")
+            .runtime_filter
+            .as_mut()
+            .expect("runtime filter contribution")
+            .lifecycle
+            .as_mut()
+            .expect("runtime filter lifecycle");
+        lifecycle.delivery_expire_ms += 1;
+
+        let error = decode_query_init_request(&wire)
+            .expect_err("mutated runtime filter payload must not retain the original digest");
+
+        assert_eq!(
+            error.code(),
+            super::QueryLifecycleErrorCode::InvalidManifest
+        );
+        assert_eq!(
+            error.detail(),
+            "runtime filter contribution digest does not match canonical payload"
+        );
     }
 
     #[test]
