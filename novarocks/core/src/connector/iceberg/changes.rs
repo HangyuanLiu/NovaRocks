@@ -21,7 +21,7 @@
 //! error enum so that CREATE-time PRIMARY KEY validation has a stable type
 //! to return.
 
-use crate::exec::node::iceberg_delta_scan::{
+use crate::connector::iceberg::delta::{
     DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
     PositionDeleteSourceData,
 };
@@ -964,7 +964,7 @@ pub(crate) fn scan_position_delete_rows_for_targets(
     deletes: &[PositionDeleteRef],
     base_data_file_lineage: &std::collections::HashMap<
         String,
-        crate::exec::node::iceberg_delta_scan::BaseDataFileLineage,
+        crate::connector::iceberg::delta::BaseDataFileLineage,
     >,
     suppressed_data_files: &std::collections::HashSet<String>,
     previously_deleted_positions_per_file: &std::collections::HashMap<
@@ -1530,7 +1530,7 @@ pub(crate) fn base_data_file_lineage_index_at(
     table: &iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
-    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     let read_snapshot =
@@ -1551,7 +1551,7 @@ pub(crate) fn previous_snapshot_data_file_lineage_index(
     table: &iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
-    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     base_data_file_lineage_index_at(table, snapshot_id)
@@ -1560,7 +1560,7 @@ pub(crate) fn previous_snapshot_data_file_lineage_index(
 fn build_data_file_lineage_index_from_snapshot(
     read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
 ) -> Result<
-    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     let mut out = std::collections::HashMap::new();
@@ -1579,7 +1579,7 @@ fn build_data_file_lineage_index_from_snapshot(
         })?;
         out.insert(
             file.path.clone(),
-            crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+            crate::connector::iceberg::delta::BaseDataFileLineage {
                 first_row_id,
                 data_sequence_number,
             },
@@ -2493,7 +2493,7 @@ mod tests {
         equality_targets.insert(
             "eq-delete.parquet".to_string(),
             vec![
-                crate::exec::node::iceberg_delta_scan::EqualityDeleteTargetData {
+                crate::connector::iceberg::delta::EqualityDeleteTargetData {
                     data_file_path: "data.parquet".to_string(),
                     data_file_size: 456,
                     data_file_first_row_id: Some(1000),
@@ -2506,7 +2506,7 @@ mod tests {
             delta_source_files_from_change_batch_with_equality_targets(&batch, &equality_targets)
                 .expect("delta source files");
         assert_eq!(files.len(), 1);
-        let crate::exec::node::iceberg_delta_scan::DeltaSourceRole::EqualityDelete {
+        let crate::connector::iceberg::delta::DeltaSourceRole::EqualityDelete {
             equality_field_ids,
             targets,
         } = &files[0].role

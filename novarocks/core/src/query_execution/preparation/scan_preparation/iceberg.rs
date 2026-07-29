@@ -16,8 +16,11 @@
 // under the License.
 
 use crate::connector::ConnectorRegistry;
+use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
+use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
 use crate::sql::planner::payload::PlanScanNode;
+use crate::sql::planner::table::ScanSource;
 
 use super::projection::effective_scan_column_names;
 
@@ -85,4 +88,67 @@ pub(super) fn plan_iceberg_connector_read(
         splits: planned.splits,
         batch: planned.batch,
     })
+}
+
+/// Plans the subset of an Iceberg delta scan that contains only newly added
+/// data files through the ordinary provider reader.  Delete-side delta roles
+/// continue through the dedicated delta reader until its provider-owned split
+/// implementation is installed; this guard prevents an incomplete cutover
+/// from silently dropping change rows.
+pub(super) fn try_plan_iceberg_delta_connector_read(
+    connectors: &ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    scan: &PlanScanNode,
+    execution: &ResolvedScanExecution,
+) -> Result<Option<PlannedConnectorRead>, String> {
+    let ResolvedScanExecution::IcebergDelta(delta) = execution else {
+        return Err("Iceberg delta connector planning requires IcebergDelta execution".to_string());
+    };
+    let ScanSource::IcebergDeltaTable { table, .. } = &scan.table.source else {
+        return Err(
+            "Iceberg delta connector planning requires IcebergDeltaTable source".to_string(),
+        );
+    };
+    if delta
+        .runtime_plan
+        .change_files
+        .iter()
+        .any(|file| !matches!(&file.role, DeltaSourceRole::DataFile))
+    {
+        return Ok(None);
+    }
+    let files = delta
+        .runtime_plan
+        .change_files
+        .iter()
+        .map(|file| IcebergDataFileInfo {
+            path: file.path.clone(),
+            size: file.size,
+            row_count: None,
+            column_stats: None,
+            partition_spec_id: file.partition_spec_id,
+            partition_key: file.partition_key.clone(),
+            first_row_id: file.first_row_id,
+            data_sequence_number: file.data_sequence_number,
+            ivm_change_op: Some(1),
+            included_positions: None,
+            delete_files: Vec::new(),
+            manifest_path: None,
+            partition_values: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let planned = crate::connector::iceberg::provider::plan_native_iceberg_read(
+        connectors,
+        context,
+        table,
+        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        &files,
+        &[],
+    )?;
+    Ok(Some(PlannedConnectorRead {
+        declaration: planned.declaration,
+        scan: planned.scan,
+        splits: planned.splits,
+        batch: planned.batch,
+    }))
 }

@@ -25,6 +25,7 @@ pub(crate) mod compact;
 pub(crate) mod data_writer;
 pub(crate) mod default_value;
 pub mod delete_file;
+pub(crate) mod delta;
 pub mod equality_delete;
 pub(crate) mod file_pruning;
 #[cfg(feature = "compat")]

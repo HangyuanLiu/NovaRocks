@@ -54,6 +54,7 @@ pub(crate) struct IcebergBatchReader {
     data_file_path: String,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
     position_deletes: roaring::RoaringTreemap,
     equality_deletes: Vec<EqualityDeleteSet>,
     included_positions: Option<roaring::RoaringTreemap>,
@@ -112,6 +113,7 @@ impl IcebergBatchReader {
             data_file_path: file.path.clone(),
             first_row_id: file.first_row_id,
             data_sequence_number: file.data_sequence_number,
+            ivm_change_op: file.ivm_change_op,
             position_deletes,
             equality_deletes,
             included_positions,
@@ -156,6 +158,7 @@ impl ConnectorBatchReader for IcebergBatchReader {
                         path: &self.data_file_path,
                         first_row_id: self.first_row_id,
                         data_sequence_number: self.data_sequence_number,
+                        ivm_change_op: self.ivm_change_op,
                     },
                 )
                 .map(Some)
@@ -284,6 +287,7 @@ struct IcebergFileFacts<'a> {
     path: &'a str,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
 }
 
 fn apply_delete_filters(
@@ -501,7 +505,7 @@ fn align_batch_to_schema(
 fn is_iceberg_virtual(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number"
+        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number" | "__change_op"
     )
 }
 
@@ -512,24 +516,27 @@ fn iceberg_virtual_column(
     facts: &IcebergFileFacts<'_>,
 ) -> Result<ArrayRef, String> {
     let name = target.name().to_ascii_lowercase();
-    let positions = positions.ok_or_else(|| {
-        format!(
-            "Iceberg virtual column {} requires physical row coordinates for {}",
-            target.name(),
-            facts.path
-        )
-    })?;
-    if positions.len() != row_count {
-        return Err(format!(
-            "Iceberg virtual column {} position count {} differs from row count {row_count}",
-            target.name(),
-            positions.len()
-        ));
-    }
+    let require_positions = || -> Result<&UInt64Array, String> {
+        let positions = positions.ok_or_else(|| {
+            format!(
+                "Iceberg virtual column {} requires physical row coordinates for {}",
+                target.name(),
+                facts.path
+            )
+        })?;
+        if positions.len() != row_count {
+            return Err(format!(
+                "Iceberg virtual column {} position count {} differs from row count {row_count}",
+                target.name(),
+                positions.len()
+            ));
+        }
+        Ok(positions)
+    };
     let raw: ArrayRef = match name.as_str() {
         "_file" => Arc::new(StringArray::from(vec![facts.path; row_count])),
         "_pos" => Arc::new(Int64Array::from(
-            positions
+            require_positions()?
                 .iter()
                 .map(|value| {
                     value
@@ -542,7 +549,7 @@ fn iceberg_virtual_column(
         )),
         "_row_id" => match facts.first_row_id {
             Some(first) => Arc::new(Int64Array::from(
-                positions
+                require_positions()?
                     .iter()
                     .map(|value| {
                         value
@@ -573,6 +580,16 @@ fn iceberg_virtual_column(
             None => {
                 return Err(format!(
                     "Iceberg data file {} is missing data_sequence_number",
+                    facts.path
+                ));
+            }
+        },
+        "__change_op" => match facts.ivm_change_op {
+            Some(change_op) => Arc::new(arrow::array::Int8Array::from(vec![change_op; row_count])),
+            None if target.is_nullable() => new_null_array(target.data_type(), row_count),
+            None => {
+                return Err(format!(
+                    "Iceberg data file {} is missing ivm_change_op for __change_op",
                     facts.path
                 ));
             }
@@ -635,6 +652,7 @@ mod tests {
                 path: "file:///test.parquet",
                 first_row_id: None,
                 data_sequence_number: None,
+                ivm_change_op: None,
             },
         )
         .expect("field-ID alignment");
@@ -715,6 +733,7 @@ mod tests {
                 path: "s3://warehouse/data.parquet",
                 first_row_id: Some(100),
                 data_sequence_number: Some(19),
+                ivm_change_op: None,
             },
         )
         .unwrap();
@@ -753,6 +772,40 @@ mod tests {
                 .unwrap()
                 .values(),
             &[19, 19]
+        );
+    }
+
+    #[test]
+    fn synthesizes_delta_change_op_from_provider_file_facts() {
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field_with_id("id", 1, false)])),
+            vec![Arc::new(Int32Array::from(vec![10, 30])) as ArrayRef],
+        )
+        .unwrap();
+        let expected = Arc::new(Schema::new(vec![
+            field_with_id("id", 1, false),
+            Field::new("__change_op", DataType::Int8, false),
+        ]));
+        let aligned = align_batch_to_schema(
+            &expected,
+            source,
+            None,
+            IcebergFileFacts {
+                path: "s3://warehouse/data.parquet",
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            aligned
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .unwrap()
+                .values(),
+            &[1, 1]
         );
     }
 }

@@ -294,7 +294,6 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
     Ok(IcebergDeltaScanRuntimePlan {
         table_location: loaded.metadata().location().to_string(),
         data_columns,
-        cloud_properties: entry.cloud_properties_map(),
         change_files,
         delete_side,
     })
@@ -829,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn real_delta_builder_materializes_changes_delete_visibility_and_cloud_properties() {
+    fn real_delta_builder_materializes_changes_and_delete_visibility() {
         let fixture = delta_overwrite_refresh_fixture("scan_binding_delta");
         let resolved = fixture
             .ctx
@@ -847,7 +846,6 @@ mod tests {
             panic!("expected delta binding");
         };
         assert!(!delta.runtime_plan.change_files.is_empty());
-        assert!(!delta.runtime_plan.cloud_properties.is_empty());
         let delete_side = delta
             .runtime_plan
             .delete_side
@@ -1002,7 +1000,6 @@ mod tests {
                         name: "k".to_string(),
                         field_id: 1,
                     }],
-                    cloud_properties: BTreeMap::new(),
                     change_files: Vec::new(),
                     delete_side: None,
                 })

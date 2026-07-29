@@ -357,7 +357,6 @@ mod tests {
             runtime_plan: IcebergDeltaScanRuntimePlan {
                 table_location: "s3://warehouse/db/table".to_string(),
                 data_columns: Vec::new(),
-                cloud_properties: BTreeMap::new(),
                 change_files: Vec::new(),
                 delete_side: None,
             },

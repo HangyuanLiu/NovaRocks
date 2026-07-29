@@ -32,7 +32,7 @@ mod projection;
 mod pruning;
 
 pub(crate) use iceberg::build_iceberg_metadata_scan_range_params;
-use iceberg::plan_iceberg_connector_read;
+use iceberg::{plan_iceberg_connector_read, try_plan_iceberg_delta_connector_read};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
 
 pub(super) fn prepare_scan_bindings(
@@ -176,11 +176,23 @@ fn prepare_scan_node(
             // hidden Iceberg delete column or file range.
             (Vec::new(), Vec::new(), Some(planned))
         }
-        ResolvedScanExecution::IcebergDelta(_) => (
-            vec![build_iceberg_metadata_scan_range_params()],
-            Vec::new(),
-            None,
-        ),
+        ResolvedScanExecution::IcebergDelta(_) => {
+            let planned = try_plan_iceberg_delta_connector_read(
+                connectors,
+                context.clone(),
+                scan,
+                &execution,
+            )
+            .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
+            match planned {
+                Some(planned) => (Vec::new(), Vec::new(), Some(planned)),
+                None => (
+                    vec![build_iceberg_metadata_scan_range_params()],
+                    Vec::new(),
+                    None,
+                ),
+            }
+        }
     };
     let required_reads = resolve_effective_required_reads(node_id, scan, &equality_required)?;
     bindings.insert_binding(ResolvedScanBinding {

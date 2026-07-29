@@ -45,7 +45,6 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver for Sentinel
                         crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
                             table_location: "s3://bucket/test_table".to_string(),
                             data_columns: Vec::new(),
-                            cloud_properties: BTreeMap::new(),
                             change_files: Vec::new(),
                             delete_side: None,
                         },

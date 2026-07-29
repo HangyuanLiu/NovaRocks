@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-
 use crate::exec::node::iceberg_delta_scan::{
     DeltaScanDeleteSidePayload, DeltaSourceFile, IcebergDeltaDataColumnPayload,
 };
@@ -25,7 +23,6 @@ use crate::exec::node::iceberg_delta_scan::{
 pub(crate) struct IcebergDeltaScanRuntimePlan {
     pub(crate) table_location: String,
     pub(crate) data_columns: Vec<IcebergDeltaDataColumnPayload>,
-    pub(crate) cloud_properties: BTreeMap<String, String>,
     pub(crate) change_files: Vec<DeltaSourceFile>,
     pub(crate) delete_side: Option<DeltaScanDeleteSidePayload>,
 }

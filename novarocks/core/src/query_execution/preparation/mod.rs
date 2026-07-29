@@ -152,22 +152,11 @@ pub(crate) fn prepare_fragments(
                             fragment.fragment_id
                         ));
                     }
-                    if matches!(
-                        scan_bindings
-                            .binding(*node_id)
-                            .map(|binding| &binding.execution),
-                        Some(scan::ResolvedScanExecution::IcebergFiles(_))
-                    ) {
+                    if scan_bindings
+                        .connector_read(fragment.fragment_id, *node_id)
+                        .is_some()
+                    {
                         expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
-                        if scan_bindings
-                            .connector_read(fragment.fragment_id, *node_id)
-                            .is_none()
-                        {
-                            return Err(format!(
-                                "prepared fragment missing connector read fragment_id={} node_id={node_id}",
-                                fragment.fragment_id
-                            ));
-                        }
                     }
                 }
             }

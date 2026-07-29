@@ -26,30 +26,19 @@
 
 use std::sync::{Arc, OnceLock};
 
+pub use crate::connector::iceberg::delta::{
+    BaseDataFileLineage, DeletedFileVisibility, DeltaDataColumn as IcebergDeltaDataColumnPayload,
+    DeltaScanDeleteSide as DeltaScanDeleteSidePayload, DeltaSourceFile, DeltaSourceRole,
+    EqualityDeleteTargetData, PositionDeleteFileFormat, PositionDeleteSourceData,
+};
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec;
 use novarocks_fs::ObjectStoreConfig;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergDeltaTablePayload {
-    pub table_location: String,
-    pub data_columns: Vec<IcebergDeltaDataColumnPayload>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct IcebergDeltaDataColumnPayload {
-    pub name: String,
-    pub field_id: i32,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DeltaScanDeleteSidePayload {
-    pub base_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
-    pub previous_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
-    pub previous_delete_visibility_data_files:
-        Vec<crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor>,
-    pub previously_deleted_positions_per_file: std::collections::HashMap<String, Vec<u64>>,
-    pub deleted_data_file_paths: std::collections::HashSet<String>,
+    pub(crate) table_location: String,
+    pub(crate) data_columns: Vec<IcebergDeltaDataColumnPayload>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,87 +86,6 @@ pub enum ApplyKeySource {
     BaseRowId,
 }
 
-#[derive(Clone, Debug)]
-pub struct DeltaSourceFile {
-    pub path: String,
-    pub size: i64,
-    pub role: DeltaSourceRole,
-    pub partition_spec_id: Option<i32>,
-    pub partition_key: Option<String>,
-    pub first_row_id: Option<i64>,
-    pub data_sequence_number: Option<i64>,
-    /// V3 row-lineage CoW-aware filter: when `Some`, the data-file scanner
-    /// only emits rows whose synthesized `_row_id` is in this set. Populated
-    /// by the IVM planner for CoW UPDATE replacement files so unchanged rows
-    /// (those whose stored `_row_id` also appears in a deleted file in the
-    /// same partition) are skipped. `None` means "emit all rows" (current
-    /// behaviour for plain INSERT files and for files where the optimisation
-    /// is not applicable).
-    pub row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
-}
-
-#[derive(Clone, Debug)]
-pub enum DeltaSourceRole {
-    DataFile,
-    PositionDelete {
-        deletes: Vec<PositionDeleteSourceData>,
-    },
-    EqualityDelete {
-        equality_field_ids: Vec<i32>,
-        targets: Vec<EqualityDeleteTargetData>,
-    },
-    DeletedDataFile {
-        previous_data_file_visibility: Option<DeletedFileVisibility>,
-    },
-}
-
-/// Encoding of a position-delete file. Mirrors the subset of
-/// `iceberg::spec::DataFileFormat` that IVM-A1 supports for the position
-/// delete role; the lowering pass rejects any other format. We carry it
-/// here (rather than re-using `iceberg::spec::DataFileFormat`) so the
-/// `IcebergDeltaScanNode` does not need to leak the wider iceberg enum
-/// through its public type surface — and so adding new formats in the
-/// future is a single localized change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PositionDeleteFileFormat {
-    /// v2 position-delete file (one row per (file, pos) pair, parquet-encoded).
-    Parquet,
-    /// v3 deletion-vector file (Puffin blob with `deletion-vector-v1` body).
-    Puffin,
-}
-
-#[derive(Clone, Debug)]
-pub struct PositionDeleteSourceData {
-    pub delete_file_path: String,
-    pub delete_file_size: i64,
-    pub referenced_data_file: Option<String>,
-    /// Position-delete encoding: Parquet for the v2 (positional rows)
-    /// format, Puffin for the v3 (deletion vector blob) format. Other
-    /// variants are rejected at plan time.
-    pub file_format: PositionDeleteFileFormat,
-    /// Required when `file_format == Puffin`: byte offset of the
-    /// `deletion-vector-v1` blob inside the Puffin file. `None` for the
-    /// Parquet position-delete format.
-    pub content_offset: Option<i64>,
-    /// Required when `file_format == Puffin`: byte length of the
-    /// `deletion-vector-v1` blob inside the Puffin file. `None` for the
-    /// Parquet position-delete format.
-    pub content_size_in_bytes: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct EqualityDeleteTargetData {
-    pub data_file_path: String,
-    pub data_file_size: i64,
-    pub data_file_first_row_id: Option<i64>,
-    pub data_file_sequence_number: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DeletedFileVisibility {
-    pub already_deleted_positions: Vec<i64>,
-}
-
 /// Iceberg per-table runtime handles required by `IcebergDeltaScanOperator`
 /// to open planned data/delete files. Constructed by `lower_iceberg_delta_scan`
 /// when lowering `ICEBERG_DELTA_SCAN_NODE` from the typed Thrift payload:
@@ -216,12 +124,6 @@ pub(crate) struct IcebergResolvedRuntime {
 /// `_file` / `_pos` / `_row_id` / `_last_updated_sequence_number` virtual
 /// columns when reverse-projecting deleted rows. Filled in from the relevant
 /// snapshot read views.
-#[derive(Clone, Copy, Debug)]
-pub struct BaseDataFileLineage {
-    pub first_row_id: i64,
-    pub data_sequence_number: i64,
-}
-
 #[derive(Debug)]
 pub struct DeltaScanDeleteSide {
     pub base_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,

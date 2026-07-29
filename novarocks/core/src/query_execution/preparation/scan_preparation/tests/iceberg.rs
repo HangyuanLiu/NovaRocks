@@ -167,7 +167,7 @@ fn ordinary_iceberg_scan_preserves_min_max_pruning() {
 }
 
 #[test]
-fn delta_scan_uses_resolved_payload_and_sentinel_range() {
+fn data_only_delta_scan_uses_opaque_connector_read() {
     let mut root = scan_node(40, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut root,
@@ -181,20 +181,27 @@ fn delta_scan_uses_resolved_payload_and_sentinel_range() {
         execution: resolved_delta(),
     };
 
-    let bindings = prepare_scan_bindings(&plan(root), &ConnectorRegistry::new(), Some(&resolver))
+    let bindings = prepare_scan_bindings(&plan(root), &registry(Vec::new()), Some(&resolver))
         .expect("prepare delta scan");
 
     assert!(matches!(
         bindings.binding(40).expect("binding").execution,
         ResolvedScanExecution::IcebergDelta(_)
     ));
-    let ranges = bindings.scan_ranges(0, 40).expect("delta ranges");
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected delta sentinel range");
-    };
-    assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
-    assert!(file.use_iceberg_jni_metadata_reader);
+    assert!(
+        bindings
+            .scan_ranges(0, 40)
+            .expect("delta ranges")
+            .is_empty()
+    );
+    let planned = bindings
+        .connector_read(0, 40)
+        .expect("delta connector read");
+    assert_eq!(
+        planned.declaration.descriptor().provider_id.as_str(),
+        "iceberg"
+    );
+    assert!(planned.splits.is_empty());
 }
 
 #[test]

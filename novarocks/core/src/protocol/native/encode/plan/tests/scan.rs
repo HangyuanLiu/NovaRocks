@@ -74,10 +74,6 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
                 runtime_plan: IcebergDeltaScanRuntimePlan {
                     table_location: "s3://prepared/orders".to_string(),
                     data_columns: Vec::new(),
-                    cloud_properties: BTreeMap::from([(
-                        "endpoint".to_string(),
-                        "http://prepared-minio".to_string(),
-                    )]),
                     change_files: Vec::new(),
                     delete_side: None,
                 },
@@ -580,7 +576,6 @@ fn delta_binding_for_test(node_id: i32) -> ResolvedScanBinding {
             runtime_plan: IcebergDeltaScanRuntimePlan {
                 table_location: "s3://prepared/orders".to_string(),
                 data_columns: Vec::new(),
-                cloud_properties: BTreeMap::new(),
                 change_files: Vec::new(),
                 delete_side: None,
             },
