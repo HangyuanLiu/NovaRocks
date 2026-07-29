@@ -18,7 +18,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -139,25 +138,6 @@ impl QueryLifecycleTransport for GrpcQueryLifecycleTransport {
                 "InitQuery acknowledgement digest mismatch",
             ));
         }
-        if let Some(token) = claim_backend_fault(target.backend_idx(), "init-ack-drop") {
-            eprintln!(
-                "NOVAROCKS_QUERY_INIT_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={token}",
-                execution_id.query_id().high(),
-                execution_id.query_id().low(),
-                execution_id.attempt_id().get(),
-                target.backend_idx()
-            );
-            return Err(transport_error(
-                QueryLifecycleTransportErrorKind::DeadlineExceeded,
-                format!(
-                    "runner-owned InitAck drop after backend {} applied execution {}:{}:{}",
-                    target.backend_idx(),
-                    execution_id.query_id().high(),
-                    execution_id.query_id().low(),
-                    execution_id.attempt_id().get()
-                ),
-            ));
-        }
         Ok(ack)
     }
 
@@ -195,12 +175,9 @@ impl QueryLifecycleTransport for GrpcQueryLifecycleTransport {
                 commands_for_bridge,
             ));
         Ok(Arc::new(GrpcQueryControlSession {
-            target,
-            execution_id: attach.execution_id(),
             commands,
             events: Mutex::new(event_rx),
             bridge: Mutex::new(Some(bridge)),
-            heartbeat_stopped: AtomicBool::new(false),
         }))
     }
 
@@ -229,34 +206,13 @@ impl QueryLifecycleTransport for GrpcQueryLifecycleTransport {
 }
 
 struct GrpcQueryControlSession {
-    target: QueryLifecycleTarget,
-    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
     commands: Arc<Mutex<QueryControlCommandState>>,
     events: Mutex<mpsc::Receiver<Result<QueryControlEvent, QueryLifecycleTransportError>>>,
     bridge: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    heartbeat_stopped: AtomicBool,
 }
 
 impl QueryControlSession for GrpcQueryControlSession {
     fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
-        if matches!(command, QueryControlCommand::Heartbeat { .. })
-            && (self.heartbeat_stopped.load(Ordering::Acquire)
-                || claim_backend_fault(self.target.backend_idx(), "heartbeat-stop").is_some_and(
-                    |token| {
-                        self.heartbeat_stopped.store(true, Ordering::Release);
-                        eprintln!(
-                            "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={}:{}:{} backend_index={} token={token}",
-                            self.execution_id.query_id().high(),
-                            self.execution_id.query_id().low(),
-                            self.execution_id.attempt_id().get(),
-                            self.target.backend_idx()
-                        );
-                        true
-                    },
-                ))
-        {
-            return Ok(());
-        }
         let mut state = self
             .commands
             .lock()
@@ -319,28 +275,6 @@ impl QueryControlSession for GrpcQueryControlSession {
         })
         .map_err(|error| unavailable("drive QueryControl event receive", error))?
     }
-}
-
-#[cfg(debug_assertions)]
-fn claim_backend_fault(backend_index: usize, kind: &str) -> Option<String> {
-    let root = crate::common::config::sql_test_query_lifecycle_fault_dir()?;
-    let path = root.join(format!("be-{backend_index}.{kind}.trigger"));
-    let token = std::fs::read_to_string(&path).ok()?;
-    let token = token.trim();
-    if token.is_empty()
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return None;
-    }
-    std::fs::remove_file(&path).ok()?;
-    Some(token.to_string())
-}
-
-#[cfg(not(debug_assertions))]
-fn claim_backend_fault(_backend_index: usize, _kind: &str) -> Option<String> {
-    None
 }
 
 impl Drop for GrpcQueryControlSession {

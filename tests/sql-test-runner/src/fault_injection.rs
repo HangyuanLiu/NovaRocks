@@ -17,7 +17,7 @@
 
 use crate::cluster::ServerHandle;
 use crate::types::QueryMeta;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
@@ -299,7 +299,8 @@ where
         },
         BackendInit {
             index: usize,
-            applied_count: usize,
+            token: String,
+            start_epoch: u64,
         },
     }
 
@@ -394,7 +395,10 @@ where
                 }
                 FaultBaseline::BackendInit {
                     index,
-                    applied_count: server.be_log_count(index, "NOVAROCKS_QUERY_INIT_APPLIED")?,
+                    token: server
+                        .armed_query_lifecycle_fault_token(index, "restart-after-init-ack")?
+                        .context("restart-after-InitAck fault has no armed token")?,
+                    start_epoch: server.backend_start_epoch(index)?,
                 }
             }
         }
@@ -438,11 +442,12 @@ where
                     }
                     FaultBaseline::BackendInit {
                         index,
-                        applied_count,
-                    } => {
-                        server.be_log_count(*index, "NOVAROCKS_QUERY_INIT_APPLIED")?
-                            > *applied_count
-                    }
+                        token,
+                        ..
+                    } => server.be_log_contents(*index)?.lines().any(|line| {
+                        line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
+                            && line.contains(&format!("token={token}"))
+                    }),
                 }
             };
             if ready {
@@ -454,18 +459,55 @@ where
                 let mut server = worker_server
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-                match fault {
+                let action_result = (|| -> Result<()> {
+                    match fault {
                     PostQueryFault::KillBackend(index) => server.kill_be(index)?,
                     PostQueryFault::ReleaseFragmentFailure(index) => {
                         server.release_fragment_executor_failure(index)?
                     }
                     PostQueryFault::RestartBackendAfterInitAck(index) => {
-                        server.restart_be(index)?
+                        let FaultBaseline::BackendInit {
+                            token,
+                            start_epoch,
+                            ..
+                        } = &baseline
+                        else {
+                            unreachable!("BE restart fault has BackendInit baseline")
+                        };
+                        let old_log = server.be_log_contents(index)?;
+                        let old_execution = old_log
+                            .lines()
+                            .rev()
+                            .find(|line| {
+                                line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
+                                    && line.contains(&format!("token={token}"))
+                            })
+                            .and_then(|line| marker_field(line, "execution_id"))
+                            .context("restart marker is missing execution_id")?;
+                        server.restart_be_until(index, deadline)?;
+                        let new_epoch = server.backend_start_epoch(index)?;
+                        if new_epoch == *start_epoch {
+                            bail!(
+                                "BE[{index}] restart did not change start epoch: old={start_epoch} new={new_epoch}"
+                            );
+                        }
+                        let new_log = server.be_current_log_contents(index)?;
+                        if new_log.lines().any(|line| {
+                            line.contains("NOVAROCKS_QUERY_INIT_APPLIED")
+                                && line.contains(&format!("execution_id={old_execution}"))
+                        }) {
+                            bail!(
+                                "BE[{index}] restored old execution {old_execution} after restart"
+                            );
+                        }
+                        println!(
+                            "query lifecycle BE restart proof PASS: backend_index={index} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} restored=false"
+                        );
                     }
                     PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
-                        server.kill_query(connection_id)?
+                        server.kill_query_until(connection_id, deadline)?
                     }
-                    PostQueryFault::KillFrontendAfterControlReady(_) => {
+                        PostQueryFault::KillFrontendAfterControlReady(_) => {
                         server.kill_fe()?;
                         let FaultBaseline::FrontendReady {
                             coordinator_lost, ..
@@ -505,8 +547,21 @@ where
                             sleep(POST_FRAGMENT_START_POLL_INTERVAL);
                         }
                         server.clear_query_lifecycle_faults()?;
-                        server.restart_fe()?;
+                        server.restart_fe_until(deadline)?;
+                        }
                     }
+                    Ok(())
+                })();
+                if let Err(error) = action_result {
+                    let fe = server.fe_log_contents().unwrap_or_default();
+                    let bes = (0..server.be_count())
+                        .map(|index| server.be_log_contents(index).unwrap_or_default())
+                        .collect::<Vec<_>>();
+                    bail!(
+                        "post-query fault action failed within 30s deadline: {error:#}; fe_tail={:?}; be_tails={:?}",
+                        log_tail(&fe),
+                        bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
+                    );
                 }
                 return Ok(());
             }
@@ -561,6 +616,12 @@ fn log_tail(log: &str) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn marker_field(line: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    line.split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix(&prefix).map(ToOwned::to_owned))
 }
 
 #[cfg(test)]

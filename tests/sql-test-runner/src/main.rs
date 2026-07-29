@@ -2497,6 +2497,84 @@ fn validate_fault_injection_jobs(cases: &[SqlCase], jobs: usize) -> Result<()> {
     Ok(())
 }
 
+fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
+    const DIRECTIVES: &[&str] = &[
+        "drop_next_init_ack_be_index",
+        "stop_query_control_heartbeat_be_index",
+        "kill_fe_after_control_ready_count",
+        "restart_be_after_init_ack_index",
+        "kill_query_after_control_ready_count",
+        "query_control_fragment_backend_limit",
+    ];
+    sql.lines().any(|line| {
+        let line = line.trim_start();
+        DIRECTIVES
+            .iter()
+            .any(|directive| line.starts_with(&format!("-- @{directive}=")))
+    })
+}
+
+fn validate_selected_suite_cluster(
+    suite_names: &[String],
+    mode: ClusterMode,
+    cluster_size: usize,
+) -> Result<()> {
+    if suite_names
+        .iter()
+        .any(|suite| suite == "distributed-resilience")
+        && (mode != ClusterMode::CrossProcess || cluster_size != 3)
+    {
+        bail!(
+            "distributed-resilience requires --cluster-mode cross-process --cluster-size 3"
+        );
+    }
+    Ok(())
+}
+
+fn selected_cases_require_query_lifecycle_faults(
+    cli: &Cli,
+    suite_names: &[String],
+    suite_configs: &BTreeMap<String, SuiteConfig>,
+    base_dir: &std::path::Path,
+) -> Result<bool> {
+    for suite_name in suite_names {
+        let suite = suite_configs
+            .get(suite_name)
+            .with_context(|| format!("selected suite {suite_name} is missing"))?;
+        let sql_dir = resolve_path(cli.sql_dir.as_deref(), base_dir)
+            .unwrap_or_else(|| suite.sql_dir.clone());
+        let sql_glob = cli
+            .sql_glob
+            .clone()
+            .unwrap_or_else(|| suite.sql_glob.clone());
+        let mut files = list_sql_files(&sql_dir, &sql_glob)?;
+        let available = files
+            .iter()
+            .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
+        let only = parse_selector_list(cli.only.as_deref(), &available, "--only")?;
+        let skip = parse_selector_list(cli.skip.as_deref(), &available, "--skip")?;
+        files.retain(|path| {
+            let Some(case_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                return false;
+            };
+            (only.is_empty() || only.contains(case_id)) && !skip.contains(case_id)
+        });
+        if let Some(limit) = cli.limit {
+            files.truncate(limit.min(files.len()));
+        }
+        for path in files {
+            let sql = fs::read_to_string(&path)
+                .with_context(|| format!("read lifecycle fault preflight {}", path.display()))?;
+            if sql_text_has_query_lifecycle_fault_directive(&sql) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2593,6 +2671,12 @@ fn run() -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    if let Err(error) =
+        validate_selected_suite_cluster(&suite_names, selected_cluster_mode, selected_cluster_size)
+    {
+        println!("❌ ERROR: {error}");
+        return Ok(1);
+    }
 
     // Validate: per-suite path overrides conflict with multi-suite
     let multi_suite = suite_names.len() > 1;
@@ -2616,6 +2700,13 @@ fn run() -> Result<i32> {
         rebuild: cli.benchmark_bootstrap_rebuild,
         scales: parse_scale_overrides(&cli.benchmark_scale)?,
     };
+    let query_lifecycle_faults_enabled = !cli.dry_run
+        && selected_cases_require_query_lifecycle_faults(
+            &cli,
+            &suite_names,
+            &suite_configs,
+            &base_dir,
+        )?;
 
     let launch_cluster_mode = if cli.dry_run {
         ClusterMode::AllInOne
@@ -2638,6 +2729,7 @@ fn run() -> Result<i32> {
         &base_dir,
         &runner_config,
         compat_artifact,
+        query_lifecycle_faults_enabled,
     )?;
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
@@ -3225,6 +3317,7 @@ mod tests {
         Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
         execute_target_session_sql_with, expected_engine_error_code_diff_result,
         expected_engine_error_code_result, finish_expected_error_step, validate_fault_injection_jobs,
+        sql_text_has_query_lifecycle_fault_directive, validate_selected_suite_cluster,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3301,6 +3394,42 @@ mod tests {
         validate_fault_injection_jobs(&cases, 1).expect("serial jobs should be accepted");
         validate_fault_injection_jobs(&[test_case_with_meta(QueryMeta::default())], 8)
             .expect("cases without fault directives should allow parallel jobs");
+    }
+
+    #[test]
+    fn lifecycle_fault_preflight_only_matches_explicit_directives() {
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @drop_next_init_ack_be_index=1\nSELECT 1;"
+        ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @kill_query_after_control_ready_count=3\nSELECT 1;"
+        ));
+        assert!(!sql_text_has_query_lifecycle_fault_directive(
+            "-- query-control-heartbeat-loss is only a case name\nSELECT 1;"
+        ));
+    }
+
+    #[test]
+    fn distributed_resilience_requires_exact_native_three_be_topology() {
+        let suites = vec!["distributed-resilience".to_string()];
+        validate_selected_suite_cluster(&suites, ClusterMode::CrossProcess, 3)
+            .expect("canonical distributed topology");
+        for (mode, size) in [
+            (ClusterMode::CrossProcess, 2),
+            (ClusterMode::CrossProcess, 4),
+            (ClusterMode::AllInOne, 1),
+        ] {
+            let error = validate_selected_suite_cluster(&suites, mode, size)
+                .expect_err("distributed-resilience must reject noncanonical topology");
+            assert!(
+                error
+                    .to_string()
+                    .contains("distributed-resilience requires --cluster-mode cross-process --cluster-size 3"),
+                "unexpected error: {error}"
+            );
+        }
+        validate_selected_suite_cluster(&["join".to_string()], ClusterMode::AllInOne, 1)
+            .expect("other suites retain their own topology");
     }
 
     #[test]

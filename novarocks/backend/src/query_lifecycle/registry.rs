@@ -385,7 +385,6 @@ impl QueryLifecycleRegistry {
             entry
         };
         self.publish_metrics();
-
         let ack = InitWorkspace {
             registry: self
                 .self_weak
@@ -981,6 +980,13 @@ impl QueryLifecycleRegistry {
             "backend query lifecycle terminated"
         );
         self.publish_metrics();
+        if query_lifecycle_test_markers_enabled() {
+            eprintln!(
+                "NOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={} backend_id={} active=false tombstone=true reason={reason:?}",
+                format_execution_id(execution_id),
+                self.local_backend_id().unwrap_or_default()
+            );
+        }
     }
 
     fn clean_tombstones_locked(
@@ -1428,8 +1434,12 @@ impl FragmentAdmissionPermit {
         self.committed = true;
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={} finst_id={}",
+                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={} backend_id={} finst_id={}",
                 format_execution_id(self.execution_id),
+                self.registry
+                    .upgrade()
+                    .and_then(|registry| registry.local_backend_id())
+                    .unwrap_or_default(),
                 self.fragment_instance_id
             );
         }
@@ -1477,9 +1487,15 @@ impl BackendQueryControl for RegistryQueryControl {
 
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
         if query_lifecycle_test_markers_enabled() {
+            let backend_id = self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.local_backend_id())
+                .unwrap_or_default();
             eprintln!(
-                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={} reason={reason:?}",
-                format_execution_id(self.execution_id)
+                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={} backend_id={} reason={reason:?}",
+                format_execution_id(self.execution_id),
+                backend_id
             );
         }
         self.registry
@@ -1504,6 +1520,7 @@ pub(super) fn query_lifecycle_test_markers_enabled() -> bool {
         .ok()
         .and_then(|config| config.debug.query_lifecycle_fault_dir())
         .is_some()
+        || std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
 }
 
 #[cfg(not(debug_assertions))]

@@ -155,6 +155,7 @@ impl FrontendFragmentScheduler {
         view: FragmentSchedulingView<'_>,
         execution_id: QueryExecutionId,
     ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
+        bind_query_lifecycle_fault_scopes(execution_id, &self.backends)?;
         let fragments = view
             .fragments()
             .map(|fragment| (fragment.fragment_id(), fragment))
@@ -262,6 +263,71 @@ impl FrontendFragmentScheduler {
         }
         ValidatedFragmentSchedule::validate(view, execution_id, draft)
     }
+}
+
+#[cfg(debug_assertions)]
+fn bind_query_lifecycle_fault_scopes(
+    execution_id: QueryExecutionId,
+    backends: &FrontendBackendSnapshot,
+) -> Result<(), DistributedQueryError> {
+    use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, bind_armed_fault};
+
+    let Some(root) = novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(());
+    };
+    for &(backend_index, _) in &backends.entries {
+        let start_epoch = backends
+            .generations
+            .get(&backend_index)
+            .copied()
+            .ok_or_else(|| {
+                contract_error(format!(
+                    "runner-owned lifecycle fault binding has no generation for backend {backend_index}"
+                ))
+            })?;
+        let backend_id = u64::try_from(backend_index)
+            .map_err(|_| contract_error("backend index does not fit u64"))?;
+        for kind in [
+            QueryLifecycleFaultKind::InitAckDrop,
+            QueryLifecycleFaultKind::HeartbeatStop,
+            QueryLifecycleFaultKind::RestartAfterInitAck,
+        ] {
+            if let Some(scope) = bind_armed_fault(
+                root,
+                kind,
+                execution_id,
+                backend_index,
+                backend_id,
+                start_epoch,
+            )
+            .map_err(contract_error)?
+            {
+                eprintln!(
+                    "NOVAROCKS_QUERY_FAULT_BOUND kind={} execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                    kind.file_stem(),
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    scope.backend_index,
+                    scope.backend_id,
+                    scope.start_epoch,
+                    scope.token
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn bind_query_lifecycle_fault_scopes(
+    _execution_id: QueryExecutionId,
+    _backends: &FrontendBackendSnapshot,
+) -> Result<(), DistributedQueryError> {
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
