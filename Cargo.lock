@@ -3284,6 +3284,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "novarocks",
+ "novarocks-fs",
  "prost 0.13.5",
  "serde_json",
  "thrift",

@@ -264,7 +264,7 @@ fn build_load_datacache_metrics(
     if read_bytes == 0 && read_time_ns == 0 && write_bytes == 0 && write_time_ns == 0 {
         return None;
     }
-    let cache = novarocks::cache::DataCacheManager::instance().block_cache();
+    let cache = novarocks_fs::DataCacheManager::instance().block_cache();
     let runtime_metrics = cache.map(|cache| {
         data_cache::TDataCacheMetrics::new(
             Some(data_cache::TDataCacheStatus::NORMAL),
