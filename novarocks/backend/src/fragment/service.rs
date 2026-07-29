@@ -172,10 +172,11 @@ impl NativeFragmentIngress for NativeFragmentService {
         request: NativeFragmentRequest,
     ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
         let query_id = request.query_id();
+        let execution_id = request.execution_id();
         let fragment_instance_id = request.fragment_instance_id();
         let lifecycle_permit = self
             .lifecycle
-            .admit_fragment(request.execution_id(), fragment_instance_id)
+            .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
         #[cfg(test)]
         if let Some(after_lifecycle_admission) = self.after_lifecycle_admission.as_ref() {
@@ -295,7 +296,7 @@ impl NativeFragmentIngress for NativeFragmentService {
                         }
                     }
                 }
-                consume_terminal_fact(running, token, queries, lifecycle);
+                consume_terminal_fact(running, token, queries, lifecycle, execution_id);
             })
             .map_err(|error| {
                 NativeFragmentIngressError::new(format!(
@@ -422,11 +423,12 @@ fn consume_terminal_fact(
     token: super::control::FragmentControlToken,
     queries: NativeFragmentQueryRuntime,
     lifecycle: Arc<QueryLifecycleRegistry>,
+    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) {
     let fact = running.join();
     let query_id = fact.query_id();
     let fragment_instance_id = fact.fragment_instance_id();
-    lifecycle.record_fragment_terminal(fragment_instance_id, fact.outcome());
+    lifecycle.record_fragment_terminal(execution_id, fragment_instance_id, fact.outcome());
     let report_error = match fact.outcome() {
         FragmentOutcome::Succeeded => {
             if let Some(profile) = fact.profile() {
@@ -1013,6 +1015,7 @@ mod tests {
         let service = NativeFragmentService::with_lifecycle_observer(|_| {});
         let request = values_result_request(83_100, 83_104);
         let query_id = request.query_id();
+        let execution_id = request.execution_id();
         let failed_finst = request.fragment_instance_id();
         let sibling_finst = UniqueId {
             hi: 83_102,
@@ -1053,6 +1056,7 @@ mod tests {
             failed_token,
             service.queries.clone(),
             Arc::clone(&service.lifecycle),
+            execution_id,
         );
 
         assert!(

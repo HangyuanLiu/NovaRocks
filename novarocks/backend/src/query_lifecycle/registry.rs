@@ -957,26 +957,48 @@ impl QueryLifecycleRegistry {
 
     pub(crate) fn record_fragment_terminal(
         &self,
+        execution_id: QueryExecutionId,
         fragment_instance_id: UniqueId,
         outcome: &FragmentOutcome,
     ) {
-        let execution_id = self
-            .state
-            .lock()
-            .expect("query lifecycle registry lock")
-            .fragment_executions
-            .remove(&fragment_instance_id);
+        let committed_execution_id = {
+            let mut state = self.state.lock().expect("query lifecycle registry lock");
+            match state
+                .fragment_executions
+                .get(&fragment_instance_id)
+                .copied()
+            {
+                Some(committed_execution_id) if committed_execution_id == execution_id => {
+                    state.fragment_executions.remove(&fragment_instance_id);
+                    Some(committed_execution_id)
+                }
+                Some(committed_execution_id) => {
+                    warn!(
+                        target: "novarocks::query_lifecycle",
+                        finst_id = %fragment_instance_id,
+                        terminal_execution_id = %format_execution_id(execution_id),
+                        committed_execution_id = %format_execution_id(committed_execution_id),
+                        "ignoring stale fragment terminal fact for a reused fragment instance"
+                    );
+                    None
+                }
+                None => {
+                    warn!(
+                        target: "novarocks::query_lifecycle",
+                        finst_id = %fragment_instance_id,
+                        terminal_execution_id = %format_execution_id(execution_id),
+                        "fragment terminal fact has no committed query lifecycle admission"
+                    );
+                    None
+                }
+            }
+        };
+        let Some(execution_id) = committed_execution_id else {
+            return;
+        };
         if matches!(outcome, FragmentOutcome::Succeeded) {
             return;
         }
-        let Some(execution_id) = execution_id else {
-            warn!(
-                target: "novarocks::query_lifecycle",
-                finst_id = %fragment_instance_id,
-                "fragment terminal fact has no committed query lifecycle admission"
-            );
-            return;
-        };
         let entry = self
             .state
             .lock()

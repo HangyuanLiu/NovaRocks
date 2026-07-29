@@ -933,6 +933,7 @@ fn fragment_failure_emits_query_local_failure() {
         .expect("fragment admission commits");
 
     registry.record_fragment_terminal(
+        execution_id,
         expected,
         &FragmentOutcome::Failed(FragmentExecutionError::new(
             FragmentExecutionErrorKind::Pipeline,
@@ -1096,6 +1097,7 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
         .expect("second abort is accepted");
     assert!(!registry.contains(first_execution));
     registry.record_fragment_terminal(
+        first_execution,
         fragment_instance_id,
         &FragmentOutcome::Failed(FragmentExecutionError::new(
             FragmentExecutionErrorKind::Pipeline,
@@ -1125,6 +1127,97 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
         .expect("evicted fragment mapping permits reuse")
         .commit()
         .expect("replacement fragment admission commits");
+}
+
+#[test]
+fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance() {
+    let runtime = RecordingLocalRuntime::default();
+    let mut config = registry_config(8);
+    config.tombstone_capacity = 1;
+    let registry = QueryLifecycleRegistry::new_with_clock(
+        LOCAL_BACKEND_ID,
+        LOCAL_START_EPOCH,
+        Arc::new(runtime),
+        config,
+        Arc::new(ManualClock::default()),
+    );
+    let fragment_instance_id = UniqueId { hi: 814, lo: 1 };
+    let first = fragment_init_request_fixture(814, &[fragment_instance_id]);
+    let first_execution = first.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(first.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _first_control = attach_control(&registry, &first);
+    registry
+        .admit_fragment(first_execution, fragment_instance_id)
+        .expect("first fragment permit")
+        .commit()
+        .expect("first fragment admission commits");
+    registry
+        .abort_query(
+            QueryAbortRequest::new(first_execution, first.digest(), "first tombstone")
+                .expect("valid abort"),
+        )
+        .expect("first abort is accepted");
+
+    let eviction = init_request_fixture(815, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let eviction_execution = eviction.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(eviction.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                eviction_execution,
+                eviction.digest(),
+                "evict first tombstone",
+            )
+            .expect("valid abort"),
+        )
+        .expect("eviction abort is accepted");
+    assert!(!registry.contains(first_execution));
+
+    let replacement = fragment_init_request_fixture(816, &[fragment_instance_id]);
+    let replacement_execution = replacement.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(replacement.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _replacement_control = attach_control(&registry, &replacement);
+    registry
+        .admit_fragment(replacement_execution, fragment_instance_id)
+        .expect("replacement fragment permit")
+        .commit()
+        .expect("replacement fragment admission commits");
+
+    registry.record_fragment_terminal(
+        first_execution,
+        fragment_instance_id,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "late failure from evicted execution",
+        )),
+    );
+
+    assert_eq!(registry.termination_reason(replacement_execution), None);
+    let competing = fragment_init_request_fixture(817, &[fragment_instance_id]);
+    let competing_execution = competing.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(competing.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _competing_control = attach_control(&registry, &competing);
+    assert_eq!(
+        registry
+            .admit_fragment(competing_execution, fragment_instance_id)
+            .expect("competing fragment permit")
+            .commit()
+            .expect_err("replacement execution must retain the fragment mapping")
+            .code(),
+        QueryLifecycleErrorCode::Conflict
+    );
 }
 
 #[test]
