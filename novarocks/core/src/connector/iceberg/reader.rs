@@ -24,8 +24,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Array, ArrayRef, new_null_array};
-use arrow::compute::cast;
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt64Array, new_null_array};
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
@@ -39,11 +39,20 @@ use novarocks_spi::connector::{
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use super::scan_model::IcebergDataFileInfo;
+use super::delete_file::{IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat};
+use super::equality_delete::{
+    EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets,
+};
+use super::position_delete::load_position_deletes;
+use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
 
 pub(crate) struct IcebergBatchReader {
     reader: Box<dyn FileBatchReader>,
     expected_schema: SchemaRef,
+    data_file_path: String,
+    position_deletes: roaring::RoaringTreemap,
+    equality_deletes: Vec<EqualityDeleteSet>,
+    included_positions: Option<roaring::RoaringTreemap>,
     context: novarocks_spi::connector::ConnectorRequestContext,
     cancellation: FileCancellation,
     closed: bool,
@@ -65,6 +74,12 @@ impl IcebergBatchReader {
         let access = FsAccessResolver::new()
             .resolve_location(&file.path, object_store_config)
             .map_err(map_file_error)?;
+        let delete_specs = delete_specs(file)?;
+        let position_deletes = load_position_deletes(&delete_specs, &file.path, &access)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+        let equality_deletes = load_equality_delete_sets(&delete_specs, &access)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+        let included_positions = included_positions(file)?;
         let bound_file = access
             .bind_location(&file.path, FileIdentity::new(&file.path, file_size, None))
             .map_err(map_file_error)?;
@@ -92,6 +107,10 @@ impl IcebergBatchReader {
         Ok(Self {
             reader,
             expected_schema: request.expected_schema,
+            data_file_path: file.path.clone(),
+            position_deletes,
+            equality_deletes,
+            included_positions,
             context: request.context,
             cancellation,
             closed: false,
@@ -116,9 +135,19 @@ impl ConnectorBatchReader for IcebergBatchReader {
         let next = self.reader.next_batch().map_err(map_file_error)?;
         self.validate_context()?;
         match next {
-            Some(file_batch) => align_batch_to_schema(&self.expected_schema, file_batch.batch)
-                .map(Some)
-                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error)),
+            Some(file_batch) => {
+                let batch = apply_delete_filters(
+                    file_batch.batch,
+                    file_batch.physical_row_positions,
+                    &self.position_deletes,
+                    &self.equality_deletes,
+                    self.included_positions.as_ref(),
+                    &self.data_file_path,
+                )?;
+                align_batch_to_schema(&self.expected_schema, batch)
+                    .map(Some)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
+            }
             None => {
                 self.close()?;
                 Ok(None)
@@ -160,6 +189,137 @@ fn physical_format(path: &str) -> Result<FileFormat, ConnectorError> {
         ConnectorErrorKind::Unsupported,
         format!("Iceberg data file format is not declared or supported: {path}"),
     ))
+}
+
+fn delete_specs(file: &IcebergDataFileInfo) -> Result<Vec<IcebergDeleteFileSpec>, ConnectorError> {
+    const MAX_DELETE_FILES: usize = 1024;
+    const MAX_DELETE_BYTES: i64 = 512 * 1024 * 1024;
+    if file.delete_files.len() > MAX_DELETE_FILES {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!(
+                "too many Iceberg delete files attached to {}: count={} max={MAX_DELETE_FILES}",
+                file.path,
+                file.delete_files.len()
+            ),
+        ));
+    }
+    let total_bytes = file
+        .delete_files
+        .iter()
+        .try_fold(0_i64, |total, delete| {
+            total.checked_add(delete.length.unwrap_or_default().max(0))
+        })
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                format!("Iceberg delete byte total overflows for {}", file.path),
+            )
+        })?;
+    if total_bytes > MAX_DELETE_BYTES {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!(
+                "Iceberg delete files attached to {} exceed byte limit: bytes={total_bytes} max={MAX_DELETE_BYTES}",
+                file.path
+            ),
+        ));
+    }
+    file.delete_files
+        .iter()
+        .map(|delete| {
+            let file_format = match delete.file_format {
+                IcebergDeleteFileFormat::Parquet => IcebergFileFormat::Parquet,
+                IcebergDeleteFileFormat::Puffin => IcebergFileFormat::Puffin,
+            };
+            let file_content = match delete.file_content {
+                IcebergDeleteFileContent::Position => IcebergFileContent::PositionDeletes,
+                IcebergDeleteFileContent::Equality => IcebergFileContent::EqualityDeletes,
+            };
+            Ok(IcebergDeleteFileSpec {
+                path: delete.path.clone(),
+                file_format,
+                file_content,
+                length: delete.length.and_then(|length| u64::try_from(length).ok()),
+                content_offset: delete.content_offset,
+                content_size_in_bytes: delete.content_size_in_bytes,
+            })
+        })
+        .collect()
+}
+
+fn included_positions(
+    file: &IcebergDataFileInfo,
+) -> Result<Option<roaring::RoaringTreemap>, ConnectorError> {
+    let Some(positions) = &file.included_positions else {
+        return Ok(None);
+    };
+    let mut included = roaring::RoaringTreemap::new();
+    for position in positions {
+        let position = u64::try_from(*position).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("Iceberg included position is negative for {}", file.path),
+            )
+        })?;
+        included.insert(position);
+    }
+    Ok(Some(included))
+}
+
+fn apply_delete_filters(
+    batch: RecordBatch,
+    positions: Option<UInt64Array>,
+    position_deletes: &roaring::RoaringTreemap,
+    equality_deletes: &[EqualityDeleteSet],
+    included_positions: Option<&roaring::RoaringTreemap>,
+    data_file_path: &str,
+) -> Result<RecordBatch, ConnectorError> {
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let positions = positions.ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("Iceberg physical reader did not return row coordinates for {data_file_path}"),
+        )
+    })?;
+    if positions.len() != batch.num_rows() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!(
+                "Iceberg physical position count mismatch for {data_file_path}: positions={} rows={}",
+                positions.len(),
+                batch.num_rows()
+            ),
+        ));
+    }
+    let equality_keep = equality_delete_keep_mask(&batch, equality_deletes)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+    let mut changed =
+        equality_keep.is_some() || !position_deletes.is_empty() || included_positions.is_some();
+    let mut keep = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let position = positions.value(row);
+        let position_keep = !position_deletes.contains(position)
+            && included_positions.is_none_or(|included| included.contains(position));
+        let equality_keep = equality_keep
+            .as_ref()
+            .is_none_or(|values| values.get(row).copied().unwrap_or(false));
+        keep.push(position_keep && equality_keep);
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    if keep.iter().all(|keep| *keep) {
+        return Ok(batch);
+    }
+    filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("apply Iceberg delete filter for {data_file_path}: {error}"),
+        )
+    })
 }
 
 fn validate_context(
@@ -350,5 +510,36 @@ mod tests {
             20
         );
         assert_eq!(aligned.column(2).null_count(), 1);
+    }
+
+    #[test]
+    fn applies_position_deletes_and_included_positions_to_physical_coordinates() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
+        )
+        .expect("source batch");
+        let deletes = roaring::RoaringTreemap::from_iter([6]);
+        let included = roaring::RoaringTreemap::from_iter([5, 6]);
+
+        let filtered = apply_delete_filters(
+            batch,
+            Some(UInt64Array::from(vec![5, 6, 7])),
+            &deletes,
+            &[],
+            Some(&included),
+            "file:///warehouse/data.parquet",
+        )
+        .expect("filter physical positions");
+        assert_eq!(filtered.num_rows(), 1);
+        assert_eq!(
+            filtered
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
     }
 }
