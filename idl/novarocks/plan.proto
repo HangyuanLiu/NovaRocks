@@ -1017,6 +1017,7 @@ message ConnectorReadSource {
   uint64 max_handle_payload_bytes = 6; // required bounded provider-handle budget.
   uint64 max_total_payload_bytes = 7;  // required bounded request aggregate budget.
   reserved 8; // former provider_id; host lookup is keyed only by instance_id.
+  bytes expected_schema_ipc = 9; // bounded Arrow IPC schema expected from the provider.
 }
 
 // One scheduled split in a ConnectorReadSource.

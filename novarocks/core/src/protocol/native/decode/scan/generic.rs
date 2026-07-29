@@ -18,10 +18,12 @@
 //! Native decoding for the provider-neutral SPI read carrier.
 
 use std::collections::BTreeSet;
+use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow::ipc::reader::StreamReader;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
@@ -160,6 +162,11 @@ pub(super) fn lower_connector_read_scan(
 
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
+    validate_expected_schema_ipc(
+        &source.expected_schema_ipc,
+        output_schema.arrow_schema_ref().as_ref(),
+        request_context.max_handle_payload_bytes(),
+    )?;
     let connectors = ctx.connectors()?;
     let instance = connectors
         .connector_instance(&instance_id)
@@ -196,6 +203,42 @@ pub(super) fn lower_connector_read_scan(
         layout,
         output_schema,
     })
+}
+
+fn validate_expected_schema_ipc(
+    encoded: &[u8],
+    expected: &arrow::datatypes::Schema,
+    max_bytes: usize,
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    if encoded.is_empty() {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "expected_schema_ipc",
+            "ConnectorReadSource requires an expected Arrow schema",
+        ));
+    }
+    if encoded.len() > max_bytes {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "expected_schema_ipc",
+            format!("ConnectorReadSource expected Arrow schema exceeds handle budget {max_bytes}"),
+        ));
+    }
+    let reader = StreamReader::try_new(Cursor::new(encoded), None).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "expected_schema_ipc",
+            format!("decode ConnectorReadSource expected Arrow schema: {error}"),
+        )
+    })?;
+    if reader.schema().as_ref() != expected {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "expected_schema_ipc",
+            "ConnectorReadSource expected Arrow schema does not match scan output columns",
+        ));
+    }
+    Ok(())
 }
 
 fn required_nonzero_usize(

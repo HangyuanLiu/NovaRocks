@@ -383,6 +383,7 @@ fn placement(
         backend_idx: fixture_backend_idx(),
         endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
         scan_ranges: BTreeMap::new(),
+        connector_splits: BTreeMap::new(),
         destinations: Vec::new(),
         per_exch_num_senders: BTreeMap::new(),
     }

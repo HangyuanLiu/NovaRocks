@@ -3030,6 +3030,7 @@ pub(super) mod test_support {
             backend_idx,
             endpoint: RuntimeEndpoint::from_socket_addr(endpoint.parse().unwrap()),
             scan_ranges: BTreeMap::new(),
+            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         };
@@ -4075,6 +4076,7 @@ pub(crate) mod tests {
             backend_idx: 0,
             endpoint: RuntimeEndpoint::from_socket_addr("127.0.0.1:9060".parse().unwrap()),
             scan_ranges: BTreeMap::new(),
+            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         };

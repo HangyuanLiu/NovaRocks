@@ -488,6 +488,7 @@ impl ValidatedFragmentSchedule {
                         backend_idx: placement.backend_idx,
                         endpoint: RuntimeEndpoint::from_socket_addr(placement.endpoint),
                         scan_ranges: BTreeMap::new(),
+                        connector_splits: BTreeMap::new(),
                         destinations: Vec::new(),
                         per_exch_num_senders: BTreeMap::new(),
                     })
@@ -517,16 +518,34 @@ impl ValidatedFragmentSchedule {
                         .or_default()
                         .push(range.clone());
                 }
+                if let Some(connector_read) = view.inner.connector_read(fragment_id, node_id) {
+                    for instance in &mut instances {
+                        instance.connector_splits.entry(node_id).or_default();
+                    }
+                    for (index, split) in connector_read.splits.iter().enumerate() {
+                        instances[index % instance_count]
+                            .connector_splits
+                            .entry(node_id)
+                            .or_default()
+                            .push(split.clone());
+                    }
+                }
             }
             let total_ranges = instances
                 .iter()
                 .flat_map(|instance| instance.scan_ranges.values())
                 .map(Vec::len)
-                .sum::<usize>();
-            if total_ranges > 0
-                && instances
+                .sum::<usize>()
+                + instances
                     .iter()
-                    .any(|instance| instance.scan_ranges.values().all(Vec::is_empty))
+                    .flat_map(|instance| instance.connector_splits.values())
+                    .map(Vec::len)
+                    .sum::<usize>();
+            if total_ranges > 0
+                && instances.iter().any(|instance| {
+                    instance.scan_ranges.values().all(Vec::is_empty)
+                        && instance.connector_splits.values().all(Vec::is_empty)
+                })
             {
                 return Err(contract_error(format!(
                     "frontend schedule fragment {fragment_id} creates an empty scan instance"
@@ -1108,6 +1127,14 @@ fn assemble_native_execution(
                     });
                 }
                 let mut native_fragment = template.clone();
+                for (&node_id, splits) in &placement.connector_splits {
+                    crate::query_execution::assembly::patch_native_connector_read_splits(
+                        &mut native_fragment,
+                        node_id,
+                        splits,
+                    )
+                    .map_err(contract_error)?;
+                }
                 if !is_root && !is_writer && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         crate::query_execution::assembly::

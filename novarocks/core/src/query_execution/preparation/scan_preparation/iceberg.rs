@@ -17,7 +17,9 @@
 
 use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_range::IcebergScanRangeContext;
-use crate::query_execution::preparation::scan::{ResolvedIcebergFileScan, ResolvedScanExecution};
+use crate::query_execution::preparation::scan::{
+    PlannedConnectorRead, ResolvedIcebergFileScan, ResolvedScanExecution,
+};
 use crate::sql::planner::payload::PlanScanNode;
 
 use super::projection::effective_scan_column_names;
@@ -89,6 +91,45 @@ pub(super) fn plan_iceberg_file_ranges(
         },
     )?;
     Ok((plan.scan_ranges, equality_required))
+}
+
+/// Plans executable opaque splits through the real Iceberg connector instance.
+/// Native scheduling owns only the resulting SPI identities and byte-size
+/// hints; it must not lower these splits back into `FileScanRange`.
+pub(super) fn plan_iceberg_connector_read(
+    connectors: &ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    scan: &PlanScanNode,
+    execution: &ResolvedScanExecution,
+) -> Result<PlannedConnectorRead, String> {
+    let ResolvedScanExecution::IcebergFiles(files) = execution else {
+        return Err("Iceberg connector planning requires IcebergFiles execution".to_string());
+    };
+    let projection = effective_scan_column_names(scan)
+        .iter()
+        .filter_map(|name| {
+            files
+                .table
+                .schema
+                .fields
+                .iter()
+                .position(|field| field.name.eq_ignore_ascii_case(name))
+        })
+        .collect::<Vec<_>>();
+    let planned = crate::connector::iceberg::provider::plan_native_iceberg_read(
+        connectors,
+        context,
+        &files.table,
+        files.binding,
+        &files.files,
+        &projection,
+    )?;
+    Ok(PlannedConnectorRead {
+        declaration: planned.declaration,
+        scan: planned.scan,
+        splits: planned.splits,
+        batch: planned.batch,
+    })
 }
 
 fn merge_effective_column_names(existing: Vec<String>, additional: &[String]) -> Vec<String> {

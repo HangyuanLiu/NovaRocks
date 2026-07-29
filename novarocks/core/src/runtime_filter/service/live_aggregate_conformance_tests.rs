@@ -349,6 +349,7 @@ fn placement(fragment: PlanFragmentId, instance: UniqueId) -> FragmentInstancePl
         backend_idx: 0,
         endpoint: RuntimeEndpoint::from_socket_addr(fixture_endpoint()),
         scan_ranges: BTreeMap::new(),
+        connector_splits: BTreeMap::new(),
         destinations: Vec::new(),
         per_exch_num_senders: BTreeMap::new(),
     }

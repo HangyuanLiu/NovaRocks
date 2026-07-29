@@ -224,7 +224,8 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use novarocks_spi::connector::{
         ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorInstance,
@@ -319,6 +320,13 @@ mod tests {
     fn scan_node(source: plan::scan_source::Kind) -> plan::DistributedNode {
         let columns = vec![output_column(1, "id", DataType::Int64)];
         scan_node_with(columns, Vec::new(), Vec::new(), source)
+    }
+
+    fn expected_connector_schema_ipc() -> Vec<u8> {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let mut writer = StreamWriter::try_new(Vec::new(), &schema).expect("schema IPC writer");
+        writer.finish().expect("finish schema IPC writer");
+        writer.get_ref().clone()
     }
 
     fn scan_node_with(
@@ -439,6 +447,7 @@ mod tests {
                 max_batch_bytes: 4096,
                 max_handle_payload_bytes: 1024,
                 max_total_payload_bytes: 4096,
+                expected_schema_ipc: expected_connector_schema_ipc(),
             },
         ));
         let context = NativePlanDecodeContext::default()
@@ -472,6 +481,7 @@ mod tests {
                 max_batch_bytes: 4096,
                 max_handle_payload_bytes: 1024,
                 max_total_payload_bytes: 4096,
+                expected_schema_ipc: expected_connector_schema_ipc(),
             },
         ));
         let context = NativePlanDecodeContext::default()
@@ -504,6 +514,7 @@ mod tests {
                 max_batch_bytes: 4096,
                 max_handle_payload_bytes: 1024,
                 max_total_payload_bytes: 4096,
+                expected_schema_ipc: expected_connector_schema_ipc(),
             },
         ));
         let context = NativePlanDecodeContext::default()
@@ -540,6 +551,7 @@ mod tests {
                 max_batch_bytes: 4096,
                 max_handle_payload_bytes: 1024,
                 max_total_payload_bytes: 4096,
+                expected_schema_ipc: expected_connector_schema_ipc(),
             },
         ));
         let context = NativePlanDecodeContext::default()
@@ -1548,6 +1560,7 @@ mod tests {
             endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 8060)
                 .expect("native test endpoint"),
             scan_ranges: BTreeMap::from([(10, planned.scan_ranges)]),
+            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         };

@@ -219,6 +219,14 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
         self.scan_bindings.scan_ranges(fragment_id, node_id)
     }
 
+    pub(crate) fn connector_read(
+        self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&'a super::scan::PlannedConnectorRead> {
+        self.scan_bindings.connector_read(fragment_id, node_id)
+    }
+
     pub(crate) fn boundary_projection(
         self,
         fragment_id: FragmentId,

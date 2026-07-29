@@ -1213,6 +1213,38 @@ pub(crate) fn plan_scan_files(
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
+    let planned = plan_native_iceberg_read(
+        connectors,
+        context,
+        table,
+        binding,
+        explicit_files,
+        projection,
+    )?;
+    planned
+        .splits
+        .iter()
+        .map(|split| {
+            decode_payload::<SplitPayload>(split.payload(), "split")
+                .map(|payload| payload.data_file)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+/// Fully plans an Iceberg read through its real connector instance.  The
+/// returned scan handle and splits are provider-owned bytes; callers may only
+/// schedule and carry them.  This is intentionally separate from range
+/// planning so native execution never reconstructs an Iceberg file scan in
+/// core.
+pub(crate) fn plan_native_iceberg_read(
+    connectors: &crate::connector::ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    binding: super::scan_model::IcebergDataFileBinding,
+    explicit_files: &[IcebergDataFileInfo],
+    projection: &[usize],
+) -> Result<PlannedIcebergConnectorRead, String> {
     use std::num::NonZeroUsize;
 
     let instance_id =
@@ -1220,8 +1252,17 @@ pub(crate) fn plan_scan_files(
     let instance = connectors
         .connector_instance(&instance_id)
         .map_err(|error| error.to_string())?;
+    let distribution = instance.distribution().ok_or_else(|| {
+        format!(
+            "Iceberg connector instance {} cannot be distributed to native backends",
+            instance_id.as_str()
+        )
+    })?;
+    let declaration = distribution
+        .declaration(&context)
+        .map_err(|error| error.to_string())?;
     let table_handle = ConnectorTableHandle::try_new(
-        instance_id,
+        instance_id.clone(),
         encode_payload(
             &TablePayload {
                 namespace: table.namespace.clone(),
@@ -1282,16 +1323,31 @@ pub(crate) fn plan_scan_files(
             },
         )
         .map_err(|error| error.to_string())?;
-    splits
+    if splits
         .iter()
-        .map(|split| {
-            ensure_owner(split.owner(), &instance.descriptor().instance_id)
-                .map_err(|error| error.to_string())?;
-            decode_payload::<SplitPayload>(split.payload(), "split")
-                .map(|payload| payload.data_file)
-                .map_err(|error| error.to_string())
-        })
-        .collect()
+        .any(|split| split.owner() != &instance.descriptor().instance_id)
+    {
+        return Err("Iceberg connector planned a split for another instance".to_string());
+    }
+    Ok(PlannedIcebergConnectorRead {
+        declaration,
+        scan,
+        splits,
+        batch: novarocks_spi::connector::ConnectorBatchBudget {
+            max_rows: NonZeroUsize::new(4096).expect("batch rows are nonzero"),
+            max_bytes: NonZeroUsize::new(
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            )
+            .expect("batch bytes are nonzero"),
+        },
+    })
+}
+
+pub(crate) struct PlannedIcebergConnectorRead {
+    pub(crate) declaration: ConnectorInstanceDeclaration,
+    pub(crate) scan: ConnectorScan,
+    pub(crate) splits: Vec<ConnectorSplit>,
+    pub(crate) batch: novarocks_spi::connector::ConnectorBatchBudget,
 }
 
 fn ensure_owner(

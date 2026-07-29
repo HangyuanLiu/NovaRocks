@@ -727,6 +727,7 @@ mod tests {
                         backend_idx: 0,
                         endpoint: endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
+                        connector_splits: BTreeMap::new(),
                         destinations: Vec::new(),
                         per_exch_num_senders: plan
                             .edges()
