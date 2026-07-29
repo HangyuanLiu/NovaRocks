@@ -357,7 +357,6 @@ fn root_plan_node_id(plan: &ExecPlan) -> i32 {
         ExecNodeKind::Limit(node) => node.node_id,
         ExecNodeKind::ExchangeSource(node) => node.node_id,
         ExecNodeKind::Scan(node) => node.node_id().unwrap_or(-1),
-        ExecNodeKind::IcebergDeltaScan(node) => node.node_id,
         #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(node) => node.node_id,
         ExecNodeKind::LookUp(node) => node.node_id,

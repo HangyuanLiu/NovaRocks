@@ -19,10 +19,8 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use crate::connector::iceberg::delta::{DeltaDataColumn, DeltaScanDeleteSide};
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
-use crate::exec::node::iceberg_delta_scan::{
-    DeltaScanDeleteSidePayload, IcebergDeltaDataColumnPayload,
-};
 use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
 use crate::query_execution::preparation::scan::{
     IcebergDeltaScanRuntimePlan, ResolvedIcebergDeltaScan, ResolvedIcebergFileScan,
@@ -270,7 +268,7 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
                 &loaded,
                 batch.previous_snapshot_id,
             )?;
-        Some(DeltaScanDeleteSidePayload {
+        Some(DeltaScanDeleteSide {
             base_data_file_lineage,
             previous_data_file_lineage,
             previous_delete_visibility_data_files,
@@ -286,7 +284,7 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
         .as_struct()
         .fields()
         .iter()
-        .map(|field| IcebergDeltaDataColumnPayload {
+        .map(|field| DeltaDataColumn {
             name: field.name.clone(),
             field_id: field.id,
         })
@@ -996,7 +994,7 @@ mod tests {
                 assert_eq!((from, to), (10, 20));
                 Ok(IcebergDeltaScanRuntimePlan {
                     table_location: "s3://bucket/base".to_string(),
-                    data_columns: vec![IcebergDeltaDataColumnPayload {
+                    data_columns: vec![DeltaDataColumn {
                         name: "k".to_string(),
                         field_id: 1,
                     }],

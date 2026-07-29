@@ -171,10 +171,10 @@ mod tests {
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
+    use crate::connector::iceberg::delta::DeltaSourceRole;
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
-    use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
     use crate::exec::node::scan::ScanMorsel;
     use crate::proto::{common, expr, novarocks, plan};
     use crate::protocol::common::error::ProtocolErrorKind;

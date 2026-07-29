@@ -470,7 +470,6 @@ fn replace_values_chunk(
         ExecNodeKind::Values(_)
         | ExecNodeKind::ExchangeSource(_)
         | ExecNodeKind::Scan(_)
-        | ExecNodeKind::IcebergDeltaScan(_)
         | ExecNodeKind::LookUp(_) => false,
     }
 }
@@ -878,10 +877,7 @@ fn collect_exchange_contracts(
                 }
             }
             ExecNodeKind::NativeRuntimeFilterConsumer(value) => visit(&value.input, contracts)?,
-            ExecNodeKind::Values(_)
-            | ExecNodeKind::Scan(_)
-            | ExecNodeKind::IcebergDeltaScan(_)
-            | ExecNodeKind::LookUp(_) => {}
+            ExecNodeKind::Values(_) | ExecNodeKind::Scan(_) | ExecNodeKind::LookUp(_) => {}
         }
         Ok(())
     }
@@ -987,7 +983,7 @@ fn collect_row_position_descriptors(
         ExecNodeKind::Values(_)
         | ExecNodeKind::ExchangeSource(_)
         | ExecNodeKind::Scan(_)
-        | ExecNodeKind::IcebergDeltaScan(_) => {}
+        | ExecNodeKind::LookUp(_) => {}
     }
     Ok(())
 }

@@ -154,20 +154,16 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
         ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
             collect_incremental_scan_contracts(&value.input, output)
         }
-        ExecNodeKind::Values(_)
-        | ExecNodeKind::ExchangeSource(_)
-        | ExecNodeKind::IcebergDeltaScan(_)
-        | ExecNodeKind::LookUp(_) => {}
+        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::LookUp(_) => {}
     }
 }
 
 struct ProgramInventory {
-    /// All scan-shaped plan nodes (`ExecNodeKind::Scan` + `IcebergDeltaScan`).
+    /// All scan-shaped plan nodes (`ExecNodeKind::Scan`).
     /// Used to cross-check the static `scan_sources` contracts.
     scan_nodes: BTreeSet<FragmentNodeId>,
-    /// Only `ExecNodeKind::Scan` nodes — the ones `materialize_scan_bindings`
-    /// binds and that therefore require an instance `ScanAssignment`.
-    /// `IcebergDeltaScan` is intentionally excluded (it carries its own ranges).
+    /// `ExecNodeKind::Scan` nodes are materialized by `materialize_scan_bindings`
+    /// and therefore require an instance `ScanAssignment`.
     materializable_scan_nodes: BTreeSet<FragmentNodeId>,
     exchange_nodes: BTreeMap<FragmentNodeId, ChunkSchemaRef>,
 }
@@ -216,10 +212,6 @@ impl ProgramInventory {
                     self.materializable_scan_nodes.insert(id);
                 }
                 Ok(())
-            }
-            ExecNodeKind::IcebergDeltaScan(node) => {
-                // Counts as a scan contract, but is not materialized here.
-                self.insert_scan(FragmentNodeId::new(node.node_id))
             }
             #[cfg(feature = "compat")]
             ExecNodeKind::Fetch(node) => self.visit(&node.input),
@@ -446,14 +438,12 @@ fn validate_exchange_contracts(
 /// `validate_exchange_assignments`).
 ///
 /// This is checked against the plan's `ExecNodeKind::Scan` set rather than the
-/// static `scan_sources` contract set, because the two legitimately differ:
-/// jdbc/mysql scans are materializable `Scan` nodes with no `ScanAssignmentKind`
-/// (hence not in `scan_sources`), and `IcebergDeltaScan` is a `scan_sources`
-/// contract that is not materialized here. Every materializable scan must have
-/// an instance assignment (so `materialize_scan_bindings` never misses), and no
-/// assignment may lack a materializable node. The old strict kind match is gone:
-/// variant-vs-source correctness is enforced at materialize time by
-/// `ScanSource::bind`.
+/// static `scan_sources` contract set, because JDBC/MySQL scans are
+/// materializable `Scan` nodes with no `ScanAssignmentKind` (hence not in
+/// `scan_sources`). Every materializable scan must have an instance assignment
+/// (so `materialize_scan_bindings` never misses), and no assignment may lack a
+/// materializable node. The old strict kind match is gone: variant-vs-source
+/// correctness is enforced at materialize time by `ScanSource::bind`.
 fn validate_scan_assignments(
     inventory: &ProgramInventory,
     instance: &FragmentInstanceSpec,
@@ -615,10 +605,6 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::exec::node::fetch::FetchNode;
     use crate::exec::node::filter::FilterNode;
-    use crate::exec::node::iceberg_delta_scan::{
-        ApplyKeySource, BaseTableIdent, IcebergDeltaScanNode, IcebergDeltaTablePayload,
-        IcebergRuntimeHandles,
-    };
     use crate::exec::node::join::{
         JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
     };
@@ -737,37 +723,6 @@ mod tests {
                 kind: ExecNodeKind::UnionAll(UnionAllNode {
                     inputs,
                     node_id: 99,
-                }),
-            },
-        }
-    }
-
-    fn native_delta_scan_plan(node_id: i32) -> ExecPlan {
-        ExecPlan {
-            arena: ExprArena::default(),
-            root: ExecNode {
-                kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
-                    base_table_ident: BaseTableIdent {
-                        catalog: "rest".to_string(),
-                        namespace: "db".to_string(),
-                        table: "t".to_string(),
-                    },
-                    table_location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
-                    from_snapshot_id: 1,
-                    to_snapshot_id: 2,
-                    output_chunk_schema: Arc::new(ChunkSchema::empty()),
-                    apply_key_source: ApplyKeySource::BaseRowId,
-                    change_files: Vec::new(),
-                    object_store_config: None,
-                    iceberg_runtime: Arc::new(IcebergRuntimeHandles::new(
-                        IcebergDeltaTablePayload {
-                            table_location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
-                            data_columns: Vec::new(),
-                        },
-                        None,
-                    )),
-                    node_id,
-                    native_runtime_filter_specs: Vec::new(),
                 }),
             },
         }
@@ -2077,34 +2032,6 @@ mod tests {
             BTreeMap::new(),
         );
         FragmentSubmission::try_new(program, instance).expect("set op child scan");
-    }
-
-    #[test]
-    fn iceberg_delta_scan_required_identity_is_collected() {
-        let id = FragmentNodeId::new(44);
-        let program = program_with(
-            native_delta_scan_plan(44),
-            result_sink(),
-            BTreeMap::from([(id, ScanAssignmentKind::File)]),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
-        // IcebergDelta is a scan *contract* (`scan_sources`) but is not a
-        // materializable `ExecNodeKind::Scan` node, so it must NOT carry an
-        // instance scan assignment (it keeps its own ranges). Submission still
-        // succeeds: the contract resolves to the delta plan node, and the empty
-        // materializable-scan set needs no assignment.
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 66),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            FragmentSinkAssignment::None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
-        FragmentSubmission::try_new(program, instance).expect("Iceberg delta scan identity");
     }
 
     #[cfg(feature = "compat")]

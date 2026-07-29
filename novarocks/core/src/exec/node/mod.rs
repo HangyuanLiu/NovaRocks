@@ -22,7 +22,6 @@ pub mod exchange_source;
 #[cfg(feature = "compat")]
 pub mod fetch;
 pub mod filter;
-pub mod iceberg_delta_scan;
 pub mod join;
 pub mod limit;
 pub mod lookup;
@@ -36,11 +35,6 @@ pub mod sort;
 pub mod table_function;
 pub mod union_all;
 pub mod values;
-
-pub use iceberg_delta_scan::{
-    ApplyKeySource, BaseTableIdent, DeletedFileVisibility, DeltaSourceFile, DeltaSourceRole,
-    EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
-};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
@@ -80,7 +74,6 @@ pub enum ExecNodeKind {
     Limit(LimitNode),
     ExchangeSource(ExchangeSourceNode),
     Scan(ScanNode),
-    IcebergDeltaScan(IcebergDeltaScanNode),
     #[cfg(feature = "compat")]
     Fetch(FetchNode),
     LookUp(LookUpNode),

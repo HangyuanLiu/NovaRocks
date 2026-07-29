@@ -713,7 +713,15 @@ fn lower_node_with_children_typed(
                     )
                     .into());
                 }
-                lower_iceberg_delta_scan_node(node, desc_tbl, out_layout, context.decode_facts)?
+                lower_iceberg_delta_scan_node(
+                    node,
+                    desc_tbl,
+                    out_layout,
+                    connectors,
+                    context.query_id,
+                    context.scan_ranges,
+                    &context.query_options,
+                )?
             }
             t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => {
                 #[cfg(feature = "compat")]
