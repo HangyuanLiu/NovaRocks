@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::exec::pipeline::schedule::event_scheduler::EventScheduler;
 use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime::fragment::io::{FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
@@ -54,6 +55,7 @@ pub(crate) struct FragmentContext {
     #[allow(dead_code)]
     runtime_profile_report_interval_ns: Option<i64>,
     legacy_progress_reporting: bool,
+    event_sink: Arc<dyn FragmentEventSink>,
     final_error: Mutex<Option<String>>,
     cancelled: AtomicBool,
     event_scheduler: Arc<EventScheduler>,
@@ -84,6 +86,7 @@ impl FragmentContext {
             enable_profile,
             runtime_profile_report_interval_ns,
             legacy_progress_reporting: true,
+            event_sink: Arc::new(NoopFragmentEventSink),
             final_error: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             event_scheduler: Arc::new(EventScheduler::new()),
@@ -94,6 +97,7 @@ impl FragmentContext {
         profiler: Option<Profiler>,
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
+        event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
         Self {
             next_driver_id: AtomicI32::new(0),
@@ -106,6 +110,7 @@ impl FragmentContext {
             enable_profile: false,
             runtime_profile_report_interval_ns: None,
             legacy_progress_reporting: false,
+            event_sink,
             final_error: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             event_scheduler: Arc::new(EventScheduler::new()),
@@ -151,6 +156,10 @@ impl FragmentContext {
 
     pub(crate) const fn legacy_progress_reporting(&self) -> bool {
         self.legacy_progress_reporting
+    }
+
+    pub(crate) fn event_sink(&self) -> Arc<dyn FragmentEventSink> {
+        Arc::clone(&self.event_sink)
     }
 
     pub(crate) fn next_driver_id(&self) -> i32 {

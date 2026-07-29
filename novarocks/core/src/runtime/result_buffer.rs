@@ -20,12 +20,117 @@ use std::time::Duration;
 
 use crate::common::result_batch::ResultBatch;
 use crate::common::types::{FetchResult, UniqueId};
+use crate::runtime::fragment::io::ResultAbort;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ResultBufferMode {
     Legacy,
     Typed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultBufferWriteState {
+    Open,
+    Finished,
+    Aborted,
+}
+
+/// Fragment-scoped ownership of a single Result Buffer sender registration.
+///
+/// The handle intentionally owns terminal publication: callers cannot finish through one path
+/// and later discard the same finished result through another cleanup path.
+pub struct ResultBufferWriteHandle {
+    fragment_instance_id: UniqueId,
+    mode: ResultBufferMode,
+    state: Mutex<ResultBufferWriteState>,
+}
+
+impl ResultBufferWriteHandle {
+    pub fn open(
+        fragment_instance_id: UniqueId,
+        typed: bool,
+        mem_tracker: Option<&Arc<MemTracker>>,
+    ) -> Result<Self, String> {
+        let mode = if typed {
+            ResultBufferMode::Typed
+        } else {
+            ResultBufferMode::Legacy
+        };
+        try_create_sender_with_mode(fragment_instance_id, mode)?;
+        if let Some(root) = mem_tracker {
+            let tracker =
+                MemTracker::new_child(format!("ResultBuffer: finst={fragment_instance_id}"), root);
+            set_mem_tracker(fragment_instance_id, tracker);
+        }
+        Ok(Self {
+            fragment_instance_id,
+            mode,
+            state: Mutex::new(ResultBufferWriteState::Open),
+        })
+    }
+
+    pub fn write_legacy(&self, result: FetchResult) -> Result<(), String> {
+        self.require_open()?;
+        if self.mode != ResultBufferMode::Legacy {
+            return Err("typed result buffer cannot accept legacy result batches".to_string());
+        }
+        insert(self.fragment_instance_id, result);
+        Ok(())
+    }
+
+    pub fn write_typed(&self, payload: Vec<u8>) -> Result<(), String> {
+        self.require_open()?;
+        if self.mode != ResultBufferMode::Typed {
+            return Err("legacy result buffer cannot accept typed payloads".to_string());
+        }
+        insert_typed(self.fragment_instance_id, payload)
+    }
+
+    pub fn finish(&self) -> Result<(), String> {
+        let mut state = self.state.lock().expect("result buffer write handle lock");
+        match *state {
+            ResultBufferWriteState::Open => {
+                close_ok(self.fragment_instance_id);
+                *state = ResultBufferWriteState::Finished;
+                Ok(())
+            }
+            ResultBufferWriteState::Finished => Ok(()),
+            ResultBufferWriteState::Aborted => {
+                Err("result buffer session was aborted before finish".to_string())
+            }
+        }
+    }
+
+    pub fn abort(&self, reason: ResultAbort) {
+        let mut state = self.state.lock().expect("result buffer write handle lock");
+        if *state != ResultBufferWriteState::Open {
+            return;
+        }
+        match reason {
+            ResultAbort::PrepareRollback | ResultAbort::NeverStarted => {
+                discard(self.fragment_instance_id)
+            }
+            ResultAbort::Failed => close_error(
+                self.fragment_instance_id,
+                "fragment result session aborted after execution failure".to_string(),
+            ),
+            ResultAbort::Cancelled => cancel(self.fragment_instance_id),
+        }
+        *state = ResultBufferWriteState::Aborted;
+    }
+
+    fn require_open(&self) -> Result<(), String> {
+        match *self.state.lock().expect("result buffer write handle lock") {
+            ResultBufferWriteState::Open => Ok(()),
+            ResultBufferWriteState::Finished => {
+                Err("result buffer session was already finished".to_string())
+            }
+            ResultBufferWriteState::Aborted => {
+                Err("result buffer session was already aborted".to_string())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -636,7 +741,92 @@ pub(crate) fn fetch_wait_timeout_ms(finst_id: UniqueId) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::fragment::io::ResultAbort;
     use crate::runtime::query_context::{QueryId, query_context_manager};
+
+    #[test]
+    fn fragment_result_session_writes_twenty_plus_seventeen_rows_and_finishes_once() {
+        let finst_id = UniqueId { hi: 9901, lo: 9902 };
+        let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
+        let first_rows = (0..20)
+            .map(|row| format!("row-{row}").into_bytes())
+            .collect();
+        let second_rows = (20..37)
+            .map(|row| format!("row-{row}").into_bytes())
+            .collect();
+
+        handle
+            .write_legacy(FetchResult {
+                packet_seq: 0,
+                eos: false,
+                result_batch: ResultBatch::new(first_rows, false, 0, None),
+            })
+            .expect("write first result batch");
+        handle
+            .write_legacy(FetchResult {
+                packet_seq: 0,
+                eos: false,
+                result_batch: ResultBatch::new(second_rows, false, 0, None),
+            })
+            .expect("write second result batch");
+        handle.finish().expect("finish once");
+        handle.finish().expect("repeated finish is idempotent");
+
+        let TryFetchResult::Ready(first) = try_fetch(finst_id) else {
+            panic!("expected first result batch");
+        };
+        let TryFetchResult::Ready(second) = try_fetch(finst_id) else {
+            panic!("expected second result batch");
+        };
+        let TryFetchResult::Ready(eos) = try_fetch(finst_id) else {
+            panic!("expected eos");
+        };
+        assert_eq!(first.result_batch.rows.len(), 20);
+        assert_eq!(second.result_batch.rows.len(), 17);
+        assert!(eos.eos);
+    }
+
+    #[test]
+    fn fragment_result_session_abort_is_idempotent_and_rejects_late_write() {
+        let finst_id = UniqueId { hi: 9903, lo: 9904 };
+        let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
+
+        handle.abort(ResultAbort::Cancelled);
+        handle.abort(ResultAbort::Failed);
+        assert!(
+            handle
+                .write_legacy(FetchResult {
+                    packet_seq: 0,
+                    eos: false,
+                    result_batch: ResultBatch::empty(),
+                })
+                .is_err()
+        );
+        let TryFetchResult::Error(error) = try_fetch(finst_id) else {
+            panic!("expected cancelled result");
+        };
+        assert!(matches!(error.kind, FetchErrorKind::Cancelled));
+    }
+
+    #[test]
+    fn fragment_result_session_late_abort_preserves_finished_result() {
+        let finst_id = UniqueId { hi: 9905, lo: 9906 };
+        let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
+        handle
+            .write_legacy(FetchResult {
+                packet_seq: 0,
+                eos: false,
+                result_batch: ResultBatch::new(vec![b"done".to_vec()], false, 0, None),
+            })
+            .expect("write result");
+        handle.finish().expect("finish result");
+        handle.abort(ResultAbort::Cancelled);
+
+        let TryFetchResult::Ready(result) = try_fetch(finst_id) else {
+            panic!("late abort must not discard a finished result");
+        };
+        assert_eq!(result.result_batch.rows, vec![b"done".to_vec()]);
+    }
 
     #[test]
     fn cancel_is_observable() {

@@ -78,7 +78,7 @@ pub fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, S
     }
 }
 
-pub(crate) fn thrift_compact_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
+pub fn thrift_compact_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
     // Compact thrift encoding size for statistic rows can vary significantly
     // (for example large HLL hex payloads in statistics v9). Retry with a
     // larger transport buffer to avoid fixed-capacity transport failures.

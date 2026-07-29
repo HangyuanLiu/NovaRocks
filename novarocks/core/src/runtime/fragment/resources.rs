@@ -23,8 +23,10 @@ use crate::runtime::fragment::error::{
     FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
 };
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::{exchange, result_buffer, sink_commit};
+use crate::runtime::fragment::io::{
+    FragmentResultSession, FragmentResultWriter, ResultAbort, ResultWriteSpec,
+};
+use crate::runtime::{exchange, sink_commit};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ResourceKind {
@@ -110,30 +112,22 @@ impl Drop for SinkCommitLease {
 }
 
 pub(crate) struct ResultRegistration {
-    finst_id: UniqueId,
+    session: Arc<dyn FragmentResultSession>,
     active: bool,
     cleanup_should_fail: bool,
 }
 
 impl ResultRegistration {
     pub(crate) fn acquire(
-        finst_id: UniqueId,
-        typed: bool,
-        mem_tracker: Option<&Arc<MemTracker>>,
+        writer: &Arc<dyn FragmentResultWriter>,
+        spec: ResultWriteSpec,
         cleanup_should_fail: bool,
     ) -> Result<Self, FragmentLaunchError> {
-        let result = if typed {
-            result_buffer::try_create_typed_sender(finst_id)
-        } else {
-            result_buffer::try_create_sender(finst_id)
-        };
-        result.map_err(registration_error)?;
-        if let Some(root) = mem_tracker {
-            let tracker = MemTracker::new_child(format!("ResultBuffer: finst={finst_id}"), root);
-            result_buffer::set_mem_tracker(finst_id, tracker);
-        }
+        let session = writer
+            .open(spec)
+            .map_err(|error| registration_error(error.to_string()))?;
         Ok(Self {
-            finst_id,
+            session,
             active: true,
             cleanup_should_fail,
         })
@@ -141,7 +135,7 @@ impl ResultRegistration {
 
     fn rollback(&mut self) -> Result<(), String> {
         if self.active {
-            result_buffer::discard(self.finst_id);
+            self.session.abort(ResultAbort::PrepareRollback);
             self.active = false;
         }
         if self.cleanup_should_fail {
@@ -156,9 +150,9 @@ impl ResultRegistration {
         self.cleanup_should_fail = false;
     }
 
-    fn finish_failure(&mut self, error: String) {
+    fn finish_failure(&mut self, _error: String) {
         if self.active {
-            result_buffer::close_error(self.finst_id, error);
+            self.session.abort(ResultAbort::Failed);
             self.active = false;
         }
         self.cleanup_should_fail = false;
@@ -166,7 +160,7 @@ impl ResultRegistration {
 
     fn finish_cancelled(&mut self) {
         if self.active {
-            result_buffer::cancel(self.finst_id);
+            self.session.abort(ResultAbort::Cancelled);
             self.active = false;
         }
         self.cleanup_should_fail = false;
@@ -295,19 +289,24 @@ impl FragmentResources {
     pub(crate) fn acquire_result(
         &mut self,
         program: &FragmentProgram,
-        instance: &FragmentInstanceSpec,
-        mem_tracker: Option<&Arc<MemTracker>>,
+        writer: &Arc<dyn FragmentResultWriter>,
+        spec: ResultWriteSpec,
     ) -> Result<(), FragmentLaunchError> {
         if program.sink().kind() != FragmentSinkKind::Result {
             return Ok(());
         }
         self.result = Some(ResultRegistration::acquire(
-            instance.fragment_instance_id().get(),
-            instance.runtime_options().typed_result_sink(),
-            mem_tracker,
+            writer,
+            spec,
             self.cleanup_faults.should_fail(ResourceKind::Result),
         )?);
         Ok(())
+    }
+
+    pub(crate) fn result_session(&self) -> Option<Arc<dyn FragmentResultSession>> {
+        self.result
+            .as_ref()
+            .map(|registration| Arc::clone(&registration.session))
     }
 
     pub(crate) fn acquire_exchange(

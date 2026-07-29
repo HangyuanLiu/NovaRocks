@@ -21,7 +21,6 @@ pub mod cluster_heartbeat;
 pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
-pub mod exchange_sender;
 #[cfg(feature = "compat")]
 pub(crate) mod exec_state_reporter;
 #[cfg(feature = "compat")]
@@ -50,7 +49,7 @@ pub mod native_fragment_ingress;
 #[cfg(test)]
 pub(crate) mod native_fragment_service_test_fixture;
 pub mod report_worker;
-pub(crate) mod result_batch_wire;
+pub mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
 #[cfg(feature = "compat")]

@@ -36,6 +36,7 @@ use crate::exec::expr::ExprArena;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
@@ -61,6 +62,7 @@ impl MultiCastDataStreamSinkFactory {
         sender_id: Option<i32>,
         partition_arena: ExprArena,
         plan_node_id: i32,
+        transmitter: Arc<dyn ExchangeFrameTransmitter>,
     ) -> Self {
         let name = if plan_node_id >= 0 {
             format!("MULTI_CAST_DATA_STREAM_SINK (id={plan_node_id})")
@@ -87,6 +89,7 @@ impl MultiCastDataStreamSinkFactory {
                         sender_id,
                         plan_node_id,
                         partition_arena.clone(),
+                        Arc::clone(&transmitter),
                     ),
                 });
             }

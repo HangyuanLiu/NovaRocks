@@ -59,6 +59,7 @@ use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSh
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
+use crate::runtime::fragment::io::{FragmentLookupClient, UnavailableFragmentLookupClient};
 use crate::runtime_filter::model::contract::ReductionRequirement;
 use crate::runtime_filter::port::producer::ProducerPortKind;
 use crate::runtime_filter::port::subscription::SubscriptionKind;
@@ -115,6 +116,7 @@ struct PipelineBuildContext {
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
+    lookup_client: Arc<dyn FragmentLookupClient>,
     next_pipeline_id: i32,
     pipeline_dop: i32,
 }
@@ -173,6 +175,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         pipeline_dop,
         None,
         PipelineRuntimeFilterExecution { context: None },
+        Arc::new(UnavailableFragmentLookupClient),
     )
 }
 
@@ -210,6 +213,33 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
     root_sink_dop: Option<i32>,
     context: Option<NativeRuntimeFilterExecutionContext>,
 ) -> Result<PipelineGraph, String> {
+    build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client(
+        plan,
+        debug,
+        dep_manager,
+        exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
+        pipeline_dop,
+        root_sink_dop,
+        context,
+        Arc::new(UnavailableFragmentLookupClient),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client(
+    plan: &ExecPlan,
+    debug: bool,
+    dep_manager: DependencyManager,
+    exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    context: Option<NativeRuntimeFilterExecutionContext>,
+    lookup_client: Arc<dyn FragmentLookupClient>,
+) -> Result<PipelineGraph, String> {
     build_pipeline_graph_in_mode(
         plan,
         debug,
@@ -220,6 +250,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         pipeline_dop,
         root_sink_dop,
         PipelineRuntimeFilterExecution { context },
+        lookup_client,
     )
 }
 
@@ -243,6 +274,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_cont
         pipeline_dop,
         None,
         PipelineRuntimeFilterExecution { context },
+        Arc::new(UnavailableFragmentLookupClient),
     )
 }
 
@@ -256,6 +288,7 @@ fn build_pipeline_graph_in_mode(
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
+    lookup_client: Arc<dyn FragmentLookupClient>,
 ) -> Result<PipelineGraph, String> {
     let arena = Arc::new(plan.arena.clone());
     let mut ctx = PipelineBuildContext {
@@ -264,6 +297,7 @@ fn build_pipeline_graph_in_mode(
         runtime_filter_execution,
         exchange_bindings,
         scan_bindings,
+        lookup_client,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
     };
@@ -2071,8 +2105,10 @@ fn build_pipeline_for_node(
                     fetch.node_id,
                     fetch.target_node_id,
                     fetch.row_pos_descs.clone(),
+                    fetch.output_slots_by_tuple.clone(),
                     fetch.nodes_info.clone(),
                     fetch.output_chunk_schema.clone(),
+                    Arc::clone(&ctx.lookup_client),
                 )));
             Ok(PipelineBuildResult {
                 pipeline: child_build.pipeline,

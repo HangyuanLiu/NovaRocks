@@ -9,7 +9,10 @@ use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::{grpc_server, report_worker};
 
-use crate::fragment::NativeFragmentService;
+use crate::fragment::{
+    NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
+    native_fragment_event_sink, native_result_writer,
+};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -134,7 +137,12 @@ impl BackendApplicationHost {
             )?;
         let bind_host = config.server.host.clone();
         let grpc_port = config.server.grpc_port;
-        let native_fragment_service = Arc::new(NativeFragmentService::new());
+        let native_fragment_service = Arc::new(NativeFragmentService::new(
+            grpc_exchange_transmitter(),
+            grpc_fragment_lookup_client(),
+            native_result_writer(),
+            native_fragment_event_sink(),
+        ));
 
         grpc_server::start_grpc_exchange_server(
             &bind_host,

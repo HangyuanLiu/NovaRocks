@@ -27,9 +27,9 @@ use crate::runtime::io::io_executor;
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
-use crate::service::internal_rpc_transport::{
-    InternalRpcTransport, internal_rpc_transport_for_current_process,
-};
+
+use super::exchange::{ExchangeFrame, ExchangeFrameTransmitter};
+use super::exchange_metrics::observe_exchange_shuffle_bytes;
 
 pub struct ExchangeSendTracker {
     inflight_tasks: AtomicUsize,
@@ -64,16 +64,8 @@ impl ExchangeSendTracker {
 }
 
 pub struct ExchangeSendTask {
-    pub dest_host: String,
-    pub dest_port: u16,
-    pub finst_id: UniqueId,
-    pub sender_finst_id: UniqueId,
-    pub node_id: i32,
-    pub sender_id: i32,
-    pub be_number: i32,
-    pub eos: bool,
-    pub sequence: i64,
-    pub payload: Vec<u8>,
+    pub frame: ExchangeFrame,
+    pub transmitter: Arc<dyn ExchangeFrameTransmitter>,
     pub payload_accounting: Option<TrackedBytes>,
     pub encode_ns: u128,
     pub payload_bytes: usize,
@@ -95,11 +87,11 @@ struct ExchangeSendKey {
 impl ExchangeSendKey {
     fn from_task(task: &ExchangeSendTask) -> Self {
         Self {
-            dest_host: task.dest_host.clone(),
-            dest_port: task.dest_port,
-            finst_id: task.finst_id,
-            node_id: task.node_id,
-            sender_id: task.sender_id,
+            dest_host: task.frame.destination.host().to_string(),
+            dest_port: task.frame.destination.port() as u16,
+            finst_id: task.frame.destination_fragment_instance_id,
+            node_id: task.frame.destination_node_id,
+            sender_id: task.frame.sender_id,
         }
     }
 }
@@ -359,41 +351,35 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
     // reservation symmetrically with the global one on completion.
     let dest_key = ExchangeSendKey::from_task(&task);
 
-    let result = match internal_rpc_transport_for_current_process() {
-        #[cfg(feature = "compat")]
-        InternalRpcTransport::BrpcCompat => crate::service::internal_rpc_client::send_chunks(
-            &task.dest_host,
-            task.dest_port,
-            task.finst_id,
-            task.node_id,
-            task.sender_id,
-            task.be_number,
-            task.eos,
-            task.sequence,
-            task.payload,
-        ),
-        InternalRpcTransport::Grpc => crate::service::grpc_client::send_chunks(
-            &task.dest_host,
-            task.dest_port,
-            task.finst_id,
-            task.node_id,
-            task.sender_id,
-            task.be_number,
-            task.eos,
-            task.sequence,
-            task.payload,
-        ),
-    };
+    let ExchangeSendTask {
+        frame,
+        transmitter,
+        payload_accounting,
+        encode_ns,
+        payload_bytes,
+        profiles,
+        notify,
+        error_state,
+        tracker,
+    } = task;
+    let destination = frame.destination.host().to_string();
+    let destination_fragment_instance_id = frame.destination_fragment_instance_id;
+    let sender_fragment_instance_id = frame.sender_fragment_instance_id;
+    let destination_node_id = frame.destination_node_id;
+    let sender_id = frame.sender_id;
+    let eos = frame.eos;
+    let sequence = frame.sequence;
+    let result = transmitter.transmit(frame);
     let send_ns = send_start.elapsed().as_nanos();
 
-    if let Some(profile) = task.profiles.as_ref() {
+    if let Some(profile) = profiles.as_ref() {
         profile
             .common
             .counter_add("RequestSent", ProfileUnit::Unit, 1);
         profile.common.counter_add(
             "BytesSent",
             ProfileUnit::Bytes,
-            clamp_u128_to_i64(task.payload_bytes as u128),
+            clamp_u128_to_i64(payload_bytes as u128),
         );
         profile.unique.counter_add(
             "NetworkTime",
@@ -403,47 +389,43 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
         profile.common.counter_add(
             "OverallTime",
             ProfileUnit::TimeNs,
-            clamp_u128_to_i64(task.encode_ns.saturating_add(send_ns)),
+            clamp_u128_to_i64(encode_ns.saturating_add(send_ns)),
         );
-    }
-
-    if result.is_ok() {
-        crate::service::metrics_http::observe_exchange_shuffle_bytes(task.payload_bytes);
     }
 
     if let Err(err) = result {
-        task.error_state.set_error(err.clone());
+        error_state.set_error(err.to_string());
         error!(
             "exchange send failed: dest={} dest_finst={} sender_finst={} node_id={} sender_id={} seq={} error={}",
-            task.dest_host,
-            task.finst_id,
-            task.sender_finst_id,
-            task.node_id,
-            task.sender_id,
-            task.sequence,
+            destination,
+            destination_fragment_instance_id,
+            sender_fragment_instance_id,
+            destination_node_id,
+            sender_id,
+            sequence,
             err
         );
-        crate::runtime::query_context::query_context_manager()
-            .propagate_sender_error(task.sender_finst_id, err);
     } else {
+        observe_exchange_shuffle_bytes(payload_bytes);
         debug!(
             "exchange send completed: dest={} finst={} node_id={} sender_id={} eos={} seq={} bytes={}",
-            task.dest_host,
-            task.finst_id,
-            task.node_id,
-            task.sender_id,
-            task.eos,
-            task.sequence,
-            task.payload_bytes
+            destination,
+            destination_fragment_instance_id,
+            destination_node_id,
+            sender_id,
+            eos,
+            sequence,
+            payload_bytes
         );
     }
 
     inflight.fetch_sub(reserve_bytes, Ordering::AcqRel);
     exchange_send_queue().release_per_dest(&dest_key, reserve_bytes);
-    task.tracker.on_complete(reserve_bytes);
-    let notify = task.notify.defer_notify();
-    notify.arm();
+    tracker.on_complete(reserve_bytes);
+    let deferred_notify = notify.defer_notify();
+    deferred_notify.arm();
     exchange_send_queue().notify_send_observers();
+    drop(payload_accounting);
 }
 
 fn spawn_send_task(
@@ -492,9 +474,129 @@ pub fn exchange_send_queue() -> &'static ExchangeSendQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime::fragment::io::{FragmentIoError, FragmentIoErrorKind, FragmentIoOperation};
+
+    #[derive(Default)]
+    struct RecordingTransmitter {
+        frames: Mutex<Vec<ExchangeFrame>>,
+        failure: Option<FragmentIoError>,
+    }
+
+    impl ExchangeFrameTransmitter for RecordingTransmitter {
+        fn transmit(&self, frame: ExchangeFrame) -> Result<(), FragmentIoError> {
+            self.frames
+                .lock()
+                .expect("recorded frames lock")
+                .push(frame);
+            if let Some(error) = self.failure.as_ref() {
+                return Err(error.clone());
+            }
+            Ok(())
+        }
+    }
 
     fn finst() -> UniqueId {
         UniqueId { hi: 1, lo: 1 }
+    }
+
+    fn exchange_task(
+        transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        error_state: Arc<RuntimeErrorState>,
+        tracker: Arc<ExchangeSendTracker>,
+    ) -> ExchangeSendTask {
+        ExchangeSendTask {
+            frame: ExchangeFrame {
+                destination: RuntimeEndpoint::new("be-2", 9060).expect("destination"),
+                destination_fragment_instance_id: UniqueId { hi: 2, lo: 3 },
+                sender_fragment_instance_id: UniqueId { hi: 4, lo: 5 },
+                destination_node_id: 6,
+                sender_id: 7,
+                backend_number: 8,
+                sequence: 9,
+                eos: true,
+                payload: vec![10, 11],
+            },
+            transmitter,
+            payload_accounting: None,
+            encode_ns: 12,
+            payload_bytes: 2,
+            profiles: None,
+            notify: Arc::new(Observable::default()),
+            error_state,
+            tracker,
+        }
+    }
+
+    #[test]
+    fn worker_forwards_the_complete_exchange_frame_to_the_injected_transmitter() {
+        let transmitter = Arc::new(RecordingTransmitter::default());
+        let error_state = Arc::new(RuntimeErrorState::default());
+        let tracker = ExchangeSendTracker::new();
+        tracker.on_enqueue(2);
+
+        run_send_task(
+            exchange_task(
+                Arc::clone(&transmitter) as Arc<dyn ExchangeFrameTransmitter>,
+                Arc::clone(&error_state),
+                Arc::clone(&tracker),
+            ),
+            Arc::new(AtomicUsize::new(2)),
+            2,
+        );
+
+        let frames = transmitter.frames.lock().expect("recorded frames lock");
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0];
+        assert_eq!(frame.destination.host(), "be-2");
+        assert_eq!(frame.destination.port(), 9060);
+        assert_eq!(
+            frame.destination_fragment_instance_id,
+            UniqueId { hi: 2, lo: 3 }
+        );
+        assert_eq!(frame.sender_fragment_instance_id, UniqueId { hi: 4, lo: 5 });
+        assert_eq!(frame.destination_node_id, 6);
+        assert_eq!(frame.sender_id, 7);
+        assert_eq!(frame.backend_number, 8);
+        assert_eq!(frame.sequence, 9);
+        assert!(frame.eos);
+        assert_eq!(frame.payload, vec![10, 11]);
+        assert!(error_state.error().is_none());
+        assert!(tracker.is_idle());
+    }
+
+    #[test]
+    fn worker_records_transmit_failure_only_in_its_fragment_error_state() {
+        let transmitter = Arc::new(RecordingTransmitter {
+            frames: Mutex::new(Vec::new()),
+            failure: Some(FragmentIoError::new(
+                FragmentIoOperation::ExchangeTransmit,
+                FragmentIoErrorKind::Unavailable,
+                "receiver unavailable",
+            )),
+        });
+        let error_state = Arc::new(RuntimeErrorState::default());
+        let tracker = ExchangeSendTracker::new();
+        tracker.on_enqueue(2);
+
+        run_send_task(
+            exchange_task(
+                Arc::clone(&transmitter) as Arc<dyn ExchangeFrameTransmitter>,
+                Arc::clone(&error_state),
+                Arc::clone(&tracker),
+            ),
+            Arc::new(AtomicUsize::new(2)),
+            2,
+        );
+
+        assert!(
+            error_state
+                .error()
+                .is_some_and(|error| error.contains("receiver unavailable"))
+        );
+        assert!(tracker.is_idle());
     }
 
     #[test]

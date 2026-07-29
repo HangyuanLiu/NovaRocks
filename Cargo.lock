@@ -3280,8 +3280,12 @@ name = "novarocks-compat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "hex",
  "novarocks",
  "prost 0.13.5",
+ "serde_json",
+ "thrift",
 ]
 
 [[package]]

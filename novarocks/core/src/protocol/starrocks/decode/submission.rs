@@ -35,9 +35,11 @@ use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec,
     FragmentRuntimeOptions, ScanAssignments,
 };
+use crate::runtime::fragment::io::{
+    FragmentEventSink, FragmentResultWriter, ResultPresentation, ResultProjection, ResultWriteSpec,
+};
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::LookupFetcherLifecycle;
-use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
 use crate::thrift::{descriptors, internal_service, planner, types};
 
 use super::dependency::{
@@ -112,7 +114,8 @@ impl DecodedStarRocksFragment {
 pub struct StarRocksSubmissionMetadata {
     descriptor_snapshot: Option<DescriptorSnapshot>,
     row_position_descriptors: HashMap<i32, RowPositionDescriptor>,
-    result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+    result_override: Option<(ResultPresentation, Option<Vec<ResultProjection>>)>,
+    typed_result_sink: bool,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
     report_destination: Option<StarRocksReportDestination>,
@@ -158,8 +161,24 @@ impl StarRocksSubmissionMetadata {
 
     pub(crate) fn result_override(
         &self,
-    ) -> Option<&(ResultSinkConfig, Option<Vec<ResultProjection>>)> {
+    ) -> Option<&(ResultPresentation, Option<Vec<ResultProjection>>)> {
         self.result_override.as_ref()
+    }
+
+    fn result_write_spec(
+        &self,
+        fragment_instance_id: crate::common::types::UniqueId,
+    ) -> Option<ResultWriteSpec> {
+        self.result_override
+            .as_ref()
+            .map(|(presentation, projections)| {
+                ResultWriteSpec::new(
+                    fragment_instance_id,
+                    *presentation,
+                    projections.clone(),
+                    self.typed_result_sink,
+                )
+            })
     }
 
     pub const fn root_sink_dop(&self) -> Option<i32> {
@@ -186,13 +205,24 @@ impl StarRocksSubmissionMetadata {
         &self,
         profiler: Option<crate::runtime::profile::Profiler>,
         mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
+        exchange_transmitter: std::sync::Arc<
+            dyn crate::runtime::fragment::io::ExchangeFrameTransmitter,
+        >,
+        lookup_client: std::sync::Arc<dyn crate::runtime::fragment::io::FragmentLookupClient>,
+        result_writer: std::sync::Arc<dyn FragmentResultWriter>,
+        event_sink: std::sync::Arc<dyn FragmentEventSink>,
+        fragment_instance_id: crate::common::types::UniqueId,
     ) -> crate::runtime::fragment::FragmentPrepareContext {
         crate::runtime::fragment::FragmentPrepareContext::new_with_execution_overrides(
             profiler,
             mem_tracker,
-            self.result_override.clone(),
+            self.result_write_spec(fragment_instance_id),
             self.root_sink_dop,
             self.group_execution_scan_dop,
+            exchange_transmitter,
+            lookup_client,
+            result_writer,
+            event_sink,
         )
     }
 }
@@ -678,6 +708,7 @@ fn decode_draft_parts(
             descriptor_snapshot,
             row_position_descriptors,
             result_override,
+            typed_result_sink: instance.typed_result_sink,
             root_sink_dop,
             group_execution_scan_dop: input.group_execution_scan_dop,
             report_destination,

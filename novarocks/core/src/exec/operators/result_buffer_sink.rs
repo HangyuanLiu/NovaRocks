@@ -18,16 +18,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::common::types::{FetchResult, UniqueId};
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::result_buffer;
+use crate::runtime::fragment::io::FragmentResultSession;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::service::result_batch_wire::{
-    ResultProjection, ResultSinkConfig, ResultSinkType, build_empty_fetch_result_batch_template,
-    build_fetch_result_batch_for_chunk,
-};
 
 #[derive(Debug)]
 struct ResultBufferSinkShared {
@@ -52,28 +47,19 @@ impl ResultBufferSinkShared {
 /// Factory for result sinks that stream encoded batches directly into the fetch result buffer.
 pub struct ResultBufferSinkFactory {
     name: String,
-    output_projections: Option<Vec<ResultProjection>>,
-    result_sink_config: ResultSinkConfig,
-    typed_result_sink: bool,
+    session: Arc<dyn FragmentResultSession>,
     shared: Arc<ResultBufferSinkShared>,
 }
 
 impl ResultBufferSinkFactory {
-    pub fn new(
-        output_projections: Option<Vec<ResultProjection>>,
-        result_sink_config: ResultSinkConfig,
-        plan_node_id: Option<i32>,
-        typed_result_sink: bool,
-    ) -> Self {
+    pub fn new(session: Arc<dyn FragmentResultSession>, plan_node_id: Option<i32>) -> Self {
         let plan_node_id = match plan_node_id {
             Some(id) if id >= 0 => id,
             _ => -1,
         };
         Self {
             name: format!("RESULT_BUFFER_SINK (plan_node_id={plan_node_id})"),
-            output_projections,
-            result_sink_config,
-            typed_result_sink,
+            session,
             shared: Arc::new(ResultBufferSinkShared::new()),
         }
     }
@@ -88,9 +74,7 @@ impl OperatorFactory for ResultBufferSinkFactory {
         self.shared.init_driver_count(dop);
         Box::new(ResultBufferSinkOperator {
             name: self.name.clone(),
-            output_projections: self.output_projections.clone(),
-            result_sink_config: self.result_sink_config,
-            typed_result_sink: self.typed_result_sink,
+            session: Arc::clone(&self.session),
             shared: Arc::clone(&self.shared),
             finished: false,
         })
@@ -103,40 +87,12 @@ impl OperatorFactory for ResultBufferSinkFactory {
 
 struct ResultBufferSinkOperator {
     name: String,
-    output_projections: Option<Vec<ResultProjection>>,
-    result_sink_config: ResultSinkConfig,
-    typed_result_sink: bool,
+    session: Arc<dyn FragmentResultSession>,
     shared: Arc<ResultBufferSinkShared>,
     finished: bool,
 }
 
-impl ResultBufferSinkOperator {
-    fn finst_id(&self, state: &RuntimeState) -> Result<UniqueId, String> {
-        state
-            .fragment_instance_id()
-            .ok_or_else(|| "RESULT_SINK missing fragment_instance_id".to_string())
-    }
-
-    fn ensure_eos_template(&self, state: &RuntimeState) -> Result<UniqueId, String> {
-        let finst_id = self.finst_id(state)?;
-        if self.typed_result_sink {
-            return Ok(finst_id);
-        }
-        let template = build_empty_fetch_result_batch_template(self.result_sink_config)?;
-        result_buffer::set_eos_template(finst_id, template);
-        Ok(finst_id)
-    }
-
-    fn validate_typed_result_sink(&self) -> Result<(), String> {
-        match self.result_sink_config.sink_type {
-            ResultSinkType::MySqlProtocol => Ok(()),
-            other => Err(format!(
-                "typed RESULT_SINK only supports MYSQL_PROTOCAL result sink, got {:?}",
-                other
-            )),
-        }
-    }
-}
+impl ResultBufferSinkOperator {}
 
 impl Operator for ResultBufferSinkOperator {
     fn name(&self) -> &str {
@@ -165,50 +121,30 @@ impl ProcessorOperator for ResultBufferSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         if self.finished || chunk.is_empty() {
             return Ok(());
         }
 
-        let finst_id = self.ensure_eos_template(state)?;
-        if self.typed_result_sink {
-            self.validate_typed_result_sink()?;
-            let payload = crate::runtime::exchange::encode_chunks(&[chunk], true)?;
-            return result_buffer::insert_typed(finst_id, payload);
-        }
-        let batch = build_fetch_result_batch_for_chunk(
-            &chunk,
-            self.output_projections.as_deref(),
-            self.result_sink_config,
-        )?;
-        result_buffer::insert(
-            finst_id,
-            FetchResult {
-                packet_seq: 0,
-                eos: false,
-                result_batch: batch,
-            },
-        );
-        Ok(())
+        self.session.write(chunk).map_err(|error| error.to_string())
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
         if self.finished {
             return Ok(());
         }
         self.finished = true;
 
-        let finst_id = self.ensure_eos_template(state)?;
         let prev = self.shared.remaining_drivers.fetch_sub(1, Ordering::AcqRel);
         if prev <= 0 {
             return Err("RESULT_SINK driver count underflow".to_string());
         }
         if prev == 1 {
-            result_buffer::close_ok(finst_id);
+            self.session.finish().map_err(|error| error.to_string())?;
         }
         Ok(())
     }

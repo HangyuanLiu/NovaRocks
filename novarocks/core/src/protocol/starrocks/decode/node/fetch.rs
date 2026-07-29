@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::common::ids::SlotId;
 use crate::exec::node::fetch::FetchNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::starrocks::decode::descriptor::decode_lookup_nodes_info;
@@ -85,6 +86,16 @@ pub(crate) fn lower_fetch_node(
         "FETCH_NODE requires descriptor table for output chunk schema".to_string()
     })?;
     let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &fetch_layout)?;
+    let mut output_slots_by_tuple = std::collections::HashMap::<i32, Vec<SlotId>>::new();
+    for (tuple_id, slot_id) in &fetch_layout.order {
+        let slot_id = SlotId::try_from(*slot_id).map_err(|detail| {
+            format!("FETCH_NODE output slot id {slot_id} is invalid: {detail}")
+        })?;
+        output_slots_by_tuple
+            .entry(*tuple_id)
+            .or_default()
+            .push(slot_id);
+    }
 
     Ok(Lowered {
         node: ExecNode {
@@ -93,6 +104,7 @@ pub(crate) fn lower_fetch_node(
                 node_id: node.node_id,
                 target_node_id,
                 row_pos_descs,
+                output_slots_by_tuple,
                 nodes_info: fetch
                     .nodes_info
                     .as_ref()

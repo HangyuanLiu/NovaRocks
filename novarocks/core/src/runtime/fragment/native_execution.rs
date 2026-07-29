@@ -26,6 +26,9 @@ use crate::common::config::debug_exec_node_output;
 use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::runtime::fragment::error::{FragmentExecutionError, FragmentExecutionErrorKind};
+use crate::runtime::fragment::io::{
+    ExchangeFrameTransmitter, FragmentResultWriter, ResultPresentation, ResultWriteSpec,
+};
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
@@ -34,7 +37,6 @@ use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
-use crate::runtime::result_buffer;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 #[cfg(test)]
@@ -207,9 +209,17 @@ pub(crate) fn native_execution_readiness_channel() -> (
 pub(crate) fn execute_native_submission(
     submission: FragmentSubmission,
     context: NativeExecutionContext,
+    exchange_transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    result_writer: std::sync::Arc<dyn FragmentResultWriter>,
 ) -> Result<FragmentOutput, FragmentExecutionError> {
     let failure_trigger = configured_fragment_failure_trigger();
-    execute_native_submission_with_failure_trigger(submission, context, failure_trigger.as_deref())
+    execute_native_submission_with_failure_trigger(
+        submission,
+        context,
+        exchange_transmitter,
+        result_writer,
+        failure_trigger.as_deref(),
+    )
 }
 
 fn configured_fragment_failure_trigger() -> Option<PathBuf> {
@@ -219,6 +229,8 @@ fn configured_fragment_failure_trigger() -> Option<PathBuf> {
 pub(crate) fn execute_native_submission_with_failure_trigger(
     submission: FragmentSubmission,
     context: NativeExecutionContext,
+    exchange_transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    result_writer: std::sync::Arc<dyn FragmentResultWriter>,
     failure_trigger: Option<&Path>,
 ) -> Result<FragmentOutput, FragmentExecutionError> {
     let instance = submission.instance();
@@ -256,14 +268,23 @@ pub(crate) fn execute_native_submission_with_failure_trigger(
         wait_at_test_result_buffer_creation_gate(fragment_instance_id);
         #[cfg(test)]
         maybe_panic_before_ready(fragment_instance_id);
-        prepare_result_buffer(
-            fragment_instance_id,
-            instance.runtime_options().typed_result_sink(),
-            context.mem_tracker.as_ref(),
-        );
         context.readiness.signal_ready();
     }
-    let sink = materialize_fragment_sink(program, instance).map_err(|error| {
+    let result_session = if program.sink().kind() == FragmentSinkKind::Result {
+        let spec = ResultWriteSpec::new(
+            fragment_instance_id,
+            ResultPresentation::MysqlText,
+            None,
+            instance.runtime_options().typed_result_sink(),
+        );
+        Some(result_writer.open(spec).map_err(|error| {
+            FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
+        })?)
+    } else {
+        None
+    };
+    let sink = materialize_fragment_sink(program, instance, exchange_transmitter, result_session)
+        .map_err(|error| {
         FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
     })?;
     if program.sink().kind() != FragmentSinkKind::Result {
@@ -372,22 +393,6 @@ fn consume_fragment_failure_trigger(
     Ok(Some(token.to_string()))
 }
 
-fn prepare_result_buffer(
-    finst_id: crate::common::types::UniqueId,
-    typed_result_sink: bool,
-    mem_tracker: Option<&Arc<MemTracker>>,
-) {
-    if typed_result_sink {
-        result_buffer::create_typed_sender(finst_id);
-    } else {
-        result_buffer::create_sender(finst_id);
-    }
-    if let Some(root) = mem_tracker {
-        let tracker = MemTracker::new_child(format!("ResultBuffer: finst={finst_id}"), root);
-        result_buffer::set_mem_tracker(finst_id, tracker);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -463,6 +468,8 @@ mod tests {
                 readiness,
                 runtime_filter: None,
             },
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            crate::runtime::fragment::io::result::discard_result_writer(),
         )
         .expect("noop submission executes");
 
@@ -484,6 +491,8 @@ mod tests {
                 readiness,
                 runtime_filter: None,
             },
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            crate::runtime::fragment::io::result::discard_result_writer(),
             Some(trigger.as_path()),
         )
         .expect_err("armed fragment must fail");
@@ -510,6 +519,8 @@ mod tests {
                 readiness,
                 runtime_filter: None,
             },
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            crate::runtime::fragment::io::result::discard_result_writer(),
             Some(trigger.as_path()),
         )
         .expect("consumed trigger must not poison later fragments");

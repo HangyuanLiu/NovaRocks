@@ -35,14 +35,6 @@ static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     .expect("register novarocks_fragment_scheduled_total")
 });
 
-static EXCHANGE_SHUFFLE_BYTES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!(
-        "novarocks_exchange_shuffle_bytes_total",
-        "Total number of exchange shuffle payload bytes sent."
-    )
-    .expect("register novarocks_exchange_shuffle_bytes_total")
-});
-
 static HEARTBEAT_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(HistogramOpts::new(
         "novarocks_heartbeat_rtt_seconds",
@@ -70,10 +62,6 @@ static BACKENDS_BY_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 pub(crate) fn observe_fragment_scheduled() {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc();
-}
-
-pub(crate) fn observe_exchange_shuffle_bytes(bytes: usize) {
-    Lazy::force(&EXCHANGE_SHUFFLE_BYTES_TOTAL).inc_by(bytes as u64);
 }
 
 pub(crate) fn observe_heartbeat_rtt(duration: Duration) {
@@ -183,7 +171,7 @@ pub(crate) fn render_metrics_json() -> Result<String, String> {
 
 fn refresh_backend_gauges() {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL);
-    Lazy::force(&EXCHANGE_SHUFFLE_BYTES_TOTAL);
+    crate::runtime::fragment::io::exchange_metrics::ensure_exchange_metrics_registered();
     Lazy::force(&HEARTBEAT_RTT_SECONDS);
     Lazy::force(&LIVE_BACKENDS);
     Lazy::force(&BACKENDS_BY_STATE);
@@ -196,7 +184,7 @@ mod tests {
     #[test]
     fn rendered_metrics_include_cluster_core_names() {
         observe_fragment_scheduled();
-        observe_exchange_shuffle_bytes(7);
+        crate::runtime::fragment::io::exchange_metrics::observe_exchange_shuffle_bytes(7);
         observe_heartbeat_rtt(Duration::from_millis(5));
 
         let body = render_metrics().expect("render metrics");
