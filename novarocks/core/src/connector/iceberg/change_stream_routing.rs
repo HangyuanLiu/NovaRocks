@@ -20,10 +20,6 @@ use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology;
 
-pub(crate) fn writer_fragment_id_from_finst_lo(finst_lo: i64) -> i32 {
-    (finst_lo >> 16) as i32
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriterCommitPlan {
     branch_by_writer_fragment: BTreeMap<i32, ChangeStreamBranchKind>,
@@ -76,8 +72,12 @@ impl ChangeStreamWriterCommitPlan {
             .collect()
     }
 
-    fn branch_for_finst_lo(&self, finst_lo: i64) -> Result<ChangeStreamBranchKind, String> {
-        let fragment_id = writer_fragment_id_from_finst_lo(finst_lo);
+    fn branch_for_fragment_id(
+        &self,
+        fragment_id: FragmentId,
+    ) -> Result<ChangeStreamBranchKind, String> {
+        let fragment_id = i32::try_from(fragment_id)
+            .map_err(|_| format!("writer fragment {fragment_id} does not fit in commit plan"))?;
         self.branch_by_writer_fragment
             .get(&fragment_id)
             .copied()
@@ -198,7 +198,7 @@ pub(crate) fn route_change_stream_writer_reports(
             writer_files.push(file);
         }
         let branch = plan
-            .branch_for_finst_lo(writer.writer_key.fragment_instance_id.lo)
+            .branch_for_fragment_id(writer.fragment_id)
             .map_err(|message| {
                 ChangeStreamWriterRoutingError::new(
                     message,
@@ -310,12 +310,12 @@ mod tests {
         writer_report_to_iceberg_commit_info(report, metadata).expect("wire encode")
     }
 
-    fn writer_key(query_id: UniqueId, writer_fragment_id: i32, backend_num: i32) -> WriterKey {
+    fn writer_key(query_id: UniqueId, backend_num: i32) -> WriterKey {
         WriterKey {
             query_id,
             fragment_instance_id: UniqueId {
-                hi: 101,
-                lo: ((writer_fragment_id as i64) << 16) | backend_num as i64,
+                hi: -7_553_829_481_223_774_409,
+                lo: -2_319_882_701_944_413_767 + i64::from(backend_num),
             },
             backend_num,
         }
@@ -333,7 +333,8 @@ mod tests {
                 let backend_num = idx as i32;
                 WriterCommitInput {
                     writer_id: idx,
-                    writer_key: writer_key(query_id, writer_fragment_id, backend_num),
+                    fragment_id: writer_fragment_id as u32,
+                    writer_key: writer_key(query_id, backend_num),
                     iceberg_commits: vec![sink_commit_info_for_data_file(metadata, path)],
                     load_counters: BTreeMap::new(),
                     loaded_rows: 2,
@@ -349,13 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn finst_id_decodes_writer_fragment_id() {
-        let finst_lo = (42_i64 << 16) | 3;
-        assert_eq!(writer_fragment_id_from_finst_lo(finst_lo), 42);
-    }
-
-    #[test]
-    fn change_stream_commit_routes_fresh_files_to_appended_channel() {
+    fn change_stream_commit_routes_attempt_bound_finst_by_explicit_fragment() {
         let metadata = test_unpartitioned_metadata();
         let collector = test_collector(&metadata, CommitOpKind::RowDeltaDvFromFiles);
         let write_commit = write_commit_for_fragments(

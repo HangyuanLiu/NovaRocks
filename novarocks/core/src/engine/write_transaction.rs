@@ -489,6 +489,7 @@ mod tests {
             write_id,
             writers: vec![WriterCommitInput {
                 writer_id: 0,
+                fragment_id: 0,
                 writer_key,
                 iceberg_commits: Vec::new(),
                 load_counters: BTreeMap::new(),

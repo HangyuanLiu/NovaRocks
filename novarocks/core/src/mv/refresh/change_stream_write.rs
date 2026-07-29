@@ -238,6 +238,7 @@ mod tests {
             .map(
                 |(index, (fragment_id, path, content, record_count))| WriterCommitInput {
                     writer_id: index,
+                    fragment_id: fragment_id as u32,
                     writer_key: writer_key(query_id, fragment_id, index as i32),
                     iceberg_commits: vec![writer_report(table, path, content, record_count)],
                     load_counters: BTreeMap::new(),

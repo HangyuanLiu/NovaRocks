@@ -827,6 +827,7 @@ impl RootFetchMetadata {
 
 pub(crate) struct WriterRegistration {
     pub(crate) query_id: UniqueId,
+    pub(crate) fragment_id: FragmentId,
     pub(crate) fragment_instance_id: UniqueId,
     pub(crate) backend_num: i32,
 }
@@ -1101,6 +1102,7 @@ fn assemble_native_execution(
                 if is_writer {
                     writer_registrations.push(WriterRegistration {
                         query_id,
+                        fragment_id,
                         fragment_instance_id: placement.finst_id,
                         backend_num: placement.instance_index as i32,
                     });
