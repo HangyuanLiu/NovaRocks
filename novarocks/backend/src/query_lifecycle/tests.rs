@@ -313,7 +313,60 @@ fn fresh_unbound_registry_reports_no_restoration_relevant_state_after_binding() 
     assert_eq!(status.active_lifecycle, 0);
     assert_eq!(status.fragment_admissions, 0);
     assert_eq!(status.fragment_acceptances, 0);
+    assert_eq!(status.lifecycle_entries, 0);
+    assert_eq!(status.lifecycle_tombstones, 0);
+    assert_eq!(status.pre_init_tombstones, 0);
+    assert_eq!(status.tombstone_index, 0);
     assert!(!status.restored);
+}
+
+#[test]
+fn restoration_status_counts_all_retained_execution_indexes_without_clearing_them() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let active = init_request_fixture(120, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let lifecycle_tombstone = init_request_fixture(121, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let pre_init_tombstone = init_request_fixture(122, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+
+    assert_eq!(
+        registry.init_query(active.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    assert_eq!(
+        registry.init_query(lifecycle_tombstone.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                lifecycle_tombstone.manifest().execution_id(),
+                lifecycle_tombstone.digest(),
+                "retain lifecycle tombstone",
+            )
+            .expect("valid lifecycle tombstone abort"),
+        )
+        .expect("lifecycle tombstone abort is accepted");
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                pre_init_tombstone.manifest().execution_id(),
+                pre_init_tombstone.digest(),
+                "retain pre-init tombstone",
+            )
+            .expect("valid pre-init tombstone abort"),
+        )
+        .expect("pre-init tombstone abort is accepted");
+
+    let status = registry.restoration_status();
+
+    assert_eq!(status.active_lifecycle, 1);
+    assert_eq!(status.lifecycle_entries, 2);
+    assert_eq!(status.lifecycle_tombstones, 1);
+    assert_eq!(status.pre_init_tombstones, 1);
+    assert_eq!(status.tombstone_index, 2);
+    assert!(status.restored);
+    assert!(registry.contains(active.manifest().execution_id()));
+    assert!(registry.contains(lifecycle_tombstone.manifest().execution_id()));
+    assert!(registry.contains(pre_init_tombstone.manifest().execution_id()));
 }
 
 fn execution_id(query_low: i64, attempt: u64) -> QueryExecutionId {

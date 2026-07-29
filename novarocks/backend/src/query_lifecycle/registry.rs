@@ -148,6 +148,10 @@ pub(crate) struct QueryLifecycleRestorationStatus {
     pub(crate) active_lifecycle: usize,
     pub(crate) fragment_admissions: usize,
     pub(crate) fragment_acceptances: usize,
+    pub(crate) lifecycle_entries: usize,
+    pub(crate) lifecycle_tombstones: usize,
+    pub(crate) pre_init_tombstones: usize,
+    pub(crate) tombstone_index: usize,
     pub(crate) restored: bool,
 }
 
@@ -310,13 +314,17 @@ impl QueryLifecycleRegistry {
                 let status = self.restoration_status();
                 if query_lifecycle_test_markers_enabled() {
                     eprintln!(
-                        "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id={} start_epoch={} control_ready={} active_lifecycle={} fragment_admissions={} fragment_acceptances={} restored={}",
+                        "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id={} start_epoch={} control_ready={} active_lifecycle={} fragment_admissions={} fragment_acceptances={} lifecycle_entries={} lifecycle_tombstones={} pre_init_tombstones={} tombstone_index={} restored={}",
                         backend_id,
                         self.local_start_epoch,
                         status.control_ready,
                         status.active_lifecycle,
                         status.fragment_admissions,
                         status.fragment_acceptances,
+                        status.lifecycle_entries,
+                        status.lifecycle_tombstones,
+                        status.pre_init_tombstones,
+                        status.tombstone_index,
                         status.restored
                     );
                 }
@@ -337,23 +345,37 @@ impl QueryLifecycleRegistry {
         let mut control_ready = 0;
         let mut fragment_admissions = 0;
         let mut fragment_acceptances = 0;
+        let mut lifecycle_tombstones = 0;
         for entry in state.entries.values() {
             let entry_state = entry.state.lock().expect("query lifecycle entry lock");
             control_ready += usize::from(entry_state.phase == QueryLifecyclePhase::ControlAttached);
             fragment_admissions += entry_state.in_flight_fragments.len();
             fragment_acceptances += entry_state.accepted_fragments.len();
+            lifecycle_tombstones +=
+                usize::from(entry_state.phase == QueryLifecyclePhase::Tombstone);
         }
         fragment_acceptances = fragment_acceptances.max(state.fragment_executions.len());
         let active_lifecycle = state.active_entries;
+        let lifecycle_entries = state.entries.len();
+        let pre_init_tombstones = state.pre_init_tombstones.len();
+        let tombstone_index = state.tombstones.len();
         let restored = control_ready != 0
             || active_lifecycle != 0
             || fragment_admissions != 0
-            || fragment_acceptances != 0;
+            || fragment_acceptances != 0
+            || lifecycle_entries != 0
+            || lifecycle_tombstones != 0
+            || pre_init_tombstones != 0
+            || tombstone_index != 0;
         QueryLifecycleRestorationStatus {
             control_ready,
             active_lifecycle,
             fragment_admissions,
             fragment_acceptances,
+            lifecycle_entries,
+            lifecycle_tombstones,
+            pre_init_tombstones,
+            tombstone_index,
             restored,
         }
     }

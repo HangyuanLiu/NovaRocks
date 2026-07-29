@@ -538,7 +538,7 @@ where
                         )?;
                         evidence_execution = Some(old_execution.clone());
                         println!(
-                            "query lifecycle BE restart proof PASS: backend_index={index} backend_id={backend_id} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 restored=false"
+                            "query lifecycle BE restart proof PASS: backend_index={index} backend_id={backend_id} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false"
                         );
                     }
                     PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
@@ -819,6 +819,10 @@ fn validate_restart_nonrestore_status(
         ("active_lifecycle", "0"),
         ("fragment_admissions", "0"),
         ("fragment_acceptances", "0"),
+        ("lifecycle_entries", "0"),
+        ("lifecycle_tombstones", "0"),
+        ("pre_init_tombstones", "0"),
+        ("tombstone_index", "0"),
         ("restored", "false"),
     ] {
         let actual = marker_field(marker, field);
@@ -1707,7 +1711,7 @@ mod tests {
 
     #[test]
     fn restart_nonrestore_proof_requires_all_restoration_relevant_state_fields() {
-        let complete = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 restored=false\n";
+        let complete = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false\n";
         validate_restart_nonrestore_status(complete, "10:20:1", 7, 42)
             .expect("complete fresh-process state proves non-restoration");
 
@@ -1716,6 +1720,10 @@ mod tests {
             "active_lifecycle=0",
             "fragment_admissions=0",
             "fragment_acceptances=0",
+            "lifecycle_entries=0",
+            "lifecycle_tombstones=0",
+            "pre_init_tombstones=0",
+            "tombstone_index=0",
             "restored=false",
         ] {
             let incomplete = complete.replace(field, "");
@@ -1726,8 +1734,28 @@ mod tests {
     }
 
     #[test]
+    fn restart_nonrestore_proof_rejects_nonzero_retained_execution_indexes() {
+        let complete = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false\n";
+
+        for field in [
+            "lifecycle_entries",
+            "lifecycle_tombstones",
+            "pre_init_tombstones",
+            "tombstone_index",
+        ] {
+            let retained = complete.replace(&format!("{field}=0"), &format!("{field}=1"));
+            let error = validate_restart_nonrestore_status(&retained, "10:20:1", 7, 42)
+                .expect_err("nonzero retained execution index must reject restart proof");
+            assert!(
+                error.to_string().contains(field),
+                "error must identify retained field {field}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn restart_nonrestore_proof_rejects_old_execution_control_or_fragment_state() {
-        let status = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 restored=false\n";
+        let status = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false\n";
         for marker in [
             "NOVAROCKS_QUERY_CONTROL_READY",
             "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
