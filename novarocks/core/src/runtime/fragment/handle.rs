@@ -371,7 +371,11 @@ impl RunningFragmentInner {
             FragmentOutcome::Failed(error) => {
                 state.resources.finish_failure(error.to_string());
             }
-            FragmentOutcome::Cancelled { .. } => state.resources.finish_cancelled(),
+            FragmentOutcome::Cancelled { reason } => {
+                state
+                    .resources
+                    .finish_cancelled(reason.detail().to_string());
+            }
         }
         let fact = FragmentTerminalFact::new(
             self.query_id,

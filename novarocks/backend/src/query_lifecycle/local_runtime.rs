@@ -67,16 +67,16 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
         &self,
         execution_id: QueryExecutionId,
         expected_instances: &[UniqueId],
-        reason: QueryTerminationReason,
+        _reason: QueryTerminationReason,
+        detail: &str,
     ) {
-        let detail = format!("query lifecycle terminated: {reason:?}");
         let mut fragment_instance_ids = expected_instances.iter().copied().collect::<BTreeSet<_>>();
         fragment_instance_ids.extend(
             self.runtime
-                .cancel_query(execution_id.query_id(), detail.clone()),
+                .cancel_query(execution_id.query_id(), detail.to_string()),
         );
         let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
-        self.controls.cancel_many(&fragment_instance_ids, &detail);
+        self.controls.cancel_many(&fragment_instance_ids, detail);
         if fragment_failure_test_markers_enabled() {
             for finst_id in fragment_instance_ids {
                 eprintln!(

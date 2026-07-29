@@ -52,6 +52,7 @@ pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
         execution_id: QueryExecutionId,
         expected_instances: &[UniqueId],
         reason: QueryTerminationReason,
+        detail: &str,
     );
 }
 
@@ -554,7 +555,12 @@ impl QueryLifecycleRegistry {
                 "abort digest conflicts with initialized manifest",
             ));
         }
-        let reason = self.request_termination(entry, QueryTerminationReason::CoordinatorAbort);
+        let reason = self.request_termination_with_detail(
+            entry,
+            QueryTerminationReason::CoordinatorAbort,
+            None,
+            request.reason().to_string(),
+        );
         Ok(QueryTerminationAck::new(execution_id, reason))
     }
 
@@ -853,7 +859,12 @@ impl QueryLifecycleRegistry {
         entry: Arc<QueryLifecycleEntry>,
         requested_reason: QueryTerminationReason,
     ) -> QueryTerminationReason {
-        self.request_termination_with_event(entry, requested_reason, None)
+        self.request_termination_with_detail(
+            entry,
+            requested_reason,
+            None,
+            termination_detail(requested_reason),
+        )
     }
 
     fn request_termination_with_event(
@@ -861,6 +872,20 @@ impl QueryLifecycleRegistry {
         entry: Arc<QueryLifecycleEntry>,
         requested_reason: QueryTerminationReason,
         terminal_event: Option<QueryControlEvent>,
+    ) -> QueryTerminationReason {
+        let detail = match terminal_event.as_ref() {
+            Some(QueryControlEvent::LocalFailure { detail, .. }) => detail.clone(),
+            _ => termination_detail(requested_reason),
+        };
+        self.request_termination_with_detail(entry, requested_reason, terminal_event, detail)
+    }
+
+    fn request_termination_with_detail(
+        &self,
+        entry: Arc<QueryLifecycleEntry>,
+        requested_reason: QueryTerminationReason,
+        terminal_event: Option<QueryControlEvent>,
+        detail: String,
     ) -> QueryTerminationReason {
         let (execution_id, expected_instances, initializing, terminal_event_permit) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
@@ -894,8 +919,12 @@ impl QueryLifecycleRegistry {
             ));
         }
         self.publish_metrics();
-        self.local_runtime
-            .terminate_query(execution_id, &expected_instances, requested_reason);
+        self.local_runtime.terminate_query(
+            execution_id,
+            &expected_instances,
+            requested_reason,
+            &detail,
+        );
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
                 "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={} backend_id={} reason={requested_reason:?} expected_fragments={}",
@@ -1369,6 +1398,7 @@ impl InitWorkspace {
                     self.execution_id,
                     &expected_instances,
                     reason,
+                    &termination_detail(reason),
                 );
             }
             if self
@@ -1457,6 +1487,7 @@ impl FragmentAdmissionPermit {
                     self.execution_id,
                     &expected_instances,
                     reason,
+                    &termination_detail(reason),
                 );
             }
             return Err(QueryLifecycleError::new(
@@ -1673,6 +1704,10 @@ fn termination_reason_index(reason: QueryTerminationReason) -> usize {
         QueryTerminationReason::LocalFailure => 4,
         QueryTerminationReason::PreStartTimeout => 5,
     }
+}
+
+fn termination_detail(reason: QueryTerminationReason) -> String {
+    format!("query lifecycle terminated: {reason:?}")
 }
 
 fn format_digest(digest: ParticipantManifestDigest) -> String {

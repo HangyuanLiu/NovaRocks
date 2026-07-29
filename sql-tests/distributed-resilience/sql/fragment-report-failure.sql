@@ -39,7 +39,7 @@ INSERT INTO ${case_db}.fragment_report_failure VALUES (3, 5);
 
 -- query 5
 -- @fail_fragment_after_start_be_index=1
--- @expect_error=Cancelled
+-- @expect_error=fragment executor failure injected after start
 -- @be_log_exact_fragment_cancellation=3
 SELECT COUNT(*)
 FROM ${case_db}.fragment_report_failure

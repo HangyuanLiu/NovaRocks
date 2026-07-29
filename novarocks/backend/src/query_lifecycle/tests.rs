@@ -78,7 +78,14 @@ struct RecordingLocalRuntime {
 struct RecordingLocalRuntimeState {
     install_calls: Mutex<Vec<QueryExecutionId>>,
     abort_calls: Mutex<Vec<QueryExecutionId>>,
-    terminations: Mutex<Vec<(QueryExecutionId, Vec<UniqueId>, QueryTerminationReason)>>,
+    terminations: Mutex<
+        Vec<(
+            QueryExecutionId,
+            Vec<UniqueId>,
+            QueryTerminationReason,
+            String,
+        )>,
+    >,
     install_gate: Mutex<InstallGate>,
     install_gate_changed: Condvar,
     fail_install: Mutex<bool>,
@@ -222,11 +229,13 @@ impl QueryLifecycleLocalRuntime for RecordingLocalRuntime {
         execution_id: QueryExecutionId,
         expected_instances: &[UniqueId],
         reason: QueryTerminationReason,
+        detail: &str,
     ) {
         self.state.terminations.lock().expect("terminations").push((
             execution_id,
             expected_instances.to_vec(),
             reason,
+            detail.to_string(),
         ));
     }
 }
@@ -841,7 +850,8 @@ fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
 
 #[test]
 fn fragment_failure_emits_query_local_failure() {
-    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let runtime = RecordingLocalRuntime::default();
+    let registry = registry_with(runtime.clone(), 8);
     let expected = UniqueId { hi: 76, lo: 1 };
     let request = fragment_init_request_fixture(76, &[expected]);
     let execution_id = request.manifest().execution_id();
@@ -878,6 +888,20 @@ fn fragment_failure_emits_query_local_failure() {
     assert_eq!(
         registry.termination_reason(execution_id),
         Some(QueryTerminationReason::LocalFailure)
+    );
+    assert_eq!(
+        runtime
+            .state
+            .terminations
+            .lock()
+            .expect("terminations")
+            .as_slice(),
+        &[(
+            execution_id,
+            vec![expected],
+            QueryTerminationReason::LocalFailure,
+            "fragment execution error (pipeline): pipeline worker failed".to_string(),
+        )]
     );
 }
 

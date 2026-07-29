@@ -89,12 +89,12 @@ impl ResultWriteSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResultAbort {
     PrepareRollback,
     NeverStarted,
-    Failed,
-    Cancelled,
+    Failed(String),
+    Cancelled(String),
 }
 
 pub trait FragmentResultWriter: Send + Sync + 'static {
