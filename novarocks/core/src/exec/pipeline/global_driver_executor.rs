@@ -206,10 +206,11 @@ impl DriverTask {
     }
 
     pub(crate) fn should_abort_immediately(&self) -> bool {
-        self.should_abort() && !self.has_pending_finish()
+        self.should_abort()
     }
 
-    pub(crate) fn finish_due_to_abort(self) {
+    pub(crate) fn finish_due_to_abort(mut self) {
+        self.driver.cancel_for_fragment_abort();
         self.driver_finished();
         drop(self);
     }
@@ -379,9 +380,8 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
             continue;
         };
 
-        if task.completion.should_abort() && !task.has_pending_finish() {
-            task.driver_finished();
-            drop(task.driver);
+        if task.completion.should_abort() {
+            task.finish_due_to_abort();
             continue;
         }
 
@@ -399,6 +399,11 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
             DriverState::Failed(format!("panic in driver execution: {msg}"))
         });
 
+        if task.completion.should_abort() {
+            task.finish_due_to_abort();
+            continue;
+        }
+
         if matches!(
             state,
             DriverState::Ready
@@ -411,9 +416,8 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
 
         match state {
             DriverState::Ready | DriverState::Running => {
-                if task.completion.should_abort() && !task.has_pending_finish() {
-                    task.driver_finished();
-                    drop(task.driver);
+                if task.completion.should_abort() {
+                    task.finish_due_to_abort();
                     continue;
                 }
                 let mut queue = shared.queue.lock().expect("global executor queue lock");

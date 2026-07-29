@@ -1643,6 +1643,8 @@ pub struct DebugConfig {
     pub emit_grpc_fragment_marker: bool,
     #[cfg(debug_assertions)]
     pub query_lifecycle_fault_dir: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    pub emit_connector_reader_marker: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -1656,6 +1658,7 @@ struct DebugConfigToml {
     emit_cancel_marker: bool,
     emit_grpc_fragment_marker: bool,
     query_lifecycle_fault_dir: Option<PathBuf>,
+    emit_connector_reader_marker: bool,
 }
 
 #[cfg(not(debug_assertions))]
@@ -1669,6 +1672,7 @@ struct DebugConfigToml {
     emit_cancel_marker: Option<bool>,
     emit_grpc_fragment_marker: Option<bool>,
     query_lifecycle_fault_dir: Option<PathBuf>,
+    emit_connector_reader_marker: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for DebugConfig {
@@ -1687,6 +1691,7 @@ impl<'de> Deserialize<'de> for DebugConfig {
                 emit_cancel_marker: raw.emit_cancel_marker,
                 emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
                 query_lifecycle_fault_dir: raw.query_lifecycle_fault_dir,
+                emit_connector_reader_marker: raw.emit_connector_reader_marker,
             })
         }
         #[cfg(not(debug_assertions))]
@@ -1714,6 +1719,11 @@ impl<'de> Deserialize<'de> for DebugConfig {
             if raw.query_lifecycle_fault_dir.is_some() {
                 return Err(serde::de::Error::custom(
                     "debug.query_lifecycle_fault_dir is only available in debug builds",
+                ));
+            }
+            if raw.emit_connector_reader_marker.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.emit_connector_reader_marker is only available in debug builds",
                 ));
             }
             Ok(Self {
@@ -1773,6 +1783,16 @@ impl DebugConfig {
     #[cfg(not(debug_assertions))]
     pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
         None
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn emit_connector_reader_marker(&self) -> bool {
+        self.emit_connector_reader_marker
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn emit_connector_reader_marker(&self) -> bool {
+        false
     }
 }
 
@@ -2221,6 +2241,7 @@ fault_inject_fetch_not_ready_count = 2
 emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 query_lifecycle_fault_dir = "/tmp/runner-owned-query-lifecycle-faults"
+emit_connector_reader_marker = true
 "#,
         )
         .expect("parse config");
@@ -2234,6 +2255,7 @@ query_lifecycle_fault_dir = "/tmp/runner-owned-query-lifecycle-faults"
                 "/tmp/runner-owned-query-lifecycle-faults"
             ))
         );
+        assert!(cfg.debug.emit_connector_reader_marker);
     }
 
     #[test]
@@ -2296,6 +2318,21 @@ emit_grpc_fragment_marker = false
         let err = err.to_string();
         assert!(
             err.contains("emit_grpc_fragment_marker"),
+            "unexpected parse error: {err}"
+        );
+
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+emit_connector_reader_marker = false
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject emit_connector_reader_marker knob"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("emit_connector_reader_marker"),
             "unexpected parse error: {err}"
         );
     }

@@ -177,6 +177,14 @@ pub(super) fn lower_connector_read_scan(
                 error.to_string(),
             )
         })?;
+    if crate::common::config::debug_emit_connector_reader_marker() {
+        println!(
+            "NOVAROCKS_CONNECTOR_READ_SOURCE instance={} splits={}",
+            instance_id.as_str(),
+            scheduled.len()
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
     let request = ConnectorOpenReaderRequest {
         expected_schema: output_schema.arrow_schema_ref(),
         batch,

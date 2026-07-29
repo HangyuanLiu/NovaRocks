@@ -53,6 +53,15 @@ impl ScanBindings {
     pub(crate) fn get(&self, node_id: i32) -> Option<Arc<dyn ScanOp>> {
         self.0.get(&node_id).cloned()
     }
+
+    /// All instance-materialized scan operations owned by this fragment.
+    ///
+    /// The pipeline execution retains these terminal hooks so an external
+    /// fragment abort can close connector readers even when every driver is
+    /// parked and no further driver turn is scheduled.
+    pub(crate) fn terminal_ops(&self) -> Vec<Arc<dyn ScanOp>> {
+        self.0.values().cloned().collect()
+    }
 }
 
 // `dyn ScanOp` is not `Debug`, so print only the bound node ids. Enough for

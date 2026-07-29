@@ -55,7 +55,28 @@ struct ConnectorReaderGroup {
 struct ConnectorReaderGroupState {
     phase: ConnectorReaderGroupPhase,
     next_reader_id: usize,
-    readers: BTreeMap<usize, Arc<Mutex<Option<Box<dyn ConnectorBatchReader>>>>>,
+    readers: BTreeMap<usize, RegisteredConnectorReader>,
+}
+
+struct RegisteredConnectorReader {
+    reader: Arc<Mutex<Option<Box<dyn ConnectorBatchReader>>>>,
+    marker: Option<ConnectorReaderMarker>,
+}
+
+#[derive(Clone)]
+struct ConnectorReaderMarker {
+    provider_id: String,
+    instance_id: String,
+}
+
+impl ConnectorReaderMarker {
+    fn emit(&self, event: &str) {
+        println!(
+            "NOVAROCKS_CONNECTOR_READER_{event} provider={} instance={}",
+            self.provider_id, self.instance_id
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -70,6 +91,7 @@ impl ConnectorReaderGroup {
     fn register(
         self: &Arc<Self>,
         reader: Box<dyn ConnectorBatchReader>,
+        marker: Option<ConnectorReaderMarker>,
     ) -> Result<Box<dyn ConnectorBatchReader>, String> {
         let reader = Arc::new(Mutex::new(Some(reader)));
         let reader_id = {
@@ -82,13 +104,23 @@ impl ConnectorReaderGroup {
             }
             let reader_id = state.next_reader_id;
             state.next_reader_id = state.next_reader_id.saturating_add(1);
-            state.readers.insert(reader_id, Arc::clone(&reader));
+            state.readers.insert(
+                reader_id,
+                RegisteredConnectorReader {
+                    reader: Arc::clone(&reader),
+                    marker: marker.clone(),
+                },
+            );
             reader_id
         };
+        if let Some(marker) = marker.as_ref() {
+            marker.emit("OPEN");
+        }
         Ok(Box::new(GroupedConnectorBatchReader {
             reader,
             group: Arc::downgrade(self),
             reader_id,
+            marker,
         }))
     }
 
@@ -113,14 +145,24 @@ impl ConnectorReaderGroup {
                 .collect::<Vec<_>>()
         };
         let mut cleanup_errors = Vec::new();
-        for reader in readers {
-            let result = reader
+        for registered in readers {
+            let mut was_closed = false;
+            let result = registered
+                .reader
                 .lock()
                 .map_err(|_| "connector reader lock poisoned".to_string())
                 .and_then(|mut reader| match reader.take() {
-                    Some(mut reader) => reader.close().map_err(|error| error.to_string()),
+                    Some(mut reader) => {
+                        was_closed = true;
+                        reader.close().map_err(|error| error.to_string())
+                    }
                     None => Ok(()),
                 });
+            if was_closed {
+                if let Some(marker) = registered.marker.as_ref() {
+                    marker.emit("CLOSE");
+                }
+            }
             if let Err(error) = result {
                 cleanup_errors.push(error);
             }
@@ -150,6 +192,7 @@ struct GroupedConnectorBatchReader {
     reader: Arc<Mutex<Option<Box<dyn ConnectorBatchReader>>>>,
     group: Weak<ConnectorReaderGroup>,
     reader_id: usize,
+    marker: Option<ConnectorReaderMarker>,
 }
 
 impl GroupedConnectorBatchReader {
@@ -178,6 +221,7 @@ impl ConnectorBatchReader for GroupedConnectorBatchReader {
     }
 
     fn close(&mut self) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        let mut was_closed = false;
         let result = self
             .reader
             .lock()
@@ -188,9 +232,17 @@ impl ConnectorBatchReader for GroupedConnectorBatchReader {
                 )
             })?
             .take()
-            .map(|mut reader| reader.close())
+            .map(|mut reader| {
+                was_closed = true;
+                reader.close()
+            })
             .transpose();
         self.unregister();
+        if was_closed {
+            if let Some(marker) = self.marker.as_ref() {
+                marker.emit("CLOSE");
+            }
+        }
         result.map(|_| ())
     }
 
@@ -241,9 +293,12 @@ mod connector_reader_group_tests {
         let group = Arc::new(ConnectorReaderGroup::default());
         let closes = Arc::new(AtomicUsize::new(0));
         let mut reader = group
-            .register(Box::new(RecordingReader {
-                closes: Arc::clone(&closes),
-            }))
+            .register(
+                Box::new(RecordingReader {
+                    closes: Arc::clone(&closes),
+                }),
+                None,
+            )
             .expect("reader registration");
 
         group.terminate().expect("terminal cleanup");
@@ -252,7 +307,7 @@ mod connector_reader_group_tests {
         assert_eq!(closes.load(Ordering::SeqCst), 1);
         assert!(
             group
-                .register(Box::new(RecordingReader { closes }))
+                .register(Box::new(RecordingReader { closes }), None)
                 .is_err()
         );
     }
@@ -670,7 +725,13 @@ impl ScanOp for ConnectorReadScanOp {
             .read()
             .open_reader(&split, self.request.clone())
             .map_err(|error| error.to_string())?;
-        let reader = self.reader_group.register(reader)?;
+        let marker = crate::common::config::debug_emit_connector_reader_marker().then(|| {
+            ConnectorReaderMarker {
+                provider_id: self.instance.descriptor().provider_id.as_str().to_string(),
+                instance_id: self.instance.descriptor().instance_id.as_str().to_string(),
+            }
+        });
+        let reader = self.reader_group.register(reader, marker)?;
         Ok(Box::new(ConnectorBatchReaderIter::with_profile(
             reader,
             Arc::clone(&self.chunk_schema),

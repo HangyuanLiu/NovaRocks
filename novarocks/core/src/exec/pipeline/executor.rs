@@ -33,8 +33,9 @@ use std::time::Duration;
 
 use crate::common::app_config;
 use crate::exec::node::ExecPlan;
+use crate::exec::node::scan::ScanOp;
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
-use crate::novarocks_logging::info;
+use crate::novarocks_logging::{info, warn};
 use crate::runtime::runtime_state::RuntimeState;
 
 use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client;
@@ -57,6 +58,7 @@ pub(crate) struct PreparedPipelineExecution {
     fragment_ctx: Arc<FragmentContext>,
     runtime_state: Arc<RuntimeState>,
     fragment_profiler: Option<Profiler>,
+    terminal_scan_ops: Vec<Arc<dyn ScanOp>>,
 }
 
 impl PreparedPipelineExecution {
@@ -88,6 +90,7 @@ impl PreparedPipelineExecution {
             fragment_ctx,
             runtime_state,
             fragment_profiler,
+            terminal_scan_ops,
         } = self;
         let submitted_driver_count = tasks.len();
         let fragment_wall_timer = fragment_profiler
@@ -97,6 +100,7 @@ impl PreparedPipelineExecution {
             && completion.fail(error.clone())
         {
             fragment_ctx.set_final_status(error);
+            terminate_scan_ops(&terminal_scan_ops);
         }
         global_driver_executor().submit(tasks);
         RunningPipelineExecution {
@@ -105,6 +109,7 @@ impl PreparedPipelineExecution {
             runtime_state,
             submitted_driver_count,
             fragment_wall_timer: Mutex::new(fragment_wall_timer),
+            terminal_scan_ops,
         }
     }
 }
@@ -116,6 +121,7 @@ pub(crate) struct RunningPipelineExecution {
     runtime_state: Arc<RuntimeState>,
     submitted_driver_count: usize,
     fragment_wall_timer: Mutex<Option<ScopedTimer>>,
+    terminal_scan_ops: Vec<Arc<dyn ScanOp>>,
 }
 
 impl RunningPipelineExecution {
@@ -128,6 +134,7 @@ impl RunningPipelineExecution {
         let won = self.completion.fail(err.clone());
         if won {
             self.fragment_ctx.set_final_status(err);
+            terminate_scan_ops(&self.terminal_scan_ops);
         }
         won
     }
@@ -157,6 +164,7 @@ impl RunningPipelineExecution {
                 self.completion
                     .wait_timeout_with_local_cancel(timeout, err, move || {
                         fragment_ctx.set_final_status(timeout_error);
+                        terminate_scan_ops(&self.terminal_scan_ops);
                     })
             }
             None => self.completion.wait(),
@@ -420,6 +428,7 @@ fn prepare_pipeline_execution_inner(
     report_neutral: bool,
 ) -> Result<PreparedPipelineExecution, String> {
     let dep_manager = DependencyManager::new();
+    let terminal_scan_ops = scan_bindings.terminal_ops();
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
     let graph =
@@ -524,7 +533,16 @@ fn prepare_pipeline_execution_inner(
         fragment_ctx: ctx,
         runtime_state,
         fragment_profiler: profiler,
+        terminal_scan_ops,
     })
+}
+
+fn terminate_scan_ops(scan_ops: &[Arc<dyn ScanOp>]) {
+    for scan_op in scan_ops {
+        if let Err(error) = scan_op.terminate() {
+            warn!("connector scan terminal cleanup failed: {error}");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -572,7 +590,7 @@ fn execute_plan_with_pipeline(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
@@ -624,6 +642,7 @@ mod tests {
     struct ParkedSourceOperator {
         observable: Arc<Observable>,
         ready: Arc<AtomicBool>,
+        cancel_calls: Arc<AtomicUsize>,
     }
 
     struct PanicOperator;
@@ -631,6 +650,10 @@ mod tests {
     impl Operator for ParkedSourceOperator {
         fn name(&self) -> &str {
             "ParkedSourceOperator"
+        }
+
+        fn cancel(&mut self) {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         }
 
         fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -730,6 +753,7 @@ mod tests {
             fragment_ctx,
             runtime_state,
             fragment_profiler: None,
+            terminal_scan_ops: Vec::new(),
         }
     }
 
@@ -805,11 +829,13 @@ mod tests {
         let runtime_state = Arc::new(RuntimeState::default());
         let observable = Arc::new(Observable::new());
         let ready = Arc::new(AtomicBool::new(false));
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
         let driver = PipelineDriver::new(
             1,
             vec![Box::new(ParkedSourceOperator {
                 observable: Arc::clone(&observable),
                 ready,
+                cancel_calls: Arc::clone(&cancel_calls),
             })],
             None,
             Vec::new(),
@@ -836,6 +862,11 @@ mod tests {
             Err("local cancel".to_string()),
             "cancel must remain a fragment-local terminal result after the submitted driver drains"
         );
+        assert_eq!(
+            cancel_calls.load(Ordering::SeqCst),
+            1,
+            "an externally cancelled parked driver must cancel its operators before drop"
+        );
     }
 
     #[test]
@@ -855,11 +886,13 @@ mod tests {
         ));
         let observable = Arc::new(Observable::new());
         let ready = Arc::new(AtomicBool::new(false));
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
         let driver = PipelineDriver::new(
             3,
             vec![Box::new(ParkedSourceOperator {
                 observable: Arc::clone(&observable),
                 ready: Arc::clone(&ready),
+                cancel_calls,
             })],
             None,
             Vec::new(),
