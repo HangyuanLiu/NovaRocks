@@ -36,6 +36,7 @@ use novarocks::service::native_fragment_ingress::{
 };
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
+use super::failure_injection::start_with_configured_fragment_failure_trigger;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NativeFragmentLifecycleEvent {
@@ -161,6 +162,7 @@ impl NativeFragmentIngress for NativeFragmentService {
             .map_err(NativeFragmentIngressError::new)?;
         let query_mem_tracker = admission.query_mem_tracker();
         let fragment_mem_tracker = admission.fragment_mem_tracker();
+        let failure_injection_eligible = !request.uses_result_sink();
         let dormant = prepare_fragment(
             request.into_submission(),
             admission.into_prepare_context(
@@ -189,7 +191,6 @@ impl NativeFragmentIngress for NativeFragmentService {
             .map_err(NativeFragmentIngressError::new)?;
 
         let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
-        let controls = Arc::clone(&self.controls);
         let queries = self.queries.clone();
         let observer = self.lifecycle_observer.clone();
         #[cfg(test)]
@@ -211,7 +212,11 @@ impl NativeFragmentIngress for NativeFragmentService {
                     fe_report::report_fragment_done(fragment_instance_id, Some(error), false);
                     return;
                 }
-                let running = dormant.start();
+                let (running, failure_release) =
+                    start_with_configured_fragment_failure_trigger(
+                        dormant,
+                        failure_injection_eligible,
+                    );
                 let control = Arc::new(RunningFragmentControl {
                     handle: running.clone(),
                 });
@@ -220,7 +225,31 @@ impl NativeFragmentIngress for NativeFragmentService {
                 if let Some(observer) = observer.as_ref() {
                     observer(NativeFragmentLifecycleEvent::Started);
                 }
-                consume_terminal_fact(running, token, controls, queries);
+                if let Some(release) = failure_release {
+                    match release.wait() {
+                        Ok(evidence_token) => {
+                            eprintln!(
+                                "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token={} query_hi={} query_lo={} finst_hi={} finst_lo={}",
+                                evidence_token,
+                                query_id.hi(),
+                                query_id.lo(),
+                                fragment_instance_id.hi,
+                                fragment_instance_id.lo
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_RELEASE_FAILED query_hi={} query_lo={} finst_hi={} finst_lo={} error={}",
+                                query_id.hi(),
+                                query_id.lo(),
+                                fragment_instance_id.hi,
+                                fragment_instance_id.lo,
+                                error
+                            );
+                        }
+                    }
+                }
+                consume_terminal_fact(running, token, queries);
             })
             .map_err(|error| {
                 NativeFragmentIngressError::new(format!(
@@ -280,7 +309,6 @@ impl FragmentControlHandle for RunningFragmentControl {
 fn consume_terminal_fact(
     running: RunningFragmentHandle,
     token: super::control::FragmentControlToken,
-    controls: Arc<FragmentControlRegistry>,
     queries: NativeFragmentQueryRuntime,
 ) {
     let fact = running.join();
@@ -306,8 +334,6 @@ fn consume_terminal_fact(
                 error = %execution_error,
                 "native fragment execution failed"
             );
-            let finsts = queries.cancel_query(query_id, report_error.clone());
-            controls.cancel_many(&finsts, &report_error);
             Some(report_error)
         }
         FragmentOutcome::Cancelled { reason } => Some(reason.detail().to_string()),
@@ -355,12 +381,35 @@ mod tests {
 
     use novarocks::UniqueId;
     use novarocks::proto;
+    use novarocks::runtime::fragment::{FragmentOutcome, FragmentPrepareContext, prepare_fragment};
     use novarocks::runtime::query_context::QueryId;
     use novarocks::service::native_fragment_ingress::{
         NativeFragmentIngress, NativeFragmentRequest,
     };
 
-    use super::{NativeFragmentLifecycleEvent, NativeFragmentService};
+    use crate::fragment::control::FragmentControlHandle;
+    use crate::fragment::failure_injection::{
+        FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
+    };
+
+    use super::{
+        NativeFragmentLifecycleEvent, NativeFragmentService, RunningFragmentControl,
+        consume_terminal_fact,
+    };
+
+    #[derive(Default)]
+    struct RecordingControl {
+        reasons: Mutex<Vec<String>>,
+    }
+
+    impl FragmentControlHandle for RecordingControl {
+        fn cancel(&self, reason: &str) {
+            self.reasons
+                .lock()
+                .expect("recording control reasons")
+                .push(reason.to_string());
+        }
+    }
 
     fn values_result_request(query_base: i64, fragment_base: i64) -> NativeFragmentRequest {
         let fragment_id = 7;
@@ -539,6 +588,139 @@ mod tests {
                 .cancel_query(query_id, "post-terminal probe".to_string())
                 .is_empty(),
             "terminated query must not retain either fragment mapping"
+        );
+    }
+
+    #[test]
+    fn native_failed_terminal_fact_does_not_locally_cancel_siblings_before_frontend_ack() {
+        let service = NativeFragmentService::new();
+        let request = values_result_request(83_100, 83_104);
+        let query_id = request.query_id();
+        let failed_finst = request.fragment_instance_id();
+        let sibling_finst = UniqueId {
+            hi: 83_102,
+            lo: 83_103,
+        };
+        let delivery_expire = Duration::from_secs(1);
+        let query_expire = Duration::from_secs(5);
+
+        let sibling_registration = service
+            .queries
+            .register_fragment(query_id, sibling_finst, delivery_expire, query_expire)
+            .expect("register sibling fragment");
+        sibling_registration.into_running();
+        let sibling_control = Arc::new(RecordingControl::default());
+        let sibling_token = service
+            .controls
+            .reserve(sibling_finst)
+            .expect("reserve sibling control")
+            .publish(sibling_control.clone());
+
+        let failed_registration = service
+            .queries
+            .register_fragment(query_id, failed_finst, delivery_expire, query_expire)
+            .expect("register failed fragment");
+        failed_registration.into_running();
+        let failed = prepare_fragment(request.into_submission(), FragmentPrepareContext::default())
+            .expect("failed fragment prepares")
+            .start_failed("native executor failure");
+        let failed_token = service
+            .controls
+            .reserve(failed_finst)
+            .expect("reserve failed control")
+            .publish(Arc::new(RunningFragmentControl {
+                handle: failed.clone(),
+            }));
+
+        consume_terminal_fact(failed, failed_token, service.queries.clone());
+
+        assert!(
+            sibling_control
+                .reasons
+                .lock()
+                .expect("recording control reasons")
+                .is_empty(),
+            "native failure must be reported to the frontend before any query-wide sibling cancellation"
+        );
+
+        sibling_token.complete();
+        let report_decision = service.queries.finish_fragment_for_report(query_id);
+        service.queries.unregister_fragment(sibling_finst);
+        service
+            .queries
+            .cleanup_after_fragment_report(query_id, report_decision);
+    }
+
+    #[test]
+    fn failure_trigger_skips_ineligible_fragment_and_fails_exactly_one_eligible_fragment() {
+        let trigger = std::env::temp_dir().join(format!(
+            "novarocks-fragment-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&trigger, b"step-token-17").expect("arm fragment failure");
+        let first = values_result_request(84_000, 84_002);
+        let first = prepare_fragment(first.into_submission(), FragmentPrepareContext::default())
+            .expect("first fragment prepares");
+
+        let (first, release) =
+            start_with_fragment_failure_trigger(first, Some(trigger.as_path()), false);
+        assert!(
+            release.is_none(),
+            "an ineligible result fragment must not claim the trigger"
+        );
+        assert!(
+            trigger.exists(),
+            "an ineligible result fragment must leave the trigger armed"
+        );
+        let first = first.join();
+        assert!(
+            matches!(first.outcome(), FragmentOutcome::Succeeded),
+            "the ineligible fragment must run normally: {first:?}"
+        );
+
+        let second = values_result_request(84_100, 84_102);
+        let second = prepare_fragment(second.into_submission(), FragmentPrepareContext::default())
+            .expect("second fragment prepares");
+        let (second, release) =
+            start_with_fragment_failure_trigger(second, Some(trigger.as_path()), true);
+        assert!(
+            second.submitted_driver_count() > 0,
+            "the injected failure must happen after the fragment enters started state"
+        );
+        std::fs::write(trigger.with_extension("release"), b"step-token-17")
+            .expect("release fragment failure");
+        assert_eq!(
+            release
+                .expect("armed fragment has a pending release")
+                .wait()
+                .expect("matching release token"),
+            "step-token-17"
+        );
+        let failed = second.join();
+        assert!(matches!(
+            failed.outcome(),
+            FragmentOutcome::Failed(error)
+                if error.detail() == FRAGMENT_EXECUTOR_FAILURE_MESSAGE
+        ));
+        assert!(!trigger.exists(), "the trigger must be consumed once");
+
+        let third = values_result_request(84_200, 84_202);
+        let third = prepare_fragment(third.into_submission(), FragmentPrepareContext::default())
+            .expect("third fragment prepares");
+        let (third, release) =
+            start_with_fragment_failure_trigger(third, Some(trigger.as_path()), true);
+        assert!(
+            release.is_none(),
+            "the consumed trigger must not create another release rendezvous"
+        );
+        let succeeded = third.join();
+        assert!(
+            matches!(succeeded.outcome(), FragmentOutcome::Succeeded),
+            "the consumed trigger must not poison later fragments: {succeeded:?}"
         );
     }
 }

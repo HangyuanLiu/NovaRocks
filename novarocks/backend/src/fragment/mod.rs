@@ -17,6 +17,7 @@
 
 mod control;
 mod event_io;
+mod failure_injection;
 mod io;
 mod lookup_io;
 mod result_io;

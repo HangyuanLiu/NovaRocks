@@ -169,59 +169,106 @@ pub(crate) fn execute_with_post_fragment_start_fault<T, F>(
 where
     F: FnOnce() -> T,
 {
-    let Some(index) = meta.kill_be_after_fragment_start else {
-        return Ok(execute_query());
+    #[derive(Clone, Copy)]
+    enum PostFragmentStartFault {
+        KillBackend(usize),
+        ReleaseFragmentFailure(usize),
+    }
+
+    impl PostFragmentStartFault {
+        fn target_index(self) -> usize {
+            match self {
+                Self::KillBackend(index) | Self::ReleaseFragmentFailure(index) => index,
+            }
+        }
+
+        fn apply(self, server: &mut dyn ServerHandle) -> Result<()> {
+            match self {
+                Self::KillBackend(index) => server.kill_be(index),
+                Self::ReleaseFragmentFailure(index) => {
+                    server.release_fragment_executor_failure(index)
+                }
+            }
+        }
+    }
+
+    let fault = match (
+        meta.kill_be_after_fragment_start,
+        meta.fail_fragment_after_start_be_index,
+    ) {
+        (Some(index), None) => PostFragmentStartFault::KillBackend(index),
+        (None, Some(index)) => PostFragmentStartFault::ReleaseFragmentFailure(index),
+        (None, None) => return Ok(execute_query()),
+        (Some(_), Some(_)) => {
+            bail!("a SQL step may configure at most one post-fragment-start fault");
+        }
     };
-    let baseline = {
+    let target_index = fault.target_index();
+    let baselines = {
         let server = server
             .lock()
             .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
         if !server.supports_fault_injection() {
-            bail!("kill_be_after_fragment_start requires a mutable cross-process server handle");
+            bail!("post-fragment-start faults require a mutable cross-process server handle");
         }
-        if index >= server.be_count() {
+        if target_index >= server.be_count() {
             bail!(
-                "kill_be_after_fragment_start index {index} is out of bounds for {} BE(s)",
+                "post-fragment-start fault index {target_index} is out of bounds for {} BE(s)",
                 server.be_count()
             );
         }
-        server.scheduled_fragment_count(index)?
+        let observed_indices = match fault {
+            PostFragmentStartFault::KillBackend(_) => vec![target_index],
+            PostFragmentStartFault::ReleaseFragmentFailure(_) => (0..server.be_count()).collect(),
+        };
+        observed_indices
+            .into_iter()
+            .map(|index| Ok((index, server.scheduled_fragment_count(index)?)))
+            .collect::<Result<Vec<_>>>()?
     };
+    if baselines.is_empty() {
+        return Ok(execute_query());
+    }
     let fault_state = Arc::new(ActiveQueryFaultState::new());
     let worker_server = Arc::clone(server);
     let worker_fault_state = Arc::clone(&fault_state);
     let worker = thread::spawn(move || -> Result<()> {
         let deadline = Instant::now() + POST_FRAGMENT_START_TIMEOUT;
         loop {
-            let current = worker_server
-                .lock()
-                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
-                .scheduled_fragment_count(index)?;
-            if current < baseline {
-                bail!(
-                    "BE[{index}] fragment-start marker count decreased from {baseline} to {current}"
-                );
-            }
-            if current > baseline {
+            let all_fresh = {
+                let server = worker_server
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+                let mut all_fresh = true;
+                for &(index, baseline) in &baselines {
+                    let current = server.scheduled_fragment_count(index)?;
+                    if current < baseline {
+                        bail!(
+                            "BE[{index}] fragment-start marker count decreased from {baseline} to {current}"
+                        );
+                    }
+                    all_fresh &= current > baseline;
+                }
+                all_fresh
+            };
+            if all_fresh {
                 if !worker_fault_state.claim_fault() {
                     bail!(
-                        "query completed before BE[{index}] fault could claim the fresh ScheduledFragments observation"
+                        "query completed before the post-fragment-start fault could claim fresh ScheduledFragments observations"
                     );
                 }
-                worker_server
+                let mut server = worker_server
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
-                    .kill_be(index)?;
+                    .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+                fault.apply(server.as_mut())?;
                 return Ok(());
             }
             if worker_fault_state.query_is_done() {
-                bail!(
-                    "query completed before BE[{index}] ScheduledFragments advanced past {baseline}"
-                );
+                bail!("query completed before every required BE ScheduledFragments count advanced");
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "timed out waiting for BE[{index}] ScheduledFragments to advance past {baseline}"
+                    "timed out waiting for every required BE ScheduledFragments count to advance"
                 );
             }
             sleep(POST_FRAGMENT_START_POLL_INTERVAL);
@@ -567,6 +614,101 @@ mod tests {
                 "query:end",
             ]
         );
+    }
+
+    struct AllBackendsReleaseServerHandle {
+        state: Arc<(Mutex<AllBackendsReleaseState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct AllBackendsReleaseState {
+        baseline_reads: Vec<usize>,
+        fresh_reads: Vec<usize>,
+        query_started: bool,
+        released_index: Option<usize>,
+        events: Vec<&'static str>,
+    }
+
+    impl ServerHandle for AllBackendsReleaseServerHandle {
+        fn target_host(&self) -> Option<&str> {
+            None
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            None
+        }
+
+        fn supports_fault_injection(&self) -> bool {
+            true
+        }
+
+        fn be_count(&self) -> usize {
+            3
+        }
+
+        fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
+            let (lock, _) = self.state.as_ref();
+            let mut state = lock.lock().expect("all-backend release state");
+            if state.query_started {
+                state.fresh_reads.push(index);
+                Ok(11)
+            } else {
+                state.baseline_reads.push(index);
+                Ok(10)
+            }
+        }
+
+        fn release_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
+            let (lock, wake) = self.state.as_ref();
+            let mut state = lock.lock().expect("all-backend release state");
+            state.released_index = Some(index);
+            state.events.push("release");
+            wake.notify_all();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fragment_failure_release_waits_for_fresh_counts_on_every_backend() {
+        let state = Arc::new((
+            Mutex::new(AllBackendsReleaseState::default()),
+            Condvar::new(),
+        ));
+        let server_handle: Arc<Mutex<Box<dyn ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(AllBackendsReleaseServerHandle {
+                state: Arc::clone(&state),
+            })));
+        let meta = QueryMeta {
+            fail_fragment_after_start_be_index: Some(1),
+            ..QueryMeta::default()
+        };
+
+        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, || {
+            let (lock, wake) = state.as_ref();
+            let mut query = lock.lock().expect("all-backend release state");
+            query.events.push("query:start");
+            query.query_started = true;
+            wake.notify_all();
+            query = wake
+                .wait_while(query, |state| state.released_index.is_none())
+                .expect("wait for runner release");
+            query.events.push("query:end");
+            42
+        })
+        .expect("active-query fragment failure release");
+
+        assert_eq!(result, 42);
+        let state = state.0.lock().expect("all-backend release state");
+        assert_eq!(state.baseline_reads, vec![0, 1, 2]);
+        assert!(
+            [0, 1, 2]
+                .into_iter()
+                .all(|index| state.fresh_reads.contains(&index)),
+            "release must observe a fresh ScheduledFragments count on every BE: {:?}",
+            state.fresh_reads
+        );
+        assert_eq!(state.released_index, Some(1));
+        assert_eq!(state.events, vec!["query:start", "release", "query:end"]);
     }
 
     #[test]
