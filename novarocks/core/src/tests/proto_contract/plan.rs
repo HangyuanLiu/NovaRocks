@@ -184,7 +184,6 @@ fn iceberg_table(table: &str, file_count: usize) -> plan::TableDef {
                             partition_values: vec![],
                         })
                         .collect(),
-                    cloud_properties: Default::default(),
                     binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
                 },
             )),

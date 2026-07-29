@@ -572,7 +572,6 @@ mod tests {
                                 plan::IcebergDataFiles {
                                     table: Some(variant_table_info()),
                                     files: Vec::new(),
-                                    cloud_properties: HashMap::new(),
                                     binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
                                 },
                             )),
@@ -964,7 +963,6 @@ mod tests {
             plan::IcebergDataFiles {
                 table: Some(table_info()),
                 files: Vec::new(),
-                cloud_properties: HashMap::new(),
                 binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
             },
         ));
@@ -1145,7 +1143,6 @@ mod tests {
             plan::IcebergDataFiles {
                 table: Some(table_info()),
                 files: Vec::new(),
-                cloud_properties: HashMap::new(),
                 binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
             },
         ));
@@ -1165,7 +1162,6 @@ mod tests {
             plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
                 table: Some(table_info()),
                 files: Vec::new(),
-                cloud_properties: HashMap::new(),
                 binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
             }),
         );

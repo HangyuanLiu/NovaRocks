@@ -1087,8 +1087,8 @@ message StarRocksColumnSchema {
 message IcebergDataFiles {
   IcebergTableInfo table = 1;                      // Iceberg table identity and schema.
   repeated IcebergDataFileInfo files = 2;          // explicit data files, possibly empty.
-  map<string, string> cloud_properties = 3;        // object-store properties.
   IcebergDataFileBinding binding = 4;              // current-snapshot vs explicit-file binding.
+  reserved 3; // former cloud_properties; credentials never enter a read carrier.
 }
 
 // Iceberg data-file binding provenance.

@@ -684,7 +684,6 @@ fn encode_scan_source(
                     .iter()
                     .map(encode_iceberg_data_file_info)
                     .collect::<Result<Vec<_>, _>>()?,
-                cloud_properties: Default::default(),
                 binding: match binding {
                     iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
