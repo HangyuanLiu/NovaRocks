@@ -60,6 +60,33 @@ static BACKENDS_BY_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_backends")
 });
 
+static BACKEND_QUERY_LIFECYCLE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_lifecycle_entries",
+        "Number of backend query lifecycle entries by state.",
+        &["state"]
+    )
+    .expect("register novarocks_backend_query_lifecycle_entries")
+});
+
+static BACKEND_QUERY_LIFECYCLE_REJECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_lifecycle_rejections",
+        "Cumulative backend query lifecycle rejections by reason.",
+        &["reason"]
+    )
+    .expect("register novarocks_backend_query_lifecycle_rejections")
+});
+
+static BACKEND_QUERY_LIFECYCLE_TERMINATIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_lifecycle_terminations",
+        "Cumulative backend query lifecycle terminations by reason.",
+        &["reason"]
+    )
+    .expect("register novarocks_backend_query_lifecycle_terminations")
+});
+
 pub(crate) fn observe_fragment_scheduled() {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc();
 }
@@ -80,6 +107,44 @@ pub(crate) fn publish_backend_topology_metrics(
     ] {
         BACKENDS_BY_STATE
             .with_label_values(&[state_name])
+            .set(count as i64);
+    }
+}
+
+pub fn publish_backend_query_lifecycle_metrics(
+    snapshot: crate::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot,
+    termination_reasons: [u64; 6],
+) {
+    for (state_name, count) in [
+        ("initializing", snapshot.initializing),
+        ("initialized", snapshot.initialized),
+        ("control_attached", snapshot.control_attached),
+        ("terminating", snapshot.terminating),
+        ("tombstone", snapshot.tombstones),
+    ] {
+        BACKEND_QUERY_LIFECYCLE_ENTRIES
+            .with_label_values(&[state_name])
+            .set(count as i64);
+    }
+    for (reason, count) in [
+        ("admission", snapshot.admission_rejected),
+        ("init_conflict", snapshot.init_conflicts),
+        ("heartbeat_timeout", snapshot.heartbeat_timeouts),
+    ] {
+        BACKEND_QUERY_LIFECYCLE_REJECTIONS
+            .with_label_values(&[reason])
+            .set(count as i64);
+    }
+    for (reason, count) in [
+        ("coordinator_abort", termination_reasons[0]),
+        ("coordinator_finalize", termination_reasons[1]),
+        ("coordinator_stream_lost", termination_reasons[2]),
+        ("coordinator_heartbeat_timeout", termination_reasons[3]),
+        ("local_failure", termination_reasons[4]),
+        ("pre_start_timeout", termination_reasons[5]),
+    ] {
+        BACKEND_QUERY_LIFECYCLE_TERMINATIONS
+            .with_label_values(&[reason])
             .set(count as i64);
     }
 }
@@ -175,6 +240,9 @@ fn refresh_backend_gauges() {
     Lazy::force(&HEARTBEAT_RTT_SECONDS);
     Lazy::force(&LIVE_BACKENDS);
     Lazy::force(&BACKENDS_BY_STATE);
+    Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES);
+    Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS);
+    Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS);
 }
 
 #[cfg(test)]

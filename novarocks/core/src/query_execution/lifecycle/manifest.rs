@@ -275,6 +275,38 @@ impl RuntimeFilterContribution {
         digest.update(envelope.encode_to_vec());
         Self::new(participant_id, lifecycle, install, digest.finalize().into())
     }
+
+    #[cfg(feature = "query-execution-contract-test-support")]
+    pub fn empty_for_contract_test(
+        execution_id: QueryExecutionId,
+        participant_id: u32,
+    ) -> Result<Self, QueryLifecycleError> {
+        use std::collections::BTreeMap;
+
+        use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+        use crate::runtime_filter::port::install::{
+            RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+        };
+        use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
+
+        let epoch = DeploymentEpoch::new(execution_id.attempt_id().get());
+        let participant = RuntimeFilterParticipantId::new(participant_id);
+        let install = RuntimeFilterParticipantInstall::new(
+            RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
+            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
+                .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?,
+        );
+        let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
+            delivery_expire: Duration::from_secs(5),
+            query_expire: Duration::from_secs(30),
+            transport_retry_interval: Duration::from_millis(200),
+            transport_max_attempts: 3,
+            transport_deadline: Duration::from_secs(2),
+            transport_max_pending_entries: 1024,
+            transport_max_pending_bytes: 1 << 20,
+        };
+        Self::from_compiled(execution_id, participant_id, lifecycle, install)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

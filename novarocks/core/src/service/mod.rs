@@ -45,6 +45,7 @@ pub mod internal_rpc_client;
 pub(crate) mod internal_rpc_transport;
 pub mod load_tracking_http;
 pub(crate) mod metrics_http;
+pub use metrics_http::publish_backend_query_lifecycle_metrics;
 pub mod native_fragment_ingress;
 #[cfg(test)]
 pub(crate) mod native_fragment_service_test_fixture;
