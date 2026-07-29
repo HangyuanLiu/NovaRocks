@@ -24,7 +24,6 @@ mod instance;
 mod metadata;
 mod read;
 
-#[cfg(feature = "connector-conformance")]
 pub mod conformance;
 
 pub use context::{ConnectorCancellation, ConnectorRequestContext};

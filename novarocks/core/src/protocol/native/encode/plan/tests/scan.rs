@@ -561,7 +561,6 @@ fn file_binding_for_test(
         execution: ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
             table,
             files: Vec::new(),
-            cloud_properties: BTreeMap::from([("region".to_string(), "test".to_string())]),
             binding: file_binding,
         }),
         physical_columns,

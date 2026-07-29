@@ -109,12 +109,11 @@ fn prepare_scan_node(
         ScanSource::IcebergDataFiles {
             table,
             files,
-            cloud_properties,
             binding,
+            ..
         } => ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
             table: table.clone(),
             files: files.clone(),
-            cloud_properties: cloud_properties.clone(),
             binding: *binding,
         }),
         ScanSource::IcebergMetadataTable { .. } => {

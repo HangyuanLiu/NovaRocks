@@ -254,7 +254,6 @@ fn resolved_files(files: Vec<IcebergDataFileInfo>) -> ResolvedScanExecution {
     ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
         table: iceberg_table(),
         files,
-        cloud_properties: BTreeMap::new(),
         binding: IcebergDataFileBinding::ExplicitFiles,
     })
 }

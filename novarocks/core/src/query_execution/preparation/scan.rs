@@ -52,7 +52,6 @@ pub(crate) enum ResolvedScanExecution {
 pub(crate) struct ResolvedIcebergFileScan {
     pub table: IcebergTableInfo,
     pub files: Vec<IcebergDataFileInfo>,
-    pub cloud_properties: BTreeMap<String, String>,
     pub binding: IcebergDataFileBinding,
 }
 

@@ -120,8 +120,8 @@ fn resolve_file_scan(
     let ScanSource::IcebergDataFiles {
         table,
         files,
-        cloud_properties,
         binding,
+        ..
     } = source
     else {
         return Err(format!(
@@ -131,7 +131,6 @@ fn resolve_file_scan(
     Ok(ResolvedIcebergFileScan {
         table,
         files,
-        cloud_properties,
         binding,
     })
 }
