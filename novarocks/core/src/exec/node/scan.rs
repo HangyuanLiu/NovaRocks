@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::file_execution::FileScanRange;
-use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
@@ -40,19 +39,7 @@ pub enum ScanMorsel {
         offset: u64,
         length: u64,
         scan_range_id: i32,
-        first_row_id: Option<i64>,
-        /// Iceberg V3 data sequence number for the manifest entry this range
-        /// belongs to. Used to synthesize `_last_updated_sequence_number`.
-        /// None for non-row-lineage scans.
-        data_sequence_number: Option<i64>,
-        ivm_change_op: Option<i8>,
-        included_positions: Option<Vec<i64>>,
         external_datacache: Option<ExternalDataCacheRangeOptions>,
-        /// Iceberg v2 position-delete files that apply to this data file.
-        /// Empty for append-only tables and for v1 scans.
-        delete_files: Vec<IcebergDeleteFileSpec>,
-        iceberg_file_pruning:
-            Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata>,
     },
     #[cfg(feature = "compat")]
     StarRocksRange {
@@ -85,27 +72,15 @@ impl ScanMorsel {
                 offset,
                 length,
                 scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions,
                 external_datacache,
-                delete_files,
-                iceberg_file_pruning,
             } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} included_positions={} external_datacache={:?} delete_files={} iceberg_file_pruning={}",
+                "path={} file_len={} offset={} length={} scan_range_id={} external_datacache={:?}",
                 path,
                 file_len,
                 offset,
                 length,
                 scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions.as_ref().map(|v| v.len()).unwrap_or(0),
                 external_datacache,
-                delete_files.len(),
-                iceberg_file_pruning.is_some()
             ),
             #[cfg(feature = "compat")]
             ScanMorsel::StarRocksRange { index, tablet_id } => {
@@ -140,26 +115,14 @@ impl ScanMorsel {
                 offset,
                 length,
                 scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions,
                 external_datacache,
-                delete_files,
-                iceberg_file_pruning,
             } => Some(FileScanRange {
                 path: path.clone(),
                 file_len: *file_len,
                 offset: *offset,
                 length: *length,
                 scan_range_id: *scan_range_id,
-                first_row_id: *first_row_id,
-                data_sequence_number: *data_sequence_number,
-                ivm_change_op: *ivm_change_op,
-                included_positions: included_positions.clone(),
                 external_datacache: external_datacache.clone(),
-                delete_files: delete_files.clone(),
-                iceberg_file_pruning: iceberg_file_pruning.clone(),
             }),
             _ => None,
         }

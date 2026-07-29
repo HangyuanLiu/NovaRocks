@@ -16,14 +16,12 @@
 // under the License.
 
 use crate::connector::ConnectorRegistry;
-use crate::connector::iceberg::scan_range::IcebergScanRangeContext;
 use crate::query_execution::preparation::scan::{
-    PlannedConnectorRead, ResolvedIcebergFileScan, ResolvedScanExecution,
+    PlannedConnectorRead, ResolvedScanExecution,
 };
 use crate::sql::planner::payload::PlanScanNode;
 
 use super::projection::effective_scan_column_names;
-use super::pruning::native_scan_min_max_predicates;
 
 pub(crate) fn build_iceberg_metadata_scan_range_params()
 -> crate::runtime::scan_range::ScanRangeParams {
@@ -50,47 +48,6 @@ pub(crate) fn build_iceberg_metadata_scan_range_params()
         ivm_change_op: None,
         file_pruning_min_max_values: None,
     })
-}
-
-pub(super) fn plan_iceberg_file_ranges(
-    connectors: &ConnectorRegistry,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    scan: &PlanScanNode,
-    execution: &ResolvedScanExecution,
-) -> Result<
-    (
-        Vec<crate::runtime::scan_range::ScanRangeParams>,
-        Vec<String>,
-    ),
-    String,
-> {
-    let ResolvedScanExecution::IcebergFiles(files) = execution else {
-        return Err("Iceberg file range planning requires IcebergFiles execution".to_string());
-    };
-    let base_column_names = effective_scan_column_names(scan);
-    let mut effective_column_names = base_column_names.clone();
-    let mut planned_files =
-        plan_files(connectors, context.clone(), files, &effective_column_names)?;
-    let equality_required =
-        crate::connector::iceberg::scan_range::equality_delete_required_columns(
-            &files.table,
-            &planned_files,
-        )?;
-    effective_column_names =
-        merge_effective_column_names(base_column_names.clone(), &equality_required);
-    if effective_column_names != base_column_names {
-        planned_files = plan_files(connectors, context, files, &effective_column_names)?;
-    }
-    let plan = crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(
-        &files.table,
-        &planned_files,
-        &effective_column_names,
-        IcebergScanRangeContext {
-            min_max_predicates: native_scan_min_max_predicates(&scan.predicates),
-            columns: scan.table.columns.clone(),
-        },
-    )?;
-    Ok((plan.scan_ranges, equality_required))
 }
 
 /// Plans executable opaque splits through the real Iceberg connector instance.
@@ -130,44 +87,4 @@ pub(super) fn plan_iceberg_connector_read(
         splits: planned.splits,
         batch: planned.batch,
     })
-}
-
-fn merge_effective_column_names(existing: Vec<String>, additional: &[String]) -> Vec<String> {
-    use std::collections::BTreeSet;
-
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for name in existing.into_iter().chain(additional.iter().cloned()) {
-        if seen.insert(name.to_ascii_lowercase()) {
-            out.push(name);
-        }
-    }
-    out
-}
-
-fn plan_files(
-    connectors: &ConnectorRegistry,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    files: &ResolvedIcebergFileScan,
-    column_names: &[String],
-) -> Result<Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>, String> {
-    let projection = column_names
-        .iter()
-        .filter_map(|name| {
-            files
-                .table
-                .schema
-                .fields
-                .iter()
-                .position(|field| field.name.eq_ignore_ascii_case(name))
-        })
-        .collect::<Vec<_>>();
-    crate::connector::iceberg::provider::plan_scan_files(
-        connectors,
-        context,
-        &files.table,
-        files.binding,
-        &files.files,
-        &projection,
-    )
 }

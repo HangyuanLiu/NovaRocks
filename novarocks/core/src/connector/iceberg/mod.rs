@@ -44,7 +44,6 @@ pub(crate) mod report;
 pub(crate) mod row_lineage_synth;
 pub mod scan_deletes;
 pub mod scan_model;
-pub(crate) mod scan_range;
 pub mod schema;
 pub mod sink;
 pub(crate) mod sink_plan;

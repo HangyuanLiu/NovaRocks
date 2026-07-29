@@ -21,7 +21,6 @@ use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMa
 use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
-use crate::connector::file_execution::FileScanRange;
 use crate::connector::iceberg::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue,
 };
@@ -141,43 +140,6 @@ pub(crate) fn file_may_satisfy_scan_predicates(
     true
 }
 
-pub(crate) fn iceberg_range_may_satisfy_scan_predicates(
-    range: &FileScanRange,
-    predicates: &[ScanPredicate],
-    counters: &mut IcebergFilePruningCounters,
-) -> bool {
-    counters.files_total += 1;
-    counters.predicates += predicates.len() as u128;
-
-    if predicates.is_empty() {
-        counters.files_selected += 1;
-        return true;
-    }
-
-    let Some(metadata) = range.iceberg_file_pruning.as_ref() else {
-        counters.unsupported += 1;
-        counters.files_selected += 1;
-        return true;
-    };
-
-    for predicate in predicates {
-        match stats_may_satisfy_predicate(Some(&metadata.columns), predicate) {
-            PredicateDecision::Evaluated(may_satisfy) => {
-                counters.stats_evaluated += 1;
-                if !may_satisfy {
-                    counters.files_pruned += 1;
-                    return false;
-                }
-            }
-            PredicateDecision::Unsupported => {
-                counters.unsupported += 1;
-            }
-        }
-    }
-
-    counters.files_selected += 1;
-    true
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PredicateDecision {

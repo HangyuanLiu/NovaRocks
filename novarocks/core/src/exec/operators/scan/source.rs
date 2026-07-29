@@ -817,13 +817,7 @@ mod tests {
             offset: 0,
             length: 0,
             scan_range_id: -1,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         }
     }
 
@@ -903,13 +897,7 @@ mod tests {
                     offset: 0,
                     length: 0,
                     scan_range_id: -1,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    ivm_change_op: None,
-                    included_positions: None,
                     external_datacache: None,
-                    delete_files: Vec::new(),
-                    iceberg_file_pruning: None,
                 })
                 .collect();
             Ok(ScanMorsels::new(morsels, false))
@@ -947,13 +935,7 @@ mod tests {
                     offset: 0,
                     length: 0,
                     scan_range_id: -1,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    ivm_change_op: None,
-                    included_positions: None,
                     external_datacache: None,
-                    delete_files: Vec::new(),
-                    iceberg_file_pruning: None,
                 }],
                 false,
             ))

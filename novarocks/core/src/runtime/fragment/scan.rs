@@ -214,13 +214,7 @@ mod tests {
             offset: 0,
             length: 0,
             scan_range_id: index as i32,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         }
     }
 
@@ -231,13 +225,7 @@ mod tests {
             offset: 0,
             length: 16,
             scan_range_id: index as i32,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         }
     }
 
