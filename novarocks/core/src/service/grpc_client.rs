@@ -248,6 +248,32 @@ impl NovaRocksGrpcRemoteClient {
         })?
     }
 
+    pub fn blocking_install_connector_instance(
+        &self,
+        req: proto::novarocks::InstallConnectorInstanceRequest,
+    ) -> Result<proto::novarocks::InstallConnectorInstanceResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.install_connector_instance(req)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| format!("install_connector_instance rpc failed: {error}"))
+        })?
+    }
+
+    pub fn blocking_retire_connector_instance(
+        &self,
+        req: proto::novarocks::RetireConnectorInstanceRequest,
+    ) -> Result<proto::novarocks::RetireConnectorInstanceResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.retire_connector_instance(req)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| format!("retire_connector_instance rpc failed: {error}"))
+        })?
+    }
+
     #[cfg(test)]
     pub(crate) fn blocking_submit_fragment_with_timeout(
         &self,

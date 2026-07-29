@@ -224,6 +224,26 @@ impl fmt::Display for NativeFragmentIngressError {
 impl std::error::Error for NativeFragmentIngressError {}
 
 pub trait NativeFragmentIngress: Send + Sync + 'static {
+    fn install_connector_instance(
+        &self,
+        _declaration: novarocks_spi::connector::ConnectorInstanceDeclaration,
+        _context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), NativeFragmentIngressError> {
+        Err(NativeFragmentIngressError::new(
+            "connector binding ingress is not configured",
+        ))
+    }
+
+    fn retire_connector_instance(
+        &self,
+        _instance_id: novarocks_spi::connector::ConnectorInstanceId,
+        _incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+    ) -> Result<(), NativeFragmentIngressError> {
+        Err(NativeFragmentIngressError::new(
+            "connector binding ingress is not configured",
+        ))
+    }
+
     fn submit_native_payload(
         &self,
         _execution_id: proto::novarocks::QueryExecutionId,

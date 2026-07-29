@@ -1166,6 +1166,79 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         ))
     }
 
+    async fn install_connector_instance(
+        &self,
+        request: tonic::Request<proto::novarocks::InstallConnectorInstanceRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::InstallConnectorInstanceResponse>, tonic::Status>
+    {
+        self.require_local_execution("InstallConnectorInstance")?;
+        let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
+            tonic::Status::failed_precondition("connector binding ingress is not configured")
+        })?;
+        let request = request.into_inner();
+        let result = tokio::task::spawn_blocking(move || {
+            let declaration = crate::service::connector_binding::decode_install_request(request)
+                .map_err(|error| error.to_string())?;
+            let context = crate::service::connector_binding::install_request_context()
+                .map_err(|error| error.to_string())?;
+            ingress
+                .install_connector_instance(declaration, context)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!(
+                "install_connector_instance handler panicked: {error}"
+            ))
+        })?;
+        let (status_code, message) = match result {
+            Ok(()) => (0, String::new()),
+            Err(error) => (1, error),
+        };
+        Ok(tonic::Response::new(
+            proto::novarocks::InstallConnectorInstanceResponse {
+                status_code,
+                message,
+            },
+        ))
+    }
+
+    async fn retire_connector_instance(
+        &self,
+        request: tonic::Request<proto::novarocks::RetireConnectorInstanceRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::RetireConnectorInstanceResponse>, tonic::Status>
+    {
+        self.require_local_execution("RetireConnectorInstance")?;
+        let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
+            tonic::Status::failed_precondition("connector binding ingress is not configured")
+        })?;
+        let request = request.into_inner();
+        let result = tokio::task::spawn_blocking(move || {
+            let (instance_id, incarnation) =
+                crate::service::connector_binding::decode_retire_request(request)
+                    .map_err(|error| error.to_string())?;
+            ingress
+                .retire_connector_instance(instance_id, incarnation)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!(
+                "retire_connector_instance handler panicked: {error}"
+            ))
+        })?;
+        let (status_code, message) = match result {
+            Ok(()) => (0, String::new()),
+            Err(error) => (1, error),
+        };
+        Ok(tonic::Response::new(
+            proto::novarocks::RetireConnectorInstanceResponse {
+                status_code,
+                message,
+            },
+        ))
+    }
+
     async fn heartbeat(
         &self,
         request: tonic::Request<proto::novarocks::HeartbeatRequest>,

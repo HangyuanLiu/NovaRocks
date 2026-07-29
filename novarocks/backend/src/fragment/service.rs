@@ -36,6 +36,10 @@ use novarocks::service::native_fragment_ingress::{
     NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
     NativeFragmentIngressError, NativeFragmentRequest,
 };
+use novarocks_spi::connector::{
+    ConnectorInstanceDeclaration, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorRequestContext,
+};
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
 use super::failure_injection::start_with_configured_fragment_failure_trigger;
@@ -174,6 +178,26 @@ impl NativeFragmentService {
 }
 
 impl NativeFragmentIngress for NativeFragmentService {
+    fn install_connector_instance(
+        &self,
+        declaration: ConnectorInstanceDeclaration,
+        context: ConnectorRequestContext,
+    ) -> Result<(), NativeFragmentIngressError> {
+        self.connector_registry
+            .install_distributed_instance(&declaration, &context)
+            .map_err(NativeFragmentIngressError::new)
+    }
+
+    fn retire_connector_instance(
+        &self,
+        instance_id: ConnectorInstanceId,
+        incarnation: ConnectorInstanceIncarnation,
+    ) -> Result<(), NativeFragmentIngressError> {
+        self.connector_registry
+            .retire_distributed_instance(&instance_id, incarnation)
+            .map_err(NativeFragmentIngressError::new)
+    }
+
     fn submit_native_payload(
         &self,
         execution_id: novarocks::proto::novarocks::QueryExecutionId,

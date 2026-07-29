@@ -359,8 +359,10 @@ mod tests {
     use proto::novarocks::{
         BatchReportExecStatusRequest, BatchReportExecStatusResponse, CancelFragmentRequest,
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
-        HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
-        SubmitFragmentRequest, SubmitFragmentResponse,
+        HeartbeatRequest, HeartbeatResponse, InstallConnectorInstanceRequest,
+        InstallConnectorInstanceResponse, ReportExecStatusRequest, ReportExecStatusResponse,
+        RetireConnectorInstanceRequest, RetireConnectorInstanceResponse, SubmitFragmentRequest,
+        SubmitFragmentResponse,
     };
     use tonic::{Request, Response, Status, Streaming};
 
@@ -514,6 +516,20 @@ mod tests {
             &self,
             _request: Request<Streaming<proto::novarocks::QueryControlRequest>>,
         ) -> Result<Response<Self::QueryControlStreamStream>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn install_connector_instance(
+            &self,
+            _request: Request<InstallConnectorInstanceRequest>,
+        ) -> Result<Response<InstallConnectorInstanceResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn retire_connector_instance(
+            &self,
+            _request: Request<RetireConnectorInstanceRequest>,
+        ) -> Result<Response<RetireConnectorInstanceResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 

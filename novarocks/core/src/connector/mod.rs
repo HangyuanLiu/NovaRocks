@@ -488,6 +488,31 @@ impl ConnectorRegistry {
             .retire(instance_id, incarnation)
     }
 
+    /// Installs a startup-bound read-only instance received by the native
+    /// control plane. This is the only composition-facing installation API;
+    /// fragment decoding only resolves instances already present in this host.
+    pub fn install_distributed_instance(
+        &self,
+        declaration: &ConnectorInstanceDeclaration,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
+        self.install_connector_instance(declaration, context)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Marks one distributed instance generation as retiring. Existing reader
+    /// Arcs may drain, while subsequent fragment resolution is rejected.
+    pub fn retire_distributed_instance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        incarnation: ConnectorInstanceIncarnation,
+    ) -> Result<(), String> {
+        self.retire_connector_instance(instance_id, incarnation)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn materialize_transport_connector_instance(
         &self,
         provider_id: &ConnectorProviderId,
