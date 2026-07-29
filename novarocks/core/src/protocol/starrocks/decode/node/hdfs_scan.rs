@@ -1768,19 +1768,7 @@ pub(crate) fn lower_hdfs_scan_node(
         .with_accept_empty_scan_ranges(true)
         .with_row_position(row_position_spec)
         .with_row_position_scan(row_position_scan)
-        .with_row_position_ranges(row_position_ranges)
-        .with_iceberg_virtual(Some(crate::exec::row_position::IcebergVirtualSpec {
-            file_path_slot: iceberg_virtual_file_slot,
-            row_pos_slot: iceberg_virtual_pos_slot,
-            row_id_slot: iceberg_virtual_row_id_slot,
-            last_updated_seq_slot: iceberg_virtual_last_updated_seq_slot,
-            change_op_slot: iceberg_virtual_change_op_slot,
-            file_path_field: iceberg_virtual_file_field,
-            row_pos_field: iceberg_virtual_pos_field,
-            row_id_field: iceberg_virtual_row_id_field,
-            last_updated_seq_field: iceberg_virtual_last_updated_seq_field,
-            change_op_field: iceberg_virtual_change_op_field,
-        }));
+        .with_row_position_ranges(row_position_ranges);
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),

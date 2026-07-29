@@ -19,7 +19,6 @@ mod common;
 mod delete_files;
 mod file_range;
 mod generic;
-mod iceberg_data;
 mod iceberg_delta;
 mod iceberg_metadata;
 #[cfg(feature = "compat")]
@@ -69,38 +68,11 @@ pub(crate) fn lower_scan_node(
     let source_path = path.clone().field("table").field("source");
     let output_columns = common::decode_scan_output_columns(scan, path.clone())?;
     match source {
-        plan::scan_source::Kind::IcebergDataFiles(source) => {
-            let table_path = source_path
-                .clone()
-                .field("iceberg_data_files")
-                .field("table");
-            let table = source.table.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    table_path.clone(),
-                    "IcebergDataFiles table missing",
-                )
-            })?;
-            let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
-                scan,
-                table,
-                output_columns.columns(),
-            )
-            .map_err(|error| error.into_native(path.clone()))?;
-            schema::validate_decoded_iceberg_output_schema(
-                table,
-                source_path.clone().field("iceberg_data_files"),
-                &output_columns,
-                &variant_path_plan,
-            )?;
-            let read_plan = read_plan::scan_read_plan(
-                scan,
-                table,
-                &output_columns,
-                path.clone(),
-                source_path.clone().field("iceberg_data_files"),
-            )?;
-            iceberg_data::lower_iceberg_data_files_scan(node, scan, source, read_plan, ctx, arena)
-                .map_err(|error| error.into_native(source_path.field("iceberg_data_files")))
+        plan::scan_source::Kind::IcebergDataFiles(_) => {
+            Err(NativeFragmentDecodeError::unsupported(
+                source_path.field("iceberg_data_files"),
+                "legacy IcebergDataFiles must be materialized as ConnectorReadSource before native decoding",
+            ))
         }
         plan::scan_source::Kind::IcebergMetadataTable(source) => {
             reject_variant_columns_for_source(scan, "IcebergMetadataTable")
