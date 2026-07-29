@@ -3311,6 +3311,7 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "uuid",
 ]

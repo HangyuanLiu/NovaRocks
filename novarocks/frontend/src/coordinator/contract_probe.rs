@@ -44,6 +44,7 @@ mod tests {
     use novarocks::query_execution::write::NativeExecutionReport;
 
     use crate::coordinator::FrontendDistributedQueryCoordinator;
+    use crate::coordinator::execution::unavailable_lifecycle_transport_for_test;
     use crate::coordinator::query_registry::FrontendQueryRegistry;
     use crate::coordinator::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
     use crate::topology::FrontendTopologyController;
@@ -584,6 +585,7 @@ mod tests {
             dispatcher,
             NonZeroUsize::new(1).unwrap(),
             Arc::new(NoopRuntimeFilterDispatcher),
+            unavailable_lifecycle_transport_for_test(),
         )
     }
 
@@ -640,6 +642,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(1).unwrap(),
             Arc::new(NoopRuntimeFilterDispatcher),
+            unavailable_lifecycle_transport_for_test(),
             topology.clone(),
         );
 
@@ -711,6 +714,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(1).unwrap(),
             Arc::new(NoopRuntimeFilterDispatcher),
+            unavailable_lifecycle_transport_for_test(),
         );
 
         assert_result_outcome_preserved(coordinator.execute(first_request).unwrap(), 1).unwrap();
@@ -1310,6 +1314,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(1).unwrap(),
             Arc::new(NoopRuntimeFilterDispatcher),
+            unavailable_lifecycle_transport_for_test(),
         );
         dispatcher.report_on_submit(2, report, &coordinator);
 
@@ -1364,6 +1369,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(2).unwrap(),
             runtime_filters.clone(),
+            unavailable_lifecycle_transport_for_test(),
         );
 
         let outcome = coordinator
@@ -1408,6 +1414,7 @@ mod tests {
             dispatcher,
             NonZeroUsize::new(2).unwrap(),
             runtime_filters.clone(),
+            unavailable_lifecycle_transport_for_test(),
         );
 
         let outcome = coordinator
@@ -1434,6 +1441,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(2).unwrap(),
             runtime_filters.clone(),
+            unavailable_lifecycle_transport_for_test(),
         );
 
         let error = coordinator
@@ -1475,6 +1483,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(2).unwrap(),
             runtime_filters.clone(),
+            unavailable_lifecycle_transport_for_test(),
         );
 
         let error = match coordinator.execute(request) {
@@ -1527,6 +1536,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(2).unwrap(),
             runtime_filters,
+            unavailable_lifecycle_transport_for_test(),
         );
 
         let error = coordinator
@@ -1584,6 +1594,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(2).unwrap(),
             runtime_filters.clone(),
+            unavailable_lifecycle_transport_for_test(),
         );
 
         let error = coordinator

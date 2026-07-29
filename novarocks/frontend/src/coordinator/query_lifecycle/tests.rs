@@ -26,13 +26,21 @@ use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
 };
 use novarocks::query_execution::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-    ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
-    QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitBarrier,
-    QueryInitOutcome, QueryInitPlan, QueryInitRequest, QueryTerminationAck, QueryTerminationReason,
-    RuntimeFilterContribution,
+    AttemptId, BackendQueryControl, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
+    QueryControlAttachment, QueryControlCommand, QueryControlEndpoint, QueryControlEvent,
+    QueryExecutionId, QueryInitAck, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
+    QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
+    QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
 };
+use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::query_options::QueryOptions;
+use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
+use novarocks::service::grpc_server::GrpcService;
+use novarocks::service::native_fragment_ingress::{
+    NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
+    NativeFragmentIngressError, NativeFragmentRequest,
+};
 
 use super::barrier::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, PreReadyAttemptGuard,
@@ -1121,4 +1129,335 @@ fn frontend_query_lifecycle_query_registry_service_only_backend_loss_aborts_atte
         );
     }
     drop(lease);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service() {
+    let ingress = Arc::new(LiveLifecycleIngress::default());
+    let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
+
+    let execution_id = query_execution_id();
+    let backend = LiveBackendTarget::new(7, endpoint, 77);
+    let live_manifest = ParticipantManifest::new(
+        execution_id,
+        ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
+        [ParticipantRole::FragmentExecutor],
+        [UniqueId { hi: 801, lo: 1 }],
+        ParticipantQueryOptions::new(QueryOptions::default()),
+        1_900_000_000_000,
+        [],
+        None,
+        Duration::from_secs(30),
+        QueryControlEndpoint::new("127.0.0.1", 19_000).expect("report endpoint"),
+    )
+    .expect("live manifest");
+    let digest = QueryInitRequest::from_manifest(live_manifest.clone()).digest();
+    let plan = QueryInitPlan::from_manifests_for_contract_test(execution_id, [(7, live_manifest)])
+        .expect("live plan");
+    let (registry, _query) = registry_for(&plan);
+    let transport =
+        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let live_config = FrontendQueryLifecycleConfig::new(
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .expect("live lifecycle config");
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::clone(&transport), registry, live_config);
+
+    barrier
+        .initialize_all(plan)
+        .expect("Init and ControlReady cross the generated gRPC service")
+        .finalize()
+        .expect("Finalize crosses the same control stream");
+    let abort_ack = transport
+        .abort_query(
+            QueryLifecycleTarget::new(7, endpoint, 77),
+            QueryAbortRequest::new(execution_id, digest, "idempotent cleanup")
+                .expect("abort request"),
+            Duration::from_secs(2),
+        )
+        .expect("AbortQuery crosses the generated gRPC service");
+    assert_eq!(abort_ack.execution_id(), execution_id);
+
+    assert_eq!(
+        ingress
+            .initialized_backend
+            .lock()
+            .expect("initialized backend")
+            .clone(),
+        Some(ParticipantBackendIdentity::from_live_backend(backend).expect("identity"))
+    );
+    assert!(ingress.finalized.load(std::sync::atomic::Ordering::Acquire));
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stream_reset() {
+    let gate = Arc::new(LiveHeartbeatGate::default());
+    let ingress = Arc::new(LiveLifecycleIngress {
+        gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    });
+    let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress).await;
+    let backend = LiveBackendTarget::new(7, endpoint, 88);
+    let target = QueryLifecycleTarget::new(7, endpoint, 88);
+    let live_manifest = ParticipantManifest::new(
+        query_execution_id(),
+        ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
+        [ParticipantRole::FragmentExecutor],
+        [UniqueId { hi: 802, lo: 1 }],
+        ParticipantQueryOptions::new(QueryOptions::default()),
+        1_900_000_000_000,
+        [],
+        None,
+        Duration::from_secs(30),
+        QueryControlEndpoint::new("127.0.0.1", 19_000).expect("report endpoint"),
+    )
+    .expect("live manifest");
+    let request = QueryInitRequest::from_manifest(live_manifest);
+    let execution_id = request.manifest().execution_id();
+    let digest = request.digest();
+    let transport =
+        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    transport
+        .init_query(target, request, Duration::from_secs(2))
+        .expect("InitQuery");
+    let session = transport
+        .attach_control(
+            target,
+            QueryControlAttach::new(execution_id, digest, 9).expect("attach"),
+            Duration::from_secs(2),
+        )
+        .expect("attach");
+    assert_eq!(
+        session
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ControlReady"),
+        QueryControlEvent::ControlReady
+    );
+
+    for sequence in 0..32 {
+        session
+            .send(QueryControlCommand::Heartbeat {
+                sequence,
+                sent_mono_ns: sequence,
+            })
+            .expect("bounded command");
+    }
+    let error = session
+        .send(QueryControlCommand::Heartbeat {
+            sequence: 33,
+            sent_mono_ns: 33,
+        })
+        .expect_err("the 33rd unacknowledged command must backpressure");
+    assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::Backpressure);
+    wait_until(Duration::from_secs(2), || {
+        gate.entered.load(std::sync::atomic::Ordering::Acquire)
+    });
+    gate.release
+        .store(true, std::sync::atomic::Ordering::Release);
+    let error = session
+        .recv_timeout(Duration::from_secs(2))
+        .expect_err("server reset must close the stream");
+    assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed);
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
+}
+
+async fn spawn_frontend_live_server(
+    ingress: Arc<dyn QueryLifecycleIngress>,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind live lifecycle server");
+    let endpoint = listener.local_addr().expect("live lifecycle endpoint");
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        let item = listener.accept().await.map(|(stream, _)| stream);
+        Some((item, listener))
+    });
+    let service = GrpcService::with_fragment_execution(
+        Arc::new(RejectNativeFragments),
+        ingress,
+        Arc::new(AcceptReports),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                novarocks::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
+                    service,
+                ),
+            )
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve live lifecycle server");
+    });
+    (endpoint, shutdown_tx, server)
+}
+
+#[derive(Default)]
+struct LiveLifecycleIngress {
+    initialized: Mutex<
+        Option<(
+            QueryExecutionId,
+            novarocks::query_execution::lifecycle::ParticipantManifestDigest,
+        )>,
+    >,
+    initialized_backend: Mutex<Option<ParticipantBackendIdentity>>,
+    finalized: Arc<std::sync::atomic::AtomicBool>,
+    gate: Option<Arc<LiveHeartbeatGate>>,
+}
+
+impl QueryLifecycleIngress for LiveLifecycleIngress {
+    fn bind_backend_identity(&self, _backend_id: u64) -> Result<(), QueryLifecycleError> {
+        Ok(())
+    }
+
+    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
+        let execution_id = request.manifest().execution_id();
+        let digest = request.digest();
+        *self
+            .initialized_backend
+            .lock()
+            .expect("initialized backend") = Some(request.manifest().backend().clone());
+        *self.initialized.lock().expect("initialized") = Some((execution_id, digest));
+        QueryInitAck::new(execution_id, digest, QueryInitOutcome::Applied)
+    }
+
+    fn abort_query(
+        &self,
+        request: QueryAbortRequest,
+    ) -> Result<QueryTerminationAck, QueryLifecycleError> {
+        Ok(QueryTerminationAck::new(
+            request.execution_id(),
+            QueryTerminationReason::CoordinatorAbort,
+        ))
+    }
+
+    fn attach_control(
+        &self,
+        attach: QueryControlAttach,
+    ) -> Result<QueryControlAttachment, QueryLifecycleError> {
+        if *self.initialized.lock().expect("initialized")
+            != Some((attach.execution_id(), attach.digest()))
+        {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "attach identity or digest mismatch",
+            ));
+        }
+        let (events, receiver) = tokio::sync::mpsc::channel(32);
+        events
+            .try_send(QueryControlEvent::ControlReady)
+            .expect("ControlReady");
+        Ok(QueryControlAttachment {
+            control: Arc::new(LiveBackendControl {
+                events,
+                finalized: Arc::clone(&self.finalized),
+                gate: self.gate.clone(),
+            }),
+            events: receiver,
+        })
+    }
+}
+
+struct LiveBackendControl {
+    events: tokio::sync::mpsc::Sender<QueryControlEvent>,
+    finalized: Arc<std::sync::atomic::AtomicBool>,
+    gate: Option<Arc<LiveHeartbeatGate>>,
+}
+
+impl BackendQueryControl for LiveBackendControl {
+    fn heartbeat(&self, sequence: u64) -> Result<(), QueryLifecycleError> {
+        if let Some(gate) = &self.gate {
+            gate.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+            while !gate.release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Transport,
+                "reset live test stream",
+            ));
+        }
+        self.events
+            .try_send(QueryControlEvent::HeartbeatAck { sequence })
+            .map_err(live_control_error)
+    }
+
+    fn abort(&self, _reason: String) -> Result<(), QueryLifecycleError> {
+        self.events
+            .try_send(QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorAbort,
+            })
+            .map_err(live_control_error)
+    }
+
+    fn finalize(&self) -> Result<(), QueryLifecycleError> {
+        self.finalized
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.events
+            .try_send(QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorFinalize,
+            })
+            .map_err(live_control_error)
+    }
+
+    fn coordinator_lost(&self, _reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct LiveHeartbeatGate {
+    entered: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+}
+
+fn live_control_error(
+    error: tokio::sync::mpsc::error::TrySendError<QueryControlEvent>,
+) -> QueryLifecycleError {
+    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+}
+
+struct RejectNativeFragments;
+
+impl NativeFragmentIngress for RejectNativeFragments {
+    fn submit(
+        &self,
+        _request: NativeFragmentRequest,
+    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+        Err(NativeFragmentIngressError::new(
+            "live lifecycle test does not submit fragments",
+        ))
+    }
+
+    fn cancel(
+        &self,
+        _request: NativeFragmentCancelRequest,
+    ) -> Result<(), NativeFragmentIngressError> {
+        Ok(())
+    }
+}
+
+struct AcceptReports;
+
+impl NativeReportHandler for AcceptReports {
+    fn handle_native_report(
+        &self,
+        _report: novarocks::proto::novarocks::ExecStatusReport,
+    ) -> Result<(), NativeReportHandlerError> {
+        Ok(())
+    }
 }

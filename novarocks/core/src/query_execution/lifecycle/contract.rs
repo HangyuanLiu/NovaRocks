@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,6 +89,115 @@ pub enum QueryControlCommand {
     Abort { reason: String },
     Finalize,
 }
+
+pub trait QueryLifecycleTransport: Send + Sync + 'static {
+    fn init_query(
+        &self,
+        target: QueryLifecycleTarget,
+        request: QueryInitRequest,
+        timeout: Duration,
+    ) -> Result<QueryInitAck, QueryLifecycleTransportError>;
+
+    fn attach_control(
+        &self,
+        target: QueryLifecycleTarget,
+        attach: QueryControlAttach,
+        timeout: Duration,
+    ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError>;
+
+    fn abort_query(
+        &self,
+        target: QueryLifecycleTarget,
+        request: QueryAbortRequest,
+        timeout: Duration,
+    ) -> Result<QueryTerminationAck, QueryLifecycleTransportError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryLifecycleTarget {
+    backend_idx: usize,
+    endpoint: SocketAddr,
+    start_epoch: u64,
+}
+
+impl QueryLifecycleTarget {
+    pub const fn new(backend_idx: usize, endpoint: SocketAddr, start_epoch: u64) -> Self {
+        Self {
+            backend_idx,
+            endpoint,
+            start_epoch,
+        }
+    }
+
+    pub const fn backend_idx(self) -> usize {
+        self.backend_idx
+    }
+
+    pub const fn endpoint(self) -> SocketAddr {
+        self.endpoint
+    }
+
+    pub const fn start_epoch(self) -> u64 {
+        self.start_epoch
+    }
+}
+
+pub trait QueryControlSession: Send + Sync + 'static {
+    fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError>;
+
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<QueryControlEvent, QueryLifecycleTransportError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryLifecycleTransportErrorKind {
+    DeadlineExceeded,
+    StreamClosed,
+    Backpressure,
+    InvalidResponse,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryLifecycleTransportError {
+    kind: QueryLifecycleTransportErrorKind,
+    detail: String,
+}
+
+impl QueryLifecycleTransportError {
+    pub fn new(kind: QueryLifecycleTransportErrorKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> QueryLifecycleTransportErrorKind {
+        self.kind
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    pub const fn is_unknown_init_outcome(&self) -> bool {
+        matches!(
+            self.kind,
+            QueryLifecycleTransportErrorKind::DeadlineExceeded
+                | QueryLifecycleTransportErrorKind::StreamClosed
+        )
+    }
+}
+
+impl std::fmt::Display for QueryLifecycleTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}: {}", self.kind, self.detail)
+    }
+}
+
+impl std::error::Error for QueryLifecycleTransportError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryTerminationReason {

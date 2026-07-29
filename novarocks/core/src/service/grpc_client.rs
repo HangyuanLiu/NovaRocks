@@ -22,6 +22,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::sync::mpsc::SyncSender;
 
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::transport::Channel;
 
@@ -42,6 +43,13 @@ pub use crate::proto;
 pub struct NovaRocksGrpcRemoteClient {
     host: String,
     port: u16,
+}
+
+#[derive(Debug)]
+pub(crate) enum QueryLifecycleRpcError {
+    DeadlineExceeded(String),
+    Status(tonic::Status),
+    Transport(String),
 }
 
 impl NovaRocksGrpcRemoteClient {
@@ -136,6 +144,95 @@ impl NovaRocksGrpcRemoteClient {
         proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
             .max_encoding_message_size(GRPC_MAX_ENCODING_BYTES)
             .max_decoding_message_size(GRPC_MAX_DECODING_BYTES)
+    }
+
+    pub(crate) async fn init_query_async(
+        &self,
+        request: proto::novarocks::InitQueryRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::InitQueryResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("init_query", deadline_at)
+            .await
+            .map_err(|error| lifecycle_channel_error("init_query", error))?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::DeadlineExceeded(
+                "init_query deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.init_query(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::DeadlineExceeded(
+                    "init_query deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::Status)
+    }
+
+    pub(crate) async fn abort_query_async(
+        &self,
+        request: proto::novarocks::AbortQueryRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::AbortQueryResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("abort_query", deadline_at)
+            .await
+            .map_err(|error| lifecycle_channel_error("abort_query", error))?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::DeadlineExceeded(
+                "abort_query deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.abort_query(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::DeadlineExceeded(
+                    "abort_query deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::Status)
+    }
+
+    pub(crate) async fn attach_query_control_async(
+        &self,
+        outbound: ReceiverStream<proto::novarocks::QueryControlRequest>,
+        timeout: Duration,
+    ) -> Result<tonic::Streaming<proto::novarocks::QueryControlResponse>, QueryLifecycleRpcError>
+    {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("query_control_attach", deadline_at)
+            .await
+            .map_err(|error| lifecycle_channel_error("query_control_attach", error))?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::DeadlineExceeded(
+                "query_control_attach deadline exceeded before stream RPC submission".to_string(),
+            ));
+        }
+        tokio::time::timeout_at(
+            deadline_at,
+            client.query_control_stream(Request::new(outbound)),
+        )
+        .await
+        .map_err(|_| {
+            QueryLifecycleRpcError::DeadlineExceeded(
+                "query_control_attach deadline exceeded during stream RPC".to_string(),
+            )
+        })?
+        .map(|response| response.into_inner())
+        .map_err(QueryLifecycleRpcError::Status)
     }
 
     pub fn blocking_submit_fragment(
@@ -410,6 +507,14 @@ impl NovaRocksGrpcRemoteClient {
                 .map(|r| r.into_inner())
                 .map_err(|e| format!("heartbeat rpc failed: {e}"))
         })?
+    }
+}
+
+fn lifecycle_channel_error(operation: &str, error: String) -> QueryLifecycleRpcError {
+    if error.contains("deadline exceeded") {
+        QueryLifecycleRpcError::DeadlineExceeded(error)
+    } else {
+        QueryLifecycleRpcError::Transport(format!("{operation} {error}"))
     }
 }
 

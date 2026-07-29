@@ -39,8 +39,9 @@ use novarocks::query_execution::contract::{
 use novarocks::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
 };
-use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId, QueryLifecycleTransport};
 use novarocks::query_execution::write::WriteReportBuilder;
+use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 
 use super::backend_events::BackendQueryActivity;
 use super::query_registry::FrontendQueryRegistry;
@@ -180,20 +181,77 @@ enum BackendServicesSource {
     Fixed {
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
-        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     },
     #[cfg(test)]
     Sequence {
         schedulers: Mutex<VecDeque<FrontendFragmentScheduler>>,
         dispatcher: Arc<dyn FragmentDispatcher>,
-        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     },
 }
 
 struct QueryBackendServices {
     scheduler: FrontendFragmentScheduler,
     dispatcher: Arc<dyn FragmentDispatcher>,
-    runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+    #[allow(dead_code)]
+    lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
+}
+
+#[cfg(test)]
+pub(crate) fn unavailable_lifecycle_transport_for_test() -> Arc<dyn QueryLifecycleTransport> {
+    Arc::new(UnavailableLifecycleTransportForTest)
+}
+
+#[cfg(test)]
+struct UnavailableLifecycleTransportForTest;
+
+#[cfg(test)]
+impl QueryLifecycleTransport for UnavailableLifecycleTransportForTest {
+    fn init_query(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _request: novarocks::query_execution::lifecycle::QueryInitRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryInitAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Err(unavailable_lifecycle_transport_error_for_test())
+    }
+
+    fn attach_control(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _attach: novarocks::query_execution::lifecycle::QueryControlAttach,
+        _timeout: Duration,
+    ) -> Result<
+        Arc<dyn novarocks::query_execution::lifecycle::QueryControlSession>,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Err(unavailable_lifecycle_transport_error_for_test())
+    }
+
+    fn abort_query(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _request: novarocks::query_execution::lifecycle::QueryAbortRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryTerminationAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Err(unavailable_lifecycle_transport_error_for_test())
+    }
+}
+
+#[cfg(test)]
+fn unavailable_lifecycle_transport_error_for_test()
+-> novarocks::query_execution::lifecycle::QueryLifecycleTransportError {
+    novarocks::query_execution::lifecycle::QueryLifecycleTransportError::new(
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportErrorKind::Unavailable,
+        "test lifecycle transport was not injected",
+    )
 }
 
 impl BackendServicesSource {
@@ -205,31 +263,31 @@ impl BackendServicesSource {
                     .iter()
                     .map(|target| (target.backend_idx(), target.endpoint()))
                     .collect::<Vec<_>>();
+                let lifecycle_transport =
+                    new_grpc_query_lifecycle_transport(&targets).map_err(failed)?;
                 let snapshot = FrontendBackendSnapshot::from_live_targets(targets)?;
                 let dispatcher = new_grpc_fragment_dispatcher(&entries).map_err(failed)?;
-                let runtime_filter_dispatcher =
-                    new_grpc_runtime_filter_deployment_dispatcher(&entries).map_err(failed)?;
                 Ok(QueryBackendServices {
                     scheduler: FrontendFragmentScheduler::new(snapshot),
                     dispatcher,
-                    runtime_filter_dispatcher,
+                    lifecycle_transport,
                 })
             }
             #[cfg(test)]
             Self::Fixed {
                 scheduler,
                 dispatcher,
-                runtime_filter_dispatcher,
+                lifecycle_transport,
             } => Ok(QueryBackendServices {
                 scheduler: scheduler.clone(),
                 dispatcher: Arc::clone(dispatcher),
-                runtime_filter_dispatcher: Arc::clone(runtime_filter_dispatcher),
+                lifecycle_transport: Arc::clone(lifecycle_transport),
             }),
             #[cfg(test)]
             Self::Sequence {
                 schedulers,
                 dispatcher,
-                runtime_filter_dispatcher,
+                lifecycle_transport,
             } => Ok(QueryBackendServices {
                 scheduler: schedulers
                     .lock()
@@ -237,7 +295,7 @@ impl BackendServicesSource {
                     .pop_front()
                     .expect("frontend test backend sequence exhausted"),
                 dispatcher: Arc::clone(dispatcher),
-                runtime_filter_dispatcher: Arc::clone(runtime_filter_dispatcher),
+                lifecycle_transport: Arc::clone(lifecycle_transport),
             }),
         }
     }
@@ -248,6 +306,7 @@ pub struct FrontendDistributedQueryCoordinator {
     live_topology: Arc<FrontendLiveBackendTopology>,
     backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     backend_services: BackendServicesSource,
+    legacy_runtime_filter_dispatcher_override: Option<Arc<dyn RuntimeFilterDeploymentDispatcher>>,
     runtime_filter_worker_count: NonZeroUsize,
     next_runtime_filter_epoch: AtomicU64,
     #[cfg(test)]
@@ -272,6 +331,7 @@ impl FrontendDistributedQueryCoordinator {
             live_topology: Arc::clone(&live_topology),
             backend_topology,
             backend_services: BackendServicesSource::Live(live_topology),
+            legacy_runtime_filter_dispatcher_override: None,
             runtime_filter_worker_count,
             next_runtime_filter_epoch: AtomicU64::new(1),
             #[cfg(test)]
@@ -289,6 +349,7 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     ) -> Self {
         Self::new_for_test_with_topology(
             query_id,
@@ -297,6 +358,7 @@ impl FrontendDistributedQueryCoordinator {
             dispatcher,
             runtime_filter_worker_count,
             runtime_filter_dispatcher,
+            lifecycle_transport,
             Arc::new(crate::topology::FrontendTopologyController::new(1)),
         )
     }
@@ -309,6 +371,7 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     ) -> Self {
         let live_topology = Arc::new(FrontendLiveBackendTopology::new());
@@ -321,8 +384,9 @@ impl FrontendDistributedQueryCoordinator {
             backend_services: BackendServicesSource::Fixed {
                 scheduler,
                 dispatcher,
-                runtime_filter_dispatcher,
+                lifecycle_transport,
             },
+            legacy_runtime_filter_dispatcher_override: Some(runtime_filter_dispatcher),
             runtime_filter_worker_count,
             next_runtime_filter_epoch: AtomicU64::new(1),
             runtime_filter_barrier_calls: Arc::new(AtomicU64::new(0)),
@@ -339,6 +403,7 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     ) -> Self {
         let live_topology = Arc::new(FrontendLiveBackendTopology::new());
         Self {
@@ -350,8 +415,9 @@ impl FrontendDistributedQueryCoordinator {
             backend_services: BackendServicesSource::Sequence {
                 schedulers: Mutex::new(schedulers.into()),
                 dispatcher,
-                runtime_filter_dispatcher,
+                lifecycle_transport,
             },
+            legacy_runtime_filter_dispatcher_override: Some(runtime_filter_dispatcher),
             runtime_filter_worker_count,
             next_runtime_filter_epoch: AtomicU64::new(1),
             runtime_filter_barrier_calls: Arc::new(AtomicU64::new(0)),
@@ -421,6 +487,17 @@ impl FrontendDistributedQueryCoordinator {
         let parts = request.into_parts();
         let intent = parts.completion.intent();
         let backend_services = self.backend_services.resolve()?;
+        // Task 7 removes this pre-lifecycle runtime-filter deployment. Until that
+        // cutover, derive the production adapter from this query's frozen
+        // scheduler snapshot; tests inject their explicit legacy fake.
+        let legacy_runtime_filter_dispatcher = match &self.legacy_runtime_filter_dispatcher_override
+        {
+            Some(dispatcher) => Arc::clone(dispatcher),
+            None => new_grpc_runtime_filter_deployment_dispatcher(
+                backend_services.scheduler.backend_entries(),
+            )
+            .map_err(failed)?,
+        };
         let dispatcher = backend_services.dispatcher;
         let _query = self
             .registry
@@ -436,12 +513,12 @@ impl FrontendDistributedQueryCoordinator {
         let scheduled = parts.artifacts.bind_schedule(schedule)?;
         #[cfg(test)]
         let runtime_filters = FrontendRuntimeFilterDeployment::with_barrier_counter(
-            backend_services.runtime_filter_dispatcher,
+            legacy_runtime_filter_dispatcher,
             Arc::clone(&self.runtime_filter_barrier_calls),
         );
         #[cfg(not(test))]
         let runtime_filters =
-            FrontendRuntimeFilterDeployment::new(backend_services.runtime_filter_dispatcher);
+            FrontendRuntimeFilterDeployment::new(legacy_runtime_filter_dispatcher);
         let runtime_filter_options = RuntimeFilterDeploymentOptions::new(
             self.next_runtime_filter_epoch()?,
             backend_services.scheduler.backend_entries().to_vec(),
@@ -867,5 +944,20 @@ mod tests {
                 .backend_entries(),
             &[(8, second)]
         );
+    }
+
+    #[test]
+    fn frontend_query_lifecycle_live_transport_is_built_with_the_scheduler_snapshot() {
+        let topology = Arc::new(FrontendLiveBackendTopology::new());
+        let source = BackendServicesSource::Live(Arc::clone(&topology));
+        let endpoint = "127.0.0.1:19073".parse().expect("valid endpoint");
+        topology.replace(1, vec![LiveBackendTarget::new(7, endpoint, 21)]);
+
+        let services = source
+            .resolve()
+            .expect("one immutable snapshot builds every backend service");
+
+        assert_eq!(services.scheduler.backend_entries(), &[(7, endpoint)]);
+        assert_eq!(Arc::strong_count(&services.lifecycle_transport), 1);
     }
 }

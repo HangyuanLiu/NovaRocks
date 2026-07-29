@@ -24,9 +24,10 @@ pub mod metrics;
 
 pub use contract::{
     BackendQueryControl, QueryAbortRequest, QueryControlAttach, QueryControlAttachment,
-    QueryControlCommand, QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest,
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminationAck,
-    QueryTerminationReason,
+    QueryControlCommand, QueryControlEvent, QueryControlSession, QueryInitAck, QueryInitOutcome,
+    QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
+    QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError,
+    QueryLifecycleTransportErrorKind, QueryTerminationAck, QueryTerminationReason,
 };
 pub use identity::{AttemptId, QueryExecutionId};
 pub(crate) use init_plan::QueryInitPlanHeader;
