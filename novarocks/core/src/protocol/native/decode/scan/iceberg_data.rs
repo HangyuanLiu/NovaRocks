@@ -24,7 +24,7 @@ use super::common::{
 };
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{ScanReadPlan, maybe_project_data_scan_output};
-use crate::cache::{CacheOptions, DataCacheContext};
+use crate::cache::CacheOptions;
 use crate::connector::hdfs::{HdfsInstanceConfig, plan_native_hdfs_read_source};
 use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 use crate::exec::expr::ExprArena;
@@ -34,6 +34,7 @@ use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig};
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_fs::DataCacheContext;
 
 pub(super) fn lower_iceberg_data_files_scan(
     node: &plan::DistributedNode,
@@ -81,7 +82,7 @@ pub(super) fn lower_iceberg_data_files_scan(
         runtime_min_max_filter_columns: HashMap::new(),
         variant_path_predicates: Vec::new(),
         batch_size: Some(batch_size),
-        datacache: DataCacheContext::external(cache_options),
+        datacache: DataCacheContext::external(cache_options.to_file_cache_options()),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
         iceberg_output_schema: Some(read_plan.parquet_schema.arrow_schema_ref()),

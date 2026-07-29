@@ -24,7 +24,7 @@ use orc_rust::arrow_reader::ArrowReaderBuilder;
 use orc_rust::projection::ProjectionMask;
 use orc_rust::schema::RootDataType;
 
-use crate::cache::{CachedRangeReader, DataCacheContext};
+use crate::cache::CachedRangeReader;
 use crate::common::config;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
@@ -34,6 +34,7 @@ use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
+use novarocks_fs::DataCacheContext;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
 static ORC_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();

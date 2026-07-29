@@ -25,8 +25,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::common::file_identity::FileIdentity;
-use crate::runtime::io::io_executor;
+use crate::FileIdentity;
 
 const BLOCK_FILE_PREFIX: &str = "blockfile";
 const BLOCKS_PER_SPACE: usize = 1024;
@@ -237,9 +236,12 @@ impl BlockCache {
         }
         let cache = Arc::clone(self);
         if async_populate {
-            io_executor().submit(move |_| {
-                let _ = cache.write_sync(cache_key, block_index, data);
-            });
+            std::thread::Builder::new()
+                .name("novarocks-fs-cache-populate".to_string())
+                .spawn(move || {
+                    let _ = cache.write_sync(cache_key, block_index, data);
+                })
+                .map_err(|error| format!("spawn async block cache populate: {error}"))?;
             Ok(())
         } else {
             self.write_sync(cache_key, block_index, data)
@@ -1062,7 +1064,7 @@ pub fn get_block_cache() -> Option<Arc<BlockCache>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::file_identity::FileIdentity;
+    use crate::FileIdentity;
 
     use super::CacheKey;
 

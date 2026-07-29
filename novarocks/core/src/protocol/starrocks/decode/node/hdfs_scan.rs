@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::cache::{CacheOptions, DataCacheContext, ExternalDataCacheRangeOptions};
+use crate::cache::{CacheOptions, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::hdfs::{HdfsInstanceConfig, plan_starrocks_hdfs_read_source};
@@ -56,6 +56,7 @@ use crate::runtime::descriptor_snapshot::{
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
 use crate::thrift::{descriptors, exprs, plan_nodes, types};
+use novarocks_fs::DataCacheContext;
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
     let max_slot = visible_slot_ids
@@ -1381,7 +1382,7 @@ pub(crate) fn lower_hdfs_scan_node(
 
     debug!("HDFS_SCAN using batch_size: {:?}", batch_size);
 
-    let external_datacache = DataCacheContext::external(cache_options.clone());
+    let external_datacache = DataCacheContext::external(cache_options.to_file_cache_options());
     let (enable_file_metacache, enable_file_pagecache) =
         file_cache_flags_from_query_options(query_opts);
     if is_iceberg_table && scan_format == Some(descriptors::THdfsFileFormat::ORC) {

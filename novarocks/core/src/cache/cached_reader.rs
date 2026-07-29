@@ -22,14 +22,15 @@ use orc_rust::reader::ChunkReader as OrcChunkReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
 
-use crate::cache::cache_input_stream::CacheInputStream;
-use crate::cache::{BlockCache, CacheBlockRead, DataCacheContext, DataCacheMetricsRecorder};
 use crate::common::config;
-use crate::common::file_identity::FileIdentity;
 use crate::fs::coalesced_reader::{CoalescedRangeReader, CoalescedReadOptions};
 use crate::fs::opendal::OpendalRangeReader;
 use crate::fs::range_plan::PlannedIoRanges;
 use crate::runtime::profile::{CounterRef, ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
+use novarocks_fs::{
+    BlockCache, CacheBlockRead, CacheInputStream, DataCacheContext, DataCacheMetricsRecorder,
+    FileIdentity,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct CacheIoCounters {
@@ -356,11 +357,11 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, Once, OnceLock};
 
-    use crate::cache::block_cache::{BlockCacheOptions, get_block_cache, init_block_cache};
-    use crate::cache::{CacheOptions, DataCacheManager};
+    use crate::cache::CacheOptions;
     use crate::fs::opendal::OpendalRangeReaderFactory;
     use crate::fs::opendal::build_fs_operator;
     use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
+    use novarocks_fs::{BlockCacheOptions, DataCacheManager, get_block_cache, init_block_cache};
 
     use super::CachedRangeReader;
 
@@ -428,7 +429,8 @@ mod tests {
         let reader = factory
             .open_with_len("sample.bin", Some(8))
             .expect("open with len");
-        let ctx = DataCacheManager::instance().external_context(test_cache_options());
+        let ctx = DataCacheManager::instance()
+            .external_context(test_cache_options().to_file_cache_options());
         let cached = CachedRangeReader::new(reader, Some(ctx));
 
         let first = cached.read_bytes(0, 4).expect("first read");
@@ -454,7 +456,8 @@ mod tests {
         let reader = factory
             .open_with_len("sample.bin", Some(10))
             .expect("open with len");
-        let ctx = DataCacheManager::instance().external_context(test_cache_options());
+        let ctx = DataCacheManager::instance()
+            .external_context(test_cache_options().to_file_cache_options());
         let cached = CachedRangeReader::new(reader, Some(ctx));
 
         let bytes = cached.read_bytes(2, 6).expect("cross block read");

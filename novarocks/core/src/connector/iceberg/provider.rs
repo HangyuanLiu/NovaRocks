@@ -42,13 +42,14 @@ use super::catalog::registry::{
 };
 use super::scan_model::IcebergDataFileInfo;
 use super::scan_range::plan_iceberg_file_ranges;
-use crate::cache::{CacheOptions, DataCacheContext};
+use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::connector::HdfsScanConfig;
 use crate::connector::hdfs::HdfsFileBatchReader;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::formats::FileFormatConfig;
 use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
+use novarocks_fs::DataCacheContext;
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
@@ -659,7 +660,8 @@ impl ConnectorRead for IcebergConnectorInstance {
             batch_size: Some(batch_size),
             datacache: DataCacheContext::external(
                 CacheOptions::from_query_options(None)
-                    .map_err(|error| internal(format!("default cache options: {error}")))?,
+                    .map_err(|error| internal(format!("default cache options: {error}")))?
+                    .to_file_cache_options(),
             ),
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
             profile_label: Some("spi_iceberg_reader".to_string()),

@@ -20,7 +20,6 @@ pub mod datasketches;
 pub mod engine_error;
 pub mod engine_error_codes;
 pub mod failpoint;
-pub mod file_identity;
 pub mod ids;
 pub mod logging;
 pub mod memory_limit;

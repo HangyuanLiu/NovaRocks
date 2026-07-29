@@ -35,7 +35,7 @@ use novarocks_spi::connector::{
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
-use crate::cache::{CacheOptions, DataCacheContext};
+use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::RuntimeScanPredicateCounters;
 use crate::connector::ConnectorRegistry;
@@ -59,6 +59,7 @@ use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
+use novarocks_fs::DataCacheContext;
 
 const HDFS_SPI_PROVIDER_ID: &str = "hdfs";
 
@@ -122,7 +123,7 @@ impl ConnectorTransportFactory for HdfsNativeTransportFactory {
             runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: Vec::new(),
             batch_size: None,
-            datacache: DataCacheContext::external(cache_options),
+            datacache: DataCacheContext::external(cache_options.to_file_cache_options()),
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
             profile_label: Some("native_connector_hdfs".to_string()),
             iceberg_output_schema: Some(output_schema.arrow_schema_ref()),
@@ -740,6 +741,9 @@ pub(crate) fn build_hdfs_range_iter(
     runtime_filters: Option<&RuntimeFilterContext>,
 ) -> Result<BoxedExecIter, String> {
     let external_datacache = range.external_datacache.clone();
+    let file_external_datacache = external_datacache
+        .as_ref()
+        .map(novarocks_fs::ExternalDataCacheRangeOptions::from);
     let scan = FileScanContext::build(
         vec![range],
         profile.clone(),
@@ -764,7 +768,7 @@ pub(crate) fn build_hdfs_range_iter(
         FileFormatConfig::Parquet(mut parquet_cfg) => {
             parquet_cfg.datacache = parquet_cfg
                 .datacache
-                .with_external_range_options(external_datacache.as_ref())?;
+                .with_external_range_options(file_external_datacache.as_ref())?;
             parquet_cfg.query_global_dicts = cfg.query_global_dicts.clone();
             apply_parquet_pruning_gate_for_delete_files(&mut parquet_cfg, current_delete_files);
             FileFormatConfig::Parquet(parquet_cfg)
@@ -772,7 +776,7 @@ pub(crate) fn build_hdfs_range_iter(
         FileFormatConfig::Orc(mut orc_cfg) => {
             orc_cfg.datacache = orc_cfg
                 .datacache
-                .with_external_range_options(external_datacache.as_ref())?;
+                .with_external_range_options(file_external_datacache.as_ref())?;
             FileFormatConfig::Orc(orc_cfg)
         }
     };
@@ -1589,7 +1593,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use crate::cache::{CacheOptions, DataCacheManager};
+    use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::connector::iceberg::delete_file::{
@@ -1620,6 +1624,7 @@ mod tests {
     use crate::runtime_filter::model::contract::{ChannelId, NullOrder, SortDirection};
     use crate::runtime_filter::port::identity::LogicalVersion;
     use crate::runtime_filter::port::ordered_bound::OrderedScalar;
+    use novarocks_fs::DataCacheManager;
 
     use super::{
         HdfsConnectorInstance, HdfsDeleteAuxiliary, HdfsIcebergRuntimePruningConfig,
@@ -1757,9 +1762,9 @@ mod tests {
         }
     }
 
-    fn test_datacache_context() -> crate::cache::DataCacheContext {
+    fn test_datacache_context() -> novarocks_fs::DataCacheContext {
         let cache_options = CacheOptions::from_query_options(None).expect("cache options");
-        DataCacheManager::instance().external_context(cache_options)
+        DataCacheManager::instance().external_context(cache_options.to_file_cache_options())
     }
 
     fn test_delete_file(file_content: IcebergFileContent) -> IcebergDeleteFileSpec {

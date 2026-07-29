@@ -20,8 +20,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use parquet::file::metadata::ParquetMetaData;
 
-use crate::cache::{DataCacheManager, DataCachePageKey};
-use crate::common::file_identity::FileIdentity;
+use novarocks_fs::{DataCacheManager, DataCachePageKey, FileIdentity};
 
 const PARQUET_CACHE_NAMESPACE: &str = "formats.parquet";
 const META_KEY_PREFIX: &[u8; 2] = b"ft";
@@ -64,7 +63,7 @@ fn parquet_cache_options() -> &'static ParquetCacheOptions {
     PARQUET_CACHE_OPTIONS.get_or_init(ParquetCacheOptions::default)
 }
 
-fn datacache_page_cache() -> Option<Arc<crate::cache::DataCachePageCache>> {
+fn datacache_page_cache() -> Option<Arc<novarocks_fs::DataCachePageCache>> {
     DataCacheManager::instance().page_cache()
 }
 
@@ -249,7 +248,7 @@ fn fmix64(mut k: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::file_identity::FileIdentity;
+    use novarocks_fs::FileIdentity;
 
     use super::{meta_cache_key, page_cache_key};
 

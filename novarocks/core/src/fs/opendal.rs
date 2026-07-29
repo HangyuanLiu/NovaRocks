@@ -14,12 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::file_identity::FileIdentity;
 use crate::novarocks_logging::debug;
 use crate::runtime::global_async_runtime::data_runtime;
 use crate::runtime::profile::{CounterRef, ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use novarocks_fs::FileIdentity;
 use opendal::Operator;
 use std::future::IntoFuture;
 use std::io::{self, Read};

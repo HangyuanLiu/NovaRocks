@@ -19,8 +19,8 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::cache::block_cache::{BlockCache, CacheKey};
-use crate::common::file_identity::FileIdentity;
+use super::block_cache::{BlockCache, CacheKey};
+use crate::FileIdentity;
 
 pub struct CacheInputStream {
     cache: Arc<BlockCache>,

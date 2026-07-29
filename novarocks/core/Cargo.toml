@@ -26,6 +26,7 @@ doctest = false
 
 [dependencies]
 novarocks-catalog = { path = "../catalog" }
+novarocks-fs = { path = "../fs" }
 novarocks-spi = { path = "../spi" }
 novarocks-types = { path = "../types" }
 novarocks-version = { path = "../version" }

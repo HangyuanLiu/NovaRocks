@@ -3215,6 +3215,7 @@ dependencies = [
  "mysql",
  "mysql_common 0.32.4",
  "novarocks-catalog",
+ "novarocks-fs",
  "novarocks-spi",
  "novarocks-state-store",
  "novarocks-types",
@@ -3318,9 +3319,13 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "crc32c",
+ "libc",
  "opendal",
+ "reqwest",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -3335,6 +3340,7 @@ dependencies = [
  "novarocks-backend",
  "novarocks-compat",
  "novarocks-frontend",
+ "novarocks-fs",
  "novarocks-state-store",
  "reqwest",
  "tempfile",

@@ -16,7 +16,8 @@
 // under the License.
 
 use novarocks_fs::{
-    FileErrorKind, FileIdentity, FileReadRange, FsLocation, FsScheme, ObjectStoreConfig,
+    FileCancellation, FileErrorKind, FileIdentity, FileReadRange, FsAccessResolver, FsLocation,
+    FsScheme, ObjectStoreConfig,
 };
 
 #[test]
@@ -26,10 +27,24 @@ fn parses_local_path() {
 }
 
 #[test]
-fn parses_file_uri() {
-    let location = FsLocation::parse("file:///tmp/a.parquet").expect("file URI");
-    assert_eq!(location.scheme(), FsScheme::Local);
-    assert_eq!(location.path(), "/tmp/a.parquet");
+fn resolves_and_binds_local_file() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("a.parquet");
+    std::fs::write(&path, b"physical-bytes").expect("write fixture");
+    let access = FsAccessResolver::new()
+        .resolve_location(path.to_string_lossy(), None)
+        .expect("resolve local file");
+    let file = access
+        .bind(0, FileIdentity::new(path.to_string_lossy(), 14, Some(123)))
+        .expect("bind file");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let bytes = runtime
+        .block_on(file.read(FileReadRange::WholeFile, &FileCancellation::new()))
+        .expect("read bound file");
+    assert_eq!(bytes.as_ref(), b"physical-bytes");
 }
 
 #[test]
@@ -57,6 +72,10 @@ fn parses_hdfs_uri() {
 fn rejects_unsupported_scheme_with_structured_error() {
     let error = FsLocation::parse("ftp://host/a.parquet").expect_err("unsupported");
     assert_eq!(error.kind(), FileErrorKind::Unsupported);
+    let mixed = FsAccessResolver::new()
+        .resolve_locations(["/tmp/a.parquet", "s3://bucket/a.parquet"], None)
+        .expect_err("mixed schemes");
+    assert_eq!(mixed.kind(), FileErrorKind::Invalid);
 }
 
 #[test]

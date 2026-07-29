@@ -22,6 +22,7 @@
 //! ask this crate to read physical Parquet or ORC columns.
 
 mod access;
+mod cache;
 mod error;
 mod predicate;
 mod read;
@@ -30,6 +31,13 @@ mod runtime;
 pub use access::{
     BoundFile, FileIdentity, FsAccessHandle, FsAccessResolver, FsLocation, FsScheme,
     ObjectStoreConfig, ResolvedFsPath,
+};
+pub use cache::{
+    BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,
+    CacheOptions, DataCacheContext, DataCacheIoOptions, DataCacheManager, DataCacheMetricsRecorder,
+    DataCachePageCache, DataCachePageCacheOptions, DataCachePageKey, ExternalDataCacheRangeOptions,
+    PageCache, PageCacheStats, PageCacheValue, PageHandle, get_block_cache, init_block_cache,
+    validate_datacache_priority, validate_evict_probability, validate_non_negative_i64,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
 pub use predicate::{

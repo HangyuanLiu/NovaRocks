@@ -114,9 +114,9 @@ mod tests {
 
     use parquet::file::reader::ChunkReader;
 
-    use crate::cache::{DataCacheManager, DataCachePageCacheOptions};
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
+    use novarocks_fs::{DataCacheManager, DataCachePageCacheOptions};
 
     use super::{ParquetCachedReader, ParquetReadCachePolicy};
 

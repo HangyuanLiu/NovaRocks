@@ -24,7 +24,6 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
-use crate::cache::DataCacheManager;
 use crate::common::ids::SlotId;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::read_starrocks_batches;
@@ -43,6 +42,7 @@ use crate::runtime::descriptor_snapshot::{
     is_iceberg_v3_row_position, is_lake_row_position, lookup_file_format_config,
 };
 use crate::runtime::query_context::{QueryId, query_context_manager};
+use novarocks_fs::DataCacheManager;
 
 #[derive(Clone, Debug)]
 pub struct GlobalLateMaterializationContext {
@@ -258,7 +258,8 @@ pub fn execute_lookup_request(
             runtime_min_max_filter_columns: HashMap::new(),
             variant_path_predicates: Vec::new(),
             batch_size: scan_cfg.batch_size,
-            datacache: DataCacheManager::instance().external_context(cache_options.clone()),
+            datacache: DataCacheManager::instance()
+                .external_context(cache_options.to_file_cache_options()),
             cache_policy: ParquetReadCachePolicy::with_flags(
                 scan_cfg.enable_file_metacache,
                 scan_cfg.enable_file_pagecache,

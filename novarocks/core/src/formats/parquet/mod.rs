@@ -51,7 +51,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::cache::{CachedRangeReader, DataCacheContext};
+use crate::cache::CachedRangeReader;
 use crate::common::config;
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::{
@@ -71,6 +71,7 @@ use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
+use novarocks_fs::DataCacheContext;
 use page_selection::{
     PageSelectionResult, build_row_selection_for_row_groups,
     build_row_selection_for_scan_predicates,
@@ -2669,14 +2670,13 @@ mod tests {
     use parquet::schema::types::ColumnPath;
     use parquet::variant::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
-    use crate::cache::{
-        CacheOptions, CachedRangeReader, DataCacheManager, DataCachePageCacheOptions,
-    };
+    use crate::cache::{CacheOptions, CachedRangeReader};
     use crate::common::ids::SlotId;
     use crate::common::scan_predicate::{MembershipPredicate, ScanPredicateDomain};
     use crate::exec::chunk::ChunkSchema;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use crate::fs::scan_context::{FileScanContext, FileScanRange};
+    use novarocks_fs::{DataCacheManager, DataCachePageCacheOptions};
     use novarocks_types::PrimitiveType;
     use novarocks_types::arrow_primitive::primitive_to_arrow_type;
 
@@ -2700,9 +2700,9 @@ mod tests {
         Field::new(name, data_type, nullable).with_metadata(field_id_meta(field_id))
     }
 
-    fn test_datacache_context() -> crate::cache::DataCacheContext {
+    fn test_datacache_context() -> novarocks_fs::DataCacheContext {
         let cache_options = CacheOptions::from_query_options(None).expect("cache options");
-        DataCacheManager::instance().external_context(cache_options)
+        DataCacheManager::instance().external_context(cache_options.to_file_cache_options())
     }
 
     fn test_parquet_scan_cfg(

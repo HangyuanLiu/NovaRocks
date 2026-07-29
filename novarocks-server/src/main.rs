@@ -696,8 +696,8 @@ fn main() {
             eprintln!("NovaRocks {}", novarocks::version::full_version());
 
             let page_cache_initialized = if cfg.runtime.cache.page_cache_enable {
-                novarocks::cache::DataCacheManager::instance().init_page_cache(
-                    novarocks::cache::DataCachePageCacheOptions {
+                novarocks_fs::DataCacheManager::instance().init_page_cache(
+                    novarocks_fs::DataCachePageCacheOptions {
                         capacity: cfg.runtime.cache.page_cache_capacity,
                         evict_probability: cfg.runtime.cache.page_cache_evict_probability,
                     },
