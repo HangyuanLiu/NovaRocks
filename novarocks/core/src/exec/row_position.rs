@@ -108,34 +108,6 @@ pub struct RowPositionDescriptor {
     pub lookup_ref_slots: Vec<SlotId>,
 }
 
-/// Iceberg virtual columns used by row-level DELETE (`_file`, `_pos`) and
-/// V3 row-lineage reads (`_row_id`, `_last_updated_sequence_number`).
-/// All fields are optional: only the slots present in the SELECT list (and
-/// therefore in the scan-node output layout) are populated.
-#[derive(Clone, Debug, Default)]
-pub struct IcebergVirtualSpec {
-    pub file_path_slot: Option<SlotId>,
-    pub row_pos_slot: Option<SlotId>,
-    pub row_id_slot: Option<SlotId>,
-    pub last_updated_seq_slot: Option<SlotId>,
-    pub change_op_slot: Option<SlotId>,
-    pub file_path_field: Option<Field>,
-    pub row_pos_field: Option<Field>,
-    pub row_id_field: Option<Field>,
-    pub last_updated_seq_field: Option<Field>,
-    pub change_op_field: Option<Field>,
-}
-
-impl IcebergVirtualSpec {
-    pub fn is_empty(&self) -> bool {
-        self.file_path_slot.is_none()
-            && self.row_pos_slot.is_none()
-            && self.row_id_slot.is_none()
-            && self.last_updated_seq_slot.is_none()
-            && self.change_op_slot.is_none()
-    }
-}
-
 /// Row position spec for Iceberg V3 tables (scan_range_id + row_id).
 #[derive(Clone, Debug)]
 pub struct RowPositionSpec {
@@ -217,9 +189,4 @@ mod tests {
         assert!(!is_change_op("_change_op"));
     }
 
-    #[test]
-    fn iceberg_virtual_spec_default_is_empty() {
-        let spec = IcebergVirtualSpec::default();
-        assert!(spec.is_empty());
-    }
 }

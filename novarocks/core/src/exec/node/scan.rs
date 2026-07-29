@@ -71,12 +71,6 @@ pub enum ScanMorsel {
         index: usize,
         row_position: Option<ConnectorRowPosition>,
     },
-    /// Transitional legacy physical-file morsel. New connector reads use
-    /// `ConnectorSplit` and never expose their file details here.
-    ConnectorFileSplit {
-        index: usize,
-        range: FileScanRange,
-    },
     Schema {
         table_name: String,
     },
@@ -132,10 +126,6 @@ impl ScanMorsel {
                     .map(|position| position.scan_range_id.to_string())
                     .unwrap_or_else(|| "none".to_string())
             ),
-            ScanMorsel::ConnectorFileSplit { index, range } => format!(
-                "connector_file_split_index={index} path={} offset={} length={}",
-                range.path, range.offset, range.length
-            ),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),
         }
@@ -172,7 +162,6 @@ impl ScanMorsel {
                 delete_files: delete_files.clone(),
                 iceberg_file_pruning: iceberg_file_pruning.clone(),
             }),
-            Self::ConnectorFileSplit { range, .. } => Some(range.clone()),
             _ => None,
         }
     }

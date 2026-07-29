@@ -28,7 +28,6 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::host::ConnectorInstanceLease;
-use crate::connector::file_execution::FileScanRange;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
@@ -297,13 +296,11 @@ impl ConnectorSplitAppend {
     }
 }
 
-/// A queued provider split plus the optional file metadata that remains owned
-/// by core execution. Provider payloads never contain the sidecar.
+/// A queued provider split plus provider-neutral core row-position identity.
 #[derive(Clone)]
 pub(crate) struct ConnectorScheduledSplit {
     split: ConnectorSplit,
     row_position: Option<ConnectorRowPosition>,
-    legacy_file_range: Option<FileScanRange>,
 }
 
 impl ConnectorScheduledSplit {
@@ -311,7 +308,6 @@ impl ConnectorScheduledSplit {
         Self {
             split,
             row_position: None,
-            legacy_file_range: None,
         }
     }
 
@@ -322,17 +318,6 @@ impl ConnectorScheduledSplit {
         Self {
             split,
             row_position: Some(row_position),
-            legacy_file_range: None,
-        }
-    }
-
-    /// Temporary compatibility path for the legacy raw-file owner. It is not
-    /// used by ConnectorRead sources produced for Iceberg.
-    pub(crate) fn file(split: ConnectorSplit, file_range: FileScanRange) -> Self {
-        Self {
-            split,
-            row_position: None,
-            legacy_file_range: Some(file_range),
         }
     }
 
@@ -340,20 +325,10 @@ impl ConnectorScheduledSplit {
         &self.split
     }
 
-    pub(crate) fn file_range(&self) -> Option<&FileScanRange> {
-        self.legacy_file_range.as_ref()
-    }
-
     fn morsel(&self, index: usize) -> ScanMorsel {
-        match &self.legacy_file_range {
-            Some(range) => ScanMorsel::ConnectorFileSplit {
-                index,
-                range: range.clone(),
-            },
-            None => ScanMorsel::ConnectorSplit {
-                index,
-                row_position: self.row_position,
-            },
+        ScanMorsel::ConnectorSplit {
+            index,
+            row_position: self.row_position,
         }
     }
 }
@@ -731,7 +706,7 @@ impl ScanOp for ConnectorReadScanOp {
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<crate::exec::node::BoxedExecIter, String> {
         let index = match morsel {
-            ScanMorsel::ConnectorSplit { index, .. } | ScanMorsel::ConnectorFileSplit { index, .. } => {
+            ScanMorsel::ConnectorSplit { index, .. } => {
                 index
             }
             _ => {

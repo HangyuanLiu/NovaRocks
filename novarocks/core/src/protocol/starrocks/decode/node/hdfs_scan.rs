@@ -1056,7 +1056,6 @@ pub(crate) fn lower_hdfs_scan_node(
         }
 
         // Lowering of `_row_id` / `_last_updated_sequence_number` slots into
-        // IcebergVirtualSpec is exercised end-to-end by the Task 5 integration
         // tests (e.g. `select_row_id_and_last_updated_seq_on_v3_row_lineage_table`).
         // The synthetic-fixture style used elsewhere in this file is not added
         // here because constructing a valid `TPlanNode` for an iceberg scan
