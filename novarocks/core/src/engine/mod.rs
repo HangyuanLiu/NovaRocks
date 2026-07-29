@@ -1518,6 +1518,19 @@ impl StandaloneSession {
         self.execute_in_context_inner(sql, &context, query_opts, connector_context)
     }
 
+    #[cfg(test)]
+    pub(crate) fn execute_in_context_with_connector_context(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_opts: Option<QueryOptions>,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, String> {
+        let context = test_request_context(current_catalog, current_database);
+        self.execute_in_context_inner(sql, &context, query_opts, connector_context)
+    }
+
     fn execute_in_context_inner(
         &self,
         sql: &str,
