@@ -597,6 +597,23 @@ impl ConnectorRegistry {
     }
 }
 
+/// Registers the startup-bound installers that a BE process may use through
+/// the connector binding control plane.  Callers supply the already parsed
+/// local configuration; declarations only select the fixed `default` binding
+/// and cannot replace its credentials or endpoint.
+pub fn compose_backend_connector_installers(
+    registry: &ConnectorRegistry,
+    default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
+) -> Result<(), String> {
+    registry
+        .register_connector_instance_installer(Arc::new(
+            iceberg::provider::IcebergConnectorInstaller::new(
+                iceberg::provider::IcebergReadBinding::default_binding(default_object_store),
+            ),
+        ))
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
     let iceberg_catalogs = Arc::clone(&state.iceberg_catalogs);
     {
