@@ -75,12 +75,7 @@ impl ScanMorsel {
                 external_datacache,
             } => format!(
                 "path={} file_len={} offset={} length={} scan_range_id={} external_datacache={:?}",
-                path,
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                external_datacache,
+                path, file_len, offset, length, scan_range_id, external_datacache,
             ),
             #[cfg(feature = "compat")]
             ScanMorsel::StarRocksRange { index, tablet_id } => {
@@ -339,7 +334,6 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
-
 }
 
 /// Instance-decoded, proto-free connector ranges handed to [`ScanSource::bind`].
@@ -572,7 +566,6 @@ impl ScanNode {
     pub fn lake_glm_info(&self) -> Option<&LakeGlmScanInfo> {
         self.lake_glm_info.as_ref()
     }
-
 }
 
 impl std::fmt::Debug for ScanNode {

@@ -139,7 +139,10 @@ pub(crate) fn compile_install_plan(
 ) -> Result<ConnectorBindingInstallPlan, DistributedQueryError> {
     let mut by_backend: BTreeMap<
         usize,
-        (SocketAddr, BTreeMap<ConnectorInstanceId, ConnectorInstanceDeclaration>),
+        (
+            SocketAddr,
+            BTreeMap<ConnectorInstanceId, ConnectorInstanceDeclaration>,
+        ),
     > = BTreeMap::new();
 
     for (&fragment_id, placements) in &schedule.by_fragment {
@@ -168,7 +171,8 @@ pub(crate) fn compile_install_plan(
                     Some(existing) if existing != &read.declaration => {
                         return Err(contract_error(format!(
                             "connector instance '{}' has conflicting declarations for backend {}",
-                            instance_id.as_str(), placement.backend_idx
+                            instance_id.as_str(),
+                            placement.backend_idx
                         )));
                     }
                     Some(_) => {}
@@ -319,7 +323,10 @@ mod tests {
             ],
         };
 
-        barrier.install_all(plan).expect("all installs ACK").release();
+        barrier
+            .install_all(plan)
+            .expect("all installs ACK")
+            .release();
         assert_eq!(dispatcher.installs.lock().unwrap().len(), 3);
     }
 

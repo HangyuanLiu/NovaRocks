@@ -1219,9 +1219,7 @@ mod tests {
                     Arc::clone(&arena),
                     vec![typed],
                 );
-        let op: Arc<dyn ScanOp> = Arc::new(ValuesScanOp {
-            values: vec![1, 2],
-        });
+        let op: Arc<dyn ScanOp> = Arc::new(ValuesScanOp { values: vec![1, 2] });
         let scan = ScanNode::new_for_test(Arc::clone(&op));
         let morsels = op.build_morsels().expect("build blocking-filter morsel");
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
@@ -1432,5 +1430,4 @@ mod tests {
         );
         assert_eq!(output.columns()[0].data_type(), &DataType::Utf8);
     }
-
 }

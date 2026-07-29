@@ -374,7 +374,10 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             files.binding,
             crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
         );
-        assert_eq!(files.binding, crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32);
+        assert_eq!(
+            files.binding,
+            crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
+        );
     }
 }
 
@@ -526,7 +529,9 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     else {
         panic!("variant binding must encode as IcebergDataFiles");
     };
-    assert!(matches!(files.binding, x if x == crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32));
+    assert!(
+        matches!(files.binding, x if x == crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32)
+    );
 }
 
 fn root_scan_for_test(

@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int32Array, Int64Array, UInt32Array, new_empty_array};
 use arrow::compute::{concat, take};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
@@ -35,14 +35,11 @@ use crate::exec::row_position::RowPositionType;
 #[cfg(feature = "compat")]
 use crate::novarocks_connectors::StarRocksScanConfig;
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
-use crate::runtime::descriptor_snapshot::{
-    is_iceberg_v3_row_position, is_lake_row_position,
-};
+use crate::runtime::descriptor_snapshot::{is_iceberg_v3_row_position, is_lake_row_position};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorCancellation, ConnectorOpenReaderRequest,
-    ConnectorRequestContext,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 struct LookupCancellation {
@@ -220,7 +217,9 @@ fn execute_connector_lookup_request(
     let mut response_indices = vec![u32::MAX; request_len];
     for (response_index, request_index) in response_positions.iter().enumerate() {
         if response_indices[*request_index] != u32::MAX {
-            return Err(format!("duplicate connector lookup response position {request_index}"));
+            return Err(format!(
+                "duplicate connector lookup response position {request_index}"
+            ));
         }
         response_indices[*request_index] = response_index as u32;
     }
@@ -234,7 +233,10 @@ fn execute_connector_lookup_request(
             let chunks = column_chunks
                 .get(slot)
                 .ok_or_else(|| format!("missing connector lookup column {slot}"))?;
-            let refs = chunks.iter().map(|chunk| chunk.as_ref()).collect::<Vec<_>>();
+            let refs = chunks
+                .iter()
+                .map(|chunk| chunk.as_ref())
+                .collect::<Vec<_>>();
             let full = concat(&refs).map_err(|error| error.to_string())?;
             take(&full, &response_indices, None)
                 .map(|array| (*slot, array))

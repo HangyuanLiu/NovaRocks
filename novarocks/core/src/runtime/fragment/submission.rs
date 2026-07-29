@@ -113,10 +113,7 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
     match &node.kind {
         ExecNodeKind::Scan(scan) => {
             if let Some(node_id) = scan.node_id() {
-                output.insert(
-                    node_id,
-                    None,
-                );
+                output.insert(node_id, None);
             }
         }
         ExecNodeKind::AssertNumRows(value) => {

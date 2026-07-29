@@ -188,5 +188,4 @@ mod tests {
         assert!(!is_change_op("change_op"));
         assert!(!is_change_op("_change_op"));
     }
-
 }

@@ -140,7 +140,6 @@ pub(crate) fn file_may_satisfy_scan_predicates(
     true
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PredicateDecision {
     Evaluated(bool),

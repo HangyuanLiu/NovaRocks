@@ -79,10 +79,7 @@ impl ConnectorReaderGroup {
                 .lock()
                 .map_err(|_| "connector reader group lock poisoned".to_string())?;
             if state.phase != ConnectorReaderGroupPhase::Open {
-                return Err(format!(
-                    "connector reader group is {:?}",
-                    state.phase
-                ));
+                return Err(format!("connector reader group is {:?}", state.phase));
             }
             let reader_id = state.next_reader_id;
             state.next_reader_id = state.next_reader_id.saturating_add(1);
@@ -662,7 +659,6 @@ impl ConnectorReadScanSource {
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
-
 }
 
 impl ScanSource for ConnectorReadScanSource {
@@ -706,9 +702,7 @@ impl ScanOp for ConnectorReadScanOp {
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<crate::exec::node::BoxedExecIter, String> {
         let index = match morsel {
-            ScanMorsel::ConnectorSplit { index, .. } => {
-                index
-            }
+            ScanMorsel::ConnectorSplit { index, .. } => index,
             _ => {
                 return Err("SPI connector scan received an unexpected morsel".to_string());
             }

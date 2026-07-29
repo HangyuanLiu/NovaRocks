@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
+use crate::exec::node::scan::ConnectorRowPositionLookup;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::IncrementalScanRange;
 #[cfg(feature = "compat")]
@@ -36,7 +37,6 @@ use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
-use crate::exec::node::scan::ConnectorRowPositionLookup;
 use crate::runtime::mem_tracker::{self, MemTracker};
 pub(crate) use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::runtime_filter_observability::{
@@ -642,7 +642,10 @@ impl QueryContext {
         &self,
         row_source_slot: SlotId,
         scan_range_id: i32,
-    ) -> Option<(Arc<novarocks_spi::connector::ConnectorInstance>, novarocks_spi::connector::ConnectorSplit)> {
+    ) -> Option<(
+        Arc<novarocks_spi::connector::ConnectorInstance>,
+        novarocks_spi::connector::ConnectorSplit,
+    )> {
         let lookup = self.connector_glm_contexts.get(&row_source_slot)?;
         Some((
             Arc::clone(&lookup.instance),

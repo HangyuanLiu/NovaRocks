@@ -16,9 +16,7 @@
 // under the License.
 
 use crate::connector::ConnectorRegistry;
-use crate::query_execution::preparation::scan::{
-    PlannedConnectorRead, ResolvedScanExecution,
-};
+use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
 use crate::sql::planner::payload::PlanScanNode;
 
 use super::projection::effective_scan_column_names;

@@ -1077,11 +1077,9 @@ fn build_table_payload(
         .map(|column| column.name.clone())
         .collect();
     let (table_info, source_files) = match table_def.source {
-        crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table,
-            files,
-            ..
-        } => (table, files),
+        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, files, .. } => {
+            (table, files)
+        }
         _ => {
             return Err(internal(
                 "Iceberg metadata capability produced a non-Iceberg table source".to_string(),

@@ -241,14 +241,14 @@ impl CompatApplicationHost {
         ));
         let compat_routes = load_router(Arc::clone(&load_service), Arc::clone(&tracking));
         fragment_service
-            .compose_connector_bindings(
-                config.connector.object_store_config().map_err(|error| {
+            .compose_connector_bindings(config.connector.object_store_config().map_err(
+                |error| {
                     CompatApplicationError::new(
                         CompatApplicationErrorKind::Configuration,
                         format!("resolve connector startup object-store binding: {error}"),
                     )
-                })?,
-            )
+                },
+            )?)
             .map_err(|error| {
                 CompatApplicationError::new(
                     CompatApplicationErrorKind::Configuration,

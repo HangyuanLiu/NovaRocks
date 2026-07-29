@@ -19,8 +19,8 @@ pub mod artifact;
 pub(crate) mod assembly;
 pub mod backend;
 pub mod cancellation;
-pub mod contract;
 mod connector_binding;
+pub mod contract;
 #[cfg(feature = "query-execution-contract-test-support")]
 pub mod contract_test_support;
 pub mod control;

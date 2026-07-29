@@ -975,9 +975,11 @@ mod tests {
             .with_scan_ranges(10, vec![file_range()]);
         let error = decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect_err("legacy Iceberg source must not bypass ConnectorReadSource");
-        assert!(error.to_string().contains(
-            "legacy IcebergDataFiles must be materialized as ConnectorReadSource"
-        ));
+        assert!(
+            error
+                .to_string()
+                .contains("legacy IcebergDataFiles must be materialized as ConnectorReadSource")
+        );
     }
 
     #[test]
