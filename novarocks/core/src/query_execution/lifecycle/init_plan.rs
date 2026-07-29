@@ -38,6 +38,33 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QueryInitPlanHeader {
+    execution_id: QueryExecutionId,
+    query_deadline_unix_ms: u64,
+    runtime_filter_strategy: Option<crate::protocol::native::RuntimeFilterQueryLifecycleOptions>,
+}
+
+impl QueryInitPlanHeader {
+    const fn new(
+        execution_id: QueryExecutionId,
+        query_deadline_unix_ms: u64,
+        runtime_filter_strategy: Option<
+            crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
+        >,
+    ) -> Self {
+        Self {
+            execution_id,
+            query_deadline_unix_ms,
+            runtime_filter_strategy,
+        }
+    }
+
+    pub(crate) const fn execution_id(self) -> QueryExecutionId {
+        self.execution_id
+    }
+}
+
 pub struct QueryInitOptions {
     execution_id: QueryExecutionId,
     live_backends: Vec<LiveBackendTarget>,
@@ -414,10 +441,16 @@ pub(crate) fn compile_query_init_plan(
             digest,
         });
     }
-    Ok(QueryInitPlan {
-        execution_id: options.execution_id,
-        query_deadline_unix_ms: options.query_deadline_unix_ms,
+    let header = QueryInitPlanHeader::new(
+        options.execution_id,
+        options.query_deadline_unix_ms,
         runtime_filter_strategy,
+    );
+    fragments.freeze_query_init_header(header)?;
+    Ok(QueryInitPlan {
+        execution_id: header.execution_id,
+        query_deadline_unix_ms: header.query_deadline_unix_ms,
+        runtime_filter_strategy: header.runtime_filter_strategy,
         participants,
     })
 }
@@ -712,6 +745,48 @@ mod tests {
                 .expect("nonempty RF plan has one strategy")
                 .transport_retry_interval,
             Duration::from_millis(200)
+        );
+
+        let changed_deadline = QueryInitOptions::new(
+            execution_id(),
+            vec![backend(2)],
+            2,
+            resolved.runtime_filter_lifecycle(),
+            &resolved,
+            9_001,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+            false,
+        )
+        .expect("valid changed options");
+        let deadline_error =
+            match compile_query_init_plan(&fragments, vec![runtime_filter(2)], &changed_deadline) {
+                Ok(_) => panic!("one schedule cannot rebuild the same QEI with a new deadline"),
+                Err(error) => error,
+            };
+        assert!(
+            deadline_error
+                .message()
+                .contains("query initialization header differs")
+        );
+
+        let strategy_error = match compile_query_init_plan(
+            &fragments,
+            vec![runtime_filter_with_retry_interval(
+                2,
+                Duration::from_millis(201),
+            )],
+            &options,
+        ) {
+            Ok(_) => panic!("one schedule cannot rebuild the same QEI with a new RF strategy"),
+            Err(error) => error,
+        };
+        assert!(
+            strategy_error
+                .message()
+                .contains("query initialization header differs")
         );
     }
 }

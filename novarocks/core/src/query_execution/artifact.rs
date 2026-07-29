@@ -1334,9 +1334,49 @@ fn build_expected_output_schema(
 
 #[cfg(test)]
 mod tests {
-    use super::derive_fragment_instance_id;
+    use std::collections::BTreeMap;
+
+    use super::{build_fragment_lifecycle_projection, derive_fragment_instance_id};
+    use crate::common::types::UniqueId;
+    use crate::query_execution::backend::LiveBackendTarget;
     use crate::query_execution::contract::QueryId;
-    use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+    use crate::query_execution::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
+    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::sql::planner::distributed::{
+        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    };
+
+    fn placement(
+        fragment_id: u32,
+        instance_index: usize,
+        finst_id: UniqueId,
+        backend_idx: usize,
+    ) -> FragmentInstancePlacement {
+        FragmentInstancePlacement {
+            fragment_id,
+            instance_index,
+            finst_id,
+            backend_idx,
+            endpoint: RuntimeEndpoint::new("127.0.0.1", 19040 + backend_idx as i32)
+                .expect("valid endpoint"),
+            scan_ranges: BTreeMap::new(),
+            destinations: Vec::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        }
+    }
+
+    fn stream_edge(source_fragment_id: u32, target_fragment_id: u32, node_id: i32) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id: node_id,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
+        }
+    }
 
     #[test]
     fn fragment_instance_identity_is_stable_and_attempt_bound() {
@@ -1359,5 +1399,90 @@ mod tests {
             derive_fragment_instance_id(second_attempt, 9, 3).expect("second fragment instance id"),
             first
         );
+    }
+
+    #[test]
+    fn exchange_route_projection_canonicalizes_out_of_order_edges_and_placements() {
+        let schedule = SchedulingPlan {
+            root_fragment_id: 40,
+            by_fragment: BTreeMap::from([
+                (
+                    10,
+                    vec![
+                        placement(10, 0, UniqueId { hi: 9, lo: 1 }, 0),
+                        placement(10, 1, UniqueId { hi: 1, lo: 1 }, 1),
+                    ],
+                ),
+                (
+                    20,
+                    vec![
+                        placement(20, 0, UniqueId { hi: 8, lo: 1 }, 0),
+                        placement(20, 1, UniqueId { hi: 2, lo: 1 }, 1),
+                    ],
+                ),
+                (30, vec![placement(30, 0, UniqueId { hi: 7, lo: 1 }, 0)]),
+                (40, vec![placement(40, 0, UniqueId { hi: 6, lo: 1 }, 1)]),
+            ]),
+            root_finst_id: UniqueId { hi: 6, lo: 1 },
+            root_backend_idx: 1,
+        };
+        let edges = vec![stream_edge(30, 40, 400), stream_edge(10, 20, 200)];
+        let live_backends = BTreeMap::from([
+            (
+                0,
+                LiveBackendTarget::new(0, "127.0.0.1:19040".parse().expect("valid endpoint"), 100),
+            ),
+            (
+                1,
+                LiveBackendTarget::new(1, "127.0.0.1:19041".parse().expect("valid endpoint"), 101),
+            ),
+        ]);
+
+        let projection = build_fragment_lifecycle_projection(&schedule, &edges, live_backends)
+            .expect("valid lifecycle projection");
+        let expected = vec![
+            ExchangeRouteManifest::new(
+                UniqueId { hi: 1, lo: 1 },
+                UniqueId { hi: 2, lo: 1 },
+                200,
+                1,
+                2,
+            )
+            .expect("valid route"),
+            ExchangeRouteManifest::new(
+                UniqueId { hi: 1, lo: 1 },
+                UniqueId { hi: 8, lo: 1 },
+                200,
+                1,
+                2,
+            )
+            .expect("valid route"),
+            ExchangeRouteManifest::new(
+                UniqueId { hi: 7, lo: 1 },
+                UniqueId { hi: 6, lo: 1 },
+                400,
+                0,
+                1,
+            )
+            .expect("valid route"),
+            ExchangeRouteManifest::new(
+                UniqueId { hi: 9, lo: 1 },
+                UniqueId { hi: 2, lo: 1 },
+                200,
+                0,
+                2,
+            )
+            .expect("valid route"),
+            ExchangeRouteManifest::new(
+                UniqueId { hi: 9, lo: 1 },
+                UniqueId { hi: 8, lo: 1 },
+                200,
+                0,
+                2,
+            )
+            .expect("valid route"),
+        ];
+
+        assert_eq!(projection.exchange_routes, expected);
     }
 }

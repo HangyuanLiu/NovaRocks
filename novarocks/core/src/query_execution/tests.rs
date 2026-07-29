@@ -28,7 +28,7 @@ use crate::query_execution::contract::{
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
     build_distributed_query_request,
 };
-use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryExecutionId};
 use crate::query_execution::lifecycle::{
     QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLifecycleLease,
     QueryLifecycleLeaseGuard,
@@ -594,10 +594,10 @@ fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participan
     draft
         .assign_fragment(
             11,
-            live_backends
-                .iter()
-                .map(|target| BackendPlacement::new(target.backend_idx(), target.endpoint()))
-                .collect(),
+            vec![BackendPlacement::new(
+                live_backends[0].backend_idx(),
+                live_backends[0].endpoint(),
+            )],
         )
         .expect("schedule producer fragment");
     draft
@@ -612,6 +612,16 @@ fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participan
     let schedule =
         ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), execution_id, draft)
             .expect("validate schedule");
+    assert_eq!(
+        schedule
+            .lifecycle_projection()
+            .instances_by_backend
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![3],
+        "all scheduled fragments intentionally use a strict subset of the live backends"
+    );
     let options = QueryInitOptions::new(
         execution_id,
         live_backends,
@@ -643,8 +653,34 @@ fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participan
         let captured = captured.lock().expect("read captured plan");
         let plan = captured.as_ref().expect("captured init plan");
         assert_eq!(plan.backend_ids(), vec![3, 8]);
-        for backend_idx in [3, 8] {
-            let participant = plan.participant(backend_idx).expect("RF participant");
+        let scheduled = plan.participant(3).expect("scheduled RF participant");
+        assert_eq!(
+            scheduled.manifest().roles(),
+            &std::collections::BTreeSet::from([
+                ParticipantRole::FragmentExecutor,
+                ParticipantRole::RuntimeFilterService,
+            ])
+        );
+        assert!(
+            !scheduled
+                .manifest()
+                .expected_fragment_instance_ids()
+                .is_empty()
+        );
+
+        let service_only = plan
+            .participant(8)
+            .expect("compiler-added service-only participant");
+        assert_eq!(
+            service_only.manifest().roles(),
+            &std::collections::BTreeSet::from([ParticipantRole::RuntimeFilterService])
+        );
+        assert_eq!(
+            service_only.manifest().expected_fragment_instance_ids(),
+            &std::collections::BTreeSet::new()
+        );
+
+        for participant in [scheduled, service_only] {
             let contribution = participant
                 .manifest()
                 .runtime_filter()
@@ -653,6 +689,7 @@ fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participan
             assert_ne!(contribution.digest(), &[0; 32]);
             assert_eq!(participant.digest(), participant.manifest().digest());
         }
+        assert_ne!(scheduled.digest(), service_only.digest());
     }
     drop(ready);
 }

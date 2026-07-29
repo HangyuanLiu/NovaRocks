@@ -21,11 +21,12 @@
 //! description while preparing protocol payloads and runtime-filter routes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use crate::common::types::UniqueId;
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::lifecycle::ExchangeRouteManifest;
+use crate::query_execution::lifecycle::{ExchangeRouteManifest, QueryInitPlanHeader};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::FragmentId;
@@ -76,6 +77,7 @@ pub(crate) struct FragmentLifecycleProjection {
     pub(crate) endpoints_by_backend: BTreeMap<usize, RuntimeEndpoint>,
     pub(crate) frozen_live_backends: BTreeMap<usize, LiveBackendTarget>,
     pub(crate) exchange_routes: Vec<ExchangeRouteManifest>,
+    query_init_header: OnceLock<QueryInitPlanHeader>,
 }
 
 impl FragmentLifecycleProjection {
@@ -90,7 +92,25 @@ impl FragmentLifecycleProjection {
             endpoints_by_backend,
             frozen_live_backends: BTreeMap::new(),
             exchange_routes,
+            query_init_header: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn freeze_query_init_header(
+        &self,
+        candidate: QueryInitPlanHeader,
+    ) -> Result<(), DistributedQueryError> {
+        let frozen = self.query_init_header.get_or_init(|| candidate);
+        if *frozen != candidate {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                format!(
+                    "query initialization header differs from first construction for execution {:?}",
+                    frozen.execution_id()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn with_frozen_live_backends(

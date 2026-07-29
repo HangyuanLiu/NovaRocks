@@ -35,13 +35,15 @@ use crate::query_execution::schedule::SchedulingPlan;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime_filter::deployment::{
     RuntimeFilterDeploymentPolicy, RuntimeFilterQueryDeploymentPolicy,
-    RuntimeFilterQueryTransportPolicy,
+    RuntimeFilterQueryTransportPolicy, participant_id_for_backend,
 };
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
 use crate::runtime_filter::port::install::{
-    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
+    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
+    RuntimeFilterParticipantInstall,
 };
+use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 use crate::sql::planner::distributed::{FragmentEdge, JoinBuildProgressCatalog};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
@@ -550,6 +552,32 @@ pub(crate) fn compile_contribution_plan(
                     "runtime filter participant install projection failed: {error}"
                 ))
             })?;
+    let mut installs = installs.into_iter().collect::<BTreeMap<_, _>>();
+    // InitQuery owns query-scoped RF service readiness across the frozen live
+    // topology, including backends that do not execute a fragment for this
+    // query. Give those service-only participants a typed empty install under
+    // the same attempt epoch.
+    for target in live_backends {
+        let participant = participant_id_for_backend(target.backend_idx()).map_err(|error| {
+            contract_error(format!(
+                "runtime filter live backend {} has an invalid participant identity: {error}",
+                target.backend_idx()
+            ))
+        })?;
+        if let std::collections::btree_map::Entry::Vacant(entry) = installs.entry(participant) {
+            let core_view = RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new());
+            let routing_shard = RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
+                .map_err(|error| {
+                    failed(format!(
+                        "runtime filter service-only routing shard failed: {error}"
+                    ))
+                })?;
+            entry.insert(RuntimeFilterParticipantInstall::new(
+                core_view,
+                routing_shard,
+            ));
+        }
+    }
     let lifecycle = RuntimeFilterQueryLifecycleOptions {
         delivery_expire: lifecycle.delivery_expire(),
         query_expire: lifecycle.query_expire(),

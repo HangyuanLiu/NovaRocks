@@ -29,6 +29,7 @@ pub use contract::{
     QueryTerminationReason,
 };
 pub use identity::{AttemptId, QueryExecutionId};
+pub(crate) use init_plan::QueryInitPlanHeader;
 pub use init_plan::{
     QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan, QueryLifecycleLease,
     QueryLifecycleLeaseGuard,
