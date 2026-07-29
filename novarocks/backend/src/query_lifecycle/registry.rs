@@ -205,6 +205,17 @@ struct RegistryQueryControl {
 }
 
 impl QueryLifecycleRegistry {
+    #[cfg(test)]
+    pub(crate) fn hold_registry_state_lock_for_test(
+        &self,
+        acquired: &std::sync::Barrier,
+        release: &std::sync::Barrier,
+    ) {
+        let _state = self.state.lock().expect("query lifecycle registry lock");
+        acquired.wait();
+        release.wait();
+    }
+
     #[allow(dead_code)]
     pub(crate) fn new(
         local_backend_id: u64,
@@ -1119,17 +1130,7 @@ impl QueryLifecycleRegistry {
                 break;
             }
             state.tombstones.pop_front();
-            state.pre_init_tombstones.remove(&execution_id);
-            if state.entries.get(&execution_id).is_some_and(|entry| {
-                entry
-                    .state
-                    .lock()
-                    .expect("query lifecycle entry lock")
-                    .phase
-                    == QueryLifecyclePhase::Tombstone
-            }) {
-                state.entries.remove(&execution_id);
-            }
+            Self::evict_tombstone_execution_locked(state, execution_id);
             removed += 1;
         }
     }
@@ -1140,18 +1141,28 @@ impl QueryLifecycleRegistry {
                 .tombstones
                 .pop_front()
                 .expect("tombstone length checked");
-            state.pre_init_tombstones.remove(&execution_id);
-            if state.entries.get(&execution_id).is_some_and(|entry| {
-                entry
-                    .state
-                    .lock()
-                    .expect("query lifecycle entry lock")
-                    .phase
-                    == QueryLifecyclePhase::Tombstone
-            }) {
-                state.entries.remove(&execution_id);
-            }
+            Self::evict_tombstone_execution_locked(state, execution_id);
         }
+    }
+
+    fn evict_tombstone_execution_locked(
+        state: &mut QueryLifecycleRegistryState,
+        execution_id: QueryExecutionId,
+    ) {
+        state.pre_init_tombstones.remove(&execution_id);
+        if state.entries.get(&execution_id).is_some_and(|entry| {
+            entry
+                .state
+                .lock()
+                .expect("query lifecycle entry lock")
+                .phase
+                == QueryLifecyclePhase::Tombstone
+        }) {
+            state.entries.remove(&execution_id);
+        }
+        state
+            .fragment_executions
+            .retain(|_, mapped_execution_id| *mapped_execution_id != execution_id);
     }
 
     fn heartbeat(
@@ -1462,7 +1473,20 @@ impl InitWorkspace {
 }
 
 impl FragmentAdmissionPermit {
+    #[cfg(test)]
+    pub(crate) fn entry_for_test(&self) -> Arc<QueryLifecycleEntry> {
+        Arc::clone(&self.entry)
+    }
+
     pub(crate) fn commit(mut self) -> Result<(), QueryLifecycleError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?;
+        let mut registry_state = registry
+            .state
+            .lock()
+            .expect("query lifecycle registry lock");
         let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
         if state.termination_reason.is_some()
             || matches!(
@@ -1479,7 +1503,8 @@ impl FragmentAdmissionPermit {
                 .copied()
                 .collect::<Vec<_>>();
             drop(state);
-            if let (Some(registry), Some(reason)) = (self.registry.upgrade(), reason) {
+            drop(registry_state);
+            if let Some(reason) = reason {
                 // Termination may have raced ahead of the service registration/control
                 // publication protected by this permit. Re-drive local termination after
                 // those resources exist so the rejected admission cannot leave a live worker.
@@ -1501,38 +1526,33 @@ impl FragmentAdmissionPermit {
                 "query control is not ready for fragment admission commit",
             ));
         }
-        if !state.in_flight_fragments.remove(&self.fragment_instance_id) {
+        if !state
+            .in_flight_fragments
+            .contains(&self.fragment_instance_id)
+        {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Conflict,
                 "fragment admission permit is no longer in flight",
             ));
         }
-        state.accepted_fragments.insert(self.fragment_instance_id);
-        state.pre_start_deadline = None;
-        let registry = self
-            .registry
-            .upgrade()
-            .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?;
-        let mut registry_state = registry
-            .state
-            .lock()
-            .expect("query lifecycle registry lock");
-        let previous = registry_state
+        if registry_state
             .fragment_executions
-            .insert(self.fragment_instance_id, self.execution_id);
-        if let Some(previous_execution_id) = previous {
-            registry_state
-                .fragment_executions
-                .insert(self.fragment_instance_id, previous_execution_id);
-            drop(registry_state);
-            state.accepted_fragments.remove(&self.fragment_instance_id);
+            .contains_key(&self.fragment_instance_id)
+        {
+            state.in_flight_fragments.remove(&self.fragment_instance_id);
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Conflict,
                 "fragment instance already belongs to a committed query lifecycle admission",
             ));
         }
-        drop(registry_state);
+        registry_state
+            .fragment_executions
+            .insert(self.fragment_instance_id, self.execution_id);
+        state.in_flight_fragments.remove(&self.fragment_instance_id);
+        state.accepted_fragments.insert(self.fragment_instance_id);
+        state.pre_start_deadline = None;
         drop(state);
+        drop(registry_state);
         self.committed = true;
         if query_lifecycle_test_markers_enabled() {
             eprintln!(

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
@@ -811,6 +811,68 @@ fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
 }
 
 #[test]
+fn query_lifecycle_admission_commit_does_not_hold_entry_while_waiting_for_registry() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let expected = UniqueId { hi: 741, lo: 1 };
+    let request = fragment_init_request_fixture(741, &[expected]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _control = attach_control(&registry, &request);
+    let permit = registry
+        .admit_fragment(execution_id, expected)
+        .expect("fragment permit");
+    let entry = permit.entry_for_test();
+
+    let registry_acquired = Arc::new(Barrier::new(2));
+    let release_registry = Arc::new(Barrier::new(2));
+    let holder_registry = Arc::clone(&registry);
+    let holder_acquired = Arc::clone(&registry_acquired);
+    let holder_release = Arc::clone(&release_registry);
+    let holder = std::thread::spawn(move || {
+        holder_registry.hold_registry_state_lock_for_test(&holder_acquired, &holder_release);
+    });
+    registry_acquired.wait();
+
+    let commit_started = Arc::new(Barrier::new(2));
+    let commit_started_thread = Arc::clone(&commit_started);
+    let commit = std::thread::spawn(move || {
+        commit_started_thread.wait();
+        permit.commit()
+    });
+    commit_started.wait();
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut entry_was_locked = false;
+    while Instant::now() < deadline {
+        match entry.state.try_lock() {
+            Ok(state) => drop(state),
+            Err(TryLockError::WouldBlock) => {
+                entry_was_locked = true;
+                break;
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                panic!("query lifecycle entry lock poisoned: {error}")
+            }
+        }
+        std::thread::yield_now();
+    }
+
+    release_registry.wait();
+    holder.join().expect("registry lock holder");
+    commit
+        .join()
+        .expect("fragment commit thread")
+        .expect("fragment admission commits");
+    assert!(
+        !entry_was_locked,
+        "fragment commit must acquire the registry lock before the entry lock"
+    );
+}
+
+#[test]
 fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let expected = UniqueId { hi: 75, lo: 1 };
@@ -989,6 +1051,83 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
 }
 
 #[test]
+fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
+    let runtime = RecordingLocalRuntime::default();
+    let mut config = registry_config(8);
+    config.tombstone_capacity = 1;
+    let registry = QueryLifecycleRegistry::new_with_clock(
+        LOCAL_BACKEND_ID,
+        LOCAL_START_EPOCH,
+        Arc::new(runtime.clone()),
+        config,
+        Arc::new(ManualClock::default()),
+    );
+    let fragment_instance_id = UniqueId { hi: 811, lo: 1 };
+    let first = fragment_init_request_fixture(811, &[fragment_instance_id]);
+    let first_execution = first.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(first.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _first_control = attach_control(&registry, &first);
+    registry
+        .admit_fragment(first_execution, fragment_instance_id)
+        .expect("first fragment permit")
+        .commit()
+        .expect("first fragment admission commits");
+    registry
+        .abort_query(
+            QueryAbortRequest::new(first_execution, first.digest(), "first tombstone")
+                .expect("valid abort"),
+        )
+        .expect("first abort is accepted");
+
+    let second = init_request_fixture(812, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let second_execution = second.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(second.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(second_execution, second.digest(), "evict first tombstone")
+                .expect("valid abort"),
+        )
+        .expect("second abort is accepted");
+    assert!(!registry.contains(first_execution));
+    registry.record_fragment_terminal(
+        fragment_instance_id,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "late terminal after lifecycle eviction",
+        )),
+    );
+    assert_eq!(
+        runtime
+            .state
+            .terminations
+            .lock()
+            .expect("terminations")
+            .len(),
+        2,
+        "late terminal after eviction must not target another lifecycle"
+    );
+
+    let replacement = fragment_init_request_fixture(813, &[fragment_instance_id]);
+    let replacement_execution = replacement.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(replacement.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _replacement_control = attach_control(&registry, &replacement);
+    registry
+        .admit_fragment(replacement_execution, fragment_instance_id)
+        .expect("evicted fragment mapping permits reuse")
+        .commit()
+        .expect("replacement fragment admission commits");
+}
+
+#[test]
 fn query_lifecycle_tombstone_releases_active_capacity() {
     let registry = registry_with(RecordingLocalRuntime::default(), 1);
     let first = init_request_fixture(84, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
@@ -1057,6 +1196,56 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
         QueryInitOutcome::Applied
     );
     assert!(!registry.contains(terminated_id));
+}
+
+#[test]
+fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
+    let clock = Arc::new(ManualClock::default());
+    let mut config = registry_config(8);
+    config.tombstone_retention = Duration::from_millis(10);
+    let registry = QueryLifecycleRegistry::new_with_clock(
+        LOCAL_BACKEND_ID,
+        LOCAL_START_EPOCH,
+        Arc::new(RecordingLocalRuntime::default()),
+        config,
+        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+    );
+    let fragment_instance_id = UniqueId { hi: 861, lo: 1 };
+    let first = fragment_init_request_fixture(861, &[fragment_instance_id]);
+    let first_execution = first.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(first.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _first_control = attach_control(&registry, &first);
+    registry
+        .admit_fragment(first_execution, fragment_instance_id)
+        .expect("first fragment permit")
+        .commit()
+        .expect("first fragment admission commits");
+    registry
+        .abort_query(
+            QueryAbortRequest::new(first_execution, first.digest(), "retention cleanup")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
+
+    clock.advance(Duration::from_millis(11));
+    registry.sweep_expired(clock.now());
+    assert!(!registry.contains(first_execution));
+
+    let replacement = fragment_init_request_fixture(862, &[fragment_instance_id]);
+    let replacement_execution = replacement.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(replacement.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _replacement_control = attach_control(&registry, &replacement);
+    registry
+        .admit_fragment(replacement_execution, fragment_instance_id)
+        .expect("expired fragment mapping permits reuse")
+        .commit()
+        .expect("replacement fragment admission commits");
 }
 
 #[test]
