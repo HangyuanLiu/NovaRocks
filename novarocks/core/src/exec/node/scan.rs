@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
-use crate::common::ids::SlotId;
 use crate::connector::file_execution::FileScanRange;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 #[cfg(feature = "compat")]
@@ -433,18 +432,6 @@ pub struct LakeGlmScanInfo {
     pub lake_schema_meta: Option<LakeScanSchemaMeta>,
 }
 
-#[derive(Clone, Debug)]
-pub struct RowPositionScanConfig {
-    pub file_format: HdfsScanFileFormat,
-    pub case_sensitive: bool,
-    pub batch_size: Option<usize>,
-    pub enable_file_metacache: bool,
-    pub enable_file_pagecache: bool,
-    /// OSS credentials for re-scanning the source file during late-materialisation lookups.
-    /// `None` for local / HDFS paths; must be `Some` for `oss://` / `s3://` paths.
-    pub oss_config: Option<novarocks_fs::ObjectStoreConfig>,
-}
-
 #[derive(Clone)]
 pub struct ScanNode {
     source: Arc<dyn ScanSource>,
@@ -459,8 +446,6 @@ pub struct ScanNode {
     limit: Option<usize>,
     accept_empty_scan_ranges: bool,
     row_position: Option<RowPositionSpec>,
-    row_position_scan: Option<RowPositionScanConfig>,
-    row_position_ranges: Option<Vec<FileScanRange>>,
     connector_row_position_lookup: Option<ConnectorRowPositionLookup>,
     lake_row_position: Option<LakeRowPositionSpec>,
     #[cfg(feature = "compat")]
@@ -492,8 +477,6 @@ impl ScanNode {
             limit: None,
             accept_empty_scan_ranges: false,
             row_position: None,
-            row_position_scan: None,
-            row_position_ranges: None,
             connector_row_position_lookup: None,
             lake_row_position: None,
             #[cfg(feature = "compat")]
@@ -542,16 +525,6 @@ impl ScanNode {
 
     pub fn with_row_position(mut self, spec: Option<RowPositionSpec>) -> Self {
         self.row_position = spec;
-        self
-    }
-
-    pub fn with_row_position_scan(mut self, cfg: Option<RowPositionScanConfig>) -> Self {
-        self.row_position_scan = cfg;
-        self
-    }
-
-    pub fn with_row_position_ranges(mut self, ranges: Option<Vec<FileScanRange>>) -> Self {
-        self.row_position_ranges = ranges;
         self
     }
 
@@ -622,14 +595,6 @@ impl ScanNode {
 
     pub fn row_position(&self) -> Option<&RowPositionSpec> {
         self.row_position.as_ref()
-    }
-
-    pub fn row_position_scan(&self) -> Option<&RowPositionScanConfig> {
-        self.row_position_scan.as_ref()
-    }
-
-    pub fn row_position_ranges(&self) -> Option<&[FileScanRange]> {
-        self.row_position_ranges.as_deref()
     }
 
     pub(crate) fn connector_row_position_lookup(&self) -> Option<&ConnectorRowPositionLookup> {

@@ -274,28 +274,7 @@ impl ScanSourceOperator {
             self.row_position_registered = true;
             return Ok(());
         }
-        let Some(ranges) = self.scan.row_position_ranges() else {
-            return Err("row position ranges missing".to_string());
-        };
-        if ranges.is_empty() {
-            self.row_position_registered = true;
-            return Ok(());
-        }
-        let Some(scan_cfg) = self.scan.row_position_scan() else {
-            return Err("row position scan config missing".to_string());
-        };
-        let Some(query_id) = state.query_id() else {
-            return Err("row position requires query_id".to_string());
-        };
-        // Register ranges once so lookup RPCs can re-scan files by scan_range_id/row_id.
-        crate::runtime::query_context::query_context_manager().register_glm_scan_ranges(
-            query_id,
-            spec.row_source_slot,
-            scan_cfg.clone(),
-            ranges.to_vec(),
-        )?;
-        self.row_position_registered = true;
-        Ok(())
+        Err("row position requires a connector read binding".to_string())
     }
 
     fn register_lake_row_position(&mut self, state: &RuntimeState) -> Result<(), String> {

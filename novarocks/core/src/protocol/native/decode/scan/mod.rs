@@ -17,7 +17,6 @@
 
 mod common;
 mod delete_files;
-mod file_range;
 mod generic;
 mod iceberg_delta;
 mod iceberg_metadata;

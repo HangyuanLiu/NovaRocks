@@ -28,11 +28,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::connector::file_execution::FileScanRange;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::read_starrocks_batches;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::row_position::RowPositionType;
 #[cfg(feature = "compat")]
 use crate::novarocks_connectors::StarRocksScanConfig;
@@ -54,33 +52,6 @@ struct LookupCancellation {
 impl ConnectorCancellation for LookupCancellation {
     fn is_cancelled(&self) -> bool {
         query_context_manager().is_query_canceled(self.query_id)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct GlobalLateMaterializationContext {
-    pub row_source_slot: SlotId,
-    pub scan_config: RowPositionScanConfig,
-    scan_ranges: HashMap<i32, FileScanRange>,
-}
-
-impl GlobalLateMaterializationContext {
-    pub fn new(row_source_slot: SlotId, scan_config: RowPositionScanConfig) -> Self {
-        Self {
-            row_source_slot,
-            scan_config,
-            scan_ranges: HashMap::new(),
-        }
-    }
-
-    pub fn register_ranges(&mut self, ranges: Vec<FileScanRange>) {
-        for range in ranges {
-            self.scan_ranges.entry(range.scan_range_id).or_insert(range);
-        }
-    }
-
-    pub fn get_scan_range(&self, scan_range_id: i32) -> Option<&FileScanRange> {
-        self.scan_ranges.get(&scan_range_id)
     }
 }
 
