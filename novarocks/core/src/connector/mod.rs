@@ -52,7 +52,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorInstance, ConnectorInstanceId, ConnectorProviderId,
+    ConnectorCancellation, ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorInstanceInstaller, ConnectorProviderId,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution,
 };
@@ -453,6 +454,38 @@ impl ConnectorRegistry {
             .read()
             .map_err(|_| ConnectorHostError::unavailable("connector host read lock poisoned"))?
             .resolve(instance_id)
+    }
+
+    pub(crate) fn register_connector_instance_installer(
+        &self,
+        installer: Arc<dyn ConnectorInstanceInstaller>,
+    ) -> Result<(), ConnectorHostError> {
+        self.connector_host
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .register_installer(installer)
+    }
+
+    pub(crate) fn install_connector_instance(
+        &self,
+        declaration: &ConnectorInstanceDeclaration,
+        context: &ConnectorRequestContext,
+    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
+        self.connector_host
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .install(declaration, context)
+    }
+
+    pub(crate) fn retire_connector_instance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        incarnation: ConnectorInstanceIncarnation,
+    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
+        self.connector_host
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .retire(instance_id, incarnation)
     }
 
     pub(crate) fn materialize_transport_connector_instance(

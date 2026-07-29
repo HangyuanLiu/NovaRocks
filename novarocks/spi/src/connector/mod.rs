@@ -16,6 +16,7 @@
 // under the License.
 
 mod context;
+mod distribution;
 mod error;
 mod handle;
 mod identity;
@@ -27,6 +28,10 @@ mod read;
 pub mod conformance;
 
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
+pub use distribution::{
+    ConnectorInstanceDeclaration, ConnectorInstanceDistribution, ConnectorInstanceIncarnation,
+    ConnectorInstanceInstaller, MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
+};
 pub use error::{ConnectorError, ConnectorErrorKind};
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,

@@ -18,14 +18,15 @@
 use std::sync::Arc;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMetadata,
-    ConnectorRead,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceDistribution,
+    ConnectorMetadata, ConnectorRead,
 };
 
 pub struct ConnectorInstance {
     descriptor: ConnectorInstanceDescriptor,
     metadata: Option<Arc<dyn ConnectorMetadata>>,
     read: Arc<dyn ConnectorRead>,
+    distribution: Option<Arc<dyn ConnectorInstanceDistribution>>,
 }
 
 impl ConnectorInstance {
@@ -52,6 +53,7 @@ impl ConnectorInstance {
             descriptor,
             metadata,
             read,
+            distribution: None,
         })
     }
 
@@ -65,5 +67,17 @@ impl ConnectorInstance {
 
     pub fn read(&self) -> &Arc<dyn ConnectorRead> {
         &self.read
+    }
+
+    pub fn with_distribution(
+        mut self,
+        distribution: Arc<dyn ConnectorInstanceDistribution>,
+    ) -> Self {
+        self.distribution = Some(distribution);
+        self
+    }
+
+    pub fn distribution(&self) -> Option<&Arc<dyn ConnectorInstanceDistribution>> {
+        self.distribution.as_ref()
     }
 }
