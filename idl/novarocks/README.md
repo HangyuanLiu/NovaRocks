@@ -69,3 +69,10 @@ is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
 No cross-version compatibility is promised: a NovaRocks cluster upgrades as a
 whole. Tag discipline exists only to leave the door open for future rolling
 upgrades. Any wire change MUST be called out explicitly in the PR description.
+
+Before the first released wire contract, an explicitly reviewed no-history
+migration may replace the compatibility ledger atomically when it also removes
+an unreleased RPC ownership model. The reset MUST land with the schema cutover,
+keep the ordinary schema comparator enabled, and become the new append-only
+baseline immediately. This exception does not apply once a released client or
+mixed-version deployment depends on the removed surface.

@@ -1322,6 +1322,25 @@ impl FragmentAdmissionPermit {
                 QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone
             )
         {
+            let reason = state.termination_reason;
+            let expected_instances = self
+                .entry
+                .manifest
+                .expected_fragment_instance_ids()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            drop(state);
+            if let (Some(registry), Some(reason)) = (self.registry.upgrade(), reason) {
+                // Termination may have raced ahead of the service registration/control
+                // publication protected by this permit. Re-drive local termination after
+                // those resources exist so the rejected admission cannot leave a live worker.
+                registry.local_runtime.terminate_query(
+                    self.execution_id,
+                    &expected_instances,
+                    reason,
+                );
+            }
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Terminated,
                 "query lifecycle terminated before fragment admission commit",

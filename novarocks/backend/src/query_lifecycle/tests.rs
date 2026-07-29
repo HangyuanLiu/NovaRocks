@@ -729,7 +729,7 @@ fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
 }
 
 #[test]
-fn query_abort_submit_race() {
+fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let expected = UniqueId { hi: 75, lo: 1 };
     let request = fragment_init_request_fixture(75, &[expected]);

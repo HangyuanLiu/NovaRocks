@@ -17,11 +17,11 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
     use novarocks::UniqueId;
@@ -31,11 +31,18 @@ mod tests {
         assert_write_abort_reason, assert_write_outcome_preserved,
         non_empty_profile_contract_fixture,
         non_empty_profile_contract_fixture_with_query_timeout_seconds,
-        non_empty_result_contract_fixture, non_empty_write_contract_fixture,
+        non_empty_result_contract_fixture, non_empty_runtime_filter_contract_fixture,
+        non_empty_write_contract_fixture,
         non_empty_write_contract_fixture_with_query_timeout_seconds,
     };
     use novarocks::query_execution::fragment_transport::{
         FetchOutcome, FetchedQueryBatch, FragmentDispatcher, NativeFragmentEnvelope,
+    };
+    use novarocks::query_execution::lifecycle::{
+        ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
+        QueryControlEvent, QueryControlSession, QueryInitAck, QueryInitOutcome, QueryInitRequest,
+        QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError,
+        QueryTerminationAck, QueryTerminationReason,
     };
     use novarocks::query_execution::write::NativeExecutionReport;
 
@@ -333,6 +340,179 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct AllReadyBoundaryState {
+        initialized: BTreeSet<usize>,
+        ready: BTreeSet<usize>,
+        first_submit_entered: bool,
+        release_first_submit: bool,
+        all_ready_at_first_submit: bool,
+        saw_fragment_executor: bool,
+        saw_runtime_filter_service: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct AllReadyBoundary {
+        state: Arc<(Mutex<AllReadyBoundaryState>, Condvar)>,
+    }
+
+    struct AllReadySession {
+        backend_idx: usize,
+        boundary: AllReadyBoundary,
+        events: Mutex<VecDeque<QueryControlEvent>>,
+    }
+
+    impl QueryControlSession for AllReadySession {
+        fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
+            let event = match command {
+                QueryControlCommand::Heartbeat { sequence, .. } => {
+                    QueryControlEvent::HeartbeatAck { sequence }
+                }
+                QueryControlCommand::Abort { .. } => QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorAbort,
+                },
+                QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorFinalize,
+                },
+            };
+            self.events
+                .lock()
+                .expect("all-ready events")
+                .push_back(event);
+            self.boundary.state.1.notify_all();
+            Ok(())
+        }
+
+        fn recv_timeout(
+            &self,
+            timeout: Duration,
+        ) -> Result<QueryControlEvent, QueryLifecycleTransportError> {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(event) = self.events.lock().expect("all-ready events").pop_front() {
+                    if event == QueryControlEvent::ControlReady {
+                        let mut state = self.boundary.state.0.lock().expect("all-ready boundary");
+                        state.ready.insert(self.backend_idx);
+                        drop(state);
+                        self.boundary.state.1.notify_all();
+                    }
+                    return Ok(event);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(QueryLifecycleTransportError::new(
+                        novarocks::query_execution::lifecycle::QueryLifecycleTransportErrorKind::DeadlineExceeded,
+                        "all-ready session receive timed out",
+                    ));
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    impl QueryLifecycleTransport for AllReadyBoundary {
+        fn init_query(
+            &self,
+            target: QueryLifecycleTarget,
+            request: QueryInitRequest,
+            _timeout: Duration,
+        ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+            let mut state = self.state.0.lock().expect("all-ready boundary");
+            state.initialized.insert(target.backend_idx());
+            state.saw_fragment_executor |= request
+                .manifest()
+                .roles()
+                .contains(&ParticipantRole::FragmentExecutor);
+            state.saw_runtime_filter_service |= request
+                .manifest()
+                .roles()
+                .contains(&ParticipantRole::RuntimeFilterService);
+            drop(state);
+            Ok(QueryInitAck::new(
+                request.manifest().execution_id(),
+                request.digest(),
+                QueryInitOutcome::Applied,
+            ))
+        }
+
+        fn attach_control(
+            &self,
+            target: QueryLifecycleTarget,
+            _attach: QueryControlAttach,
+            _timeout: Duration,
+        ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
+            Ok(Arc::new(AllReadySession {
+                backend_idx: target.backend_idx(),
+                boundary: self.clone(),
+                events: Mutex::new(VecDeque::from([QueryControlEvent::ControlReady])),
+            }))
+        }
+
+        fn abort_query(
+            &self,
+            _target: QueryLifecycleTarget,
+            request: QueryAbortRequest,
+            _timeout: Duration,
+        ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
+            Ok(QueryTerminationAck::new(
+                request.execution_id(),
+                QueryTerminationReason::CoordinatorAbort,
+            ))
+        }
+    }
+
+    struct PausingFirstSubmitDispatcher {
+        inner: RecordingDispatcher,
+        boundary: AllReadyBoundary,
+    }
+
+    impl FragmentDispatcher for PausingFirstSubmitDispatcher {
+        fn submit_fragment(
+            &self,
+            backend_idx: usize,
+            submission: NativeFragmentEnvelope,
+        ) -> Result<(), String> {
+            let (lock, ready) = &*self.boundary.state;
+            let mut state = lock.lock().expect("all-ready boundary");
+            if !state.first_submit_entered {
+                state.first_submit_entered = true;
+                state.all_ready_at_first_submit =
+                    !state.initialized.is_empty() && state.ready == state.initialized;
+                ready.notify_all();
+                while !state.release_first_submit {
+                    state = ready.wait(state).expect("release first dispatcher submit");
+                }
+            }
+            drop(state);
+            self.inner.submit_fragment(backend_idx, submission)
+        }
+
+        fn fetch_result(
+            &self,
+            backend_idx: usize,
+            finst_id: UniqueId,
+            max_wait_ms: i64,
+            expected_output_schema: Option<
+                novarocks::query_execution::fragment_transport::ExpectedOutputSchemaView<'_>,
+            >,
+        ) -> Result<FetchOutcome, String> {
+            self.inner
+                .fetch_result(backend_idx, finst_id, max_wait_ms, expected_output_schema)
+        }
+
+        fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]) {
+            self.inner
+                .cancel_fragments(backend_idx, query_id, finst_ids);
+        }
+
+        fn backend_count(&self) -> usize {
+            self.inner.backend_count()
+        }
+
+        fn needs_fragment_status_report(&self) -> bool {
+            self.inner.needs_fragment_status_report()
+        }
+    }
+
     fn test_coordinator(
         query_id: QueryId,
         scheduler: FrontendFragmentScheduler,
@@ -376,6 +556,75 @@ mod tests {
             1
         );
         assert!(!dispatcher.fetches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn query_control_barrier_precedes_submission() {
+        let fixture = non_empty_runtime_filter_contract_fixture();
+        let backends = fixture.backends().to_vec();
+        let batch = fixture.result_batch();
+        let request = fixture.into_request();
+        let boundary = AllReadyBoundary::default();
+        let dispatcher = Arc::new(PausingFirstSubmitDispatcher {
+            inner: RecordingDispatcher::with_result(batch),
+            boundary: boundary.clone(),
+        });
+        let scheduler =
+            FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
+        let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
+            QueryId::new(41, 73),
+            report_endpoint(),
+            scheduler,
+            dispatcher,
+            NonZeroUsize::new(2).unwrap(),
+            Arc::new(()),
+            Arc::new(boundary.clone()),
+        );
+        let execution = std::thread::spawn(move || coordinator.execute(request));
+
+        let (lock, ready) = &*boundary.state;
+        let mut state = lock.lock().expect("all-ready boundary");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !state.first_submit_entered {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "first dispatcher submit was not reached"
+            );
+            let (next, timeout) = ready
+                .wait_timeout(state, remaining)
+                .expect("wait for first dispatcher submit");
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.first_submit_entered,
+                "first dispatcher submit was not reached"
+            );
+        }
+        assert_eq!(
+            state.ready, state.initialized,
+            "every materialized participant must emit ControlReady before submission"
+        );
+        assert!(
+            state.all_ready_at_first_submit,
+            "the first actual dispatcher submission crossed the all-ready barrier"
+        );
+        assert!(
+            state.initialized.len() >= 2,
+            "the production-boundary fixture must cover multiple participants"
+        );
+        assert!(
+            state.saw_fragment_executor && state.saw_runtime_filter_service,
+            "the production-boundary fixture must cover fragment and service roles"
+        );
+        state.release_first_submit = true;
+        drop(state);
+        ready.notify_all();
+
+        let outcome = execution
+            .join()
+            .expect("coordinator execution thread")
+            .expect("coordinator completes after first submission resumes");
+        assert_result_outcome_preserved(outcome, 1).expect("engine consumes Result payload");
     }
 
     #[test]

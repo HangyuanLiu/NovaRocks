@@ -437,7 +437,7 @@ fn frontend_query_lifecycle_config_requires_three_heartbeat_intervals() {
 }
 
 #[test]
-fn query_control_barrier_precedes_submission() {
+fn query_control_barrier_initializes_every_participant() {
     let plan = query_init_plan(Some(2));
     let (transport, _) = RecordingTransport::ready(&plan);
     let (registry, _query) = registry_for(&plan);

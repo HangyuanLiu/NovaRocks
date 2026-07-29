@@ -44,6 +44,7 @@ use crate::query_lifecycle::QueryLifecycleRegistry;
 pub(super) enum NativeFragmentLifecycleEvent {
     Prepared,
     Registered,
+    Cancelled,
     Accepted,
     Started,
 }
@@ -59,6 +60,8 @@ pub struct NativeFragmentService {
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
     lifecycle_observer: Option<LifecycleObserver>,
+    #[cfg(test)]
+    after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     fail_worker_spawn_on_submission: Option<usize>,
     #[cfg(test)]
@@ -110,6 +113,8 @@ impl NativeFragmentService {
             event_sink,
             lifecycle_observer: None,
             #[cfg(test)]
+            after_lifecycle_admission: None,
+            #[cfg(test)]
             fail_worker_spawn_on_submission: None,
             #[cfg(test)]
             submission_count: AtomicUsize::new(0),
@@ -144,6 +149,16 @@ impl NativeFragmentService {
         service
     }
 
+    #[cfg(test)]
+    fn with_lifecycle_observer_and_admission_pause(
+        observer: impl Fn(NativeFragmentLifecycleEvent) + Send + Sync + 'static,
+        after_lifecycle_admission: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let mut service = Self::with_lifecycle_observer(observer);
+        service.after_lifecycle_admission = Some(Arc::new(after_lifecycle_admission));
+        service
+    }
+
     fn observe(&self, event: NativeFragmentLifecycleEvent) {
         if let Some(observer) = self.lifecycle_observer.as_ref() {
             observer(event);
@@ -162,6 +177,10 @@ impl NativeFragmentIngress for NativeFragmentService {
             .lifecycle
             .admit_fragment(request.execution_id(), fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
+        #[cfg(test)]
+        if let Some(after_lifecycle_admission) = self.after_lifecycle_admission.as_ref() {
+            after_lifecycle_admission();
+        }
         let backend_num = request.backend_num();
         let report_endpoint = request.report_endpoint().cloned();
         let enable_profile = request.enable_profile();
@@ -214,7 +233,8 @@ impl NativeFragmentIngress for NativeFragmentService {
             )
             .map_err(NativeFragmentIngressError::new)?;
 
-        let pending_control = Arc::new(PendingFragmentControl::default());
+        let pending_control =
+            Arc::new(PendingFragmentControl::new(self.lifecycle_observer.clone()));
         let control_handle: Arc<dyn FragmentControlHandle> = pending_control.clone();
         let token = reservation.publish(control_handle);
         let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
@@ -342,9 +362,9 @@ struct RunningFragmentControl {
     handle: RunningFragmentHandle,
 }
 
-#[derive(Default)]
 struct PendingFragmentControl {
     state: Mutex<PendingFragmentControlState>,
+    observer: Option<LifecycleObserver>,
 }
 
 #[derive(Default)]
@@ -354,6 +374,13 @@ struct PendingFragmentControlState {
 }
 
 impl PendingFragmentControl {
+    fn new(observer: Option<LifecycleObserver>) -> Self {
+        Self {
+            state: Mutex::new(PendingFragmentControlState::default()),
+            observer,
+        }
+    }
+
     fn attach(&self, running: RunningFragmentHandle) {
         let cancellation = {
             let mut state = self.state.lock().expect("pending fragment control");
@@ -368,11 +395,15 @@ impl PendingFragmentControl {
 
 impl FragmentControlHandle for PendingFragmentControl {
     fn cancel(&self, reason: &str) {
-        let running = {
+        let (running, first_cancellation) = {
             let mut state = self.state.lock().expect("pending fragment control");
+            let first_cancellation = state.cancellation.is_none();
             state.cancellation.get_or_insert_with(|| reason.to_string());
-            state.running.clone()
+            (state.running.clone(), first_cancellation)
         };
+        if first_cancellation && let Some(observer) = self.observer.as_ref() {
+            observer(NativeFragmentLifecycleEvent::Cancelled);
+        }
         if let Some(running) = running {
             running.cancel(FragmentCancelReason::new(reason));
         }
@@ -481,8 +512,8 @@ mod tests {
     use novarocks::query_execution::contract::QueryId as ExecutionQueryId;
     use novarocks::query_execution::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-        ParticipantRole, QueryControlAttach, QueryControlEndpoint, QueryExecutionId,
-        QueryInitOutcome, QueryInitRequest,
+        ParticipantRole, QueryControlAttach, QueryControlAttachment, QueryControlEndpoint,
+        QueryExecutionId, QueryInitOutcome, QueryInitRequest,
     };
     use novarocks::runtime::fragment::{DormantFragmentHandle, FragmentOutcome, prepare_fragment};
     use novarocks::runtime::query_context::QueryId;
@@ -647,7 +678,7 @@ mod tests {
         service: &NativeFragmentService,
         request: &NativeFragmentRequest,
         expected_fragments: impl IntoIterator<Item = UniqueId>,
-    ) {
+    ) -> QueryControlAttachment {
         let execution_id = request.execution_id();
         let manifest =
             ParticipantManifest::new(
@@ -686,6 +717,7 @@ mod tests {
             attachment.events.try_recv().expect("ControlReady"),
             novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady
         );
+        attachment
     }
 
     fn prepare_request_for_test(
@@ -761,6 +793,97 @@ mod tests {
         assert!(
             error.to_string().contains("query is not active"),
             "unexpected admission error: {error}"
+        );
+    }
+
+    #[test]
+    fn query_abort_submit_race() {
+        let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let resume_rx = Mutex::new(resume_rx);
+        let service = Arc::new(
+            NativeFragmentService::with_lifecycle_observer_and_admission_pause(
+                move |event| captured.lock().expect("lifecycle events").push(event),
+                move || {
+                    permit_tx.send(()).expect("publish lifecycle permit");
+                    resume_rx
+                        .lock()
+                        .expect("admission resume")
+                        .recv()
+                        .expect("resume fragment registration");
+                },
+            ),
+        );
+        let request = values_result_request(81_200, 81_202);
+        let query_id = request.query_id();
+        let fragment_instance_id = request.fragment_instance_id();
+        let attachment = make_control_ready(&service, &request, [fragment_instance_id]);
+        let submit_service = Arc::clone(&service);
+        let submit = std::thread::spawn(move || submit_service.submit(request));
+
+        permit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("submit pauses after lifecycle permit issuance");
+        attachment
+            .control
+            .abort("abort after permit issuance".to_string())
+            .expect("query abort is accepted");
+        resume_tx
+            .send(())
+            .expect("resume fragment registration and control publication");
+
+        let error = submit
+            .join()
+            .expect("submit thread")
+            .expect_err("late lifecycle admission must reject fragment start");
+        assert!(
+            error
+                .to_string()
+                .contains("terminated before fragment admission commit")
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !events
+            .lock()
+            .expect("lifecycle events")
+            .contains(&NativeFragmentLifecycleEvent::Cancelled)
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let observed = events.lock().expect("lifecycle events").clone();
+        assert!(
+            observed.contains(&NativeFragmentLifecycleEvent::Registered),
+            "the race must cross real fragment registration: {observed:?}"
+        );
+        assert!(
+            observed.contains(&NativeFragmentLifecycleEvent::Cancelled),
+            "late lifecycle cancellation must reach the published fragment control: {observed:?}"
+        );
+        assert!(
+            !observed.contains(&NativeFragmentLifecycleEvent::Started),
+            "an aborted lifecycle permit must never start the worker: {observed:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match service.controls.reserve(fragment_instance_id) {
+                Ok(reservation) => {
+                    drop(reservation);
+                    break;
+                }
+                Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+                Err(error) => panic!("aborted fragment route did not terminate: {error}"),
+            }
+        }
+        assert!(
+            service
+                .queries
+                .cancel_query(query_id, "post-abort probe".to_string())
+                .is_empty(),
+            "aborted query must not retain the late fragment registration"
         );
     }
 
@@ -847,7 +970,15 @@ mod tests {
                 .expect("failed second registration must release its route"),
         );
 
+        service
+            .submit(values_result_request(83_000, 83_004))
+            .expect("retry of the same fragment proves lifecycle admission rollback");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retried fragment reaches worker start");
+
         release_tx.send(()).expect("release first worker");
+        release_tx.send(()).expect("release retried worker");
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match service.controls.reserve(first) {

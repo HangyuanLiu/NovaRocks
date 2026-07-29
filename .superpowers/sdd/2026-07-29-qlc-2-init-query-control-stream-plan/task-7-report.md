@@ -190,3 +190,106 @@ production Core default/compat compile gates 均通过。
 6. **Compat 是否伪造 Init？**
 
    否。compat target 独立编译通过，未新增 compat-specific fake lifecycle 分支。
+
+## Fix round 1/5：review finding closure
+
+### Proto baseline 与 tag discipline
+
+`current_schema_matches_baseline` 的初始 RED 同时报告了 QLC-2 新 lifecycle
+messages/RPC、`SubmitFragmentRequest.execution_id = 3`、已删除的旧 RF unary
+RPC/response DTO，以及本 arc 当前 native plan/filter schema 尚未进入 ledger 的变更。
+
+本仓库当前明确不承诺 mixed-version wire compatibility，NovaRocks cluster 整体升级，
+且该迁移没有 released client/history。恢复旧 unary RPC/response 会重新引入已经删除的
+legacy RF owner，与本任务的 single query-lifecycle owner 冲突。因此本轮采用受审查的
+pre-release no-history baseline 原子重置，而不是保留兼容 shim、跳过测试或放宽
+comparator：
+
+- `idl/novarocks/README.md` 记录该 reset 仅适用于首个 released wire contract 之前；
+- ordinary comparator 与 additive writer 的拒绝规则保持原样；
+- reset 后的 ledger 立即成为新的 append-only baseline；
+- `RuntimeFilterProducerRole` 没有复用旧 tag 3：显式 reserve tag/name，新
+  `join_build_key` / `aggregate_topn_key` 使用 tag 4/5；
+- 最终在没有 write env、没有 skip 的情况下，focused baseline test 真实通过。
+
+### Production all-ready ordering boundary
+
+旧 `query_control_barrier_precedes_submission` 只直接调用 barrier。本轮将 production
+ordering 证据放到真实 `FrontendDistributedQueryCoordinator::execute` 边界：
+
+- 使用包含 fragment executor 与 RF service 的 multi-participant contract fixture；
+- transport 在每个 session 真正返回 `ControlReady` 时记录 participant；
+- 第一次实际 `FragmentDispatcher::submit_fragment` 入口确定性暂停；
+- 在该入口比较 materialized Init participant set 与 ControlReady set，要求二者完全相等
+  且 participant 数至少为 2；
+- 释放 submit 后继续走真实 result fetch/finalize 并验证 non-empty result。
+
+因此如果 coordinator 在最后一个 participant ready 前开始 dispatch，该测试会在实际
+submit boundary 直接失败；它不再只是 barrier fake 的内部断言。
+
+### Abort/Submit service race
+
+新增真实 `NativeFragmentService` race：在 lifecycle permit 发放后暂停 submit，
+并发从 query control 执行 Abort，再恢复 fragment prepare、query registration 与
+pending control publication。
+
+RED 证据是 lifecycle events 只有：
+
+```text
+[Prepared, Registered]
+```
+
+也就是首次 termination 发生时资源还不存在，旧实现的 late permit commit 虽拒绝 start，
+但没有让 local termination 观察随后发布的真实 control。修复后，late commit rejection
+在 resource publication 之后幂等重放 local termination；测试观察真实
+`Registered -> Cancelled`，断言永远没有 `Started`，并等待 control route/query mapping
+清理完成。
+
+### Spawn failure rollback
+
+第二次 worker spawn failure 后不再只检查 route cleanup；测试会用完全相同的 finst
+再次 submit 并要求进入 worker start。这同时证明：
+
+- query registration/control reservation 已释放；
+- lifecycle in-flight permit 已由 RAII drop 回滚；
+- first running fragment 的 route 没有被错误回滚。
+
+### Fix-round verification
+
+```text
+cargo test -p novarocks --test proto_schema_compatibility \
+  current_schema_matches_baseline -- --exact --nocapture
+1 passed; 0 failed
+
+cargo test -p novarocks-frontend --lib \
+  query_control_barrier_precedes_submission -- --nocapture
+1 passed; 0 failed
+
+cargo test -p novarocks-backend query_abort_submit_race -- --nocapture
+1 passed; 0 failed
+
+cargo test -p novarocks-backend \
+  second_worker_spawn_failure_rolls_back_only_its_pre_start_registration -- --nocapture
+1 passed; 0 failed
+
+cargo test -p novarocks-frontend --lib -- --nocapture
+120 passed; 0 failed
+
+cargo test -p novarocks-backend --lib -- --nocapture
+51 passed; 0 failed
+
+cargo check -p novarocks --features compat
+exit 0
+
+cargo check -p novarocks-compat
+exit 0
+
+cargo fmt --all -- --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+不带 `--lib` 的 Frontend filtered 命令仍会在运行目标测试前编译所有 integration
+targets，并复现上文已归因的 StateStore API drift；本轮没有修改该独立阻塞路径。
