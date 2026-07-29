@@ -37,6 +37,7 @@ use novarocks_spi::connector::{
     ConnectorTableRequest, ConnectorTableResolution,
 };
 use serde::{Deserialize, Serialize};
+use novarocks_fs::{FsAccessHandle, FsAccessResolver};
 
 use super::catalog::IcebergCatalogEntry;
 use super::catalog::registry::{
@@ -109,6 +110,7 @@ impl ConnectorInstanceDistribution for IcebergInstanceDistribution {
 pub(crate) struct IcebergReadBinding {
     access_binding: String,
     object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+    access_resolver: FsAccessResolver,
 }
 
 impl IcebergReadBinding {
@@ -118,7 +120,14 @@ impl IcebergReadBinding {
         Self {
             access_binding: DEFAULT_ACCESS_BINDING.to_string(),
             object_store_config,
+            access_resolver: FsAccessResolver::new(),
         }
+    }
+
+    fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
+        self.access_resolver
+            .resolve_location(location, self.object_store_config.as_ref())
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string()))
     }
 
     fn file_read_context(
@@ -263,9 +272,10 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
             novarocks_fs::FileCancellation::new(),
             request.context.deadline(),
         )?;
+        let access = self.binding.resolve_access(&payload.data_file.path)?;
         IcebergBatchReader::try_new(
             &payload.data_file,
-            self.binding.object_store_config.as_ref(),
+            access,
             request,
             file_context,
         )
@@ -845,14 +855,14 @@ impl ConnectorRead for IcebergConnectorInstance {
                 ));
             }
         }
-        let file_context = IcebergReadBinding::default_binding(loaded.object_store_config.clone())
-            .file_read_context(
-                novarocks_fs::FileCancellation::new(),
-                request.context.deadline(),
-            )?;
+        let binding = IcebergReadBinding::default_binding(loaded.object_store_config.clone());
+        let file_context = binding.file_read_context(
+            novarocks_fs::FileCancellation::new(),
+            request.context.deadline(),
+        )?;
         Ok(Box::new(IcebergBatchReader::try_new(
             &split.data_file,
-            loaded.object_store_config.as_ref(),
+            binding.resolve_access(&split.data_file.path)?,
             request,
             file_context,
         )?))

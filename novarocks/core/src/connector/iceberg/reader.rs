@@ -33,7 +33,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileBatchReader, FileCancellation, FileError, FileErrorKind, FileFormat, FileIdentity,
     FileMetricsSnapshot, FileProjection, FileReadBudget, FileReadRange, FileReadRequest,
-    FileReadContext, FsAccessResolver, ObjectStoreConfig, PhysicalPruning, open_file_reader,
+    FileReadContext, FsAccessHandle, PhysicalPruning, open_file_reader,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
@@ -65,7 +65,7 @@ pub(crate) struct IcebergBatchReader {
 impl IcebergBatchReader {
     pub(crate) fn try_new(
         file: &IcebergDataFileInfo,
-        object_store_config: Option<&ObjectStoreConfig>,
+        access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
     ) -> Result<Self, ConnectorError> {
@@ -76,9 +76,6 @@ impl IcebergBatchReader {
                 format!("Iceberg data file {} has a negative size", file.path),
             )
         })?;
-        let access = FsAccessResolver::new()
-            .resolve_location(&file.path, object_store_config)
-            .map_err(map_file_error)?;
         let cancellation = FileCancellation::new();
         let delete_specs = delete_specs(file)?;
         let position_deletes = load_position_deletes_with_context(
