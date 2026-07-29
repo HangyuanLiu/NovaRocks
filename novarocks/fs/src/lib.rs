@@ -24,6 +24,7 @@
 mod access;
 mod cache;
 mod error;
+mod physical_reader;
 mod predicate;
 mod read;
 mod runtime;
@@ -40,6 +41,7 @@ pub use cache::{
     validate_datacache_priority, validate_evict_probability, validate_non_negative_i64,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
+pub use physical_reader::open_file_reader;
 pub use predicate::{
     MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain,
     ScanPredicateSource,
@@ -48,6 +50,9 @@ pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
     FileReadContext, FileReadRange, FileReadRequest,
 };
-pub use runtime::{FileCancellation, FileIoRuntime, FileTask, FileTaskFuture, FileTaskSpawner};
+pub use runtime::{
+    FileBytesFuture, FileCancellation, FileIoRuntime, FileTask, FileTaskFuture, FileTaskSpawner,
+    TokioFileIoRuntime, TokioFileTaskSpawner,
+};
 
 // Design: ADR-0011 (docs/adr/ADR-0011-connector-neutral-file-foundation.md)

@@ -29,6 +29,8 @@ bytes = "1"
 crc32c = "0.6"
 libc = "0.2"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
+orc-rust = { version = "0.8.0", default-features = false }
+parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 url = "2"

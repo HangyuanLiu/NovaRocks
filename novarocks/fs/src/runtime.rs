@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
@@ -61,9 +62,10 @@ impl std::fmt::Debug for FileCancellation {
 }
 
 pub type FileTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub type FileBytesFuture = Pin<Box<dyn Future<Output = FileResult<Bytes>> + Send + 'static>>;
 
 pub trait FileIoRuntime: Send + Sync {
-    fn handle(&self) -> Handle;
+    fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<Bytes>;
 }
 
 pub trait FileTaskSpawner: Send + Sync {
@@ -93,5 +95,39 @@ impl FileTask {
 impl Drop for FileTask {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+#[derive(Clone)]
+pub struct TokioFileIoRuntime {
+    handle: Handle,
+}
+
+impl TokioFileIoRuntime {
+    pub fn new(handle: Handle) -> Self {
+        Self { handle }
+    }
+}
+
+impl FileIoRuntime for TokioFileIoRuntime {
+    fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<Bytes> {
+        self.handle.block_on(future)
+    }
+}
+
+#[derive(Clone)]
+pub struct TokioFileTaskSpawner {
+    handle: Handle,
+}
+
+impl TokioFileTaskSpawner {
+    pub fn new(handle: Handle) -> Self {
+        Self { handle }
+    }
+}
+
+impl FileTaskSpawner for TokioFileTaskSpawner {
+    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+        Ok(FileTask::new(self.handle.spawn(task)))
     }
 }

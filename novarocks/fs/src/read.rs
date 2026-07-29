@@ -24,8 +24,8 @@ use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;
 
 use crate::{
-    BoundFile, FileCancellation, FileIoRuntime, FileResult, FileTaskSpawner, PhysicalPruning,
-    ScanPredicate,
+    BoundFile, DataCacheContext, FileCancellation, FileIoRuntime, FileResult, FileTaskSpawner,
+    PhysicalPruning, ScanPredicate,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +109,7 @@ pub struct FileReadRequest {
     pub budget: FileReadBudget,
     pub predicates: Vec<ScanPredicate>,
     pub pruning: PhysicalPruning,
+    pub cache: Option<DataCacheContext>,
     pub context: FileReadContext,
 }
 

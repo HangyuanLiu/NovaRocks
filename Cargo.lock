@@ -3322,6 +3322,8 @@ dependencies = [
  "crc32c",
  "libc",
  "opendal",
+ "orc-rust",
+ "parquet",
  "reqwest",
  "tempfile",
  "tokio",
