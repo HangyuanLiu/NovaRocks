@@ -30,7 +30,9 @@ use super::lease::{
     spawn_supervisor,
 };
 use super::manifest::{MaterializedParticipant, materialize};
-use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQueryRegistry};
+use crate::coordinator::query_registry::{
+    ActiveQueryAttemptBinding, ActiveQueryAttemptControl, FrontendQueryRegistry,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct FrontendQueryLifecycleConfig {
@@ -56,9 +58,12 @@ impl FrontendQueryLifecycleConfig {
                 "frontend query lifecycle timeouts must be nonzero",
             ));
         }
-        if heartbeat_timeout <= heartbeat_interval {
+        let minimum_heartbeat_timeout = heartbeat_interval.checked_mul(3).ok_or_else(|| {
+            contract_error("frontend query lifecycle heartbeat interval is too large to validate")
+        })?;
+        if heartbeat_timeout < minimum_heartbeat_timeout {
             return Err(contract_error(
-                "frontend query lifecycle heartbeat timeout must exceed its interval",
+                "frontend query lifecycle heartbeat timeout must be at least 3 times its interval",
             ));
         }
         Ok(Self {
@@ -93,6 +98,56 @@ pub(crate) struct FrontendQueryLifecycleBarrier {
     metrics: Arc<FrontendLifecycleMetrics>,
 }
 
+pub(super) struct PreReadyAttemptGuard {
+    control: Arc<AttemptControl>,
+    registry_binding: Option<ActiveQueryAttemptBinding>,
+    armed: bool,
+}
+
+impl PreReadyAttemptGuard {
+    pub(super) fn new(
+        control: Arc<AttemptControl>,
+        registry_binding: ActiveQueryAttemptBinding,
+    ) -> Self {
+        Self {
+            control,
+            registry_binding: Some(registry_binding),
+            armed: true,
+        }
+    }
+
+    fn into_lease(mut self, supervisor: std::thread::JoinHandle<()>) -> QueryLifecycleLease {
+        let registry_binding = self
+            .registry_binding
+            .take()
+            .expect("pre-ready lifecycle guard registry binding");
+        let lease = FrontendQueryLifecycleLeaseGuard::lease(
+            Arc::clone(&self.control),
+            supervisor,
+            registry_binding,
+        );
+        self.armed = false;
+        lease
+    }
+}
+
+impl Drop for PreReadyAttemptGuard {
+    fn drop(&mut self) {
+        if self.armed && self.control.is_active() {
+            let error = self.control.abort_before_ready(
+                "query lifecycle initialization interrupted before all-ready".to_string(),
+            );
+            tracing::error!(
+                query_id_high = self.control.execution_id().query_id().high(),
+                query_id_low = self.control.execution_id().query_id().low(),
+                attempt_id = self.control.execution_id().attempt_id().get(),
+                reason = %error,
+                "frontend query lifecycle pre-ready guard cleaned up interrupted attempt"
+            );
+        }
+    }
+}
+
 impl FrontendQueryLifecycleBarrier {
     pub(crate) fn new(
         transport: Arc<dyn QueryLifecycleTransport>,
@@ -105,6 +160,13 @@ impl FrontendQueryLifecycleBarrier {
             config,
             metrics: Arc::new(FrontendLifecycleMetrics::default()),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn metrics_snapshot(
+        &self,
+    ) -> novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot {
+        self.metrics.snapshot()
     }
 }
 
@@ -147,10 +209,15 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
                 )
             })
             .collect::<Vec<_>>();
+        control.set_attempted(&materialized.participants);
         if let Err(error) = self
             .registry
             .extend_attempt_backend_ownership(execution_id.query_id(), &ownership)
         {
+            if error.is_backend_epoch_mismatch() {
+                self.metrics.backend_epoch_mismatch();
+            }
+            let error = error.into_error();
             let message = control.abort_before_ready(error.message().to_string());
             return Err(DistributedQueryError::new(error.kind(), message));
         }
@@ -165,12 +232,12 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
                 return Err(DistributedQueryError::new(error.kind(), message));
             }
         };
+        let pre_ready_guard = PreReadyAttemptGuard::new(Arc::clone(&control), registry_binding);
         if !control.is_active() {
             return Err(failed(
                 "query lifecycle attempt was cancelled before InitQuery",
             ));
         }
-        control.set_attempted(&materialized.participants);
         if !control.is_active() {
             return Err(failed(
                 "query lifecycle attempt was cancelled before InitQuery",
@@ -212,11 +279,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         }
 
         let supervisor = spawn_supervisor(&control);
-        Ok(FrontendQueryLifecycleLeaseGuard::lease(
-            control,
-            supervisor,
-            registry_binding,
-        ))
+        Ok(pre_ready_guard.into_lease(supervisor))
     }
 }
 
@@ -235,11 +298,26 @@ fn init_all(
                     let result = init_one(transport, participant, config.init_rpc_timeout());
                     let latency = started.elapsed();
                     match &result {
-                        Ok(QueryInitOutcome::Applied) => metrics.observe_init(true, false, latency),
-                        Ok(QueryInitOutcome::AlreadyApplied) => {
-                            metrics.observe_init(false, true, latency)
+                        Ok(QueryInitOutcome::Applied) => {
+                            metrics.observe_init(true, false, false, false, latency)
                         }
-                        Ok(_) | Err(_) => metrics.observe_init(false, false, latency),
+                        Ok(QueryInitOutcome::AlreadyApplied) => {
+                            metrics.observe_init(false, true, false, false, latency)
+                        }
+                        Ok(_) => metrics.observe_init(false, false, false, false, latency),
+                        Err(error) => metrics.observe_init(
+                            false,
+                            false,
+                            error.uncertain_cleanup,
+                            error.manifest_conflict,
+                            latency,
+                        ),
+                    }
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.backend_epoch_mismatch)
+                    {
+                        metrics.backend_epoch_mismatch();
                     }
                     tracing::info!(
                         query_id_high = participant.request.manifest().execution_id().query_id().high(),
@@ -252,7 +330,7 @@ fn init_all(
                         latency_micros = latency.as_micros() as u64,
                         "frontend query lifecycle InitQuery completed"
                     );
-                    result.map(|_| ())
+                    result.map(|_| ()).map_err(|error| error.message)
                 })
             })
             .collect::<Vec<_>>();
@@ -267,47 +345,105 @@ fn init_all(
     })
 }
 
+#[derive(Debug)]
+struct InitFailure {
+    message: String,
+    uncertain_cleanup: bool,
+    manifest_conflict: bool,
+    backend_epoch_mismatch: bool,
+}
+
+impl InitFailure {
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_cleanup: false,
+            manifest_conflict: false,
+            backend_epoch_mismatch: false,
+        }
+    }
+
+    fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_cleanup: true,
+            manifest_conflict: false,
+            backend_epoch_mismatch: false,
+        }
+    }
+
+    fn manifest_conflict(message: impl Into<String>, uncertain_cleanup: bool) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_cleanup,
+            manifest_conflict: true,
+            backend_epoch_mismatch: false,
+        }
+    }
+
+    fn backend_epoch_mismatch(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_cleanup: false,
+            manifest_conflict: false,
+            backend_epoch_mismatch: true,
+        }
+    }
+}
+
 fn init_one(
     transport: &dyn QueryLifecycleTransport,
     participant: &MaterializedParticipant,
     timeout: Duration,
-) -> Result<QueryInitOutcome, String> {
+) -> Result<QueryInitOutcome, InitFailure> {
     let first = transport.init_query(participant.target, participant.request.clone(), timeout);
     let ack = match first {
         Ok(ack) => ack,
         Err(error) if error.is_unknown_init_outcome() => transport
             .init_query(participant.target, participant.request.clone(), timeout)
             .map_err(|retry| {
-                format!(
+                InitFailure::uncertain(format!(
                     "backend {} InitQuery retry failed after unknown outcome ({error}): {retry}",
                     participant.target.backend_idx()
-                )
+                ))
             })?,
         Err(error) => {
-            return Err(format!(
+            return Err(InitFailure::failed(format!(
                 "backend {} InitQuery failed: {error}",
                 participant.target.backend_idx()
-            ));
+            )));
         }
     };
     if ack.execution_id() != participant.request.manifest().execution_id() {
-        return Err(format!(
+        return Err(InitFailure::uncertain(format!(
             "backend {} InitAck execution id mismatch",
             participant.target.backend_idx()
-        ));
+        )));
     }
     if ack.digest() != participant.digest {
-        return Err(format!(
-            "backend {} InitAck digest mismatch",
-            participant.target.backend_idx()
+        return Err(InitFailure::manifest_conflict(
+            format!(
+                "backend {} InitAck digest mismatch",
+                participant.target.backend_idx()
+            ),
+            true,
         ));
     }
     if !ack.outcome().is_ready() {
-        return Err(format!(
+        let message = format!(
             "backend {} InitQuery rejected with {:?}",
             participant.target.backend_idx(),
             ack.outcome()
-        ));
+        );
+        return match ack.outcome() {
+            QueryInitOutcome::RejectedConflict | QueryInitOutcome::RejectedInvalidManifest => {
+                Err(InitFailure::manifest_conflict(message, false))
+            }
+            QueryInitOutcome::RejectedStaleBackend => {
+                Err(InitFailure::backend_epoch_mismatch(message))
+            }
+            _ => Err(InitFailure::failed(message)),
+        };
     }
     Ok(ack.outcome())
 }

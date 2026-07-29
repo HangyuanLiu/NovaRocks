@@ -173,3 +173,99 @@ Core metrics 单元 filter 同样被既有 Iceberg optimize job 测试编译错�
 - Task 6 必须把 production Tonic transport 的 inflight 限制落在
   `QueryLifecycleTransport` 实现中；Task 5 的并发 worker 数严格等于 frozen
   participant 数，不创建额外 fanout。
+
+## Review fix round 1/5
+
+本轮关闭五项 P1/P2 finding，提交信息为
+`fix(frontend): harden lifecycle cleanup and metrics`。
+
+### 1. pre-ready unwind-safe ownership
+
+- registry bind 成功后、第一条 Init 之前立即构造 `PreReadyAttemptGuard`；guard 已持有
+  完整 attempted participant、`AttemptControl` 和 registry binding。
+- 只有 supervisor 成功创建并把所有权转入正式 lease 后才 disarm。Init/Attach
+  期间任何 unwind、worker 外异常或 lease 构造前中断都会由 Drop 并发 unary abort
+  attempted set，并释放 registry binding。
+- 回归先让一个 participant 的真实 fake `InitQuery` 成功，再 deterministic panic；
+  `catch_unwind` 后断言三个 attempted target 全部收到 AbortQuery，且同 execution id
+  可以重新绑定 registry。
+
+### 2. first-wins unary termination ACK
+
+- unary fallback 仍严格校验 ACK execution identity，但接受 Backend 已锁存的任意合法
+  `QueryTerminationReason`，包括 `CoordinatorStreamLost`、
+  `CoordinatorHeartbeatTimeout` 和 `LocalFailure`。
+- stream 与 unary acceptance 都记录实际 accepted reason，以及 query/attempt/backend
+  generation/digest。
+- fake 让三个 stream Abort 分别失败，再让 unary 返回三种已锁存 reason；primary
+  error 保持不变，不再制造 rollback failure。
+
+### 3. Drop cleanup failure 可观测
+
+- cleanup failure 改为 typed participant failure，保留 target、digest、transport error
+  kind 与 detail。
+- 每个失败 participant 单独发布结构化 error 日志，字段包含 query id、attempt id、
+  backend id、start epoch、digest、error kind/detail，并逐项增加
+  `cleanup_failures` metric。
+- Drop 仍 best effort，但 enriched failure 不再丢弃；存在不完整 cleanup 时额外记录
+  attempt-level error。
+- 回归让三个 stream 与 unary fallback 全部失败，断言三个 unary target 均被尝试且
+  `cleanup_failures == 3`。
+
+### 4. FE metrics 分类与维度
+
+- `LocalFailure`、heartbeat timeout、control stream lost 现在是互斥分类；
+  LocalFailure 不再增加 `coordinator_lost`。
+- FE snapshot/Prometheus 新增：
+  `init_uncertain_cleanup`、`manifest_conflicts`、`attach_failed`、
+  `local_failures`、`backend_epoch_mismatches`、`cleanup_failures`。
+- unknown Init retry 仍无法确定 outcome 时增加 uncertain cleanup；Attach 失败、
+  frozen topology epoch mismatch、Init stale-backend rejection 和 manifest conflict
+  分别进入对应维度。
+- fake tests 分别断言 LocalFailure、heartbeat timeout、stream loss、unknown Init、
+  attach failure、manifest conflict、epoch mismatch 和 cleanup failure 的 snapshot
+  分类。
+
+### 5. heartbeat ratio 的双层校验
+
+- Task 5 `FrontendQueryLifecycleConfig` 与全局 config 使用同一约束：
+  heartbeat timeout 必须至少为 interval 的 3 倍，并对乘法 overflow fail closed。
+- RED 证明 50 ms / 100 ms 原先会被错误接受；GREEN 证明该组合被拒绝，而
+  50 ms / 150 ms 合法。
+
+### Review RED/GREEN
+
+关键 RED：
+
+```text
+frontend_query_lifecycle_config_requires_three_heartbeat_intervals
+FAILED: 50/100 must violate the 3x bound
+
+frontend_query_lifecycle_pre_ready_guard_unwind_aborts_and_unbinds
+E0432: no PreReadyAttemptGuard
+
+frontend_query_lifecycle_unary_fallback_accepts_first_wins_terminal_reasons
+FAILED: three valid first-wins reasons were appended as rollback failures
+
+frontend_query_lifecycle_drop_cleanup_failure_is_observable
+E0599: no metrics_snapshot and no cleanup failure dimension
+```
+
+最终 focused gate：
+
+```text
+cargo test -p novarocks-frontend --lib frontend_query_lifecycle -- --nocapture
+test result: ok. 20 passed; 0 failed
+
+cargo check -p novarocks-frontend
+Finished `dev` profile; exit 0
+
+cargo fmt --all -- --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+本轮仍未创建 production gRPC client，也未修改
+`coordinator/execution.rs` 的 submit/cancel 路径；Task 6/7 stop rule 保持。

@@ -21,13 +21,19 @@ pub struct FrontendQueryLifecycleMetricsSnapshot {
     pub init_applied: u64,
     pub init_idempotent: u64,
     pub init_failed: u64,
+    pub init_uncertain_cleanup: u64,
+    pub manifest_conflicts: u64,
     pub init_latency_micros_total: u64,
     pub init_latency_samples: u64,
     pub control_ready: u64,
+    pub attach_failed: u64,
     pub attach_latency_micros_total: u64,
     pub attach_latency_samples: u64,
     pub heartbeat_timeouts: u64,
     pub coordinator_lost: u64,
+    pub local_failures: u64,
+    pub backend_epoch_mismatches: u64,
+    pub cleanup_failures: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

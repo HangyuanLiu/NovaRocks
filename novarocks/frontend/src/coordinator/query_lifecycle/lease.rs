@@ -30,7 +30,10 @@ use novarocks::query_execution::lifecycle::{
 
 use super::barrier::FrontendQueryLifecycleConfig;
 use super::manifest::MaterializedParticipant;
-use super::{QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport};
+use super::{
+    QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
+    QueryLifecycleTransportErrorKind,
+};
 use crate::coordinator::query_registry::ActiveQueryAttemptBinding;
 use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQueryRegistry};
 
@@ -38,6 +41,47 @@ const ACTIVE: u8 = 0;
 const ABORTED: u8 = 1;
 const FINALIZING: u8 = 2;
 const FINALIZED: u8 = 3;
+
+#[derive(Clone, Copy)]
+enum SupervisorFailureKind {
+    HeartbeatTimeout,
+    CoordinatorLost,
+    LocalFailure,
+}
+
+struct AbortCleanupFailure {
+    target: QueryLifecycleTarget,
+    digest: ParticipantManifestDigest,
+    kind: QueryLifecycleTransportErrorKind,
+    detail: String,
+}
+
+impl AbortCleanupFailure {
+    fn new(
+        participant: &MaterializedParticipant,
+        kind: QueryLifecycleTransportErrorKind,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            target: participant.target,
+            digest: participant.digest,
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AbortCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend {} {:?}: {}",
+            self.target.backend_idx(),
+            self.kind,
+            self.detail
+        )
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ActiveSession {
@@ -86,7 +130,14 @@ impl FrontendLifecycleMetrics {
         });
     }
 
-    pub fn observe_init(&self, applied: bool, idempotent: bool, latency: Duration) {
+    pub fn observe_init(
+        &self,
+        applied: bool,
+        idempotent: bool,
+        uncertain_cleanup: bool,
+        manifest_conflict: bool,
+        latency: Duration,
+    ) {
         self.update(|snapshot| {
             if applied {
                 snapshot.init_applied += 1;
@@ -95,6 +146,8 @@ impl FrontendLifecycleMetrics {
             } else {
                 snapshot.init_failed += 1;
             }
+            snapshot.init_uncertain_cleanup += u64::from(uncertain_cleanup);
+            snapshot.manifest_conflicts += u64::from(manifest_conflict);
             snapshot.init_latency_micros_total += latency.as_micros() as u64;
             snapshot.init_latency_samples += 1;
         });
@@ -103,6 +156,7 @@ impl FrontendLifecycleMetrics {
     pub fn observe_attach(&self, ready: bool, latency: Duration) {
         self.update(|snapshot| {
             snapshot.control_ready += u64::from(ready);
+            snapshot.attach_failed += u64::from(!ready);
             snapshot.attach_latency_micros_total += latency.as_micros() as u64;
             snapshot.attach_latency_samples += 1;
         });
@@ -114,6 +168,23 @@ impl FrontendLifecycleMetrics {
 
     pub fn coordinator_lost(&self) {
         self.update(|snapshot| snapshot.coordinator_lost += 1);
+    }
+
+    pub fn local_failure(&self) {
+        self.update(|snapshot| snapshot.local_failures += 1);
+    }
+
+    pub fn backend_epoch_mismatch(&self) {
+        self.update(|snapshot| snapshot.backend_epoch_mismatches += 1);
+    }
+
+    pub fn cleanup_failure(&self) {
+        self.update(|snapshot| snapshot.cleanup_failures += 1);
+    }
+
+    #[cfg(test)]
+    pub fn snapshot(&self) -> FrontendQueryLifecycleMetricsSnapshot {
+        *self.snapshot.lock().expect("frontend lifecycle metrics")
     }
 
     fn update(&self, update: impl FnOnce(&mut FrontendQueryLifecycleMetricsSnapshot)) {
@@ -164,6 +235,10 @@ impl AttemptControl {
 
     pub fn is_active(&self) -> bool {
         self.state.load(Ordering::Acquire) == ACTIVE
+    }
+
+    pub(super) const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
     }
 
     pub fn set_attempted(&self, participants: &[MaterializedParticipant]) {
@@ -232,7 +307,11 @@ impl AttemptControl {
         } else {
             format!(
                 "{primary_error}; query lifecycle rollback failed: {}",
-                errors.join("; ")
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             )
         };
         *self
@@ -242,7 +321,7 @@ impl AttemptControl {
         enriched
     }
 
-    fn abort_targets(&self, force_unary: bool, reason: &str) -> Vec<String> {
+    fn abort_targets(&self, force_unary: bool, reason: &str) -> Vec<AbortCleanupFailure> {
         let attempted = self
             .attempted
             .lock()
@@ -255,25 +334,53 @@ impl AttemptControl {
             .lock()
             .expect("active query control sessions")
             .clone();
-        std::thread::scope(|scope| {
+        let failures: Vec<AbortCleanupFailure> = std::thread::scope(|scope| {
             let handles = attempted
                 .into_iter()
                 .map(|participant| {
                     let session = sessions.get(&participant.target.backend_idx()).cloned();
-                    scope.spawn(move || {
-                        self.abort_target(&participant, session.as_ref(), force_unary, reason)
-                    })
+                    let worker_participant = participant.clone();
+                    (
+                        participant,
+                        scope.spawn(move || {
+                            self.abort_target(
+                                &worker_participant,
+                                session.as_ref(),
+                                force_unary,
+                                reason,
+                            )
+                        }),
+                    )
                 })
                 .collect::<Vec<_>>();
             handles
                 .into_iter()
-                .filter_map(|handle| match handle.join() {
+                .filter_map(|(participant, handle)| match handle.join() {
                     Ok(Ok(())) => None,
                     Ok(Err(error)) => Some(error),
-                    Err(_) => Some("query lifecycle abort worker panicked".to_string()),
+                    Err(_) => Some(AbortCleanupFailure::new(
+                        &participant,
+                        QueryLifecycleTransportErrorKind::Unavailable,
+                        "query lifecycle abort worker panicked",
+                    )),
                 })
                 .collect()
-        })
+        });
+        for failure in &failures {
+            self.metrics.cleanup_failure();
+            tracing::error!(
+                query_id_high = self.execution_id.query_id().high(),
+                query_id_low = self.execution_id.query_id().low(),
+                attempt_id = self.execution_id.attempt_id().get(),
+                backend_id = failure.target.backend_idx(),
+                backend_start_epoch = failure.target.start_epoch(),
+                participant_digest = %hex::encode(failure.digest.as_bytes()),
+                error_kind = ?failure.kind,
+                error = %failure.detail,
+                "frontend query lifecycle participant cleanup failed"
+            );
+        }
+        failures
     }
 
     fn abort_target(
@@ -282,7 +389,7 @@ impl AttemptControl {
         session: Option<&ActiveSession>,
         force_unary: bool,
         reason: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), AbortCleanupFailure> {
         if !force_unary && let Some(session) = session {
             let stream_result = (|| {
                 session
@@ -290,15 +397,32 @@ impl AttemptControl {
                     .send(QueryControlCommand::Abort {
                         reason: reason.to_string(),
                     })
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| (error.kind(), error.to_string()))?;
                 match session
                     .recv(self.config.attach_timeout())
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| (error.kind(), error.to_string()))?
                 {
-                    QueryControlEvent::TerminationAccepted { .. } => Ok(()),
-                    event => Err(format!(
-                        "backend {} returned {event:?} after stream abort",
-                        participant.target.backend_idx()
+                    QueryControlEvent::TerminationAccepted {
+                        reason: accepted_reason,
+                    } => {
+                        tracing::info!(
+                            query_id_high = self.execution_id.query_id().high(),
+                            query_id_low = self.execution_id.query_id().low(),
+                            attempt_id = self.execution_id.attempt_id().get(),
+                            backend_id = participant.target.backend_idx(),
+                            backend_start_epoch = participant.target.start_epoch(),
+                            participant_digest = %hex::encode(participant.digest.as_bytes()),
+                            accepted_reason = ?accepted_reason,
+                            "frontend query lifecycle stream abort accepted"
+                        );
+                        Ok(())
+                    }
+                    event => Err((
+                        QueryLifecycleTransportErrorKind::InvalidResponse,
+                        format!(
+                            "backend {} returned {event:?} after stream abort",
+                            participant.target.backend_idx()
+                        ),
                     )),
                 }
             })();
@@ -309,29 +433,46 @@ impl AttemptControl {
 
         let request =
             QueryAbortRequest::new(self.execution_id, participant.digest, reason.to_string())
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    AbortCleanupFailure::new(
+                        participant,
+                        QueryLifecycleTransportErrorKind::InvalidResponse,
+                        error.to_string(),
+                    )
+                })?;
         let ack = self
             .transport
             .abort_query(participant.target, request, self.config.attach_timeout())
             .map_err(|error| {
-                format!(
-                    "backend {} unary abort: {error}",
-                    participant.target.backend_idx()
+                AbortCleanupFailure::new(
+                    participant,
+                    error.kind(),
+                    format!(
+                        "backend {} unary abort: {error}",
+                        participant.target.backend_idx()
+                    ),
                 )
             })?;
         if ack.execution_id() != self.execution_id {
-            return Err(format!(
-                "backend {} unary abort acknowledgement execution id mismatch",
-                participant.target.backend_idx()
+            return Err(AbortCleanupFailure::new(
+                participant,
+                QueryLifecycleTransportErrorKind::InvalidResponse,
+                format!(
+                    "backend {} unary abort acknowledgement execution id mismatch",
+                    participant.target.backend_idx()
+                ),
             ));
         }
-        if ack.accepted_reason() != QueryTerminationReason::CoordinatorAbort {
-            return Err(format!(
-                "backend {} unary abort acknowledgement accepted {:?}",
-                participant.target.backend_idx(),
-                ack.accepted_reason()
-            ));
-        }
+        tracing::info!(
+            query_id_high = self.execution_id.query_id().high(),
+            query_id_low = self.execution_id.query_id().low(),
+            attempt_id = self.execution_id.attempt_id().get(),
+            backend_id = participant.target.backend_idx(),
+            backend_start_epoch = participant.target.start_epoch(),
+            participant_digest = %hex::encode(participant.digest.as_bytes()),
+            accepted_reason = ?ack.accepted_reason(),
+            "frontend query lifecycle unary abort accepted"
+        );
         Ok(())
     }
 
@@ -354,11 +495,11 @@ impl AttemptControl {
         !*stopped
     }
 
-    fn supervisor_failed(&self, reason: String, heartbeat_timeout: bool) {
-        if heartbeat_timeout {
-            self.metrics.heartbeat_timeout();
-        } else {
-            self.metrics.coordinator_lost();
+    fn supervisor_failed(&self, reason: String, kind: SupervisorFailureKind) {
+        match kind {
+            SupervisorFailureKind::HeartbeatTimeout => self.metrics.heartbeat_timeout(),
+            SupervisorFailureKind::CoordinatorLost => self.metrics.coordinator_lost(),
+            SupervisorFailureKind::LocalFailure => self.metrics.local_failure(),
         }
         if let Some(registry) = self.registry.upgrade() {
             let _ = registry.latch_failure_and_cancel(self.execution_id.query_id(), reason);
@@ -435,7 +576,11 @@ impl AttemptControl {
             } else {
                 format!(
                     "{primary}; query lifecycle rollback failed: {}",
-                    cleanup.join("; ")
+                    cleanup
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 )
             };
             *self
@@ -485,7 +630,7 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
             None => {
                 control.supervisor_failed(
                     "query lifecycle heartbeat sequence exhausted".to_string(),
-                    false,
+                    SupervisorFailureKind::CoordinatorLost,
                 );
                 return;
             }
@@ -502,7 +647,7 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                         session.target.backend_idx(),
                         hex::encode(session.digest.as_bytes())
                     ),
-                    false,
+                    SupervisorFailureKind::CoordinatorLost,
                 );
                 return;
             }
@@ -518,7 +663,7 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                             "query lifecycle local failure on backend {} ({code}): {detail}",
                             session.target.backend_idx()
                         ),
-                        false,
+                        SupervisorFailureKind::LocalFailure,
                     );
                     return;
                 }
@@ -528,7 +673,7 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                             "query lifecycle invalid heartbeat event from backend {}: {event:?}",
                             session.target.backend_idx()
                         ),
-                        false,
+                        SupervisorFailureKind::CoordinatorLost,
                     );
                     return;
                 }
@@ -550,7 +695,14 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                             hex::encode(session.digest.as_bytes())
                         )
                     };
-                    control.supervisor_failed(failure, timeout);
+                    control.supervisor_failed(
+                        failure,
+                        if timeout {
+                            SupervisorFailureKind::HeartbeatTimeout
+                        } else {
+                            SupervisorFailureKind::CoordinatorLost
+                        },
+                    );
                     return;
                 }
             }
@@ -612,9 +764,17 @@ impl Drop for FrontendQueryLifecycleLeaseGuard {
     fn drop(&mut self) {
         self.stop_and_join();
         if self.control.is_active() {
-            let _ = self
-                .control
-                .abort_preserving("query lifecycle lease dropped before finalize".to_string());
+            let primary = "query lifecycle lease dropped before finalize".to_string();
+            let outcome = self.control.abort_preserving(primary.clone());
+            if outcome != primary {
+                tracing::error!(
+                    query_id_high = self.control.execution_id.query_id().high(),
+                    query_id_low = self.control.execution_id.query_id().low(),
+                    attempt_id = self.control.execution_id.attempt_id().get(),
+                    error = %outcome,
+                    "frontend query lifecycle drop cleanup was incomplete"
+                );
+            }
         }
     }
 }

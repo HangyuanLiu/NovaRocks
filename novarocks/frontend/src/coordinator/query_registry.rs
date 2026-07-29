@@ -68,6 +68,28 @@ pub(crate) struct FrontendQueryRegistry {
     backend_topology: Mutex<BackendTopologyState>,
 }
 
+pub(crate) struct AttemptBackendOwnershipError {
+    error: DistributedQueryError,
+    backend_epoch_mismatch: bool,
+}
+
+impl AttemptBackendOwnershipError {
+    fn new(error: DistributedQueryError, backend_epoch_mismatch: bool) -> Self {
+        Self {
+            error,
+            backend_epoch_mismatch,
+        }
+    }
+
+    pub(crate) const fn is_backend_epoch_mismatch(&self) -> bool {
+        self.backend_epoch_mismatch
+    }
+
+    pub(crate) fn into_error(self) -> DistributedQueryError {
+        self.error
+    }
+}
+
 impl FrontendQueryRegistry {
     pub(crate) fn register(
         self: &Arc<Self>,
@@ -153,7 +175,7 @@ impl FrontendQueryRegistry {
         &self,
         query_id: QueryId,
         backend_ownership: &[(usize, u64)],
-    ) -> Result<(), DistributedQueryError> {
+    ) -> Result<(), AttemptBackendOwnershipError> {
         let topology = self
             .backend_topology
             .lock()
@@ -163,19 +185,25 @@ impl FrontendQueryRegistry {
                 match topology.live_generations.get(&backend_idx) {
                     Some(current_epoch) if *current_epoch == start_epoch => {}
                     Some(current_epoch) => {
-                        return Err(DistributedQueryError::new(
-                            DistributedQueryErrorKind::Rejected,
-                            format!(
-                                "query lifecycle backend {backend_idx} generation {start_epoch} is stale; current generation is {current_epoch}"
+                        return Err(AttemptBackendOwnershipError::new(
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::Rejected,
+                                format!(
+                                    "query lifecycle backend {backend_idx} generation {start_epoch} is stale; current generation is {current_epoch}"
+                                ),
                             ),
+                            true,
                         ));
                     }
                     None => {
-                        return Err(DistributedQueryError::new(
-                            DistributedQueryErrorKind::Rejected,
-                            format!(
-                                "query lifecycle backend {backend_idx} is no longer live in the current frontend topology"
+                        return Err(AttemptBackendOwnershipError::new(
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::Rejected,
+                                format!(
+                                    "query lifecycle backend {backend_idx} is no longer live in the current frontend topology"
+                                ),
                             ),
+                            false,
                         ));
                     }
                 }
@@ -186,7 +214,7 @@ impl FrontendQueryRegistry {
         let mut active = self.active.lock().expect("frontend query registry lock");
         let query = active
             .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
+            .ok_or_else(|| AttemptBackendOwnershipError::new(inactive_query(query_id), false))?;
         for &(backend_idx, start_epoch) in backend_ownership {
             match query.scheduled_backends.entry(backend_idx) {
                 Entry::Vacant(entry) => {
@@ -194,9 +222,12 @@ impl FrontendQueryRegistry {
                 }
                 Entry::Occupied(entry) if *entry.get() == start_epoch => {}
                 Entry::Occupied(_) => {
-                    return Err(contract_violation(format!(
-                        "frontend query lifecycle backend {backend_idx} generation conflicts with scheduled ownership"
-                    )));
+                    return Err(AttemptBackendOwnershipError::new(
+                        contract_violation(format!(
+                            "frontend query lifecycle backend {backend_idx} generation conflicts with scheduled ownership"
+                        )),
+                        false,
+                    ));
                 }
             }
         }

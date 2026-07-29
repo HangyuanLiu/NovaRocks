@@ -192,6 +192,8 @@ pub fn publish_frontend_query_lifecycle_metrics(
         ("applied", snapshot.init_applied),
         ("already_applied", snapshot.init_idempotent),
         ("failed", snapshot.init_failed),
+        ("uncertain_cleanup", snapshot.init_uncertain_cleanup),
+        ("manifest_conflict", snapshot.manifest_conflicts),
     ] {
         FRONTEND_QUERY_LIFECYCLE_INIT
             .with_label_values(&[outcome])
@@ -199,8 +201,12 @@ pub fn publish_frontend_query_lifecycle_metrics(
     }
     for (outcome, count) in [
         ("control_ready", snapshot.control_ready),
+        ("attach_failed", snapshot.attach_failed),
         ("heartbeat_timeout", snapshot.heartbeat_timeouts),
         ("coordinator_lost", snapshot.coordinator_lost),
+        ("local_failure", snapshot.local_failures),
+        ("backend_epoch_mismatch", snapshot.backend_epoch_mismatches),
+        ("cleanup_failure", snapshot.cleanup_failures),
     ] {
         FRONTEND_QUERY_LIFECYCLE_CONTROL
             .with_label_values(&[outcome])
@@ -402,13 +408,19 @@ mod tests {
                 init_applied: 3,
                 init_idempotent: 4,
                 init_failed: 5,
-                init_latency_micros_total: 6,
-                init_latency_samples: 7,
-                control_ready: 8,
-                attach_latency_micros_total: 9,
-                attach_latency_samples: 10,
-                heartbeat_timeouts: 11,
-                coordinator_lost: 12,
+                init_uncertain_cleanup: 6,
+                manifest_conflicts: 7,
+                init_latency_micros_total: 8,
+                init_latency_samples: 9,
+                control_ready: 10,
+                attach_failed: 11,
+                attach_latency_micros_total: 12,
+                attach_latency_samples: 13,
+                heartbeat_timeouts: 14,
+                coordinator_lost: 15,
+                local_failures: 16,
+                backend_epoch_mismatches: 17,
+                cleanup_failures: 18,
             },
         );
 
@@ -425,13 +437,37 @@ mod tests {
         );
         assert!(
             body.contains(
-                "novarocks_frontend_query_lifecycle_control_total{outcome=\"heartbeat_timeout\"} 11"
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"heartbeat_timeout\"} 14"
             ),
             "{body}"
         );
         assert!(
             body.contains(
-                "novarocks_frontend_query_lifecycle_latency_micros{measure=\"samples\",phase=\"attach\"} 10"
+                "novarocks_frontend_query_lifecycle_latency_micros{measure=\"samples\",phase=\"attach\"} 13"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"local_failure\"} 16"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"cleanup_failure\"} 18"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_init_total{outcome=\"uncertain_cleanup\"} 6"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"backend_epoch_mismatch\"} 17"
             ),
             "{body}"
         );

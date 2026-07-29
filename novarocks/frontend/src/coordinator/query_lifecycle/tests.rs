@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
+use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{DistributedQueryIntent, QueryId};
 use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
@@ -33,12 +34,15 @@ use novarocks::query_execution::lifecycle::{
 };
 use novarocks::runtime::query_options::QueryOptions;
 
-use super::barrier::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
+use super::barrier::{
+    FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, PreReadyAttemptGuard,
+};
+use super::lease::{AttemptControl, FrontendLifecycleMetrics};
 use super::{
     QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
     QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
-use crate::coordinator::query_registry::FrontendQueryRegistry;
+use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQueryRegistry};
 
 #[derive(Default)]
 struct NoopFragmentDispatcher;
@@ -78,6 +82,7 @@ struct RecordingSession {
 struct RecordingSessionState {
     commands: Vec<QueryControlCommand>,
     events: VecDeque<Result<QueryControlEvent, QueryLifecycleTransportError>>,
+    send_errors: VecDeque<QueryLifecycleTransportError>,
 }
 
 impl RecordingSession {
@@ -101,11 +106,24 @@ impl RecordingSession {
             .commands
             .clone()
     }
+
+    fn fail_next_send(&self, error: QueryLifecycleTransportError) {
+        self.state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .send_errors
+            .push_back(error);
+    }
 }
 
 impl QueryControlSession for RecordingSession {
     fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
         let mut state = self.state.0.lock().expect("recording session lock");
+        if let Some(error) = state.send_errors.pop_front() {
+            state.commands.push(command);
+            return Err(error);
+        }
         let terminal = match &command {
             QueryControlCommand::Abort { .. } => Some(QueryTerminationReason::CoordinatorAbort),
             QueryControlCommand::Finalize => Some(QueryTerminationReason::CoordinatorFinalize),
@@ -384,11 +402,84 @@ fn registry_for(
 fn config() -> FrontendQueryLifecycleConfig {
     FrontendQueryLifecycleConfig::new(
         Duration::from_millis(50),
-        Duration::from_millis(100),
+        Duration::from_millis(150),
         Duration::from_millis(20),
         Duration::from_millis(20),
     )
     .expect("fixture lifecycle config")
+}
+
+#[test]
+fn frontend_query_lifecycle_config_requires_three_heartbeat_intervals() {
+    let invalid = FrontendQueryLifecycleConfig::new(
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+    );
+    assert!(invalid.is_err(), "50/100 must violate the 3x bound");
+
+    FrontendQueryLifecycleConfig::new(
+        Duration::from_millis(50),
+        Duration::from_millis(150),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+    )
+    .expect("50/150 must satisfy the 3x bound");
+}
+
+#[test]
+fn frontend_query_lifecycle_pre_ready_guard_unwind_aborts_and_unbinds() {
+    let plan = query_init_plan(None);
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let materialized = super::manifest::materialize(plan).expect("materialize fixture plan");
+    let metrics = Arc::new(FrontendLifecycleMetrics::default());
+    let control = AttemptControl::new(
+        execution_id,
+        Arc::new(transport.clone()),
+        Arc::downgrade(&registry),
+        config(),
+        Arc::clone(&metrics),
+    );
+    control.set_attempted(&materialized.participants);
+    let active: Arc<dyn ActiveQueryAttemptControl> = control.clone();
+    let binding = registry
+        .bind_active_attempt(execution_id, active)
+        .expect("bind fixture attempt");
+    let guard = PreReadyAttemptGuard::new(control, binding);
+    let initialized = materialized.participants[0].clone();
+    let init_transport = transport.clone();
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = guard;
+        init_transport
+            .init_query(
+                initialized.target,
+                initialized.request,
+                Duration::from_millis(20),
+            )
+            .expect("first participant Init succeeds before interruption");
+        panic!("deterministic interruption after a successful Init");
+    }));
+    assert!(unwind.is_err(), "fixture must unwind");
+    assert_eq!(transport.init_calls().len(), 1);
+    assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+
+    let replacement = AttemptControl::new(
+        execution_id,
+        Arc::new(transport),
+        Arc::downgrade(&registry),
+        config(),
+        metrics,
+    );
+    let replacement_control: Arc<dyn ActiveQueryAttemptControl> = replacement.clone();
+    let replacement_binding = registry
+        .bind_active_attempt(execution_id, replacement_control)
+        .expect("unwind guard must clear the registry binding");
+    replacement.abort_before_ready("fixture cleanup".to_string());
+    drop(replacement_binding);
 }
 
 fn sorted(mut values: Vec<usize>) -> Vec<usize> {
@@ -513,6 +604,32 @@ fn frontend_query_lifecycle_business_rejection_is_not_retried() {
             .count(),
         1
     );
+    assert_eq!(barrier.metrics_snapshot().manifest_conflicts, 0);
+}
+
+#[test]
+fn frontend_query_lifecycle_manifest_conflict_is_classified() {
+    let plan = query_init_plan(None);
+    let digest = plan.participant(1).unwrap().digest();
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().init_results.insert(
+        1,
+        VecDeque::from([Ok(QueryInitAck::new(
+            execution_id,
+            digest,
+            QueryInitOutcome::RejectedConflict,
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
+
+    match barrier.initialize_all(plan) {
+        Ok(_) => panic!("manifest conflict must fail the barrier"),
+        Err(error) => assert!(error.message().contains("RejectedConflict"), "{error}"),
+    }
+
+    assert_eq!(barrier.metrics_snapshot().manifest_conflicts, 1);
 }
 
 #[test]
@@ -556,6 +673,130 @@ fn frontend_query_lifecycle_rollback_preserves_primary_error() {
         "{error}"
     );
     assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+    assert_eq!(barrier.metrics_snapshot().attach_failed, 1);
+}
+
+#[test]
+fn frontend_query_lifecycle_unary_fallback_accepts_first_wins_terminal_reasons() {
+    let plan = query_init_plan(None);
+    let execution_id = plan.execution_id();
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    {
+        let mut state = transport.state.lock().unwrap();
+        for (backend_idx, reason) in [
+            (0, QueryTerminationReason::CoordinatorStreamLost),
+            (1, QueryTerminationReason::CoordinatorHeartbeatTimeout),
+            (2, QueryTerminationReason::LocalFailure),
+        ] {
+            sessions[&backend_idx].fail_next_send(transport_error(
+                QueryLifecycleTransportErrorKind::StreamClosed,
+                "control stream already closed after backend termination",
+            ));
+            state.abort_results.insert(
+                backend_idx,
+                VecDeque::from([Ok(QueryTerminationAck::new(execution_id, reason))]),
+            );
+        }
+    }
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants ready");
+
+    let message = lease.abort_preserving("primary execution failure".to_string());
+
+    assert_eq!(message, "primary execution failure");
+    assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+}
+
+#[test]
+fn frontend_query_lifecycle_unknown_init_cleanup_is_classified() {
+    let plan = query_init_plan(None);
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().init_results.insert(
+        1,
+        VecDeque::from([
+            Err(transport_error(
+                QueryLifecycleTransportErrorKind::DeadlineExceeded,
+                "first InitAck outcome unknown",
+            )),
+            Err(transport_error(
+                QueryLifecycleTransportErrorKind::StreamClosed,
+                "retry InitAck outcome unknown",
+            )),
+        ]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
+
+    match barrier.initialize_all(plan) {
+        Ok(_) => panic!("unresolved Init outcome must fail the barrier"),
+        Err(error) => assert!(error.message().contains("unknown outcome"), "{error}"),
+    }
+
+    let snapshot = barrier.metrics_snapshot();
+    assert_eq!(snapshot.init_failed, 1);
+    assert_eq!(snapshot.init_uncertain_cleanup, 1);
+}
+
+#[test]
+fn frontend_query_lifecycle_epoch_mismatch_is_classified_before_init() {
+    let plan = query_init_plan(None);
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    registry.replace_live_backends(
+        1,
+        &[
+            LiveBackendTarget::new(0, "127.0.0.1:18000".parse().unwrap(), 90),
+            LiveBackendTarget::new(1, "127.0.0.1:18001".parse().unwrap(), 999),
+            LiveBackendTarget::new(2, "127.0.0.1:18002".parse().unwrap(), 92),
+        ],
+    );
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    match barrier.initialize_all(plan) {
+        Ok(_) => panic!("stale backend generation must fail the barrier"),
+        Err(error) => assert!(error.message().contains("stale"), "{error}"),
+    }
+
+    assert!(transport.init_calls().is_empty());
+    assert_eq!(barrier.metrics_snapshot().backend_epoch_mismatches, 1);
+}
+
+#[test]
+fn frontend_query_lifecycle_drop_cleanup_failure_is_observable() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    {
+        let mut state = transport.state.lock().unwrap();
+        for backend_idx in 0..3 {
+            sessions[&backend_idx].fail_next_send(transport_error(
+                QueryLifecycleTransportErrorKind::StreamClosed,
+                "drop cleanup stream unavailable",
+            ));
+            state.abort_results.insert(
+                backend_idx,
+                VecDeque::from([Err(transport_error(
+                    QueryLifecycleTransportErrorKind::Unavailable,
+                    "drop cleanup unary fallback unavailable",
+                ))]),
+            );
+        }
+    }
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants ready");
+
+    drop(lease);
+
+    assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+    assert_eq!(barrier.metrics_snapshot().cleanup_failures, 3);
 }
 
 #[test]
@@ -687,6 +928,12 @@ fn frontend_query_lifecycle_lease_local_failure_aborts_other_participants() {
         registry
             .first_failure(query_id)
             .is_some_and(|failure| failure.contains("backend 0 scan failed"))
+            && [1, 2].into_iter().all(|backend_idx| {
+                sessions[&backend_idx]
+                    .commands()
+                    .iter()
+                    .any(|command| matches!(command, QueryControlCommand::Abort { .. }))
+            })
     });
     for backend_idx in [1, 2] {
         assert!(
@@ -696,6 +943,10 @@ fn frontend_query_lifecycle_lease_local_failure_aborts_other_participants() {
                 .any(|command| matches!(command, QueryControlCommand::Abort { .. }))
         );
     }
+    let snapshot = barrier.metrics_snapshot();
+    assert_eq!(snapshot.local_failures, 1);
+    assert_eq!(snapshot.coordinator_lost, 0);
+    assert_eq!(snapshot.heartbeat_timeouts, 0);
     drop(lease);
 }
 
@@ -763,6 +1014,64 @@ fn frontend_query_lifecycle_heartbeat_timeout_fails_closed() {
             .first_failure(query_id)
             .is_some_and(|failure| failure.contains("heartbeat"))
     });
+    let snapshot = barrier.metrics_snapshot();
+    assert_eq!(snapshot.heartbeat_timeouts, 1);
+    assert_eq!(snapshot.local_failures, 0);
+    assert_eq!(snapshot.coordinator_lost, 0);
+    drop(lease);
+}
+
+#[test]
+fn frontend_query_lifecycle_stream_loss_is_classified_as_coordinator_lost() {
+    let plan = query_init_plan(None);
+    let query_id = plan.execution_id().query_id();
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    sessions.get(&0).unwrap().state.0.lock().unwrap().events = VecDeque::from([
+        Ok(QueryControlEvent::ControlReady),
+        Err(transport_error(
+            QueryLifecycleTransportErrorKind::StreamClosed,
+            "backend 0 stream closed",
+        )),
+    ]);
+    for backend_idx in [1, 2] {
+        sessions
+            .get(&backend_idx)
+            .unwrap()
+            .state
+            .0
+            .lock()
+            .unwrap()
+            .events = VecDeque::from([
+            Ok(QueryControlEvent::ControlReady),
+            Ok(QueryControlEvent::HeartbeatAck { sequence: 1 }),
+        ]);
+    }
+    let (registry, _query) = registry_for(&plan);
+    let stream_loss_config = FrontendQueryLifecycleConfig::new(
+        Duration::from_millis(1),
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    let barrier = FrontendQueryLifecycleBarrier::new(
+        Arc::new(transport),
+        Arc::clone(&registry),
+        stream_loss_config,
+    );
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants ready");
+
+    wait_until(Duration::from_secs(1), || {
+        registry
+            .first_failure(query_id)
+            .is_some_and(|failure| failure.contains("stream lost"))
+    });
+    let snapshot = barrier.metrics_snapshot();
+    assert_eq!(snapshot.coordinator_lost, 1);
+    assert_eq!(snapshot.local_failures, 0);
+    assert_eq!(snapshot.heartbeat_timeouts, 0);
     drop(lease);
 }
 
