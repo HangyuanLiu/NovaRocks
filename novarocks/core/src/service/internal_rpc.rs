@@ -29,7 +29,6 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::query_context::query_context_manager;
 use crate::service::native_fragment_ingress::{
     NativeFragmentAccepted, NativeFragmentIngress, NativeFragmentIngressError,
-    NativeFragmentRequest,
 };
 
 #[cfg(feature = "compat")]
@@ -310,13 +309,7 @@ pub(crate) fn handle_submit_fragment(
     fragment: proto::plan::PlanFragment,
     instance_params: proto::novarocks::InstanceParams,
 ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-    let execution_id = crate::protocol::native::decode::decode_query_execution_id(&execution_id)
-        .map_err(NativeFragmentIngressError::new)?;
-    ingress.submit(NativeFragmentRequest::try_decode(
-        execution_id,
-        fragment,
-        instance_params,
-    )?)
+    ingress.submit_native_payload(execution_id, fragment, instance_params)
 }
 
 #[cfg(feature = "compat")]

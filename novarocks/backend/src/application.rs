@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks::common::app_config::{self, NovaRocksConfig};
+use novarocks::connector::ConnectorRegistry;
 use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::grpc_server;
@@ -169,6 +170,7 @@ fn compose_backend_application_services(config: &NovaRocksConfig) -> BackendAppl
         native_fragment_event_sink(),
         controls,
         Arc::clone(&query_lifecycle_registry),
+        Arc::new(ConnectorRegistry::new()),
     ));
     BackendApplicationServices {
         native_fragment_service,

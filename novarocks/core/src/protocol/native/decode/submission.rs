@@ -76,9 +76,10 @@ struct DecodedNativeInstanceParts {
     typed_result_sink: bool,
 }
 
-pub(crate) fn decode_fragment_submission(
+pub(crate) fn decode_fragment_submission_with_connectors(
     fragment: &plan::PlanFragment,
     instance_params: &novarocks::InstanceParams,
+    connectors: Arc<crate::connector::ConnectorRegistry>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let instance_parts = decode_instance_parts(instance_params)?;
     let root_path = FieldPath::root("plan_fragment").field("root");
@@ -124,7 +125,7 @@ pub(crate) fn decode_fragment_submission(
         instance_parts.exchange_inputs.clone(),
         instance_parts.raw_scan_ranges,
         instance_parts.query_options.clone(),
-        Arc::new(crate::connector::ConnectorRegistry::default()),
+        connectors,
         instance_parts.query_id,
         instance_parts.fragment_instance_id,
     );
@@ -199,6 +200,18 @@ pub(crate) fn decode_query_execution_id(
     })?;
     QueryExecutionId::new(ExecutionQueryId::new(query_id.hi, query_id.lo), attempt_id)
         .map_err(|error| NativeFragmentDecodeError::invalid_value(root, error.to_string()))
+}
+
+#[cfg(test)]
+pub(crate) fn decode_fragment_submission(
+    fragment: &plan::PlanFragment,
+    instance_params: &novarocks::InstanceParams,
+) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+    decode_fragment_submission_with_connectors(
+        fragment,
+        instance_params,
+        Arc::new(crate::connector::ConnectorRegistry::new()),
+    )
 }
 
 fn validate_node_required_fields(

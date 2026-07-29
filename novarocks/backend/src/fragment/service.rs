@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use novarocks::common::app_config;
+use novarocks::connector::ConnectorRegistry;
 use novarocks::novarocks_logging::{error, info, warn};
 use novarocks::query_execution::native_fragment_report;
 use novarocks::runtime::fragment::io::{
@@ -59,6 +60,7 @@ pub struct NativeFragmentService {
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
+    connector_registry: Arc<ConnectorRegistry>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -84,6 +86,7 @@ impl NativeFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
         lifecycle: Arc<QueryLifecycleRegistry>,
+        connector_registry: Arc<ConnectorRegistry>,
     ) -> Self {
         Self::new_with_controls(
             exchange_transmitter,
@@ -92,6 +95,7 @@ impl NativeFragmentService {
             event_sink,
             Arc::new(FragmentControlRegistry::default()),
             lifecycle,
+            connector_registry,
         )
     }
 
@@ -102,6 +106,7 @@ impl NativeFragmentService {
         event_sink: Arc<dyn FragmentEventSink>,
         controls: Arc<FragmentControlRegistry>,
         lifecycle: Arc<QueryLifecycleRegistry>,
+        connector_registry: Arc<ConnectorRegistry>,
     ) -> Self {
         Self {
             controls,
@@ -111,6 +116,7 @@ impl NativeFragmentService {
             lookup_client,
             result_writer,
             event_sink,
+            connector_registry,
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -134,6 +140,7 @@ impl NativeFragmentService {
             crate::fragment::native_fragment_event_sink(),
             controls,
             lifecycle,
+            Arc::new(ConnectorRegistry::new()),
         );
         service.lifecycle_observer = Some(Arc::new(observer));
         service
@@ -167,6 +174,20 @@ impl NativeFragmentService {
 }
 
 impl NativeFragmentIngress for NativeFragmentService {
+    fn submit_native_payload(
+        &self,
+        execution_id: novarocks::proto::novarocks::QueryExecutionId,
+        fragment: novarocks::proto::plan::PlanFragment,
+        instance_params: novarocks::proto::novarocks::InstanceParams,
+    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+        self.submit(NativeFragmentRequest::try_decode_wire(
+            execution_id,
+            fragment,
+            instance_params,
+            Arc::clone(&self.connector_registry),
+        )?)
+    }
+
     fn submit(
         &self,
         request: NativeFragmentRequest,
@@ -520,6 +541,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks::UniqueId;
+    use novarocks::connector::ConnectorRegistry;
     use novarocks::proto;
     use novarocks::query_execution::contract::QueryId as ExecutionQueryId;
     use novarocks::query_execution::lifecycle::{
@@ -682,6 +704,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            Arc::new(ConnectorRegistry::new()),
         )
         .expect("valid native fragment request")
     }
@@ -908,6 +931,7 @@ mod tests {
             crate::fragment::native_result_writer(),
             crate::fragment::native_fragment_event_sink(),
             test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),
+            Arc::new(ConnectorRegistry::new()),
         );
         let first = values_result_request(82_000, 82_002);
         let finst_id = first.fragment_instance_id();

@@ -54,6 +54,8 @@ use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 use crate::query_execution::lifecycle::QueryLifecycleIngress;
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
+#[cfg(all(test, feature = "compat"))]
+use crate::runtime::fragment::io::SyncFragmentExecutor;
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
@@ -90,6 +92,33 @@ struct RejectingTestNativeFragmentIngress;
 
 #[cfg(test)]
 struct RejectingTestQueryLifecycleIngress;
+
+#[cfg(test)]
+fn decode_test_native_fragment_request(
+    execution_id: crate::proto::novarocks::QueryExecutionId,
+    fragment: crate::proto::plan::PlanFragment,
+    instance_params: crate::proto::novarocks::InstanceParams,
+) -> Result<
+    crate::service::native_fragment_ingress::NativeFragmentRequest,
+    crate::service::native_fragment_ingress::NativeFragmentIngressError,
+> {
+    crate::service::native_fragment_ingress::NativeFragmentRequest::try_decode_wire(
+        execution_id,
+        fragment,
+        instance_params,
+        Arc::new(crate::connector::ConnectorRegistry::new()),
+    )
+}
+
+#[cfg(all(test, feature = "compat"))]
+struct RejectingTestSyncFragmentExecutor;
+
+#[cfg(all(test, feature = "compat"))]
+impl SyncFragmentExecutor for RejectingTestSyncFragmentExecutor {
+    fn execute_encoded(&self, _payload: &[u8]) -> Result<crate::common::types::UniqueId, String> {
+        Err("test StarRocks fragment sync ingress is not configured".to_string())
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn rejecting_test_native_fragment_ingress() -> Arc<dyn NativeFragmentIngress> {
@@ -150,6 +179,22 @@ impl QueryLifecycleIngress for RejectingTestQueryLifecycleIngress {
 
 #[cfg(test)]
 impl NativeFragmentIngress for RejectingTestNativeFragmentIngress {
+    fn submit_native_payload(
+        &self,
+        execution_id: crate::proto::novarocks::QueryExecutionId,
+        fragment: crate::proto::plan::PlanFragment,
+        instance_params: crate::proto::novarocks::InstanceParams,
+    ) -> Result<
+        crate::service::native_fragment_ingress::NativeFragmentAccepted,
+        crate::service::native_fragment_ingress::NativeFragmentIngressError,
+    > {
+        self.submit(decode_test_native_fragment_request(
+            execution_id,
+            fragment,
+            instance_params,
+        )?)
+    }
+
     fn submit(
         &self,
         _request: crate::service::native_fragment_ingress::NativeFragmentRequest,
@@ -2876,6 +2921,7 @@ mod pr3_tests {
     use crate::runtime_filter::port::transport::{
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
     };
+    use crate::service::grpc_server::decode_test_native_fragment_request;
     use crate::service::native_fragment_ingress::{
         NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
         NativeFragmentIngressError, NativeFragmentRequest,
@@ -3363,6 +3409,19 @@ mod pr3_tests {
     }
 
     impl NativeFragmentIngress for RecordingNativeFragmentIngress {
+        fn submit_native_payload(
+            &self,
+            execution_id: novarocks::QueryExecutionId,
+            fragment: plan::PlanFragment,
+            instance_params: novarocks::InstanceParams,
+        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+            self.submit(decode_test_native_fragment_request(
+                execution_id,
+                fragment,
+                instance_params,
+            )?)
+        }
+
         fn submit(
             &self,
             request: NativeFragmentRequest,
@@ -3418,6 +3477,19 @@ mod pr3_tests {
     }
 
     impl NativeFragmentIngress for GatedNativeFragmentIngress {
+        fn submit_native_payload(
+            &self,
+            execution_id: novarocks::QueryExecutionId,
+            fragment: plan::PlanFragment,
+            instance_params: novarocks::InstanceParams,
+        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+            self.submit(decode_test_native_fragment_request(
+                execution_id,
+                fragment,
+                instance_params,
+            )?)
+        }
+
         fn submit(
             &self,
             request: NativeFragmentRequest,
