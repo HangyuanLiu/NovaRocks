@@ -91,6 +91,13 @@ pub struct QueryMeta {
     pub network_partition_be: Option<usize>,
     pub heartbeat_delay_ms: Option<u64>,
     pub restart_be_delay_ms: Option<u64>,
+    pub drop_next_init_ack_be_index: Option<usize>,
+    pub stop_query_control_heartbeat_be_index: Option<usize>,
+    pub kill_fe_after_control_ready_count: Option<usize>,
+    pub restart_be_after_init_ack_index: Option<usize>,
+    /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
+    pub kill_query_after_control_ready_count: Option<usize>,
+    pub query_control_fragment_backend_limit: Option<usize>,
     /// After the step SQL executes, poll `SHOW ALTER TABLE COLUMN` until FINISHED.
     /// Value is the table name.
     pub wait_alter_column: Option<String>,

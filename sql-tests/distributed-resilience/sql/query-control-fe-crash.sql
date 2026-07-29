@@ -19,7 +19,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.fragment_report_failure (
+CREATE TABLE ${case_db}.fe_crash (
   id BIGINT,
   delay_s BIGINT
 )
@@ -27,20 +27,25 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (1, 5);
+INSERT INTO ${case_db}.fe_crash VALUES (1, 10);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (2, 5);
+INSERT INTO ${case_db}.fe_crash VALUES (2, 10);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (3, 5);
+INSERT INTO ${case_db}.fe_crash VALUES (3, 10);
 
 -- query 5
--- @fail_fragment_after_start_be_index=1
--- @expect_error=Cancelled
--- @be_log_exact_fragment_cancellation=3
+-- @kill_fe_after_control_ready_count=2
+-- @expect_error=server disconnected
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST,3
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
 SELECT COUNT(*)
-FROM ${case_db}.fragment_report_failure
+FROM ${case_db}.fe_crash
 WHERE sleep(delay_s);
+
+-- query 6
+-- @result_contains=3
+SELECT COUNT(*) FROM ${case_db}.fe_crash;

@@ -315,11 +315,44 @@ impl NovaRocksConfig {
             .with_context(|| format!("parse toml: {}", path.display()))?;
         validate_state_store_configuration(&cfg)?;
         validate_query_control_config(&cfg.runtime)?;
+        validate_query_lifecycle_fault_environment(&cfg)?;
         Ok(cfg)
     }
 
     pub fn jdbc_config(&self) -> Option<&JdbcConfig> {
         self.jdbc.as_ref()
+    }
+}
+
+fn validate_query_lifecycle_fault_environment(cfg: &NovaRocksConfig) -> Result<()> {
+    let environment =
+        std::env::var_os("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR").map(PathBuf::from);
+    #[cfg(debug_assertions)]
+    {
+        let configured = cfg.debug.query_lifecycle_fault_dir().map(Path::to_path_buf);
+        match (configured, environment) {
+            (None, None) => Ok(()),
+            (Some(configured), Some(environment)) if configured == environment => Ok(()),
+            (Some(configured), Some(environment)) => bail!(
+                "debug.query_lifecycle_fault_dir {} does not match runner-owned environment {}",
+                configured.display(),
+                environment.display()
+            ),
+            (Some(_), None) => bail!(
+                "debug.query_lifecycle_fault_dir requires NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR"
+            ),
+            (None, Some(_)) => bail!(
+                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR requires debug.query_lifecycle_fault_dir"
+            ),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = cfg;
+        if environment.is_some() {
+            bail!("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR is only available in debug builds");
+        }
+        Ok(())
     }
 }
 
@@ -1560,6 +1593,8 @@ pub struct DebugConfig {
     pub emit_cancel_marker: bool,
     #[cfg(debug_assertions)]
     pub emit_grpc_fragment_marker: bool,
+    #[cfg(debug_assertions)]
+    pub query_lifecycle_fault_dir: Option<PathBuf>,
 }
 
 #[cfg(debug_assertions)]
@@ -1572,6 +1607,7 @@ struct DebugConfigToml {
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: bool,
     emit_grpc_fragment_marker: bool,
+    query_lifecycle_fault_dir: Option<PathBuf>,
 }
 
 #[cfg(not(debug_assertions))]
@@ -1584,6 +1620,7 @@ struct DebugConfigToml {
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: Option<bool>,
     emit_grpc_fragment_marker: Option<bool>,
+    query_lifecycle_fault_dir: Option<PathBuf>,
 }
 
 impl<'de> Deserialize<'de> for DebugConfig {
@@ -1601,6 +1638,7 @@ impl<'de> Deserialize<'de> for DebugConfig {
                 fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
                 emit_cancel_marker: raw.emit_cancel_marker,
                 emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
+                query_lifecycle_fault_dir: raw.query_lifecycle_fault_dir,
             })
         }
         #[cfg(not(debug_assertions))]
@@ -1623,6 +1661,11 @@ impl<'de> Deserialize<'de> for DebugConfig {
             if raw.emit_grpc_fragment_marker.is_some() {
                 return Err(serde::de::Error::custom(
                     "debug.emit_grpc_fragment_marker is only available in debug builds",
+                ));
+            }
+            if raw.query_lifecycle_fault_dir.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.query_lifecycle_fault_dir is only available in debug builds",
                 ));
             }
             Ok(Self {
@@ -1672,6 +1715,16 @@ impl DebugConfig {
     #[cfg(not(debug_assertions))]
     pub fn emit_grpc_fragment_marker(&self) -> bool {
         false
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
+        self.query_lifecycle_fault_dir.as_deref()
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
+        None
     }
 }
 
@@ -2119,6 +2172,7 @@ fault_inject_submit_fail_after = 1
 fault_inject_fetch_not_ready_count = 2
 emit_cancel_marker = true
 emit_grpc_fragment_marker = true
+query_lifecycle_fault_dir = "/tmp/runner-owned-query-lifecycle-faults"
 "#,
         )
         .expect("parse config");
@@ -2126,6 +2180,12 @@ emit_grpc_fragment_marker = true
         assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
         assert!(cfg.debug.emit_cancel_marker);
         assert!(cfg.debug.emit_grpc_fragment_marker);
+        assert_eq!(
+            cfg.debug.query_lifecycle_fault_dir.as_deref(),
+            Some(std::path::Path::new(
+                "/tmp/runner-owned-query-lifecycle-faults"
+            ))
+        );
     }
 
     #[test]
@@ -2158,6 +2218,21 @@ emit_cancel_marker = false
         let err = err.to_string();
         assert!(
             err.contains("emit_cancel_marker"),
+            "unexpected parse error: {err}"
+        );
+
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+query_lifecycle_fault_dir = "/tmp/not-allowed"
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject query lifecycle fault hooks"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("query_lifecycle_fault_dir"),
             "unexpected parse error: {err}"
         );
 

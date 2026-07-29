@@ -102,6 +102,40 @@ impl Drop for FragmentFailureStepGuard {
     }
 }
 
+pub(crate) struct QueryLifecycleFaultStepGuard {
+    server: Option<Arc<Mutex<Box<dyn ServerHandle>>>>,
+}
+
+pub(crate) fn query_lifecycle_fault_step_guard(
+    meta: &QueryMeta,
+    server: Arc<Mutex<Box<dyn ServerHandle>>>,
+) -> QueryLifecycleFaultStepGuard {
+    let armed = meta.drop_next_init_ack_be_index.is_some()
+        || meta.stop_query_control_heartbeat_be_index.is_some()
+        || meta.kill_fe_after_control_ready_count.is_some()
+        || meta.restart_be_after_init_ack_index.is_some()
+        || meta.kill_query_after_control_ready_count.is_some()
+        || meta.query_control_fragment_backend_limit.is_some();
+    QueryLifecycleFaultStepGuard {
+        server: armed.then_some(server),
+    }
+}
+
+impl Drop for QueryLifecycleFaultStepGuard {
+    fn drop(&mut self) {
+        let Some(server) = self.server.take() else {
+            return;
+        };
+        let mut server = match server.lock() {
+            Ok(server) => server,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Err(error) = server.clear_query_lifecycle_faults() {
+            eprintln!("failed to clear query lifecycle fault triggers after SQL step: {error:#}");
+        }
+    }
+}
+
 pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
     meta.kill_be_index.is_some()
         || meta.kill_be_after_fragment_start.is_some()
@@ -109,6 +143,12 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.network_partition_be.is_some()
         || meta.heartbeat_delay_ms.is_some()
         || meta.restart_be_delay_ms.is_some()
+        || meta.drop_next_init_ack_be_index.is_some()
+        || meta.stop_query_control_heartbeat_be_index.is_some()
+        || meta.kill_fe_after_control_ready_count.is_some()
+        || meta.restart_be_after_init_ack_index.is_some()
+        || meta.kill_query_after_control_ready_count.is_some()
+        || meta.query_control_fragment_backend_limit.is_some()
 }
 
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
@@ -126,6 +166,22 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         );
     }
 
+    let lifecycle_fault_count = [
+        meta.drop_next_init_ack_be_index.is_some(),
+        meta.stop_query_control_heartbeat_be_index.is_some(),
+        meta.kill_fe_after_control_ready_count.is_some(),
+        meta.restart_be_after_init_ack_index.is_some(),
+        meta.kill_query_after_control_ready_count.is_some(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count();
+    if lifecycle_fault_count > 1 {
+        bail!(
+            "a SQL step may configure at most one query lifecycle fault directive: drop_next_init_ack_be_index, stop_query_control_heartbeat_be_index, kill_fe_after_control_ready_count, restart_be_after_init_ack_index, or kill_query_after_control_ready_count"
+        );
+    }
+
     if let Some(index) = meta.network_partition_be {
         bail!(
             "network_partition_be is unsupported by the SQL test runner in Task 7.1 (index={index})"
@@ -140,6 +196,59 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         bail!(
             "fault injection directives require a mutable cross-process server handle; current server mode does not support fault injection"
         );
+    }
+
+    let be_count = server.be_count();
+    for (name, index) in [
+        (
+            "drop_next_init_ack_be_index",
+            meta.drop_next_init_ack_be_index,
+        ),
+        (
+            "stop_query_control_heartbeat_be_index",
+            meta.stop_query_control_heartbeat_be_index,
+        ),
+        (
+            "restart_be_after_init_ack_index",
+            meta.restart_be_after_init_ack_index,
+        ),
+    ] {
+        if let Some(index) = index
+            && index >= be_count
+        {
+            bail!("{name} {index} is out of bounds for {be_count} BE(s)");
+        }
+    }
+    if let Some(count) = meta.kill_fe_after_control_ready_count
+        && !(1..=be_count).contains(&count)
+    {
+        bail!("kill_fe_after_control_ready_count must be between 1 and {be_count}, got {count}");
+    }
+    if let Some(count) = meta.kill_query_after_control_ready_count
+        && !(1..=be_count).contains(&count)
+    {
+        bail!("kill_query_after_control_ready_count must be between 1 and {be_count}, got {count}");
+    }
+    if let Some(limit) = meta.query_control_fragment_backend_limit
+        && !(1..=be_count).contains(&limit)
+    {
+        bail!("query_control_fragment_backend_limit must be between 1 and {be_count}, got {limit}");
+    }
+
+    if let Some(index) = meta.drop_next_init_ack_be_index {
+        server.arm_init_ack_drop(index)?;
+    }
+    if let Some(index) = meta.stop_query_control_heartbeat_be_index {
+        server.arm_query_control_heartbeat_stop(index)?;
+    }
+    if let Some(count) = meta.kill_fe_after_control_ready_count {
+        server.arm_fe_crash_after_control_ready(count)?;
+    }
+    if let Some(index) = meta.restart_be_after_init_ack_index {
+        server.arm_be_restart_after_init_ack(index)?;
+    }
+    if let Some(limit) = meta.query_control_fragment_backend_limit {
+        server.arm_query_control_fragment_backend_limit(limit)?;
     }
 
     if let Some(index) = meta.fail_fragment_after_start_be_index {
@@ -164,111 +273,258 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
 pub(crate) fn execute_with_post_fragment_start_fault<T, F>(
     meta: &QueryMeta,
     server: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    query_connection_id: Option<u32>,
     execute_query: F,
 ) -> Result<T>
 where
     F: FnOnce() -> T,
 {
     #[derive(Clone, Copy)]
-    enum PostFragmentStartFault {
+    enum PostQueryFault {
         KillBackend(usize),
         ReleaseFragmentFailure(usize),
+        KillFrontendAfterControlReady(usize),
+        RestartBackendAfterInitAck(usize),
+        KillQueryAfterControlReady {
+            ready_count: usize,
+            connection_id: u32,
+        },
     }
 
-    impl PostFragmentStartFault {
-        fn target_index(self) -> usize {
-            match self {
-                Self::KillBackend(index) | Self::ReleaseFragmentFailure(index) => index,
-            }
-        }
-
-        fn apply(self, server: &mut dyn ServerHandle) -> Result<()> {
-            match self {
-                Self::KillBackend(index) => server.kill_be(index),
-                Self::ReleaseFragmentFailure(index) => {
-                    server.release_fragment_executor_failure(index)
-                }
-            }
-        }
+    enum FaultBaseline {
+        ScheduledFragments(Vec<(usize, u64)>),
+        FrontendReady {
+            ready_count: u64,
+            coordinator_lost: Vec<u64>,
+        },
+        BackendInit {
+            index: usize,
+            applied_count: usize,
+        },
     }
 
-    let fault = match (
-        meta.kill_be_after_fragment_start,
-        meta.fail_fragment_after_start_be_index,
-    ) {
-        (Some(index), None) => PostFragmentStartFault::KillBackend(index),
-        (None, Some(index)) => PostFragmentStartFault::ReleaseFragmentFailure(index),
-        (None, None) => return Ok(execute_query()),
-        (Some(_), Some(_)) => {
-            bail!("a SQL step may configure at most one post-fragment-start fault");
+    let faults = [
+        meta.kill_be_after_fragment_start
+            .map(PostQueryFault::KillBackend),
+        meta.fail_fragment_after_start_be_index
+            .map(PostQueryFault::ReleaseFragmentFailure),
+        meta.kill_fe_after_control_ready_count
+            .map(PostQueryFault::KillFrontendAfterControlReady),
+        meta.restart_be_after_init_ack_index
+            .map(PostQueryFault::RestartBackendAfterInitAck),
+        meta.kill_query_after_control_ready_count
+            .map(|ready_count| {
+                query_connection_id
+                    .map(|connection_id| PostQueryFault::KillQueryAfterControlReady {
+                        ready_count,
+                        connection_id,
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "kill_query_after_control_ready_count requires the target query connection id"
+                        )
+                    })
+            })
+            .transpose()?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let [fault] = faults.as_slice() else {
+        if faults.is_empty() {
+            return Ok(execute_query());
         }
+        bail!("a SQL step may configure at most one post-query lifecycle fault");
     };
-    let target_index = fault.target_index();
-    let baselines = {
+    let fault = *fault;
+    let baseline = {
         let server = server
             .lock()
             .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
         if !server.supports_fault_injection() {
-            bail!("post-fragment-start faults require a mutable cross-process server handle");
+            bail!("post-query faults require a mutable cross-process server handle");
         }
-        if target_index >= server.be_count() {
-            bail!(
-                "post-fragment-start fault index {target_index} is out of bounds for {} BE(s)",
-                server.be_count()
-            );
+        match fault {
+            PostQueryFault::KillBackend(index) => {
+                if index >= server.be_count() {
+                    bail!(
+                        "post-query fault index {index} is out of bounds for {} BE(s)",
+                        server.be_count()
+                    );
+                }
+                FaultBaseline::ScheduledFragments(vec![(
+                    index,
+                    server.scheduled_fragment_count(index)?,
+                )])
+            }
+            PostQueryFault::ReleaseFragmentFailure(index) => {
+                if index >= server.be_count() {
+                    bail!(
+                        "post-query fault index {index} is out of bounds for {} BE(s)",
+                        server.be_count()
+                    );
+                }
+                FaultBaseline::ScheduledFragments(
+                    (0..server.be_count())
+                        .map(|backend| Ok((backend, server.scheduled_fragment_count(backend)?)))
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+            PostQueryFault::KillFrontendAfterControlReady(_) => FaultBaseline::FrontendReady {
+                ready_count: server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")? as u64,
+                coordinator_lost: (0..server.be_count())
+                    .map(|index| {
+                        server.be_log_count(index, "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST")
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|count| count as u64)
+                    .collect(),
+            },
+            PostQueryFault::KillQueryAfterControlReady { .. } => FaultBaseline::FrontendReady {
+                ready_count: server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")? as u64,
+                coordinator_lost: Vec::new(),
+            },
+            PostQueryFault::RestartBackendAfterInitAck(index) => {
+                if index >= server.be_count() {
+                    bail!(
+                        "post-query fault index {index} is out of bounds for {} BE(s)",
+                        server.be_count()
+                    );
+                }
+                FaultBaseline::BackendInit {
+                    index,
+                    applied_count: server.be_log_count(index, "NOVAROCKS_QUERY_INIT_APPLIED")?,
+                }
+            }
         }
-        let observed_indices = match fault {
-            PostFragmentStartFault::KillBackend(_) => vec![target_index],
-            PostFragmentStartFault::ReleaseFragmentFailure(_) => (0..server.be_count()).collect(),
-        };
-        observed_indices
-            .into_iter()
-            .map(|index| Ok((index, server.scheduled_fragment_count(index)?)))
-            .collect::<Result<Vec<_>>>()?
     };
-    if baselines.is_empty() {
-        return Ok(execute_query());
-    }
     let fault_state = Arc::new(ActiveQueryFaultState::new());
     let worker_server = Arc::clone(server);
     let worker_fault_state = Arc::clone(&fault_state);
     let worker = thread::spawn(move || -> Result<()> {
         let deadline = Instant::now() + POST_FRAGMENT_START_TIMEOUT;
         loop {
-            let all_fresh = {
+            let ready = {
                 let server = worker_server
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-                let mut all_fresh = true;
-                for &(index, baseline) in &baselines {
-                    let current = server.scheduled_fragment_count(index)?;
-                    if current < baseline {
-                        bail!(
-                            "BE[{index}] fragment-start marker count decreased from {baseline} to {current}"
-                        );
+                match &baseline {
+                    FaultBaseline::ScheduledFragments(baselines) => {
+                        let mut all_fresh = true;
+                        for &(index, baseline) in baselines {
+                            let current = server.scheduled_fragment_count(index)?;
+                            if current < baseline {
+                                bail!(
+                                    "BE[{index}] fragment-start marker count decreased from {baseline} to {current}"
+                                );
+                            }
+                            all_fresh &= current > baseline;
+                        }
+                        all_fresh
                     }
-                    all_fresh &= current > baseline;
+                    FaultBaseline::FrontendReady { ready_count, .. } => {
+                        let target = match fault {
+                            PostQueryFault::KillFrontendAfterControlReady(target) => target,
+                            PostQueryFault::KillQueryAfterControlReady { ready_count, .. } => {
+                                ready_count
+                            }
+                            _ => unreachable!(
+                                "frontend baseline pairs with ControlReady-driven fault"
+                            ),
+                        };
+                        server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")?
+                            >= (*ready_count as usize).saturating_add(target)
+                    }
+                    FaultBaseline::BackendInit {
+                        index,
+                        applied_count,
+                    } => {
+                        server.be_log_count(*index, "NOVAROCKS_QUERY_INIT_APPLIED")?
+                            > *applied_count
+                    }
                 }
-                all_fresh
             };
-            if all_fresh {
+            if ready {
                 if !worker_fault_state.claim_fault() {
                     bail!(
-                        "query completed before the post-fragment-start fault could claim fresh ScheduledFragments observations"
+                        "query completed before the post-query fault could claim its marker barrier"
                     );
                 }
                 let mut server = worker_server
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-                fault.apply(server.as_mut())?;
+                match fault {
+                    PostQueryFault::KillBackend(index) => server.kill_be(index)?,
+                    PostQueryFault::ReleaseFragmentFailure(index) => {
+                        server.release_fragment_executor_failure(index)?
+                    }
+                    PostQueryFault::RestartBackendAfterInitAck(index) => {
+                        server.restart_be(index)?
+                    }
+                    PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
+                        server.kill_query(connection_id)?
+                    }
+                    PostQueryFault::KillFrontendAfterControlReady(_) => {
+                        server.kill_fe()?;
+                        let FaultBaseline::FrontendReady {
+                            coordinator_lost, ..
+                        } = &baseline
+                        else {
+                            unreachable!("FE crash fault has frontend baseline");
+                        };
+                        loop {
+                            let all_lost = coordinator_lost
+                                .iter()
+                                .enumerate()
+                                .map(|(index, baseline)| {
+                                    server
+                                        .be_log_count(
+                                            index,
+                                            "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST",
+                                        )
+                                        .map(|count| count > *baseline as usize)
+                                })
+                                .collect::<Result<Vec<_>>>()?
+                                .into_iter()
+                                .all(|lost| lost);
+                            if all_lost {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                let fe = server.fe_log_contents().unwrap_or_default();
+                                let bes = (0..server.be_count())
+                                    .map(|index| server.be_log_contents(index).unwrap_or_default())
+                                    .collect::<Vec<_>>();
+                                bail!(
+                                    "timed out waiting for coordinator-lost marker on every BE after FE crash; fe_tail={:?}; be_tails={:?}",
+                                    log_tail(&fe),
+                                    bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
+                                );
+                            }
+                            sleep(POST_FRAGMENT_START_POLL_INTERVAL);
+                        }
+                        server.clear_query_lifecycle_faults()?;
+                        server.restart_fe()?;
+                    }
+                }
                 return Ok(());
             }
             if worker_fault_state.query_is_done() {
-                bail!("query completed before every required BE ScheduledFragments count advanced");
+                bail!("query completed before the post-query marker barrier was reached");
             }
             if Instant::now() >= deadline {
+                let server = worker_server
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+                let fe = server.fe_log_contents().unwrap_or_default();
+                let bes = (0..server.be_count())
+                    .map(|index| server.be_log_contents(index).unwrap_or_default())
+                    .collect::<Vec<_>>();
                 bail!(
-                    "timed out waiting for every required BE ScheduledFragments count to advance"
+                    "timed out waiting for post-query fault marker; fe_tail={:?}; be_tails={:?}",
+                    log_tail(&fe),
+                    bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
                 );
             }
             sleep(POST_FRAGMENT_START_POLL_INTERVAL);
@@ -296,6 +552,17 @@ where
     }
 }
 
+fn log_tail(log: &str) -> String {
+    log.lines()
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +586,10 @@ mod tests {
             true
         }
 
+        fn be_count(&self) -> usize {
+            3
+        }
+
         fn kill_be(&mut self, index: usize) -> Result<()> {
             self.events.push(format!("kill:{index}"));
             Ok(())
@@ -336,6 +607,31 @@ mod tests {
 
         fn disarm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
             self.events.push(format!("disarm-failure:{index}"));
+            Ok(())
+        }
+
+        fn arm_init_ack_drop(&mut self, index: usize) -> Result<()> {
+            self.events.push(format!("arm-init-ack-drop:{index}"));
+            Ok(())
+        }
+
+        fn arm_query_control_heartbeat_stop(&mut self, index: usize) -> Result<()> {
+            self.events.push(format!("arm-heartbeat-stop:{index}"));
+            Ok(())
+        }
+
+        fn arm_fe_crash_after_control_ready(&mut self, count: usize) -> Result<()> {
+            self.events.push(format!("arm-fe-crash:{count}"));
+            Ok(())
+        }
+
+        fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
+            self.events.push(format!("arm-be-restart:{index}"));
+            Ok(())
+        }
+
+        fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
+            self.events.push(format!("arm-fragment-limit:{limit}"));
             Ok(())
         }
     }
@@ -394,6 +690,207 @@ mod tests {
                 .contains("require a mutable cross-process server handle"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn lifecycle_fault_directives_require_cross_process_mode() {
+        struct UnsupportedServerHandle;
+
+        impl ServerHandle for UnsupportedServerHandle {
+            fn target_host(&self) -> Option<&str> {
+                None
+            }
+
+            fn target_port(&self) -> Option<u16> {
+                None
+            }
+        }
+
+        for meta in [
+            QueryMeta {
+                drop_next_init_ack_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                stop_query_control_heartbeat_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                kill_fe_after_control_ready_count: Some(1),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                restart_be_after_init_ack_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                kill_query_after_control_ready_count: Some(1),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                query_control_fragment_backend_limit: Some(1),
+                ..QueryMeta::default()
+            },
+        ] {
+            let mut server = UnsupportedServerHandle;
+            let error = apply_pre_query(&meta, &mut server)
+                .expect_err("lifecycle faults must reject non-cross-process mode");
+            assert!(
+                error
+                    .to_string()
+                    .contains("require a mutable cross-process server handle"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_fault_directives_reject_mutually_exclusive_faults_before_mutation() {
+        let mut server = RecordingServerHandle::default();
+        let meta = QueryMeta {
+            drop_next_init_ack_be_index: Some(0),
+            stop_query_control_heartbeat_be_index: Some(1),
+            ..QueryMeta::default()
+        };
+
+        let error = apply_pre_query(&meta, &mut server)
+            .expect_err("one step may arm only one lifecycle failure");
+
+        assert!(
+            error
+                .to_string()
+                .contains("at most one query lifecycle fault directive"),
+            "unexpected error: {error}"
+        );
+        assert!(server.events.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_fault_directives_validate_counts_and_backend_indices() {
+        struct ThreeBackendServer;
+
+        impl ServerHandle for ThreeBackendServer {
+            fn target_host(&self) -> Option<&str> {
+                None
+            }
+
+            fn target_port(&self) -> Option<u16> {
+                None
+            }
+
+            fn supports_fault_injection(&self) -> bool {
+                true
+            }
+
+            fn be_count(&self) -> usize {
+                3
+            }
+        }
+
+        for (meta, expected) in [
+            (
+                QueryMeta {
+                    drop_next_init_ack_be_index: Some(3),
+                    ..QueryMeta::default()
+                },
+                "drop_next_init_ack_be_index 3 is out of bounds for 3 BE(s)",
+            ),
+            (
+                QueryMeta {
+                    stop_query_control_heartbeat_be_index: Some(4),
+                    ..QueryMeta::default()
+                },
+                "stop_query_control_heartbeat_be_index 4 is out of bounds for 3 BE(s)",
+            ),
+            (
+                QueryMeta {
+                    restart_be_after_init_ack_index: Some(5),
+                    ..QueryMeta::default()
+                },
+                "restart_be_after_init_ack_index 5 is out of bounds for 3 BE(s)",
+            ),
+            (
+                QueryMeta {
+                    kill_fe_after_control_ready_count: Some(0),
+                    ..QueryMeta::default()
+                },
+                "kill_fe_after_control_ready_count must be between 1 and 3",
+            ),
+            (
+                QueryMeta {
+                    kill_query_after_control_ready_count: Some(4),
+                    ..QueryMeta::default()
+                },
+                "kill_query_after_control_ready_count must be between 1 and 3",
+            ),
+            (
+                QueryMeta {
+                    query_control_fragment_backend_limit: Some(0),
+                    ..QueryMeta::default()
+                },
+                "query_control_fragment_backend_limit must be between 1 and 3",
+            ),
+            (
+                QueryMeta {
+                    query_control_fragment_backend_limit: Some(4),
+                    ..QueryMeta::default()
+                },
+                "query_control_fragment_backend_limit must be between 1 and 3",
+            ),
+        ] {
+            let mut server = ThreeBackendServer;
+            let error = apply_pre_query(&meta, &mut server)
+                .expect_err("invalid lifecycle fault target must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_fault_directives_arm_tokenized_cluster_hooks() {
+        for (meta, expected_event) in [
+            (
+                QueryMeta {
+                    drop_next_init_ack_be_index: Some(1),
+                    ..QueryMeta::default()
+                },
+                "arm-init-ack-drop:1",
+            ),
+            (
+                QueryMeta {
+                    stop_query_control_heartbeat_be_index: Some(2),
+                    ..QueryMeta::default()
+                },
+                "arm-heartbeat-stop:2",
+            ),
+            (
+                QueryMeta {
+                    kill_fe_after_control_ready_count: Some(3),
+                    ..QueryMeta::default()
+                },
+                "arm-fe-crash:3",
+            ),
+            (
+                QueryMeta {
+                    restart_be_after_init_ack_index: Some(0),
+                    ..QueryMeta::default()
+                },
+                "arm-be-restart:0",
+            ),
+            (
+                QueryMeta {
+                    query_control_fragment_backend_limit: Some(2),
+                    ..QueryMeta::default()
+                },
+                "arm-fragment-limit:2",
+            ),
+        ] {
+            let mut server = RecordingServerHandle::default();
+            apply_pre_query(&meta, &mut server).expect("arm lifecycle hook");
+            assert_eq!(server.events, vec![expected_event]);
+        }
     }
 
     #[test]
@@ -589,7 +1086,7 @@ mod tests {
             ..QueryMeta::default()
         };
 
-        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, || {
+        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, || {
             let (lock, wake) = state.as_ref();
             let mut query = lock.lock().expect("active query state");
             query.events.push("query:start");
@@ -683,7 +1180,7 @@ mod tests {
             ..QueryMeta::default()
         };
 
-        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, || {
+        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, || {
             let (lock, wake) = state.as_ref();
             let mut query = lock.lock().expect("all-backend release state");
             query.events.push("query:start");
@@ -724,9 +1221,10 @@ mod tests {
         };
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = execute_with_post_fragment_start_fault(&meta, &server_handle, || -> () {
-                panic!("simulated query panic");
-            });
+            let _ =
+                execute_with_post_fragment_start_fault(&meta, &server_handle, None, || -> () {
+                    panic!("simulated query panic");
+                });
         }));
 
         assert!(panic.is_err());
@@ -740,5 +1238,79 @@ mod tests {
             !state.events.contains(&"kill"),
             "the fault worker must be quiescent before panic resumes"
         );
+    }
+
+    struct KillQueryServerHandle {
+        state: Arc<(Mutex<KillQueryState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct KillQueryState {
+        control_ready_count: usize,
+        killed_connection_id: Option<u32>,
+    }
+
+    impl ServerHandle for KillQueryServerHandle {
+        fn target_host(&self) -> Option<&str> {
+            None
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            None
+        }
+
+        fn supports_fault_injection(&self) -> bool {
+            true
+        }
+
+        fn be_count(&self) -> usize {
+            3
+        }
+
+        fn fe_log_count(&self, needle: &str) -> Result<usize> {
+            assert_eq!(needle, "NOVAROCKS_QUERY_CONTROL_READY");
+            Ok(self
+                .state
+                .0
+                .lock()
+                .expect("kill-query state")
+                .control_ready_count)
+        }
+
+        fn kill_query(&mut self, connection_id: u32) -> Result<()> {
+            let (lock, wake) = self.state.as_ref();
+            let mut state = lock.lock().expect("kill-query state");
+            state.killed_connection_id = Some(connection_id);
+            wake.notify_all();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn kill_query_waits_for_control_ready_and_uses_separate_connection_id() {
+        let state = Arc::new((Mutex::new(KillQueryState::default()), Condvar::new()));
+        let server_handle: Arc<Mutex<Box<dyn ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(KillQueryServerHandle {
+                state: Arc::clone(&state),
+            })));
+        let meta = QueryMeta {
+            kill_query_after_control_ready_count: Some(3),
+            ..QueryMeta::default()
+        };
+
+        let result =
+            execute_with_post_fragment_start_fault(&meta, &server_handle, Some(41), || {
+                let (lock, wake) = state.as_ref();
+                let mut query = lock.lock().expect("kill-query state");
+                query.control_ready_count = 3;
+                wake.notify_all();
+                query = wake
+                    .wait_while(query, |state| state.killed_connection_id.is_none())
+                    .expect("wait for KILL QUERY");
+                query.killed_connection_id
+            })
+            .expect("KILL QUERY orchestration");
+
+        assert_eq!(result, Some(41));
     }
 }

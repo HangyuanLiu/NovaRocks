@@ -27,7 +27,7 @@ use novarocks::runtime::native_query_lifecycle::NativeQueryLifecycleRuntime;
 
 use crate::fragment::control::FragmentControlRegistry;
 
-use super::registry::QueryLifecycleLocalRuntime;
+use super::registry::{QueryLifecycleLocalRuntime, query_lifecycle_test_markers_enabled};
 
 pub(crate) struct NativeQueryLifecycleLocalRuntime {
     runtime: NativeQueryLifecycleRuntime,
@@ -75,10 +75,19 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
             self.runtime
                 .cancel_query(execution_id.query_id(), detail.clone()),
         );
-        self.controls.cancel_many(
-            &fragment_instance_ids.into_iter().collect::<Vec<_>>(),
-            &detail,
-        );
+        let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
+        self.controls.cancel_many(&fragment_instance_ids, &detail);
+        if query_lifecycle_test_markers_enabled() {
+            for finst_id in fragment_instance_ids {
+                eprintln!(
+                    "NOVAROCKS_CANCEL_FINST query_hi={} query_lo={} finst_hi={} finst_lo={}",
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    finst_id.hi,
+                    finst_id.lo
+                );
+            }
+        }
     }
 }
 

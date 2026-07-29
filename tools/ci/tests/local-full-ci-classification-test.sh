@@ -136,6 +136,14 @@ if [ "$(ci_suite_cluster_size optimizer)" != "3" ]; then
   echo "ordinary suites must default to a 3-BE cluster" >&2
   exit 1
 fi
+if [ "$(ci_suite_cluster_mode distributed-resilience)" != "cross-process" ]; then
+  echo "distributed-resilience must run in cross-process mode" >&2
+  exit 1
+fi
+if [ "$(ci_suite_cluster_size distributed-resilience)" != "3" ]; then
+  echo "distributed-resilience must run with 3 BEs" >&2
+  exit 1
+fi
 if ci_native_cross_process_enabled; then
   echo "the duplicate native cross-process matrix must be disabled by default" >&2
   exit 1

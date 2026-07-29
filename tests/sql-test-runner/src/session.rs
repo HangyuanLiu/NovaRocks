@@ -85,6 +85,7 @@ pub fn mysql_row_to_strings(row: MysqlRow) -> Vec<String> {
 
 pub struct MysqlSession {
     pub conn: MysqlConn,
+    base_config: ConnectionConfig,
 }
 
 impl MysqlSession {
@@ -106,6 +107,7 @@ impl MysqlSession {
                     conn.host, conn.port
                 )
             })?,
+            base_config: conn.clone(),
         };
 
         session.apply_base_context(conn)?;
@@ -132,6 +134,16 @@ impl MysqlSession {
                     .with_context(|| format!("failed to USE {}", db))?;
             }
         }
+        Ok(())
+    }
+
+    pub fn connection_id(&self) -> u32 {
+        self.conn.connection_id()
+    }
+
+    pub fn reconnect(&mut self) -> Result<()> {
+        let config = self.base_config.clone();
+        *self = Self::new(&config)?;
         Ok(())
     }
 

@@ -191,7 +191,9 @@ impl FrontendFragmentScheduler {
                 });
         }
 
-        let backend_count = self.backends.entries.len();
+        let live_backend_count = self.backends.entries.len();
+        let backend_count = query_control_fragment_backend_limit(execution_id, live_backend_count)?
+            .unwrap_or(live_backend_count);
         let mut counts = BTreeMap::<FragmentId, usize>::new();
         for &fragment_id in view.topological_order() {
             let fragment = fragments.get(&fragment_id).ok_or_else(|| {
@@ -260,6 +262,78 @@ impl FrontendFragmentScheduler {
         }
         ValidatedFragmentSchedule::validate(view, execution_id, draft)
     }
+}
+
+#[cfg(debug_assertions)]
+fn query_control_fragment_backend_limit(
+    execution_id: QueryExecutionId,
+    live_backend_count: usize,
+) -> Result<Option<usize>, DistributedQueryError> {
+    let Some(root) = novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(None);
+    };
+    let path = root.join("fragment-backend-limit.trigger");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(contract_error(format!(
+                "read runner-owned fragment backend limit trigger {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    std::fs::remove_file(&path).map_err(|error| {
+        contract_error(format!(
+            "consume runner-owned fragment backend limit trigger {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut lines = contents.lines();
+    let token = lines.next().unwrap_or_default().trim();
+    let limit = lines
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| contract_error(format!("invalid fragment backend limit: {error}")))?;
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || lines.any(|line| !line.trim().is_empty())
+    {
+        return Err(contract_error(
+            "runner-owned fragment backend limit trigger has invalid tokenized contents",
+        ));
+    }
+    if !(1..=live_backend_count).contains(&limit) {
+        return Err(contract_error(format!(
+            "runner-owned fragment backend limit {limit} is outside 1..={live_backend_count}"
+        )));
+    }
+    eprintln!(
+        "NOVAROCKS_QUERY_CONTROL_FRAGMENT_LIMIT execution_id={}:{}:{} limit={limit} live_backends={live_backend_count} token={token}",
+        execution_id.query_id().high(),
+        execution_id.query_id().low(),
+        execution_id.attempt_id().get()
+    );
+    Ok(Some(limit))
+}
+
+#[cfg(not(debug_assertions))]
+fn query_control_fragment_backend_limit(
+    _execution_id: QueryExecutionId,
+    _live_backend_count: usize,
+) -> Result<Option<usize>, DistributedQueryError> {
+    Ok(None)
+}
+
+fn contract_error(message: impl Into<String>) -> DistributedQueryError {
+    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
 #[cfg(test)]

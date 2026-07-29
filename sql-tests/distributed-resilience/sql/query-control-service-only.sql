@@ -19,28 +19,31 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.fragment_report_failure (
+CREATE TABLE ${case_db}.service_only (
   id BIGINT,
-  delay_s BIGINT
+  payload BIGINT
 )
 TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (1, 5);
+INSERT INTO ${case_db}.service_only VALUES (1, 10);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (2, 5);
+INSERT INTO ${case_db}.service_only VALUES (2, 20);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (3, 5);
+INSERT INTO ${case_db}.service_only VALUES (3, 30);
 
 -- query 5
--- @fail_fragment_after_start_be_index=1
--- @expect_error=Cancelled
--- @be_log_exact_fragment_cancellation=3
-SELECT COUNT(*)
-FROM ${case_db}.fragment_report_failure
-WHERE sleep(delay_s);
+-- @query_control_fragment_backend_limit=2
+-- @result_contains=60
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_CONTROL_READY,3
+-- @be_log_contains=expected_fragments=0
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED,2
+SELECT SUM(left_side.payload) AS total
+FROM ${case_db}.service_only left_side
+JOIN ${case_db}.service_only right_side
+  ON left_side.id = right_side.id;

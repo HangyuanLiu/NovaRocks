@@ -1016,16 +1016,29 @@ fn execute_target_query_with_fault(
     sql: &str,
     db: Option<&str>,
 ) -> (bool, Option<QueryExecution>, String) {
-    fault_injection::execute_with_post_fragment_start_fault(meta, server_handle, || {
-        session.execute_query(query_timeout, sql, db)
-    })
+    let result = fault_injection::execute_with_post_fragment_start_fault(
+        meta,
+        server_handle,
+        Some(session.connection_id()),
+        || session.execute_query(query_timeout, sql, db),
+    )
     .unwrap_or_else(|error| {
         (
             false,
             None,
             format!("FAIL (runner fault injection): {error:#}"),
         )
-    })
+    });
+    if meta.kill_fe_after_control_ready_count.is_some()
+        && let Err(error) = session.reconnect()
+    {
+        return (
+            false,
+            None,
+            format!("FAIL (runner FE restart reconnect): {error:#}"),
+        );
+    }
+    result
 }
 
 fn finish_expected_error_step(
@@ -1418,6 +1431,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
         let _fragment_failure_guard = fault_injection::fragment_failure_step_guard(
+            &step.meta,
+            Arc::clone(&ctx.server_handle),
+        );
+        let _query_lifecycle_fault_guard = fault_injection::query_lifecycle_fault_step_guard(
             &step.meta,
             Arc::clone(&ctx.server_handle),
         );

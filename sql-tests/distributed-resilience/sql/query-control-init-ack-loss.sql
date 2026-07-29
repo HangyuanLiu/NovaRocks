@@ -19,28 +19,43 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.fragment_report_failure (
+CREATE TABLE ${case_db}.ack_loss (
   id BIGINT,
-  delay_s BIGINT
+  payload BIGINT
 )
 TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (1, 5);
+INSERT INTO ${case_db}.ack_loss VALUES (1, 10);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (2, 5);
+INSERT INTO ${case_db}.ack_loss VALUES (2, 20);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (3, 5);
+INSERT INTO ${case_db}.ack_loss VALUES (3, 30);
 
 -- query 5
--- @fail_fragment_after_start_be_index=1
--- @expect_error=Cancelled
--- @be_log_exact_fragment_cancellation=3
-SELECT COUNT(*)
-FROM ${case_db}.fragment_report_failure
-WHERE sleep(delay_s);
+-- @drop_next_init_ack_be_index=1
+-- @result_contains=1	10
+-- @result_contains=2	20
+-- @result_contains=3	30
+-- @be_log_count_at_least=NOVAROCKS_QUERY_INIT_APPLIED,3
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_INIT_APPLIED,3
+-- @be_log_count_at_least=NOVAROCKS_QUERY_INIT_IDEMPOTENT,1
+SELECT id, payload
+FROM ${case_db}.ack_loss
+ORDER BY id;
+
+-- query 6
+-- @drop_next_init_ack_be_index=2
+-- @result_contains=60
+-- @be_log_count_at_least=NOVAROCKS_QUERY_INIT_APPLIED,3
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_INIT_APPLIED,3
+-- @be_log_count_at_least=NOVAROCKS_QUERY_INIT_IDEMPOTENT,1
+SELECT SUM(left_side.payload) AS total
+FROM ${case_db}.ack_loss left_side
+JOIN ${case_db}.ack_loss right_side
+  ON left_side.id = right_side.id;

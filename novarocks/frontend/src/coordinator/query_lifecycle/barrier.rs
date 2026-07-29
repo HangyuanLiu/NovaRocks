@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -537,7 +538,12 @@ fn attach_one(
         })?;
     let active = ActiveSession::new(participant.target, participant.digest, session);
     match active.recv(config.attach_timeout()) {
-        Ok(QueryControlEvent::ControlReady) => Ok(active),
+        Ok(QueryControlEvent::ControlReady) => {
+            if let Err(error) = record_control_ready_marker(participant) {
+                return Err((Some(active), error));
+            }
+            Ok(active)
+        }
         Ok(event) => Err((
             Some(active),
             format!(
@@ -553,6 +559,88 @@ fn attach_one(
             ),
         )),
     }
+}
+
+#[cfg(debug_assertions)]
+fn record_control_ready_marker(participant: &MaterializedParticipant) -> Result<(), String> {
+    let Some(root) = novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(());
+    };
+    let execution_id = participant.request.manifest().execution_id();
+    let backend_index = participant.target.backend_idx();
+    let trigger_path = root.join("fe-crash-after-control-ready.trigger");
+    let contents = match std::fs::read_to_string(&trigger_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "read runner-owned FE crash trigger {}: {error}",
+                trigger_path.display()
+            ));
+        }
+    };
+    let Some(contents) = contents else {
+        eprintln!(
+            "NOVAROCKS_QUERY_CONTROL_READY execution_id={}:{}:{} backend_index={backend_index} token=none ready_count=0",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get()
+        );
+        return Ok(());
+    };
+    let mut lines = contents.lines();
+    let token = lines.next().unwrap_or_default().trim();
+    let target = lines
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| format!("invalid runner-owned FE crash ready count: {error}"))?;
+    if target == 0
+        || token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || lines.any(|line| !line.trim().is_empty())
+    {
+        return Err("runner-owned FE crash trigger has invalid tokenized contents".to_string());
+    }
+    static COUNTS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+    let observed = {
+        let mut counts = COUNTS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| "lock FE crash ControlReady counter".to_string())?;
+        let count = counts.entry(token.to_string()).or_default();
+        *count = count.saturating_add(1);
+        *count
+    };
+    eprintln!(
+        "NOVAROCKS_QUERY_CONTROL_READY execution_id={}:{}:{} backend_index={backend_index} token={token} ready_count={observed}",
+        execution_id.query_id().high(),
+        execution_id.query_id().low(),
+        execution_id.attempt_id().get()
+    );
+    if observed == target {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while trigger_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        return Err(if trigger_path.exists() {
+            format!("timed out waiting for runner to kill FE after ControlReady count {target}")
+        } else {
+            "runner released FE crash trigger without killing FE".to_string()
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn record_control_ready_marker(_participant: &MaterializedParticipant) -> Result<(), String> {
+    Ok(())
 }
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {

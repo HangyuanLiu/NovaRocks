@@ -579,6 +579,14 @@ impl QueryLifecycleRegistry {
             reason = "none",
             "backend query lifecycle control attached"
         );
+        if query_lifecycle_test_markers_enabled() {
+            eprintln!(
+                "NOVAROCKS_QUERY_CONTROL_READY execution_id={} backend_id={} expected_fragments={}",
+                format_execution_id(attach.execution_id()),
+                self.local_backend_id().unwrap_or_default(),
+                entry.manifest.expected_fragment_instance_ids().len()
+            );
+        }
         self.publish_metrics();
         Ok(QueryControlAttachment {
             control: Arc::new(RegistryQueryControl {
@@ -818,6 +826,14 @@ impl QueryLifecycleRegistry {
         self.publish_metrics();
         self.local_runtime
             .terminate_query(execution_id, &expected_instances, requested_reason);
+        if query_lifecycle_test_markers_enabled() {
+            eprintln!(
+                "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={} backend_id={} reason={requested_reason:?} expected_fragments={}",
+                format_execution_id(execution_id),
+                self.local_backend_id().unwrap_or_default(),
+                expected_instances.len()
+            );
+        }
         if requested_reason == QueryTerminationReason::CoordinatorHeartbeatTimeout {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
             state.heartbeat_timeouts = state.heartbeat_timeouts.saturating_add(1);
@@ -1214,6 +1230,31 @@ impl QueryLifecycleRegistry {
             reason = "none",
             "backend query lifecycle init"
         );
+        if query_lifecycle_test_markers_enabled()
+            && matches!(
+                ack.outcome(),
+                QueryInitOutcome::Applied | QueryInitOutcome::AlreadyApplied
+            )
+        {
+            let expected_fragments = self
+                .state
+                .lock()
+                .expect("query lifecycle registry lock")
+                .entries
+                .get(&ack.execution_id())
+                .map(|entry| entry.manifest.expected_fragment_instance_ids().len())
+                .unwrap_or_default();
+            let marker = if ack.outcome() == QueryInitOutcome::Applied {
+                "NOVAROCKS_QUERY_INIT_APPLIED"
+            } else {
+                "NOVAROCKS_QUERY_INIT_IDEMPOTENT"
+            };
+            eprintln!(
+                "{marker} execution_id={} backend_id={} expected_fragments={expected_fragments}",
+                format_execution_id(ack.execution_id()),
+                self.local_backend_id().unwrap_or_default()
+            );
+        }
     }
 }
 
@@ -1385,6 +1426,13 @@ impl FragmentAdmissionPermit {
         drop(registry_state);
         drop(state);
         self.committed = true;
+        if query_lifecycle_test_markers_enabled() {
+            eprintln!(
+                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={} finst_id={}",
+                format_execution_id(self.execution_id),
+                self.fragment_instance_id
+            );
+        }
         Ok(())
     }
 }
@@ -1428,11 +1476,39 @@ impl BackendQueryControl for RegistryQueryControl {
     }
 
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
+        if query_lifecycle_test_markers_enabled() {
+            eprintln!(
+                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={} reason={reason:?}",
+                format_execution_id(self.execution_id)
+            );
+        }
         self.registry
             .upgrade()
             .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?
             .terminate_from_control(self.execution_id, reason)
     }
+}
+
+fn format_execution_id(execution_id: QueryExecutionId) -> String {
+    format!(
+        "{}:{}:{}",
+        execution_id.query_id().high(),
+        execution_id.query_id().low(),
+        execution_id.attempt_id().get()
+    )
+}
+
+#[cfg(debug_assertions)]
+pub(super) fn query_lifecycle_test_markers_enabled() -> bool {
+    novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+        .is_some()
+}
+
+#[cfg(not(debug_assertions))]
+pub(super) fn query_lifecycle_test_markers_enabled() -> bool {
+    false
 }
 
 impl QueryLifecycleIngress for QueryLifecycleRegistry {

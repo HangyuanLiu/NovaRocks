@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::novarocks_config::config as novarocks_app_config;
+use std::path::PathBuf;
 
 pub(crate) fn debug_exec_node_output() -> bool {
     novarocks_app_config()
@@ -60,6 +61,13 @@ pub(crate) fn debug_emit_grpc_fragment_marker() -> bool {
 
 pub(crate) fn sql_test_fragment_failure_harness_enabled() -> bool {
     std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
+}
+
+pub(crate) fn sql_test_query_lifecycle_fault_dir() -> Option<PathBuf> {
+    novarocks_app_config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+        .map(PathBuf::from)
 }
 
 pub(crate) fn exchange_wait_ms() -> u64 {
