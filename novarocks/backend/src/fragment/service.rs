@@ -980,16 +980,24 @@ mod tests {
         release_tx.send(()).expect("release first worker");
         release_tx.send(()).expect("release retried worker");
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
+        let first_reservation = loop {
             match service.controls.reserve(first) {
+                Ok(reservation) => break reservation,
+                Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+                Err(error) => panic!("first fragment did not terminate: {error}"),
+            }
+        };
+        loop {
+            match service.controls.reserve(second) {
                 Ok(reservation) => {
                     drop(reservation);
                     break;
                 }
                 Err(_) if Instant::now() < deadline => std::thread::yield_now(),
-                Err(error) => panic!("first fragment did not terminate: {error}"),
+                Err(error) => panic!("second fragment did not terminate: {error}"),
             }
         }
+        drop(first_reservation);
         assert!(
             service
                 .queries

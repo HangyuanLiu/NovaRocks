@@ -309,6 +309,15 @@ fn assert_fe_report_only_endpoint_rejects_local_submit(port: u16) {
             novarocks::service::grpc_client::proto::novarocks::SubmitFragmentRequest {
                 plan: None,
                 instance_params: None,
+                execution_id: Some(
+                    novarocks::service::grpc_client::proto::novarocks::QueryExecutionId {
+                        query_id: Some(novarocks::service::grpc_client::proto::common::UniqueId {
+                            hi: 1,
+                            lo: 2,
+                        }),
+                        attempt_id: 1,
+                    },
+                ),
             },
         )
         .expect_err("role=fe report-only endpoint must reject local fragment submission");
@@ -322,6 +331,7 @@ struct ClusterHarness {
     be: ProcessGuard,
     _fe: ProcessGuard,
     fe_mysql: u16,
+    be_grpc: u16,
 }
 
 impl ClusterHarness {
@@ -387,6 +397,7 @@ backends = ["127.0.0.1:{be_grpc_port}"]
             be,
             _fe: fe,
             fe_mysql: fe_mysql_port,
+            be_grpc: be_grpc_port,
         }
     }
 }
@@ -396,6 +407,7 @@ struct MultiBeClusterHarness {
     bes: Vec<ProcessGuard>,
     fe: Option<ProcessGuard>,
     fe_mysql: u16,
+    be_grpc_ports: Vec<u16>,
     #[allow(dead_code)]
     _be_configs: Vec<NamedTempFile>,
     fe_config: NamedTempFile,
@@ -518,6 +530,7 @@ backends = [{backends_list}]
             bes,
             fe: Some(fe),
             fe_mysql: fe_mysql_port,
+            be_grpc_ports,
             _be_configs: be_configs,
             fe_config,
             be_log_dirs,
@@ -617,22 +630,20 @@ deployment_owner = "fe-1"
         self.fe = Some(fe);
     }
 
-    fn wait_for_be_submit_cancel_coverage(
+    fn wait_for_be_submit_termination_coverage(
         &mut self,
         expected_submit_count: usize,
-        expected_cancel_count: usize,
-        cancel_detail: &str,
+        termination_reasons: &[&str],
         timeout: Duration,
     ) {
         let deadline = Instant::now() + timeout;
         let mut stdout = vec![Vec::new(); self.bes.len()];
         let mut submitted = vec![0usize; self.bes.len()];
-        let mut canceled = vec![0usize; self.bes.len()];
         loop {
             for (index, be) in self.bes.iter_mut().enumerate() {
                 if let Some(status) = be.child.try_wait().expect("poll BE child") {
                     panic!(
-                        "BE {index} exited before submit/cancel pairing completed with status {status}; stdout={:?}; stderr={}",
+                        "BE {index} exited before submit/termination pairing completed with status {status}; stdout={:?}; stderr={}",
                         stdout[index],
                         be.read_stderr()
                     );
@@ -641,31 +652,26 @@ deployment_owner = "fe-1"
                     if line.starts_with("NOVAROCKS_GRPC_SUBMIT call=") {
                         submitted[index] += 1;
                     }
-                    if line.contains("NOVAROCKS_CANCEL") && line.contains(cancel_detail) {
-                        let finsts = line
-                            .split_ascii_whitespace()
-                            .find_map(|field| field.strip_prefix("finsts="))
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .unwrap_or_else(|| panic!("cancel marker lacks finsts count: {line}"));
-                        canceled[index] += finsts;
-                    }
                     stdout[index].push(line);
                 }
             }
             let submitted_total = submitted.iter().sum::<usize>();
-            let canceled_total = canceled.iter().sum::<usize>();
-            if submitted_total == expected_submit_count
-                && canceled_total == expected_cancel_count
-                && submitted
-                    .iter()
-                    .zip(&canceled)
-                    .all(|(submitted, canceled)| canceled >= submitted)
-            {
+            let submitted_backends_terminated =
+                submitted.iter().enumerate().all(|(index, submitted)| {
+                    *submitted == 0
+                        || termination_reasons.iter().any(|reason| {
+                            backend_query_lifecycle_termination_count(
+                                self.be_grpc_ports[index],
+                                reason,
+                            ) >= 1
+                        })
+                });
+            if submitted_total == expected_submit_count && submitted_backends_terminated {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "expected {expected_submit_count} submitted instances covered by {expected_cancel_count} canceled instances; submitted={submitted:?} canceled={canceled:?} stdout={stdout:?}"
+                "expected {expected_submit_count} submitted instances covered by lifecycle termination reasons={termination_reasons:?}; submitted={submitted:?} stdout={stdout:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -954,6 +960,47 @@ fn fetch_http_text(port: u16, path: &str) -> String {
         .unwrap_or_else(|err| panic!("GET {url} status failed: {err}"))
         .text()
         .unwrap_or_else(|err| panic!("read {url} text failed: {err}"))
+}
+
+fn backend_query_lifecycle_termination_count(port: u16, reason: &str) -> u64 {
+    let metric = "novarocks_backend_query_lifecycle_terminations";
+    let reason_label = format!("reason=\"{reason}\"");
+    fetch_http_text(port, "/metrics")
+        .lines()
+        .find(|line| line.starts_with(metric) && line.contains(&reason_label))
+        .and_then(|line| line.split_ascii_whitespace().last())
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|value| value as u64)
+        .unwrap_or(0)
+}
+
+fn wait_for_backend_query_lifecycle_termination(port: u16, reason: &str, timeout: Duration) {
+    wait_for_backend_query_lifecycle_termination_any(port, &[reason], timeout);
+}
+
+fn wait_for_backend_query_lifecycle_termination_any(
+    port: u16,
+    reasons: &[&str],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if reasons
+            .iter()
+            .any(|reason| backend_query_lifecycle_termination_count(port, reason) >= 1)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend {port} did not publish query lifecycle termination reasons={reasons:?}; termination_metrics={:?}",
+            fetch_http_text(port, "/metrics")
+                .lines()
+                .filter(|line| line.starts_with("novarocks_backend_query_lifecycle_terminations"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -1249,11 +1296,8 @@ fn submit_half_failure_cancels_attempted_submissions() {
     }
     let _lock = lock_cluster_mvp();
 
-    let mut cluster = ClusterHarness::start(
-        r#"
-[debug]
-emit_cancel_marker = true
-"#,
+    let cluster = ClusterHarness::start(
+        "",
         r#"
 [debug]
 fault_inject_submit_fail_after = 1
@@ -1273,8 +1317,9 @@ fault_inject_submit_fail_after = 1
         err_str.contains("debug submit fault injected"),
         "expected injected submit failure, got: {err_str}"
     );
-    cluster.be.wait_for_output_contains(
-        "NOVAROCKS_CANCEL count=1 finsts=2 reason=coordinator cancel",
+    wait_for_backend_query_lifecycle_termination(
+        cluster.be_grpc,
+        "coordinator_abort",
         Duration::from_secs(3),
     );
 }
@@ -1290,7 +1335,6 @@ fn mysql_disconnect_triggers_cancel() {
     let mut cluster = ClusterHarness::start(
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         "",
@@ -1304,9 +1348,11 @@ emit_grpc_fragment_marker = true
         .shutdown(Shutdown::Both)
         .expect("shutdown raw mysql client");
 
-    cluster
-        .be
-        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(3));
+    wait_for_backend_query_lifecycle_termination(
+        cluster.be_grpc,
+        "coordinator_abort",
+        Duration::from_secs(3),
+    );
 }
 
 #[test]
@@ -1317,13 +1363,7 @@ fn query_timeout_triggers_cancel() {
     }
     let _lock = lock_cluster_mvp();
 
-    let mut cluster = ClusterHarness::start(
-        r#"
-[debug]
-emit_cancel_marker = true
-"#,
-        "",
-    );
+    let cluster = ClusterHarness::start("", "");
 
     let mut conn = connect_mysql(cluster.fe_mysql);
     conn.query_drop("SET query_timeout = 1")
@@ -1337,9 +1377,11 @@ emit_cancel_marker = true
         "expected timeout error, got: {err_str}"
     );
 
-    cluster
-        .be
-        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(5));
+    wait_for_backend_query_lifecycle_termination_any(
+        cluster.be_grpc,
+        &["coordinator_abort", "local_failure"],
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
@@ -1354,7 +1396,6 @@ fn three_be_query_timeout_cancels_remote_fragments() {
         3,
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         "",
@@ -1373,10 +1414,9 @@ emit_grpc_fragment_marker = true
         "expected timeout error, got: {err_str}"
     );
 
-    cluster.wait_for_be_submit_cancel_coverage(
+    cluster.wait_for_be_submit_termination_coverage(
         2,
-        2,
-        "reason=coordinator cancel",
+        &["coordinator_abort", "local_failure"],
         Duration::from_secs(5),
     );
 }
@@ -1402,7 +1442,6 @@ path = "{}"
         3,
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         &metadata_config,
@@ -1464,7 +1503,13 @@ emit_grpc_fragment_marker = true
         .expect("target query must terminate after KILL QUERY")
         .expect_err("target query must not succeed after KILL QUERY");
     assert_mysql_server_error(target_error, 1317);
-    cluster.wait_for_every_be_output_contains("NOVAROCKS_CANCEL", Duration::from_secs(10));
+    for port in &cluster.be_grpc_ports {
+        wait_for_backend_query_lifecycle_termination(
+            *port,
+            "coordinator_abort",
+            Duration::from_secs(10),
+        );
+    }
 
     let idle_error = control
         .query_drop(format!("KILL QUERY {target_connection_id}"))
@@ -1497,7 +1542,6 @@ fn three_be_partial_submit_failure_cancels_attempted_fragments() {
         3,
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         r#"
@@ -1521,10 +1565,9 @@ fault_inject_submit_fail_after = 2
         "expected injected submit failure, got: {err_str}"
     );
 
-    cluster.wait_for_be_submit_cancel_coverage(
+    cluster.wait_for_be_submit_termination_coverage(
         2,
-        3,
-        "reason=coordinator cancel",
+        &["coordinator_abort"],
         Duration::from_secs(5),
     );
 }
