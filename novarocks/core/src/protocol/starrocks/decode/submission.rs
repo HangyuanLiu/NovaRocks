@@ -76,6 +76,10 @@ pub struct StarRocksDecodeInput<'a> {
     pub batch_exchange_sender_counts: &'a HashMap<i32, usize>,
     pub typed_result_sink: bool,
     pub facts: &'a StarRocksDecodeFacts,
+    /// Process-scoped connector host injected by application composition.
+    /// HDFS_SCAN_NODE is only a wire label and must never cause a decoder to
+    /// construct a query-local connector registry.
+    pub connectors: &'a crate::connector::ConnectorRegistry,
 }
 
 #[derive(Debug)]
@@ -583,7 +587,6 @@ fn decode_draft_parts(
         instance.query_options.clone(),
         input.facts,
     );
-    let connectors = crate::connector::ConnectorRegistry::default();
     let last_query_id = input
         .query_globals
         .and_then(|globals| globals.last_query_id.as_deref());
@@ -596,7 +599,7 @@ fn decode_draft_parts(
         input.fragment.query_global_dict_exprs.as_ref(),
         &plan_context,
         input.db_name,
-        &connectors,
+        input.connectors,
         &layout_hints,
         last_query_id,
         Some(dependencies),
@@ -1471,7 +1474,14 @@ mod tests {
             batch_exchange_sender_counts: &EMPTY_BATCH_SENDERS,
             typed_result_sink: false,
             facts: &EMPTY_DECODE_FACTS,
+            connectors: test_connectors(),
         }
+    }
+
+    fn test_connectors() -> &'static crate::connector::ConnectorRegistry {
+        static CONNECTORS: std::sync::OnceLock<crate::connector::ConnectorRegistry> =
+            std::sync::OnceLock::new();
+        CONNECTORS.get_or_init(crate::connector::ConnectorRegistry::default)
     }
 
     #[test]
