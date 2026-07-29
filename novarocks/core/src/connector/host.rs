@@ -19,32 +19,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceId,
+    ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorInstanceInstaller, ConnectorProviderId,
     ConnectorRequestContext,
 };
-
-use crate::connector::file_execution::FileScanRange;
-use crate::exec::chunk::ChunkSchemaRef;
-
-/// Rehydrates a provider-owned reader instance from a native transport carrier.
-///
-/// The host selects this factory by the typed provider ID. The generic native
-/// decoder never interprets `scan_payload`; core file sidecars remain a
-/// separate core-owned input for file-backed providers.
-pub(crate) trait ConnectorTransportFactory: Send + Sync {
-    fn provider_id(&self) -> &ConnectorProviderId;
-
-    fn materialize(
-        &self,
-        instance_id: ConnectorInstanceId,
-        scan_payload: Bytes,
-        file_ranges: &[FileScanRange],
-        output_schema: ChunkSchemaRef,
-    ) -> Result<ConnectorInstance, ConnectorError>;
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectorHostErrorKind {
@@ -88,7 +67,6 @@ impl std::error::Error for ConnectorHostError {}
 pub(crate) struct ConnectorHost {
     instances: BTreeMap<ConnectorInstanceId, HostedConnectorInstance>,
     installers: BTreeMap<ConnectorProviderId, Arc<dyn ConnectorInstanceInstaller>>,
-    transport_factories: BTreeMap<ConnectorProviderId, Arc<dyn ConnectorTransportFactory>>,
 }
 
 #[derive(Clone)]
@@ -294,50 +272,6 @@ impl ConnectorHost {
         }
         entry.state = ConnectorInstanceState::Retiring;
         Ok(Arc::clone(&entry.instance))
-    }
-
-    pub(crate) fn register_transport_factory(
-        &mut self,
-        factory: Arc<dyn ConnectorTransportFactory>,
-    ) -> Result<(), ConnectorHostError> {
-        let provider_id = factory.provider_id().clone();
-        if self.transport_factories.contains_key(&provider_id) {
-            return Err(ConnectorHostError {
-                kind: ConnectorHostErrorKind::DuplicateInstance,
-                message: format!(
-                    "connector transport factory `{}` is already registered",
-                    provider_id.as_str()
-                ),
-            });
-        }
-        self.transport_factories.insert(provider_id, factory);
-        Ok(())
-    }
-
-    pub(crate) fn materialize_transport_instance(
-        &self,
-        provider_id: &ConnectorProviderId,
-        instance_id: ConnectorInstanceId,
-        scan_payload: Bytes,
-        file_ranges: &[FileScanRange],
-        output_schema: ChunkSchemaRef,
-    ) -> Result<ConnectorInstance, ConnectorHostError> {
-        let factory =
-            self.transport_factories
-                .get(provider_id)
-                .ok_or_else(|| ConnectorHostError {
-                    kind: ConnectorHostErrorKind::UnknownInstance,
-                    message: format!(
-                        "unknown connector transport provider `{}`",
-                        provider_id.as_str()
-                    ),
-                })?;
-        factory
-            .materialize(instance_id, scan_payload, file_ranges, output_schema)
-            .map_err(|error| ConnectorHostError {
-                kind: ConnectorHostErrorKind::UnknownInstance,
-                message: error.to_string(),
-            })
     }
 }
 

@@ -21,7 +21,10 @@ pub(crate) fn read_parquet_batches(
 ) -> Result<Vec<FileBatch>, String> {
     context.check_active().map_err(|error| error.to_string())?;
     let provisional = access
-        .bind_location(path, FileIdentity::new(path, file_size.unwrap_or_default(), None))
+        .bind_location(
+            path,
+            FileIdentity::new(path, file_size.unwrap_or_default(), None),
+        )
         .map_err(|error| error.to_string())?;
     let resolved_size = match file_size {
         Some(size) if size > 0 => size,
@@ -70,11 +73,16 @@ pub(crate) fn read_bytes(
 ) -> Result<Bytes, String> {
     context.check_active().map_err(|error| error.to_string())?;
     let file = access
-        .bind_location(path, FileIdentity::new(path, file_size.unwrap_or_default(), None))
+        .bind_location(
+            path,
+            FileIdentity::new(path, file_size.unwrap_or_default(), None),
+        )
         .map_err(|error| error.to_string())?;
     let cancellation = context.cancellation.clone();
     context
         .runtime
-        .block_on_bytes(Box::pin(async move { file.read(range, &cancellation).await }))
+        .block_on_bytes(Box::pin(
+            async move { file.read(range, &cancellation).await },
+        ))
         .map_err(|error| error.to_string())
 }

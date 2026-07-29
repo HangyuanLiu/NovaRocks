@@ -32,8 +32,8 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileBatchReader, FileCancellation, FileError, FileErrorKind, FileFormat, FileIdentity,
-    FileMetricsSnapshot, FileProjection, FileReadBudget, FileReadRange, FileReadRequest,
-    FileReadContext, FsAccessHandle, PhysicalPruning, open_file_reader,
+    FileMetricsSnapshot, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
+    FileReadRequest, FsAccessHandle, PhysicalPruning, open_file_reader,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
@@ -81,15 +81,12 @@ impl IcebergBatchReader {
         // every provider-owned I/O path, not only the data-file decoder.
         let cancellation = file_context.cancellation.clone();
         let delete_specs = delete_specs(file)?;
-        let position_deletes = load_position_deletes_with_context(
-            &delete_specs,
-            &file.path,
-            &access,
-            &file_context,
-        )
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
-        let equality_deletes = load_equality_delete_sets_with_context(&delete_specs, &access, &file_context)
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+        let position_deletes =
+            load_position_deletes_with_context(&delete_specs, &file.path, &access, &file_context)
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+        let equality_deletes =
+            load_equality_delete_sets_with_context(&delete_specs, &access, &file_context)
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
         let included_positions = included_positions(file)?;
         let bound_file = access
             .bind_location(&file.path, FileIdentity::new(&file.path, file_size, None))
@@ -161,8 +158,8 @@ impl ConnectorBatchReader for IcebergBatchReader {
                         data_sequence_number: self.data_sequence_number,
                     },
                 )
-                    .map(Some)
-                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
+                .map(Some)
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
             }
             None => {
                 self.close()?;
@@ -353,7 +350,12 @@ fn apply_delete_filters(
         .as_any()
         .downcast_ref::<UInt64Array>()
         .cloned()
-        .ok_or_else(|| ConnectorError::new(ConnectorErrorKind::Internal, "filtered Iceberg positions changed type"))?;
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "filtered Iceberg positions changed type",
+            )
+        })?;
     Ok((batch, Some(positions)))
 }
 
@@ -513,13 +515,15 @@ fn iceberg_virtual_column(
     let positions = positions.ok_or_else(|| {
         format!(
             "Iceberg virtual column {} requires physical row coordinates for {}",
-            target.name(), facts.path
+            target.name(),
+            facts.path
         )
     })?;
     if positions.len() != row_count {
         return Err(format!(
             "Iceberg virtual column {} position count {} differs from row count {row_count}",
-            target.name(), positions.len()
+            target.name(),
+            positions.len()
         ));
     }
     let raw: ArrayRef = match name.as_str() {
@@ -529,7 +533,9 @@ fn iceberg_virtual_column(
                 .iter()
                 .map(|value| {
                     value
-                        .map(|value| i64::try_from(value).map_err(|_| "Iceberg row position exceeds Int64"))
+                        .map(|value| {
+                            i64::try_from(value).map_err(|_| "Iceberg row position exceeds Int64")
+                        })
                         .transpose()
                 })
                 .collect::<Result<Vec<Option<i64>>, _>>()?,
@@ -541,26 +547,48 @@ fn iceberg_virtual_column(
                     .map(|value| {
                         value
                             .ok_or("Iceberg physical row position is null")
-                            .and_then(|value| i64::try_from(value).map_err(|_| "Iceberg row position exceeds Int64"))
-                            .and_then(|value| first.checked_add(value).ok_or("Iceberg row id overflows Int64"))
+                            .and_then(|value| {
+                                i64::try_from(value)
+                                    .map_err(|_| "Iceberg row position exceeds Int64")
+                            })
+                            .and_then(|value| {
+                                first
+                                    .checked_add(value)
+                                    .ok_or("Iceberg row id overflows Int64")
+                            })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             None if target.is_nullable() => new_null_array(target.data_type(), row_count),
-            None => return Err(format!("Iceberg data file {} is missing first_row_id for _row_id", facts.path)),
+            None => {
+                return Err(format!(
+                    "Iceberg data file {} is missing first_row_id for _row_id",
+                    facts.path
+                ));
+            }
         },
         "_last_updated_sequence_number" => match facts.data_sequence_number {
             Some(sequence) => Arc::new(Int64Array::from(vec![sequence; row_count])),
             None if target.is_nullable() => new_null_array(target.data_type(), row_count),
-            None => return Err(format!("Iceberg data file {} is missing data_sequence_number", facts.path)),
+            None => {
+                return Err(format!(
+                    "Iceberg data file {} is missing data_sequence_number",
+                    facts.path
+                ));
+            }
         },
         _ => unreachable!("virtual column was validated by caller"),
     };
     if raw.data_type() == target.data_type() {
         Ok(raw)
     } else {
-        cast(raw.as_ref(), target.data_type())
-            .map_err(|error| format!("Iceberg virtual column {} cannot cast to {:?}: {error}", target.name(), target.data_type()))
+        cast(raw.as_ref(), target.data_type()).map_err(|error| {
+            format!(
+                "Iceberg virtual column {} cannot cast to {:?}: {error}",
+                target.name(),
+                target.data_type()
+            )
+        })
     }
 }
 
@@ -691,19 +719,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            aligned.column(1).as_any().downcast_ref::<StringArray>().unwrap().value(0),
+            aligned
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
             "s3://warehouse/data.parquet"
         );
         assert_eq!(
-            aligned.column(2).as_any().downcast_ref::<Int64Array>().unwrap().values(),
+            aligned
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
             &[5, 7]
         );
         assert_eq!(
-            aligned.column(3).as_any().downcast_ref::<Int64Array>().unwrap().values(),
+            aligned
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
             &[105, 107]
         );
         assert_eq!(
-            aligned.column(4).as_any().downcast_ref::<Int64Array>().unwrap().values(),
+            aligned
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
             &[19, 19]
         );
     }

@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
+use novarocks_fs::{FsAccessHandle, FsAccessResolver};
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
     ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
@@ -37,7 +38,6 @@ use novarocks_spi::connector::{
     ConnectorTableRequest, ConnectorTableResolution,
 };
 use serde::{Deserialize, Serialize};
-use novarocks_fs::{FsAccessHandle, FsAccessResolver};
 
 use super::catalog::IcebergCatalogEntry;
 use super::catalog::registry::{
@@ -132,7 +132,9 @@ impl IcebergReadBinding {
     fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
         self.access_resolver
             .resolve_location(location, self.object_store_config.as_ref())
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string()))
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
     }
 
     fn file_read_context(
@@ -339,13 +341,8 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
             request.context.deadline(),
         )?;
         let access = self.binding.resolve_access(&payload.data_file.path)?;
-        IcebergBatchReader::try_new(
-            &payload.data_file,
-            access,
-            request,
-            file_context,
-        )
-        .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
+        IcebergBatchReader::try_new(&payload.data_file, access, request, file_context)
+            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
     }
 }
 
@@ -1750,8 +1747,8 @@ mod tests {
         .expect("encode compat split");
         assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].owner().as_str(), COMPAT_ICEBERG_INSTANCE_ID);
-        let payload: SplitPayload = decode_payload(splits[0].payload(), "compat split")
-            .expect("decode provider split");
+        let payload: SplitPayload =
+            decode_payload(splits[0].payload(), "compat split").expect("decode provider split");
         assert_eq!(payload.incarnation, COMPAT_ICEBERG_INCARNATION);
         assert_eq!(payload.data_file.path, "file:///tmp/compat.parquet");
     }

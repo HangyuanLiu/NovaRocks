@@ -42,7 +42,6 @@ use crate::connector::ConnectorRegistry;
 use crate::connector::file_execution::{
     FileScanContext, FileScanRange, bind_foundation_file, foundation_read_context,
 };
-use crate::connector::host::ConnectorTransportFactory;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
 use crate::connector::iceberg::position_delete::load_position_deletes;
@@ -69,96 +68,10 @@ use novarocks_fs::{
     FileTask, PhysicalPruning, open_file_reader,
 };
 
-const HDFS_SPI_PROVIDER_ID: &str = "hdfs";
-
-/// BE-local native transport factory for file-backed connector reads. The
-/// provider reads object-store access from startup config; transport payloads
-/// are limited to provider-owned scan state and core file sidecars.
-pub(crate) struct HdfsNativeTransportFactory {
-    provider_id: ConnectorProviderId,
-}
-
-impl HdfsNativeTransportFactory {
-    pub(crate) fn new() -> Self {
-        Self {
-            provider_id: ConnectorProviderId::parse(HDFS_SPI_PROVIDER_ID)
-                .expect("static HDFS provider ID is valid"),
-        }
-    }
-}
-
-impl ConnectorTransportFactory for HdfsNativeTransportFactory {
-    fn provider_id(&self) -> &ConnectorProviderId {
-        &self.provider_id
-    }
-
-    fn materialize(
-        &self,
-        instance_id: ConnectorInstanceId,
-        scan_payload: bytes::Bytes,
-        file_ranges: &[FileScanRange],
-        output_schema: crate::exec::chunk::ChunkSchemaRef,
-    ) -> Result<ConnectorInstance, ConnectorError> {
-        if !scan_payload.is_empty() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "HDFS native transport scan payload must be empty",
-            ));
-        }
-        let cache_options = CacheOptions::from_query_options(None).map_err(|error| {
-            ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
-        })?;
-        let object_store_config = crate::common::app_config::config()
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error.to_string()))?
-            .connector
-            .object_store_config()
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
-        let parquet = ParquetScanConfig {
-            columns: output_schema
-                .slots()
-                .iter()
-                .map(|slot| slot.name().to_string())
-                .collect(),
-            chunk_schema: output_schema.clone(),
-            slot_kinds: output_schema
-                .slots()
-                .iter()
-                .map(|_| ParquetSlotKind::Regular)
-                .collect(),
-            case_sensitive: true,
-            enable_page_index: false,
-            min_max_predicates: Vec::new(),
-            runtime_min_max_filter_columns: HashMap::new(),
-            variant_path_predicates: Vec::new(),
-            batch_size: None,
-            datacache: DataCacheContext::external(cache_options.to_file_cache_options()),
-            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
-            profile_label: Some("native_connector_hdfs".to_string()),
-            iceberg_output_schema: Some(output_schema.arrow_schema_ref()),
-            variant_path_columns: Vec::new(),
-            query_global_dicts: Default::default(),
-        };
-        Arc::new(HdfsConnectorInstance::new(
-            instance_id,
-            HdfsInstanceConfig {
-                scan: HdfsScanConfig {
-                    original_range_count: file_ranges.len(),
-                    ranges: file_ranges.to_vec(),
-                    has_more: false,
-                    limit: None,
-                    profile_label: Some("native_connector_hdfs".to_string()),
-                    format: Some(FileFormatConfig::Parquet(parquet)),
-                    object_store_config,
-                    iceberg_table_locations: HashMap::new(),
-                    query_global_dicts: Default::default(),
-                    iceberg_runtime_pruning: None,
-                },
-                chunk_schema: output_schema,
-            },
-        ))
-        .connector_instance()
-    }
-}
+// Transitional implementation detail for the remaining core-private raw file
+// adapter. It is not registered in the process host and cannot be carried by
+// native execution.
+const LEGACY_FILE_READER_PROVIDER_ID: &str = "file-reader-legacy";
 
 #[derive(Clone)]
 pub(crate) struct HdfsInstanceConfig {
@@ -207,7 +120,7 @@ impl HdfsConnectorInstance {
     pub(crate) fn connector_instance(self: Arc<Self>) -> Result<ConnectorInstance, ConnectorError> {
         ConnectorInstance::try_new(
             ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse(HDFS_SPI_PROVIDER_ID)?,
+                provider_id: ConnectorProviderId::parse(LEGACY_FILE_READER_PROVIDER_ID)?,
                 instance_id: self.instance_id.clone(),
             },
             None,

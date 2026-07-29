@@ -32,8 +32,8 @@ use crate::connector::file_execution::read_foundation_parquet_batches;
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
-use novarocks_fs::{FileProjection, FsAccessHandle};
 use novarocks_fs::FileReadContext;
+use novarocks_fs::{FileProjection, FsAccessHandle};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EqualityValue {
@@ -130,24 +130,46 @@ pub(crate) fn load_equality_delete_sets_with_context(
         if spec.file_content != IcebergFileContent::EqualityDeletes {
             continue;
         }
-        if spec.file_format != IcebergFileFormat::Parquet || spec.content_offset.is_some() || spec.content_size_in_bytes.is_some() {
-            return Err(format!("iceberg equality-delete file {} has unsupported physical layout", spec.path));
+        if spec.file_format != IcebergFileFormat::Parquet
+            || spec.content_offset.is_some()
+            || spec.content_size_in_bytes.is_some()
+        {
+            return Err(format!(
+                "iceberg equality-delete file {} has unsupported physical layout",
+                spec.path
+            ));
         }
         let batches = crate::connector::iceberg::file_reader::read_parquet_batches(
-            access, &spec.path, spec.length, FileProjection::All, context.clone(),
+            access,
+            &spec.path,
+            spec.length,
+            FileProjection::All,
+            context.clone(),
         )?;
         let Some(schema) = batches.first().map(|batch| batch.batch.schema()) else {
             continue;
         };
         if schema.fields().is_empty() {
-            return Err(format!("iceberg equality-delete file {} has no equality columns", spec.path));
+            return Err(format!(
+                "iceberg equality-delete file {} has no equality columns",
+                spec.path
+            ));
         }
-        let columns = schema.fields().iter().map(|field| equality_column_ref(field.as_ref())).collect::<Result<Vec<_>, _>>()?;
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| equality_column_ref(field.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut keys = HashSet::new();
         for file_batch in batches {
             let batch = file_batch.batch;
             if batch.num_columns() != columns.len() {
-                return Err(format!("equality-delete batch from {} has {} columns, expected {}", spec.path, batch.num_columns(), columns.len()));
+                return Err(format!(
+                    "equality-delete batch from {} has {} columns, expected {}",
+                    spec.path,
+                    batch.num_columns(),
+                    columns.len()
+                ));
             }
             for row in 0..batch.num_rows() {
                 keys.insert(equality_key_for_row(&batch, row, &columns)?);
