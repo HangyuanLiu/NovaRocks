@@ -335,9 +335,135 @@ pub struct StandaloneStarRocksTableInfo {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum StatementResult {
+pub enum StatementResult {
     Query(QueryResult),
     Ok,
+}
+
+/// An opaque, one-shot result of core query compilation.
+///
+/// The frontend owns submission to `QueryExecutionService`, while the core
+/// keeps the native request construction and result formatting capabilities.
+/// This prevents a second router from reconstructing query artifacts or
+/// interpreting coordinator-specific state.
+pub enum PreparedQueryOperation {
+    Immediate(PreparedImmediateQuery),
+    Distributed(PreparedDistributedQuery),
+}
+
+pub struct PreparedImmediateQuery {
+    result: StatementResult,
+}
+
+impl PreparedImmediateQuery {
+    pub fn into_result(self) -> StatementResult {
+        self.result
+    }
+}
+
+pub struct PreparedDistributedQuery {
+    request: crate::query_execution::contract::DistributedQueryRequest,
+    completion: PreparedQueryCompletion,
+}
+
+impl PreparedDistributedQuery {
+    pub fn into_parts(
+        self,
+    ) -> (
+        crate::query_execution::contract::DistributedQueryRequest,
+        PreparedQueryCompletion,
+    ) {
+        (self.request, self.completion)
+    }
+}
+
+/// Core-owned completion formatter paired with a distributed request.
+///
+/// It is deliberately not constructible outside core: frontend can submit the
+/// request exactly once, but cannot substitute a formatter for a different
+/// distributed-query intent.
+pub struct PreparedQueryCompletion {
+    formatter: PreparedQueryFormatter,
+}
+
+enum PreparedQueryFormatter {
+    Result,
+    Profile(PreparedProfileFormatter),
+}
+
+struct PreparedProfileFormatter {
+    distributed_plan: crate::sql::planner::distributed::DistributedPlan,
+    planning_elapsed: std::time::Duration,
+    execution_started_at: std::time::Instant,
+}
+
+impl PreparedQueryCompletion {
+    pub fn complete(
+        self,
+        outcome: crate::query_execution::contract::DistributedQueryOutcome,
+    ) -> Result<StatementResult, String> {
+        match self.formatter {
+            PreparedQueryFormatter::Result => outcome
+                .into_result()
+                .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+                .map(StatementResult::Query)
+                .map_err(|error| error.to_string()),
+            PreparedQueryFormatter::Profile(formatter) => {
+                let outcome = outcome
+                    .into_profile()
+                    .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
+                    .map_err(|error| error.to_string())?;
+                let (query_result, fragment_profiles) = outcome;
+                let fragment_profiles = fragment_profiles.into_profiles();
+                if fragment_profiles.is_empty() {
+                    return Err(
+                        "EXPLAIN ANALYZE completed without fragment runtime profiles".into(),
+                    );
+                }
+                let actuals = crate::query_execution::profile::collect_actuals_by_plan_node_id_from_profile_trees(
+                    &fragment_profiles,
+                );
+                let profile_summary = crate::query_execution::profile::collect_distributed_profile_summary_from_profile_trees(
+                    &fragment_profiles,
+                );
+                let per_fragment =
+                    crate::query_execution::profile::collect_per_fragment_profile_summaries(
+                        &fragment_profiles,
+                    );
+                let mut lines = Vec::new();
+                lines.push(format!(
+                    "Planning: {} / Execution: {} / Rows: {}",
+                    format_explain_analyze_duration(formatter.planning_elapsed),
+                    format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
+                    query_result.row_count()
+                ));
+                lines.push(format_distributed_profile_summary(&profile_summary));
+                if let Some(apply) = crate::query_execution::profile::collect_native_runtime_filter_apply_from_profile_trees(
+                    &fragment_profiles,
+                ) {
+                    lines.push(apply.to_string());
+                }
+                if let Some(counters) =
+                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
+                        &fragment_profiles,
+                        ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
+                        "ProfileCounters",
+                    )
+                {
+                    lines.push(counters);
+                }
+                lines.extend(
+                    crate::sql::explain::distributed::explain_distributed_plan_analyze(
+                        &formatter.distributed_plan,
+                        crate::sql::explain::ExplainLevel::Analyze,
+                        &actuals,
+                        Some(&per_fragment),
+                    ),
+                );
+                build_string_query_result("Explain String", lines).map(StatementResult::Query)
+            }
+        }
+    }
 }
 
 pub(crate) struct StandaloneState {
@@ -533,6 +659,46 @@ pub struct StandaloneNovaRocks {
 #[derive(Clone)]
 pub struct StandaloneSession {
     inner: Arc<StandaloneState>,
+}
+
+/// Narrow core compiler kernel consumed by frontend QueryService.
+///
+/// It deliberately exposes neither `StandaloneState` nor connector internals.
+/// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
+#[derive(Clone)]
+pub struct StandaloneQueryCompiler {
+    session: StandaloneSession,
+}
+
+impl StandaloneQueryCompiler {
+    pub fn prepare(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<PreparedQueryOperation, String> {
+        self.session
+            .prepare_query_with_context(sql, context, query_opts)
+    }
+}
+
+/// Core command kernel for statement families whose application owner has not
+/// moved in this cutover (notably DML and MV maintenance).
+#[derive(Clone)]
+pub struct StandaloneCommandExecutor {
+    session: StandaloneSession,
+}
+
+impl StandaloneCommandExecutor {
+    pub fn execute(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        self.session
+            .execute_command_with_context(sql, context, query_opts)
+    }
 }
 
 /// Explicit application services required to open the core SQL engine.
@@ -839,6 +1005,18 @@ impl StandaloneNovaRocks {
         }
     }
 
+    pub fn query_compiler(&self) -> StandaloneQueryCompiler {
+        StandaloneQueryCompiler {
+            session: self.session(),
+        }
+    }
+
+    pub fn command_executor(&self) -> StandaloneCommandExecutor {
+        StandaloneCommandExecutor {
+            session: self.session(),
+        }
+    }
+
     pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {
         self.inner.coordinator_report_endpoint.set_bound_port(port);
     }
@@ -988,16 +1166,307 @@ impl StandaloneSession {
         self.execute_in_context(sql, None, current_database, None)
     }
 
-    /// Executes a statement using the immutable context created at server
-    /// admission. Production callers must use this entrypoint so planning and
-    /// coordinator submission share one topology, deadline and cancellation.
-    pub(crate) fn execute_with_context(
+    /// Legacy test seam retained only while core parser fixtures migrate to
+    /// frontend QuerySession fixtures. Production callers use the compiler or
+    /// command kernels above.
+    #[cfg(test)]
+    pub fn execute_with_context(
         &self,
         sql: &str,
         context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
         self.execute_in_context_inner(sql, context, query_opts)
+    }
+
+    fn execute_command_with_context(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        if Self::is_query_sql(sql) {
+            return Err("query statements must be compiled through StandaloneQueryCompiler".into());
+        }
+        self.execute_in_context_inner(sql, context, query_opts)
+    }
+
+    fn prepare_query_with_context(
+        &self,
+        sql: &str,
+        request_context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<PreparedQueryOperation, String> {
+        if !Self::is_query_sql(sql) {
+            return Err(
+                "non-query statements must be executed through StandaloneCommandExecutor".into(),
+            );
+        }
+        use crate::sql::parser::dialect::StarRocksDialect;
+        use sqlparser::ast as sqlast;
+
+        let current_catalog = request_context.session().current_catalog();
+        let current_database = request_context.session().current_database();
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let (parse_sql, forced_explain_level, force_logical_explain) =
+            if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
+                (rewritten, Some(level), true)
+            } else if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
+                (rewritten, Some(level), false)
+            } else {
+                (normalized.clone(), None, false)
+            };
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&parse_sql)
+            .map_err(|error| format_parser_error(&error.to_string()))?;
+        match stmt {
+            sqlast::Statement::Explain {
+                statement,
+                verbose,
+                analyze: false,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN only supports SELECT queries".to_string());
+                };
+                let prepared =
+                    prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
+                let level = forced_explain_level.unwrap_or(if verbose {
+                    crate::sql::explain::ExplainLevel::Verbose
+                } else {
+                    crate::sql::explain::ExplainLevel::Normal
+                });
+                let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+                let catalog_snapshot = catalog_service_snapshot
+                    .local()
+                    .read()
+                    .expect("catalog service snapshot local read lock");
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
+                let analyzer_provider = build_catalog_service_provider(
+                    current_catalog,
+                    &catalog_service_snapshot,
+                    &connectors_snapshot,
+                    TableLookupMode::ExplainStats,
+                );
+                let result = if force_logical_explain {
+                    explain_logical_query(&prepared, &analyzer_provider, current_database, level)?
+                } else {
+                    explain_query(
+                        &prepared,
+                        &analyzer_provider,
+                        &catalog_snapshot,
+                        &connectors_snapshot,
+                        current_database,
+                        level,
+                        Some(&self.inner),
+                        &optimizer_settings_for_execution(Some(request_context.execution())),
+                    )?
+                };
+                Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                    result: StatementResult::Query(result),
+                }))
+            }
+            sqlast::Statement::Explain {
+                statement,
+                analyze: true,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
+                };
+                self.prepare_explain_analyze_query(
+                    query,
+                    current_catalog,
+                    current_database,
+                    query_opts,
+                    request_context.execution(),
+                )
+            }
+            sqlast::Statement::Query(ref query) => {
+                if let Some(result) = self.inner.statistics_service.try_query(
+                    &normalized,
+                    query,
+                    statistics::StatisticsRequestContext {
+                        current_catalog,
+                        current_database,
+                    },
+                )? {
+                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                        result: StatementResult::Query(result),
+                    }));
+                }
+                if let Some(result) =
+                    self::information_schema::try_query_materialized_views(&self.inner, query)?
+                {
+                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                        result,
+                    }));
+                }
+                let mut prepared = query.as_ref().clone();
+                self.inner.view_service.rewrite_query(
+                    self.inner.as_ref(),
+                    &mut prepared,
+                    crate::engine::view::ViewRequestContext {
+                        current_catalog,
+                        current_database,
+                    },
+                )?;
+                self::virtual_table::rewrite_query(&self.inner, &mut prepared)?;
+                if has_time_travel_refs(&prepared) {
+                    rewrite_time_travel_refs(
+                        &self.inner,
+                        current_catalog,
+                        current_database,
+                        &mut prepared,
+                    )?;
+                }
+                let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+                let catalog_snapshot = catalog_service_snapshot
+                    .local()
+                    .read()
+                    .expect("catalog service snapshot local read lock");
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
+                let analyzer_provider = build_catalog_service_provider(
+                    current_catalog,
+                    &catalog_service_snapshot,
+                    &connectors_snapshot,
+                    TableLookupMode::SchemaOnly,
+                );
+                self.inner
+                    .statistics_service
+                    .observe_query(&prepared, current_database)?;
+                let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
+                    &prepared,
+                    &analyzer_provider,
+                    &catalog_snapshot,
+                    &connectors_snapshot,
+                    current_database,
+                    self.inner.exchange_port,
+                    query_opts,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&self.inner),
+                    false,
+                    Some(request_context.execution()),
+                )?;
+                Ok(PreparedQueryOperation::Distributed(
+                    PreparedDistributedQuery {
+                        request,
+                        completion: PreparedQueryCompletion {
+                            formatter: PreparedQueryFormatter::Result,
+                        },
+                    },
+                ))
+            }
+            _ => Err("query compiler only supports SELECT and EXPLAIN statements".to_string()),
+        }
+    }
+
+    fn prepare_explain_analyze_query(
+        &self,
+        query: &sqlparser::ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_opts: Option<QueryOptions>,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedQueryOperation, String> {
+        let query = prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
+        let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+        let catalog_snapshot = catalog_service_snapshot
+            .local()
+            .read()
+            .expect("catalog service snapshot local read lock");
+        let connectors_snapshot = self
+            .inner
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let analyzer_provider = build_catalog_service_provider(
+            current_catalog,
+            &catalog_service_snapshot,
+            &connectors_snapshot,
+            TableLookupMode::ExplainStats,
+        );
+        let planning_start = std::time::Instant::now();
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &analyzer_provider, current_database)?;
+        let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let mut optimizer_expr =
+            crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+                &logical_plan,
+                &mut scalar_arena,
+            )?;
+        let mut query_stats = query_stats::QueryStatsCollector::new(
+            query_stats::QueryStatsProviders::from_standalone_state(&self.inner),
+        )
+        .collect(&mut optimizer_expr);
+        let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+        let mv_candidates = crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            &self.inner,
+            &analyzer_provider,
+            current_database,
+            &logical_plan,
+            &mut factory,
+            &mut query_stats,
+            &optimizer_settings,
+        );
+        let optimized_tree = crate::sql::optimizer::optimize(
+            optimizer_expr,
+            scalar_arena,
+            &query_stats.snapshot,
+            factory,
+            mv_candidates,
+            &optimizer_settings,
+        )?;
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+            physical_plan,
+            &optimizer_settings,
+        )?;
+        let prepared = crate::query_execution::preparation::prepare_fragments(
+            &distributed_plan,
+            &connectors_snapshot,
+            None,
+        )?;
+        let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+            &distributed_plan,
+            &prepared,
+        )?;
+        let request =
+            crate::query_execution::contract::build_distributed_query_request_with_execution(
+                prepared,
+                native_bundle,
+                Some(query_options_for_explain_analyze(query_opts)),
+                crate::query_execution::contract::DistributedQueryIntent::Profile,
+                execution,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(PreparedQueryOperation::Distributed(
+            PreparedDistributedQuery {
+                request,
+                completion: PreparedQueryCompletion {
+                    formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
+                        distributed_plan,
+                        planning_elapsed: planning_start.elapsed(),
+                        execution_started_at: std::time::Instant::now(),
+                    }),
+                },
+            },
+        ))
     }
 
     #[cfg(test)]
@@ -1491,6 +1960,17 @@ impl StandaloneSession {
                 sql.chars().take(50).collect::<String>()
             )),
         }
+    }
+
+    fn is_query_sql(sql: &str) -> bool {
+        matches!(
+            sql.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "select" | "with" | "explain"
+        )
     }
 
     /// Handle ALTER TABLE ... ADD FILES FROM '...'
@@ -3555,6 +4035,46 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     run_imv_rewrite: bool,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<QueryResult, String> {
+    let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        analyzer_catalog,
+        _codegen_catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        terminal_sink,
+        iceberg_catalogs,
+        mv_refresh_ctx,
+        imv_rewrite_validator,
+        mv_rewrite_state,
+        run_imv_rewrite,
+        execution,
+    )?;
+    query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    _codegen_catalog: &PlannerMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<QueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
+    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    run_imv_rewrite: bool,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
     let optimizer_settings = optimizer_settings_for_execution(execution);
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3655,13 +4175,14 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             &maintenance_execution
         }
     };
-    execute_distributed_result_with_execution(
-        query_execution,
+    crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_opts,
+        crate::query_execution::contract::DistributedQueryIntent::Result,
         execution,
     )
+    .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4931,6 +5452,45 @@ mod tests {
             .query("SELECT 1")
             .expect("injected coordinator serves the planned query");
 
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn compiler_prepares_once_and_frontend_can_submit_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(StandaloneState {
+            exchange_port: 1,
+            query_execution: QueryExecutionService::new(Arc::new(
+                RecordingQueryExecutionCoordinator {
+                    calls: Arc::clone(&calls),
+                },
+            )),
+            ..Default::default()
+        });
+        register_connector_backends(&state);
+        let engine = StandaloneNovaRocks {
+            inner: Arc::clone(&state),
+        };
+        let context = super::test_request_context(None, super::DEFAULT_DATABASE);
+        let operation = engine
+            .query_compiler()
+            .prepare("SELECT 1", &context, None)
+            .expect("compiler prepares distributed query");
+
+        let super::PreparedQueryOperation::Distributed(operation) = operation else {
+            panic!("SELECT must produce one distributed operation");
+        };
+        let (request, completion) = operation.into_parts();
+        let outcome = state
+            .query_execution
+            .execute(request)
+            .expect("frontend submission succeeds");
+        assert!(matches!(
+            completion
+                .complete(outcome)
+                .expect("completion formats result"),
+            StatementResult::Query(_)
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

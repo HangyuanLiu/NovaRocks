@@ -35,6 +35,7 @@ pub mod request_context;
 mod runtime_filter;
 pub(crate) mod schedule;
 pub mod service;
+pub mod session;
 pub mod write;
 
 #[cfg(test)]

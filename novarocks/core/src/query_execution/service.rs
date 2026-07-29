@@ -34,7 +34,8 @@ impl QueryExecutionService {
         Self { coordinator }
     }
 
-    pub(crate) fn execute(
+    /// Submit a fully prepared request to the frontend-owned coordinator.
+    pub fn execute(
         &self,
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {

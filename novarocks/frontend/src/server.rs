@@ -141,12 +141,25 @@ where
         |state_store| async move { FrontendApplicationHost::open(state_store, execution).await },
         move |host| standalone_open_services(system_catalog, host, &topology_config),
         move |config, services, shutdown| async move {
-            novarocks::server::run_standalone_server_with_config_until_shutdown(
+            let query_control = services.query_control.clone();
+            let query_execution = services.query_execution.clone();
+            let topology = services.backend_topology.clone();
+            let role = services.execution_role;
+            novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
                 config.config,
                 config.config_path,
                 config.port_override,
                 config.grpc_endpoint.core_ownership(),
                 services,
+                move |engine| {
+                    Ok(Arc::new(crate::query::FrontendQueryService::new(
+                        engine,
+                        query_control,
+                        query_execution,
+                        role,
+                        topology,
+                    )))
+                },
                 shutdown,
             )
             .await
@@ -177,12 +190,25 @@ where
         |state_store| async move { FrontendApplicationHost::open(state_store, execution).await },
         move |host| standalone_open_services(system_catalog, host, &topology_config),
         move |config, services, shutdown| async move {
-            novarocks::server::run_standalone_server_with_config_until_shutdown(
+            let query_control = services.query_control.clone();
+            let query_execution = services.query_execution.clone();
+            let topology = services.backend_topology.clone();
+            let role = services.execution_role;
+            novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
                 config.config,
                 config.config_path,
                 config.port_override,
                 config.grpc_endpoint.core_ownership(),
                 services,
+                move |engine| {
+                    Ok(Arc::new(crate::query::FrontendQueryService::new(
+                        engine,
+                        query_control,
+                        query_execution,
+                        role,
+                        topology,
+                    )))
+                },
                 shutdown,
             )
             .await

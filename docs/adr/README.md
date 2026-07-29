@@ -89,6 +89,7 @@ code-anchors:
 - ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（active）
 - ADR-0010 — 显式 query cancellation surface 为何以 MySQL KILL QUERY 和 frontend session owner 实现（active）
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
+- ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 
 ### table-maintenance
 

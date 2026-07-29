@@ -34,6 +34,7 @@ pub(crate) mod planner;
 pub(crate) use parser::ast::{
     ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
+pub use parser::dialect::substitute_user_variables;
 
 #[cfg(test)]
 mod common_tests {

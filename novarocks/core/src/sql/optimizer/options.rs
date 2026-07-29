@@ -24,7 +24,7 @@ use crate::sql::optimizer::cascades_rules::multi_join_reorder::ReorderOptions;
 use crate::sql::optimizer::cost::CostOptions;
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SessionOptimizerSettings {
+pub struct SessionOptimizerSettings {
     pub enable_ukfk_opt: bool,
     pub enable_query_rewrite_table_prune: bool,
     pub enable_cbo_table_prune: bool,
@@ -81,6 +81,22 @@ pub(crate) struct SessionOptimizerSettings {
 }
 
 impl SessionOptimizerSettings {
+    pub fn set_disabled_rules(&mut self, rules: Vec<String>) {
+        self.disabled_rules = rules;
+    }
+
+    pub fn set_enable_eliminate_agg(&mut self, enabled: bool) {
+        self.enable_eliminate_agg = enabled;
+    }
+
+    pub fn set_enable_ukfk_opt(&mut self, enabled: bool) {
+        self.enable_ukfk_opt = enabled;
+    }
+
+    pub fn set_broadcast_backend_count(&mut self, count: f64) {
+        self.cbo_broadcast_backend_count = Some(count);
+    }
+
     pub(crate) fn global_runtime_filter_enabled(&self) -> bool {
         self.enable_global_runtime_filter.unwrap_or(true)
     }
