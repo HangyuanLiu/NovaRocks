@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::UInt64Array;
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
@@ -37,11 +39,109 @@ use crate::{
 };
 
 pub(crate) struct ParquetPhysicalReader {
-    reader: Option<ParquetRecordBatchReader>,
+    reader: Option<ParquetRangeReader>,
     positions: VecDeque<PositionSpan>,
     context: crate::FileReadContext,
     metrics: Arc<ReaderMetrics>,
     closed: bool,
+}
+
+enum ParquetRangeReader {
+    Eager(ParquetRecordBatchReader),
+    Delayed(DelayedMaterializeReader),
+}
+
+impl ParquetRangeReader {
+    fn next_batch(&mut self) -> FileResult<Option<RecordBatch>> {
+        match self {
+            Self::Eager(reader) => reader
+                .next()
+                .transpose()
+                .map_err(|error| format_error("decode Parquet batch", error)),
+            Self::Delayed(reader) => reader.next_batch(),
+        }
+    }
+}
+
+struct DelayedMaterializeReader {
+    active_reader: ParquetRecordBatchReader,
+    lazy_reader: ParquetRecordBatchReader,
+    output_sources: Vec<DelayedColumnSource>,
+}
+
+#[derive(Clone, Copy)]
+enum DelayedColumnSource {
+    Active(usize),
+    Lazy(usize),
+}
+
+impl DelayedMaterializeReader {
+    fn next_batch(&mut self) -> FileResult<Option<RecordBatch>> {
+        let active = self
+            .active_reader
+            .next()
+            .transpose()
+            .map_err(|error| format_error("decode active Parquet columns", error))?;
+        let lazy = self
+            .lazy_reader
+            .next()
+            .transpose()
+            .map_err(|error| format_error("decode lazy Parquet columns", error))?;
+        match (active, lazy) {
+            (None, None) => Ok(None),
+            (Some(active), Some(lazy)) => {
+                if active.num_rows() != lazy.num_rows() {
+                    return Err(FileError::new(
+                        FileErrorKind::Corrupt,
+                        format!(
+                            "delayed materialization batch row mismatch: active_rows={} lazy_rows={}",
+                            active.num_rows(),
+                            lazy.num_rows()
+                        ),
+                    ));
+                }
+                let active_schema = active.schema();
+                let lazy_schema = lazy.schema();
+                let mut fields = Vec::with_capacity(self.output_sources.len());
+                let mut columns = Vec::with_capacity(self.output_sources.len());
+                for source in &self.output_sources {
+                    match source {
+                        DelayedColumnSource::Active(index) => {
+                            fields.push(active_schema.field(*index).as_ref().clone());
+                            columns.push(active.column(*index).clone());
+                        }
+                        DelayedColumnSource::Lazy(index) => {
+                            fields.push(lazy_schema.field(*index).as_ref().clone());
+                            columns.push(lazy.column(*index).clone());
+                        }
+                    }
+                }
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                    .map(Some)
+                    .map_err(|error| {
+                        FileError::with_source(
+                            FileErrorKind::Corrupt,
+                            "assemble delayed Parquet batch failed",
+                            error,
+                        )
+                    })
+            }
+            (Some(_), None) => Err(FileError::new(
+                FileErrorKind::Corrupt,
+                "delayed materialization stream mismatch: active has rows but lazy reached EOF",
+            )),
+            (None, Some(_)) => Err(FileError::new(
+                FileErrorKind::Corrupt,
+                "delayed materialization stream mismatch: lazy has rows but active reached EOF",
+            )),
+        }
+    }
+}
+
+struct DelayedProjectionPlan {
+    active_roots: Vec<usize>,
+    lazy_roots: Vec<usize>,
+    output_sources: Vec<DelayedColumnSource>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,23 +172,23 @@ impl ParquetPhysicalReader {
             PageIndexPolicy::Optional
         };
         let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
-        let mut builder = if let Some(metadata) =
+        let arrow_metadata = if let Some(metadata) =
             crate::cache::parquet_cache::metadata_get(cache_enabled, &identity)
         {
-            ParquetRecordBatchReaderBuilder::new_with_metadata(chunk_reader, metadata)
+            metadata
         } else {
             let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
                 .map_err(|error| parquet_error("open Parquet metadata", error))?;
             crate::cache::parquet_cache::metadata_put(cache_enabled, &identity, metadata.clone());
-            ParquetRecordBatchReaderBuilder::new_with_metadata(chunk_reader, metadata)
+            metadata
         };
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            chunk_reader.clone(),
+            arrow_metadata.clone(),
+        );
         request.context.check_active()?;
 
-        let projection = projection_mask(&builder, &request.projection)?;
-        builder = builder
-            .with_projection(projection)
-            .with_batch_size(request.budget.max_rows.get());
-
+        let projected_roots = projection_roots(&builder, &request.projection)?;
         let metadata = builder.metadata().clone();
         let row_groups = select_row_groups(
             metadata.as_ref(),
@@ -96,15 +196,55 @@ impl ParquetPhysicalReader {
             request.pruning.row_groups.as_deref(),
             &request.predicates,
         );
+        metrics.record_row_group_selection(metadata.num_row_groups(), row_groups.len());
         let (selection, positions) =
             page_selection(metadata.as_ref(), &row_groups, &request.pruning.pages)?;
-        builder = builder.with_row_groups(row_groups);
-        if let Some(selection) = selection {
-            builder = builder.with_row_selection(selection);
-        }
-        let reader = builder
-            .build()
-            .map_err(|error| parquet_error("build Parquet reader", error))?;
+        let selected_rows = positions.iter().map(|span| span.remaining).sum::<usize>();
+        let row_group_rows = selected_row_count(metadata.as_ref(), &row_groups)?;
+        let delayed = selection.as_ref().and_then(|_| {
+            (selected_rows > 0 && selected_rows < row_group_rows)
+                .then(|| {
+                    delayed_projection_plan(
+                        builder.schema().clone(),
+                        &projected_roots,
+                        &request.predicates,
+                    )
+                })
+                .flatten()
+        });
+        let reader = if let Some(plan) = delayed {
+            let active_reader = build_projected_reader(
+                chunk_reader.clone(),
+                arrow_metadata.clone(),
+                &plan.active_roots,
+                request.budget.max_rows.get(),
+                &row_groups,
+                selection.clone(),
+            )?;
+            let lazy_reader = build_projected_reader(
+                chunk_reader,
+                arrow_metadata,
+                &plan.lazy_roots,
+                request.budget.max_rows.get(),
+                &row_groups,
+                selection,
+            )?;
+            metrics.record_delayed_materialization();
+            ParquetRangeReader::Delayed(DelayedMaterializeReader {
+                active_reader,
+                lazy_reader,
+                output_sources: plan.output_sources,
+            })
+        } else {
+            ParquetRangeReader::Eager(build_projected_reader(
+                chunk_reader,
+                arrow_metadata,
+                &projected_roots,
+                request.budget.max_rows.get(),
+                &row_groups,
+                selection,
+            )?)
+        };
 
         Ok(Self {
             reader: Some(reader),
@@ -146,9 +286,8 @@ impl FileBatchReader for ParquetPhysicalReader {
         let next = self
             .reader
             .as_mut()
-            .and_then(Iterator::next)
-            .transpose()
-            .map_err(|error| format_error("decode Parquet batch", error))?;
+            .expect("Parquet reader must exist before close")
+            .next_batch()?;
         self.context.check_active()?;
         let Some(batch) = next else {
             self.close()?;
@@ -185,14 +324,14 @@ impl Drop for ParquetPhysicalReader {
     }
 }
 
-fn projection_mask(
+fn projection_roots(
     builder: &ParquetRecordBatchReaderBuilder<BoundChunkReader>,
     projection: &FileProjection,
-) -> FileResult<ProjectionMask> {
+) -> FileResult<Vec<usize>> {
     let parquet_schema = builder.parquet_schema();
     let arrow_schema = builder.schema();
-    let roots = match projection {
-        FileProjection::All => return Ok(ProjectionMask::all()),
+    let mut roots = match projection {
+        FileProjection::All => (0..arrow_schema.fields().len()).collect(),
         FileProjection::RootNames(names) => {
             let by_name = arrow_schema
                 .fields()
@@ -242,7 +381,117 @@ fn projection_mask(
             roots
         }
     };
-    Ok(ProjectionMask::roots(parquet_schema, roots))
+    roots.sort_unstable();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn build_projected_reader(
+    chunk_reader: BoundChunkReader,
+    metadata: ArrowReaderMetadata,
+    projected_roots: &[usize],
+    batch_size: usize,
+    row_groups: &[usize],
+    selection: Option<RowSelection>,
+) -> FileResult<ParquetRecordBatchReader> {
+    let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunk_reader, metadata);
+    let projection =
+        ProjectionMask::roots(builder.parquet_schema(), projected_roots.iter().copied());
+    builder = builder
+        .with_projection(projection)
+        .with_batch_size(batch_size)
+        .with_row_groups(row_groups.to_vec());
+    if let Some(selection) = selection {
+        builder = builder.with_row_selection(selection);
+    }
+    builder
+        .build()
+        .map_err(|error| parquet_error("build Parquet reader", error))
+}
+
+fn selected_row_count(metadata: &ParquetMetaData, selected: &[usize]) -> FileResult<usize> {
+    selected.iter().try_fold(0usize, |total, index| {
+        let row_group = metadata.row_groups().get(*index).ok_or_else(|| {
+            FileError::invalid(format!(
+                "Parquet row-group selection is out of bounds: {index}"
+            ))
+        })?;
+        let rows = usize::try_from(row_group.num_rows()).map_err(|_| {
+            FileError::new(
+                FileErrorKind::Corrupt,
+                "negative or overflowing Parquet row-group row count",
+            )
+        })?;
+        total
+            .checked_add(rows)
+            .ok_or_else(|| FileError::new(FileErrorKind::Corrupt, "Parquet row count overflow"))
+    })
+}
+
+fn delayed_projection_plan(
+    schema: SchemaRef,
+    projected_roots: &[usize],
+    predicates: &[ScanPredicate],
+) -> Option<DelayedProjectionPlan> {
+    if projected_roots.len() < 2 || predicates.is_empty() {
+        return None;
+    }
+    let predicate_roots = predicates
+        .iter()
+        .filter_map(|predicate| {
+            let root_name = predicate.column().split('.').next()?;
+            schema.index_of(root_name).ok()
+        })
+        .collect::<HashSet<_>>();
+    if predicate_roots.is_empty() {
+        return None;
+    }
+
+    let active_roots = projected_roots
+        .iter()
+        .copied()
+        .filter(|index| predicate_roots.contains(index))
+        .collect::<Vec<_>>();
+    let lazy_roots = projected_roots
+        .iter()
+        .copied()
+        .filter(|index| !predicate_roots.contains(index))
+        .collect::<Vec<_>>();
+    if active_roots.is_empty() || lazy_roots.is_empty() {
+        return None;
+    }
+
+    let active_indices = active_roots
+        .iter()
+        .enumerate()
+        .map(|(output_index, root)| (*root, output_index))
+        .collect::<HashMap<_, _>>();
+    let lazy_indices = lazy_roots
+        .iter()
+        .enumerate()
+        .map(|(output_index, root)| (*root, output_index))
+        .collect::<HashMap<_, _>>();
+    let output_sources = projected_roots
+        .iter()
+        .map(|root| {
+            active_indices
+                .get(root)
+                .copied()
+                .map(DelayedColumnSource::Active)
+                .or_else(|| {
+                    lazy_indices
+                        .get(root)
+                        .copied()
+                        .map(DelayedColumnSource::Lazy)
+                })
+                .expect("projected root must belong to active or lazy projection")
+        })
+        .collect();
+    Some(DelayedProjectionPlan {
+        active_roots,
+        lazy_roots,
+        output_sources,
+    })
 }
 
 fn select_row_groups(

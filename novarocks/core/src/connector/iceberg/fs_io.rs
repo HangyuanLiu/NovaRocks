@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_file_reader_reads_range() {
+    async fn iceberg_input_range_read_succeeds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("data.bin");
         std::fs::write(&file_path, b"0123456789").expect("write data");
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_file_reader_rejects_invalid_range() {
+    async fn iceberg_input_file_rejects_invalid_range() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("data.bin");
         std::fs::write(&file_path, b"0123456789").expect("write data");

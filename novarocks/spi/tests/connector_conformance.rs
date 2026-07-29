@@ -29,9 +29,9 @@ use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError,
     ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
-    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorScan,
-    ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorReaderMetricsSnapshot,
+    ConnectorScan, ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
 };
 
 struct OwnerRead {
@@ -279,5 +279,32 @@ fn batch_reader_conformance_rejects_a_batch_after_eos() {
             .expect_err("a provider must not resume after reporting EOS")
             .kind(),
         ConnectorErrorKind::CorruptData
+    );
+}
+
+#[test]
+fn reader_metrics_snapshot_add_and_delta_are_saturating() {
+    let first = ConnectorReaderMetricsSnapshot {
+        bytes_read: 10,
+        rows_decoded: 2,
+        ..ConnectorReaderMetricsSnapshot::default()
+    };
+    let second = ConnectorReaderMetricsSnapshot {
+        bytes_read: 7,
+        rows_decoded: 3,
+        ..ConnectorReaderMetricsSnapshot::default()
+    };
+    let total = first.saturating_add(second);
+    assert_eq!(total.bytes_read, 17);
+    assert_eq!(total.rows_decoded, 5);
+    assert_eq!(
+        total
+            .saturating_delta_since(ConnectorReaderMetricsSnapshot {
+                bytes_read: 20,
+                rows_decoded: 1,
+                ..ConnectorReaderMetricsSnapshot::default()
+            })
+            .bytes_read,
+        0
     );
 }

@@ -129,6 +129,9 @@ pub struct FileMetricsSnapshot {
     pub cache_misses: u64,
     pub io_time_ns: u64,
     pub decode_time_ns: u64,
+    pub row_groups_read: u64,
+    pub row_groups_pruned: u64,
+    pub delayed_materialization_ranges: u64,
 }
 
 pub trait FileBatchReader: Send {

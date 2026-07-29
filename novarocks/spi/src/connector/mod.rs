@@ -41,6 +41,6 @@ pub use metadata::{
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
-    ConnectorOpenReaderRequest, ConnectorRead, ConnectorReadSelector, ConnectorScan,
-    ConnectorSplitPlanningRequest,
+    ConnectorOpenReaderRequest, ConnectorRead, ConnectorReadSelector,
+    ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorSplitPlanningRequest,
 };

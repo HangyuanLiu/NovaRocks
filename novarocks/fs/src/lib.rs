@@ -57,4 +57,4 @@ pub use runtime::{
     FileU64Future, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 
-// Design: ADR-0011 (docs/adr/ADR-0011-connector-neutral-file-foundation.md)
+// Design: ADR-0012 (docs/adr/ADR-0012-connector-neutral-file-foundation.md)

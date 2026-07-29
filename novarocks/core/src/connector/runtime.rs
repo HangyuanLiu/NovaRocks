@@ -23,7 +23,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorInstance, ConnectorOpenReaderRequest, ConnectorSplit,
+    ConnectorBatchReader, ConnectorInstance, ConnectorOpenReaderRequest,
+    ConnectorReaderMetricsSnapshot, ConnectorSplit,
 };
 
 use crate::common::ids::SlotId;
@@ -36,12 +37,14 @@ use crate::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
     ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanSource,
 };
-use crate::runtime::profile::RuntimeProfile;
+use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
 
 pub(crate) struct ConnectorBatchReaderIter {
     reader: Option<Box<dyn ConnectorBatchReader>>,
     chunk_schema: ChunkSchemaRef,
+    profile: Option<RuntimeProfile>,
+    last_metrics: ConnectorReaderMetricsSnapshot,
     finished: bool,
 }
 
@@ -203,16 +206,94 @@ impl ConnectorBatchReaderIter {
         Self {
             reader: Some(reader),
             chunk_schema,
+            profile: None,
+            last_metrics: ConnectorReaderMetricsSnapshot::default(),
             finished: false,
         }
     }
 
+    pub(crate) fn with_profile(
+        reader: Box<dyn ConnectorBatchReader>,
+        chunk_schema: ChunkSchemaRef,
+        profile: Option<RuntimeProfile>,
+    ) -> Self {
+        let mut iter = Self::new(reader, chunk_schema);
+        iter.profile = profile;
+        iter
+    }
+
+    fn flush_metrics_snapshot(&mut self, snapshot: ConnectorReaderMetricsSnapshot) {
+        let delta = snapshot.saturating_delta_since(self.last_metrics);
+        self.last_metrics = snapshot;
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        for (name, unit, value) in [
+            (
+                "ConnectorFileBytesRead",
+                ProfileUnit::Bytes,
+                delta.bytes_read,
+            ),
+            (
+                "ConnectorFileReadRequests",
+                ProfileUnit::Unit,
+                delta.read_requests,
+            ),
+            (
+                "ConnectorFileRowsDecoded",
+                ProfileUnit::Unit,
+                delta.rows_decoded,
+            ),
+            (
+                "ConnectorFileBatchesDelivered",
+                ProfileUnit::Unit,
+                delta.batches_delivered,
+            ),
+            (
+                "ConnectorFileCacheHits",
+                ProfileUnit::Unit,
+                delta.cache_hits,
+            ),
+            (
+                "ConnectorFileCacheMisses",
+                ProfileUnit::Unit,
+                delta.cache_misses,
+            ),
+            ("ConnectorFileIoTime", ProfileUnit::TimeNs, delta.io_time_ns),
+            (
+                "ConnectorFileDecodeTime",
+                ProfileUnit::TimeNs,
+                delta.decode_time_ns,
+            ),
+            (
+                "ConnectorFileRowGroupsRead",
+                ProfileUnit::Unit,
+                delta.row_groups_read,
+            ),
+            (
+                "ConnectorFileRowGroupsPruned",
+                ProfileUnit::Unit,
+                delta.row_groups_pruned,
+            ),
+            (
+                "ConnectorFileDelayedMaterializationRanges",
+                ProfileUnit::Unit,
+                delta.delayed_materialization_ranges,
+            ),
+        ] {
+            if value > 0 {
+                profile.counter_add(name, unit, value.min(i64::MAX as u64) as i64);
+            }
+        }
+    }
+
     fn close(&mut self) -> Result<(), String> {
-        self.reader
-            .take()
-            .map(|mut reader| reader.close().map_err(|error| error.to_string()))
-            .transpose()
-            .map(|_| ())
+        let Some(mut reader) = self.reader.take() else {
+            return Ok(());
+        };
+        let result = reader.close().map_err(|error| error.to_string());
+        self.flush_metrics_snapshot(reader.metrics_snapshot());
+        result
     }
 
     fn finish_with_primary_error(&mut self, primary: String) -> ExecResult {
@@ -236,6 +317,12 @@ impl Iterator for ConnectorBatchReaderIter {
             .as_mut()
             .expect("connector reader must exist before end of stream")
             .next_batch();
+        let metrics = self
+            .reader
+            .as_ref()
+            .expect("connector reader must exist before end of stream")
+            .metrics_snapshot();
+        self.flush_metrics_snapshot(metrics);
         match next_batch {
             Ok(Some(batch)) => Some(
                 Chunk::try_new_with_chunk_schema(batch, self.chunk_schema.clone())
@@ -482,7 +569,7 @@ impl ScanOp for ConnectorReadScanOp {
     fn execute_iter(
         &self,
         morsel: ScanMorsel,
-        _profile: Option<RuntimeProfile>,
+        profile: Option<RuntimeProfile>,
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<crate::exec::node::BoxedExecIter, String> {
         let index = match morsel {
@@ -506,9 +593,10 @@ impl ScanOp for ConnectorReadScanOp {
             .read()
             .open_reader(&split, self.request.clone())
             .map_err(|error| error.to_string())?;
-        Ok(Box::new(ConnectorBatchReaderIter::new(
+        Ok(Box::new(ConnectorBatchReaderIter::with_profile(
             reader,
             Arc::clone(&self.chunk_schema),
+            profile,
         )))
     }
 

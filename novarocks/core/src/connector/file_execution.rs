@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn build_local_scan_context_preserves_iceberg_file_pruning_metadata() {
+    fn file_read_sidecar_remains_in_core_scan_envelope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("a.parquet");
         std::fs::write(&file, b"data").expect("write fixture");

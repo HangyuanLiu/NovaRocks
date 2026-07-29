@@ -30,9 +30,9 @@ use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCancellation,
     ConnectorError, ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorReaderMetricsSnapshot, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use crate::cache::CacheOptions;
@@ -164,6 +164,16 @@ impl ConnectorTransportFactory for HdfsNativeTransportFactory {
 pub(crate) struct HdfsInstanceConfig {
     pub(crate) scan: HdfsScanConfig,
     pub(crate) chunk_schema: crate::exec::chunk::ChunkSchemaRef,
+}
+
+impl HdfsInstanceConfig {
+    fn reader_chunk_schema(&self) -> crate::exec::chunk::ChunkSchemaRef {
+        match self.scan.format.as_ref() {
+            Some(FileFormatConfig::Parquet(config)) => Arc::clone(&config.chunk_schema),
+            Some(FileFormatConfig::Orc(config)) => Arc::clone(&config.chunk_schema),
+            None => Arc::clone(&self.chunk_schema),
+        }
+    }
 }
 
 pub(crate) struct HdfsConnectorInstance {
@@ -532,8 +542,11 @@ pub(crate) fn plan_hdfs_read_source(
             ))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    let expected_schema = provider.config.chunk_schema.arrow_schema_ref();
-    let chunk_schema = Arc::clone(&provider.config.chunk_schema);
+    // File readers return only their physical/core-adapted read schema. Iceberg virtual and
+    // row-lineage columns belong to the core scan runner and are appended after this SPI
+    // boundary, so validating against the final scan output schema would reject valid batches.
+    let chunk_schema = provider.config.reader_chunk_schema();
+    let expected_schema = chunk_schema.arrow_schema_ref();
     let has_more = provider.config.scan.has_more;
     let incremental = has_more.then(|| {
         Arc::new(HdfsIncrementalSplitAdapter {
@@ -673,7 +686,7 @@ impl ConnectorRead for HdfsConnectorInstance {
         }
         Ok(ConnectorScan {
             handle: ConnectorScanHandle::try_new(self.instance_id.clone(), bytes::Bytes::new())?,
-            output_schema: self.config.chunk_schema.arrow_schema_ref(),
+            output_schema: self.config.reader_chunk_schema().arrow_schema_ref(),
         })
     }
 
@@ -700,7 +713,12 @@ impl ConnectorRead for HdfsConnectorInstance {
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
         self.validate_context(&request.context)?;
-        if request.expected_schema.as_ref() != self.config.chunk_schema.arrow_schema_ref().as_ref()
+        if request.expected_schema.as_ref()
+            != self
+                .config
+                .reader_chunk_schema()
+                .arrow_schema_ref()
+                .as_ref()
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -894,6 +912,7 @@ pub(crate) struct HdfsFileBatchReader {
     cancellation_watch: Option<FileTask>,
     max_rows: usize,
     max_bytes: usize,
+    completed_metrics: ConnectorReaderMetricsSnapshot,
     closed: bool,
 }
 
@@ -939,6 +958,14 @@ impl FoundationCurrentReader {
             }
         }
     }
+
+    fn metrics_snapshot(&self) -> ConnectorReaderMetricsSnapshot {
+        match self {
+            Self::Parquet { reader, .. } | Self::Orc { reader, .. } => {
+                connector_file_metrics(reader.metrics_snapshot())
+            }
+        }
+    }
 }
 
 impl HdfsFileBatchReader {
@@ -978,6 +1005,7 @@ impl HdfsFileBatchReader {
             cancellation_watch: Some(cancellation_watch),
             max_rows,
             max_bytes,
+            completed_metrics: ConnectorReaderMetricsSnapshot::default(),
             closed: false,
         })
     }
@@ -1016,20 +1044,7 @@ impl HdfsFileBatchReader {
                 "file reader is missing its physical format",
             )
         })?;
-        let budget = FileReadBudget {
-            max_rows: NonZeroUsize::new(self.max_rows).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "file reader row budget must be positive",
-                )
-            })?,
-            max_bytes: NonZeroUsize::new(self.max_bytes).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "file reader byte budget must be positive",
-                )
-            })?,
-        };
+        let budget = foundation_file_budget(self.max_rows, self.max_bytes)?;
         match format {
             FileFormatConfig::Parquet(mut cfg) => {
                 cfg.datacache = cfg
@@ -1038,6 +1053,10 @@ impl HdfsFileBatchReader {
                     .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
                 cfg.query_global_dicts = self.cfg.query_global_dicts.clone();
                 apply_parquet_pruning_gate_for_delete_files(&mut cfg, &range.delete_files);
+                // SPI-3R1 snapshots only provider-owned static predicates here. Core runtime
+                // filters remain correctness-preserving residuals until a provider-neutral
+                // Connector pushdown capability is designed; passing RuntimeFilterContext or a
+                // core callback into novarocks-fs would invert the dependency boundary.
                 let predicates = foundation_scan_predicates(&cfg, None)
                     .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
                 let adapter = FoundationParquetAdapter::try_new(cfg.clone())
@@ -1103,6 +1122,9 @@ impl ConnectorBatchReader for HdfsFileBatchReader {
                         return Ok(Some(batch));
                     }
                     None => {
+                        self.completed_metrics = self
+                            .completed_metrics
+                            .saturating_add(current.metrics_snapshot());
                         current.close()?;
                         self.current = None;
                     }
@@ -1118,16 +1140,26 @@ impl ConnectorBatchReader for HdfsFileBatchReader {
 
     fn close(&mut self) -> Result<(), ConnectorError> {
         self.file_context.cancellation.cancel();
-        if let Some(current) = self.current.as_mut() {
+        if let Some(mut current) = self.current.take() {
+            self.completed_metrics = self
+                .completed_metrics
+                .saturating_add(current.metrics_snapshot());
             current.close()?;
         }
-        self.current = None;
         self.ranges.clear();
         if let Some(mut watch) = self.cancellation_watch.take() {
             watch.abort();
         }
         self.closed = true;
         Ok(())
+    }
+
+    fn metrics_snapshot(&self) -> ConnectorReaderMetricsSnapshot {
+        self.current
+            .as_ref()
+            .map(FoundationCurrentReader::metrics_snapshot)
+            .map(|current| self.completed_metrics.saturating_add(current))
+            .unwrap_or(self.completed_metrics)
     }
 }
 
@@ -1158,62 +1190,74 @@ fn map_file_error(error: FileError) -> ConnectorError {
     }
 }
 
+fn foundation_file_budget(
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<FileReadBudget, ConnectorError> {
+    Ok(FileReadBudget {
+        max_rows: NonZeroUsize::new(max_rows).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "file reader row budget must be positive",
+            )
+        })?,
+        max_bytes: NonZeroUsize::new(max_bytes).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "file reader byte budget must be positive",
+            )
+        })?,
+    })
+}
+
+fn connector_file_metrics(
+    metrics: novarocks_fs::FileMetricsSnapshot,
+) -> ConnectorReaderMetricsSnapshot {
+    ConnectorReaderMetricsSnapshot {
+        bytes_read: metrics.bytes_read,
+        read_requests: metrics.read_requests,
+        rows_decoded: metrics.rows_decoded,
+        batches_delivered: metrics.batches_delivered,
+        cache_hits: metrics.cache_hits,
+        cache_misses: metrics.cache_misses,
+        io_time_ns: metrics.io_time_ns,
+        decode_time_ns: metrics.decode_time_ns,
+        row_groups_read: metrics.row_groups_read,
+        row_groups_pruned: metrics.row_groups_pruned,
+        delayed_materialization_ranges: metrics.delayed_materialization_ranges,
+    }
+}
+
 #[cfg(test)]
 mod file_read_contract_tests {
     use super::*;
 
-    fn assert_error_mapping(file_kind: FileErrorKind, connector_kind: ConnectorErrorKind) {
-        let mapped = map_file_error(FileError::new(file_kind, "contract"));
-        assert_eq!(mapped.kind(), connector_kind);
-    }
-
     #[test]
-    fn file_read_maps_invalid_error() {
-        assert_error_mapping(FileErrorKind::Invalid, ConnectorErrorKind::InvalidRequest);
-    }
-
-    #[test]
-    fn file_read_maps_unsupported_error() {
-        assert_error_mapping(FileErrorKind::Unsupported, ConnectorErrorKind::Unsupported);
-    }
-
-    #[test]
-    fn file_read_maps_not_found_error() {
-        assert_error_mapping(FileErrorKind::NotFound, ConnectorErrorKind::NotFound);
-    }
-
-    #[test]
-    fn file_read_maps_permission_error() {
-        assert_error_mapping(
-            FileErrorKind::Permission,
-            ConnectorErrorKind::PermissionDenied,
-        );
-    }
-
-    #[test]
-    fn file_read_maps_corrupt_error() {
-        assert_error_mapping(FileErrorKind::Corrupt, ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn file_read_maps_resource_error() {
-        assert_error_mapping(
-            FileErrorKind::ResourceExhausted,
-            ConnectorErrorKind::ResourceExhausted,
-        );
-    }
-
-    #[test]
-    fn file_read_maps_cancelled_error() {
-        assert_error_mapping(FileErrorKind::Cancelled, ConnectorErrorKind::Cancelled);
-    }
-
-    #[test]
-    fn file_read_maps_deadline_error() {
-        assert_error_mapping(
-            FileErrorKind::DeadlineExceeded,
-            ConnectorErrorKind::DeadlineExceeded,
-        );
+    fn file_read_maps_non_retryable_error_kinds() {
+        for (file_kind, connector_kind) in [
+            (FileErrorKind::Invalid, ConnectorErrorKind::InvalidRequest),
+            (FileErrorKind::Unsupported, ConnectorErrorKind::Unsupported),
+            (FileErrorKind::NotFound, ConnectorErrorKind::NotFound),
+            (
+                FileErrorKind::Permission,
+                ConnectorErrorKind::PermissionDenied,
+            ),
+            (FileErrorKind::Corrupt, ConnectorErrorKind::CorruptData),
+            (
+                FileErrorKind::ResourceExhausted,
+                ConnectorErrorKind::ResourceExhausted,
+            ),
+            (FileErrorKind::Cancelled, ConnectorErrorKind::Cancelled),
+            (
+                FileErrorKind::DeadlineExceeded,
+                ConnectorErrorKind::DeadlineExceeded,
+            ),
+            (FileErrorKind::Internal, ConnectorErrorKind::Internal),
+        ] {
+            let mapped = map_file_error(FileError::new(file_kind, "contract"));
+            assert_eq!(mapped.kind(), connector_kind);
+            assert!(!mapped.retryable_before_progress());
+        }
     }
 
     #[test]
@@ -1224,8 +1268,39 @@ mod file_read_contract_tests {
     }
 
     #[test]
-    fn file_read_maps_internal_error() {
-        assert_error_mapping(FileErrorKind::Internal, ConnectorErrorKind::Internal);
+    fn file_read_converts_foundation_metrics_without_core_types() {
+        let mapped = connector_file_metrics(novarocks_fs::FileMetricsSnapshot {
+            bytes_read: 1,
+            read_requests: 2,
+            rows_decoded: 3,
+            batches_delivered: 4,
+            cache_hits: 5,
+            cache_misses: 6,
+            io_time_ns: 7,
+            decode_time_ns: 8,
+            row_groups_read: 9,
+            row_groups_pruned: 10,
+            delayed_materialization_ranges: 11,
+        });
+        assert_eq!(mapped.bytes_read, 1);
+        assert_eq!(mapped.decode_time_ns, 8);
+        assert_eq!(mapped.row_groups_pruned, 10);
+        assert_eq!(mapped.delayed_materialization_ranges, 11);
+    }
+
+    #[test]
+    fn file_read_maps_spi_budget_to_foundation_budget() {
+        let budget = foundation_file_budget(17, 23).expect("valid budget");
+        assert_eq!(budget.max_rows.get(), 17);
+        assert_eq!(budget.max_bytes.get(), 23);
+        assert_eq!(
+            foundation_file_budget(0, 23).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            foundation_file_budget(17, 0).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 }
 

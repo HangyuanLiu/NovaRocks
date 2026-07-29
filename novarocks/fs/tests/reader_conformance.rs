@@ -150,6 +150,14 @@ fn parquet_predicate_prunes_row_groups() {
 fn parquet_honors_explicit_page_selection_and_positions() {
     let fixture = Fixture::parquet();
     let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.predicates.push(ScanPredicate::new(
+        "id",
+        ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Ge,
+            value: MinMaxPredicateValue::Int32(2),
+        },
+        ScanPredicateSource::Static,
+    ));
     request.pruning.row_groups = Some(vec![0]);
     request.pruning.pages.push(PhysicalPageSelection {
         row_group: 0,
@@ -168,6 +176,8 @@ fn parquet_honors_explicit_page_selection_and_positions() {
         batches[0].physical_row_positions.as_ref().unwrap().value(0),
         2
     );
+    assert_eq!(batches[0].batch.num_columns(), 2);
+    assert_eq!(reader.metrics_snapshot().delayed_materialization_ranges, 1);
 }
 
 #[test]

@@ -23,8 +23,8 @@ use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError,
     ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorReadSelector,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorReaderMetricsSnapshot, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
 };
 
 use super::runtime::{
@@ -166,6 +166,59 @@ fn reader_iterator_preserves_primary_read_failure_and_cleanup_context() {
     assert!(err.contains("primary read failure"), "err={err}");
     assert!(err.contains("cleanup failure"), "err={err}");
     assert_eq!(*close_calls.lock().expect("close calls"), 1);
+}
+
+struct MetricsReader {
+    step: usize,
+    metrics: ConnectorReaderMetricsSnapshot,
+}
+
+impl ConnectorBatchReader for MetricsReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        self.step += 1;
+        match self.step {
+            1 => {
+                self.metrics.bytes_read = 10;
+                self.metrics.read_requests = 1;
+                self.metrics.rows_decoded = 1;
+                self.metrics.batches_delivered = 1;
+                Ok(Some(batch()))
+            }
+            2 => {
+                self.metrics.bytes_read = 25;
+                self.metrics.read_requests = 2;
+                Ok(None)
+            }
+            _ => unreachable!("metrics reader reached terminal state"),
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    fn metrics_snapshot(&self) -> ConnectorReaderMetricsSnapshot {
+        self.metrics
+    }
+}
+
+#[test]
+fn file_read_profile_receives_metrics_deltas_once() {
+    let profile = crate::runtime::profile::RuntimeProfile::new("file-read");
+    let reader = MetricsReader {
+        step: 0,
+        metrics: ConnectorReaderMetricsSnapshot::default(),
+    };
+    ConnectorBatchReaderIter::with_profile(Box::new(reader), chunk_schema(), Some(profile.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("consume metric reader");
+    assert_eq!(profile.counter_value("ConnectorFileBytesRead"), Some(25));
+    assert_eq!(profile.counter_value("ConnectorFileReadRequests"), Some(2));
+    assert_eq!(profile.counter_value("ConnectorFileRowsDecoded"), Some(1));
+    assert_eq!(
+        profile.counter_value("ConnectorFileBatchesDelivered"),
+        Some(1)
+    );
 }
 
 #[test]

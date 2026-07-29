@@ -911,3 +911,92 @@ fn validate_batch_slot_count(
     }
     Ok(batch)
 }
+
+#[cfg(test)]
+mod file_read_contract_tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use std::collections::HashMap;
+
+    fn predicate_config() -> ParquetScanConfig {
+        ParquetScanConfig {
+            columns: vec!["id".to_string()],
+            chunk_schema: Arc::new(ChunkSchema::try_new(Vec::new()).expect("empty chunk schema")),
+            slot_kinds: Vec::new(),
+            case_sensitive: true,
+            enable_page_index: true,
+            min_max_predicates: vec![MinMaxPredicate::Ge {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int32(7),
+            }],
+            runtime_min_max_filter_columns: HashMap::new(),
+            variant_path_predicates: Vec::new(),
+            batch_size: None,
+            datacache: novarocks_fs::DataCacheManager::instance().external_context(
+                crate::cache::CacheOptions::from_query_options(None)
+                    .expect("cache options")
+                    .to_file_cache_options(),
+            ),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: None,
+            iceberg_output_schema: None,
+            variant_path_columns: Vec::new(),
+            query_global_dicts: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn file_read_static_predicate_snapshot_uses_physical_column_name() {
+        let predicates =
+            foundation_scan_predicates(&predicate_config(), None).expect("foundation predicates");
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].column(), "id");
+        assert_eq!(
+            predicates[0].source(),
+            novarocks_fs::ScanPredicateSource::Static
+        );
+        assert_eq!(
+            predicates[0].domain(),
+            &novarocks_fs::ScanPredicateDomain::Range {
+                op: novarocks_fs::MinMaxPredicateOp::Ge,
+                value: novarocks_fs::MinMaxPredicateValue::Int32(7),
+            }
+        );
+    }
+
+    #[test]
+    fn file_read_schema_adapter_materializes_missing_initial_default() {
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+            ])),
+            vec![Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef],
+        )
+        .expect("input batch");
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("b", DataType::Int32, true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
+                (
+                    crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
+                    "99".to_string(),
+                ),
+            ])),
+        ]));
+        let output =
+            align_batch_to_iceberg_schema(&output_schema, input, true).expect("align schema");
+        let defaulted = output
+            .column_by_name("b")
+            .expect("defaulted column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 default");
+        assert_eq!(defaulted.values(), &[99, 99]);
+    }
+}

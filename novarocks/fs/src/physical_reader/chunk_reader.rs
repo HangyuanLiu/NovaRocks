@@ -42,6 +42,9 @@ pub(crate) struct ReaderMetrics {
     cache_misses: AtomicU64,
     io_time_ns: AtomicU64,
     decode_time_ns: AtomicU64,
+    row_groups_read: AtomicU64,
+    row_groups_pruned: AtomicU64,
+    delayed_materialization_ranges: AtomicU64,
 }
 
 impl ReaderMetrics {
@@ -55,6 +58,11 @@ impl ReaderMetrics {
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             io_time_ns: self.io_time_ns.load(Ordering::Relaxed),
             decode_time_ns: self.decode_time_ns.load(Ordering::Relaxed),
+            row_groups_read: self.row_groups_read.load(Ordering::Relaxed),
+            row_groups_pruned: self.row_groups_pruned.load(Ordering::Relaxed),
+            delayed_materialization_ranges: self
+                .delayed_materialization_ranges
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -66,6 +74,18 @@ impl ReaderMetrics {
 
     pub(crate) fn record_delivery(&self) {
         self.batches_delivered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_row_group_selection(&self, total: usize, selected: usize) {
+        self.row_groups_read
+            .fetch_add(selected as u64, Ordering::Relaxed);
+        self.row_groups_pruned
+            .fetch_add(total.saturating_sub(selected) as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_delayed_materialization(&self) {
+        self.delayed_materialization_ranges
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
