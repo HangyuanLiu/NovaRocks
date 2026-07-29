@@ -116,7 +116,9 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
     assert!(!declaration_debug.contains("warehouse"));
     assert!(!declaration_debug.contains("access_key"));
 
-    let installer = IcebergConnectorInstaller::new(IcebergReadBinding::default_binding(None));
+    let installer = IcebergConnectorInstaller::new(
+        IcebergReadBinding::default_binding(None).expect("build read binding"),
+    );
     let read_only = installer
         .install(&declaration, &context())
         .expect("install read-only Iceberg instance");
@@ -200,9 +202,11 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
         .expect("distributable planning instance")
         .declaration(&context())
         .expect("declaration");
-    let installed = IcebergConnectorInstaller::new(IcebergReadBinding::default_binding(None))
-        .install(&declaration, &context())
-        .expect("install read-only instance");
+    let installed = IcebergConnectorInstaller::new(
+        IcebergReadBinding::default_binding(None).expect("build read binding"),
+    )
+    .install(&declaration, &context())
+    .expect("install read-only instance");
 
     let mut reader = installed
         .read()

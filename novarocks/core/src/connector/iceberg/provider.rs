@@ -26,7 +26,10 @@ use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
-use novarocks_fs::{FsAccessHandle, FsAccessResolver};
+use novarocks_fs::{
+    FileIoRuntime, FileTaskSpawner, FsAccessHandle, FsAccessResolver, TokioFileIoRuntime,
+    TokioFileTaskSpawner,
+};
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
     ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
@@ -111,21 +114,62 @@ impl ConnectorInstanceDistribution for IcebergInstanceDistribution {
 /// has no catalog registry or metadata capability, because BE execution must
 /// consume the fully planned provider split rather than reconnecting a
 /// catalog.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct IcebergReadBinding {
     access_binding: String,
     object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
     access_resolver: FsAccessResolver,
+    file_runtime: Arc<dyn FileIoRuntime>,
+    file_task_spawner: Arc<dyn FileTaskSpawner>,
+}
+
+impl std::fmt::Debug for IcebergReadBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergReadBinding")
+            .field("access_binding", &self.access_binding)
+            .field(
+                "object_store_config",
+                &self.object_store_config.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl IcebergReadBinding {
     pub(crate) fn default_binding(
         object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+    ) -> Result<Self, ConnectorError> {
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            static FALLBACK_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+            FALLBACK_RUNTIME
+                .get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Iceberg fallback Tokio runtime must initialize")
+                })
+                .handle()
+                .clone()
+        });
+        Ok(Self::new(
+            object_store_config,
+            Arc::new(TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(TokioFileTaskSpawner::new(handle)),
+        ))
+    }
+
+    pub(crate) fn new(
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+        file_runtime: Arc<dyn FileIoRuntime>,
+        file_task_spawner: Arc<dyn FileTaskSpawner>,
     ) -> Self {
         Self {
             access_binding: DEFAULT_ACCESS_BINDING.to_string(),
             object_store_config,
             access_resolver: FsAccessResolver::new(),
+            file_runtime,
+            file_task_spawner,
         }
     }
 
@@ -142,8 +186,12 @@ impl IcebergReadBinding {
         cancellation: novarocks_fs::FileCancellation,
         deadline: std::time::Instant,
     ) -> Result<novarocks_fs::FileReadContext, ConnectorError> {
-        crate::connector::file_execution::foundation_read_context(cancellation, Some(deadline))
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+        Ok(novarocks_fs::FileReadContext {
+            cancellation,
+            deadline: Some(deadline),
+            runtime: Arc::clone(&self.file_runtime),
+            task_spawner: Arc::clone(&self.file_task_spawner),
+        })
     }
 }
 
@@ -918,7 +966,7 @@ impl ConnectorRead for IcebergConnectorInstance {
                 ));
             }
         }
-        let binding = IcebergReadBinding::default_binding(loaded.object_store_config.clone());
+        let binding = IcebergReadBinding::default_binding(loaded.object_store_config.clone())?;
         let file_context = binding.file_read_context(
             novarocks_fs::FileCancellation::new(),
             request.context.deadline(),
@@ -1731,8 +1779,10 @@ mod tests {
 
     #[test]
     fn compat_splits_are_owned_by_the_startup_iceberg_instance() {
-        let instance = compose_compat_read_instance(IcebergReadBinding::default_binding(None))
-            .expect("compose compat Iceberg instance");
+        let instance = compose_compat_read_instance(
+            IcebergReadBinding::default_binding(None).expect("compose compat Iceberg binding"),
+        )
+        .expect("compose compat Iceberg instance");
         assert_eq!(
             instance.descriptor().instance_id.as_str(),
             COMPAT_ICEBERG_INSTANCE_ID

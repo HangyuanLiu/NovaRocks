@@ -585,7 +585,12 @@ pub fn compose_backend_connector_installers(
     registry: &ConnectorRegistry,
     default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
 ) -> Result<(), String> {
-    let binding = iceberg::provider::IcebergReadBinding::default_binding(default_object_store);
+    let file_runtime = crate::runtime::global_async_runtime::data_runtime_handle()?;
+    let binding = iceberg::provider::IcebergReadBinding::new(
+        default_object_store,
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(file_runtime.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(file_runtime)),
+    );
     registry
         .register_connector_instance_installer(Arc::new(
             iceberg::provider::IcebergConnectorInstaller::new(binding.clone()),
