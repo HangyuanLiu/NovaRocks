@@ -41,7 +41,7 @@ pub struct AdvertiseEndpoint {
     pub port: u16,
 }
 
-pub(crate) fn advertise_host() -> Result<String, String> {
+pub fn advertise_host() -> Result<String, String> {
     static ADVERTISE_HOST: OnceLock<Result<String, String>> = OnceLock::new();
     ADVERTISE_HOST
         .get_or_init(|| {
@@ -91,7 +91,7 @@ pub fn advertise_host_for_server(server: &ServerConfig) -> Result<String, String
     choose_advertise_host(&server.host, &server.priority_networks, &candidates)
 }
 
-pub(crate) fn format_host_for_url(host: &str) -> String {
+pub fn format_host_for_url(host: &str) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {

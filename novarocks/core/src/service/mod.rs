@@ -21,13 +21,6 @@ pub mod cluster_heartbeat;
 pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
-#[cfg(feature = "compat")]
-pub(crate) mod exec_state_reporter;
-#[cfg(feature = "compat")]
-pub(crate) mod exec_status_report;
-pub mod fe_report;
-#[cfg(feature = "compat")]
-pub mod fe_report_compat;
 pub mod fragment_control;
 #[cfg(feature = "compat")]
 pub mod frontend_rpc;
@@ -46,7 +39,6 @@ pub(crate) mod metrics_http;
 pub mod native_fragment_ingress;
 #[cfg(test)]
 pub(crate) mod native_fragment_service_test_fixture;
-pub mod report_worker;
 pub(crate) mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;

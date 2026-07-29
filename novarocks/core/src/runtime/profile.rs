@@ -40,6 +40,46 @@ pub struct RuntimeProfile {
 
 pub type Profiler = RuntimeProfile;
 
+/// Merges driver-level pipeline profiles into the fragment-level profile shape
+/// consumed by report transports. This is execution-domain logic; protocol
+/// adapters are responsible only for serializing the resulting profile.
+pub fn merge_pipeline_profiles(profiler: &Profiler) -> Profiler {
+    let merged = Profiler::new(profiler.name());
+    merged.set_metadata(profiler.metadata());
+    merged.copy_all_info_strings_from(profiler);
+    merged.copy_all_counters_from(profiler);
+
+    for child in profiler.children() {
+        let name = child.name();
+        if !name.starts_with("Pipeline (id=") {
+            merged.add_child(child);
+            continue;
+        }
+
+        let grand_children = child.children();
+        let has_driver_level = grand_children
+            .first()
+            .map(|c| c.name().starts_with("PipelineDriver (id="))
+            .unwrap_or(false);
+        if !has_driver_level {
+            merged.add_child(child);
+            continue;
+        }
+
+        if grand_children.is_empty() {
+            continue;
+        }
+
+        let merged_driver = Profiler::merge_isomorphic_profiles(&grand_children);
+        merged_driver.set_name(child.name());
+        merged_driver.copy_all_info_strings_from(&child);
+        merged_driver.copy_all_counters_from(&child);
+        merged.add_child(merged_driver);
+    }
+
+    merged
+}
+
 pub(crate) const RUNTIME_FILTER_INPUT_ROWS: &str = "RuntimeFilterInputRows";
 pub(crate) const RUNTIME_FILTER_OUTPUT_ROWS: &str = "RuntimeFilterOutputRows";
 

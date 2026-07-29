@@ -31,22 +31,34 @@ use crate::connector::iceberg::write_descriptor::{
 use crate::proto::novarocks::IcebergCommitInfo;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct SinkLoadStats {
-    pub(crate) loaded_rows: i64,
-    pub(crate) loaded_bytes: i64,
-    pub(crate) filtered_rows: i64,
+pub struct SinkLoadStats {
+    pub loaded_rows: i64,
+    pub loaded_bytes: i64,
+    pub filtered_rows: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TabletCommitInfo {
-    pub(crate) tablet_id: i64,
-    pub(crate) backend_id: i64,
+pub struct TabletCommitInfo {
+    pub tablet_id: i64,
+    pub backend_id: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TabletFailInfo {
-    pub(crate) tablet_id: i64,
-    pub(crate) backend_id: i64,
+pub struct TabletFailInfo {
+    pub tablet_id: i64,
+    pub backend_id: i64,
+}
+
+/// Protocol-neutral final-report facts collected by fragment sinks.
+///
+/// The runtime owns this data; protocol adapters are responsible for encoding
+/// it into their respective report wire formats.
+#[derive(Clone, Debug, Default)]
+pub struct SinkCommitReportSnapshot {
+    pub iceberg_commits: Vec<IcebergCommitInfo>,
+    pub tablet_commit_infos: Vec<TabletCommitInfo>,
+    pub tablet_fail_infos: Vec<TabletFailInfo>,
+    pub load_stats: SinkLoadStats,
 }
 
 struct SinkCommitStore {
@@ -96,7 +108,7 @@ pub(crate) fn try_register(finst_id: UniqueId) -> bool {
     true
 }
 
-pub(crate) fn unregister(finst_id: UniqueId) {
+pub fn unregister(finst_id: UniqueId) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     guard.remove(&finst_id);
@@ -223,6 +235,30 @@ pub(crate) fn get_load_stats(finst_id: UniqueId) -> SinkLoadStats {
             filtered_rows: entry.filtered_rows,
         })
         .unwrap_or_default()
+}
+
+pub fn report_snapshot(finst_id: UniqueId) -> SinkCommitReportSnapshot {
+    let store = store();
+    let guard = store.mu.lock().expect("sink commit store lock");
+    let Some(entry) = guard.get(&finst_id) else {
+        return SinkCommitReportSnapshot::default();
+    };
+    SinkCommitReportSnapshot {
+        iceberg_commits: entry.iceberg_commits.clone(),
+        #[cfg(feature = "compat")]
+        tablet_commit_infos: entry.tablet_commit_infos.clone(),
+        #[cfg(not(feature = "compat"))]
+        tablet_commit_infos: Vec::new(),
+        #[cfg(feature = "compat")]
+        tablet_fail_infos: entry.tablet_fail_infos.clone(),
+        #[cfg(not(feature = "compat"))]
+        tablet_fail_infos: Vec::new(),
+        load_stats: SinkLoadStats {
+            loaded_rows: entry.loaded_rows,
+            loaded_bytes: entry.loaded_bytes,
+            filtered_rows: entry.filtered_rows,
+        },
+    }
 }
 
 fn partition_descriptor_to_native(

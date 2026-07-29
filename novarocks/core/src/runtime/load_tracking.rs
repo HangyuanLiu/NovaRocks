@@ -76,7 +76,7 @@ pub(crate) fn append_logs(
     Some(rendered)
 }
 
-pub(crate) fn has_tracking_log(query_id: QueryId) -> bool {
+pub fn has_tracking_log(query_id: QueryId) -> bool {
     let store = store();
     let guard = store.mu.lock().expect("tracking log store lock");
     guard

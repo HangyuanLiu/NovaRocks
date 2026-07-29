@@ -22,6 +22,7 @@ use std::sync::{Arc, mpsc};
 
 use novarocks::common::app_config;
 use novarocks::novarocks_logging::{error, info, warn};
+use novarocks::query_execution::native_fragment_report;
 use novarocks::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
@@ -30,7 +31,6 @@ use novarocks::runtime::fragment::{
 };
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::profile::Profiler;
-use novarocks::service::fe_report;
 use novarocks::service::native_fragment_ingress::{
     NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
     NativeFragmentIngressError, NativeFragmentRequest,
@@ -210,7 +210,13 @@ impl NativeFragmentIngress for NativeFragmentService {
             .spawn(move || {
                 if start_rx.recv().is_err() {
                     let error = "native fragment start signal was dropped".to_string();
-                    fe_report::report_fragment_done(fragment_instance_id, Some(error), false);
+                    native_fragment_report::report_terminal(
+                        fragment_instance_id,
+                        novarocks::runtime::fragment::io::FragmentTerminalReport::new(
+                            Some(error),
+                            false,
+                        ),
+                    );
                     return;
                 }
                 let (running, failure_release) =
@@ -259,16 +265,18 @@ impl NativeFragmentIngress for NativeFragmentService {
             })?;
 
         if let Some(report_endpoint) = report_endpoint {
-            fe_report::register_novarocks_instance(
-                fragment_instance_id,
-                query_id,
+            native_fragment_report::register(
+                novarocks::runtime::fragment::io::FragmentReportRegistration::new(
+                    fragment_instance_id,
+                    query_id,
+                    backend_num,
+                    enable_profile,
+                    profiler,
+                    Some(fragment_mem_tracker),
+                    Some(query_mem_tracker),
+                    report_interval_ns,
+                ),
                 report_endpoint,
-                backend_num,
-                enable_profile,
-                profiler,
-                Some(fragment_mem_tracker),
-                Some(query_mem_tracker),
-                report_interval_ns,
             );
         } else {
             warn!(
@@ -351,10 +359,12 @@ fn consume_terminal_fact(
         FragmentOutcome::Cancelled { reason } => Some(reason.detail().to_string()),
     };
     let report_decision = queries.finish_fragment_for_report(query_id);
-    fe_report::report_fragment_done(
+    native_fragment_report::report_terminal(
         fragment_instance_id,
-        report_error,
-        report_decision.include_runtime_filter_profile(),
+        novarocks::runtime::fragment::io::FragmentTerminalReport::new(
+            report_error,
+            report_decision.include_runtime_filter_profile(),
+        ),
     );
     queries.unregister_fragment(fragment_instance_id);
     queries.cleanup_after_fragment_report(query_id, report_decision);
@@ -673,7 +683,12 @@ mod tests {
 
     #[test]
     fn native_failed_terminal_fact_does_not_locally_cancel_siblings_before_frontend_ack() {
-        let service = NativeFragmentService::new();
+        let service = NativeFragmentService::new(
+            crate::fragment::grpc_exchange_transmitter(),
+            crate::fragment::grpc_fragment_lookup_client(),
+            crate::fragment::native_result_writer(),
+            crate::fragment::native_fragment_event_sink(),
+        );
         let request = values_result_request(83_100, 83_104);
         let query_id = request.query_id();
         let failed_finst = request.fragment_instance_id();
@@ -701,9 +716,19 @@ mod tests {
             .register_fragment(query_id, failed_finst, delivery_expire, query_expire)
             .expect("register failed fragment");
         failed_registration.into_running();
-        let failed = prepare_fragment(request.into_submission(), FragmentPrepareContext::default())
-            .expect("failed fragment prepares")
-            .start_failed("native executor failure");
+        let failed = prepare_fragment(
+            request.into_submission(),
+            FragmentPrepareContext::without_runtime_filter(
+                None,
+                None,
+                Arc::clone(&service.exchange_transmitter),
+                Arc::clone(&service.lookup_client),
+                Arc::clone(&service.result_writer),
+                Arc::clone(&service.event_sink),
+            ),
+        )
+        .expect("failed fragment prepares")
+        .start_failed("native executor failure");
         let failed_token = service
             .controls
             .reserve(failed_finst)
@@ -743,8 +768,18 @@ mod tests {
         ));
         std::fs::write(&trigger, b"step-token-17").expect("arm fragment failure");
         let first = values_result_request(84_000, 84_002);
-        let first = prepare_fragment(first.into_submission(), FragmentPrepareContext::default())
-            .expect("first fragment prepares");
+        let first = prepare_fragment(
+            first.into_submission(),
+            FragmentPrepareContext::without_runtime_filter(
+                None,
+                None,
+                crate::fragment::grpc_exchange_transmitter(),
+                crate::fragment::grpc_fragment_lookup_client(),
+                crate::fragment::native_result_writer(),
+                crate::fragment::native_fragment_event_sink(),
+            ),
+        )
+        .expect("first fragment prepares");
 
         let (first, release) =
             start_with_fragment_failure_trigger(first, Some(trigger.as_path()), false);
@@ -763,8 +798,18 @@ mod tests {
         );
 
         let second = values_result_request(84_100, 84_102);
-        let second = prepare_fragment(second.into_submission(), FragmentPrepareContext::default())
-            .expect("second fragment prepares");
+        let second = prepare_fragment(
+            second.into_submission(),
+            FragmentPrepareContext::without_runtime_filter(
+                None,
+                None,
+                crate::fragment::grpc_exchange_transmitter(),
+                crate::fragment::grpc_fragment_lookup_client(),
+                crate::fragment::native_result_writer(),
+                crate::fragment::native_fragment_event_sink(),
+            ),
+        )
+        .expect("second fragment prepares");
         let (second, release) =
             start_with_fragment_failure_trigger(second, Some(trigger.as_path()), true);
         assert!(
@@ -789,8 +834,18 @@ mod tests {
         assert!(!trigger.exists(), "the trigger must be consumed once");
 
         let third = values_result_request(84_200, 84_202);
-        let third = prepare_fragment(third.into_submission(), FragmentPrepareContext::default())
-            .expect("third fragment prepares");
+        let third = prepare_fragment(
+            third.into_submission(),
+            FragmentPrepareContext::without_runtime_filter(
+                None,
+                None,
+                crate::fragment::grpc_exchange_transmitter(),
+                crate::fragment::grpc_fragment_lookup_client(),
+                crate::fragment::native_result_writer(),
+                crate::fragment::native_fragment_event_sink(),
+            ),
+        )
+        .expect("third fragment prepares");
         let (third, release) =
             start_with_fragment_failure_trigger(third, Some(trigger.as_path()), true);
         assert!(

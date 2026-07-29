@@ -105,7 +105,7 @@ impl RuntimeFilterLifecycleRegistry {
         rw_write(&self.queries).remove(&query);
     }
 
-    pub(crate) fn export_to_profile(&self, query: QueryKey, profile: &RuntimeProfile) {
+    pub fn export_to_profile(&self, query: QueryKey, profile: &RuntimeProfile) {
         let Some(snapshot) = self.snapshot(query) else {
             return;
         };

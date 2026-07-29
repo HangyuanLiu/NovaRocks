@@ -28,6 +28,7 @@ use crate::common::types::UniqueId;
 use crate::exec::fragment::program::FragmentSinkKind;
 use crate::novarocks_logging::{error, info, warn};
 use crate::protocol::native::decode::decode_fragment_submission;
+use crate::query_execution::native_fragment_report;
 use crate::runtime::exchange;
 use crate::runtime::fragment::error::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
@@ -44,7 +45,6 @@ use crate::runtime::query_context::{QueryContextManager, QueryId, query_context_
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::result_buffer;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
-use crate::service::fe_report;
 
 fn profile_report_interval_ns(
     enable_profile: bool,
@@ -178,10 +178,12 @@ fn spawn_exec_fragment_native(
             }
         }
         let report_decision = mgr.finish_fragment_for_report(query_id);
-        fe_report::report_fragment_done(
+        native_fragment_report::report_terminal(
             finst_id,
-            report_error,
-            report_decision.include_runtime_filter_profile,
+            crate::runtime::fragment::io::FragmentTerminalReport::new(
+                report_error,
+                report_decision.include_runtime_filter_profile,
+            ),
         );
         exchange::remove_fragment(finst_id.hi, finst_id.lo);
         mgr.unregister_finst(finst_id);
@@ -292,16 +294,18 @@ pub(crate) fn submit_exec_plan_fragment_native_with_manager(
     };
     let report_interval_ns = profile_report_interval_ns(enable_profile, Some(&query_opts));
     if let Some(report_endpoint) = metadata.report_endpoint().cloned() {
-        fe_report::register_novarocks_instance(
-            finst_id,
-            query_id,
+        native_fragment_report::register(
+            crate::runtime::fragment::io::FragmentReportRegistration::new(
+                finst_id,
+                query_id,
+                instance.backend_num().get(),
+                enable_profile,
+                profiler.clone(),
+                Some(Arc::clone(&fragment_mem_tracker)),
+                Some(Arc::clone(&query_mem_tracker)),
+                report_interval_ns,
+            ),
             report_endpoint,
-            instance.backend_num().get(),
-            enable_profile,
-            profiler.clone(),
-            Some(Arc::clone(&fragment_mem_tracker)),
-            Some(Arc::clone(&query_mem_tracker)),
-            report_interval_ns,
         );
     } else {
         warn!(
@@ -377,9 +381,7 @@ mod tests {
             result_buffer,
             exchange_receiver: crate::runtime::exchange::snapshot_receiver_state(exchange_key)
                 .is_some(),
-            reporter: fe_report::list_report_instances()
-                .iter()
-                .any(|(registered, _)| *registered == finst_id),
+            reporter: native_fragment_report::is_registered(finst_id),
             runtime_filter_lifecycle:
                 crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry::global()
                     .snapshot(query_key)

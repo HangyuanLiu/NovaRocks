@@ -115,10 +115,6 @@ impl CompatPorts for FakePorts {
     fn stop_grpc(&mut self) -> Result<(), String> {
         self.stop("grpc")
     }
-
-    fn stop_report_worker(&mut self) {
-        self.record("stop-report");
-    }
 }
 
 fn test_config() -> CompatServerConfig {
@@ -207,7 +203,6 @@ fn heartbeat_start_failure_rolls_back_grpc_only() {
             "start-grpc",
             "start-heartbeat",
             "stop-grpc",
-            "stop-report",
         ],
     );
 }
@@ -224,7 +219,6 @@ fn backend_start_failure_rolls_back_heartbeat_then_grpc() {
             "start-backend",
             "stop-heartbeat",
             "stop-grpc",
-            "stop-report",
         ],
     );
 }
@@ -243,7 +237,6 @@ fn brpc_start_failure_rolls_back_backend_heartbeat_and_grpc() {
             "stop-backend",
             "stop-heartbeat",
             "stop-grpc",
-            "stop-report",
         ],
     );
 }
@@ -284,13 +277,7 @@ fn cleanup_failure_does_not_skip_later_stops() {
     assert!(error.to_string().contains("grpc cleanup failed"));
     assert_eq!(
         &events.lock().unwrap()[5..],
-        [
-            "stop-brpc",
-            "stop-backend",
-            "stop-heartbeat",
-            "stop-grpc",
-            "stop-report",
-        ]
+        ["stop-brpc", "stop-backend", "stop-heartbeat", "stop-grpc",]
     );
 }
 

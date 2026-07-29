@@ -7,15 +7,14 @@ use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::fragment::io::SyncFragmentExecutor;
-use novarocks::service::{
-    backend_service, frontend_rpc, grpc_server, heartbeat_service, report_worker,
-};
+use novarocks::service::{backend_service, frontend_rpc, grpc_server, heartbeat_service};
 
 use crate::brpc;
 use crate::fragment::{
     CompatFragmentService, brpc_exchange_transmitter, brpc_fragment_lookup_client,
-    compat_fragment_event_sink, compat_result_writer,
+    compat_result_writer,
 };
+use crate::report::{CompatReportService, new_report_service};
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const COMPAT_REPORT_ROLE_REJECTION: &str =
@@ -45,6 +44,7 @@ pub struct CompatServerConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompatApplicationErrorKind {
     Configuration,
+    ReportStart,
     GrpcStart,
     HeartbeatStart,
     BackendServiceStart,
@@ -92,12 +92,14 @@ struct StartedResources {
     heartbeat: bool,
     backend: bool,
     brpc: bool,
+    report: bool,
 }
 
 pub struct CompatApplicationHost {
     ports: Box<dyn CompatPorts>,
     started: StartedResources,
     fragment_service: Arc<CompatFragmentService>,
+    report_service: Arc<CompatReportService>,
     ready_marker: String,
     startup_summary: String,
 }
@@ -110,7 +112,14 @@ impl fmt::Debug for CompatApplicationHost {
             .field("started_heartbeat", &self.started.heartbeat)
             .field("started_backend", &self.started.backend)
             .field("started_brpc", &self.started.brpc)
+            .field("started_report", &self.started.report)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CompatApplicationHost {
+    fn drop(&mut self) {
+        let _ = self.cleanup_started();
     }
 }
 
@@ -207,12 +216,13 @@ impl CompatApplicationHost {
             host: server.host.clone(),
             be_port: server.be_port,
         };
+        let report_service = new_report_service();
         let fragment_service = Arc::new(CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             brpc_exchange_transmitter(),
             brpc_fragment_lookup_client(),
             compat_result_writer(),
-            compat_fragment_event_sink(),
+            Arc::clone(&report_service),
         ));
         let brpc_config = brpc::CompatConfig {
             host: &server.host,
@@ -228,10 +238,18 @@ impl CompatApplicationHost {
             ports: Box::new(ports),
             started: StartedResources::default(),
             fragment_service,
+            report_service,
             ready_marker,
             startup_summary,
         };
         host.ports.init_frontend_rpc();
+        if let Err(error) = host.report_service.start() {
+            return Err(host.start_failure(
+                CompatApplicationErrorKind::ReportStart,
+                format!("start compat report service: {error}"),
+            ));
+        }
+        host.started.report = true;
         let grpc_fragment_service: Arc<dyn SyncFragmentExecutor> = host.fragment_service.clone();
         if let Err(error) = host.ports.start_grpc(
             &server.host,
@@ -282,10 +300,6 @@ impl CompatApplicationHost {
 
     fn cleanup_started(&mut self) -> Result<(), String> {
         let mut failures = Vec::new();
-        let stop_report_worker = self.started.grpc
-            || self.started.heartbeat
-            || self.started.backend
-            || self.started.brpc;
         if self.started.brpc {
             self.ports.stop_brpc();
             self.started.brpc = false;
@@ -308,8 +322,9 @@ impl CompatApplicationHost {
             }
             self.started.grpc = false;
         }
-        if stop_report_worker {
-            self.ports.stop_report_worker();
+        if self.started.report {
+            self.report_service.stop();
+            self.started.report = false;
         }
         if failures.is_empty() {
             Ok(())
@@ -401,7 +416,6 @@ trait CompatPorts: Send {
     fn stop_backend(&mut self) -> Result<(), String>;
     fn stop_heartbeat(&mut self) -> Result<(), String>;
     fn stop_grpc(&mut self) -> Result<(), String>;
-    fn stop_report_worker(&mut self);
 }
 
 struct LiveCompatPorts;
@@ -456,10 +470,6 @@ impl CompatPorts for LiveCompatPorts {
 
     fn stop_grpc(&mut self) -> Result<(), String> {
         grpc_server::stop_grpc_server()
-    }
-
-    fn stop_report_worker(&mut self) {
-        report_worker::stop();
     }
 }
 
