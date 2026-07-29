@@ -22,7 +22,6 @@ use novarocks::query_execution::backend::{
 };
 use novarocks::query_execution::contract::QueryId;
 
-use super::execution::FrontendLiveBackendTopology;
 use super::query_registry::FrontendQueryRegistry;
 
 /// Frontend-owned view used to translate backend lifecycle events into
@@ -30,18 +29,11 @@ use super::query_registry::FrontendQueryRegistry;
 #[derive(Clone)]
 pub struct BackendQueryActivity {
     registry: Arc<FrontendQueryRegistry>,
-    live_topology: Arc<FrontendLiveBackendTopology>,
 }
 
 impl BackendQueryActivity {
-    pub(crate) fn new(
-        registry: Arc<FrontendQueryRegistry>,
-        live_topology: Arc<FrontendLiveBackendTopology>,
-    ) -> Self {
-        Self {
-            registry,
-            live_topology,
-        }
+    pub(crate) fn new(registry: Arc<FrontendQueryRegistry>) -> Self {
+        Self { registry }
     }
 
     pub fn backend_lost(&self, backend_idx: usize) -> Vec<QueryId> {
@@ -88,7 +80,6 @@ impl BackendQueryEventSink for BackendQueryActivity {
 
     fn replace_live_backends(&self, revision: u64, backends: Vec<LiveBackendTarget>) {
         self.registry.replace_live_backends(revision, &backends);
-        self.live_topology.replace(revision, backends);
     }
 }
 
@@ -106,7 +97,6 @@ mod tests {
     };
 
     use super::BackendQueryActivity;
-    use crate::coordinator::execution::FrontendLiveBackendTopology;
     use crate::coordinator::query_registry::FrontendQueryRegistry;
 
     #[derive(Default)]
@@ -173,7 +163,7 @@ mod tests {
     }
 
     fn backend_activity(registry: Arc<FrontendQueryRegistry>) -> BackendQueryActivity {
-        BackendQueryActivity::new(registry, Arc::new(FrontendLiveBackendTopology::new()))
+        BackendQueryActivity::new(registry)
     }
 
     #[test]

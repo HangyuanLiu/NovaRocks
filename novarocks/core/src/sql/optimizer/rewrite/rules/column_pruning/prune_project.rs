@@ -245,7 +245,10 @@ mod tests {
     }
 
     fn ctx_with_factory_and_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         ctx.set_column_ref_factory(factory);
         let arena = Rc::new(RefCell::new(ScalarArena::new()));

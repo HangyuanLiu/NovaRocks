@@ -30,7 +30,6 @@ pub mod lookup;
 pub mod mem_tracker;
 pub mod native_fragment_query;
 pub mod profile;
-pub(crate) mod query_cancel;
 pub mod query_context;
 pub mod query_options;
 pub mod query_result;

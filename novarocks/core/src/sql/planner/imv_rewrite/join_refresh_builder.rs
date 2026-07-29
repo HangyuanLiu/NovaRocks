@@ -1735,6 +1735,7 @@ mod tests {
             &HashMap::new(),
             factory,
             Vec::new(),
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         )
         .expect("physical optimization")
     }

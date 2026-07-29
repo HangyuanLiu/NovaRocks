@@ -317,7 +317,10 @@ mod tests {
     }
 
     fn ctx_with_arena() -> RewriteContext {
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(arena);
         ctx
@@ -409,7 +412,10 @@ mod tests {
         let expr = scan_expr(scan, Some(needed));
         let rule = PruneScanColumns;
 
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         let result = rule.apply(expr, &mut ctx).unwrap();
 

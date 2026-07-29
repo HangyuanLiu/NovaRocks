@@ -413,7 +413,6 @@ impl BackendRegistryTestGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         replace_backend_registry_for_test(None);
-        replace_cluster_membership_for_test(None);
         Self { _guard: guard }
     }
 }
@@ -422,97 +421,6 @@ impl BackendRegistryTestGuard {
 impl Drop for BackendRegistryTestGuard {
     fn drop(&mut self) {
         replace_backend_registry_for_test(None);
-        replace_cluster_membership_for_test(None);
-    }
-}
-
-/// Read/write surface the query data plane needs from backend topology.
-///
-/// Consumers depend on this neutral view rather than the concrete registry.
-pub(crate) trait ClusterMembership: Send + Sync {
-    /// Live backends as (dispatch index, endpoint). Empty when none live.
-    fn live_endpoints(&self) -> Vec<(usize, SocketAddr)>;
-    /// Record that a fragment was scheduled onto `be_id` (telemetry counter).
-    fn record_scheduled_fragment(&self, be_id: BeId);
-}
-
-/// Stateless adapter over the process registry.
-///
-/// It reads the registry lazily because the composition root can install the
-/// registry after consumers have been constructed.
-struct RegistryClusterMembership;
-
-impl ClusterMembership for RegistryClusterMembership {
-    fn live_endpoints(&self) -> Vec<(usize, SocketAddr)> {
-        match backend_registry() {
-            Some(registry) => registry
-                .live_endpoints()
-                .into_iter()
-                .map(|(be_id, endpoint)| (be_id as usize, endpoint))
-                .collect(),
-            None => Vec::new(),
-        }
-    }
-
-    fn record_scheduled_fragment(&self, be_id: BeId) {
-        if let Some(registry) = backend_registry() {
-            registry.record_scheduled_fragment(be_id);
-        }
-    }
-}
-
-/// Sole data-plane entry point for backend topology.
-///
-/// The production value is derived from the process registry. Tests may
-/// override it with a role-neutral fake.
-pub(crate) fn cluster_membership() -> Option<Arc<dyn ClusterMembership>> {
-    #[cfg(test)]
-    if let Some(installed) = test_membership_cell().lock().unwrap().clone() {
-        return Some(installed);
-    }
-    backend_registry().map(|_| Arc::new(RegistryClusterMembership) as Arc<dyn ClusterMembership>)
-}
-
-#[cfg(test)]
-fn test_membership_cell() -> &'static Mutex<Option<Arc<dyn ClusterMembership>>> {
-    static CELL: OnceLock<Mutex<Option<Arc<dyn ClusterMembership>>>> = OnceLock::new();
-    CELL.get_or_init(|| Mutex::new(None))
-}
-
-/// Test-only override of the derived membership. Reset by `BackendRegistryTestGuard`.
-#[cfg(test)]
-pub(crate) fn replace_cluster_membership_for_test(membership: Option<Arc<dyn ClusterMembership>>) {
-    *test_membership_cell().lock().unwrap() = membership;
-}
-
-/// Test double implementing `ClusterMembership`.
-#[cfg(test)]
-pub(crate) struct FakeClusterMembership {
-    endpoints: Vec<(usize, SocketAddr)>,
-    recorded: Mutex<Vec<BeId>>,
-}
-
-#[cfg(test)]
-impl FakeClusterMembership {
-    pub(crate) fn new(endpoints: Vec<(usize, SocketAddr)>) -> Self {
-        Self {
-            endpoints,
-            recorded: Mutex::new(Vec::new()),
-        }
-    }
-
-    pub(crate) fn recorded(&self) -> Vec<BeId> {
-        self.recorded.lock().unwrap().clone()
-    }
-}
-
-#[cfg(test)]
-impl ClusterMembership for FakeClusterMembership {
-    fn live_endpoints(&self) -> Vec<(usize, SocketAddr)> {
-        self.endpoints.clone()
-    }
-    fn record_scheduled_fragment(&self, be_id: BeId) {
-        self.recorded.lock().unwrap().push(be_id);
     }
 }
 
@@ -655,72 +563,5 @@ mod tests {
             .map(|entry| entry.be_id)
             .collect();
         assert_eq!(ids, vec![1, 2]);
-    }
-
-    #[test]
-    fn cluster_membership_is_absent_without_registry() {
-        let _standalone = crate::engine::acquire_standalone_test_guard();
-        let _registry = BackendRegistryTestGuard::new();
-        assert!(cluster_membership().is_none());
-    }
-
-    #[test]
-    fn backend_registry_test_guard_clears_membership_override_on_drop() {
-        let _standalone = crate::engine::acquire_standalone_test_guard();
-        {
-            let _registry = BackendRegistryTestGuard::new();
-            replace_cluster_membership_for_test(Some(Arc::new(FakeClusterMembership::new(vec![
-                (0, "127.0.0.1:19081".parse().unwrap()),
-            ]))));
-            assert!(cluster_membership().is_some());
-        }
-
-        assert!(cluster_membership().is_none());
-    }
-
-    #[test]
-    fn cluster_membership_derives_from_registry() {
-        let _standalone = crate::engine::acquire_standalone_test_guard();
-        let _registry = BackendRegistryTestGuard::new();
-        let endpoint: SocketAddr = "127.0.0.1:19090".parse().unwrap();
-        let registry = Arc::new(BackendRegistry::new(3));
-        let be_id = registry.add_backend_with_state(endpoint, BackendState::Live);
-        replace_backend_registry_for_test(Some(Arc::clone(&registry)));
-
-        let membership = cluster_membership().expect("membership derives from installed registry");
-        assert_eq!(
-            membership.live_endpoints(),
-            vec![(be_id as usize, endpoint)]
-        );
-
-        membership.record_scheduled_fragment(be_id);
-        let entry = registry
-            .snapshot()
-            .into_iter()
-            .find(|e| e.be_id == be_id)
-            .expect("entry");
-        assert_eq!(entry.scheduled_fragments, 1);
-    }
-
-    #[test]
-    fn cluster_membership_test_override_takes_precedence() {
-        let _standalone = crate::engine::acquire_standalone_test_guard();
-        let _registry = BackendRegistryTestGuard::new();
-        // Registry present, but the test override must win.
-        let registry = Arc::new(BackendRegistry::new(3));
-        registry.add_backend_with_state("127.0.0.1:19091".parse().unwrap(), BackendState::Live);
-        replace_backend_registry_for_test(Some(registry));
-
-        let injected: SocketAddr = "127.0.0.1:29091".parse().unwrap();
-        replace_cluster_membership_for_test(Some(Arc::new(FakeClusterMembership::new(vec![(
-            7, injected,
-        )]))));
-
-        assert_eq!(
-            cluster_membership()
-                .expect("override present")
-                .live_endpoints(),
-            vec![(7usize, injected)]
-        );
     }
 }

@@ -284,6 +284,7 @@ pub(crate) fn execute_dml_change_stream_write(
         prepared,
         native_bundle,
         query_opts.cloned(),
+        None,
     )?;
     dml_change_stream_write_execution(result, commit_plan)
 }

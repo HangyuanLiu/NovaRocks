@@ -71,7 +71,10 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
 
     fn ctx() -> RewriteContext {
-        RewriteContext::new(RewriteConsumer::Query)
+        RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        )
     }
 
     #[test]

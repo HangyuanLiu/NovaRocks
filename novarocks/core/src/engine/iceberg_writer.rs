@@ -66,6 +66,7 @@ use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
 use crate::sql::parser::ast::{InsertSource, Literal};
 use crate::sql::planner::distributed::write::sink::{
@@ -84,6 +85,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     source: &InsertSource,
     overwrite_mode: crate::sql::parser::ast::OverwriteMode,
     target_ref: &str,
+    execution: Option<QueryExecutionContext>,
 ) -> Result<StatementResult, String> {
     use crate::sql::parser::ast::OverwriteMode;
     debug_assert_eq!(target.backend_name, "iceberg");
@@ -161,6 +163,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         table,
         &entry,
         table_ident,
+        execution,
     )
 }
 
@@ -177,6 +180,7 @@ fn execute_iceberg_insert_distributed(
     table: iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     table_ident: TableIdent,
+    execution: Option<QueryExecutionContext>,
 ) -> Result<StatementResult, String> {
     let metadata = table.metadata();
     let (query, sink_spec) =
@@ -225,6 +229,7 @@ fn execute_iceberg_insert_distributed(
         query,
         sink_spec,
         commit_executor,
+        execution,
     };
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
@@ -259,6 +264,7 @@ struct DistributedInsertWriteExecutor {
     query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
+    execution: Option<QueryExecutionContext>,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
@@ -274,6 +280,7 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
             self.sink_spec.clone(),
             None,
             None,
+            self.execution.as_ref(),
         )
     }
 

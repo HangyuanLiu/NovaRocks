@@ -87,6 +87,7 @@ pub(crate) fn optimize(
     query_stats: &QueryStatsSnapshot,
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
+    settings: &options::SessionOptimizerSettings,
 ) -> Result<OptimizedOperatorNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
@@ -97,6 +98,7 @@ pub(crate) fn optimize(
         factory,
         mv_candidates,
         PhysicalPropertySet::gather(),
+        settings,
     )
 }
 
@@ -106,6 +108,7 @@ pub(crate) fn optimize_with_root_distribution(
     query_stats: &QueryStatsSnapshot,
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
+    settings: &options::SessionOptimizerSettings,
 ) -> Result<OptimizedOperatorNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let root_required = PhysicalPropertySet {
@@ -120,6 +123,7 @@ pub(crate) fn optimize_with_root_distribution(
         factory,
         Vec::new(),
         root_required,
+        settings,
     )
 }
 
@@ -129,6 +133,7 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
+    settings: &options::SessionOptimizerSettings,
 ) -> Result<OptimizedOperatorNode, String> {
     // Migration-only entry point for callers that still build unbound scan
     // expressions. The scan estimator ignores this name-keyed map; production
@@ -141,6 +146,7 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
         factory,
         mv_candidates,
         PhysicalPropertySet::gather(),
+        settings,
     )
 }
 
@@ -150,6 +156,7 @@ pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migrati
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
+    settings: &options::SessionOptimizerSettings,
 ) -> Result<OptimizedOperatorNode, String> {
     // Migration-only entry point; see `optimize_with_legacy_table_stats_for_migration`.
     let root_required = PhysicalPropertySet {
@@ -164,6 +171,7 @@ pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migrati
         factory,
         Vec::new(),
         root_required,
+        settings,
     )
 }
 
@@ -174,6 +182,7 @@ fn optimize_with_root_property(
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     root_required: PhysicalPropertySet,
+    session_settings: &options::SessionOptimizerSettings,
 ) -> Result<OptimizedOperatorNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
@@ -186,10 +195,9 @@ fn optimize_with_root_property(
     // 1. Query logical rewrite pipeline. The ordered stages preserve the
     //    legacy-safe sequence: pushdown → join reorder → pushdown →
     //    variant path pushdown → aggregate pushdown → column pruning.
-    let session_settings = options::current_session_optimizer_settings();
-    let options = options::OptimizerOptions::from_session(&session_settings);
+    let options = options::OptimizerOptions::from_session(session_settings);
     let mut rewrite_ctx =
-        rewrite::context::RewriteContext::for_query(session_settings.disabled_rules.clone());
+        rewrite::context::RewriteContext::for_query_with_settings(session_settings.clone());
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
     rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
@@ -987,6 +995,22 @@ mod is_known_rule_name_tests {
         factory: ColumnRefFactory,
         mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     ) -> Result<OptimizedOperatorNode, String> {
+        optimize_logical_with_settings(
+            plan,
+            table_stats,
+            factory,
+            mv_candidates,
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        )
+    }
+
+    fn optimize_logical_with_settings(
+        plan: LogicalPlanNode,
+        table_stats: &HashMap<String, TableStatistics>,
+        factory: ColumnRefFactory,
+        mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
+        settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+    ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
         let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
         optimize_with_legacy_table_stats_for_migration(
@@ -995,6 +1019,7 @@ mod is_known_rule_name_tests {
             table_stats,
             factory,
             mv_candidates,
+            settings,
         )
     }
 
@@ -1012,6 +1037,7 @@ mod is_known_rule_name_tests {
             table_stats,
             factory,
             root_distribution,
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         )
     }
 
@@ -1315,6 +1341,7 @@ mod is_known_rule_name_tests {
             &stats,
             ColumnRefFactory::new(),
             vec![candidate],
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         )
         .expect("optimize");
 
@@ -1418,9 +1445,13 @@ mod is_known_rule_name_tests {
             ],
             ..Default::default()
         };
-        let err = crate::sql::optimizer::options::with_session_optimizer_settings(settings, || {
-            optimize_logical(plan, &HashMap::new(), ColumnRefFactory::new(), Vec::new())
-        })
+        let err = optimize_logical_with_settings(
+            plan,
+            &HashMap::new(),
+            ColumnRefFactory::new(),
+            Vec::new(),
+            &settings,
+        )
         .expect_err("backstop must reject the residual apply");
         assert!(
             err.contains("subquery decorrelation failed"),

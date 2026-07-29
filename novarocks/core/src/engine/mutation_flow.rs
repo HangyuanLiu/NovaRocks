@@ -40,6 +40,7 @@ use crate::engine::write_transaction::{
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
@@ -53,6 +54,7 @@ pub(crate) fn execute_update_statement(
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    execution: &QueryExecutionContext,
 ) -> Result<StatementResult, String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
@@ -142,6 +144,7 @@ pub(crate) fn execute_update_statement(
                 &target_columns,
                 entry,
                 &target_ref,
+                execution.clone(),
             )
         }
         IcebergUpdateMode::MergeOnRead => execute_mor_update(
@@ -155,6 +158,7 @@ pub(crate) fn execute_update_statement(
             &target_columns,
             entry,
             &target_ref,
+            execution.clone(),
         ),
     }
 }
@@ -990,6 +994,7 @@ fn execute_mor_update(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
+    execution: QueryExecutionContext,
 ) -> Result<StatementResult, String> {
     // For branch DML, read partition metadata at the branch head snapshot.
     let read_snapshot_id: Option<i64> = if target_ref != "main" {
@@ -1039,6 +1044,7 @@ fn execute_mor_update(
         read_snapshot_id,
         target_ref,
         write,
+        execution,
     )?;
     Ok(StatementResult::Ok)
 }
@@ -1051,6 +1057,7 @@ struct MorUpdateChangeStreamExecutor {
     commit_plan: Mutex<
         Option<crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan>,
     >,
+    execution: QueryExecutionContext,
 }
 
 struct MorMergeChangeStreamExecutor {
@@ -1061,6 +1068,7 @@ struct MorMergeChangeStreamExecutor {
     commit_plan: Mutex<
         Option<crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan>,
     >,
+    execution: QueryExecutionContext,
 }
 
 impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
@@ -1099,6 +1107,7 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
             prepared,
             native_bundle,
             None,
+            Some(&self.execution),
         )?;
         if let Some(commit) = result.write_commit.as_ref()
             && !write_commit_has_files(commit)
@@ -1175,6 +1184,7 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
             prepared,
             native_bundle,
             None,
+            Some(&self.execution),
         )?;
         if let Some(commit) = result.write_commit.as_ref()
             && !write_commit_has_files(commit)
@@ -1264,6 +1274,7 @@ fn run_mor_update_change_stream_transaction(
     base_snapshot_id: Option<i64>,
     target_ref: &str,
     write: crate::engine::dml_change_stream::DmlChangeStreamWritePlan,
+    execution: QueryExecutionContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -1312,6 +1323,7 @@ fn run_mor_update_change_stream_transaction(
         write: Mutex::new(Some(write)),
         commit_executor,
         commit_plan: Mutex::new(None),
+        execution,
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -1329,6 +1341,7 @@ fn run_mor_merge_change_stream_transaction(
     base_snapshot_id: Option<i64>,
     target_ref: &str,
     write: crate::engine::dml_change_stream::DmlChangeStreamWritePlan,
+    execution: QueryExecutionContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -1377,6 +1390,7 @@ fn run_mor_merge_change_stream_transaction(
         write: Mutex::new(Some(write)),
         commit_executor,
         commit_plan: Mutex::new(None),
+        execution,
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -1403,6 +1417,7 @@ fn execute_cow_update(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
+    execution: QueryExecutionContext,
 ) -> Result<StatementResult, String> {
     if matched.row_ids.is_empty() {
         return Ok(StatementResult::Ok);
@@ -1456,6 +1471,7 @@ fn execute_cow_update(
         base_snapshot_id,
         target_ref,
         write,
+        execution,
     )?;
     Ok(StatementResult::Ok)
 }
@@ -1762,6 +1778,7 @@ struct DistributedCowUpdateExecutor {
     write: Mutex<Option<CowUpdateDistributedWrite>>,
     commit_executor: IcebergWriteCommitExecutor,
     cow_update_rewrite: Mutex<Option<CowUpdateRewriteSet>>,
+    execution: QueryExecutionContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
@@ -1788,6 +1805,7 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             // Pure UPDATE appends no net-new data files; only a folded MERGE
             // not-matched INSERT (M3b) populates `appended_files`.
             Vec::new(),
+            &self.execution,
         )?;
 
         let write_commit = rewrite.write_commit;
@@ -1864,6 +1882,7 @@ fn run_cow_update_file_rewrites(
     metadata: &iceberg::spec::TableMetadata,
     collector: &Arc<IcebergCommitCollector>,
     appended_files: Vec<crate::connector::iceberg::commit::WrittenFile>,
+    execution: &QueryExecutionContext,
 ) -> Result<CowUpdateRewriteRun, String> {
     let mut merged_commit: Option<WriteCommitInput> = None;
     let mut touched_data_files = Vec::with_capacity(write.file_plans.len());
@@ -1875,6 +1894,7 @@ fn run_cow_update_file_rewrites(
             &write.data_sink_spec,
             metadata,
             collector,
+            execution,
         )?;
         // Merge this file's writer commits into the single transaction-wide
         // `WriteCommitInput`; the collector turns all of them into committed
@@ -1923,6 +1943,7 @@ fn run_one_cow_file_rewrite(
     data_sink_spec: &IcebergWriteSinkSpec,
     metadata: &iceberg::spec::TableMetadata,
     collector: &Arc<IcebergCommitCollector>,
+    execution: &QueryExecutionContext,
 ) -> Result<CowFileRewriteOutput, String> {
     crate::engine::query_prep::register_synthetic_table_for_query(
         state,
@@ -1937,6 +1958,7 @@ fn run_one_cow_file_rewrite(
         data_sink_spec.clone(),
         None,
         None,
+        Some(execution),
     );
     let drop_result = crate::engine::query_prep::drop_local_table_registration_if_exists(
         state,
@@ -2004,6 +2026,7 @@ fn run_cow_update_distributed_transaction(
     base_snapshot_id: Option<i64>,
     target_ref: &str,
     write: CowUpdateDistributedWrite,
+    execution: QueryExecutionContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -2052,6 +2075,7 @@ fn run_cow_update_distributed_transaction(
         write: Mutex::new(Some(write)),
         commit_executor,
         cow_update_rewrite: Mutex::new(None),
+        execution,
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -2374,6 +2398,7 @@ pub(crate) fn execute_merge_statement(
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    execution: &QueryExecutionContext,
 ) -> Result<StatementResult, String> {
     let target = crate::engine::backend_resolver::resolve_existing_table_target(
         state,
@@ -2502,6 +2527,7 @@ pub(crate) fn execute_merge_statement(
             base_snapshot_id,
             target_ref,
             write,
+            execution.clone(),
         )?;
         return Ok(StatementResult::Ok);
     }
@@ -2674,6 +2700,7 @@ pub(crate) fn execute_merge_statement(
             matched: matched_branch,
         })),
         commit_executor,
+        execution: execution.clone(),
         cow_update_rewrite: Mutex::new(None),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
@@ -3405,6 +3432,7 @@ struct DistributedMergeExecutor {
     commit_op_kind: CommitOpKind,
     branches: Mutex<Option<MergeBranchSet>>,
     commit_executor: IcebergWriteCommitExecutor,
+    execution: QueryExecutionContext,
     /// Populated by `run_coordinated_write` for the COW fold so `commit` can
     /// carry the rewrite set (touched files + appended INSERT data) on the
     /// commit context. `None` for MOR / DELETE / INSERT-only folds.
@@ -3434,6 +3462,7 @@ impl DistributedMergeExecutor {
             sink_spec.clone(),
             None,
             None,
+            Some(&self.execution),
         )?;
         if let Some(abort) = &result.write_abort {
             return Err(format!(
@@ -3514,6 +3543,7 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
                     self.commit_executor.table.metadata(),
                     &self.commit_executor.collector,
                     insert_files,
+                    &self.execution,
                 )?;
                 commit_parts.push(QueryExecutionResult {
                     query_result: QueryResult::empty(),

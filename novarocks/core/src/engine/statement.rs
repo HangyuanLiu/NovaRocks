@@ -1202,6 +1202,7 @@ pub(crate) fn execute_insert_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     query_opts: Option<&crate::runtime::query_options::QueryOptions>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<StatementResult, String> {
     crate::engine::insert_flow::run_insert(
         state,
@@ -1212,6 +1213,7 @@ pub(crate) fn execute_insert_statement(
         current_catalog,
         current_database,
         query_opts,
+        execution,
     )
 }
 

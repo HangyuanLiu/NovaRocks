@@ -140,6 +140,7 @@ impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor 
             self.sink_spec.clone(),
             None,
             None,
+            None,
         )?;
         if result.write_abort.is_none()
             && result

@@ -17,7 +17,6 @@
 
 //! Per-optimize-call configuration shared by logical rewrite and CBO drivers.
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -89,33 +88,6 @@ impl SessionOptimizerSettings {
     pub(crate) fn mv_rewrite_enabled(&self) -> bool {
         self.enable_materialized_view_rewrite.unwrap_or(true)
     }
-}
-
-thread_local! {
-    static SESSION_OPTIMIZER_SETTINGS: RefCell<SessionOptimizerSettings> =
-        RefCell::new(SessionOptimizerSettings::default());
-}
-
-pub(crate) fn with_session_optimizer_settings<T>(
-    settings: SessionOptimizerSettings,
-    f: impl FnOnce() -> T,
-) -> T {
-    SESSION_OPTIMIZER_SETTINGS.with(|cell| {
-        let previous = cell.replace(settings);
-        let result = f();
-        cell.replace(previous);
-        result
-    })
-}
-
-pub(crate) fn current_session_optimizer_settings() -> SessionOptimizerSettings {
-    SESSION_OPTIMIZER_SETTINGS.with(|cell| cell.borrow().clone())
-}
-
-pub(crate) fn install_session_optimizer_settings(settings: SessionOptimizerSettings) {
-    SESSION_OPTIMIZER_SETTINGS.with(|cell| {
-        *cell.borrow_mut() = settings;
-    });
 }
 
 /// Controls which rules fire and bounds resource use.
@@ -309,29 +281,6 @@ mod tests {
         let opts = OptimizerOptions::from_session(&settings);
         assert!(opts.is_enabled("JoinCommutativity"));
         assert!(opts.is_enabled("AnyRuleAtAll"));
-    }
-
-    struct SessionOptimizerSettingsRestore {
-        previous: SessionOptimizerSettings,
-    }
-
-    impl Drop for SessionOptimizerSettingsRestore {
-        fn drop(&mut self) {
-            install_session_optimizer_settings(self.previous.clone());
-        }
-    }
-
-    #[test]
-    fn install_session_optimizer_settings_updates_current_settings() {
-        let _restore = SessionOptimizerSettingsRestore {
-            previous: current_session_optimizer_settings(),
-        };
-        let settings = SessionOptimizerSettings {
-            effective_backend_count: Some(5.0),
-            ..Default::default()
-        };
-        install_session_optimizer_settings(settings.clone());
-        assert_eq!(current_session_optimizer_settings(), settings);
     }
 
     #[test]

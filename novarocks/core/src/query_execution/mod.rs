@@ -30,6 +30,7 @@ pub(crate) mod outcome;
 pub(crate) mod preparation;
 pub(crate) mod profile;
 pub mod report;
+pub mod request_context;
 mod runtime_filter;
 pub(crate) mod schedule;
 pub mod service;

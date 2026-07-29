@@ -57,6 +57,7 @@ use crate::engine::write_transaction::{
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
@@ -68,6 +69,7 @@ pub(crate) fn execute_delete_statement(
     stmt: &DeleteStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    execution: &QueryExecutionContext,
 ) -> Result<StatementResult, String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
@@ -158,6 +160,7 @@ pub(crate) fn execute_delete_statement(
             base_snapshot_id,
             &target_ref,
             &stmt.where_clause,
+            execution.clone(),
         )?;
         return Ok(StatementResult::Ok);
     }
@@ -206,6 +209,7 @@ pub(crate) fn execute_delete_statement(
         &target_ref,
         delete_query,
         sink_spec,
+        execution.clone(),
     )?;
 
     Ok(StatementResult::Ok)
@@ -217,6 +221,7 @@ struct DistributedDeleteWriteExecutor {
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
+    execution: QueryExecutionContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
@@ -232,6 +237,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
             self.sink_spec.clone(),
             None,
             None,
+            Some(&self.execution),
         )?;
         if result
             .write_commit
@@ -262,6 +268,7 @@ struct DistributedDvDeleteWriteExecutor {
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
+    execution: QueryExecutionContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
@@ -277,6 +284,7 @@ impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
             self.sink_spec.clone(),
             None,
             Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
+            Some(&self.execution),
         )?;
         if result
             .write_commit
@@ -311,6 +319,7 @@ fn run_delete_dv_write_transaction(
     base_snapshot_id: Option<i64>,
     target_ref: &str,
     where_clause: &sqlast::Expr,
+    execution: QueryExecutionContext,
 ) -> Result<(), String> {
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
@@ -399,6 +408,7 @@ fn run_delete_dv_write_transaction(
         delete_query,
         sink_spec,
         commit_executor,
+        execution,
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -417,6 +427,7 @@ fn run_delete_write_transaction(
     target_ref: &str,
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
+    execution: QueryExecutionContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -465,6 +476,7 @@ fn run_delete_write_transaction(
         delete_query,
         sink_spec,
         commit_executor,
+        execution,
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;

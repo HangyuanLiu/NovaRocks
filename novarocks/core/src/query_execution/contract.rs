@@ -18,6 +18,7 @@
 //! Core-owned distributed-query request contract.
 
 use std::fmt;
+use std::time::Instant;
 
 use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::artifact::PreparedDistributedQuery;
@@ -27,6 +28,7 @@ pub use crate::query_execution::outcome::FragmentProfileSet;
 pub use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::preparation::PreparedFragmentSet;
 pub use crate::query_execution::profile::ProfileReportBuilder;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;
 
 /// Coordinator-neutral query identity.
@@ -154,6 +156,8 @@ pub enum DistributedQueryIntent {
 pub struct DistributedQueryRequest {
     artifacts: PreparedDistributedQuery,
     options: ResolvedQueryOptions,
+    topology: crate::query_execution::backend::BackendTopologySnapshot,
+    deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
 }
@@ -175,10 +179,20 @@ impl DistributedQueryRequest {
         &self.cancellation
     }
 
+    pub fn topology(&self) -> &crate::query_execution::backend::BackendTopologySnapshot {
+        &self.topology
+    }
+
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     pub fn into_parts(self) -> DistributedQueryRequestParts {
         DistributedQueryRequestParts {
             artifacts: self.artifacts,
             options: self.options,
+            topology: self.topology,
+            deadline: self.deadline,
             cancellation: self.cancellation,
             completion: self.completion,
         }
@@ -190,23 +204,28 @@ impl DistributedQueryRequest {
 pub struct DistributedQueryRequestParts {
     pub artifacts: PreparedDistributedQuery,
     pub options: ResolvedQueryOptions,
+    pub topology: crate::query_execution::backend::BackendTopologySnapshot,
+    pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
 }
 
-/// The only production constructor for a core-owned distributed request.
-#[allow(dead_code)]
-pub(crate) fn build_distributed_query_request(
+/// Request construction accepts only the execution projection captured at
+/// admission; callers cannot synthesize an empty topology or cancellation
+/// fallback at the coordinator boundary.
+pub(crate) fn build_distributed_query_request_with_execution(
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     options: Option<QueryOptions>,
     intent: DistributedQueryIntent,
-    cancellation: QueryCancellationView,
+    execution: &QueryExecutionContext,
 ) -> Result<DistributedQueryRequest, DistributedQueryError> {
     Ok(DistributedQueryRequest {
         artifacts: PreparedDistributedQuery::new(prepared, native_bundle),
         options: ResolvedQueryOptions::from_upstream(options),
-        cancellation,
+        topology: execution.topology().clone(),
+        deadline: execution.deadline(),
+        cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(intent),
     })
 }
