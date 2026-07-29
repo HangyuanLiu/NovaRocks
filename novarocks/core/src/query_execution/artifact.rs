@@ -54,6 +54,11 @@ use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
 };
 
+pub use crate::query_execution::connector_binding::{
+    ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
+    ConnectorBindingInstallLease, ConnectorBindingInstallPlan, DispatchingConnectorBindingBarrier,
+    new_grpc_connector_binding_dispatcher,
+};
 pub type FragmentId = u32;
 pub type PlanNodeId = i32;
 
@@ -106,8 +111,8 @@ impl PreparedDistributedQuery {
 }
 
 /// A core artifact bound to one validated schedule. This type deliberately has
-/// no `assemble` method: query initialization and the frontend-owned control
-/// readiness barrier must first produce `ControlReadyDistributedQuery`.
+/// no `assemble` method: query initialization/control readiness and the
+/// connector install/ACK barrier must first complete.
 ///
 /// ```compile_fail
 /// use novarocks::query_execution::artifact::ScheduleBoundDistributedQuery;
@@ -161,7 +166,8 @@ impl ScheduleBoundDistributedQuery {
     }
 }
 
-/// The only query-control typestate that can assemble native submissions.
+/// Query lifecycle is ready, but connector instances still require their
+/// independent process-scoped install/ACK barrier.
 pub struct ControlReadyDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
@@ -171,6 +177,48 @@ pub struct ControlReadyDistributedQuery {
 }
 
 impl ControlReadyDistributedQuery {
+    pub fn prepare_connector_bindings(
+        self,
+        barrier: &dyn ConnectorBindingInstallBarrier,
+    ) -> Result<ConnectorBindingReadyDistributedQuery, DistributedQueryError> {
+        let plan = crate::query_execution::connector_binding::compile_install_plan(
+            &self.prepared,
+            &self.schedule.inner,
+        )?;
+        let connector_binding_lease = match barrier.install_all(plan) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let kind = error.kind();
+                let message = self
+                .query_lifecycle_lease
+                    .abort_preserving(error.message().to_string());
+                return Err(DistributedQueryError::new(kind, message));
+            }
+        };
+        Ok(ConnectorBindingReadyDistributedQuery {
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            options: self.options,
+            query_lifecycle_lease: self.query_lifecycle_lease,
+            connector_binding_lease,
+        })
+    }
+}
+
+/// The only typestate that can assemble native submissions.  In particular,
+/// it is impossible to create a submission before every selected BE has ACKed
+/// the connector declarations it will resolve by instance id.
+pub struct ConnectorBindingReadyDistributedQuery {
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    schedule: ValidatedFragmentSchedule,
+    options: QueryInitOptions,
+    query_lifecycle_lease: QueryLifecycleLease,
+    connector_binding_lease: ConnectorBindingInstallLease,
+}
+
+impl ConnectorBindingReadyDistributedQuery {
     pub fn assemble(self) -> Result<PreparedNativeExecution, DistributedQueryError> {
         let context = match self.options.native_submission_context() {
             Ok(context) => context,
@@ -179,6 +227,7 @@ impl ControlReadyDistributedQuery {
                 let message = self
                     .query_lifecycle_lease
                     .abort_preserving(error.message().to_string());
+                let message = self.connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -196,12 +245,14 @@ impl ControlReadyDistributedQuery {
                 writer_registrations: assembled.writer_registrations,
                 expected_output: assembled.expected_output,
                 query_lifecycle_lease: self.query_lifecycle_lease,
+                connector_binding_lease: self.connector_binding_lease,
             }),
             Err(error) => {
                 let kind = error.kind();
                 let message = self
                     .query_lifecycle_lease
                     .abort_preserving(error.message().to_string());
+                let message = self.connector_binding_lease.abort_preserving(message);
                 Err(DistributedQueryError::new(kind, message))
             }
         }
@@ -928,6 +979,7 @@ pub struct PreparedNativeExecution {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
+    connector_binding_lease: ConnectorBindingInstallLease,
 }
 
 struct AssembledNativeExecution {
@@ -945,6 +997,7 @@ impl PreparedNativeExecution {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
+            connector_binding_lease: self.connector_binding_lease,
         }
     }
 }
@@ -957,6 +1010,7 @@ pub struct PreparedNativeExecutionParts {
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
+    pub connector_binding_lease: ConnectorBindingInstallLease,
 }
 
 fn assemble_native_execution(
