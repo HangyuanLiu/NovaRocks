@@ -55,14 +55,7 @@ impl ActiveQueryFaultState {
     }
 
     fn mark_query_done(&self) -> bool {
-        self.state
-            .compare_exchange(
-                QUERY_RUNNING,
-                QUERY_DONE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        self.state.swap(QUERY_DONE, Ordering::AcqRel) != QUERY_DONE
     }
 
     fn query_is_done(&self) -> bool {
@@ -274,6 +267,7 @@ pub(crate) fn execute_with_post_fragment_start_fault<T, F>(
     meta: &QueryMeta,
     server: &Arc<Mutex<Box<dyn ServerHandle>>>,
     query_connection_id: Option<u32>,
+    shared_deadline: Option<Instant>,
     execute_query: F,
 ) -> Result<T>
 where
@@ -407,8 +401,30 @@ where
     let worker_server = Arc::clone(server);
     let worker_fault_state = Arc::clone(&fault_state);
     let worker = thread::spawn(move || -> Result<()> {
-        let deadline = Instant::now() + POST_FRAGMENT_START_TIMEOUT;
+        let deadline = shared_deadline.unwrap_or_else(|| Instant::now() + POST_FRAGMENT_START_TIMEOUT);
+        let mut deadline_cancel_sent = false;
         loop {
+            if Instant::now() >= deadline {
+                let server = worker_server
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+                let fe = server.fe_log_contents().unwrap_or_default();
+                let bes = (0..server.be_count())
+                    .map(|index| server.be_log_contents(index).unwrap_or_default())
+                    .collect::<Vec<_>>();
+                bail!(
+                    "timed out waiting for post-query fault marker; fe_tail={:?}; be_tails={:?}",
+                    log_tail(&fe),
+                    bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
+                );
+            }
+            maybe_cancel_query_near_deadline(
+                &worker_server,
+                &worker_fault_state,
+                query_connection_id,
+                deadline,
+                &mut deadline_cancel_sent,
+            )?;
             let ready = {
                 let server = worker_server
                     .lock()
@@ -459,6 +475,17 @@ where
                 let mut server = worker_server
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+                let mut evidence_execution = match (&baseline, fault) {
+                    (
+                        FaultBaseline::FrontendReady { ready_count, .. },
+                        PostQueryFault::KillFrontendAfterControlReady(_)
+                        | PostQueryFault::KillQueryAfterControlReady { .. },
+                    ) => fresh_fe_control_ready_execution(
+                        &server.fe_log_contents()?,
+                        *ready_count as usize,
+                    )?,
+                    _ => None,
+                };
                 let action_result = (|| -> Result<()> {
                     match fault {
                     PostQueryFault::KillBackend(index) => server.kill_be(index)?,
@@ -484,6 +511,17 @@ where
                             })
                             .and_then(|line| marker_field(line, "execution_id"))
                             .context("restart marker is missing execution_id")?;
+                        let backend_id = old_log
+                            .lines()
+                            .rev()
+                            .find(|line| {
+                                line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
+                                    && line.contains(&format!("token={token}"))
+                            })
+                            .and_then(|line| marker_field(line, "backend_id"))
+                            .context("restart marker is missing backend_id")?
+                            .parse::<u64>()
+                            .context("restart marker has invalid backend_id")?;
                         server.restart_be_until(index, deadline)?;
                         let new_epoch = server.backend_start_epoch(index)?;
                         if new_epoch == *start_epoch {
@@ -492,16 +530,15 @@ where
                             );
                         }
                         let new_log = server.be_current_log_contents(index)?;
-                        if new_log.lines().any(|line| {
-                            line.contains("NOVAROCKS_QUERY_INIT_APPLIED")
-                                && line.contains(&format!("execution_id={old_execution}"))
-                        }) {
-                            bail!(
-                                "BE[{index}] restored old execution {old_execution} after restart"
-                            );
-                        }
+                        validate_restart_nonrestore_status(
+                            &new_log,
+                            &old_execution,
+                            backend_id,
+                            new_epoch,
+                        )?;
+                        evidence_execution = Some(old_execution.clone());
                         println!(
-                            "query lifecycle BE restart proof PASS: backend_index={index} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} restored=false"
+                            "query lifecycle BE restart proof PASS: backend_index={index} backend_id={backend_id} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 restored=false"
                         );
                     }
                     PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
@@ -516,33 +553,44 @@ where
                             unreachable!("FE crash fault has frontend baseline");
                         };
                         loop {
-                            let all_lost = coordinator_lost
-                                .iter()
-                                .enumerate()
-                                .map(|(index, baseline)| {
-                                    server
-                                        .be_log_count(
-                                            index,
-                                            "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST",
-                                        )
-                                        .map(|count| count > *baseline as usize)
-                                })
-                                .collect::<Result<Vec<_>>>()?
-                                .into_iter()
-                                .all(|lost| lost);
-                            if all_lost {
-                                break;
-                            }
                             if Instant::now() >= deadline {
                                 let fe = server.fe_log_contents().unwrap_or_default();
                                 let bes = (0..server.be_count())
-                                    .map(|index| server.be_log_contents(index).unwrap_or_default())
+                                    .map(|index| {
+                                        server.be_log_contents(index).unwrap_or_default()
+                                    })
                                     .collect::<Vec<_>>();
                                 bail!(
                                     "timed out waiting for coordinator-lost marker on every BE after FE crash; fe_tail={:?}; be_tails={:?}",
                                     log_tail(&fe),
                                     bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
                                 );
+                            }
+                            let lost_executions = coordinator_lost
+                                .iter()
+                                .enumerate()
+                                .map(|(index, baseline)| {
+                                    let log = server.be_log_contents(index)?;
+                                    let execution = log
+                                        .lines()
+                                        .filter(|line| {
+                                            line.contains(
+                                                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST",
+                                            )
+                                        })
+                                        .skip(*baseline as usize)
+                                        .find_map(|line| marker_field(line, "execution_id"));
+                                    Ok(execution)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let all_lost = lost_executions.iter().all(Option::is_some);
+                            let same_execution = all_lost
+                                && lost_executions
+                                    .iter()
+                                    .flatten()
+                                    .all(|execution| Some(execution) == evidence_execution.as_ref());
+                            if same_execution {
+                                break;
                             }
                             sleep(POST_FRAGMENT_START_POLL_INTERVAL);
                         }
@@ -563,24 +611,59 @@ where
                         bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
                     );
                 }
-                return Ok(());
+                if matches!(
+                    fault,
+                    PostQueryFault::KillFrontendAfterControlReady(_)
+                        | PostQueryFault::KillQueryAfterControlReady { .. }
+                ) {
+                    deadline_cancel_sent = true;
+                }
+                drop(server);
+                loop {
+                    if Instant::now() >= deadline {
+                        let server = worker_server
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+                        let fe = server.fe_log_contents().unwrap_or_default();
+                        let bes = (0..server.be_count())
+                            .map(|index| server.be_log_contents(index).unwrap_or_default())
+                            .collect::<Vec<_>>();
+                        bail!(
+                            "post-query lifecycle deadline expired before query completion and required terminal cleanup evidence: query_done={} execution_id={:?}; fe_tail={:?}; be_tails={:?}",
+                            worker_fault_state.query_is_done(),
+                            evidence_execution,
+                            log_tail(&fe),
+                            bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
+                        );
+                    }
+                    maybe_cancel_query_near_deadline(
+                        &worker_server,
+                        &worker_fault_state,
+                        query_connection_id,
+                        deadline,
+                        &mut deadline_cancel_sent,
+                    )?;
+                    let evidence_ready = match fault {
+                        PostQueryFault::KillFrontendAfterControlReady(_)
+                        | PostQueryFault::KillQueryAfterControlReady { .. } => {
+                            let execution = evidence_execution
+                                .as_deref()
+                                .context("post-query lifecycle fault has no execution anchor")?;
+                            let server = worker_server
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+                            terminal_cleanup_on_all_backends(server.as_ref(), execution)?
+                        }
+                        _ => true,
+                    };
+                    if worker_fault_state.query_is_done() && evidence_ready {
+                        return Ok(());
+                    }
+                    sleep(POST_FRAGMENT_START_POLL_INTERVAL);
+                }
             }
             if worker_fault_state.query_is_done() {
                 bail!("query completed before the post-query marker barrier was reached");
-            }
-            if Instant::now() >= deadline {
-                let server = worker_server
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-                let fe = server.fe_log_contents().unwrap_or_default();
-                let bes = (0..server.be_count())
-                    .map(|index| server.be_log_contents(index).unwrap_or_default())
-                    .collect::<Vec<_>>();
-                bail!(
-                    "timed out waiting for post-query fault marker; fe_tail={:?}; be_tails={:?}",
-                    log_tail(&fe),
-                    bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
-                );
             }
             sleep(POST_FRAGMENT_START_POLL_INTERVAL);
         }
@@ -605,6 +688,147 @@ where
             std::panic::resume_unwind(panic)
         }
     }
+}
+
+fn maybe_cancel_query_near_deadline(
+    server: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    fault_state: &ActiveQueryFaultState,
+    query_connection_id: Option<u32>,
+    deadline: Instant,
+    cancel_sent: &mut bool,
+) -> Result<()> {
+    #[cfg(not(test))]
+    const DEADLINE_CANCEL_RESERVE: Duration = Duration::from_secs(1);
+    #[cfg(test)]
+    const DEADLINE_CANCEL_RESERVE: Duration = Duration::from_millis(100);
+    if *cancel_sent
+        || fault_state.query_is_done()
+        || deadline.saturating_duration_since(Instant::now()) > DEADLINE_CANCEL_RESERVE
+    {
+        return Ok(());
+    }
+    let Some(connection_id) = query_connection_id else {
+        return Ok(());
+    };
+    let mut server = server
+        .lock()
+        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+    if let Err(error) = server.kill_query_until(connection_id, deadline) {
+        let benign_completion_race = error.to_string().contains("has no active query")
+            || error.to_string().contains("ER_NO_SUCH_THREAD")
+            || error.to_string().contains("ERROR 1094");
+        if !benign_completion_race {
+            let fe = server.fe_log_contents().unwrap_or_default();
+            let bes = (0..server.be_count())
+                .map(|index| server.be_log_contents(index).unwrap_or_default())
+                .collect::<Vec<_>>();
+            bail!(
+                "cancel target query connection {connection_id} before shared fault deadline failed: {error:#}; fe_tail={:?}; be_tails={:?}",
+                log_tail(&fe),
+                bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
+            );
+        }
+    }
+    *cancel_sent = true;
+    Ok(())
+}
+
+fn fresh_fe_control_ready_execution(log: &str, baseline: usize) -> Result<Option<String>> {
+    let executions = log
+        .lines()
+        .filter(|line| line.contains("NOVAROCKS_QUERY_CONTROL_READY"))
+        .skip(baseline)
+        .filter_map(|line| marker_field(line, "execution_id"))
+        .collect::<Vec<_>>();
+    let Some(first) = executions.first() else {
+        return Ok(None);
+    };
+    if executions.iter().any(|execution| execution != first) {
+        bail!("fresh FE ControlReady markers span multiple executions: {executions:?}");
+    }
+    Ok(Some(first.clone()))
+}
+
+fn terminal_cleanup_on_all_backends(
+    server: &dyn ServerHandle,
+    execution_id: &str,
+) -> Result<bool> {
+    if server.be_count() != 3 {
+        bail!(
+            "post-query lifecycle terminal cleanup evidence requires exactly 3 BEs, found {}",
+            server.be_count()
+        );
+    }
+    for index in 0..3 {
+        let log = server.be_log_contents(index)?;
+        let terminated = log.lines().any(|line| {
+            line.contains("NOVAROCKS_QUERY_LIFECYCLE_TERMINATED")
+                && marker_field(line, "execution_id").as_deref() == Some(execution_id)
+        });
+        let cleaned = log.lines().any(|line| {
+            line.contains("NOVAROCKS_QUERY_LIFECYCLE_CLEANUP")
+                && marker_field(line, "execution_id").as_deref() == Some(execution_id)
+                && marker_field(line, "active").as_deref() == Some("false")
+                && marker_field(line, "tombstone").as_deref() == Some("true")
+        });
+        if !terminated || !cleaned {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_restart_nonrestore_status(
+    new_log: &str,
+    old_execution: &str,
+    backend_id: u64,
+    new_epoch: u64,
+) -> Result<()> {
+    for forbidden in [
+        "NOVAROCKS_QUERY_CONTROL_READY",
+        "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
+        "NOVAROCKS_QUERY_INIT_APPLIED",
+    ] {
+        if new_log.lines().any(|line| {
+            line.contains(forbidden)
+                && marker_field(line, "execution_id").as_deref() == Some(old_execution)
+        }) {
+            bail!(
+                "BE backend_id={backend_id} epoch={new_epoch} restored old execution {old_execution}: found {forbidden}"
+            );
+        }
+    }
+    let marker = new_log
+        .lines()
+        .find(|line| {
+            line.contains("NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS")
+                && marker_field(line, "backend_id")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    == Some(backend_id)
+                && marker_field(line, "start_epoch")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    == Some(new_epoch)
+        })
+        .with_context(|| {
+            format!(
+                "new BE has no restoration-status marker for backend_id={backend_id} start_epoch={new_epoch}"
+            )
+        })?;
+    for (field, expected) in [
+        ("control_ready", "0"),
+        ("active_lifecycle", "0"),
+        ("fragment_admissions", "0"),
+        ("fragment_acceptances", "0"),
+        ("restored", "false"),
+    ] {
+        let actual = marker_field(marker, field);
+        if actual.as_deref() != Some(expected) {
+            bail!(
+                "new BE restoration status for old execution {old_execution} backend_id={backend_id} start_epoch={new_epoch} requires {field}={expected}, found {actual:?}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn log_tail(log: &str) -> String {
@@ -1147,7 +1371,7 @@ mod tests {
             ..QueryMeta::default()
         };
 
-        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, || {
+        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
             let (lock, wake) = state.as_ref();
             let mut query = lock.lock().expect("active query state");
             query.events.push("query:start");
@@ -1241,7 +1465,7 @@ mod tests {
             ..QueryMeta::default()
         };
 
-        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, || {
+        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
             let (lock, wake) = state.as_ref();
             let mut query = lock.lock().expect("all-backend release state");
             query.events.push("query:start");
@@ -1283,7 +1507,7 @@ mod tests {
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ =
-                execute_with_post_fragment_start_fault(&meta, &server_handle, None, || -> () {
+                execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || -> () {
                     panic!("simulated query panic");
                 });
         }));
@@ -1338,6 +1562,37 @@ mod tests {
                 .control_ready_count)
         }
 
+        fn fe_log_contents(&self) -> Result<String> {
+            let count = self
+                .state
+                .0
+                .lock()
+                .expect("kill-query state")
+                .control_ready_count;
+            Ok((0..count)
+                .map(|_| {
+                    "NOVAROCKS_QUERY_CONTROL_READY execution_id=10:20:1 backend_id=1\n"
+                })
+                .collect())
+        }
+
+        fn be_log_contents(&self, index: usize) -> Result<String> {
+            let killed = self
+                .state
+                .0
+                .lock()
+                .expect("kill-query state")
+                .killed_connection_id
+                .is_some();
+            Ok(if killed {
+                format!(
+                    "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id=10:20:1 backend_id={index} reason=CoordinatorAbort\nNOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id=10:20:1 backend_id={index} active=false tombstone=true reason=CoordinatorAbort\n"
+                )
+            } else {
+                String::new()
+            })
+        }
+
         fn kill_query(&mut self, connection_id: u32) -> Result<()> {
             let (lock, wake) = self.state.as_ref();
             let mut state = lock.lock().expect("kill-query state");
@@ -1360,7 +1615,7 @@ mod tests {
         };
 
         let result =
-            execute_with_post_fragment_start_fault(&meta, &server_handle, Some(41), || {
+            execute_with_post_fragment_start_fault(&meta, &server_handle, Some(41), None, || {
                 let (lock, wake) = state.as_ref();
                 let mut query = lock.lock().expect("kill-query state");
                 query.control_ready_count = 3;
@@ -1373,5 +1628,115 @@ mod tests {
             .expect("KILL QUERY orchestration");
 
         assert_eq!(result, Some(41));
+    }
+
+    #[test]
+    fn expired_shared_deadline_never_claims_a_post_query_fault() {
+        let state = Arc::new((Mutex::new(KillQueryState::default()), Condvar::new()));
+        let server_handle: Arc<Mutex<Box<dyn ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(KillQueryServerHandle {
+                state: Arc::clone(&state),
+            })));
+        let meta = QueryMeta {
+            kill_query_after_control_ready_count: Some(3),
+            ..QueryMeta::default()
+        };
+
+        let error = execute_with_post_fragment_start_fault(
+            &meta,
+            &server_handle,
+            Some(41),
+            Some(Instant::now()),
+            || None::<u32>,
+        )
+        .expect_err("expired deadline must fail before claiming the fault");
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(
+            state
+                .0
+                .lock()
+                .expect("kill-query state")
+                .killed_connection_id,
+            None
+        );
+    }
+
+    #[test]
+    fn deadline_cancel_accepts_no_active_query_after_concurrent_completion() {
+        struct CompletionRaceHandle;
+
+        impl ServerHandle for CompletionRaceHandle {
+            fn target_host(&self) -> Option<&str> {
+                None
+            }
+
+            fn target_port(&self) -> Option<u16> {
+                None
+            }
+
+            fn supports_fault_injection(&self) -> bool {
+                true
+            }
+
+            fn kill_query(&mut self, _connection_id: u32) -> Result<()> {
+                bail!("ERROR 1094 (HY000): connection has no active query")
+            }
+        }
+
+        let fault_state = Arc::new(ActiveQueryFaultState::new());
+        let server: Arc<Mutex<Box<dyn ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(CompletionRaceHandle)));
+        let mut cancel_sent = false;
+
+        maybe_cancel_query_near_deadline(
+            &server,
+            fault_state.as_ref(),
+            Some(41),
+            Instant::now() + Duration::from_millis(50),
+            &mut cancel_sent,
+        )
+        .expect("concurrent query completion makes no-active-query benign");
+
+        assert!(cancel_sent);
+        assert!(
+            !fault_state.query_is_done(),
+            "the benign decision must not depend on the client setting query_done first"
+        );
+    }
+
+    #[test]
+    fn restart_nonrestore_proof_requires_all_restoration_relevant_state_fields() {
+        let complete = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 restored=false\n";
+        validate_restart_nonrestore_status(complete, "10:20:1", 7, 42)
+            .expect("complete fresh-process state proves non-restoration");
+
+        for field in [
+            "control_ready=0",
+            "active_lifecycle=0",
+            "fragment_admissions=0",
+            "fragment_acceptances=0",
+            "restored=false",
+        ] {
+            let incomplete = complete.replace(field, "");
+            let error = validate_restart_nonrestore_status(&incomplete, "10:20:1", 7, 42)
+                .expect_err("missing restoration field must fail");
+            assert!(error.to_string().contains(field.split('=').next().unwrap()));
+        }
+    }
+
+    #[test]
+    fn restart_nonrestore_proof_rejects_old_execution_control_or_fragment_state() {
+        let status = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 restored=false\n";
+        for marker in [
+            "NOVAROCKS_QUERY_CONTROL_READY",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
+            "NOVAROCKS_QUERY_INIT_APPLIED",
+        ] {
+            let log = format!("{status}{marker} execution_id=10:20:1 backend_id=7\n");
+            let error = validate_restart_nonrestore_status(&log, "10:20:1", 7, 42)
+                .expect_err("old execution state must fail");
+            assert!(error.to_string().contains(marker));
+        }
     }
 }

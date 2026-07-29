@@ -28,6 +28,7 @@ const LOG_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const LOG_EVIDENCE_TIMEOUT: Duration = Duration::from_millis(200);
 const LOG_EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const QUERY_LIFECYCLE_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 const COMPAT_PROBES: &[&str] = &[
     "malformed-plan",
@@ -81,14 +82,30 @@ pub(crate) struct BeLogSnapshot {
     fragment_failure_token: Option<String>,
     log_lengths: Vec<usize>,
     lifecycle_token: Option<(usize, &'static str, String)>,
+    evidence_deadline: Option<Instant>,
+}
+
+impl BeLogSnapshot {
+    pub(crate) fn evidence_deadline(&self) -> Option<Instant> {
+        self.evidence_deadline
+    }
 }
 
 pub(crate) fn snapshot(
     meta: &QueryMeta,
     server_handle: &dyn ServerHandle,
 ) -> Result<BeLogSnapshot> {
+    let evidence_deadline = (meta.kill_be_after_fragment_start.is_some()
+        || meta.fail_fragment_after_start_be_index.is_some()
+        || meta.kill_fe_after_control_ready_count.is_some()
+        || meta.restart_be_after_init_ack_index.is_some()
+        || meta.kill_query_after_control_ready_count.is_some())
+    .then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT);
     if !has_directives(meta) {
-        return Ok(BeLogSnapshot::default());
+        return Ok(BeLogSnapshot {
+            evidence_deadline,
+            ..BeLogSnapshot::default()
+        });
     }
     let be_count = server_handle.be_count();
     if be_count == 0 {
@@ -160,6 +177,7 @@ pub(crate) fn snapshot(
         fragment_failure_token,
         log_lengths,
         lifecycle_token,
+        evidence_deadline,
     })
 }
 
@@ -361,7 +379,6 @@ fn lifecycle_evidence(
         required_anchor_backends,
         required_reason,
         required_reason_backends,
-        require_cleanup,
     ) =
         if step.meta.stop_query_control_heartbeat_be_index.is_some() {
             (
@@ -369,7 +386,6 @@ fn lifecycle_evidence(
                 1,
                 Some("CoordinatorHeartbeatTimeout"),
                 1,
-                true,
             )
         } else if step.meta.kill_fe_after_control_ready_count.is_some() {
             (
@@ -377,7 +393,6 @@ fn lifecycle_evidence(
                 3,
                 Some("CoordinatorStreamLost"),
                 3,
-                false,
             )
         } else {
             (
@@ -385,7 +400,6 @@ fn lifecycle_evidence(
                 3,
                 Some("CoordinatorAbort"),
                 3,
-                false,
             )
         };
     let candidates = if let Some(anchor) = anchor {
@@ -422,7 +436,7 @@ fn lifecycle_evidence(
         if terminated.len() == 3
             && anchor_bes.len() == required_anchor_backends
             && reason_backends >= required_reason_backends
-            && (!require_cleanup || cleanup.len() == 3)
+            && cleanup.len() == 3
         {
             return Ok(Some(LogEvidenceCheck::Satisfied(vec![format!(
                 "    query_lifecycle_evidence PASS execution_id={execution} terminated_backends=3 cleanup_backends={}",
@@ -802,7 +816,51 @@ pub(crate) fn run(
             bail!("BE log evidence directives require at least one runner-owned BE");
         }
         let started = Instant::now();
+        let deadline = snapshot
+            .evidence_deadline
+            .unwrap_or(started + LOG_EVIDENCE_TIMEOUT);
+        let mut pending_reason = "evidence was not evaluated".to_string();
         loop {
+            if Instant::now() >= deadline {
+                let elapsed = started.elapsed();
+                let fe_tail = server_handle
+                    .fe_log_contents()
+                    .map(|contents| {
+                        contents
+                            .lines()
+                            .rev()
+                            .take(20)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_else(|error| format!("<read failed: {error:#}>"));
+                let be_tails = (0..be_count)
+                    .map(|index| {
+                        server_handle
+                            .be_log_contents(index)
+                            .map(|contents| {
+                                contents
+                                    .lines()
+                                    .rev()
+                                    .take(20)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_else(|error| format!("<read failed: {error:#}>"))
+                    })
+                    .collect::<Vec<_>>();
+                bail!(
+                    "BE log evidence timed out after {}ms (poll interval {}ms): {pending_reason}; fe_tail={fe_tail:?}; be_tails={be_tails:?}",
+                    elapsed.as_millis(),
+                    LOG_EVIDENCE_POLL_INTERVAL.as_millis(),
+                );
+            }
             match evaluate_log_evidence(step, server_handle, snapshot, be_count)? {
                 LogEvidenceCheck::Satisfied(successes) => {
                     for success in successes {
@@ -811,13 +869,7 @@ pub(crate) fn run(
                     break;
                 }
                 LogEvidenceCheck::Pending(reason) => {
-                    if started.elapsed() >= LOG_EVIDENCE_TIMEOUT {
-                        bail!(
-                            "BE log evidence timed out after {}ms (poll interval {}ms): {reason}",
-                            LOG_EVIDENCE_TIMEOUT.as_millis(),
-                            LOG_EVIDENCE_POLL_INTERVAL.as_millis()
-                        );
-                    }
+                    pending_reason = reason;
                     std::thread::sleep(LOG_EVIDENCE_POLL_INTERVAL);
                 }
             }
@@ -912,6 +964,10 @@ mod tests {
                 .get(index)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing fake BE log {index}"))
+        }
+
+        fn fe_log_contents(&self) -> Result<String> {
+            Ok("fe-tail-sentinel\n".to_string())
         }
 
         fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
@@ -1289,6 +1345,38 @@ mod tests {
     }
 
     #[test]
+    fn post_query_fragment_fault_starts_the_shared_evidence_deadline_before_execution() {
+        let handle = FakeCompatHandle::new(vec!["", "", ""]);
+        let meta = QueryMeta {
+            fail_fragment_after_start_be_index: Some(1),
+            ..QueryMeta::default()
+        };
+
+        let before = snapshot(&meta, &handle).expect("pre-step snapshot");
+
+        assert!(before.evidence_deadline().is_some());
+    }
+
+    #[test]
+    fn expired_shared_deadline_rejects_otherwise_satisfied_log_evidence() {
+        let handle = FakeCompatHandle::new(vec!["fresh-marker\n", "", ""]);
+        let step = step(QueryMeta {
+            be_log_contains: vec!["fresh-marker".to_string()],
+            ..QueryMeta::default()
+        });
+        let before = BeLogSnapshot {
+            evidence_deadline: Some(Instant::now()),
+            ..BeLogSnapshot::default()
+        };
+
+        let error = run(&step, &handle, &before, &mut String::new())
+            .expect_err("evidence observed after the shared deadline must fail");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("fe-tail-sentinel"));
+    }
+
+    #[test]
     fn compat_directive_polls_bounded_post_step_deltas_for_async_evidence() {
         let handle = Arc::new(FakeCompatHandle::new(vec!["old close\n", "", ""]));
         let step = step(QueryMeta {
@@ -1381,5 +1469,51 @@ mod tests {
             .expect("lifecycle check");
 
         assert!(matches!(check, LogEvidenceCheck::Satisfied(_)));
+    }
+
+    #[test]
+    fn fe_crash_evidence_rejects_terminal_without_cleanup_on_every_backend() {
+        let execution = "10:20:1";
+        let terminal = format!(
+            "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={execution} backend_id=0 reason=CoordinatorStreamLost\nNOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} backend_id=0 reason=CoordinatorStreamLost expected_fragments=1\n"
+        );
+        let handle = FakeCompatHandle::new(vec![
+            &terminal,
+            &terminal.replace("backend_id=0", "backend_id=1"),
+            &terminal.replace("backend_id=0", "backend_id=2"),
+        ]);
+        let step = step(QueryMeta {
+            kill_fe_after_control_ready_count: Some(3),
+            ..QueryMeta::default()
+        });
+
+        let check = lifecycle_evidence(&step, &handle, &BeLogSnapshot::default(), 3)
+            .expect("evaluate evidence")
+            .expect("lifecycle check");
+
+        assert!(matches!(check, LogEvidenceCheck::Pending(_)));
+    }
+
+    #[test]
+    fn kill_query_evidence_rejects_terminal_without_cleanup_on_every_backend() {
+        let execution = "10:20:1";
+        let terminal = format!(
+            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} backend_id=0 reason=CoordinatorAbort expected_fragments=1\n"
+        );
+        let handle = FakeCompatHandle::new(vec![
+            &terminal,
+            &terminal.replace("backend_id=0", "backend_id=1"),
+            &terminal.replace("backend_id=0", "backend_id=2"),
+        ]);
+        let step = step(QueryMeta {
+            kill_query_after_control_ready_count: Some(3),
+            ..QueryMeta::default()
+        });
+
+        let check = lifecycle_evidence(&step, &handle, &BeLogSnapshot::default(), 3)
+            .expect("evaluate evidence")
+            .expect("lifecycle check");
+
+        assert!(matches!(check, LogEvidenceCheck::Pending(_)));
     }
 }

@@ -296,6 +296,26 @@ fn query_control_attachment_requires_backend_identity_binding() {
     );
 }
 
+#[test]
+fn fresh_unbound_registry_reports_no_restoration_relevant_state_after_binding() {
+    let registry = QueryLifecycleRegistry::new_unbound(
+        LOCAL_START_EPOCH,
+        Arc::new(RecordingLocalRuntime::default()),
+        registry_config(8),
+    );
+
+    registry
+        .bind_backend_identity(LOCAL_BACKEND_ID)
+        .expect("first FE-assigned identity binds");
+    let status = registry.restoration_status();
+
+    assert_eq!(status.control_ready, 0);
+    assert_eq!(status.active_lifecycle, 0);
+    assert_eq!(status.fragment_admissions, 0);
+    assert_eq!(status.fragment_acceptances, 0);
+    assert!(!status.restored);
+}
+
 fn execution_id(query_low: i64, attempt: u64) -> QueryExecutionId {
     QueryExecutionId::new(
         QueryId::new(0x514c_4302, query_low),

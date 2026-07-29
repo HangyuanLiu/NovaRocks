@@ -1015,11 +1015,14 @@ fn execute_target_query_with_fault(
     query_timeout: u64,
     sql: &str,
     db: Option<&str>,
+    fault_deadline: Option<Instant>,
 ) -> (bool, Option<QueryExecution>, String) {
+    let query_timeout = bounded_fault_query_timeout(query_timeout, fault_deadline);
     let result = fault_injection::execute_with_post_fragment_start_fault(
         meta,
         server_handle,
         Some(session.connection_id()),
+        fault_deadline,
         || session.execute_query(query_timeout, sql, db),
     )
     .unwrap_or_else(|error| {
@@ -1029,16 +1032,85 @@ fn execute_target_query_with_fault(
             format!("FAIL (runner fault injection): {error:#}"),
         )
     });
-    if meta.kill_fe_after_control_ready_count.is_some()
-        && let Err(error) = session.reconnect()
-    {
-        return (
-            false,
-            None,
-            format!("FAIL (runner FE restart reconnect): {error:#}"),
-        );
+    if meta.kill_fe_after_control_ready_count.is_some() {
+        if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return (
+                false,
+                None,
+                fault_timeout_diagnostics(
+                    server_handle,
+                    "runner FE restart reconnect: shared lifecycle deadline expired",
+                ),
+            );
+        }
+        if let Err(error) = session.reconnect() {
+            return (
+                false,
+                None,
+                fault_timeout_diagnostics(
+                    server_handle,
+                    &format!("runner FE restart reconnect failed: {error:#}"),
+                ),
+            );
+        }
+        if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return (
+                false,
+                None,
+                fault_timeout_diagnostics(
+                    server_handle,
+                    "runner FE restart reconnect exceeded shared lifecycle deadline",
+                ),
+            );
+        }
     }
     result
+}
+
+fn fault_timeout_diagnostics(
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    message: &str,
+) -> String {
+    let Ok(server) = server_handle.lock() else {
+        return format!("FAIL ({message}); server handle mutex is poisoned");
+    };
+    let tail = |contents: String| {
+        contents
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let fe_tail = server
+        .fe_log_contents()
+        .map(tail)
+        .unwrap_or_else(|error| format!("<read failed: {error:#}>"));
+    let be_tails = (0..server.be_count())
+        .map(|index| {
+            server
+                .be_log_contents(index)
+                .map(tail)
+                .unwrap_or_else(|error| format!("<read failed: {error:#}>"))
+        })
+        .collect::<Vec<_>>();
+    format!("FAIL ({message}); fe_tail={fe_tail:?}; be_tails={be_tails:?}")
+}
+
+fn bounded_fault_query_timeout(query_timeout: u64, fault_deadline: Option<Instant>) -> u64 {
+    const TERMINAL_EVIDENCE_RESERVE: Duration = Duration::from_secs(2);
+    let Some(deadline) = fault_deadline else {
+        return query_timeout;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let bounded = remaining
+        .saturating_sub(TERMINAL_EVIDENCE_RESERVE)
+        .as_secs()
+        .max(1);
+    query_timeout.min(bounded)
 }
 
 fn finish_expected_error_step(
@@ -1483,6 +1555,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     let elapsed = execution
@@ -1778,6 +1851,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 ctx.query_timeout,
                                 &step.sql,
                                 step.meta.db.as_deref(),
+                                compat_snapshot.evidence_deadline(),
                             )
                         }
                     } else if shell::is_shell_step(&step.sql) {
@@ -1982,6 +2056,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2042,6 +2117,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2097,6 +2173,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     if !ok_t || execution_t.is_none() {
@@ -3315,7 +3392,8 @@ mod tests {
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
         Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
-        execute_target_session_sql_with, expected_engine_error_code_diff_result,
+        bounded_fault_query_timeout, execute_target_session_sql_with,
+        expected_engine_error_code_diff_result,
         expected_engine_error_code_result, finish_expected_error_step, validate_fault_injection_jobs,
         sql_text_has_query_lifecycle_fault_directive, validate_selected_suite_cluster,
     };
@@ -3325,7 +3403,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn test_runtime_dir() -> PathBuf {
         let dir = crate::resolve_repo_root()
@@ -4244,6 +4322,15 @@ enable_path_style_access = true
     fn transient_iceberg_commit_error_matches_missing_metadata() {
         let message = "ERROR 1064 (HY000) at line 11: Metadata file for version 2 is missing under file:/tmp/table/metadata";
         assert!(is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn fault_query_timeout_reserves_time_for_terminal_evidence() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        assert!(bounded_fault_query_timeout(120, Some(deadline)) <= 28);
+        assert_eq!(bounded_fault_query_timeout(5, Some(deadline)), 5);
+        assert_eq!(bounded_fault_query_timeout(120, None), 120);
     }
 
     #[test]

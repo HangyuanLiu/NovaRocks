@@ -142,6 +142,15 @@ struct PreInitTombstone {
     terminated_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryLifecycleRestorationStatus {
+    pub(crate) control_ready: usize,
+    pub(crate) active_lifecycle: usize,
+    pub(crate) fragment_admissions: usize,
+    pub(crate) fragment_acceptances: usize,
+    pub(crate) restored: bool,
+}
+
 impl Default for QueryLifecycleRegistryState {
     fn default() -> Self {
         Self {
@@ -297,6 +306,20 @@ impl QueryLifecycleRegistry {
         match *local_backend_id {
             None => {
                 *local_backend_id = Some(backend_id);
+                drop(local_backend_id);
+                let status = self.restoration_status();
+                if query_lifecycle_test_markers_enabled() {
+                    eprintln!(
+                        "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id={} start_epoch={} control_ready={} active_lifecycle={} fragment_admissions={} fragment_acceptances={} restored={}",
+                        backend_id,
+                        self.local_start_epoch,
+                        status.control_ready,
+                        status.active_lifecycle,
+                        status.fragment_admissions,
+                        status.fragment_acceptances,
+                        status.restored
+                    );
+                }
                 Ok(())
             }
             Some(current) if current == backend_id => Ok(()),
@@ -306,6 +329,32 @@ impl QueryLifecycleRegistry {
                     "backend identity is already bound to {current}; refusing reassignment to {backend_id}"
                 ),
             )),
+        }
+    }
+
+    pub(crate) fn restoration_status(&self) -> QueryLifecycleRestorationStatus {
+        let state = self.state.lock().expect("query lifecycle registry lock");
+        let mut control_ready = 0;
+        let mut fragment_admissions = 0;
+        let mut fragment_acceptances = 0;
+        for entry in state.entries.values() {
+            let entry_state = entry.state.lock().expect("query lifecycle entry lock");
+            control_ready += usize::from(entry_state.phase == QueryLifecyclePhase::ControlAttached);
+            fragment_admissions += entry_state.in_flight_fragments.len();
+            fragment_acceptances += entry_state.accepted_fragments.len();
+        }
+        fragment_acceptances = fragment_acceptances.max(state.fragment_executions.len());
+        let active_lifecycle = state.active_entries;
+        let restored = control_ready != 0
+            || active_lifecycle != 0
+            || fragment_admissions != 0
+            || fragment_acceptances != 0;
+        QueryLifecycleRestorationStatus {
+            control_ready,
+            active_lifecycle,
+            fragment_admissions,
+            fragment_acceptances,
+            restored,
         }
     }
 
@@ -1520,7 +1569,6 @@ pub(super) fn query_lifecycle_test_markers_enabled() -> bool {
         .ok()
         .and_then(|config| config.debug.query_lifecycle_fault_dir())
         .is_some()
-        || std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
 }
 
 #[cfg(not(debug_assertions))]

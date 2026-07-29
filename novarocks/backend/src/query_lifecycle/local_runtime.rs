@@ -27,7 +27,7 @@ use novarocks::runtime::native_query_lifecycle::NativeQueryLifecycleRuntime;
 
 use crate::fragment::control::FragmentControlRegistry;
 
-use super::registry::{QueryLifecycleLocalRuntime, query_lifecycle_test_markers_enabled};
+use super::registry::QueryLifecycleLocalRuntime;
 
 pub(crate) struct NativeQueryLifecycleLocalRuntime {
     runtime: NativeQueryLifecycleRuntime,
@@ -77,7 +77,7 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
         );
         let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
         self.controls.cancel_many(&fragment_instance_ids, &detail);
-        if query_lifecycle_test_markers_enabled() {
+        if fragment_failure_test_markers_enabled() {
             for finst_id in fragment_instance_ids {
                 eprintln!(
                     "NOVAROCKS_CANCEL_FINST query_hi={} query_lo={} finst_hi={} finst_lo={}",
@@ -89,6 +89,16 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
             }
         }
     }
+}
+
+#[cfg(debug_assertions)]
+fn fragment_failure_test_markers_enabled() -> bool {
+    std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn fragment_failure_test_markers_enabled() -> bool {
+    false
 }
 
 fn runtime_error(error: String) -> QueryLifecycleError {
