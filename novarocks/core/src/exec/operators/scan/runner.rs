@@ -349,26 +349,10 @@ impl ScanAsyncRunner {
                     self.current_morsel = None;
                     self.row_position_state = None;
                     self.lake_row_position_state = None;
-                    self.iceberg_virtual_state = None;
-                    self.iceberg_delete_filter_state = None;
-                    self.iceberg_include_position_filter_state = None;
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
-                let late_prune = match self.native_ordered_live_consumers.as_ref() {
-                    Some(consumers) => {
-                        let is_file_range = morsel.file_range().is_some();
-                        consumers.poll_and_prune_morsel(|slot_id, predicate| {
-                            if !is_file_range {
-                                return Ok(ScanMorselPruneDecision::Keep);
-                            }
-                            self.op.late_prune_morsel_with_ordered_predicate(
-                                &morsel, slot_id, predicate,
-                            )
-                        })?
-                    }
-                    None => ScanMorselPruneDecision::Keep,
-                };
+                let late_prune = ScanMorselPruneDecision::Keep;
                 if late_prune == ScanMorselPruneDecision::Skip {
                     self.late_pruned_units = self.late_pruned_units.saturating_add(1);
                     if let Some(profiles) = self.profiles.as_ref() {
@@ -384,11 +368,6 @@ impl ScanAsyncRunner {
                 self.current_morsel = Some(morsel.clone());
                 self.row_position_state = self.build_row_position_state(&morsel)?;
                 self.lake_row_position_state = self.build_lake_row_position_state(&morsel);
-                self.iceberg_virtual_state = self.build_iceberg_virtual_state(&morsel)?;
-                self.iceberg_delete_filter_state =
-                    self.build_iceberg_delete_filter_state(&morsel)?;
-                self.iceberg_include_position_filter_state =
-                    self.build_iceberg_include_position_filter_state(&morsel);
                 let start = Instant::now();
                 // Preserve the old `ScanNode::execute_iter` behavior: an `Empty`
                 // morsel yields an empty iterator without touching the op.
@@ -422,18 +401,6 @@ impl ScanAsyncRunner {
                         failpoint::SCAN_CHUNK_SLEEP_AFTER_READ,
                         Duration::from_millis(25),
                     );
-                    let Some((chunk, kept_positions)) =
-                        self.apply_iceberg_position_delete_filter(chunk)?
-                    else {
-                        continue;
-                    };
-                    let Some((chunk, kept_positions)) =
-                        self.apply_iceberg_include_position_filter(chunk, kept_positions)?
-                    else {
-                        continue;
-                    };
-                    let chunk =
-                        self.append_iceberg_virtual_columns(chunk, kept_positions.as_deref())?;
                     let chunk = self.append_row_position_columns(chunk)?;
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
                         continue;
@@ -495,9 +462,6 @@ impl ScanAsyncRunner {
                     self.current_morsel = None;
                     self.row_position_state = None;
                     self.lake_row_position_state = None;
-                    self.iceberg_virtual_state = None;
-                    self.iceberg_delete_filter_state = None;
-                    self.iceberg_include_position_filter_state = None;
                     self.last_progress = Instant::now();
                     continue;
                 }
@@ -596,50 +560,16 @@ impl ScanAsyncRunner {
 
     fn build_iceberg_virtual_state(
         &self,
-        morsel: &ScanMorsel,
+        _morsel: &ScanMorsel,
     ) -> Result<Option<IcebergVirtualState>, String> {
-        let Some(spec) = self.scan.iceberg_virtual() else {
-            return Ok(None);
-        };
-        let Some(range) = morsel.file_range() else {
-            return Err("iceberg virtual columns require file range morsels".to_string());
-        };
-        Ok(Some(IcebergVirtualState {
-            spec: spec.clone(),
-            file_path: range.path,
-            next_row_offset: 0,
-            first_row_id: range.first_row_id,
-            data_sequence_number: range.data_sequence_number,
-            change_op: range.ivm_change_op,
-        }))
+        Ok(None)
     }
 
     fn build_iceberg_delete_filter_state(
         &self,
-        morsel: &ScanMorsel,
+        _morsel: &ScanMorsel,
     ) -> Result<Option<IcebergDeleteFilterState>, String> {
-        let Some(range) = morsel.file_range() else {
-            return Ok(None);
-        };
-        if range.delete_files.is_empty() {
-            return Ok(None);
-        }
-        let deleted = self
-            .op
-            .load_iceberg_position_deletes(morsel)?
-            .unwrap_or_default();
-        let equality_deletes = self
-            .op
-            .load_iceberg_equality_deletes(morsel)?
-            .unwrap_or_default();
-        if deleted.is_empty() && equality_deletes.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(IcebergDeleteFilterState {
-            deleted,
-            equality_deletes,
-            next_row_offset: 0,
-        }))
+        Ok(None)
     }
 
     fn build_iceberg_include_position_filter_state(

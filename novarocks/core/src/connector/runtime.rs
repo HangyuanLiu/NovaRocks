@@ -27,18 +27,15 @@ use novarocks_spi::connector::{
     ConnectorReaderMetricsSnapshot, ConnectorSplit,
 };
 
-use crate::common::ids::SlotId;
-use crate::connector::file_execution::FileScanRange;
 use crate::connector::host::ConnectorInstanceLease;
-use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
+use crate::connector::file_execution::FileScanRange;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
     BoundScanRanges, ConnectorRowPosition, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
-    ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanSource,
+    ScanMorsels, ScanOp, ScanSource,
 };
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
-use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
 
 pub(crate) struct ConnectorBatchReaderIter {
     reader: Option<Box<dyn ConnectorBatchReader>>,
@@ -377,34 +374,6 @@ pub(crate) trait IncrementalConnectorSplitAdapter: Send + Sync {
     }
 }
 
-/// Core-private provider hook for opening delete-file data. The core runner
-/// retains all filtering semantics; a provider only resolves its storage
-/// credentials and decodes its delete files.
-pub(crate) trait ConnectorReadAuxiliary: Send + Sync {
-    fn load_iceberg_position_deletes(
-        &self,
-        range: &FileScanRange,
-    ) -> Result<Option<roaring::RoaringTreemap>, String>;
-
-    fn load_iceberg_equality_deletes(
-        &self,
-        range: &FileScanRange,
-    ) -> Result<Option<Vec<EqualityDeleteSet>>, String>;
-}
-
-pub(crate) trait ConnectorReadCoreFacet: Send + Sync {
-    fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
-
-    fn late_prune_morsel_with_ordered_predicate(
-        &self,
-        _morsel: &ScanMorsel,
-        _slot_id: SlotId,
-        _predicate: &NativeOrderedRangePredicate,
-    ) -> Result<ScanMorselPruneDecision, String> {
-        Ok(ScanMorselPruneDecision::Keep)
-    }
-}
-
 struct ConnectorSplitState {
     scheduled: Vec<ConnectorScheduledSplit>,
     split_ids: BTreeSet<String>,
@@ -596,8 +565,6 @@ pub(crate) struct ConnectorReadScanSource {
     chunk_schema: ChunkSchemaRef,
     lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
-    auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
-    facet: Option<Arc<dyn ConnectorReadCoreFacet>>,
     reader_group: Arc<ConnectorReaderGroup>,
 }
 
@@ -618,8 +585,6 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: None,
             incremental: None,
-            auxiliary: None,
-            facet: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
@@ -641,8 +606,6 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: Some(lifecycle),
             incremental: None,
-            auxiliary: None,
-            facet: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
@@ -665,8 +628,6 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: None,
             incremental: Some(incremental),
-            auxiliary: None,
-            facet: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
@@ -684,8 +645,6 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: None,
             incremental: None,
-            auxiliary: None,
-            facet: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
@@ -696,7 +655,6 @@ impl ConnectorReadScanSource {
         request: ConnectorOpenReaderRequest,
         chunk_schema: ChunkSchemaRef,
         lifecycle: Arc<ConnectorInstanceLease>,
-        auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
     ) -> Self {
         Self::new_scheduled_ephemeral_with_incremental(
             instance,
@@ -706,7 +664,6 @@ impl ConnectorReadScanSource {
             lifecycle,
             None,
             false,
-            auxiliary,
         )
     }
 
@@ -719,7 +676,6 @@ impl ConnectorReadScanSource {
         lifecycle: Arc<ConnectorInstanceLease>,
         incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
         has_more: bool,
-        auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
     ) -> Self {
         Self {
             instance,
@@ -728,36 +684,10 @@ impl ConnectorReadScanSource {
             chunk_schema,
             lifecycle: Some(lifecycle),
             incremental,
-            auxiliary,
-            facet: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
 
-    pub(crate) fn new_scheduled_with_auxiliary(
-        instance: Arc<ConnectorInstance>,
-        scheduled: Vec<ConnectorScheduledSplit>,
-        request: ConnectorOpenReaderRequest,
-        chunk_schema: ChunkSchemaRef,
-        auxiliary: Arc<dyn ConnectorReadAuxiliary>,
-    ) -> Self {
-        Self {
-            instance,
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
-            request,
-            chunk_schema,
-            lifecycle: None,
-            incremental: None,
-            auxiliary: Some(auxiliary),
-            facet: None,
-            reader_group: Arc::new(ConnectorReaderGroup::default()),
-        }
-    }
-
-    pub(crate) fn with_core_facet(mut self, facet: Arc<dyn ConnectorReadCoreFacet>) -> Self {
-        self.facet = Some(facet);
-        self
-    }
 }
 
 impl ScanSource for ConnectorReadScanSource {
@@ -772,8 +702,6 @@ impl ScanSource for ConnectorReadScanSource {
             chunk_schema: Arc::clone(&self.chunk_schema),
             _lifecycle: self.lifecycle.clone(),
             incremental: self.incremental.clone(),
-            auxiliary: self.auxiliary.clone(),
-            facet: self.facet.clone(),
             reader_group: Arc::clone(&self.reader_group),
         }))
     }
@@ -788,32 +716,12 @@ struct ConnectorReadScanOp {
     // reader derived from this source has drained.
     _lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
-    auxiliary: Option<Arc<dyn ConnectorReadAuxiliary>>,
-    facet: Option<Arc<dyn ConnectorReadCoreFacet>>,
     reader_group: Arc<ConnectorReaderGroup>,
 }
 
 impl ScanOp for ConnectorReadScanOp {
     fn terminate(&self) -> Result<(), String> {
         self.reader_group.terminate()
-    }
-
-    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
-        if let Some(facet) = &self.facet {
-            facet.flush_morsel_materialization_profile(profile);
-        }
-    }
-
-    fn late_prune_morsel_with_ordered_predicate(
-        &self,
-        morsel: &ScanMorsel,
-        slot_id: SlotId,
-        predicate: &NativeOrderedRangePredicate,
-    ) -> Result<ScanMorselPruneDecision, String> {
-        self.facet
-            .as_ref()
-            .map(|facet| facet.late_prune_morsel_with_ordered_predicate(morsel, slot_id, predicate))
-            .unwrap_or(Ok(ScanMorselPruneDecision::Keep))
     }
 
     fn execute_iter(
@@ -865,32 +773,6 @@ impl ScanOp for ConnectorReadScanOp {
                 .collect(),
             state.has_more,
         ))
-    }
-
-    fn load_iceberg_position_deletes(
-        &self,
-        morsel: &ScanMorsel,
-    ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        let Some(range) = morsel.file_range() else {
-            return Ok(None);
-        };
-        self.auxiliary
-            .as_ref()
-            .map(|auxiliary| auxiliary.load_iceberg_position_deletes(&range))
-            .unwrap_or(Ok(None))
-    }
-
-    fn load_iceberg_equality_deletes(
-        &self,
-        morsel: &ScanMorsel,
-    ) -> Result<Option<Vec<EqualityDeleteSet>>, String> {
-        let Some(range) = morsel.file_range() else {
-            return Ok(None);
-        };
-        self.auxiliary
-            .as_ref()
-            .map(|auxiliary| auxiliary.load_iceberg_equality_deletes(&range))
-            .unwrap_or(Ok(None))
     }
 
     fn supports_incremental_scan_ranges(&self) -> bool {

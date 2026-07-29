@@ -376,7 +376,6 @@ pub(crate) fn plan_iceberg_metadata_read_source(
         },
         chunk_schema,
         lifecycle,
-        None,
     )))
 }
 

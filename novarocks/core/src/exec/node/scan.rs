@@ -23,13 +23,12 @@ use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
 use crate::connector::file_execution::FileScanRange;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
-use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
-use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
+use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::profile::RuntimeProfile;
 use novarocks_spi::connector::{ConnectorInstance, ConnectorSplit};
@@ -390,40 +389,6 @@ pub trait ScanOp: Send + Sync {
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
 
-    fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
-
-    #[allow(private_interfaces)]
-    fn late_prune_morsel_with_ordered_predicate(
-        &self,
-        _morsel: &ScanMorsel,
-        _slot_id: SlotId,
-        _predicate: &crate::runtime_filter::exec::ordered_range_predicate::
-            NativeOrderedRangePredicate,
-    ) -> Result<ScanMorselPruneDecision, String> {
-        Ok(ScanMorselPruneDecision::Keep)
-    }
-
-    /// Load Iceberg v2 position-delete files attached to `morsel` and collect
-    /// the row positions they retire for the morsel's data file. Returns
-    /// `Ok(None)` when the morsel has no delete files (the common case);
-    /// returns `Ok(Some(set))` otherwise.
-    ///
-    /// Only the HDFS connector knows how to open the delete-file parquet
-    /// (it owns the object-store credentials the FE handed down), so every
-    /// other scan op inherits the default no-op implementation.
-    fn load_iceberg_position_deletes(
-        &self,
-        _morsel: &ScanMorsel,
-    ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        Ok(None)
-    }
-
-    fn load_iceberg_equality_deletes(
-        &self,
-        _morsel: &ScanMorsel,
-    ) -> Result<Option<Vec<EqualityDeleteSet>>, String> {
-        Ok(None)
-    }
 }
 
 /// Instance-decoded, proto-free connector ranges handed to [`ScanSource::bind`].
@@ -511,7 +476,6 @@ pub struct ScanNode {
     lake_row_position: Option<LakeRowPositionSpec>,
     #[cfg(feature = "compat")]
     lake_glm_info: Option<LakeGlmScanInfo>,
-    iceberg_virtual: Option<IcebergVirtualSpec>,
 }
 
 /// Test-only static source that binds to a fixed, pre-built op regardless of
@@ -545,7 +509,6 @@ impl ScanNode {
             lake_row_position: None,
             #[cfg(feature = "compat")]
             lake_glm_info: None,
-            iceberg_virtual: None,
         }
     }
 
@@ -622,11 +585,6 @@ impl ScanNode {
         self
     }
 
-    pub fn with_iceberg_virtual(mut self, spec: Option<IcebergVirtualSpec>) -> Self {
-        self.iceberg_virtual = spec.filter(|s| !s.is_empty());
-        self
-    }
-
     pub fn node_id(&self) -> Option<i32> {
         self.node_id
     }
@@ -698,9 +656,6 @@ impl ScanNode {
         self.lake_glm_info.as_ref()
     }
 
-    pub fn iceberg_virtual(&self) -> Option<&IcebergVirtualSpec> {
-        self.iceberg_virtual.as_ref()
-    }
 }
 
 impl std::fmt::Debug for ScanNode {

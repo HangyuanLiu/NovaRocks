@@ -396,7 +396,6 @@ pub(crate) fn plan_starrocks_read_source(
             lifecycle,
             None,
             has_more,
-            None,
         ),
     ))
 }

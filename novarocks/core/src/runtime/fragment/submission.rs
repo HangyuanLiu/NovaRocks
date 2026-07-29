@@ -115,7 +115,7 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
             if let Some(node_id) = scan.node_id() {
                 output.insert(
                     node_id,
-                    scan.iceberg_virtual().and_then(|spec| spec.change_op_slot),
+                    None,
                 );
             }
         }
