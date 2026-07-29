@@ -61,6 +61,10 @@ use crate::query_execution::control::{
     QueryCancelOutcome, QueryControlError, QueryControlService, QuerySessionLease, SessionIdentity,
     SessionToken, StatementFinishOutcome,
 };
+use crate::query_execution::session::{
+    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
+    QuerySessionOpenRequest,
+};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::optimizer::options::SessionOptimizerSettings;
 use crate::sql::parser::dialect::StarRocksDialect;
@@ -158,60 +162,21 @@ pub(crate) fn test_resolve_fe_server_options(
     })
 }
 
-/// Legacy standalone server entrypoint that loads config from disk/env inside
-/// [`StandaloneNovaRocks::open`].  New callers that already hold a validated
-/// config should prefer [`run_standalone_server_with_config`].
-#[deprecated(
-    note = "prefer run_standalone_server_with_config when a validated config is available"
-)]
-pub fn run_standalone_server(
-    opts: StandaloneServerOptions,
-    services: StandaloneOpenServices,
-) -> Result<(), String> {
-    let resolved = resolve_server_options(&opts)?;
-    run_with_resolved_options(resolved, services)
-}
-
-/// Run the standalone server using an already-loaded, validated [`NovaRocksConfig`].
-///
-/// `cfg` is installed as the process-wide active config before the engine
-/// opens — no second disk read occurs.  `config_path` is preserved only for
-/// resolving relative paths (e.g. SQLite metadata DB paths); pass `None` to
-/// use built-in path defaults.
-///
-/// This variant hosts the coordinator report-only gRPC endpoint.
-pub fn run_standalone_server_with_config(
-    cfg: NovaRocksConfig,
-    config_path: Option<PathBuf>,
-    port_override: Option<u16>,
-    services: StandaloneOpenServices,
-) -> Result<(), String> {
-    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
-    let resolved = ResolvedStandaloneServerOptions {
-        config_path,
-        preloaded_config: Some(cfg),
-        grpc_endpoint: StandaloneGrpcEndpointOwnership::HostedReportOnly,
-        ..resolved
-    };
-    run_with_resolved_options(resolved, services)
-}
-
-/// Run the standalone server until the supplied shutdown future resolves.
-///
-/// Unlike the synchronous compatibility wrappers, this function does not
-/// create a Tokio runtime. The caller owns the runtime that drives server and
-/// application shutdown. `grpc_endpoint` describes whether this frontend owns
-/// the report-only endpoint or uses one hosted by its composition root.
-pub async fn run_standalone_server_with_config_until_shutdown<F>(
+/// Run a standalone server whose authenticated SQL sessions are supplied by
+/// the frontend application.  This is the production entrypoint for native
+/// frontend composition; the core keeps only MySQL protocol framing.
+pub async fn run_standalone_server_with_config_until_shutdown_with_session_factory<F, B>(
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
     grpc_endpoint: StandaloneGrpcEndpointOwnership,
     services: StandaloneOpenServices,
+    session_factory_builder: B,
     shutdown: F,
 ) -> Result<(), String>
 where
     F: Future<Output = ()> + Send,
+    B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
 {
     let resolved = resolve_server_options_from_config(&cfg, port_override)?;
     let resolved = ResolvedStandaloneServerOptions {
@@ -220,65 +185,31 @@ where
         grpc_endpoint,
         ..resolved
     };
-    run_with_resolved_options_until_shutdown(resolved, services, shutdown).await
-}
-
-/// Run the standalone server for `role=fe`.
-///
-/// In role=fe all fragments (including root) run on the remote BE; the FE
-/// runs MySQL, the optimizer, the `RemoteDispatcher` coordinator, and its
-/// report-only NovaRocksGrpc endpoint.
-pub fn run_standalone_fe_server_with_config(
-    cfg: NovaRocksConfig,
-    config_path: Option<PathBuf>,
-    port_override: Option<u16>,
-    services: StandaloneOpenServices,
-) -> Result<(), String> {
-    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
-    let resolved = ResolvedStandaloneServerOptions {
-        config_path,
-        preloaded_config: Some(cfg),
-        grpc_endpoint: StandaloneGrpcEndpointOwnership::HostedReportOnly,
-        ..resolved
-    };
-    run_with_resolved_options(resolved, services)
+    run_with_resolved_options_until_shutdown_with_session_factory(
+        resolved,
+        services,
+        session_factory_builder,
+        shutdown,
+    )
+    .await
 }
 
 pub fn configure_standalone_internal_rpc_transport() {
     crate::service::internal_rpc_transport::use_grpc_internal_rpc_transport();
 }
 
-fn run_with_resolved_options(
-    resolved: ResolvedStandaloneServerOptions,
-    services: StandaloneOpenServices,
-) -> Result<(), String> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .map_err(|e| format!("build tokio runtime failed: {e}"))?;
-
-    runtime.block_on(run_with_resolved_options_until_shutdown(
-        resolved,
-        services,
-        std::future::pending(),
-    ))
-}
-
-async fn run_with_resolved_options_until_shutdown<F>(
+async fn run_with_resolved_options_until_shutdown_with_session_factory<F, B>(
     resolved: ResolvedStandaloneServerOptions,
     mut services: StandaloneOpenServices,
+    session_factory_builder: B,
     shutdown: F,
 ) -> Result<(), String>
 where
     F: Future<Output = ()> + Send,
+    B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
 {
     configure_standalone_internal_rpc_transport();
     let native_report_handler = Arc::clone(&services.native_report_handler);
-    let query_control = services.query_control.clone();
-    let execution_role = services.execution_role;
-    let admission_topology = Arc::clone(&services.backend_topology);
-
     let grpc_endpoint = start_standalone_grpc_endpoint(
         &resolved.grpc_bind_host,
         resolved.grpc_port,
@@ -313,29 +244,33 @@ where
             resolved.maintenance,
         ),
     );
+    let session_factory = match session_factory_builder(engine.clone()) {
+        Ok(factory) => factory,
+        Err(error) => {
+            let _ =
+                await_server_with_coordinator_handles(coordinator_handles, async { Ok(()) }).await;
+            if let Some(endpoint) = grpc_endpoint {
+                let _ = endpoint.stop();
+            }
+            return Err(error);
+        }
+    };
 
     let server = async move {
         let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, resolved.mysql_port));
         let ready_user = resolved.user.clone();
-        let session_engine = engine;
         let session_user = resolved.user;
-        let session_query_control = query_control.clone();
-        let session_execution_role = execution_role;
-        let session_admission_topology = admission_topology;
-        let cancellation_shutdown = query_control;
+        let shutdown_factory = Arc::clone(&session_factory);
         serve_until_shutdown(
             bind_addr,
             async move {
                 shutdown.await;
-                cancellation_shutdown.cancel_all(QueryCancellationReason::ServerShutdown);
+                shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             },
             move |stream, peer_addr| {
-                serve_mysql_connection(
-                    session_engine.clone(),
+                serve_frontend_mysql_connection(
                     session_user.clone(),
-                    session_query_control.clone(),
-                    session_execution_role,
-                    session_admission_topology.clone(),
+                    Arc::clone(&session_factory),
                     stream,
                     peer_addr,
                 )
@@ -729,6 +664,299 @@ async fn serve_mysql_connection(
             peer_addr, connection_id, err
         );
     }
+}
+
+async fn serve_frontend_mysql_connection(
+    user: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+) {
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let session = Arc::new(OnceLock::new());
+    let disconnect_watcher = spawn_frontend_disconnect_watcher(&stream, Arc::clone(&session));
+    let shim = FrontendMysqlShim::new(
+        user,
+        connection_id,
+        session_factory,
+        session,
+        disconnect_watcher,
+    );
+    let (reader, writer) = stream.into_split();
+    let result = AsyncMysqlIntermediary::run_on(shim, reader, writer).await;
+    if let Err(err) = result {
+        warn!(
+            "standalone mysql connection failed: peer={}, connection_id={}, err={}",
+            peer_addr, connection_id, err
+        );
+    }
+}
+
+struct FrontendMysqlShim {
+    user: String,
+    connection_id: u32,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    session: Arc<OnceLock<Arc<dyn QuerySession>>>,
+    _disconnect_watcher: ClientDisconnectWatcher,
+}
+
+impl FrontendMysqlShim {
+    fn new(
+        user: String,
+        connection_id: u32,
+        session_factory: Arc<dyn QuerySessionFactory>,
+        session: Arc<OnceLock<Arc<dyn QuerySession>>>,
+        disconnect_watcher: ClientDisconnectWatcher,
+    ) -> Self {
+        Self {
+            user,
+            connection_id,
+            session_factory,
+            session,
+            _disconnect_watcher: disconnect_watcher,
+        }
+    }
+
+    fn session(&self) -> Result<&Arc<dyn QuerySession>, QueryServiceError> {
+        self.session.get().ok_or_else(|| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::PermissionDenied,
+                "session is not authenticated",
+            )
+        })
+    }
+}
+
+impl Drop for FrontendMysqlShim {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.get() {
+            session.close();
+        }
+    }
+}
+
+#[async_trait]
+impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
+    type Error = io::Error;
+
+    fn version(&self) -> String {
+        format!("{}-standalone-mysql", version::short_version())
+    }
+
+    fn connect_id(&self) -> u32 {
+        self.connection_id
+    }
+
+    async fn authenticate(
+        &self,
+        auth_plugin: &str,
+        username: &[u8],
+        salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        if auth_plugin != "mysql_native_password" || username != self.user.as_bytes() {
+            return false;
+        }
+        let authenticated = if auth_data.is_empty() {
+            true
+        } else {
+            scramble_native(salt, b"")
+                .map(|expected| auth_data == expected.as_slice())
+                .unwrap_or(false)
+        };
+        if !authenticated {
+            return false;
+        }
+        let session = match self
+            .session_factory
+            .open_session(QuerySessionOpenRequest::new(
+                self.connection_id,
+                self.user.clone(),
+            )) {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(
+                    "failed to open frontend query session for connection_id={}: {}",
+                    self.connection_id, error
+                );
+                return false;
+            }
+        };
+        self.session.set(session).is_ok()
+    }
+
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _query: &'a str,
+        info: StatementMetaWriter<'a, W>,
+    ) -> io::Result<()> {
+        info.error(
+            ErrorKind::ER_NOT_SUPPORTED_YET,
+            b"prepared statements are not supported in standalone server v1",
+        )
+        .await
+    }
+
+    async fn on_execute<'a>(
+        &'a mut self,
+        _id: u32,
+        _params: ParamParser<'a>,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        results
+            .error(
+                ErrorKind::ER_NOT_SUPPORTED_YET,
+                b"prepared statements are not supported in standalone server v1",
+            )
+            .await
+    }
+
+    async fn on_close<'a>(&'a mut self, _stmt: u32) {}
+
+    async fn on_init<'a>(
+        &'a mut self,
+        schema: &'a str,
+        writer: InitWriter<'a, W>,
+    ) -> io::Result<()> {
+        let session = match self.session() {
+            Ok(session) => session,
+            Err(error) => {
+                return writer
+                    .error(
+                        map_query_service_error(error.kind()),
+                        error.message().as_bytes(),
+                    )
+                    .await;
+            }
+        };
+        match session.init_database(schema).await {
+            Ok(()) => writer.ok().await,
+            Err(error) => {
+                writer
+                    .error(
+                        map_query_service_error(error.kind()),
+                        error.message().as_bytes(),
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn on_query<'a>(
+        &'a mut self,
+        query: &'a str,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        let session = match self.session() {
+            Ok(session) => session,
+            Err(error) => {
+                return results
+                    .error(
+                        map_query_service_error(error.kind()),
+                        error.message().as_bytes(),
+                    )
+                    .await;
+            }
+        };
+        match session.execute_batch(query).await {
+            Ok(StatementResult::Query(result)) => write_query_result(result, results).await,
+            Ok(StatementResult::Ok) => results.completed(OkResponse::default()).await,
+            Err(error) => {
+                results
+                    .error(
+                        map_query_service_error(error.kind()),
+                        error.message().as_bytes(),
+                    )
+                    .await
+            }
+        }
+    }
+}
+
+fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
+    match kind {
+        QueryServiceErrorKind::Parse => ErrorKind::ER_PARSE_ERROR,
+        QueryServiceErrorKind::BadDatabase => ErrorKind::ER_BAD_DB_ERROR,
+        QueryServiceErrorKind::Unsupported => ErrorKind::ER_NOT_SUPPORTED_YET,
+        QueryServiceErrorKind::PermissionDenied => ErrorKind::ER_SPECIFIC_ACCESS_DENIED_ERROR,
+        QueryServiceErrorKind::NoSuchSession => ErrorKind::ER_NO_SUCH_THREAD,
+        QueryServiceErrorKind::Interrupted => ErrorKind::ER_QUERY_INTERRUPTED,
+        QueryServiceErrorKind::Timeout => ErrorKind::ER_UNKNOWN_ERROR,
+        QueryServiceErrorKind::InvalidValue => ErrorKind::ER_WRONG_VALUE,
+        QueryServiceErrorKind::Internal => ErrorKind::ER_UNKNOWN_ERROR,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn query_service_error_mapping_keeps_wire_concerns_in_core() {
+    assert_eq!(
+        map_query_service_error(QueryServiceErrorKind::BadDatabase),
+        ErrorKind::ER_BAD_DB_ERROR
+    );
+    assert_eq!(
+        map_query_service_error(QueryServiceErrorKind::Interrupted),
+        ErrorKind::ER_QUERY_INTERRUPTED
+    );
+}
+
+#[cfg(unix)]
+fn spawn_frontend_disconnect_watcher(
+    stream: &tokio::net::TcpStream,
+    session: Arc<OnceLock<Arc<dyn QuerySession>>>,
+) -> ClientDisconnectWatcher {
+    let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+    if fd < 0 {
+        return ClientDisconnectWatcher { join_handle: None };
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    if let Err(error) = std_stream.set_nonblocking(true) {
+        warn!("failed to configure frontend disconnect monitor: {}", error);
+        return ClientDisconnectWatcher { join_handle: None };
+    }
+    let watcher_stream = match tokio::net::TcpStream::from_std(std_stream) {
+        Ok(stream) => stream,
+        Err(error) => {
+            warn!("failed to create frontend disconnect monitor: {}", error);
+            return ClientDisconnectWatcher { join_handle: None };
+        }
+    };
+    let join_handle = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
+        loop {
+            match watcher_stream.peek(&mut buf).await {
+                Ok(0) => {
+                    if let Some(session) = session.get() {
+                        session.cancel_current(QueryCancellationReason::ClientDisconnected);
+                    }
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    if let Some(session) = session.get() {
+                        session.cancel_current(QueryCancellationReason::ClientDisconnected);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    ClientDisconnectWatcher {
+        join_handle: Some(join_handle),
+    }
+}
+
+#[cfg(not(unix))]
+fn spawn_frontend_disconnect_watcher(
+    _stream: &tokio::net::TcpStream,
+    _session: Arc<OnceLock<Arc<dyn QuerySession>>>,
+) -> ClientDisconnectWatcher {
+    ClientDisconnectWatcher { join_handle: None }
 }
 
 #[cfg(unix)]

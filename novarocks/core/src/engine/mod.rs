@@ -335,7 +335,7 @@ pub struct StandaloneStarRocksTableInfo {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum StatementResult {
+pub enum StatementResult {
     Query(QueryResult),
     Ok,
 }
@@ -533,6 +533,44 @@ pub struct StandaloneNovaRocks {
 #[derive(Clone)]
 pub struct StandaloneSession {
     inner: Arc<StandaloneState>,
+}
+
+/// Narrow core compiler kernel consumed by frontend QueryService.
+///
+/// It deliberately exposes neither `StandaloneState` nor connector internals.
+/// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
+#[derive(Clone)]
+pub struct StandaloneQueryCompiler {
+    session: StandaloneSession,
+}
+
+impl StandaloneQueryCompiler {
+    pub fn execute(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        self.session.execute_with_context(sql, context, query_opts)
+    }
+}
+
+/// Core command kernel for statement families whose application owner has not
+/// moved in this cutover (notably DML and MV maintenance).
+#[derive(Clone)]
+pub struct StandaloneCommandExecutor {
+    session: StandaloneSession,
+}
+
+impl StandaloneCommandExecutor {
+    pub fn execute(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        self.session.execute_with_context(sql, context, query_opts)
+    }
 }
 
 /// Explicit application services required to open the core SQL engine.
@@ -839,6 +877,18 @@ impl StandaloneNovaRocks {
         }
     }
 
+    pub fn query_compiler(&self) -> StandaloneQueryCompiler {
+        StandaloneQueryCompiler {
+            session: self.session(),
+        }
+    }
+
+    pub fn command_executor(&self) -> StandaloneCommandExecutor {
+        StandaloneCommandExecutor {
+            session: self.session(),
+        }
+    }
+
     pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {
         self.inner.coordinator_report_endpoint.set_bound_port(port);
     }
@@ -991,7 +1041,9 @@ impl StandaloneSession {
     /// Executes a statement using the immutable context created at server
     /// admission. Production callers must use this entrypoint so planning and
     /// coordinator submission share one topology, deadline and cancellation.
-    pub(crate) fn execute_with_context(
+    /// Core SQL/compiler and command kernel entry.  Frontend QueryService
+    /// performs session admission before calling this boundary.
+    pub fn execute_with_context(
         &self,
         sql: &str,
         context: &crate::query_execution::request_context::RequestContext,

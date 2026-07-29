@@ -85,16 +85,30 @@ where
     let services = novarocks_frontend::standalone_open_services_for_server(&frontend, &config);
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
-    let server = novarocks::server::run_standalone_server_with_config_until_shutdown(
-        config,
-        config_path,
-        port_override,
-        novarocks::server::StandaloneGrpcEndpointOwnership::ExternallyHosted,
-        services,
-        async move {
-            let _ = server_shutdown_rx.await;
-        },
-    );
+    let query_control = services.query_control.clone();
+    let topology = services.backend_topology.clone();
+    let role = services.execution_role;
+    let server =
+        novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
+            config,
+            config_path,
+            port_override,
+            novarocks::server::StandaloneGrpcEndpointOwnership::ExternallyHosted,
+            services,
+            move |engine| {
+                Ok(std::sync::Arc::new(
+                    novarocks_frontend::FrontendQueryService::new(
+                        engine,
+                        query_control,
+                        role,
+                        topology,
+                    ),
+                ))
+            },
+            async move {
+                let _ = server_shutdown_rx.await;
+            },
+        );
     tokio::pin!(server);
     tokio::pin!(shutdown);
 

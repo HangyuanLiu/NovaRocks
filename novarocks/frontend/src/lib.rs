@@ -20,6 +20,7 @@ pub mod coordinator;
 pub mod deployment;
 pub mod dml;
 pub mod mv;
+pub mod query;
 pub mod query_control;
 mod server;
 pub mod statistics;
@@ -33,6 +34,7 @@ pub use application::{
     FrontendExecutionConfig,
 };
 pub use mv::FrontendMvService;
+pub use query::FrontendQueryService;
 pub use server::{
     FrontendGrpcEndpointOwnership, FrontendServerConfig, open_frontend_application_for_server,
     run_frontend_server, run_frontend_server_until_shutdown, standalone_open_services_for_server,

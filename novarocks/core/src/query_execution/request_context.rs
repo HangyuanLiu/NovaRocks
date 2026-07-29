@@ -23,7 +23,44 @@ use std::time::Instant;
 use crate::common::app_config::ClusterRole;
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::QueryCancellationView;
-use crate::sql::optimizer::options::SessionOptimizerSettings;
+pub use crate::sql::optimizer::options::SessionOptimizerSettings;
+
+/// All inputs accepted at the frontend statement-admission boundary.
+///
+/// The contained values are moved into an immutable [`RequestContext`]; the
+/// individual projection constructors intentionally remain private.
+pub struct RequestAdmission {
+    current_catalog: Option<String>,
+    current_database: String,
+    role: ClusterRole,
+    topology: BackendTopologySnapshot,
+    deadline: Option<Instant>,
+    cancellation: QueryCancellationView,
+    optimizer_settings: SessionOptimizerSettings,
+}
+
+impl RequestAdmission {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        current_catalog: Option<String>,
+        current_database: String,
+        role: ClusterRole,
+        topology: BackendTopologySnapshot,
+        deadline: Option<Instant>,
+        cancellation: QueryCancellationView,
+        optimizer_settings: SessionOptimizerSettings,
+    ) -> Self {
+        Self {
+            current_catalog,
+            current_database,
+            role,
+            topology,
+            deadline,
+            cancellation,
+            optimizer_settings,
+        }
+    }
+}
 
 /// Session-derived inputs frozen at the request boundary.
 #[derive(Clone, Debug)]
@@ -110,8 +147,8 @@ impl QueryExecutionContext {
     }
 }
 
-/// Complete immutable statement context. Only the core server admission
-/// adapter constructs it; consumers get a narrow projection.
+/// Complete immutable statement context.  The frontend application admits a
+/// statement once, then consumers receive only narrow projections.
 #[derive(Clone)]
 pub struct RequestContext {
     session: RequestSessionContext,
@@ -121,6 +158,24 @@ pub struct RequestContext {
 impl RequestContext {
     pub(crate) fn new(session: RequestSessionContext, execution: QueryExecutionContext) -> Self {
         Self { session, execution }
+    }
+
+    pub fn admit(admission: RequestAdmission) -> Self {
+        let settings = admission.optimizer_settings;
+        Self::new(
+            RequestSessionContext::new(
+                admission.current_catalog,
+                admission.current_database,
+                settings.clone(),
+            ),
+            QueryExecutionContext::new(
+                admission.role,
+                admission.topology,
+                admission.deadline,
+                admission.cancellation,
+                settings,
+            ),
+        )
     }
 
     pub fn session(&self) -> &RequestSessionContext {
