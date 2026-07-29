@@ -605,12 +605,17 @@ pub fn compose_backend_connector_installers(
     registry: &ConnectorRegistry,
     default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
 ) -> Result<(), String> {
+    let binding = iceberg::provider::IcebergReadBinding::default_binding(default_object_store);
     registry
         .register_connector_instance_installer(Arc::new(
-            iceberg::provider::IcebergConnectorInstaller::new(
-                iceberg::provider::IcebergReadBinding::default_binding(default_object_store),
-            ),
+            iceberg::provider::IcebergConnectorInstaller::new(binding.clone()),
         ))
+        .map_err(|error| error.to_string())?;
+    registry
+        .register_connector_instance(
+            iceberg::provider::compose_compat_read_instance(binding)
+                .map_err(|error| error.to_string())?,
+        )
         .map_err(|error| error.to_string())
 }
 

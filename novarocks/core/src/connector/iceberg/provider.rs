@@ -50,6 +50,11 @@ const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
 const ICEBERG_DECLARATION_V1: u16 = 1;
 const DEFAULT_ACCESS_BINDING: &str = "default";
+/// Compat has no NovaRocks catalog instance identity on the wire.  Its
+/// read-only Iceberg binding is therefore composed once per BE process, not
+/// synthesized for each query or inferred from an HDFS path.
+pub(crate) const COMPAT_ICEBERG_INSTANCE_ID: &str = "iceberg.compat.default";
+const COMPAT_ICEBERG_INCARNATION: [u8; 16] = [0; 16];
 
 /// Provider-owned, secret-free declaration used to install an Iceberg read
 /// instance into a BE.  Catalog clients and credentials deliberately do not
@@ -155,6 +160,67 @@ impl IcebergConnectorInstaller {
             binding,
         }
     }
+}
+
+/// Build the stable compat-only Iceberg reader instance from the same startup
+/// access binding used by distributed instance installation.  The identity is
+/// intentionally not query-local and carries no catalog client or credential
+/// in a fragment payload.
+pub(crate) fn compose_compat_read_instance(
+    binding: IcebergReadBinding,
+) -> Result<ConnectorInstance, ConnectorError> {
+    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: ConnectorProviderId::parse(PROVIDER_ID)?,
+        instance_id: instance_id.clone(),
+    };
+    ConnectorInstance::try_new(
+        descriptor,
+        None,
+        Arc::new(IcebergReadOnlyConnectorInstance {
+            instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes(COMPAT_ICEBERG_INCARNATION),
+            binding,
+        }),
+    )
+}
+
+/// Encode compat-normalized data-file facts as provider-owned opaque splits.
+/// The caller cannot alter provider identity, incarnation, or payload layout.
+pub(crate) fn build_compat_read_splits(
+    files: impl IntoIterator<Item = IcebergDataFileInfo>,
+) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+    let owner = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
+    files
+        .into_iter()
+        .enumerate()
+        .map(|(index, data_file)| {
+            let estimated_bytes = u64::try_from(data_file.size).ok();
+            let payload = SplitPayload {
+                version: ICEBERG_SPLIT_V1,
+                owner_instance_id: owner.as_str().to_string(),
+                incarnation: COMPAT_ICEBERG_INCARNATION,
+                namespace: "compat".to_string(),
+                table: "iceberg".to_string(),
+                snapshot_id: None,
+                table_uuid: None,
+                schema_id: None,
+                data_file,
+                projection: Vec::new(),
+                limit: None,
+            };
+            ConnectorSplit::try_new(
+                owner.clone(),
+                format!("compat-iceberg-{index}"),
+                encode_payload(
+                    &payload,
+                    "compat Iceberg split",
+                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                )?,
+                estimated_bytes,
+            )
+        })
+        .collect()
 }
 
 impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
@@ -1664,6 +1730,30 @@ mod tests {
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
         assert_eq!(splits.len(), 1, "rejected split must not be pushed");
         assert_eq!(total, admitted_total, "rejection must not consume budget");
+    }
+
+    #[test]
+    fn compat_splits_are_owned_by_the_startup_iceberg_instance() {
+        let instance = compose_compat_read_instance(IcebergReadBinding::default_binding(None))
+            .expect("compose compat Iceberg instance");
+        assert_eq!(
+            instance.descriptor().instance_id.as_str(),
+            COMPAT_ICEBERG_INSTANCE_ID
+        );
+        assert_eq!(instance.descriptor().provider_id.as_str(), PROVIDER_ID);
+
+        let splits = build_compat_read_splits(vec![IcebergDataFileInfo::for_test(
+            "file:///tmp/compat.parquet",
+            64,
+            2,
+        )])
+        .expect("encode compat split");
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].owner().as_str(), COMPAT_ICEBERG_INSTANCE_ID);
+        let payload: SplitPayload = decode_payload(splits[0].payload(), "compat split")
+            .expect("decode provider split");
+        assert_eq!(payload.incarnation, COMPAT_ICEBERG_INCARNATION);
+        assert_eq!(payload.data_file.path, "file:///tmp/compat.parquet");
     }
 
     #[test]
