@@ -19,5 +19,8 @@ mod entry;
 mod local_runtime;
 mod registry;
 
+pub(crate) use local_runtime::NativeQueryLifecycleLocalRuntime;
+pub(crate) use registry::{QueryLifecycleRegistry, QueryLifecycleRegistryConfig};
+
 #[cfg(test)]
 mod tests;

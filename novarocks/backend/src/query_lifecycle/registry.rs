@@ -56,11 +56,31 @@ pub(crate) trait MonotonicClock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
 
+pub(crate) trait QueryLifecycleMetricsSink: Send + Sync + 'static {
+    fn publish(
+        &self,
+        snapshot: BackendQueryLifecycleMetricsSnapshot,
+        termination_reasons: [u64; 6],
+    );
+}
+
 struct SystemMonotonicClock;
 
 impl MonotonicClock for SystemMonotonicClock {
     fn now(&self) -> Instant {
         Instant::now()
+    }
+}
+
+struct PrometheusQueryLifecycleMetricsSink;
+
+impl QueryLifecycleMetricsSink for PrometheusQueryLifecycleMetricsSink {
+    fn publish(
+        &self,
+        snapshot: BackendQueryLifecycleMetricsSnapshot,
+        termination_reasons: [u64; 6],
+    ) {
+        novarocks::service::publish_backend_query_lifecycle_metrics(snapshot, termination_reasons);
     }
 }
 
@@ -93,9 +113,10 @@ pub(crate) struct QueryLifecycleRegistry {
     state: Mutex<QueryLifecycleRegistryState>,
     local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
     config: QueryLifecycleRegistryConfig,
-    local_backend_id: u64,
+    local_backend_id: Mutex<Option<u64>>,
     local_start_epoch: u64,
     clock: Arc<dyn MonotonicClock>,
+    metrics: Arc<dyn QueryLifecycleMetricsSink>,
     self_weak: Weak<QueryLifecycleRegistry>,
 }
 
@@ -187,6 +208,57 @@ impl QueryLifecycleRegistry {
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
     ) -> Arc<Self> {
+        Self::new_with_clock_and_metrics(
+            local_backend_id,
+            local_start_epoch,
+            local_runtime,
+            config,
+            clock,
+            Arc::new(PrometheusQueryLifecycleMetricsSink),
+        )
+    }
+
+    pub(crate) fn new_with_clock_and_metrics(
+        local_backend_id: u64,
+        local_start_epoch: u64,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Arc<dyn QueryLifecycleMetricsSink>,
+    ) -> Arc<Self> {
+        Self::new_with_backend_identity(
+            Some(local_backend_id),
+            local_start_epoch,
+            local_runtime,
+            config,
+            clock,
+            metrics,
+        )
+    }
+
+    pub(crate) fn new_unbound(
+        local_start_epoch: u64,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+    ) -> Arc<Self> {
+        Self::new_with_backend_identity(
+            None,
+            local_start_epoch,
+            local_runtime,
+            config,
+            Arc::new(SystemMonotonicClock),
+            Arc::new(PrometheusQueryLifecycleMetricsSink),
+        )
+    }
+
+    fn new_with_backend_identity(
+        local_backend_id: Option<u64>,
+        local_start_epoch: u64,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Arc<dyn QueryLifecycleMetricsSink>,
+    ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
         assert!(!config.tombstone_retention.is_zero());
@@ -196,17 +268,42 @@ impl QueryLifecycleRegistry {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
             config,
-            local_backend_id,
+            local_backend_id: Mutex::new(local_backend_id),
             local_start_epoch,
             clock,
+            metrics,
             self_weak: self_weak.clone(),
         })
+    }
+
+    fn local_backend_id(&self) -> Option<u64> {
+        *self
+            .local_backend_id
+            .lock()
+            .expect("query lifecycle backend identity lock")
     }
 
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let execution_id = request.manifest().execution_id();
         let digest = request.digest();
-        if request.manifest().backend().backend_id() != self.local_backend_id
+        if request
+            .manifest()
+            .roles()
+            .contains(&ParticipantRole::FragmentExecutor)
+            && request
+                .manifest()
+                .expected_fragment_instance_ids()
+                .is_empty()
+        {
+            let ack = QueryInitAck::new(
+                execution_id,
+                digest,
+                QueryInitOutcome::RejectedInvalidManifest,
+            );
+            self.log_init(&ack);
+            return ack;
+        }
+        if self.local_backend_id() != Some(request.manifest().backend().backend_id())
             || request.manifest().backend().start_epoch() != self.local_start_epoch
         {
             let ack =
@@ -340,7 +437,7 @@ impl QueryLifecycleRegistry {
                     target: "novarocks::query_lifecycle",
                     query_id = ?execution_id.query_id(),
                     attempt_id = execution_id.attempt_id().get(),
-                    backend_id = self.local_backend_id,
+                    backend_id = ?self.local_backend_id(),
                     start_epoch = self.local_start_epoch,
                     digest = %format_digest(request.digest()),
                     outcome = "terminated",
@@ -368,33 +465,58 @@ impl QueryLifecycleRegistry {
             .expect("query lifecycle registry lock")
             .entries
             .get(&attach.execution_id())
-            .cloned()
-            .ok_or_else(|| {
-                QueryLifecycleError::new(
-                    QueryLifecycleErrorCode::Terminated,
-                    "query lifecycle entry is not active",
-                )
-            })?;
+            .cloned();
+        let Some(entry) = entry else {
+            return Err(self.attach_error(
+                &attach,
+                QueryLifecycleErrorCode::Terminated,
+                "query lifecycle entry is not active",
+                "missing",
+            ));
+        };
         if entry.digest != attach.digest() {
-            return Err(QueryLifecycleError::new(
+            return Err(self.attach_error(
+                &attach,
                 QueryLifecycleErrorCode::Conflict,
                 "query control digest conflicts with initialized manifest",
+                "digest_mismatch",
             ));
         }
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
         {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
-            if state.phase != QueryLifecyclePhase::Initialized {
-                return Err(QueryLifecycleError::new(
-                    QueryLifecycleErrorCode::Conflict,
-                    "query control can attach only to an initialized entry",
-                ));
+            match state.phase {
+                QueryLifecyclePhase::Initialized => {}
+                QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => {
+                    let phase = phase_name(state.phase);
+                    drop(state);
+                    return Err(self.attach_error(
+                        &attach,
+                        QueryLifecycleErrorCode::Terminated,
+                        "query lifecycle entry has terminated",
+                        phase,
+                    ));
+                }
+                QueryLifecyclePhase::Initializing | QueryLifecyclePhase::ControlAttached => {
+                    let phase = phase_name(state.phase);
+                    drop(state);
+                    return Err(self.attach_error(
+                        &attach,
+                        QueryLifecycleErrorCode::Conflict,
+                        "query control can attach only to an initialized entry",
+                        phase,
+                    ));
+                }
             }
             state.phase = QueryLifecyclePhase::ControlAttached;
             state.frontend_owner_epoch = Some(attach.frontend_owner_epoch());
             state.last_heartbeat = Some(self.clock.now());
             state.events = Some(events_tx.clone());
-            if entry.manifest.expected_fragment_instance_ids().is_empty() {
+            if !entry
+                .manifest
+                .roles()
+                .contains(&ParticipantRole::FragmentExecutor)
+            {
                 state.pre_start_deadline = None;
             }
         }
@@ -410,7 +532,7 @@ impl QueryLifecycleRegistry {
             target: "novarocks::query_lifecycle",
             query_id = ?attach.execution_id().query_id(),
             attempt_id = attach.execution_id().attempt_id().get(),
-            backend_id = self.local_backend_id,
+            backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
             digest = %format_digest(attach.digest()),
             outcome = "control_attached",
@@ -425,6 +547,28 @@ impl QueryLifecycleRegistry {
             }),
             events: events_rx,
         })
+    }
+
+    fn attach_error(
+        &self,
+        attach: &QueryControlAttach,
+        code: QueryLifecycleErrorCode,
+        detail: &'static str,
+        phase: &'static str,
+    ) -> QueryLifecycleError {
+        warn!(
+            target: "novarocks::query_lifecycle",
+            query_id = ?attach.execution_id().query_id(),
+            attempt_id = attach.execution_id().attempt_id().get(),
+            backend_id = ?self.local_backend_id(),
+            start_epoch = self.local_start_epoch,
+            digest = %format_digest(attach.digest()),
+            outcome = "attach_rejected",
+            reason = detail,
+            phase,
+            "backend query lifecycle control attach rejected"
+        );
+        QueryLifecycleError::new(code, detail)
     }
 
     pub(crate) fn admit_fragment(
@@ -530,7 +674,7 @@ impl QueryLifecycleRegistry {
             target: "novarocks::query_lifecycle",
             query_id = ?execution_id.query_id(),
             attempt_id = execution_id.attempt_id().get(),
-            backend_id = self.local_backend_id,
+            backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
             digest = %digest,
             outcome = "admission_rejected",
@@ -548,28 +692,37 @@ impl QueryLifecycleRegistry {
             state.entries.values().cloned().collect::<Vec<_>>()
         };
         for entry in entries {
-            let expiration = {
+            let (termination_retry, expiration) = {
                 let state = entry.state.lock().expect("query lifecycle entry lock");
-                if matches!(
-                    state.phase,
-                    QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone
-                ) {
-                    None
+                if state.phase == QueryLifecyclePhase::Terminating {
+                    (state.init_outcome.and(state.termination_reason), None)
+                } else if state.phase == QueryLifecyclePhase::Tombstone {
+                    (None, None)
                 } else if state
                     .pre_start_deadline
                     .is_some_and(|deadline| now >= deadline)
                 {
-                    Some(QueryTerminationReason::PreStartTimeout)
+                    (None, Some(QueryTerminationReason::PreStartTimeout))
                 } else if state.phase == QueryLifecyclePhase::ControlAttached
                     && state.last_heartbeat.is_some_and(|heartbeat| {
                         now.saturating_duration_since(heartbeat) >= self.config.heartbeat_timeout
                     })
                 {
-                    Some(QueryTerminationReason::CoordinatorHeartbeatTimeout)
+                    (
+                        None,
+                        Some(QueryTerminationReason::CoordinatorHeartbeatTimeout),
+                    )
                 } else {
-                    None
+                    (None, None)
                 }
             };
+            if let Some(reason) = termination_retry {
+                let execution_id = entry.manifest.execution_id();
+                if self.try_complete_runtime_filter_cleanup(&entry, execution_id) {
+                    self.publish_tombstone(&entry, execution_id, reason);
+                }
+                continue;
+            }
             if let Some(reason) = expiration {
                 self.request_termination(entry, reason);
             }
@@ -581,7 +734,7 @@ impl QueryLifecycleRegistry {
         entry: Arc<QueryLifecycleEntry>,
         requested_reason: QueryTerminationReason,
     ) -> QueryTerminationReason {
-        let (execution_id, expected_instances, initializing, abort_runtime_filter) = {
+        let (execution_id, expected_instances, initializing) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if let Some(reason) = state.termination_reason {
                 return reason;
@@ -589,10 +742,8 @@ impl QueryLifecycleRegistry {
             state.termination_reason = Some(requested_reason);
             let initializing = state.phase == QueryLifecyclePhase::Initializing;
             state.phase = QueryLifecyclePhase::Terminating;
-            let abort_runtime_filter =
-                state.runtime_filter_installed && !state.runtime_filter_rollback_claimed;
-            if abort_runtime_filter {
-                state.runtime_filter_rollback_claimed = true;
+            if state.runtime_filter_installed {
+                state.runtime_filter_cleanup_required = true;
             }
             (
                 entry.manifest.execution_id(),
@@ -603,23 +754,63 @@ impl QueryLifecycleRegistry {
                     .copied()
                     .collect::<Vec<_>>(),
                 initializing,
-                abort_runtime_filter,
             )
         };
 
+        self.publish_metrics();
         self.local_runtime
             .terminate_query(execution_id, &expected_instances, requested_reason);
         if requested_reason == QueryTerminationReason::CoordinatorHeartbeatTimeout {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
             state.heartbeat_timeouts = state.heartbeat_timeouts.saturating_add(1);
         }
-        if abort_runtime_filter {
-            let _ = self.local_runtime.abort_runtime_filter(execution_id);
-        }
-        if !initializing {
+        let cleanup_complete = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
+        if !initializing && cleanup_complete {
             self.publish_tombstone(&entry, execution_id, requested_reason);
         }
         requested_reason
+    }
+
+    fn try_complete_runtime_filter_cleanup(
+        &self,
+        entry: &Arc<QueryLifecycleEntry>,
+        execution_id: QueryExecutionId,
+    ) -> bool {
+        {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if !state.runtime_filter_cleanup_required {
+                return true;
+            }
+            if state.runtime_filter_cleanup_in_flight {
+                return false;
+            }
+            state.runtime_filter_cleanup_in_flight = true;
+        }
+
+        let cleanup_result = self.local_runtime.abort_runtime_filter(execution_id);
+        let mut state = entry.state.lock().expect("query lifecycle entry lock");
+        state.runtime_filter_cleanup_in_flight = false;
+        if cleanup_result.is_ok() {
+            state.runtime_filter_cleanup_required = false;
+            state.runtime_filter_installed = false;
+            return true;
+        }
+        drop(state);
+
+        warn!(
+            target: "novarocks::query_lifecycle",
+            query_id = ?execution_id.query_id(),
+            attempt_id = execution_id.attempt_id().get(),
+            backend_id = ?self.local_backend_id(),
+            start_epoch = self.local_start_epoch,
+            digest = %format_digest(entry.digest),
+            outcome = "runtime_filter_cleanup_failed",
+            reason = "local runtime rejected runtime-filter cleanup",
+            error = %cleanup_result.expect_err("cleanup result was checked"),
+            "backend query lifecycle runtime-filter cleanup will be retried"
+        );
+        self.publish_metrics();
+        false
     }
 
     fn publish_tombstone(
@@ -631,6 +822,11 @@ impl QueryLifecycleRegistry {
         {
             let mut entry_state = entry.state.lock().expect("query lifecycle entry lock");
             if entry_state.phase == QueryLifecyclePhase::Tombstone {
+                return;
+            }
+            if entry_state.runtime_filter_cleanup_required
+                || entry_state.runtime_filter_cleanup_in_flight
+            {
                 return;
             }
             entry_state.phase = QueryLifecyclePhase::Tombstone;
@@ -654,7 +850,7 @@ impl QueryLifecycleRegistry {
             target: "novarocks::query_lifecycle",
             query_id = ?execution_id.query_id(),
             attempt_id = execution_id.attempt_id().get(),
-            backend_id = self.local_backend_id,
+            backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
             digest = %format_digest(entry.digest),
             outcome = "terminated",
@@ -776,7 +972,7 @@ impl QueryLifecycleRegistry {
                 target: "novarocks::query_lifecycle",
                 query_id = ?execution_id.query_id(),
                 attempt_id = execution_id.attempt_id().get(),
-                backend_id = self.local_backend_id,
+                backend_id = ?self.local_backend_id(),
                 start_epoch = self.local_start_epoch,
                 digest = %format_digest(entry.digest),
                 outcome = "coordinator_lost",
@@ -879,59 +1075,15 @@ impl QueryLifecycleRegistry {
 
     pub(crate) fn metrics_snapshot(&self) -> BackendQueryLifecycleMetricsSnapshot {
         let state = self.state.lock().expect("query lifecycle registry lock");
-        let mut snapshot = BackendQueryLifecycleMetricsSnapshot {
-            tombstones: state.tombstones.len(),
-            admission_rejected: state.admission_rejected,
-            init_conflicts: state.init_conflicts,
-            heartbeat_timeouts: state.heartbeat_timeouts,
-            terminations: state.terminations,
-            ..BackendQueryLifecycleMetricsSnapshot::default()
-        };
-        for entry in state.entries.values() {
-            match entry
-                .state
-                .lock()
-                .expect("query lifecycle entry lock")
-                .phase
-            {
-                QueryLifecyclePhase::Initializing => snapshot.initializing += 1,
-                QueryLifecyclePhase::Initialized => snapshot.initialized += 1,
-                QueryLifecyclePhase::ControlAttached => snapshot.control_attached += 1,
-                QueryLifecyclePhase::Terminating => snapshot.terminating += 1,
-                QueryLifecyclePhase::Tombstone => {}
-            }
-        }
-        snapshot
+        fold_metrics_locked(&state).0
     }
 
     fn publish_metrics(&self) {
         let (snapshot, termination_reasons) = {
             let state = self.state.lock().expect("query lifecycle registry lock");
-            let mut snapshot = BackendQueryLifecycleMetricsSnapshot {
-                tombstones: state.tombstones.len(),
-                admission_rejected: state.admission_rejected,
-                init_conflicts: state.init_conflicts,
-                heartbeat_timeouts: state.heartbeat_timeouts,
-                terminations: state.terminations,
-                ..BackendQueryLifecycleMetricsSnapshot::default()
-            };
-            for entry in state.entries.values() {
-                match entry
-                    .state
-                    .lock()
-                    .expect("query lifecycle entry lock")
-                    .phase
-                {
-                    QueryLifecyclePhase::Initializing => snapshot.initializing += 1,
-                    QueryLifecyclePhase::Initialized => snapshot.initialized += 1,
-                    QueryLifecyclePhase::ControlAttached => snapshot.control_attached += 1,
-                    QueryLifecyclePhase::Terminating => snapshot.terminating += 1,
-                    QueryLifecyclePhase::Tombstone => {}
-                }
-            }
-            (snapshot, state.termination_reasons)
+            fold_metrics_locked(&state)
         };
-        novarocks::service::publish_backend_query_lifecycle_metrics(snapshot, termination_reasons);
+        self.metrics.publish(snapshot, termination_reasons);
     }
 
     fn log_init(&self, ack: &QueryInitAck) {
@@ -939,7 +1091,7 @@ impl QueryLifecycleRegistry {
             target: "novarocks::query_lifecycle",
             query_id = ?ack.execution_id().query_id(),
             attempt_id = ack.execution_id().attempt_id().get(),
-            backend_id = self.local_backend_id,
+            backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
             digest = %format_digest(ack.digest()),
             outcome = ?ack.outcome(),
@@ -959,12 +1111,6 @@ impl InitWorkspace {
                 .install_runtime_filter(self.execution_id, contribution)
         });
         if install_result.is_err() {
-            if has_runtime_filter {
-                let _ = self
-                    .registry
-                    .local_runtime
-                    .abort_runtime_filter(self.execution_id);
-            }
             let (reason, terminate_locally) = {
                 let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
                 state.init_outcome = Some(QueryInitOutcome::RejectedInvalidManifest);
@@ -973,6 +1119,7 @@ impl InitWorkspace {
                     .termination_reason
                     .get_or_insert(QueryTerminationReason::LocalFailure);
                 state.phase = QueryLifecyclePhase::Terminating;
+                state.runtime_filter_cleanup_required = has_runtime_filter;
                 self.entry.init_completed.notify_all();
                 (reason, terminate_locally)
             };
@@ -990,8 +1137,13 @@ impl InitWorkspace {
                     reason,
                 );
             }
-            self.registry
-                .publish_tombstone(&self.entry, self.execution_id, reason);
+            if self
+                .registry
+                .try_complete_runtime_filter_cleanup(&self.entry, self.execution_id)
+            {
+                self.registry
+                    .publish_tombstone(&self.entry, self.execution_id, reason);
+            }
             return QueryInitAck::new(
                 self.execution_id,
                 self.digest,
@@ -1003,9 +1155,11 @@ impl InitWorkspace {
             let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
             state.runtime_filter_installed = contribution_is_present(&self.entry);
             if state.termination_reason.is_some() {
-                if state.runtime_filter_installed && !state.runtime_filter_rollback_claimed {
-                    state.runtime_filter_rollback_claimed = true;
+                if state.runtime_filter_installed {
+                    state.runtime_filter_cleanup_required = true;
                 }
+                state.init_outcome = Some(QueryInitOutcome::RejectedTerminated);
+                self.entry.init_completed.notify_all();
                 true
             } else {
                 state.phase = QueryLifecyclePhase::Initialized;
@@ -1018,12 +1172,6 @@ impl InitWorkspace {
             }
         };
         if terminated {
-            if contribution_is_present(&self.entry) {
-                let _ = self
-                    .registry
-                    .local_runtime
-                    .abort_runtime_filter(self.execution_id);
-            }
             let reason = self
                 .entry
                 .state
@@ -1031,8 +1179,13 @@ impl InitWorkspace {
                 .expect("query lifecycle entry lock")
                 .termination_reason
                 .expect("termination was observed");
-            self.registry
-                .publish_tombstone(&self.entry, self.execution_id, reason);
+            if self
+                .registry
+                .try_complete_runtime_filter_cleanup(&self.entry, self.execution_id)
+            {
+                self.registry
+                    .publish_tombstone(&self.entry, self.execution_id, reason);
+            }
             QueryInitAck::new(
                 self.execution_id,
                 self.digest,
@@ -1045,16 +1198,35 @@ impl InitWorkspace {
 }
 
 impl FragmentAdmissionPermit {
-    pub(crate) fn commit(mut self) {
+    pub(crate) fn commit(mut self) -> Result<(), QueryLifecycleError> {
         let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
-        if state.phase == QueryLifecyclePhase::ControlAttached
-            && state.termination_reason.is_none()
-            && state.in_flight_fragments.remove(&self.fragment_instance_id)
+        if state.termination_reason.is_some()
+            || matches!(
+                state.phase,
+                QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone
+            )
         {
-            state.accepted_fragments.insert(self.fragment_instance_id);
-            state.pre_start_deadline = None;
-            self.committed = true;
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Terminated,
+                "query lifecycle terminated before fragment admission commit",
+            ));
         }
+        if state.phase != QueryLifecyclePhase::ControlAttached {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "query control is not ready for fragment admission commit",
+            ));
+        }
+        if !state.in_flight_fragments.remove(&self.fragment_instance_id) {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "fragment admission permit is no longer in flight",
+            ));
+        }
+        state.accepted_fragments.insert(self.fragment_instance_id);
+        state.pre_start_deadline = None;
+        self.committed = true;
+        Ok(())
     }
 }
 
@@ -1121,8 +1293,46 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
     }
 }
 
+fn fold_metrics_locked(
+    state: &QueryLifecycleRegistryState,
+) -> (BackendQueryLifecycleMetricsSnapshot, [u64; 6]) {
+    let mut snapshot = BackendQueryLifecycleMetricsSnapshot {
+        tombstones: state.tombstones.len(),
+        admission_rejected: state.admission_rejected,
+        init_conflicts: state.init_conflicts,
+        heartbeat_timeouts: state.heartbeat_timeouts,
+        terminations: state.terminations,
+        ..BackendQueryLifecycleMetricsSnapshot::default()
+    };
+    for entry in state.entries.values() {
+        match entry
+            .state
+            .lock()
+            .expect("query lifecycle entry lock")
+            .phase
+        {
+            QueryLifecyclePhase::Initializing => snapshot.initializing += 1,
+            QueryLifecyclePhase::Initialized => snapshot.initialized += 1,
+            QueryLifecyclePhase::ControlAttached => snapshot.control_attached += 1,
+            QueryLifecyclePhase::Terminating => snapshot.terminating += 1,
+            QueryLifecyclePhase::Tombstone => {}
+        }
+    }
+    (snapshot, state.termination_reasons)
+}
+
 fn contribution_is_present(entry: &QueryLifecycleEntry) -> bool {
     entry.manifest.runtime_filter().is_some()
+}
+
+const fn phase_name(phase: QueryLifecyclePhase) -> &'static str {
+    match phase {
+        QueryLifecyclePhase::Initializing => "initializing",
+        QueryLifecyclePhase::Initialized => "initialized",
+        QueryLifecyclePhase::ControlAttached => "control_attached",
+        QueryLifecyclePhase::Terminating => "terminating",
+        QueryLifecyclePhase::Tombstone => "tombstone",
+    }
 }
 
 fn termination_reason_index(reason: QueryTerminationReason) -> usize {

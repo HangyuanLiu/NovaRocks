@@ -78,8 +78,24 @@ impl NativeFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
+        Self::new_with_controls(
+            exchange_transmitter,
+            lookup_client,
+            result_writer,
+            event_sink,
+            Arc::new(FragmentControlRegistry::default()),
+        )
+    }
+
+    pub(crate) fn new_with_controls(
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
+        result_writer: Arc<dyn FragmentResultWriter>,
+        event_sink: Arc<dyn FragmentEventSink>,
+        controls: Arc<FragmentControlRegistry>,
+    ) -> Self {
         Self {
-            controls: Arc::new(FragmentControlRegistry::default()),
+            controls,
             queries: NativeFragmentQueryRuntime::global(),
             exchange_transmitter,
             lookup_client,
@@ -393,7 +409,7 @@ mod tests {
 
     use novarocks::UniqueId;
     use novarocks::proto;
-    use novarocks::runtime::fragment::{FragmentOutcome, FragmentPrepareContext, prepare_fragment};
+    use novarocks::runtime::fragment::{DormantFragmentHandle, FragmentOutcome, prepare_fragment};
     use novarocks::runtime::query_context::QueryId;
     use novarocks::service::native_fragment_ingress::{
         NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentRequest,
@@ -544,6 +560,37 @@ mod tests {
         .expect("valid native fragment request")
     }
 
+    fn prepare_request_for_test(
+        service: &NativeFragmentService,
+        request: NativeFragmentRequest,
+    ) -> DormantFragmentHandle {
+        let query_id = request.query_id();
+        let fragment_instance_id = request.fragment_instance_id();
+        let (delivery_expire, query_expire) = request.query_expire_durations();
+        let admission = service
+            .queries
+            .prepare_admission(
+                query_id,
+                fragment_instance_id,
+                delivery_expire,
+                query_expire,
+                request.cache_options().expect("valid cache options"),
+                request.has_runtime_filter_bindings(),
+            )
+            .expect("native fragment admission");
+        prepare_fragment(
+            request.into_submission(),
+            admission.into_prepare_context(
+                None,
+                Arc::clone(&service.exchange_transmitter),
+                Arc::clone(&service.lookup_client),
+                Arc::clone(&service.result_writer),
+                Arc::clone(&service.event_sink),
+            ),
+        )
+        .expect("native fragment prepares")
+    }
+
     #[test]
     fn submit_acceptance_point_follows_prepare_and_registration_before_start() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -673,7 +720,7 @@ mod tests {
 
     #[test]
     fn native_failed_terminal_fact_does_not_locally_cancel_siblings_before_frontend_ack() {
-        let service = NativeFragmentService::new();
+        let service = NativeFragmentService::with_lifecycle_observer(|_| {});
         let request = values_result_request(83_100, 83_104);
         let query_id = request.query_id();
         let failed_finst = request.fragment_instance_id();
@@ -701,9 +748,8 @@ mod tests {
             .register_fragment(query_id, failed_finst, delivery_expire, query_expire)
             .expect("register failed fragment");
         failed_registration.into_running();
-        let failed = prepare_fragment(request.into_submission(), FragmentPrepareContext::default())
-            .expect("failed fragment prepares")
-            .start_failed("native executor failure");
+        let failed =
+            prepare_request_for_test(&service, request).start_failed("native executor failure");
         let failed_token = service
             .controls
             .reserve(failed_finst)
@@ -742,9 +788,8 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&trigger, b"step-token-17").expect("arm fragment failure");
-        let first = values_result_request(84_000, 84_002);
-        let first = prepare_fragment(first.into_submission(), FragmentPrepareContext::default())
-            .expect("first fragment prepares");
+        let service = NativeFragmentService::with_lifecycle_observer(|_| {});
+        let first = prepare_request_for_test(&service, values_result_request(84_000, 84_002));
 
         let (first, release) =
             start_with_fragment_failure_trigger(first, Some(trigger.as_path()), false);
@@ -762,9 +807,7 @@ mod tests {
             "the ineligible fragment must run normally: {first:?}"
         );
 
-        let second = values_result_request(84_100, 84_102);
-        let second = prepare_fragment(second.into_submission(), FragmentPrepareContext::default())
-            .expect("second fragment prepares");
+        let second = prepare_request_for_test(&service, values_result_request(84_100, 84_102));
         let (second, release) =
             start_with_fragment_failure_trigger(second, Some(trigger.as_path()), true);
         assert!(
@@ -788,9 +831,7 @@ mod tests {
         ));
         assert!(!trigger.exists(), "the trigger must be consumed once");
 
-        let third = values_result_request(84_200, 84_202);
-        let third = prepare_fragment(third.into_submission(), FragmentPrepareContext::default())
-            .expect("third fragment prepares");
+        let third = prepare_request_for_test(&service, values_result_request(84_200, 84_202));
         let (third, release) =
             start_with_fragment_failure_trigger(third, Some(trigger.as_path()), true);
         assert!(

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
 use novarocks::query_execution::contract::QueryId;
+use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
     AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
     ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint, QueryExecutionId,
@@ -30,7 +31,7 @@ use novarocks::runtime::query_options::QueryOptions;
 
 use super::entry::QueryLifecyclePhase;
 use super::registry::{
-    MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleRegistry,
+    MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
     QueryLifecycleRegistryConfig,
 };
 
@@ -78,6 +79,36 @@ struct RecordingLocalRuntimeState {
     install_gate: Mutex<InstallGate>,
     install_gate_changed: Condvar,
     fail_install: Mutex<bool>,
+    fail_abort: Mutex<bool>,
+}
+
+#[derive(Default)]
+struct RecordingMetricsSink {
+    snapshots: Mutex<Vec<BackendQueryLifecycleMetricsSnapshot>>,
+}
+
+impl RecordingMetricsSink {
+    fn last_snapshot(&self) -> BackendQueryLifecycleMetricsSnapshot {
+        *self
+            .snapshots
+            .lock()
+            .expect("metrics snapshots")
+            .last()
+            .expect("published metrics snapshot")
+    }
+}
+
+impl QueryLifecycleMetricsSink for RecordingMetricsSink {
+    fn publish(
+        &self,
+        snapshot: BackendQueryLifecycleMetricsSnapshot,
+        _termination_reasons: [u64; 6],
+    ) {
+        self.snapshots
+            .lock()
+            .expect("metrics snapshots")
+            .push(snapshot);
+    }
 }
 
 #[derive(Default)]
@@ -123,6 +154,14 @@ impl RecordingLocalRuntime {
     fn fail_install(&self) {
         *self.state.fail_install.lock().expect("fail install") = true;
     }
+
+    fn fail_abort(&self) {
+        *self.state.fail_abort.lock().expect("fail abort") = true;
+    }
+
+    fn allow_abort(&self) {
+        *self.state.fail_abort.lock().expect("fail abort") = false;
+    }
 }
 
 impl QueryLifecycleLocalRuntime for RecordingLocalRuntime {
@@ -165,7 +204,14 @@ impl QueryLifecycleLocalRuntime for RecordingLocalRuntime {
             .lock()
             .expect("abort calls")
             .push(execution_id);
-        Ok(())
+        if *self.state.fail_abort.lock().expect("fail abort") {
+            Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Internal,
+                "injected runtime filter abort failure",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn terminate_query(
@@ -387,6 +433,29 @@ fn query_lifecycle_registry_backend_epoch_mismatch_rejects() {
 }
 
 #[test]
+fn query_lifecycle_registry_unbound_application_identity_rejects_init() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = QueryLifecycleRegistry::new_unbound(
+        LOCAL_START_EPOCH,
+        Arc::new(runtime.clone()),
+        registry_config(8),
+    );
+
+    assert_eq!(
+        registry
+            .init_query(init_request_fixture(
+                51,
+                ATTEMPT_1,
+                LOCAL_START_EPOCH,
+                10_000,
+            ))
+            .outcome(),
+        QueryInitOutcome::RejectedStaleBackend
+    );
+    assert_eq!(runtime.runtime_filter_install_calls(), 0);
+}
+
+#[test]
 fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_once() {
     let runtime = RecordingLocalRuntime::default();
     runtime.block_install();
@@ -422,6 +491,41 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
 }
 
 #[test]
+fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
+    let runtime = RecordingLocalRuntime::default();
+    runtime.block_install();
+    let metrics = Arc::new(RecordingMetricsSink::default());
+    let registry = QueryLifecycleRegistry::new_with_clock_and_metrics(
+        LOCAL_BACKEND_ID,
+        LOCAL_START_EPOCH,
+        Arc::new(runtime.clone()),
+        registry_config(8),
+        Arc::new(ManualClock::default()),
+        Arc::clone(&metrics) as Arc<dyn QueryLifecycleMetricsSink>,
+    );
+    let request = init_request_fixture(7, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let execution_id = request.manifest().execution_id();
+    let digest = request.digest();
+
+    let init_registry = Arc::clone(&registry);
+    let init_thread = std::thread::spawn(move || init_registry.init_query(request));
+    runtime.wait_until_install_enters();
+    assert_eq!(metrics.last_snapshot().initializing, 1);
+
+    registry.abort_query(
+        QueryAbortRequest::new(execution_id, digest, "metrics while init blocks")
+            .expect("valid abort"),
+    );
+    let terminating = metrics.last_snapshot();
+    assert_eq!(terminating.initializing, 0);
+    assert_eq!(terminating.terminating, 1);
+    assert_eq!(terminating.tombstones, 0);
+
+    runtime.release_install();
+    init_thread.join().expect("init thread");
+}
+
+#[test]
 fn query_lifecycle_admission_requires_control_ready_and_commits_exactly_once() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let expected = UniqueId { hi: 71, lo: 1 };
@@ -448,7 +552,8 @@ fn query_lifecycle_admission_requires_control_ready_and_commits_exactly_once() {
     registry
         .admit_fragment(execution_id, expected)
         .expect("exact fragment is admitted")
-        .commit();
+        .commit()
+        .expect("fragment admission commits");
     assert_eq!(
         registry
             .admit_fragment(execution_id, expected)
@@ -514,7 +619,78 @@ fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
     registry
         .admit_fragment(execution_id, expected)
         .expect("dropped permit releases in-flight slot")
-        .commit();
+        .commit()
+        .expect("fragment admission commits");
+}
+
+#[test]
+fn query_lifecycle_admission_commit_after_abort_returns_terminated() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let expected = UniqueId { hi: 75, lo: 1 };
+    let request = fragment_init_request_fixture(75, &[expected]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _control = attach_control(&registry, &request);
+    let permit = registry
+        .admit_fragment(execution_id, expected)
+        .expect("fragment permit");
+
+    registry.abort_query(
+        QueryAbortRequest::new(execution_id, request.digest(), "abort before permit commit")
+            .expect("valid abort"),
+    );
+
+    assert_eq!(
+        permit
+            .commit()
+            .expect_err("late permit commit must not authorize fragment start")
+            .code(),
+        QueryLifecycleErrorCode::Terminated
+    );
+}
+
+#[test]
+fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = registry_with(runtime.clone(), 8);
+
+    assert_eq!(
+        registry
+            .init_query(fragment_init_request_fixture(76, &[]))
+            .outcome(),
+        QueryInitOutcome::RejectedInvalidManifest
+    );
+    assert_eq!(runtime.runtime_filter_install_calls(), 0);
+}
+
+#[test]
+fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = init_request_fixture(77, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _control = attach_control(&registry, &request);
+    let attach =
+        QueryControlAttach::new(execution_id, request.digest(), 1).expect("valid control attach");
+
+    let Err(duplicate_error) = registry.attach_control(attach.clone()) else {
+        panic!("duplicate active attach must conflict");
+    };
+    assert_eq!(duplicate_error.code(), QueryLifecycleErrorCode::Conflict);
+    registry.abort_query(
+        QueryAbortRequest::new(execution_id, request.digest(), "terminate before attach")
+            .expect("valid abort"),
+    );
+    let Err(terminated_error) = registry.attach_control(attach) else {
+        panic!("terminated attach must be terminal");
+    };
+    assert_eq!(terminated_error.code(), QueryLifecycleErrorCode::Terminated);
 }
 
 #[test]
@@ -673,7 +849,8 @@ fn query_lifecycle_pre_start_timeout_is_disarmed_by_first_accept_and_service_con
     registry
         .admit_fragment(fragment_execution, expected)
         .expect("fragment permit")
-        .commit();
+        .commit()
+        .expect("fragment admission commits");
 
     let service_request = init_request_fixture(92, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let service_execution = service_request.manifest().execution_id();
@@ -865,6 +1042,90 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
             .outcome(),
         QueryInitOutcome::Applied
     );
+}
+
+#[test]
+fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_retry() {
+    let runtime = RecordingLocalRuntime::default();
+    let clock = Arc::new(ManualClock::default());
+    let registry = registry_with_clock(runtime.clone(), 1, Arc::clone(&clock));
+    let request = init_request_fixture(961, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    runtime.fail_abort();
+
+    registry.abort_query(
+        QueryAbortRequest::new(execution_id, request.digest(), "abort with cleanup failure")
+            .expect("valid abort"),
+    );
+
+    assert_eq!(
+        registry.phase(execution_id),
+        Some(QueryLifecyclePhase::Terminating)
+    );
+    assert_eq!(registry.metrics_snapshot().terminating, 1);
+    assert_eq!(registry.metrics_snapshot().tombstones, 0);
+    assert_eq!(runtime.runtime_filter_abort_calls(), 1);
+    assert_eq!(
+        registry
+            .init_query(fragment_init_request_fixture(
+                962,
+                &[UniqueId { hi: 962, lo: 1 }],
+            ))
+            .outcome(),
+        QueryInitOutcome::RejectedCapacity
+    );
+
+    runtime.allow_abort();
+    registry.sweep_expired(clock.now());
+
+    assert_eq!(
+        registry.phase(execution_id),
+        Some(QueryLifecyclePhase::Tombstone)
+    );
+    assert_eq!(runtime.runtime_filter_abort_calls(), 2);
+    assert_eq!(
+        registry
+            .init_query(fragment_init_request_fixture(
+                963,
+                &[UniqueId { hi: 963, lo: 1 }],
+            ))
+            .outcome(),
+        QueryInitOutcome::Applied
+    );
+}
+
+#[test]
+fn query_lifecycle_install_and_abort_failure_stays_terminating_until_retry() {
+    let runtime = RecordingLocalRuntime::default();
+    runtime.fail_install();
+    runtime.fail_abort();
+    let clock = Arc::new(ManualClock::default());
+    let registry = registry_with_clock(runtime.clone(), 1, Arc::clone(&clock));
+    let request = init_request_fixture(964, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let execution_id = request.manifest().execution_id();
+
+    assert_eq!(
+        registry.init_query(request).outcome(),
+        QueryInitOutcome::RejectedInvalidManifest
+    );
+    assert_eq!(
+        registry.phase(execution_id),
+        Some(QueryLifecyclePhase::Terminating)
+    );
+    assert_eq!(runtime.runtime_filter_abort_calls(), 1);
+
+    runtime.allow_abort();
+    registry.sweep_expired(clock.now());
+
+    assert_eq!(
+        registry.phase(execution_id),
+        Some(QueryLifecyclePhase::Tombstone)
+    );
+    assert_eq!(runtime.runtime_filter_abort_calls(), 2);
 }
 
 #[test]

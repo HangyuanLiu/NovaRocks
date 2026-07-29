@@ -9,9 +9,13 @@ use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::{grpc_server, report_worker};
 
+use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
     native_fragment_event_sink, native_result_writer,
+};
+use crate::query_lifecycle::{
+    NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,10 +87,45 @@ impl fmt::Display for BackendApplicationError {
 
 impl std::error::Error for BackendApplicationError {}
 
-#[derive(Debug)]
 pub struct BackendApplicationHost {
     ready_marker: String,
     _native_fragment_service: Arc<NativeFragmentService>,
+    _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
+}
+
+impl fmt::Debug for BackendApplicationHost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendApplicationHost")
+            .field("ready_marker", &self.ready_marker)
+            .finish_non_exhaustive()
+    }
+}
+
+struct BackendApplicationServices {
+    native_fragment_service: Arc<NativeFragmentService>,
+    query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
+}
+
+fn compose_backend_application_services(config: &NovaRocksConfig) -> BackendApplicationServices {
+    let controls = Arc::new(FragmentControlRegistry::default());
+    let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
+        grpc_exchange_transmitter(),
+        grpc_fragment_lookup_client(),
+        native_result_writer(),
+        native_fragment_event_sink(),
+        Arc::clone(&controls),
+    ));
+    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(controls));
+    let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound(
+        novarocks::runtime::start_epoch::start_epoch(),
+        local_runtime,
+        QueryLifecycleRegistryConfig::from_runtime_config(&config.runtime),
+    );
+    BackendApplicationServices {
+        native_fragment_service,
+        query_lifecycle_registry,
+    }
 }
 
 impl BackendApplicationHost {
@@ -162,12 +201,8 @@ impl BackendApplicationHost {
             )?;
         let bind_host = config.server.host.clone();
         let grpc_port = config.server.grpc_port;
-        let native_fragment_service = Arc::new(NativeFragmentService::new(
-            grpc_exchange_transmitter(),
-            grpc_fragment_lookup_client(),
-            native_result_writer(),
-            native_fragment_event_sink(),
-        ));
+        let services = compose_backend_application_services(&config);
+        let native_fragment_service = Arc::clone(&services.native_fragment_service);
 
         grpc_server::start_grpc_exchange_server(
             &bind_host,
@@ -196,6 +231,7 @@ impl BackendApplicationHost {
                 std::process::id()
             ),
             _native_fragment_service: native_fragment_service,
+            _query_lifecycle_registry: services.query_lifecycle_registry,
         })
     }
 }
@@ -336,11 +372,11 @@ fn wait_for_tcp_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendServerConfig, combine_primary_and_shutdown,
+        BackendServerConfig, combine_primary_and_shutdown, compose_backend_application_services,
     };
     use novarocks::common::app_config::NovaRocksConfig;
     use novarocks::proto::common::{Status, UniqueId};
@@ -366,6 +402,18 @@ mod tests {
         config.cluster.advertise_host = "127.0.0.1".to_string();
         config.cluster.advertise_port = advertise_port;
         BackendServerConfig { config }
+    }
+
+    #[test]
+    fn application_composition_owns_one_query_lifecycle_registry() {
+        let config = NovaRocksConfig::default();
+        let services = compose_backend_application_services(&config);
+
+        assert_eq!(
+            Arc::strong_count(&services.query_lifecycle_registry),
+            1,
+            "application composition must be the single registry owner before ingress injection"
+        );
     }
 
     #[test]
