@@ -596,7 +596,7 @@ pub(crate) fn register_starrocks_tables_in_catalog(
     Ok(())
 }
 
-fn starrocks_table_def(runtime: &StarRocksTableRuntime) -> Result<TableDef, String> {
+pub(crate) fn starrocks_table_def(runtime: &StarRocksTableRuntime) -> Result<TableDef, String> {
     let schema_columns = visible_tablet_columns_by_name(&runtime.tablet_schema)?;
     let mut columns = Vec::with_capacity(runtime.columns.len());
     for column in &runtime.columns {

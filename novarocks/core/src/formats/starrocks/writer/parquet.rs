@@ -38,7 +38,7 @@ use crate::formats::starrocks::plan::{
     StarRocksOutputColumnHint, StarRocksPhysicalColumnBinding,
     validate_physical_schema_to_output_type,
 };
-use crate::fs::access::FsScheme;
+use novarocks_fs::FsScheme;
 
 pub fn read_bundle_parquet_snapshot_if_any(
     snapshot: &StarRocksTabletSnapshot,

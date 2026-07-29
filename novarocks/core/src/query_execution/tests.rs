@@ -147,6 +147,7 @@ fn real_execution_artifacts() -> (
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &plan,
         &crate::connector::ConnectorRegistry::new(),
+        &crate::connector::test_request_context(),
         None,
     )
     .expect("prepare production execution artifact");

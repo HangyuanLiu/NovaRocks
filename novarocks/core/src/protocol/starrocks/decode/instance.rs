@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 
+use novarocks_fs::DataCacheManager;
+
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -248,7 +250,7 @@ impl StarRocksObjectStoreDefaults {
         }
     }
 
-    pub(crate) fn apply_to(&self, config: &mut crate::fs::object_store::ObjectStoreConfig) {
+    pub(crate) fn apply_to(&self, config: &mut novarocks_fs::ObjectStoreConfig) {
         config.retry_max_times = config.retry_max_times.or(self.retry_max_times);
         config.retry_min_delay_ms = config.retry_min_delay_ms.or(self.retry_min_delay_ms);
         config.retry_max_delay_ms = config.retry_max_delay_ms.or(self.retry_max_delay_ms);
@@ -395,9 +397,7 @@ pub fn snapshot_decode_facts(
         StarRocksPathRewriteFacts::new(rewrite.from_prefix.clone(), rewrite.to_prefix.clone())
     });
     let datacache_available = config.runtime.cache.datacache_enable
-        && crate::cache::DataCacheManager::instance()
-            .block_cache()
-            .is_some();
+        && DataCacheManager::instance().block_cache().is_some();
     let jdbc = config.jdbc_config().map(|jdbc| {
         StarRocksJdbcFacts::new(
             jdbc.url.clone(),

@@ -19,13 +19,14 @@ use std::collections::HashMap;
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{
-    lower_scan_predicate, parse_scan_limit, resolve_cloud_object_store_config, scan_batch_size,
-    table_location_map,
+    lower_scan_predicate, parse_scan_limit, resolve_native_connector_object_store_config,
+    scan_batch_size, table_location_map,
 };
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{ScanReadPlan, maybe_project_data_scan_output};
-use crate::cache::{CacheOptions, DataCacheContext};
-use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig, ScanConfig};
+use crate::cache::CacheOptions;
+use crate::connector::hdfs::{HdfsInstanceConfig, plan_native_hdfs_read_source};
+use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::FileFormatConfig;
@@ -33,6 +34,7 @@ use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig};
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_fs::DataCacheContext;
 
 pub(super) fn lower_iceberg_data_files_scan(
     node: &plan::DistributedNode,
@@ -80,14 +82,15 @@ pub(super) fn lower_iceberg_data_files_scan(
         runtime_min_max_filter_columns: HashMap::new(),
         variant_path_predicates: Vec::new(),
         batch_size: Some(batch_size),
-        datacache: DataCacheContext::external(cache_options),
+        datacache: DataCacheContext::external(cache_options.to_file_cache_options()),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
         iceberg_output_schema: Some(read_plan.parquet_schema.arrow_schema_ref()),
         variant_path_columns: read_plan.variant_path_columns.clone(),
         query_global_dicts: Default::default(),
     };
-    let object_store_config = resolve_cloud_object_store_config(&source.cloud_properties)?;
+    let object_store_config =
+        resolve_native_connector_object_store_config(&source.cloud_properties)?;
     let iceberg_runtime_pruning = Some(HdfsIcebergRuntimePruningConfig {
         slot_to_column: read_plan
             .read_slot_ids
@@ -111,14 +114,21 @@ pub(super) fn lower_iceberg_data_files_scan(
         iceberg_runtime_pruning,
     };
     let predicate = lower_scan_predicate(scan, arena, &read_plan.read_layout)?;
-    let (source, bound_ranges) = ctx
-        .connectors()?
-        .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "files", error)
-        })?;
-    // Route the enriched ranges to the instance; bind happens at materialize.
-    ctx.capture_scan_ranges(node.node_id, bound_ranges);
+    let query_options = ctx.query_options().cloned().unwrap_or_default();
+    let source = plan_native_hdfs_read_source(
+        ctx.connectors()?,
+        ctx.query_id(),
+        node.node_id,
+        HdfsInstanceConfig {
+            scan: cfg,
+            chunk_schema: read_plan.read_schema.clone(),
+        },
+        &query_options,
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "files", error)
+    })?;
+    ctx.capture_scan_ranges(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
     let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(read_plan.read_schema.clone())

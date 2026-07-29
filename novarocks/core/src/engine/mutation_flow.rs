@@ -55,6 +55,7 @@ pub(crate) fn execute_update_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
@@ -129,7 +130,13 @@ pub(crate) fn execute_update_statement(
     let mode = select_iceberg_update_mode(&table)?;
     match mode {
         IcebergUpdateMode::CopyOnWrite => {
-            let matched = materialize_update_matches(state, &target, stmt, current_catalog)?;
+            let matched = materialize_update_matches(
+                state,
+                &target,
+                stmt,
+                current_catalog,
+                connector_context,
+            )?;
             if matched.row_ids.is_empty() {
                 return Ok(StatementResult::Ok);
             }
@@ -145,6 +152,7 @@ pub(crate) fn execute_update_statement(
                 entry,
                 &target_ref,
                 execution.clone(),
+                connector_context,
             )
         }
         IcebergUpdateMode::MergeOnRead => execute_mor_update(
@@ -159,6 +167,7 @@ pub(crate) fn execute_update_statement(
             entry,
             &target_ref,
             execution.clone(),
+            connector_context,
         ),
     }
 }
@@ -168,6 +177,7 @@ fn materialize_update_matches(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MatchedUpdateBatch, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     // The match SELECT runs against the standalone analyzer with
@@ -194,7 +204,13 @@ fn materialize_update_matches(
         &assignments_sql,
         where_sql.as_deref(),
     );
-    execute_update_match_query(state, Some(&target.catalog), &match_sql, &target.namespace)
+    execute_update_match_query(
+        state,
+        Some(&target.catalog),
+        &match_sql,
+        &target.namespace,
+        connector_context,
+    )
 }
 
 fn mutation_source_to_sql(
@@ -283,6 +299,7 @@ fn build_update_mor_change_stream_write_plan(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     target_ref: &str,
     new_sequence_number: i64,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
@@ -307,6 +324,7 @@ fn build_update_mor_change_stream_write_plan(
             Some(&target.catalog),
             &target.namespace,
             &mut query,
+            connector_context,
         )?;
     }
 
@@ -320,6 +338,7 @@ fn build_update_mor_change_stream_write_plan(
         Some(&target.catalog),
         &catalog_service_snapshot,
         &connectors_snapshot,
+        connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -995,6 +1014,7 @@ fn execute_mor_update(
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     // For branch DML, read partition metadata at the branch head snapshot.
     let read_snapshot_id: Option<i64> = if target_ref != "main" {
@@ -1033,6 +1053,7 @@ fn execute_mor_update(
         target_columns,
         target_ref,
         metadata.last_sequence_number() + 1,
+        connector_context,
     )?;
     run_mor_update_change_stream_transaction(
         state,
@@ -1418,6 +1439,7 @@ fn execute_cow_update(
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     if matched.row_ids.is_empty() {
         return Ok(StatementResult::Ok);
@@ -1460,6 +1482,7 @@ fn execute_cow_update(
         target_columns,
         &entry,
         base_snapshot_id,
+        connector_context,
     )?;
     run_cow_update_distributed_transaction(
         state,
@@ -1472,6 +1495,7 @@ fn execute_cow_update(
         target_ref,
         write,
         execution,
+        connector_context,
     )?;
     Ok(StatementResult::Ok)
 }
@@ -1510,13 +1534,21 @@ fn build_cow_update_distributed_write(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowUpdateDistributedWrite, String> {
     let base_snapshot_id =
         base_snapshot_id.ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &registry,
+            connector_context.clone(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
     let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
         target, &resolved, table, entry,
@@ -1779,6 +1811,7 @@ struct DistributedCowUpdateExecutor {
     commit_executor: IcebergWriteCommitExecutor,
     cow_update_rewrite: Mutex<Option<CowUpdateRewriteSet>>,
     execution: QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
@@ -1806,6 +1839,7 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             // not-matched INSERT (M3b) populates `appended_files`.
             Vec::new(),
             &self.execution,
+            &self.connector_context,
         )?;
 
         let write_commit = rewrite.write_commit;
@@ -1883,6 +1917,7 @@ fn run_cow_update_file_rewrites(
     collector: &Arc<IcebergCommitCollector>,
     appended_files: Vec<crate::connector::iceberg::commit::WrittenFile>,
     execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowUpdateRewriteRun, String> {
     let mut merged_commit: Option<WriteCommitInput> = None;
     let mut touched_data_files = Vec::with_capacity(write.file_plans.len());
@@ -1895,6 +1930,7 @@ fn run_cow_update_file_rewrites(
             metadata,
             collector,
             execution,
+            connector_context,
         )?;
         // Merge this file's writer commits into the single transaction-wide
         // `WriteCommitInput`; the collector turns all of them into committed
@@ -1944,13 +1980,14 @@ fn run_one_cow_file_rewrite(
     metadata: &iceberg::spec::TableMetadata,
     collector: &Arc<IcebergCommitCollector>,
     execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowFileRewriteOutput, String> {
     crate::engine::query_prep::register_synthetic_table_for_query(
         state,
         &plan.namespace,
         plan.synthetic_table_def.clone(),
     )?;
-    let result = crate::engine::execute_query_as_iceberg_write(
+    let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
         state,
         Some(&target.catalog),
         &target.namespace,
@@ -1959,6 +1996,7 @@ fn run_one_cow_file_rewrite(
         None,
         None,
         Some(execution),
+        connector_context,
     );
     let drop_result = crate::engine::query_prep::drop_local_table_registration_if_exists(
         state,
@@ -2027,6 +2065,7 @@ fn run_cow_update_distributed_transaction(
     target_ref: &str,
     write: CowUpdateDistributedWrite,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -2076,6 +2115,7 @@ fn run_cow_update_distributed_transaction(
         commit_executor,
         cow_update_rewrite: Mutex::new(None),
         execution,
+        connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -2095,17 +2135,19 @@ fn execute_update_match_query(
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MatchedUpdateBatch, String> {
     let statement = crate::sql::parser::parse_sql_raw(sql)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal UPDATE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_service(
+    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        connector_context,
     )?;
     matched_update_batch_from_query_result(result)
 }
@@ -2399,6 +2441,7 @@ pub(crate) fn execute_merge_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target = crate::engine::backend_resolver::resolve_existing_table_target(
         state,
@@ -2516,6 +2559,7 @@ pub(crate) fn execute_merge_statement(
             insert_columns_resolved.as_deref(),
             target_ref,
             metadata.last_sequence_number() + 1,
+            connector_context,
         )?;
         run_mor_merge_change_stream_transaction(
             state,
@@ -2539,6 +2583,7 @@ pub(crate) fn execute_merge_statement(
         current_catalog,
         &target_columns,
         insert_columns_resolved.as_deref(),
+        connector_context,
     )?;
 
     // Build the not-matched INSERT branch only when there are unmatched rows to
@@ -2559,8 +2604,15 @@ pub(crate) fn execute_merge_statement(
             )?;
             let resolved = {
                 let registry = state.connectors.read().expect("connector registry read");
-                let backend = registry.catalog_backend("iceberg")?;
-                backend.load_table(&target.catalog, &target.namespace, &target.table)?
+                crate::connector::metadata_load_table(
+                    &registry,
+                    connector_context.clone(),
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
+                    novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                )?
+                .0
             };
             let plan = crate::engine::iceberg_writer::build_insert_write_plan(
                 &target,
@@ -2598,6 +2650,7 @@ pub(crate) fn execute_merge_statement(
                         &target_columns,
                         &entry,
                         base_snapshot_id,
+                        connector_context,
                     )?;
                     MergeMatchedBranch::CowUpdate(write)
                 }
@@ -2702,6 +2755,7 @@ pub(crate) fn execute_merge_statement(
         commit_executor,
         execution: execution.clone(),
         cow_update_rewrite: Mutex::new(None),
+        connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -2909,6 +2963,7 @@ fn materialize_merge_match(
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MergeMatchRows, String> {
     let target_alias = stmt
         .target_alias
@@ -3019,7 +3074,13 @@ fn materialize_merge_match(
         stmt.not_matched.is_some(),
     );
 
-    let result = execute_merge_match_query(state, Some(&target.catalog), &sql, &target.namespace)?;
+    let result = execute_merge_match_query(
+        state,
+        Some(&target.catalog),
+        &sql,
+        &target.namespace,
+        connector_context,
+    )?;
     Ok(result)
 }
 
@@ -3033,6 +3094,7 @@ fn build_merge_mor_change_stream_write_plan(
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
     new_sequence_number: i64,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
     let target_alias = stmt
         .target_alias
@@ -3148,6 +3210,7 @@ fn build_merge_mor_change_stream_write_plan(
             Some(&target.catalog),
             &target.namespace,
             &mut query,
+            connector_context,
         )?;
     }
 
@@ -3161,6 +3224,7 @@ fn build_merge_mor_change_stream_write_plan(
         Some(&target.catalog),
         &catalog_service_snapshot,
         &connectors_snapshot,
+        connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -3210,17 +3274,19 @@ fn execute_merge_match_query(
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MergeMatchRows, String> {
     let statement = crate::sql::parser::parse_sql_raw(sql)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal MERGE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_service(
+    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        connector_context,
     )?;
     let Some(first_chunk) = result.chunks.first() else {
         return Ok(MergeMatchRows::empty());
@@ -3437,6 +3503,7 @@ struct DistributedMergeExecutor {
     /// carry the rewrite set (touched files + appended INSERT data) on the
     /// commit context. `None` for MOR / DELETE / INSERT-only folds.
     cow_update_rewrite: Mutex<Option<CowUpdateRewriteSet>>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl DistributedMergeExecutor {
@@ -3454,7 +3521,7 @@ impl DistributedMergeExecutor {
         ),
         String,
     > {
-        let result = crate::engine::execute_query_as_iceberg_write(
+        let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -3463,6 +3530,7 @@ impl DistributedMergeExecutor {
             None,
             None,
             Some(&self.execution),
+            &self.connector_context,
         )?;
         if let Some(abort) = &result.write_abort {
             return Err(format!(
@@ -3544,6 +3612,7 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
                     &self.commit_executor.collector,
                     insert_files,
                     &self.execution,
+                    &self.connector_context,
                 )?;
                 commit_parts.push(QueryExecutionResult {
                     query_result: QueryResult::empty(),

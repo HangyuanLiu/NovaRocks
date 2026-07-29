@@ -28,8 +28,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec;
-use crate::fs::object_store::ObjectStoreConfig;
-use crate::fs::opendal::OpendalRangeReaderFactory;
+use novarocks_fs::ObjectStoreConfig;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergDeltaTablePayload {
@@ -208,7 +207,7 @@ impl IcebergRuntimeHandles {
 
 #[derive(Debug)]
 pub(crate) struct IcebergResolvedRuntime {
-    pub(crate) object_store_factory: Arc<OpendalRangeReaderFactory>,
+    pub(crate) object_store_factory: Arc<novarocks_fs::FsAccessHandle>,
     pub(crate) delete_side: Option<DeltaScanDeleteSide>,
 }
 

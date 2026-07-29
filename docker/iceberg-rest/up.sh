@@ -373,6 +373,12 @@ endpoint = "$minio_endpoint"
 access_key_id = "$minio_user"
 access_key_secret = "$minio_password"
 enable_path_style_access = true
+
+[connector.object_store]
+endpoint = "$minio_endpoint"
+access_key_id = "$minio_user"
+access_key_secret = "$minio_password"
+enable_path_style_access = true
 EOF
 
 cat > "$runtime_dir/standalone-managed-lake-scheduler.toml" <<EOF
@@ -404,6 +410,12 @@ mv_refresh_scheduler_failure_backoff_ms = 500
 mv_refresh_scheduler_max_failure_backoff_ms = 2000
 
 [standalone_server.object_store]
+endpoint = "$minio_endpoint"
+access_key_id = "$minio_user"
+access_key_secret = "$minio_password"
+enable_path_style_access = true
+
+[connector.object_store]
 endpoint = "$minio_endpoint"
 access_key_id = "$minio_user"
 access_key_secret = "$minio_password"

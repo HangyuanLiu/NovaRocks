@@ -4068,16 +4068,23 @@ pub(crate) fn alter_table_properties(
         );
     }
     let target_table = {
-        let backend = {
-            let connectors = state
-                .connectors
-                .read()
-                .expect("connector registry read lock");
-            connectors.catalog_backend("iceberg")?
-        };
-        backend
-            .current_schema_id_for_read(&target.catalog, &target.namespace, &target.table)
-            .map(|(resolved_table, _schema_id)| resolved_table)?
+        let connectors = state
+            .connectors
+            .read()
+            .expect("connector registry read lock");
+        crate::connector::metadata_load_table(
+            &connectors,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
+        .table
     };
 
     // 2. Denylist check — fail fast before any IO.

@@ -206,7 +206,7 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 /// `ScanSource::IcebergMetadataTable` source. The optimizer treats it
 /// like any other Scan; codegen branches on the source variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
-/// `IcebergMetadataScanOp` (no JVM / JNI bridge — the embedded-Java
+/// Iceberg metadata SPI reader (no JVM / JNI bridge — the embedded-Java
 /// path was removed in favor of iceberg-rust).
 fn plan_iceberg_metadata_scan(
     rel: IcebergMetadataScanRelation,

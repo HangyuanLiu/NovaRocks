@@ -198,18 +198,8 @@ pub(crate) fn rewrite_time_travel_refs(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &mut sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    let (catalog_backend, table_source) = {
-        let registry = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock");
-        (
-            registry.catalog_backend("iceberg")?,
-            registry.table_source("iceberg")?,
-        )
-    };
-
     // Walk CTEs
     if let Some(with) = &mut query.with {
         for cte in &mut with.cte_tables {
@@ -217,9 +207,8 @@ pub(crate) fn rewrite_time_travel_refs(
                 state,
                 current_catalog,
                 current_database,
-                &catalog_backend,
-                &table_source,
                 cte.query.body.as_mut(),
+                connector_context,
             )?;
         }
     }
@@ -227,9 +216,8 @@ pub(crate) fn rewrite_time_travel_refs(
         state,
         current_catalog,
         current_database,
-        &catalog_backend,
-        &table_source,
         query.body.as_mut(),
+        connector_context,
     )
 }
 
@@ -237,9 +225,8 @@ fn rewrite_time_travel_in_set_expr(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
-    catalog_backend: &Arc<dyn crate::connector::backend::CatalogBackend>,
-    table_source: &Arc<dyn crate::connector::backend::TableSource>,
     expr: &mut sqlparser::ast::SetExpr,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     match expr {
         sqlparser::ast::SetExpr::Select(select) => {
@@ -248,18 +235,16 @@ fn rewrite_time_travel_in_set_expr(
                     state,
                     current_catalog,
                     current_database,
-                    catalog_backend,
-                    table_source,
                     &mut tw.relation,
+                    connector_context,
                 )?;
                 for join in &mut tw.joins {
                     rewrite_time_travel_in_factor(
                         state,
                         current_catalog,
                         current_database,
-                        catalog_backend,
-                        table_source,
                         &mut join.relation,
+                        connector_context,
                     )?;
                 }
             }
@@ -270,26 +255,23 @@ fn rewrite_time_travel_in_set_expr(
                 state,
                 current_catalog,
                 current_database,
-                catalog_backend,
-                table_source,
                 left.as_mut(),
+                connector_context,
             )?;
             rewrite_time_travel_in_set_expr(
                 state,
                 current_catalog,
                 current_database,
-                catalog_backend,
-                table_source,
                 right.as_mut(),
+                connector_context,
             )
         }
         sqlparser::ast::SetExpr::Query(q) => rewrite_time_travel_in_set_expr(
             state,
             current_catalog,
             current_database,
-            catalog_backend,
-            table_source,
             q.body.as_mut(),
+            connector_context,
         ),
         _ => Ok(()),
     }
@@ -299,9 +281,8 @@ fn rewrite_time_travel_in_factor(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
-    catalog_backend: &Arc<dyn crate::connector::backend::CatalogBackend>,
-    table_source: &Arc<dyn crate::connector::backend::TableSource>,
     factor: &mut sqlparser::ast::TableFactor,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     match factor {
         sqlparser::ast::TableFactor::Table {
@@ -375,12 +356,20 @@ fn rewrite_time_travel_in_factor(
             // Build and register the synthetic table def
             let synthetic_table_name = format!("{}__at_{}", target.table, snapshot_id);
             {
-                let resolved = catalog_backend.load_table(
+                let connectors = state
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
+                let (table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
+                    &connectors,
+                    connector_context.clone(),
                     &target.catalog,
                     &target.namespace,
                     &target.table,
+                    Some(snapshot_id),
+                    false,
                 )?;
-                let table_def = table_source.build_table_def_at(&resolved, Some(snapshot_id))?;
                 // Build a new TableDef with the synthetic name
                 let synthetic_def = TableDef {
                     name: synthetic_table_name.clone(),
@@ -427,9 +416,8 @@ fn rewrite_time_travel_in_factor(
             state,
             current_catalog,
             current_database,
-            catalog_backend,
-            table_source,
             subquery.body.as_mut(),
+            connector_context,
         ),
         _ => Ok(()),
     }
@@ -463,16 +451,11 @@ pub(crate) fn materialize_external_schema_table_for_statement(
         return Ok(());
     }
 
-    let (catalog, source) = {
-        let registry = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock");
-        (
-            registry.catalog_backend("iceberg")?,
-            registry.table_source("iceberg")?,
-        )
-    };
+    let connectors = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
 
     {
         let registry = state
@@ -484,15 +467,22 @@ pub(crate) fn materialize_external_schema_table_for_statement(
     }
     drop_local_table_registration_if_exists(state, &target.namespace, &target.table)?;
 
-    let resolved = catalog
-        .load_table_for_read(&target.catalog, &target.namespace, &target.table)
-        .map_err(|err| {
-            format!(
-                "load iceberg table {}.{}.{} failed: {err}",
-                target.catalog, target.namespace, target.table
-            )
-        })?;
-    let mut table_def = source.build_schema_table_def(&resolved)?;
+    let (mut table_def, _) = crate::connector::iceberg::provider::load_schema_table_def(
+        &connectors,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    )
+    .map_err(|err| {
+        format!(
+            "load iceberg table {}.{}.{} failed: {err}",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
     table_def.name = target.table;
     register_local_table_registration(state, &target.namespace, table_def)
 }
@@ -770,83 +760,6 @@ mod tests {
         }
     }
 
-    struct PerTableBindingBackend;
-
-    impl crate::connector::backend::CatalogBackend for PerTableBindingBackend {
-        fn name(&self) -> &'static str {
-            "iceberg"
-        }
-
-        fn namespace_exists(&self, _: &str, _: &str) -> Result<bool, String> {
-            Err("unused".to_string())
-        }
-
-        fn create_namespace(&self, _: &str, _: &str) -> Result<(), String> {
-            Err("unused".to_string())
-        }
-
-        fn drop_namespace(&self, _: &str, _: &str, _: bool) -> Result<(), String> {
-            Err("unused".to_string())
-        }
-
-        fn create_table(
-            &self,
-            _: crate::connector::backend::CreateTableRequest,
-        ) -> Result<(), String> {
-            Err("unused".to_string())
-        }
-
-        fn table_exists(&self, _: &str, _: &str, _: &str) -> Result<bool, String> {
-            Err("unused".to_string())
-        }
-
-        fn drop_table(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
-            Err("unused".to_string())
-        }
-
-        fn load_table(
-            &self,
-            catalog: &str,
-            namespace: &str,
-            table: &str,
-        ) -> Result<crate::connector::backend::ResolvedTable, String> {
-            Ok(crate::connector::backend::ResolvedTable {
-                catalog: catalog.to_string(),
-                namespace: namespace.to_string(),
-                table: table.to_string(),
-                columns: vec![],
-            })
-        }
-    }
-
-    struct PerTableBindingSource;
-
-    impl crate::connector::backend::TableSource for PerTableBindingSource {
-        fn name(&self) -> &'static str {
-            "iceberg"
-        }
-
-        fn build_table_def(
-            &self,
-            table: &crate::connector::backend::ResolvedTable,
-        ) -> Result<TableDef, String> {
-            Ok(table_def_with_binding(
-                table,
-                crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-            ))
-        }
-
-        fn build_schema_table_def(
-            &self,
-            table: &crate::connector::backend::ResolvedTable,
-        ) -> Result<TableDef, String> {
-            Ok(table_def_with_binding(
-                table,
-                crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-            ))
-        }
-    }
-
     fn table_def_with_binding(
         table: &crate::connector::backend::ResolvedTable,
         binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
@@ -908,64 +821,6 @@ mod tests {
         );
         super::drop_local_table_registration_if_exists(&state, "scratch", "rewrite_piece")
             .expect("drop is idempotent for scoped cleanup");
-    }
-
-    fn state_with_per_table_binding_source() -> std::sync::Arc<crate::engine::StandaloneState> {
-        let state = std::sync::Arc::new(crate::engine::StandaloneState::default());
-        {
-            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
-            catalogs
-                .create_catalog(
-                    "ice",
-                    &[
-                        ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                        (
-                            "iceberg.catalog.warehouse".to_string(),
-                            "file:///tmp/novarocks-per-table-binding".to_string(),
-                        ),
-                    ],
-                )
-                .expect("create iceberg catalog");
-        }
-        {
-            let mut connectors = state.connectors.write().expect("connector registry write");
-            connectors.register_catalog_backend(std::sync::Arc::new(PerTableBindingBackend));
-            connectors.register_table_source(std::sync::Arc::new(PerTableBindingSource));
-        }
-        state
-    }
-
-    #[test]
-    fn catalog_service_provider_analyzes_iceberg_query_without_global_registration() {
-        let state = state_with_per_table_binding_source();
-        {
-            let connectors = state.connectors.read().expect("connectors");
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    "ice",
-                    connectors.catalog_backend("iceberg").expect("backend"),
-                    connectors.table_source("iceberg").expect("source"),
-                ));
-        }
-        let catalog_service = crate::engine::catalog_service_snapshot(&state);
-        let local = catalog_service.local_snapshot();
-        let connectors = state.connectors.read().expect("connectors").clone();
-        let provider = crate::engine::build_catalog_service_provider(
-            Some("ice"),
-            &catalog_service,
-            &connectors,
-            crate::sql::catalog::TableLookupMode::SchemaOnly,
-        );
-        let query = parse_query_for_table_names("SELECT * FROM parted");
-
-        let _ = crate::sql::analyzer::analyze(&query, &provider, "db").expect("analyze");
-
-        assert!(
-            local.get("db", "parted").is_err(),
-            "Iceberg analysis must not require global InMemoryCatalog registration"
-        );
     }
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {

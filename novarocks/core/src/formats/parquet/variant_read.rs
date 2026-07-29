@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_variant_columns_handles_shredded_struct() {
+    fn file_read_variant_adapter_handles_shredded_struct() {
         let batch = batch_with_variant_struct(true);
         let out = convert_variant_columns(&[ParquetSlotKind::Variant], batch).expect("convert");
         assert_eq!(out.column(0).data_type(), &DataType::LargeBinary);

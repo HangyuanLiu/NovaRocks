@@ -15,23 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, Int32Array, Int64Array, MapBuilder, MapFieldNames, RecordBatch, RecordBatchOptions,
     StringArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCancellation,
+    ConnectorError, ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+    ConnectorSplitPlanningRequest, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
 
 use iceberg::spec::{SnapshotRetention, TableMetadata};
 
 use crate::common::ids::SlotId;
+use crate::connector::ConnectorRegistry;
+use crate::connector::runtime::ConnectorReadScanSource;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{
-    BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp, ScanSource,
-};
-use crate::runtime::profile::RuntimeProfile;
+use crate::exec::node::scan::ScanSource;
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 
 /// Decode the JSON payload that the planner stamps onto
 /// `IcebergMetadataScanConfig::serialized_table` back into an iceberg-rust
@@ -42,7 +52,7 @@ fn parse_table_metadata(serialized: &str) -> Result<TableMetadata, String> {
         .map_err(|e| format!("parse iceberg table metadata for metadata-scan failed: {e}"))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergMetadataTableType {
     Files,
     Manifests,
@@ -111,14 +121,337 @@ pub struct IcebergMetadataScanConfig {
     pub profile_label: Option<String>,
 }
 
+const ICEBERG_METADATA_SPI_PROVIDER_ID: &str = "iceberg-metadata";
+
+struct IcebergMetadataConnectorInstance {
+    instance_id: ConnectorInstanceId,
+    config: IcebergMetadataScanConfig,
+    ranges: Mutex<Vec<IcebergMetadataScanRange>>,
+}
+
+impl IcebergMetadataConnectorInstance {
+    fn new(instance_id: ConnectorInstanceId, config: IcebergMetadataScanConfig) -> Self {
+        Self {
+            instance_id,
+            ranges: Mutex::new(config.ranges.clone()),
+            config,
+        }
+    }
+
+    fn range_count(&self) -> Result<usize, ConnectorError> {
+        self.ranges
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "Iceberg metadata range lock poisoned",
+                )
+            })
+            .map(|ranges| ranges.len())
+    }
+
+    fn split_for_index(&self, index: usize) -> Result<ConnectorSplit, ConnectorError> {
+        self.ranges
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "Iceberg metadata range lock poisoned",
+                )
+            })?
+            .get(index)
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg metadata split index is out of bounds",
+                )
+            })?;
+        ConnectorSplit::try_new(
+            self.instance_id.clone(),
+            format!("iceberg-metadata-{index}"),
+            bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+            None,
+        )
+    }
+
+    fn range_for_split(
+        &self,
+        split: &ConnectorSplit,
+    ) -> Result<IcebergMetadataScanRange, ConnectorError> {
+        if split.owner() != &self.instance_id || split.payload().len() != 8 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid Iceberg metadata split payload",
+            ));
+        }
+        let bytes: [u8; 8] = split
+            .payload()
+            .as_ref()
+            .try_into()
+            .expect("payload length checked");
+        let index = usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata split index overflows usize",
+            )
+        })?;
+        self.ranges
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "Iceberg metadata range lock poisoned",
+                )
+            })?
+            .get(index)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg metadata split index is out of bounds",
+                )
+            })
+    }
+
+    fn connector_instance(self: Arc<Self>) -> Result<ConnectorInstance, ConnectorError> {
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(ICEBERG_METADATA_SPI_PROVIDER_ID)?,
+                instance_id: self.instance_id.clone(),
+            },
+            None,
+            self,
+        )
+    }
+}
+
+impl ConnectorRead for IcebergMetadataConnectorInstance {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        _: &ConnectorTableHandle,
+        _: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg metadata reads are decoder-planned",
+        ))
+    }
+
+    fn plan_splits(
+        &self,
+        _: &ConnectorScanHandle,
+        _: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg metadata reads are decoder-planned",
+        ))
+    }
+
+    fn open_reader(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        let range = self.range_for_split(split)?;
+        let mut config = self.config.clone();
+        config.ranges = vec![range];
+        let reader = IcebergMetadataReader::new(config)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
+        if reader.output_schema.as_ref() != request.expected_schema.as_ref() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata reader expected schema does not match the split",
+            ));
+        }
+        let batches: Vec<RecordBatch> = reader
+            .read_chunks()
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?
+            .into_iter()
+            .map(|chunk| chunk.batch)
+            .collect();
+        Ok(Box::new(IcebergMetadataBatchReader {
+            batches: batches.into_iter(),
+            context: request.context,
+            closed: false,
+        }))
+    }
+}
+
+struct IcebergMetadataBatchReader {
+    batches: std::vec::IntoIter<RecordBatch>,
+    context: ConnectorRequestContext,
+    closed: bool,
+}
+
+impl ConnectorBatchReader for IcebergMetadataBatchReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        if self.closed {
+            return Ok(None);
+        }
+        if self.context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= self.context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        Ok(self.batches.next())
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.closed = true;
+        Ok(())
+    }
+}
+
+struct IcebergMetadataQueryCancellation {
+    query_id: Option<QueryId>,
+}
+
+impl ConnectorCancellation for IcebergMetadataQueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.query_id
+            .is_some_and(|query_id| query_context_manager().is_query_canceled(query_id))
+    }
+}
+
+pub(crate) fn plan_iceberg_metadata_read_source(
+    connectors: &ConnectorRegistry,
+    instance_id: ConnectorInstanceId,
+    config: IcebergMetadataScanConfig,
+    batch: ConnectorBatchBudget,
+    context: ConnectorRequestContext,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let output_schema = IcebergMetadataReader::new(config.clone())
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?
+        .output_schema;
+    let provider = Arc::new(IcebergMetadataConnectorInstance::new(instance_id, config));
+    let scheduled = (0..provider.range_count()?)
+        .map(|index| {
+            provider
+                .split_for_index(index)
+                .map(crate::connector::runtime::ConnectorScheduledSplit::plain)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let chunk_schema = Arc::new(
+        ChunkSchema::try_new(
+            provider
+                .config
+                .output_columns
+                .iter()
+                .zip(output_schema.fields())
+                .map(|(column, field)| {
+                    ChunkSlotSchema::new_with_field(
+                        column.slot_id,
+                        field.as_ref().clone(),
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+        )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?,
+    );
+    let instance = Arc::clone(&provider).connector_instance()?;
+    let (instance, lifecycle) = connectors
+        .register_ephemeral_connector_instance(instance)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
+    Ok(Arc::new(ConnectorReadScanSource::new_scheduled_ephemeral(
+        instance,
+        scheduled,
+        ConnectorOpenReaderRequest {
+            expected_schema: output_schema,
+            batch,
+            context,
+        },
+        chunk_schema,
+        lifecycle,
+        None,
+    )))
+}
+
+fn metadata_budget_and_context(
+    query_id: Option<QueryId>,
+    query_options: &QueryOptions,
+) -> Result<(ConnectorBatchBudget, ConnectorRequestContext), ConnectorError> {
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let batch = ConnectorBatchBudget {
+        max_rows: rows,
+        max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+            .expect("SPI handle maximum is nonzero"),
+    };
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(IcebergMetadataQueryCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )?;
+    Ok((batch, context))
+}
+
+pub(crate) fn plan_native_iceberg_metadata_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: Option<QueryId>,
+    node_id: i32,
+    config: IcebergMetadataScanConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let (batch, context) = metadata_budget_and_context(query_id, query_options)?;
+    let query_label = query_id
+        .map(|query_id| query_id.to_string())
+        .unwrap_or_else(|| "unidentified".to_string());
+    plan_iceberg_metadata_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("iceberg.metadata.native.{query_label}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
+}
+
+pub(crate) fn plan_compat_iceberg_metadata_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: Option<QueryId>,
+    node_id: i32,
+    config: IcebergMetadataScanConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let (batch, context) = metadata_budget_and_context(query_id, query_options)?;
+    let query_label = query_id
+        .map(|query_id| query_id.to_string())
+        .unwrap_or_else(|| "unidentified".to_string());
+    plan_iceberg_metadata_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("iceberg.metadata.compat.{query_label}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
+}
+
 #[derive(Clone, Debug)]
-pub struct IcebergMetadataScanOp {
+struct IcebergMetadataReader {
     cfg: IcebergMetadataScanConfig,
     output_schema: SchemaRef,
     output_chunk_schema: Arc<ChunkSchema>,
 }
 
-impl IcebergMetadataScanOp {
+impl IcebergMetadataReader {
     pub fn new(cfg: IcebergMetadataScanConfig) -> Result<Self, String> {
         // All metadata-table flavors are now produced natively. Snapshots /
         // History / Refs read directly off `TableMetadata`; Partitions /
@@ -150,6 +483,60 @@ impl IcebergMetadataScanOp {
             output_chunk_schema: chunk_schema,
             cfg,
         })
+    }
+
+    fn read_chunks(&self) -> Result<Vec<Chunk>, String> {
+        match self.cfg.metadata_table_type {
+            IcebergMetadataTableType::Files => build_files_chunks(
+                &load_files_rows(&self.cfg)?,
+                &self.cfg.output_columns,
+                &self.output_schema,
+                &self.output_chunk_schema,
+                self.cfg.batch_size,
+            ),
+            IcebergMetadataTableType::Manifests => build_manifests_chunks(
+                &load_manifests_rows(&self.cfg)?,
+                &self.cfg.output_columns,
+                &self.output_schema,
+                &self.output_chunk_schema,
+                self.cfg.batch_size,
+            ),
+            IcebergMetadataTableType::LogicalIcebergMetadata => build_entries_chunks(
+                &load_entries_rows(&self.cfg)?,
+                &self.cfg.output_columns,
+                &self.output_schema,
+                &self.output_chunk_schema,
+                self.cfg.batch_size,
+            ),
+            IcebergMetadataTableType::Snapshots => build_snapshot_chunks(
+                &load_snapshot_rows(&self.cfg)?,
+                &self.cfg.output_columns,
+                &self.output_schema,
+                &self.output_chunk_schema,
+                self.cfg.batch_size,
+            ),
+            IcebergMetadataTableType::History => build_history_chunks(
+                &load_history_rows(&self.cfg)?,
+                &self.cfg.output_columns,
+                &self.output_schema,
+                &self.output_chunk_schema,
+                self.cfg.batch_size,
+            ),
+            IcebergMetadataTableType::Refs => build_ref_chunks(
+                &load_ref_rows(&self.cfg)?,
+                &self.cfg.output_columns,
+                &self.output_schema,
+                &self.output_chunk_schema,
+                self.cfg.batch_size,
+            ),
+            IcebergMetadataTableType::Partitions => build_partition_chunks(
+                &load_partition_rows(&self.cfg)?,
+                &self.cfg.output_columns,
+                &self.output_schema,
+                &self.output_chunk_schema,
+                self.cfg.batch_size,
+            ),
+        }
     }
 }
 
@@ -207,186 +594,6 @@ fn normalize_metadata_output_field(field: &Field) -> Field {
     field
         .clone()
         .with_data_type(normalize_metadata_output_type(field.data_type()))
-}
-
-impl ScanOp for IcebergMetadataScanOp {
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        _runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        let ScanMorsel::IcebergMetadata { index } = morsel else {
-            return Err("iceberg metadata scan received unexpected morsel".to_string());
-        };
-        // Indices come from build_morsels (0..ranges.len()), so .get(index) is
-        // always Some. Table-level scans (snapshots/history/refs/partitions)
-        // borrow `range` only for the optional profile annotation below.
-        let range = self
-            .cfg
-            .ranges
-            .get(index)
-            .ok_or_else(|| format!("iceberg metadata range index out of bounds: {index}"))?;
-        let chunks = match self.cfg.metadata_table_type {
-            IcebergMetadataTableType::Files => {
-                let rows = load_files_rows(&self.cfg)?;
-                build_files_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-            IcebergMetadataTableType::Manifests => {
-                let rows = load_manifests_rows(&self.cfg)?;
-                build_manifests_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-            IcebergMetadataTableType::LogicalIcebergMetadata => {
-                let rows = load_entries_rows(&self.cfg)?;
-                build_entries_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-            IcebergMetadataTableType::Snapshots => {
-                let rows = load_snapshot_rows(&self.cfg)?;
-                build_snapshot_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-            IcebergMetadataTableType::History => {
-                let rows = load_history_rows(&self.cfg)?;
-                build_history_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-            IcebergMetadataTableType::Refs => {
-                let rows = load_ref_rows(&self.cfg)?;
-                build_ref_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-            IcebergMetadataTableType::Partitions => {
-                let rows = load_partition_rows(&self.cfg)?;
-                build_partition_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-        };
-
-        if let Some(profile) = profile.as_ref() {
-            profile.add_info_string(
-                "IcebergMetadataTableType",
-                format!("{:?}", self.cfg.metadata_table_type),
-            );
-            profile.add_info_string("RangeIndex", index.to_string());
-            if !range.path.is_empty() {
-                profile.add_info_string("RangePath", range.path.clone());
-            }
-        }
-
-        Ok(Box::new(chunks.into_iter().map(Ok)))
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        let morsels = (0..self.cfg.ranges.len())
-            .map(|index| ScanMorsel::IcebergMetadata { index })
-            .collect();
-        Ok(ScanMorsels::new(morsels, false))
-    }
-
-    fn profile_name(&self) -> Option<String> {
-        let prefix = "ICEBERG_METADATA_SCAN";
-        if let Some(label) = self.cfg.profile_label.as_deref() {
-            return Some(format!("{prefix} ({label})"));
-        }
-        Some(prefix.to_string())
-    }
-}
-
-/// Static [`ScanSource`] for Iceberg metadata-table scans.
-///
-/// All fields except the per-instance metadata split ranges are fixed at decode
-/// time and stored here. The `ranges` arrive via
-/// [`BoundScanRanges::IcebergMetadata`] at bind time.
-pub(crate) struct IcebergMetadataScanSource {
-    metadata_table_type: IcebergMetadataTableType,
-    serialized_table: String,
-    serialized_predicate: String,
-    load_column_stats: bool,
-    batch_size: usize,
-    output_columns: Vec<IcebergMetadataOutputColumn>,
-    profile_label: Option<String>,
-}
-
-impl IcebergMetadataScanSource {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        metadata_table_type: IcebergMetadataTableType,
-        serialized_table: String,
-        serialized_predicate: String,
-        load_column_stats: bool,
-        batch_size: usize,
-        output_columns: Vec<IcebergMetadataOutputColumn>,
-        profile_label: Option<String>,
-    ) -> Self {
-        Self {
-            metadata_table_type,
-            serialized_table,
-            serialized_predicate,
-            load_column_stats,
-            batch_size,
-            output_columns,
-            profile_label,
-        }
-    }
-}
-
-impl ScanSource for IcebergMetadataScanSource {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
-        let BoundScanRanges::IcebergMetadata { ranges } = ranges else {
-            return Err(
-                "iceberg metadata scan source requires IcebergMetadata scan ranges".to_string(),
-            );
-        };
-        let cfg = IcebergMetadataScanConfig {
-            metadata_table_type: self.metadata_table_type.clone(),
-            serialized_table: self.serialized_table.clone(),
-            serialized_predicate: self.serialized_predicate.clone(),
-            load_column_stats: self.load_column_stats,
-            ranges,
-            batch_size: self.batch_size,
-            output_columns: self.output_columns.clone(),
-            profile_label: self.profile_label.clone(),
-        };
-        Ok(Arc::new(IcebergMetadataScanOp::new(cfg)?))
-    }
 }
 
 fn build_chunks(
@@ -1476,78 +1683,11 @@ fn build_entries_chunks(
 
 #[cfg(test)]
 mod tests {
-    // `IcebergMetadataOutputColumn` is imported by a later `use super::{...}` in
-    // this same test module, so it is intentionally not re-listed here.
-    use super::{
-        IcebergMetadataScanConfig, IcebergMetadataScanOp, IcebergMetadataScanRange,
-        IcebergMetadataScanSource, IcebergMetadataTableType, normalize_metadata_output_type,
-    };
+    use super::{IcebergMetadataTableType, normalize_metadata_output_type};
     use crate::common::ids::SlotId;
-    use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
     use arrow::array::{Array, MapArray};
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
-
-    fn iceberg_metadata_source_for_test() -> IcebergMetadataScanSource {
-        IcebergMetadataScanSource::new(
-            IcebergMetadataTableType::Snapshots,
-            String::new(),
-            String::new(),
-            false,
-            4096,
-            vec![IcebergMetadataOutputColumn {
-                name: "snapshot_id".to_string(),
-                slot_id: SlotId::new(1),
-                data_type: DataType::Int64,
-                nullable: true,
-            }],
-            None,
-        )
-    }
-
-    fn metadata_range(path: &str) -> IcebergMetadataScanRange {
-        IcebergMetadataScanRange {
-            path: path.to_string(),
-            serialized_split: String::new(),
-        }
-    }
-
-    #[test]
-    fn iceberg_metadata_scan_source_bind_yields_one_morsel_per_range() {
-        let source = iceberg_metadata_source_for_test();
-        let op = source
-            .bind(BoundScanRanges::IcebergMetadata {
-                ranges: vec![
-                    metadata_range("meta-a"),
-                    metadata_range("meta-b"),
-                    metadata_range("meta-c"),
-                ],
-            })
-            .expect("iceberg metadata scan source bind should succeed");
-
-        let morsels = op.build_morsels().expect("build morsels");
-        assert!(!morsels.has_more);
-        assert_eq!(morsels.morsels.len(), 3);
-        assert!(
-            morsels.morsels.iter().enumerate().all(|(index, morsel)| {
-                matches!(morsel, ScanMorsel::IcebergMetadata { index: got } if *got == index)
-            }),
-            "expected contiguous IcebergMetadata morsels, got {:?}",
-            morsels.morsels
-        );
-    }
-
-    #[test]
-    fn iceberg_metadata_scan_source_bind_rejects_wrong_variant() {
-        let source = iceberg_metadata_source_for_test();
-        let Err(err) = source.bind(BoundScanRanges::None) else {
-            panic!("non-IcebergMetadata scan ranges must be rejected");
-        };
-        assert!(
-            err.contains("iceberg metadata scan source requires IcebergMetadata scan ranges"),
-            "err={err}"
-        );
-    }
 
     #[test]
     fn test_normalize_metadata_output_type_makes_map_keys_non_nullable() {
@@ -1836,7 +1976,7 @@ mod tests {
     }
 
     /// Build the normalized output schema + chunk schema exactly the way
-    /// `IcebergMetadataScanOp::new` does, so `build_*_chunks` validates the
+    /// the metadata SPI reader does, so `build_*_chunks` validates the
     /// produced arrays against the real declared (normalized) types.
     fn schemas_for(
         cols: &[IcebergMetadataOutputColumn],

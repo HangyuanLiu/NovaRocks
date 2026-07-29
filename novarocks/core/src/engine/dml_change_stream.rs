@@ -120,8 +120,18 @@ pub(crate) fn build_dml_change_stream_write_plan(
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &registry,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
 
     let branch_kinds = branch_set.branch_kinds();

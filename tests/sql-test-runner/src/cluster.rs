@@ -1638,6 +1638,11 @@ endpoint = "http://127.0.0.1:9000"
 access_key_id = "admin"
 enable_path_style_access = true
 
+[connector.object_store]
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "admin"
+enable_path_style_access = true
+
 [debug]
 exec_node_output = true
 "#;
@@ -1669,6 +1674,10 @@ exec_node_output = true
         );
         assert_eq!(
             fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(
+            fe_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
         assert_eq!(fe_value["debug"]["exec_node_output"].as_bool(), Some(true));
@@ -1706,6 +1715,10 @@ exec_node_output = true
         );
         assert_eq!(
             be_value["standalone_server"]["object_store"]["endpoint"].as_str(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(
+            be_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
         assert_eq!(be_value["debug"]["exec_node_output"].as_bool(), Some(true));

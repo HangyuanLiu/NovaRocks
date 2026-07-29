@@ -144,6 +144,16 @@ retry_log_first_n = 3
 # Summary window in milliseconds for suppressed retry warnings. Default: 30000.
 retry_log_summary_interval_ms = 30000
 
+# Native connector readers obtain object-store access from this local BE startup
+# configuration. Every BE in a distributed deployment must use the same values;
+# native fragment plans never carry endpoint or credential configuration.
+# [connector.object_store]
+# endpoint = "http://127.0.0.1:9000"
+# access_key_id = "admin"
+# access_key_secret = "admin123"
+# region = "us-east-1"
+# enable_path_style_access = true
+
 [runtime.cache]
 # Generic page cache switch. Default: true.
 page_cache_enable = true

@@ -70,6 +70,7 @@ pub(crate) fn execute_delete_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
@@ -161,14 +162,22 @@ pub(crate) fn execute_delete_statement(
             &target_ref,
             &stmt.where_clause,
             execution.clone(),
+            connector_context,
         )?;
         return Ok(StatementResult::Ok);
     }
 
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &registry,
+            connector_context.clone(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
     let sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
         &target, &resolved, &table, &entry,
@@ -210,6 +219,7 @@ pub(crate) fn execute_delete_statement(
         delete_query,
         sink_spec,
         execution.clone(),
+        connector_context,
     )?;
 
     Ok(StatementResult::Ok)
@@ -222,6 +232,7 @@ struct DistributedDeleteWriteExecutor {
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
     execution: QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
@@ -229,7 +240,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        let mut result = crate::engine::execute_query_as_iceberg_write(
+        let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -238,6 +249,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
             None,
             None,
             Some(&self.execution),
+            &self.connector_context,
         )?;
         if result
             .write_commit
@@ -269,6 +281,7 @@ struct DistributedDvDeleteWriteExecutor {
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
     execution: QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
@@ -276,7 +289,7 @@ impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        let mut result = crate::engine::execute_query_as_iceberg_write(
+        let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -285,6 +298,7 @@ impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
             None,
             Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
             Some(&self.execution),
+            &self.connector_context,
         )?;
         if result
             .write_commit
@@ -320,11 +334,19 @@ fn run_delete_dv_write_transaction(
     target_ref: &str,
     where_clause: &sqlast::Expr,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &registry,
+            connector_context.clone(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
     let mut sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
         target, &resolved, &table, &entry,
@@ -409,6 +431,7 @@ fn run_delete_dv_write_transaction(
         sink_spec,
         commit_executor,
         execution,
+        connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -428,6 +451,7 @@ fn run_delete_write_transaction(
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -477,6 +501,7 @@ fn run_delete_write_transaction(
         sink_spec,
         commit_executor,
         execution,
+        connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
@@ -1046,7 +1071,7 @@ pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDel
 pub(crate) fn load_existing_delete_visibility_by_data_file_at(
     table: &iceberg::table::Table,
     snapshot_id: Option<i64>,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     let data_files = match snapshot_id {
         Some(id) => crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
@@ -1059,14 +1084,14 @@ pub(crate) fn load_existing_delete_visibility_by_data_file_at(
 
 pub(crate) fn load_existing_delete_visibility_by_data_file(
     table: &iceberg::table::Table,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     load_existing_delete_visibility_by_data_file_at(table, None, object_store_config)
 }
 
 pub(crate) fn load_existing_delete_visibility_from_descriptors(
     data_files: &[crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor],
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     let mut out: ExistingDeleteVisibilityByDataFile = HashMap::new();
 
@@ -1078,7 +1103,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
         let data_file_len = u64::try_from(data_file.size)
             .map_err(|_| format!("iceberg data file size is negative: {}", data_file.path))?;
         let mut loader_ranges = Vec::with_capacity(1 + data_file.delete_files.len());
-        loader_ranges.push(crate::fs::scan_context::FileScanRange {
+        loader_ranges.push(crate::connector::file_execution::FileScanRange {
             path: data_file.path.clone(),
             file_len: data_file_len,
             offset: 0,
@@ -1097,7 +1122,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
             let delete_len = u64::try_from(delete_len_i64).map_err(|_| {
                 format!("iceberg delete file size is negative: {}", delete_file.path)
             })?;
-            loader_ranges.push(crate::fs::scan_context::FileScanRange {
+            loader_ranges.push(crate::connector::file_execution::FileScanRange {
                 path: delete_file.path.clone(),
                 file_len: delete_len,
                 offset: 0,
@@ -1113,7 +1138,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
             });
         }
 
-        let ctx = crate::fs::scan_context::FileScanContext::build(
+        let ctx = crate::connector::file_execution::FileScanContext::build(
             loader_ranges,
             None,
             object_store_config,
@@ -1161,12 +1186,12 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
         let deleted_positions = crate::connector::iceberg::position_delete::load_position_deletes(
             &normalized_delete_specs,
             &data_file.path,
-            &ctx.factory,
+            &ctx.access,
         )?;
         let equality_deletes =
             crate::connector::iceberg::equality_delete::load_equality_delete_sets(
                 &normalized_delete_specs,
-                &ctx.factory,
+                &ctx.access,
             )?;
         if deleted_positions.is_empty() && equality_deletes.is_empty() {
             continue;
@@ -1188,7 +1213,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
 
 fn load_delete_visibility_from_data_files(
     data_files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     let mut out: ExistingDeleteVisibilityByDataFile = HashMap::new();
 
@@ -1200,7 +1225,7 @@ fn load_delete_visibility_from_data_files(
         let data_file_len = u64::try_from(data_file.size)
             .map_err(|_| format!("iceberg data file size is negative: {}", data_file.path))?;
         let mut loader_ranges = Vec::with_capacity(1 + data_file.delete_files.len());
-        loader_ranges.push(crate::fs::scan_context::FileScanRange {
+        loader_ranges.push(crate::connector::file_execution::FileScanRange {
             path: data_file.path.clone(),
             file_len: data_file_len,
             offset: 0,
@@ -1219,7 +1244,7 @@ fn load_delete_visibility_from_data_files(
             let delete_len = u64::try_from(delete_len_i64).map_err(|_| {
                 format!("iceberg delete file size is negative: {}", delete_file.path)
             })?;
-            loader_ranges.push(crate::fs::scan_context::FileScanRange {
+            loader_ranges.push(crate::connector::file_execution::FileScanRange {
                 path: delete_file.path.clone(),
                 file_len: delete_len,
                 offset: 0,
@@ -1235,7 +1260,7 @@ fn load_delete_visibility_from_data_files(
             });
         }
 
-        let ctx = crate::fs::scan_context::FileScanContext::build(
+        let ctx = crate::connector::file_execution::FileScanContext::build(
             loader_ranges,
             None,
             object_store_config,
@@ -1283,12 +1308,12 @@ fn load_delete_visibility_from_data_files(
         let deleted_positions = crate::connector::iceberg::position_delete::load_position_deletes(
             &normalized_delete_specs,
             &data_file.path,
-            &ctx.factory,
+            &ctx.access,
         )?;
         let equality_deletes =
             crate::connector::iceberg::equality_delete::load_equality_delete_sets(
                 &normalized_delete_specs,
-                &ctx.factory,
+                &ctx.access,
             )?;
         if deleted_positions.is_empty() && equality_deletes.is_empty() {
             continue;
@@ -1693,7 +1718,6 @@ mod tests {
     use crate::connector::iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
-    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
 
     fn temp_dir_for(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
@@ -1707,9 +1731,10 @@ mod tests {
         dir
     }
 
-    fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
-        let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("operator");
-        OpendalRangeReaderFactory::from_operator(op).expect("factory")
+    fn factory_for_dir(dir: &std::path::Path) -> novarocks_fs::FsAccessHandle {
+        novarocks_fs::FsAccessResolver::new()
+            .resolve_location(dir.join("__binding__").to_string_lossy(), None)
+            .expect("access")
     }
 
     fn write_eq_delete_parquet(path: &std::path::Path) {

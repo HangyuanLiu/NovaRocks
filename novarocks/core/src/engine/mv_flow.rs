@@ -112,7 +112,11 @@ mod lifecycle_tests {
             Ok(vec![])
         }
 
-        fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError> {
+        fn plan_refresh(
+            &self,
+            req: RefreshRequest,
+            _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<RefreshPlan, RefreshError> {
             self.calls.lock().unwrap().plan += 1;
             if let Some(err) = &self.plan_err {
                 return Err(err.clone());
@@ -212,12 +216,19 @@ mod lifecycle_tests {
         }
     }
 
+    fn run_test_refresh_lifecycle(
+        backend: Arc<dyn MvBackend>,
+        request: RefreshRequest,
+    ) -> Result<(), String> {
+        super::run_refresh_lifecycle(backend, request, &crate::connector::test_request_context())
+    }
+
     #[test]
     fn plan_error_stops_lifecycle_without_rollback() {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut backend = MockBackend::ok(Arc::clone(&calls));
         backend.plan_err = Some(RefreshError::user("bad plan"));
-        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        let err = run_test_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
         assert_eq!(err, "bad plan");
         let calls = calls.lock().unwrap();
         assert_eq!(calls.plan, 1);
@@ -231,7 +242,7 @@ mod lifecycle_tests {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut backend = MockBackend::ok(Arc::clone(&calls));
         backend.execute_err = Some(RefreshError::pre_commit("execute failed"));
-        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        let err = run_test_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
         assert_eq!(err, "execute failed");
         let calls = calls.lock().unwrap();
         assert_eq!(calls.plan, 1);
@@ -246,7 +257,7 @@ mod lifecycle_tests {
         let mut backend = MockBackend::ok(Arc::clone(&calls));
         backend.execute_err = Some(RefreshError::pre_commit("contract drift"));
 
-        let error = super::run_refresh_lifecycle(Arc::new(backend), refresh_request())
+        let error = run_test_refresh_lifecycle(Arc::new(backend), refresh_request())
             .expect_err("pre-commit validation must fail");
 
         assert_eq!(error, "contract drift");
@@ -268,7 +279,7 @@ mod lifecycle_tests {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut backend = MockBackend::ok(Arc::clone(&calls));
         backend.execute_err = Some(RefreshError::commit_unknown("execute commit unknown"));
-        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        let err = run_test_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
         assert_eq!(err, "execute commit unknown");
         let calls = calls.lock().unwrap();
         assert_eq!(calls.plan, 1);
@@ -282,7 +293,7 @@ mod lifecycle_tests {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut backend = MockBackend::ok(Arc::clone(&calls));
         backend.commit_err = Some(RefreshError::commit_unknown("commit unknown"));
-        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        let err = run_test_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
         assert_eq!(err, "commit unknown");
         let calls = calls.lock().unwrap();
         assert_eq!(calls.plan, 1);
@@ -297,7 +308,7 @@ mod lifecycle_tests {
         let mut backend = MockBackend::ok(Arc::clone(&calls));
         backend.execute_err = Some(RefreshError::pre_commit("execute failed"));
         backend.rollback_err = Some(RefreshError::pre_commit("rollback failed"));
-        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        let err = run_test_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
         assert_eq!(
             err,
             "execute failed; additionally failed to rollback MV refresh: rollback failed"
@@ -458,9 +469,14 @@ fn refresh_error_with_rollback(
 fn run_refresh_lifecycle(
     backend: Arc<dyn crate::connector::backend::MvBackend>,
     req: RefreshRequest,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    let mut ctx = RefreshCtx::default();
-    let plan = backend.plan_refresh(req).map_err(|err| err.to_string())?;
+    crate::connector::validate_request_context(connector_context)?;
+    let mut ctx = RefreshCtx::new(connector_context.clone());
+    let plan = backend
+        .plan_refresh(req, connector_context)
+        .map_err(|err| err.to_string())?;
+    crate::connector::validate_request_context(&ctx.connector_context)?;
     let outcome = match backend.execute_refresh(&plan, &mut ctx) {
         Ok(outcome) => outcome,
         Err(err) if err.kind.should_rollback_after_commit() => {
@@ -502,12 +518,15 @@ pub(crate) fn create_mv(
     current_catalog: Option<&str>,
     db: &str,
     stmt: &CreateMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let engine = storage_engine_for_create(state, stmt)?;
     backend_by_engine(state, engine)?.create_mv(CreateMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
+        connector_context: connector_context.clone(),
     })?;
     Ok(StatementResult::Ok)
 }
@@ -539,12 +558,30 @@ pub(crate) fn drop_mv(
     Ok(StatementResult::Ok)
 }
 
+#[cfg(test)]
 pub(crate) fn alter_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &AlterMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    alter_mv_with_connector_context(
+        state,
+        current_catalog,
+        db,
+        stmt,
+        &crate::connector::test_request_context(),
+    )
+}
+
+pub(crate) fn alter_mv_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    db: &str,
+    stmt: &AlterMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     if matches!(
         stmt.action,
         AlterMaterializedViewAction::Repartition(_) | AlterMaterializedViewAction::SetProperties(_)
@@ -583,11 +620,12 @@ pub(crate) fn alter_mv(
             )?;
             return Ok(StatementResult::Ok);
         }
-        return crate::engine::mv::iceberg_refresh::repartition_iceberg_mv(
+        return crate::engine::mv::iceberg_refresh::repartition_iceberg_mv_with_connector_context(
             state,
             Some(current_catalog),
             db,
             stmt,
+            connector_context,
         );
     }
     let definition = load_definition_for_alter(state, current_catalog, db, &stmt.name)?;
@@ -635,12 +673,30 @@ pub(crate) fn alter_mv(
     Ok(StatementResult::Ok)
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    refresh_mv_with_connector_context(
+        state,
+        current_catalog,
+        db,
+        stmt,
+        &crate::connector::test_request_context(),
+    )
+}
+
+pub(crate) fn refresh_mv_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    db: &str,
+    stmt: &RefreshMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
         current_catalog,
         db,
@@ -690,7 +746,7 @@ pub(crate) fn refresh_mv(
             current_database: step.target.database.clone(),
             statement,
         };
-        if let Err(err) = run_refresh_lifecycle(backend, req) {
+        if let Err(err) = run_refresh_lifecycle(backend, req, connector_context) {
             if step.object != requested_object {
                 return Err(format!(
                     "cannot refresh materialized view {}: upstream materialized view {} failed: {err}",
@@ -736,14 +792,16 @@ pub(crate) fn analyze_visible_output_types(
     state: &Arc<StandaloneState>,
     current_database: &str,
     sql: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<crate::sql::analysis::OutputColumn>, String> {
-    Ok(analyze_visible_query(state, current_database, sql)?.output_columns)
+    Ok(analyze_visible_query(state, current_database, sql, connector_context)?.output_columns)
 }
 
 pub(crate) fn analyze_visible_query(
     state: &Arc<StandaloneState>,
     current_database: &str,
     sql: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::sql::analysis::ResolvedQuery, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
@@ -764,6 +822,7 @@ pub(crate) fn analyze_visible_query(
         None,
         &catalog_service,
         &connectors,
+        connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let (resolved, _cte_registry, _factory) =
@@ -776,8 +835,9 @@ pub(crate) fn execute_query_for_mv_refresh(
     state: &Arc<StandaloneState>,
     current_database: &str,
     sql: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryResult, String> {
-    execute_query_for_mv_refresh_with_catalog(state, None, current_database, sql)
+    execute_query_for_mv_refresh_with_catalog(state, None, current_database, sql, connector_context)
 }
 
 pub(crate) fn execute_query_for_mv_refresh_with_catalog(
@@ -785,6 +845,7 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
     current_catalog: Option<&str>,
     current_database: &str,
     sql: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryResult, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
@@ -799,15 +860,17 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
             current_catalog,
             current_database,
             &mut query,
+            connector_context,
         )?;
     }
 
-    crate::engine::execute_query_with_catalog_service(
+    crate::engine::execute_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        connector_context,
     )
 }
 

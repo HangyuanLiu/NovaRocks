@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::fs::access::{FsAccessHandle, FsAccessResolver, FsLocation, FsScheme, ResolvedFsPath};
-use crate::fs::object_store::ObjectStoreConfig;
-use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
+use novarocks_fs::ObjectStoreConfig;
+use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsLocation, FsScheme, ResolvedFsPath};
 
 use super::ObjectStoreProfile;
 
@@ -31,6 +30,7 @@ pub(crate) fn tablet_root_scheme(tablet_root_path: &str) -> Result<FsScheme, Str
     FsAccessResolver::new()
         .parse_location(tablet_root_path)
         .map(|location| location.scheme())
+        .map_err(|error| error.to_string())
 }
 
 impl StarRocksFsAccess {
@@ -56,10 +56,6 @@ impl StarRocksFsAccess {
         }
         Ok(paths[0].operator_relative_path())
     }
-
-    pub(crate) fn reader_factory(&self) -> Result<OpendalRangeReaderFactory, String> {
-        self.handle.reader_factory()
-    }
 }
 
 pub(crate) fn resolve_tablet_root(
@@ -76,7 +72,9 @@ pub(crate) fn resolve_tablet_root(
 
 pub(crate) fn resolve_runtime_path(path: &str) -> Result<StarRocksFsAccess, String> {
     let resolver = FsAccessResolver::new();
-    let location = resolver.parse_location(path)?;
+    let location = resolver
+        .parse_location(path)
+        .map_err(|error| error.to_string())?;
     match location.scheme() {
         FsScheme::Local => resolve_with_object_store_config(path, None),
         FsScheme::ObjectStore => {
@@ -102,7 +100,9 @@ where
         .first()
         .ok_or_else(|| "StarRocks runtime paths are empty".to_string())?;
     let resolver = FsAccessResolver::new();
-    let locations = resolver.parse_locations(paths.iter().map(String::as_str))?;
+    let locations = resolver
+        .parse_locations(paths.iter().map(String::as_str))
+        .map_err(|error| error.to_string())?;
     let first_scheme = locations
         .first()
         .expect("non-empty runtime paths must produce locations")
@@ -157,7 +157,9 @@ where
     }
 
     let resolver = FsAccessResolver::new();
-    let locations = resolver.parse_locations(paths.iter().map(String::as_str))?;
+    let locations = resolver
+        .parse_locations(paths.iter().map(String::as_str))
+        .map_err(|error| error.to_string())?;
     let first = locations
         .first()
         .expect("non-empty runtime paths must produce locations");
@@ -296,7 +298,9 @@ fn resolve_with_object_store_config(
         }
     }
 
-    let handle = resolver.resolve_location(path, object_store_config)?;
+    let handle = resolver
+        .resolve_location(path, object_store_config)
+        .map_err(|error| error.to_string())?;
     Ok(StarRocksFsAccess { handle })
 }
 
@@ -305,7 +309,8 @@ fn resolve_with_object_store_config_many(
     object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<StarRocksFsAccess, String> {
     let handle = FsAccessResolver::new()
-        .resolve_locations(paths.iter().map(String::as_str), object_store_config)?;
+        .resolve_locations(paths.iter().map(String::as_str), object_store_config)
+        .map_err(|error| error.to_string())?;
     Ok(StarRocksFsAccess { handle })
 }
 

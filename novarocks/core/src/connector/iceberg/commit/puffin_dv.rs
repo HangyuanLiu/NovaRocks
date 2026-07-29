@@ -423,7 +423,7 @@ pub(crate) fn decode_deletion_vector_payload(payload: &[u8]) -> Result<DeletionV
 }
 
 pub async fn read_deletion_vector_puffin_with_range_reader(
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     path: &str,
     content_offset: i64,
     content_size_in_bytes: i64,
@@ -440,23 +440,18 @@ pub async fn read_deletion_vector_puffin_with_range_reader(
     let start = u64::try_from(content_offset).context("invalid Puffin content offset")?;
     let size =
         u64::try_from(content_size_in_bytes).context("invalid Puffin content size in bytes")?;
-    let end = start
-        .checked_add(size)
-        .context("Puffin deletion vector byte range overflows u64")?;
-    let read_payload = || -> Result<Bytes> {
-        let reader = factory
-            .open(path)
-            .with_context(|| format!("failed to open Puffin input file reader: {path}"))?;
-        reader
-            .read_remote_range(start, end)
-            .with_context(|| format!("failed to read Puffin deletion vector byte range: {path}"))
-    };
-    let payload = std::thread::scope(|scope| {
-        scope
-            .spawn(read_payload)
-            .join()
-            .map_err(|_| anyhow!("Puffin deletion vector range reader thread panicked"))
-    })??;
+    let range = novarocks_fs::FileReadRange::bounded(start, size)
+        .map_err(|error| anyhow!(error.to_string()))?;
+    let file = factory
+        .bind_location(path, novarocks_fs::FileIdentity::new(path, 0, None))
+        .map_err(|error| anyhow!(error.to_string()))
+        .with_context(|| format!("failed to bind Puffin input file: {path}"))?;
+    let cancellation = novarocks_fs::FileCancellation::new();
+    let payload = file
+        .read(range, &cancellation)
+        .await
+        .map_err(|error| anyhow!(error.to_string()))
+        .with_context(|| format!("failed to read Puffin deletion vector byte range: {path}"))?;
 
     decode_deletion_vector_payload(payload.as_ref())
 }
@@ -464,7 +459,6 @@ pub async fn read_deletion_vector_puffin_with_range_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use iceberg::io::FileIO;
 
     fn local_file_io(location: &str) -> FileIO {
@@ -508,9 +502,10 @@ mod tests {
         );
     }
 
-    fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
-        let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("fs operator");
-        OpendalRangeReaderFactory::from_operator(op).expect("reader factory")
+    fn factory_for_dir(dir: &std::path::Path) -> novarocks_fs::FsAccessHandle {
+        novarocks_fs::FsAccessResolver::new()
+            .resolve_location(dir.join("__binding__").to_string_lossy(), None)
+            .expect("access")
     }
 
     async fn read_puffin_footer_metadata(

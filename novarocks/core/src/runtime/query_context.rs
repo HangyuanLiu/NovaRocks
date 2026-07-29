@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
+use crate::connector::file_execution::FileScanRange;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::IncrementalScanRange;
 #[cfg(feature = "compat")]
@@ -35,7 +36,6 @@ use crate::exec::node::scan::ScanOp;
 #[cfg(feature = "compat")]
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::fs::scan_context::FileScanRange;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::lookup::GlobalLateMaterializationContext;

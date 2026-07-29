@@ -53,6 +53,7 @@ pub(crate) fn execute_add_equality_delete_statement(
     stmt: &AddEqualityDeleteStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
         resolve_existing_table_target(state, &stmt.table, current_catalog, current_database)?;
@@ -115,6 +116,7 @@ pub(crate) fn execute_add_equality_delete_statement(
         current_snapshot_id,
         &delete_columns,
         values_query,
+        connector_context,
     )?;
     Ok(StatementResult::Ok)
 }
@@ -125,6 +127,7 @@ struct DistributedEqualityDeleteWriteExecutor {
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor {
@@ -132,7 +135,7 @@ impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor 
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        let result = crate::engine::execute_query_as_iceberg_write(
+        let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -141,6 +144,7 @@ impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor 
             None,
             None,
             None,
+            &self.connector_context,
         )?;
         if result.write_abort.is_none()
             && result
@@ -179,11 +183,19 @@ fn run_equality_delete_distributed_transaction(
     current_snapshot_id: Option<i64>,
     delete_columns: &[EqualityDeleteColumn],
     values_query: sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let resolved = {
         let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+        crate::connector::metadata_load_table(
+            &registry,
+            connector_context.clone(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0
     };
     let mut sink_spec = crate::engine::iceberg_writer::build_equality_delete_sink_spec(
         target,
@@ -265,6 +277,7 @@ fn run_equality_delete_distributed_transaction(
         delete_query: values_query,
         sink_spec,
         commit_executor,
+        connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;

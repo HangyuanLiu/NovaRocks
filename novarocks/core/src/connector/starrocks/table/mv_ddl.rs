@@ -97,7 +97,9 @@ pub(crate) fn create_mv(
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &CreateMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     if !state.mv_repository.availability().is_available() {
         return Err("materialized view service requires [state_store]".to_string());
     }
@@ -146,7 +148,13 @@ pub(crate) fn create_mv(
         "StarRocks table create materialized view requires metadata provider".to_string()
     })?;
 
-    let analysis = analyze_mv_select(state, current_catalog, current_database, &stmt.select_query)?;
+    let analysis = analyze_mv_select(
+        state,
+        current_catalog,
+        current_database,
+        &stmt.select_query,
+        connector_context,
+    )?;
     validate_starrocks_mv_partition_columns(
         stmt.partition_by.as_deref(),
         &analysis.output_columns,
@@ -1207,12 +1215,15 @@ pub(crate) fn analyze_mv_select(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MvAnalysis, String> {
     analyze_mv_select_with(
         query,
         current_catalog,
         current_database,
-        |resolved_refs| register_iceberg_tables_for_mv_analysis(state, resolved_refs),
+        |resolved_refs| {
+            register_iceberg_tables_for_mv_analysis(state, resolved_refs, connector_context)
+        },
         |query_for_analysis| {
             let catalog = state
                 .catalog_service
@@ -1230,17 +1241,13 @@ pub(crate) fn analyze_mv_select(
 fn register_iceberg_tables_for_mv_analysis(
     state: &Arc<StandaloneState>,
     resolved_refs: &[ResolvedTableRef],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    let (catalog_backend, table_source) = {
-        let registry = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock");
-        (
-            registry.catalog_backend("iceberg")?,
-            registry.table_source("iceberg")?,
-        )
-    };
+    let connectors = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
 
     for table_ref in resolved_refs {
         let ResolvedTableRef::Iceberg {
@@ -1252,12 +1259,16 @@ fn register_iceberg_tables_for_mv_analysis(
             continue;
         };
         drop_local_table_registration_if_exists(state, namespace, table)?;
-        let resolved = catalog_backend
-            .load_table_for_read(catalog, namespace, table)
-            .map_err(|err| {
-                format!("load iceberg table {catalog}.{namespace}.{table} failed: {err}")
-            })?;
-        let mut table_def = table_source.build_table_def(&resolved)?;
+        let (mut table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
+            &connectors,
+            connector_context.clone(),
+            catalog,
+            namespace,
+            table,
+            None,
+            false,
+        )
+        .map_err(|err| format!("load iceberg table {catalog}.{namespace}.{table} failed: {err}"))?;
         table_def.name = table.clone();
         let mut local_catalog = state
             .catalog_service

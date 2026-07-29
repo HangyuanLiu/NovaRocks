@@ -75,7 +75,9 @@ pub(crate) fn refresh_mv(
     _current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
 
@@ -218,6 +220,7 @@ pub(crate) fn refresh_mv(
                 &mv_name,
                 pinned_full_select_sql.clone(),
                 pinned_base_metadata.clone(),
+                connector_context,
                 move |ctx| {
                     run_projection_mv_select_and_chunks(ctx, &projection_full_primary_key_columns)
                 },
@@ -231,6 +234,7 @@ pub(crate) fn refresh_mv(
                 shape,
                 pinned_full_select_sql.clone(),
                 pinned_base_metadata.clone(),
+                connector_context,
             )
         },
         |_current_snapshot_id| {
@@ -272,6 +276,7 @@ pub(crate) fn refresh_mv(
                             &mv_name,
                             pinned_full_select_sql.clone(),
                             pinned_base_metadata.clone(),
+                            connector_context,
                             move |ctx| {
                                 run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
                             },
@@ -316,6 +321,7 @@ pub(crate) fn refresh_mv(
                         &mv_name,
                         pinned_full_select_sql.clone(),
                         pinned_base_metadata.clone(),
+                        connector_context,
                         move |ctx| run_projection_mv_select_and_chunks(ctx, &primary_key_columns),
                     );
                 }
@@ -371,6 +377,7 @@ pub(crate) fn refresh_mv(
                 },
                 &tagged_select_sql,
                 source_files,
+                connector_context,
             )?;
             let (chunks, row_delta) = if mv_definition.primary_key_columns.is_empty() {
                 tagged_projection_insert_chunks(delta_result)?
@@ -430,6 +437,7 @@ pub(crate) fn refresh_mv(
                             shape,
                             pinned_full_select_sql.clone(),
                             pinned_base_metadata.clone(),
+                            connector_context,
                         );
                     }
                     MvRefreshPolicy::Unsupported { reason } => {
@@ -461,6 +469,7 @@ pub(crate) fn refresh_mv(
                 pinned_full_select_sql: pinned_full_select_sql.clone(),
                 pinned_base_metadata: pinned_base_metadata.clone(),
                 loaded: &loaded,
+                connector_context,
             })
         },
     )
@@ -544,6 +553,7 @@ where
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 fn refresh_aggregate_mv_full(
     state: &Arc<StandaloneState>,
     database: &str,
@@ -563,6 +573,7 @@ fn refresh_aggregate_mv_full_with_pinned_metadata(
     shape: &crate::mv::aggregate_state::mv_shape::AggregateMvShape,
     pinned_select_sql: String,
     base_metadata: CurrentBaseMetadata,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let shape = shape.clone();
     refresh_mv_full_with_pinned_executor(
@@ -571,6 +582,7 @@ fn refresh_aggregate_mv_full_with_pinned_metadata(
         mv_name,
         pinned_select_sql,
         base_metadata,
+        connector_context,
         move |ctx| execute_aggregate_mv_full_refresh(ctx, &shape),
     )
 }
@@ -583,7 +595,12 @@ fn execute_aggregate_mv_full_refresh(
     // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
     // (one column per visible_output), not state-shaped types (which expand AVG into
     // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
-    let visible_analysis = analyze_visible_query(&ctx.state, &ctx.database, &ctx.select_sql)?;
+    let visible_analysis = analyze_visible_query(
+        &ctx.state,
+        &ctx.database,
+        &ctx.select_sql,
+        &ctx.connector_context,
+    )?;
     let aggregate_input_types =
         crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
             &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
@@ -605,7 +622,12 @@ fn execute_aggregate_mv_full_refresh(
         &ctx.select_sql,
         &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
     )?;
-    let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
+    let result = execute_query_for_mv_refresh(
+        &ctx.state,
+        &ctx.database,
+        &state_sql,
+        &ctx.connector_context,
+    )?;
 
     // Step 4: materialize state-shaped executor result using the visible-type layout.
     crate::mv::aggregate_state::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
@@ -667,6 +689,7 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     pinned_full_select_sql: String,
     pinned_base_metadata: CurrentBaseMetadata,
     loaded: &'a crate::connector::iceberg::catalog::IcebergLoadedTable,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
 }
 
 fn refresh_aggregate_mv_incremental(
@@ -700,6 +723,7 @@ fn refresh_aggregate_mv_incremental(
                 ctx.shape,
                 ctx.pinned_full_select_sql.clone(),
                 ctx.pinned_base_metadata.clone(),
+                ctx.connector_context,
             );
         }
         MvApplyPolicy::Unsupported { reason } => {
@@ -747,7 +771,12 @@ fn refresh_aggregate_mv_incremental(
     // The rewritten state SQL (AVG -> SUM + COUNT) produces state-shaped columns whose
     // count does not match shape.visible_outputs. Sourcing types from the analyzer
     // avoids this mismatch before materializing state chunks.
-    let visible_analysis = analyze_visible_query(ctx.state, ctx.database, ctx.select_sql)?;
+    let visible_analysis = analyze_visible_query(
+        ctx.state,
+        ctx.database,
+        ctx.select_sql,
+        ctx.connector_context,
+    )?;
     let aggregate_input_types =
         crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
             &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
@@ -775,6 +804,7 @@ fn refresh_aggregate_mv_incremental(
         },
         &signed_state_sql,
         source_files,
+        ctx.connector_context,
     )?;
     let delta_chunks =
         crate::mv::aggregate_state::mv_agg_state::materialize_aggregate_result_chunks(
@@ -822,7 +852,7 @@ fn advance_mv_refresh_metadata_without_writes(
     )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn refresh_mv_full_with_executor<F>(
     state: &Arc<StandaloneState>,
     database: &str,
@@ -832,7 +862,15 @@ pub(crate) fn refresh_mv_full_with_executor<F>(
 where
     F: FnOnce(MvRefreshContext) -> Result<Vec<Chunk>, String>,
 {
-    refresh_mv_full_with_executor_inner(state, database, mv_name, None, None, executor)
+    refresh_mv_full_with_executor_inner(
+        state,
+        database,
+        mv_name,
+        None,
+        None,
+        &crate::connector::test_request_context(),
+        executor,
+    )
 }
 
 fn refresh_mv_full_with_pinned_executor<F>(
@@ -841,6 +879,7 @@ fn refresh_mv_full_with_pinned_executor<F>(
     mv_name: &str,
     pinned_select_sql: String,
     base_metadata: CurrentBaseMetadata,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     executor: F,
 ) -> Result<StatementResult, String>
 where
@@ -852,6 +891,7 @@ where
         mv_name,
         Some(pinned_select_sql),
         Some(base_metadata),
+        connector_context,
         executor,
     )
 }
@@ -862,6 +902,7 @@ fn refresh_mv_full_with_executor_inner<F>(
     mv_name: &str,
     select_sql_override: Option<String>,
     base_metadata_override: Option<CurrentBaseMetadata>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     executor: F,
 ) -> Result<StatementResult, String>
 where
@@ -923,6 +964,7 @@ where
         state: Arc::clone(state),
         database: database.to_string(),
         select_sql: select_sql_override.unwrap_or_else(|| mv_definition.select_sql.clone()),
+        connector_context: connector_context.clone(),
     }) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -992,6 +1034,7 @@ pub(crate) struct MvRefreshContext {
     pub(crate) state: Arc<StandaloneState>,
     pub(crate) database: String,
     pub(crate) select_sql: String,
+    pub(crate) connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 fn run_projection_mv_select_and_chunks(
@@ -999,7 +1042,12 @@ fn run_projection_mv_select_and_chunks(
     primary_key_columns: &[String],
 ) -> Result<Vec<Chunk>, String> {
     let select_sql = projection_mv_physical_select_sql(&ctx.select_sql, primary_key_columns)?;
-    let result: QueryResult = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &select_sql)?;
+    let result: QueryResult = execute_query_for_mv_refresh(
+        &ctx.state,
+        &ctx.database,
+        &select_sql,
+        &ctx.connector_context,
+    )?;
     query_result_to_chunks(result)
 }
 
@@ -1049,9 +1097,15 @@ pub(crate) fn run_mv_full_select_chunks_with_catalog(
     current_catalog: Option<&str>,
     database: &str,
     select_sql: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<Chunk>, String> {
-    let result =
-        execute_query_for_mv_refresh_with_catalog(state, current_catalog, database, select_sql)?;
+    let result = execute_query_for_mv_refresh_with_catalog(
+        state,
+        current_catalog,
+        database,
+        select_sql,
+        connector_context,
+    )?;
     query_result_to_chunks(result)
 }
 

@@ -30,6 +30,7 @@ use opendal::layers::{
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::global_async_runtime::data_block_on;
+use novarocks_fs::ObjectStoreConfig;
 
 const DEFAULT_OSS_RETRY_MAX_TIMES: usize = 6;
 const DEFAULT_OSS_RETRY_MIN_DELAY_MS: u64 = 100;
@@ -167,21 +168,6 @@ fn parse_usize_property(key: &str, value: &str) -> Option<usize> {
             None
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct ObjectStoreConfig {
-    pub endpoint: String,
-    pub access_key_id: String,
-    pub access_key_secret: String,
-    pub session_token: Option<String>,
-    pub enable_path_style_access: Option<bool>,
-    pub region: Option<String>,
-    pub retry_max_times: Option<usize>,
-    pub retry_min_delay_ms: Option<u64>,
-    pub retry_max_delay_ms: Option<u64>,
-    pub timeout_ms: Option<u64>,
-    pub io_timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -687,7 +673,7 @@ mod tests {
         effective_timeout_ms, normalize_s3_endpoint, prefer_virtual_host_style,
         should_use_path_style,
     };
-    use crate::fs::object_store::ObjectStoreConfig;
+    use novarocks_fs::ObjectStoreConfig;
     use std::collections::BTreeMap;
 
     #[test]

@@ -23,11 +23,11 @@ use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
-use novarocks::fs::object_store::ObjectStoreConfig;
 use novarocks::fs::object_store_credentials::{
     ObjectStoreCredentials, ObjectStoreCredentialsSource,
 };
 use novarocks::novarocks_config::{NovaRocksConfig, init_from_env_or_default, init_from_path};
+use novarocks_fs::ObjectStoreConfig;
 
 #[derive(Clone, Debug)]
 struct ParquetProbe {

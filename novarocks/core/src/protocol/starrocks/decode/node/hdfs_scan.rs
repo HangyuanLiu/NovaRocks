@@ -20,27 +20,28 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::cache::{CacheOptions, DataCacheContext, ExternalDataCacheRangeOptions};
+use crate::cache::{CacheOptions, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::connector::hdfs::{HdfsInstanceConfig, plan_starrocks_hdfs_read_source};
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
     IcebergMetadataScanRange, IcebergMetadataTableType,
-    build_projected_output_schema_from_descriptor,
+    build_projected_output_schema_from_descriptor, plan_compat_iceberg_metadata_read_source,
 };
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::fragment::program::ScanAssignmentKind;
-use crate::exec::node::scan::ScanNode;
+use crate::exec::node::scan::{BoundScanRanges, ScanNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
 };
 use crate::novarocks_connectors::{
     ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsIcebergRuntimePruningConfig,
-    HdfsScanConfig, OrcScanConfig, ParquetScanConfig, ScanConfig,
+    HdfsScanConfig, OrcScanConfig, ParquetScanConfig,
 };
 use crate::novarocks_logging::{debug, warn};
 use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thrift;
@@ -55,6 +56,7 @@ use crate::runtime::descriptor_snapshot::{
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
 use crate::thrift::{descriptors, exprs, plan_nodes, types};
+use novarocks_fs::DataCacheContext;
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
     let max_slot = visible_slot_ids
@@ -186,7 +188,7 @@ fn file_cache_flags_from_query_options(query_opts: &QueryOptions) -> (bool, bool
 fn resolve_cloud_object_store_config<S>(
     cloud_props: Option<&std::collections::BTreeMap<S, S>>,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
-) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String>
+) -> Result<Option<novarocks_fs::ObjectStoreConfig>, String>
 where
     S: std::borrow::Borrow<str> + Ord,
 {
@@ -678,6 +680,7 @@ pub(crate) fn lower_hdfs_scan_node(
     query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+    query_id: Option<crate::runtime::query_context::QueryId>,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
@@ -1010,8 +1013,7 @@ pub(crate) fn lower_hdfs_scan_node(
     }
     // The metadata-table scan path used to require an embedded JVM bridge
     // for the Iceberg Java SDK; it now runs natively against
-    // iceberg-rust's `TableMetadata`. The operator constructor itself
-    // (`IcebergMetadataScanOp::new`) rejects flavors the native path does
+    // iceberg-rust's `TableMetadata`. The SPI reader rejects flavors the native path does
     // not yet implement (Files / Manifests / LogicalIcebergMetadata).
     let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
     let mut ranges: Vec<FileScanRange> = Vec::new();
@@ -1307,12 +1309,15 @@ pub(crate) fn lower_hdfs_scan_node(
             output_columns,
             profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         };
-        let (source, bound_ranges) = connectors.create_scan_node(
-            "iceberg",
-            crate::connector::ScanConfig::IcebergMetadata(cfg),
-        )?;
-        // Route the enriched ranges to the instance; bind at materialize time.
-        scan_ranges.capture(node.node_id, bound_ranges);
+        let source = plan_compat_iceberg_metadata_read_source(
+            connectors,
+            query_id,
+            node.node_id,
+            cfg,
+            query_opts,
+        )
+        .map_err(|error| error.to_string())?;
+        scan_ranges.capture(node.node_id, BoundScanRanges::None);
         let scan = ScanNode::new(source)
             .with_node_id(node.node_id)
             .with_output_chunk_schema(chunk_schema_for_snapshot_layout(
@@ -1377,7 +1382,7 @@ pub(crate) fn lower_hdfs_scan_node(
 
     debug!("HDFS_SCAN using batch_size: {:?}", batch_size);
 
-    let external_datacache = DataCacheContext::external(cache_options.clone());
+    let external_datacache = DataCacheContext::external(cache_options.to_file_cache_options());
     let (enable_file_metacache, enable_file_pagecache) =
         file_cache_flags_from_query_options(query_opts);
     if is_iceberg_table && scan_format == Some(descriptors::THdfsFileFormat::ORC) {
@@ -1572,10 +1577,21 @@ pub(crate) fn lower_hdfs_scan_node(
         )
     });
 
-    let (source, bound_ranges) =
-        connectors.create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))?;
-    // Route the enriched ranges to the instance; bind at materialize time.
-    scan_ranges.capture(node.node_id, bound_ranges);
+    let query_id = query_id.ok_or_else(|| {
+        "HDFS_SCAN_NODE requires a query identity for connector cancellation".to_string()
+    })?;
+    let source = plan_starrocks_hdfs_read_source(
+        connectors,
+        query_id,
+        node.node_id,
+        HdfsInstanceConfig {
+            scan: cfg,
+            chunk_schema: output_chunk_schema.clone(),
+        },
+        query_opts,
+    )
+    .map_err(|error| error.to_string())?;
+    scan_ranges.capture(node.node_id, BoundScanRanges::None);
     let scan = ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)

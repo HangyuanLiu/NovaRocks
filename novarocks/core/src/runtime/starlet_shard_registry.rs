@@ -37,7 +37,7 @@ pub(crate) struct S3StoreConfig {
 }
 
 impl S3StoreConfig {
-    pub(crate) fn to_object_store_config(&self) -> crate::fs::object_store::ObjectStoreConfig {
+    pub(crate) fn to_object_store_config(&self) -> novarocks_fs::ObjectStoreConfig {
         let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
             crate::fs::object_store_credentials::ObjectStoreCredentialsSource::StarletProfile,
             &self.endpoint,
@@ -257,9 +257,7 @@ pub(crate) fn s3_config_for_path(path: &str) -> Result<S3StoreConfig, String> {
 
 // Retained only for FS-6 StarRocks format writer/reader migration compatibility.
 // StarRocks lake production modules must use S3StoreConfig-based access instead.
-pub(crate) fn oss_config_for_path(
-    path: &str,
-) -> Result<crate::fs::object_store::ObjectStoreConfig, String> {
+pub(crate) fn oss_config_for_path(path: &str) -> Result<novarocks_fs::ObjectStoreConfig, String> {
     s3_config_for_path(path).map(|cfg| cfg.to_object_store_config())
 }
 
@@ -338,9 +336,10 @@ mod tests {
         cfg: &S3StoreConfig,
     ) -> Result<String, String> {
         let object_store_config = cfg.to_object_store_config();
-        let handle = crate::fs::access::FsAccessResolver::new()
-            .resolve_location(full_path, Some(&object_store_config))?;
-        if handle.scheme() != crate::fs::access::FsScheme::ObjectStore {
+        let handle = novarocks_fs::FsAccessResolver::new()
+            .resolve_location(full_path, Some(&object_store_config))
+            .map_err(|error| error.to_string())?;
+        if handle.scheme() != novarocks_fs::FsScheme::ObjectStore {
             return Err(format!("expected object-store path: {full_path}"));
         }
         handle

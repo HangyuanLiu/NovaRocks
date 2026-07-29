@@ -86,6 +86,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     overwrite_mode: crate::sql::parser::ast::OverwriteMode,
     target_ref: &str,
     execution: Option<QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     use crate::sql::parser::ast::OverwriteMode;
     debug_assert_eq!(target.backend_name, "iceberg");
@@ -164,6 +165,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         &entry,
         table_ident,
         execution,
+        connector_context,
     )
 }
 
@@ -181,6 +183,7 @@ fn execute_iceberg_insert_distributed(
     entry: &IcebergCatalogEntry,
     table_ident: TableIdent,
     execution: Option<QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let metadata = table.metadata();
     let (query, sink_spec) =
@@ -230,6 +233,7 @@ fn execute_iceberg_insert_distributed(
         sink_spec,
         commit_executor,
         execution,
+        connector_context: connector_context.clone(),
     };
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
@@ -265,6 +269,7 @@ struct DistributedInsertWriteExecutor {
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
     execution: Option<QueryExecutionContext>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
@@ -272,7 +277,7 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        crate::engine::execute_query_as_iceberg_write(
+        crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -281,6 +286,7 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
             None,
             None,
             self.execution.as_ref(),
+            &self.connector_context,
         )
     }
 
@@ -1271,6 +1277,7 @@ pub(crate) fn run_select_to_chunks_and_schema(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
     query: &sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<
     (
         Vec<Chunk>,
@@ -1286,12 +1293,13 @@ pub(crate) fn run_select_to_chunks_and_schema(
     } else {
         None
     };
-    let result = crate::engine::execute_query_with_catalog_service(
+    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         &target.namespace,
         query,
         None,
+        connector_context,
     )?;
     let schema_cols = result.columns.clone();
     let chunks = query_result_to_chunks(result)?;
@@ -1324,7 +1332,7 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
             .to_string();
         let fs = access.operator();
         let mapper: CleanupPathMapper = Arc::new(move |path| {
-            crate::fs::access::parse_object_store_path_parse_only(path)
+            novarocks_fs::parse_object_store_path_parse_only(path)
                 .ok()
                 .and_then(|(actual_bucket, key)| {
                     if actual_bucket == bucket {
@@ -1341,8 +1349,10 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
         });
     }
 
-    let fs = crate::fs::local::build_fs_operator("/")
-        .map_err(|e| format!("build local-FS operator failed: {e}"))?;
+    let fs = novarocks_fs::FsAccessResolver::new()
+        .resolve_location("/__novarocks_local_root__", None)
+        .map_err(|error| format!("build local-FS operator failed: {error}"))?
+        .operator();
     let mapper: CleanupPathMapper =
         Arc::new(|path: &str| path.strip_prefix("file://").unwrap_or(path).to_string());
     Ok(AbortCleanupOperator {

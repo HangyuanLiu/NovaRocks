@@ -29,9 +29,7 @@ use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
-use crate::fs::access::{FsAccessHandle, FsAccessResolver, FsScheme};
-use crate::fs::object_store::ObjectStoreConfig;
-use crate::fs::opendal::OpendalRangeReaderFactory;
+use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergFsAccess {
@@ -61,15 +59,11 @@ impl IcebergFsAccess {
             )),
         }
     }
-
-    pub(crate) fn reader_factory(&self) -> std::result::Result<OpendalRangeReaderFactory, String> {
-        self.handle.reader_factory()
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct IcebergFsStorageFactory {
-    #[serde(default)]
+    #[serde(skip, default)]
     object_store_config: Option<ObjectStoreConfig>,
 }
 
@@ -92,7 +86,7 @@ impl StorageFactory for IcebergFsStorageFactory {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct IcebergFsStorage {
-    #[serde(default)]
+    #[serde(skip, default)]
     object_store_config: Option<ObjectStoreConfig>,
 }
 
@@ -266,40 +260,22 @@ impl FileRead for IcebergFsFileRead {
             ));
         }
 
-        let access = self.access.clone();
+        let operator = self.access.operator();
         let relative_path = self.relative_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let factory = access.reader_factory().map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("build fs range reader factory: {e}"),
-                )
-            })?;
-            let reader = factory.open(&relative_path).map_err(|e| {
+        operator
+            .read_with(&relative_path)
+            .range(range.clone())
+            .await
+            .map(|buffer| buffer.to_bytes())
+            .map_err(|e| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!("open fs range reader({relative_path}): {e}"),
+                    format!(
+                        "fs range read({relative_path} {}..{}): {e}",
+                        range.start, range.end
+                    ),
                 )
-            })?;
-            reader
-                .read_remote_range(range.start, range.end)
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "fs range read({relative_path} {}..{}): {e}",
-                            range.start, range.end
-                        ),
-                    )
-                })
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("join fs range read task: {e}"),
-            )
-        })?
+            })
     }
 }
 
@@ -397,7 +373,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let handle = FsAccessResolver::new().resolve_locations(locations, object_store_config)?;
+    let handle = FsAccessResolver::new()
+        .resolve_locations(locations, object_store_config)
+        .map_err(|error| error.to_string())?;
     Ok(IcebergFsAccess::new(handle))
 }
 
@@ -442,21 +420,14 @@ pub(crate) fn format_resolved_location(
 pub(crate) fn reader_factory_for_table_location(
     location: &str,
     object_store_config: Option<&ObjectStoreConfig>,
-) -> std::result::Result<OpendalRangeReaderFactory, String> {
+) -> std::result::Result<FsAccessHandle, String> {
     let resolver = FsAccessResolver::new();
     let parsed = resolver
         .parse_location(location)
         .map_err(|e| format!("parse table fs location {location}: {e}"))?;
-    if parsed.scheme() == FsScheme::Local {
-        let operator = crate::fs::opendal::build_fs_operator("/")
-            .map_err(|e| format!("build local table reader factory operator: {e}"))?;
-        return OpendalRangeReaderFactory::from_operator(operator)
-            .map_err(|e| format!("build local table reader factory: {e}"));
-    }
-
     resolver
         .resolve_location(parsed.original(), object_store_config)
-        .and_then(|handle| handle.reader_factory())
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<String, String> {
@@ -466,7 +437,7 @@ pub(crate) fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<
     if location.scheme() != FsScheme::Hdfs {
         return Err(format!("expected hdfs location: {path}"));
     }
-    crate::fs::hdfs::parse_hdfs_path(location.original()).map(|parsed| parsed.rel_path)
+    Ok(location.path().trim_start_matches('/').to_string())
 }
 
 pub(crate) fn read_exact_range(
@@ -480,21 +451,23 @@ pub(crate) fn read_exact_range(
             range.start, range.end
         ));
     }
+    if range.is_empty() {
+        return Ok(Bytes::new());
+    }
 
     let access = resolve_access_for_location(path, object_store_config)?;
-    let relative_path = access.single_relative_path()?.to_string();
-    let factory = access.reader_factory()?;
-    let reader = factory
-        .open(&relative_path)
-        .map_err(|e| format!("open fs range reader({path}) through {relative_path}: {e}"))?;
-    reader
-        .read_remote_range(range.start, range.end)
-        .map_err(|e| {
-            format!(
-                "fs range read({path}) through {relative_path} {}..{}: {e}",
-                range.start, range.end
-            )
-        })
+    let file = access
+        .handle()
+        .bind(0, novarocks_fs::FileIdentity::new(path, 0, None))
+        .map_err(|error| error.to_string())?;
+    let read_range = novarocks_fs::FileReadRange::bounded(range.start, range.end - range.start)
+        .map_err(|error| error.to_string())?;
+    let cancellation = novarocks_fs::FileCancellation::new();
+    crate::runtime::global_async_runtime::data_block_on(async move {
+        file.read(read_range, &cancellation).await
+    })
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -507,8 +480,8 @@ mod tests {
         resolve_access_for_locations,
     };
 
-    fn test_object_store_config() -> crate::fs::object_store::ObjectStoreConfig {
-        crate::fs::object_store::ObjectStoreConfig {
+    fn test_object_store_config() -> novarocks_fs::ObjectStoreConfig {
+        novarocks_fs::ObjectStoreConfig {
             endpoint: "http://localhost:9000".to_string(),
             access_key_id: "ak".to_string(),
             access_key_secret: "sk".to_string(),
@@ -597,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_file_reader_reads_range() {
+    async fn iceberg_input_range_read_succeeds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("data.bin");
         std::fs::write(&file_path, b"0123456789").expect("write data");
@@ -615,7 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_file_reader_rejects_invalid_range() {
+    async fn iceberg_input_file_rejects_invalid_range() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("data.bin");
         std::fs::write(&file_path, b"0123456789").expect("write data");

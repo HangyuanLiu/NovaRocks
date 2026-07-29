@@ -971,8 +971,8 @@ pub(crate) fn scan_position_delete_rows_for_targets(
         String,
         roaring::RoaringTreemap,
     >,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let size_lookup = |_path: &str| -> Option<u64> { None };
@@ -1003,8 +1003,8 @@ pub(crate) fn scan_position_delete_rows_for_targets(
 pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage(
     base_table: &iceberg::table::Table,
     delete: &EqualityDeleteRef,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     scan_equality_delete_rows_for_table_with_v3_lineage(
         base_table,
@@ -1021,8 +1021,8 @@ pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage_at(
     base_table: &iceberg::table::Table,
     delete: &EqualityDeleteRef,
     snapshot_id: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     scan_equality_delete_rows_for_table_with_v3_lineage_at(
         base_table,
@@ -1036,8 +1036,8 @@ pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage_at(
 pub(crate) fn scan_equality_delete_rows_for_targets_with_v3_lineage(
     delete: &EqualityDeleteRef,
     targets: &[EqualityDeleteTargetData],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if targets.is_empty() {
@@ -1094,7 +1094,7 @@ pub(crate) fn scan_one_added_data_file(
     path: &str,
     size: i64,
     base_table: &iceberg::table::Table,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let factory = build_factory_for_table(base_table, object_store_config)?;
     let expected_bucket = expected_object_store_bucket_for_table(base_table)?;
@@ -1110,8 +1110,8 @@ pub(crate) fn scan_one_added_data_file(
 pub(crate) fn scan_one_added_data_file_with_factory(
     path: &str,
     size: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let normalized =
@@ -1131,7 +1131,7 @@ pub(crate) fn scan_one_added_data_file_with_factory(
 pub(crate) fn scan_one_deleted_data_file(
     base_table: &iceberg::table::Table,
     deleted_file: &DeletedDataFileRef,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let factory = build_factory_for_table(base_table, object_store_config)?;
@@ -1147,8 +1147,8 @@ pub(crate) fn scan_one_deleted_data_file(
 
 pub(crate) fn scan_one_deleted_data_file_with_factory(
     deleted_file: &DeletedDataFileRef,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
     previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
@@ -1165,8 +1165,8 @@ pub(crate) fn scan_one_deleted_data_file_with_factory(
 pub(crate) fn scan_equality_delete_rows_for_table(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
@@ -1186,8 +1186,8 @@ pub(crate) fn scan_equality_delete_rows_for_table_at(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
     snapshot_id: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
@@ -1207,8 +1207,8 @@ pub(crate) fn scan_equality_delete_rows_for_table_at(
 fn scan_equality_delete_rows_for_snapshot(
     read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
     equality_deletes: &[EqualityDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
@@ -1256,8 +1256,8 @@ fn scan_equality_delete_rows_for_snapshot(
 pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
@@ -1280,8 +1280,8 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
     snapshot_id: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
@@ -1301,8 +1301,8 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
 fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
     read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
     equality_deletes: &[EqualityDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
@@ -1361,55 +1361,30 @@ fn read_data_file_matching_equality_deletes_with_v3_lineage<N>(
     sets: &[crate::connector::iceberg::equality_delete::EqualityDeleteSet],
     first_row_id: i64,
     data_sequence_number: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: N,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String>
 where
     N: Fn(&str) -> Result<String, String>,
 {
-    use crate::cache::CachedRangeReader;
-    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
     use arrow::array::BooleanArray;
     use arrow::compute::filter_record_batch;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     if sets.is_empty() {
         return Ok(Vec::new());
     }
 
     let normalized_path = normalize_path(data_file_path)?;
-    let reader = factory
-        .open_with_len(&normalized_path, data_file_size)
-        .map_err(|e| {
-            format!(
-                "open iceberg data file {data_file_path} for equality-delete v3-lineage reverse projection failed: {e}"
-            )
-        })?;
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-    let reader = ParquetRecordBatchReaderBuilder::try_new(reader)
-        .map_err(|e| {
-            format!(
-                "read iceberg data file {data_file_path} metadata for equality-delete v3-lineage reverse projection failed: {e}"
-            )
-        })?
-        .build()
-        .map_err(|e| {
-            format!(
-                "build iceberg data reader for equality-delete v3-lineage reverse projection {data_file_path} failed: {e}"
-            )
-        })?;
+    let batches = crate::connector::file_execution::read_foundation_parquet_batches(
+        factory,
+        &normalized_path,
+        data_file_size,
+        novarocks_fs::FileProjection::All,
+    )?;
 
     let mut out = Vec::new();
     let mut next_position = 0_u64;
-    for batch in reader {
-        let batch = batch.map_err(|e| {
-            format!(
-                "read iceberg data file {data_file_path} batch for equality-delete v3-lineage reverse projection failed: {e}"
-            )
-        })?;
+    for batch in batches {
         let row_count = batch.num_rows();
         let Some(keep_mask) =
             crate::connector::iceberg::equality_delete::equality_delete_keep_mask(&batch, sets)?
@@ -1465,55 +1440,30 @@ fn read_data_file_matching_equality_deletes_with_base_row_id<N>(
     data_file_size: Option<u64>,
     sets: &[crate::connector::iceberg::equality_delete::EqualityDeleteSet],
     first_row_id: Option<i64>,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: N,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String>
 where
     N: Fn(&str) -> Result<String, String>,
 {
-    use crate::cache::CachedRangeReader;
-    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
     use arrow::array::BooleanArray;
     use arrow::compute::filter_record_batch;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     if sets.is_empty() {
         return Ok(Vec::new());
     }
 
     let normalized_path = normalize_path(data_file_path)?;
-    let reader = factory
-        .open_with_len(&normalized_path, data_file_size)
-        .map_err(|e| {
-            format!(
-                "open iceberg data file {data_file_path} for equality-delete row-id reverse projection failed: {e}"
-            )
-        })?;
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-    let reader = ParquetRecordBatchReaderBuilder::try_new(reader)
-        .map_err(|e| {
-            format!(
-                "read iceberg data file {data_file_path} metadata for equality-delete row-id reverse projection failed: {e}"
-            )
-        })?
-        .build()
-        .map_err(|e| {
-            format!(
-                "build iceberg data reader for equality-delete row-id reverse projection {data_file_path} failed: {e}"
-            )
-        })?;
+    let batches = crate::connector::file_execution::read_foundation_parquet_batches(
+        factory,
+        &normalized_path,
+        data_file_size,
+        novarocks_fs::FileProjection::All,
+    )?;
 
     let mut out = Vec::new();
     let mut next_position = 0_u64;
-    for batch in reader {
-        let batch = batch.map_err(|e| {
-            format!(
-                "read iceberg data file {data_file_path} batch for equality-delete row-id reverse projection failed: {e}"
-            )
-        })?;
+    for batch in batches {
         let row_count = batch.num_rows();
         let Some(keep_mask) =
             crate::connector::iceberg::equality_delete::equality_delete_keep_mask(&batch, sets)?
@@ -1659,7 +1609,7 @@ fn equality_change_to_read_delete(
 
 fn equality_change_to_delete_spec(
     delete: &EqualityDeleteRef,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<crate::connector::iceberg::delete_file::IcebergDeleteFileSpec, String> {
     Ok(
@@ -1693,7 +1643,7 @@ fn equality_change_to_delete_spec(
 pub(crate) fn scan_deleted_data_file_rows(
     base_table: &iceberg::table::Table,
     deleted_data_files: &[DeletedDataFileRef],
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if deleted_data_files.is_empty() {
         return Ok(Vec::new());
@@ -1711,8 +1661,8 @@ pub(crate) fn scan_deleted_data_file_rows(
 /// emits the full Iceberg v3 row-lineage virtual column set on each batch.
 fn scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
     deleted_data_files: &[DeletedDataFileRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    factory: &novarocks_fs::FsAccessHandle,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
@@ -1769,7 +1719,7 @@ fn read_full_data_file_with_v3_lineage_and_visibility(
     size: Option<u64>,
     first_row_id: i64,
     data_sequence_number: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     existing_deletes_by_file: Option<
         &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     >,
@@ -1838,7 +1788,7 @@ fn read_full_data_file_with_v3_lineage_and_visibility(
 
 pub(crate) fn scan_deleted_data_file_rows_with_factory<N>(
     deleted_data_files: &[DeletedDataFileRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: N,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, ChangeError>
 where
@@ -1854,7 +1804,7 @@ where
 
 fn scan_deleted_data_file_rows_with_factory_and_visibility<N>(
     deleted_data_files: &[DeletedDataFileRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: N,
     existing_deletes_by_file: Option<
         &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
@@ -1901,32 +1851,20 @@ where
 fn read_full_data_file(
     path: &str,
     size: Option<u64>,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
-    use crate::cache::CachedRangeReader;
-    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let reader = factory
-        .open_with_len(path, size)
-        .map_err(|e| format!("open data file {path} for overwrite delete-row scan: {e}"))?;
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-    let builder = ParquetRecordBatchReaderBuilder::try_new(reader)
-        .map_err(|e| format!("read parquet metadata for {path}: {e}"))?;
-    let reader = builder
-        .build()
-        .map_err(|e| format!("build parquet reader for {path}: {e}"))?;
-    let mut out = Vec::new();
-    for batch_result in reader {
-        let batch = batch_result.map_err(|e| format!("read parquet batch for {path}: {e}"))?;
-        if batch.num_rows() > 0 {
-            out.push(batch);
-        }
-    }
-    Ok(out)
+    crate::connector::file_execution::read_foundation_parquet_batches(
+        factory,
+        path,
+        size,
+        novarocks_fs::FileProjection::All,
+    )
+    .map(|batches| {
+        batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .collect()
+    })
 }
 
 fn read_full_data_file_with_base_row_id_and_visibility(
@@ -1934,7 +1872,7 @@ fn read_full_data_file_with_base_row_id_and_visibility(
     path: &str,
     size: Option<u64>,
     first_row_id: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     existing_deletes_by_file: Option<
         &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     >,
@@ -2002,8 +1940,8 @@ fn read_full_data_file_with_base_row_id_and_visibility(
 /// files for a table location through the Iceberg fs adapter.
 pub(crate) fn build_factory_for_table_location(
     location: &str,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+) -> Result<novarocks_fs::FsAccessHandle, String> {
     crate::connector::iceberg::fs_io::reader_factory_for_table_location(
         location,
         object_store_config,
@@ -2014,10 +1952,10 @@ pub(crate) fn build_factory_for_table_location(
 pub(crate) fn expected_object_store_bucket_from_location(
     location: &str,
 ) -> Result<Option<String>, String> {
-    let location = crate::fs::access::FsAccessResolver::new()
+    let location = novarocks_fs::FsAccessResolver::new()
         .parse_location(location)
         .map_err(|e| format!("parse iceberg table location {location}: {e}"))?;
-    if location.scheme() == crate::fs::access::FsScheme::ObjectStore {
+    if location.scheme() == novarocks_fs::FsScheme::ObjectStore {
         return location
             .authority()
             .map(|bucket| Some(bucket.to_string()))
@@ -2043,17 +1981,17 @@ pub(crate) fn expected_object_store_bucket_for_table(
 /// `build_factory_for_table_location` to avoid runtime TableMetadata handles.
 pub(crate) fn build_factory_for_table(
     table: &iceberg::table::Table,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+) -> Result<novarocks_fs::FsAccessHandle, String> {
     build_factory_for_table_location(table.metadata().location(), object_store_config)
 }
 
 pub(crate) fn normalize_delete_projection_path(
     path: &str,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<String, ChangeError> {
-    let parsed = crate::fs::access::FsAccessResolver::new()
+    let parsed = novarocks_fs::FsAccessResolver::new()
         .parse_location(path)
         .map_err(|e| {
             ChangeError::InternalInconsistency(format!(
@@ -2061,8 +1999,8 @@ pub(crate) fn normalize_delete_projection_path(
             ))
         })?;
     match parsed.scheme() {
-        crate::fs::access::FsScheme::Local => Ok(parsed.path().to_string()),
-        crate::fs::access::FsScheme::ObjectStore => {
+        novarocks_fs::FsScheme::Local => Ok(parsed.path().to_string()),
+        novarocks_fs::FsScheme::ObjectStore => {
             let access = crate::connector::iceberg::fs_io::resolve_access_for_location(
                 path,
                 object_store_config,
@@ -2093,7 +2031,7 @@ pub(crate) fn normalize_delete_projection_path(
                     ))
                 })
         }
-        crate::fs::access::FsScheme::Hdfs => {
+        novarocks_fs::FsScheme::Hdfs => {
             crate::connector::iceberg::fs_io::normalize_hdfs_path_parse_only(path).map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "normalize hdfs delete reverse projection path {path}: {e}"
@@ -2525,10 +2463,10 @@ mod tests {
     use crate::connector::iceberg::commit::{
         CommitCtx, CommitOpKind, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
     };
-    use crate::fs::object_store::ObjectStoreConfig;
     use crate::sql::parser::ast::IcebergPartitionFieldExpr;
     use crate::sql::{Literal, TableColumnDef};
     use novarocks_catalog::schema::SqlType;
+    use novarocks_fs::ObjectStoreConfig;
 
     use super::plan_changes;
 
@@ -2631,11 +2569,9 @@ mod tests {
             first_row_id: Some(200),
             data_sequence_number: None,
         }];
-        let factory = crate::fs::opendal::OpendalRangeReaderFactory::from_operator(
-            crate::fs::opendal::build_fs_operator(dir.path().to_str().expect("utf8 dir"))
-                .expect("fs operator"),
-        )
-        .expect("factory");
+        let factory = novarocks_fs::FsAccessResolver::new()
+            .resolve_location(dir.path().join("__binding__").to_string_lossy(), None)
+            .expect("access");
 
         let batches = scan_deleted_data_file_rows_with_factory(&deleted, &factory, |path: &str| {
             Ok(path.to_string())
@@ -2689,11 +2625,9 @@ mod tests {
         writer.write(&equality).expect("write equality");
         writer.close().expect("close equality writer");
 
-        let factory = crate::fs::opendal::OpendalRangeReaderFactory::from_operator(
-            crate::fs::opendal::build_fs_operator(dir.path().to_str().expect("utf8 dir"))
-                .expect("fs operator"),
-        )
-        .expect("factory");
+        let factory = novarocks_fs::FsAccessResolver::new()
+            .resolve_location(dir.path().join("__binding__").to_string_lossy(), None)
+            .expect("access");
         let spec = crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
             path: "eq.parquet".to_string(),
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
@@ -2962,9 +2896,24 @@ mod tests {
             build_factory_for_table_location(&table_location, None).expect("local factory");
         let normalized =
             normalize_delete_projection_path(&data_location, None, None).expect("normalize");
-        let reader = factory.open(&normalized).expect("open normalized path");
+        let file = factory
+            .bind_location(
+                &normalized,
+                novarocks_fs::FileIdentity::new(&normalized, 6, None),
+            )
+            .expect("bind normalized path");
+        let cancellation = novarocks_fs::FileCancellation::new();
+        let bytes = crate::runtime::global_async_runtime::data_block_on(async move {
+            file.read(
+                novarocks_fs::FileReadRange::bounded(1, 3).expect("range"),
+                &cancellation,
+            )
+            .await
+        })
+        .expect("runtime")
+        .expect("read range");
 
-        assert_eq!(reader.read_remote_range(1, 4).expect("read range"), "bcd");
+        assert_eq!(bytes, "bcd");
     }
 
     #[test]

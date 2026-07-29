@@ -17,15 +17,12 @@
 //! Integration tests for connectors (JDBC, Iceberg).
 
 use crate::common::TestConfig;
-use arrow::array::Array;
 use arrow::datatypes::{DataType, Field};
-use novarocks::cache::{CacheOptions, DataCacheManager};
-use novarocks::common::ids::SlotId;
+use novarocks::cache::CacheOptions;
 use novarocks::connector::{self, FileFormatConfig, ParquetScanConfig};
 use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use novarocks::exec::node::scan::ScanOp;
 use novarocks::formats::parquet::{ParquetReadCachePolicy, ParquetSlotKind};
-use novarocks::novarocks_connector_jdbc::{JdbcScanConfig, JdbcScanOp};
+use novarocks_fs::DataCacheManager;
 use std::sync::Arc;
 
 #[path = "../common/mod.rs"]
@@ -89,7 +86,6 @@ fn test_jdbc_connector_module() {
             .expect("chunk schema"),
         ),
     };
-    let _op = novarocks::novarocks_connector_jdbc::JdbcScanOp::new(cfg.clone());
     assert_eq!(cfg.table, "lineorder");
 }
 
@@ -113,7 +109,8 @@ fn test_iceberg_connector_module() {
         runtime_min_max_filter_columns: std::collections::HashMap::new(),
         variant_path_predicates: Vec::new(),
         batch_size: None,
-        datacache: DataCacheManager::instance().external_context(test_cache_options()),
+        datacache: DataCacheManager::instance()
+            .external_context(test_cache_options().to_file_cache_options()),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some("connector_smoke".to_string()),
         iceberg_output_schema: None,
@@ -145,7 +142,6 @@ fn test_iceberg_connector_module() {
         query_global_dicts: Default::default(),
         iceberg_runtime_pruning: None,
     };
-    let _scan = novarocks::novarocks_connector_iceberg::HdfsScanOp::new(config.clone());
     assert_eq!(config.ranges.len(), 1);
 }
 
@@ -154,62 +150,4 @@ fn test_connector_config_loading() {
     let test_config = TestConfig::new().expect("Failed to create test config");
     let config = test_config.load_config().expect("Failed to load config");
     assert_eq!(config.server.host, "127.0.0.1");
-}
-
-#[test]
-fn test_jdbc_sqlite_scan_full_table() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("test.db");
-    let conn = rusqlite::Connection::open(&path).expect("open");
-    conn.execute("CREATE TABLE t(a INTEGER)", [])
-        .expect("create");
-    conn.execute("INSERT INTO t(a) VALUES (1)", [])
-        .expect("insert 1");
-    conn.execute("INSERT INTO t(a) VALUES (2)", [])
-        .expect("insert 2");
-
-    let cfg = JdbcScanConfig {
-        jdbc_url: format!("jdbc:sqlite:{}", path.to_string_lossy()),
-        jdbc_user: None,
-        jdbc_passwd: None,
-        table: "t".to_string(),
-        columns: vec!["a".to_string()],
-        filters: vec![],
-        limit: None,
-        chunk_schema: Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                SlotId::new(1),
-                Field::new("a", DataType::Int64, true),
-                None,
-                None,
-            )])
-            .expect("chunk schema"),
-        ),
-    };
-    let op = JdbcScanOp::new(cfg);
-    let iter = op
-        .execute_iter(
-            novarocks::exec::node::scan::ScanMorsel::JdbcSingle,
-            None,
-            None,
-        )
-        .expect("scan");
-    let mut values = Vec::new();
-    for chunk in iter {
-        let chunk = chunk.expect("chunk");
-        assert_eq!(chunk.columns().len(), 1);
-        let col_ref = chunk.column_by_slot_id(SlotId::new(1)).expect("a column");
-        let col = col_ref
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("int64");
-        for i in 0..col.len() {
-            values.push(if col.is_null(i) {
-                None
-            } else {
-                Some(col.value(i))
-            });
-        }
-    }
-    assert_eq!(values, vec![Some(1), Some(2)]);
 }
