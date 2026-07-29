@@ -120,6 +120,15 @@ impl IcebergReadBinding {
             object_store_config,
         }
     }
+
+    fn file_read_context(
+        &self,
+        cancellation: novarocks_fs::FileCancellation,
+        deadline: std::time::Instant,
+    ) -> Result<novarocks_fs::FileReadContext, ConnectorError> {
+        crate::connector::file_execution::foundation_read_context(cancellation, Some(deadline))
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+    }
 }
 
 /// Startup-composed installer for Iceberg read-only instances.  The payload
@@ -250,10 +259,15 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
                 "Iceberg split does not belong to this installed instance incarnation",
             ));
         }
+        let file_context = self.binding.file_read_context(
+            novarocks_fs::FileCancellation::new(),
+            request.context.deadline(),
+        )?;
         IcebergBatchReader::try_new(
             &payload.data_file,
             self.binding.object_store_config.as_ref(),
             request,
+            file_context,
         )
         .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
     }
@@ -831,10 +845,16 @@ impl ConnectorRead for IcebergConnectorInstance {
                 ));
             }
         }
+        let file_context = IcebergReadBinding::default_binding(loaded.object_store_config.clone())
+            .file_read_context(
+                novarocks_fs::FileCancellation::new(),
+                request.context.deadline(),
+            )?;
         Ok(Box::new(IcebergBatchReader::try_new(
             &split.data_file,
             loaded.object_store_config.as_ref(),
             request,
+            file_context,
         )?))
     }
 }

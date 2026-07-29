@@ -35,6 +35,7 @@ use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use novarocks_fs::{FileProjection, FileReadRange, FsAccessHandle};
+use novarocks_fs::FileReadContext;
 
 /// The only two column names a position-delete Parquet file is allowed to
 /// have (equality-delete files carry a different schema and are rejected in
@@ -59,6 +60,79 @@ pub fn load_position_deletes(
         accumulate_deletes_from_file(spec, data_file_path, access, &mut deleted)?;
     }
     Ok(deleted)
+}
+
+/// Provider-reader variant that carries the same cancellation, deadline, and
+/// runtime binding through delete and deletion-vector I/O as data-file I/O.
+pub(crate) fn load_position_deletes_with_context(
+    specs: &[IcebergDeleteFileSpec],
+    data_file_path: &str,
+    access: &FsAccessHandle,
+    context: &FileReadContext,
+) -> Result<RoaringTreemap, String> {
+    let mut deleted = RoaringTreemap::new();
+    for spec in specs {
+        if spec.file_content != IcebergFileContent::PositionDeletes {
+            continue;
+        }
+        accumulate_deletes_from_file_with_context(spec, data_file_path, access, context, &mut deleted)?;
+    }
+    Ok(deleted)
+}
+
+fn accumulate_deletes_from_file_with_context(
+    spec: &IcebergDeleteFileSpec,
+    data_file_path: &str,
+    access: &FsAccessHandle,
+    context: &FileReadContext,
+    deleted: &mut RoaringTreemap,
+) -> Result<(), String> {
+    if spec.content_offset.is_some() || spec.content_size_in_bytes.is_some() {
+        let offset = spec.content_offset.ok_or_else(|| format!("Puffin deletion vector {} missing content_offset", spec.path))?;
+        let size = spec.content_size_in_bytes.ok_or_else(|| format!("Puffin deletion vector {} missing content_size_in_bytes", spec.path))?;
+        let start = u64::try_from(offset).map_err(|_| format!("Puffin deletion vector {} has negative offset", spec.path))?;
+        let length = u64::try_from(size).map_err(|_| format!("Puffin deletion vector {} size is too large", spec.path))?;
+        let payload = crate::connector::iceberg::file_reader::read_bytes(
+            access,
+            &spec.path,
+            spec.length,
+            FileReadRange::bounded(start, length).map_err(|error| error.to_string())?,
+            context,
+        )?;
+        let dv = crate::connector::iceberg::commit::DeletionVector::from_iceberg_payload(payload.as_ref())
+            .map_err(|error| format!("decode Puffin deletion vector {} failed: {error}", spec.path))?;
+        let _ = data_file_path;
+        *deleted |= dv.to_roaring_treemap();
+        return Ok(());
+    }
+    if spec.file_format != IcebergFileFormat::Parquet {
+        return Err(format!("iceberg position-delete file {} has unsupported format {:?}; only PARQUET is supported", spec.path, spec.file_format));
+    }
+    for batch in crate::connector::iceberg::file_reader::read_parquet_batches(
+        access,
+        &spec.path,
+        spec.length,
+        FileProjection::RootNames(vec![FILE_PATH_COLUMN.to_string(), POS_COLUMN.to_string()]),
+        context.clone(),
+    )? {
+        let batch = batch.batch;
+        let schema = batch.schema();
+        let file_path_index = schema.index_of(FILE_PATH_COLUMN).map_err(|error| format!("projected batch from {} missing `{FILE_PATH_COLUMN}`: {error}", spec.path))?;
+        let pos_index = schema.index_of(POS_COLUMN).map_err(|error| format!("projected batch from {} missing `{POS_COLUMN}`: {error}", spec.path))?;
+        let file_paths = batch.column(file_path_index).as_any().downcast_ref::<StringArray>().ok_or_else(|| format!("iceberg position-delete file {} column `{FILE_PATH_COLUMN}` is not STRING", spec.path))?;
+        let positions = batch.column(pos_index).as_any().downcast_ref::<Int64Array>().ok_or_else(|| format!("iceberg position-delete file {} column `{POS_COLUMN}` is not BIGINT", spec.path))?;
+        for row in 0..batch.num_rows() {
+            if file_paths.is_null(row) || positions.is_null(row) || !paths_match(file_paths.value(row), data_file_path) {
+                continue;
+            }
+            let position = positions.value(row);
+            if position < 0 {
+                return Err(format!("iceberg position-delete file {} has negative pos {} for data file {data_file_path}", spec.path, position));
+            }
+            deleted.insert(position as u64);
+        }
+    }
+    Ok(())
 }
 
 fn accumulate_deletes_from_file(

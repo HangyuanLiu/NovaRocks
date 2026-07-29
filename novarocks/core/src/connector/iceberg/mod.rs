@@ -27,6 +27,7 @@ pub(crate) mod default_value;
 pub mod delete_file;
 pub mod equality_delete;
 pub(crate) mod file_pruning;
+pub(crate) mod file_reader;
 #[cfg(feature = "compat")]
 pub(crate) mod file_pruning_wire;
 pub(crate) mod fs_io;

@@ -31,7 +31,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileBatchReader, FileCancellation, FileError, FileErrorKind, FileFormat, FileIdentity,
     FileMetricsSnapshot, FileProjection, FileReadBudget, FileReadRange, FileReadRequest,
-    FsAccessResolver, ObjectStoreConfig, PhysicalPruning, open_file_reader,
+    FileReadContext, FsAccessResolver, ObjectStoreConfig, PhysicalPruning, open_file_reader,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
@@ -41,9 +41,9 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::delete_file::{IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat};
 use super::equality_delete::{
-    EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets,
+    EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_with_context,
 };
-use super::position_delete::load_position_deletes;
+use super::position_delete::load_position_deletes_with_context;
 use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
 
 pub(crate) struct IcebergBatchReader {
@@ -63,6 +63,7 @@ impl IcebergBatchReader {
         file: &IcebergDataFileInfo,
         object_store_config: Option<&ObjectStoreConfig>,
         request: ConnectorOpenReaderRequest,
+        file_context: FileReadContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(&request.context)?;
         let file_size = u64::try_from(file.size).map_err(|_| {
@@ -74,21 +75,21 @@ impl IcebergBatchReader {
         let access = FsAccessResolver::new()
             .resolve_location(&file.path, object_store_config)
             .map_err(map_file_error)?;
+        let cancellation = FileCancellation::new();
         let delete_specs = delete_specs(file)?;
-        let position_deletes = load_position_deletes(&delete_specs, &file.path, &access)
+        let position_deletes = load_position_deletes_with_context(
+            &delete_specs,
+            &file.path,
+            &access,
+            &file_context,
+        )
             .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
-        let equality_deletes = load_equality_delete_sets(&delete_specs, &access)
+        let equality_deletes = load_equality_delete_sets_with_context(&delete_specs, &access, &file_context)
             .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
         let included_positions = included_positions(file)?;
         let bound_file = access
             .bind_location(&file.path, FileIdentity::new(&file.path, file_size, None))
             .map_err(map_file_error)?;
-        let cancellation = FileCancellation::new();
-        let context = crate::connector::file_execution::foundation_read_context(
-            cancellation.clone(),
-            Some(request.context.deadline()),
-        )
-        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
         let reader = open_file_reader(FileReadRequest {
             file: bound_file,
             format: physical_format(&file.path)?,
@@ -101,7 +102,7 @@ impl IcebergBatchReader {
             predicates: Vec::new(),
             pruning: PhysicalPruning::default(),
             cache: None,
-            context,
+            context: file_context,
         })
         .map_err(map_file_error)?;
         Ok(Self {
