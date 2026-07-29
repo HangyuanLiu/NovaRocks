@@ -57,7 +57,7 @@ use novarocks_spi::connector::{
     ConnectorTableResolution,
 };
 
-use self::host::{ConnectorHost, ConnectorHostError, ConnectorInstanceLease};
+use self::host::{ConnectorHost, ConnectorHostError};
 
 struct RequestConnectorCancellation {
     signal: Arc<AtomicBool>,
@@ -509,27 +509,6 @@ impl ConnectorRegistry {
         self.retire_connector_instance(instance_id, incarnation)
             .map(|_| ())
             .map_err(|error| error.to_string())
-    }
-
-    /// Register a query-local instance and return a lease that removes it once
-    /// the physical scan no longer retains it.
-    pub(crate) fn register_ephemeral_connector_instance(
-        &self,
-        instance: ConnectorInstance,
-    ) -> Result<(Arc<ConnectorInstance>, Arc<ConnectorInstanceLease>), ConnectorHostError> {
-        let instance_id = instance.descriptor().instance_id.clone();
-        self.register_connector_instance(instance)?;
-        let lease = Arc::new(ConnectorInstanceLease::new(
-            Arc::clone(&self.connector_host),
-            instance_id.clone(),
-        ));
-        match self.connector_instance(&instance_id) {
-            Ok(instance) => Ok((instance, lease)),
-            Err(error) => {
-                drop(lease);
-                Err(error)
-            }
-        }
     }
 
     pub(crate) fn register_catalog_backend(&mut self, backend: Arc<dyn CatalogBackend>) {

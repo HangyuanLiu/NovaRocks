@@ -352,7 +352,7 @@ impl ConnectorBatchReader for StarRocksBatchReader {
 }
 
 pub(crate) fn plan_starrocks_read_source(
-    connectors: &ConnectorRegistry,
+    _connectors: &ConnectorRegistry,
     instance_id: ConnectorInstanceId,
     config: StarRocksScanConfig,
     batch: ConnectorBatchBudget,
@@ -380,12 +380,9 @@ pub(crate) fn plan_starrocks_read_source(
     let chunk_schema = Arc::clone(&provider.config.output_chunk_schema);
     let has_more = provider.config.has_more;
     let instance = Arc::clone(&provider).connector_instance()?;
-    let (instance, lifecycle) = connectors
-        .register_ephemeral_connector_instance(instance)
-        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
     Ok(Arc::new(
-        ConnectorReadScanSource::new_scheduled_ephemeral_with_incremental(
-            instance,
+        ConnectorReadScanSource::new_scheduled_with_incremental(
+            Arc::new(instance),
             scheduled,
             ConnectorOpenReaderRequest {
                 expected_schema,
@@ -393,7 +390,6 @@ pub(crate) fn plan_starrocks_read_source(
                 context,
             },
             chunk_schema,
-            lifecycle,
             None,
             has_more,
         ),

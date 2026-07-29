@@ -27,7 +27,6 @@ use novarocks_spi::connector::{
     ConnectorReaderMetricsSnapshot, ConnectorSplit,
 };
 
-use crate::connector::host::ConnectorInstanceLease;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
@@ -535,7 +534,6 @@ pub(crate) struct ConnectorReadScanSource {
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
-    lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
     reader_group: Arc<ConnectorReaderGroup>,
 }
@@ -555,28 +553,6 @@ impl ConnectorReadScanSource {
             ))),
             request,
             chunk_schema,
-            lifecycle: None,
-            incremental: None,
-            reader_group: Arc::new(ConnectorReaderGroup::default()),
-        }
-    }
-
-    pub(crate) fn new_ephemeral(
-        instance: Arc<ConnectorInstance>,
-        splits: Vec<ConnectorSplit>,
-        request: ConnectorOpenReaderRequest,
-        chunk_schema: ChunkSchemaRef,
-        lifecycle: Arc<ConnectorInstanceLease>,
-    ) -> Self {
-        Self {
-            instance,
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(
-                plain_scheduled(splits),
-                false,
-            ))),
-            request,
-            chunk_schema,
-            lifecycle: Some(lifecycle),
             incremental: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -598,7 +574,6 @@ impl ConnectorReadScanSource {
             ))),
             request,
             chunk_schema,
-            lifecycle: None,
             incremental: Some(incremental),
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -615,37 +590,17 @@ impl ConnectorReadScanSource {
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
             request,
             chunk_schema,
-            lifecycle: None,
             incremental: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
 
-    pub(crate) fn new_scheduled_ephemeral(
-        instance: Arc<ConnectorInstance>,
-        scheduled: Vec<ConnectorScheduledSplit>,
-        request: ConnectorOpenReaderRequest,
-        chunk_schema: ChunkSchemaRef,
-        lifecycle: Arc<ConnectorInstanceLease>,
-    ) -> Self {
-        Self::new_scheduled_ephemeral_with_incremental(
-            instance,
-            scheduled,
-            request,
-            chunk_schema,
-            lifecycle,
-            None,
-            false,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_scheduled_ephemeral_with_incremental(
+    pub(crate) fn new_scheduled_with_incremental(
         instance: Arc<ConnectorInstance>,
         scheduled: Vec<ConnectorScheduledSplit>,
         request: ConnectorOpenReaderRequest,
         chunk_schema: ChunkSchemaRef,
-        lifecycle: Arc<ConnectorInstanceLease>,
         incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
         has_more: bool,
     ) -> Self {
@@ -654,7 +609,6 @@ impl ConnectorReadScanSource {
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
             request,
             chunk_schema,
-            lifecycle: Some(lifecycle),
             incremental,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -671,7 +625,6 @@ impl ScanSource for ConnectorReadScanSource {
             splits: Arc::clone(&self.splits),
             request: self.request.clone(),
             chunk_schema: Arc::clone(&self.chunk_schema),
-            _lifecycle: self.lifecycle.clone(),
             incremental: self.incremental.clone(),
             reader_group: Arc::clone(&self.reader_group),
         }))
@@ -683,9 +636,6 @@ struct ConnectorReadScanOp {
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
-    // Keep ephemeral provider credentials registered until every scan op and
-    // reader derived from this source has drained.
-    _lifecycle: Option<Arc<ConnectorInstanceLease>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
     reader_group: Arc<ConnectorReaderGroup>,
 }

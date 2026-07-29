@@ -980,10 +980,7 @@ fn collect_row_position_descriptors(
         ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
             collect_row_position_descriptors(&value.input, output)?
         }
-        ExecNodeKind::Values(_)
-        | ExecNodeKind::ExchangeSource(_)
-        | ExecNodeKind::Scan(_)
-        | ExecNodeKind::LookUp(_) => {}
+        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::Scan(_) => {}
     }
     Ok(())
 }

@@ -326,7 +326,7 @@ impl ConnectorCancellation for IcebergMetadataQueryCancellation {
 }
 
 pub(crate) fn plan_iceberg_metadata_read_source(
-    connectors: &ConnectorRegistry,
+    _connectors: &ConnectorRegistry,
     instance_id: ConnectorInstanceId,
     config: IcebergMetadataScanConfig,
     batch: ConnectorBatchBudget,
@@ -363,11 +363,8 @@ pub(crate) fn plan_iceberg_metadata_read_source(
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?,
     );
     let instance = Arc::clone(&provider).connector_instance()?;
-    let (instance, lifecycle) = connectors
-        .register_ephemeral_connector_instance(instance)
-        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
-    Ok(Arc::new(ConnectorReadScanSource::new_scheduled_ephemeral(
-        instance,
+    Ok(Arc::new(ConnectorReadScanSource::new_scheduled(
+        Arc::new(instance),
         scheduled,
         ConnectorOpenReaderRequest {
             expected_schema: output_schema,
@@ -375,7 +372,6 @@ pub(crate) fn plan_iceberg_metadata_read_source(
             context,
         },
         chunk_schema,
-        lifecycle,
     )))
 }
 
