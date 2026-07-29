@@ -299,6 +299,8 @@ impl QueryTerminationAck {
 }
 
 pub trait QueryLifecycleIngress: Send + Sync + 'static {
+    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError>;
+
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
 
     fn abort_query(&self, request: QueryAbortRequest) -> QueryTerminationAck;

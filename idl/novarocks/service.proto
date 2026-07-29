@@ -61,6 +61,12 @@ service NovaRocksGrpc {
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
   // Coordinator cancels one or more fragment instances.
   rpc CancelFragment(CancelFragmentRequest) returns (CancelFragmentResponse);
+  // Coordinator establishes and owns one backend-local query attempt before
+  // any native fragment is accepted.
+  rpc InitQuery(InitQueryRequest) returns (InitQueryResponse);
+  rpc AbortQuery(AbortQueryRequest) returns (AbortQueryResponse);
+  rpc QueryControlStream(stream QueryControlRequest)
+      returns (stream QueryControlResponse);
   // FE-pull cluster heartbeat (unary). Consumer: src/runtime/heartbeat_mgr.rs.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 

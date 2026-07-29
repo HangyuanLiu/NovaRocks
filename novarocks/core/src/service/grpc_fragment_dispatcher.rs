@@ -782,6 +782,13 @@ mod tests {
     impl NovaRocksGrpc for MockGrpc {
         type ExchangeStream =
             Pin<Box<dyn tokio_stream::Stream<Item = Result<ExchangeResponse, Status>> + Send>>;
+        type QueryControlStreamStream = Pin<
+            Box<
+                dyn tokio_stream::Stream<
+                        Item = Result<proto::novarocks::QueryControlResponse, Status>,
+                    > + Send,
+            >,
+        >;
 
         async fn exchange(
             &self,
@@ -869,6 +876,27 @@ mod tests {
             Ok(Response::new(proto::novarocks::CancelFragmentResponse {
                 status_code: 0,
             }))
+        }
+
+        async fn init_query(
+            &self,
+            _request: Request<proto::novarocks::InitQueryRequest>,
+        ) -> Result<Response<proto::novarocks::InitQueryResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn abort_query(
+            &self,
+            _request: Request<proto::novarocks::AbortQueryRequest>,
+        ) -> Result<Response<proto::novarocks::AbortQueryResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn query_control_stream(
+            &self,
+            _request: Request<Streaming<proto::novarocks::QueryControlRequest>>,
+        ) -> Result<Response<Self::QueryControlStreamStream>, Status> {
+            Err(Status::unimplemented("mock"))
         }
 
         async fn heartbeat(

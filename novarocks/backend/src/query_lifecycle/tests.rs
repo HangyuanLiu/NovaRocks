@@ -263,6 +263,36 @@ fn registry_with_clock(
     )
 }
 
+#[test]
+fn query_control_attachment_requires_backend_identity_binding() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = QueryLifecycleRegistry::new_unbound(
+        LOCAL_START_EPOCH,
+        Arc::new(runtime),
+        registry_config(8),
+    );
+    let request = init_request_fixture(700, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::RejectedStaleBackend
+    );
+    registry
+        .bind_backend_identity(LOCAL_BACKEND_ID)
+        .expect("first FE-assigned identity binds");
+    assert_eq!(
+        registry
+            .bind_backend_identity(LOCAL_BACKEND_ID + 1)
+            .expect_err("backend identity takeover must fail")
+            .code(),
+        QueryLifecycleErrorCode::Conflict
+    );
+    assert_eq!(
+        registry.init_query(request).outcome(),
+        QueryInitOutcome::Applied
+    );
+}
+
 fn execution_id(query_low: i64, attempt: u64) -> QueryExecutionId {
     QueryExecutionId::new(
         QueryId::new(0x514c_4302, query_low),

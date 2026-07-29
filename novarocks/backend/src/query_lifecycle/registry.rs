@@ -283,6 +283,26 @@ impl QueryLifecycleRegistry {
             .expect("query lifecycle backend identity lock")
     }
 
+    pub(crate) fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
+        let mut local_backend_id = self
+            .local_backend_id
+            .lock()
+            .expect("query lifecycle backend identity lock");
+        match *local_backend_id {
+            None => {
+                *local_backend_id = Some(backend_id);
+                Ok(())
+            }
+            Some(current) if current == backend_id => Ok(()),
+            Some(current) => Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                format!(
+                    "backend identity is already bound to {current}; refusing reassignment to {backend_id}"
+                ),
+            )),
+        }
+    }
+
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let execution_id = request.manifest().execution_id();
         let digest = request.digest();
@@ -1277,6 +1297,10 @@ impl BackendQueryControl for RegistryQueryControl {
 }
 
 impl QueryLifecycleIngress for QueryLifecycleRegistry {
+    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
+        QueryLifecycleRegistry::bind_backend_identity(self, backend_id)
+    }
+
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         QueryLifecycleRegistry::init_query(self, request)
     }

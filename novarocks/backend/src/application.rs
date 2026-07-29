@@ -91,6 +91,7 @@ pub struct BackendApplicationHost {
     ready_marker: String,
     _native_fragment_service: Arc<NativeFragmentService>,
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
+    query_lifecycle_sweep: QueryLifecycleSweepTask,
 }
 
 impl fmt::Debug for BackendApplicationHost {
@@ -105,6 +106,52 @@ impl fmt::Debug for BackendApplicationHost {
 struct BackendApplicationServices {
     native_fragment_service: Arc<NativeFragmentService>,
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
+}
+
+struct QueryLifecycleSweepTask {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl QueryLifecycleSweepTask {
+    fn start(registry: Arc<QueryLifecycleRegistry>, interval: Duration) -> Result<Self, String> {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let join_handle = std::thread::Builder::new()
+            .name("query-lifecycle-sweep".to_string())
+            .spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(interval) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            registry.sweep_expired(Instant::now());
+                        }
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("spawn query lifecycle sweep task: {error}"))?;
+        Ok(Self {
+            stop_tx: Some(stop_tx),
+            join_handle: Some(join_handle),
+        })
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        let Some(join_handle) = self.join_handle.take() else {
+            return Ok(());
+        };
+        join_handle
+            .join()
+            .map_err(|_| "query lifecycle sweep task panicked".to_string())
+    }
+}
+
+impl Drop for QueryLifecycleSweepTask {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 fn compose_backend_application_services(config: &NovaRocksConfig) -> BackendApplicationServices {
@@ -164,8 +211,10 @@ impl BackendApplicationHost {
             })
     }
 
-    pub fn shutdown(self) -> Result<(), BackendApplicationError> {
-        stop_backend_resources().map_err(|error| {
+    pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
+        let sweep_result = self.query_lifecycle_sweep.stop();
+        let resource_result = stop_backend_resources();
+        combine_shutdown_results(sweep_result, resource_result).map_err(|error| {
             BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
         })
     }
@@ -203,14 +252,21 @@ impl BackendApplicationHost {
         let grpc_port = config.server.grpc_port;
         let services = compose_backend_application_services(&config);
         let native_fragment_service = Arc::clone(&services.native_fragment_service);
+        let mut query_lifecycle_sweep = QueryLifecycleSweepTask::start(
+            Arc::clone(&services.query_lifecycle_registry),
+            Duration::from_millis(config.runtime.query_control_heartbeat_interval_ms),
+        )
+        .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
 
         grpc_server::start_grpc_exchange_server(
             &bind_host,
             grpc_port,
             native_fragment_service.clone(),
+            services.query_lifecycle_registry.clone(),
             native_report_handler,
         )
         .map_err(|error| {
+            let _ = query_lifecycle_sweep.stop();
             BackendApplicationError::new(
                 BackendApplicationErrorKind::Start,
                 format!("start native backend gRPC server on {bind_host}:{grpc_port}: {error}"),
@@ -218,6 +274,7 @@ impl BackendApplicationHost {
         })?;
 
         if let Err(error) = wait_for_tcp_ready(readiness_addr, readiness_timeout) {
+            let _ = query_lifecycle_sweep.stop();
             return Err(cleanup_after_primary_error(BackendApplicationError::new(
                 BackendApplicationErrorKind::Readiness,
                 format!("advertised endpoint readiness failed: {error}"),
@@ -232,6 +289,7 @@ impl BackendApplicationHost {
             ),
             _native_fragment_service: native_fragment_service,
             _query_lifecycle_registry: services.query_lifecycle_registry,
+            query_lifecycle_sweep,
         })
     }
 }
@@ -334,6 +392,17 @@ fn stop_backend_resources() -> Result<(), String> {
     grpc_result
 }
 
+fn combine_shutdown_results(
+    sweep: Result<(), String>,
+    resources: Result<(), String>,
+) -> Result<(), String> {
+    match (sweep, resources) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(sweep), Err(resources)) => Err(format!("{sweep}; {resources}")),
+    }
+}
+
 fn advertised_probe_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     let host = host
         .trim()
@@ -380,8 +449,23 @@ mod tests {
     };
     use novarocks::common::app_config::NovaRocksConfig;
     use novarocks::proto::common::{Status, UniqueId};
-    use novarocks::proto::novarocks::{ExecStatusReport, ReportExecStatusRequest};
+    use novarocks::proto::novarocks::{
+        ExecStatusReport, HeartbeatRequest, ReportExecStatusRequest,
+    };
+    use novarocks::query_execution::contract::QueryId;
+    use novarocks::query_execution::lifecycle::contract::{
+        decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
+        encode_query_control_command, encode_query_init_request,
+    };
+    use novarocks::query_execution::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
+        ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
+        QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitRequest,
+        QueryTerminationReason,
+    };
+    use novarocks::runtime::query_options::QueryOptions;
     use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
+    use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -402,6 +486,49 @@ mod tests {
         config.cluster.advertise_host = "127.0.0.1".to_string();
         config.cluster.advertise_port = advertise_port;
         BackendServerConfig { config }
+    }
+
+    fn live_query_init_request(start_epoch: u64, query_low: i64) -> QueryInitRequest {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(0x514c_4302, query_low),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+        QueryInitRequest::from_manifest(
+            ParticipantManifest::new(
+                execution_id,
+                ParticipantBackendIdentity::new(
+                    7,
+                    QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid backend endpoint"),
+                    start_epoch,
+                )
+                .expect("valid backend identity"),
+                [ParticipantRole::FragmentExecutor],
+                [novarocks::UniqueId {
+                    hi: query_low,
+                    lo: 1,
+                }],
+                ParticipantQueryOptions::new(QueryOptions::default()),
+                10_000,
+                [],
+                None,
+                std::time::Duration::from_secs(30),
+                QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
+            )
+            .expect("valid participant manifest"),
+        )
+    }
+
+    async fn connect_live_client(
+        grpc_port: u16,
+    ) -> novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<
+        tonic::transport::Channel,
+    > {
+        novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::connect(format!(
+            "http://127.0.0.1:{grpc_port}"
+        ))
+        .await
+        .expect("connect native backend gRPC")
     }
 
     #[test]
@@ -464,6 +591,158 @@ mod tests {
             response.message,
             "native backend role does not own coordinator report ingress"
         );
+        host.shutdown().expect("native backend shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_query_control_attachment_live_loopback_round_trip() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
+            .expect("native backend host starts");
+        let mut client = connect_live_client(grpc_port).await;
+        let heartbeat = client
+            .heartbeat(HeartbeatRequest {
+                assigned_be_id: 7,
+                fe_epoch: 1,
+            })
+            .await
+            .expect("bind backend identity")
+            .into_inner();
+        let init = live_query_init_request(heartbeat.start_epoch, 901);
+        client
+            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .await
+            .expect("InitQuery succeeds");
+
+        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
+            .expect("valid Attach");
+        let (commands, command_rx) = tokio::sync::mpsc::channel(4);
+        commands
+            .send(encode_query_control_attach(&attach))
+            .await
+            .expect("send Attach");
+        let mut events = client
+            .query_control_stream(ReceiverStream::new(command_rx))
+            .await
+            .expect("attach QueryControlStream")
+            .into_inner();
+        assert_eq!(
+            decode_query_control_event(
+                &events
+                    .message()
+                    .await
+                    .expect("read ControlReady")
+                    .expect("ControlReady")
+            )
+            .expect("decode ControlReady"),
+            QueryControlEvent::ControlReady
+        );
+        commands
+            .send(encode_query_control_command(
+                &QueryControlCommand::Heartbeat {
+                    sequence: 77,
+                    sent_mono_ns: 123,
+                },
+            ))
+            .await
+            .expect("send heartbeat");
+        assert_eq!(
+            decode_query_control_event(
+                &events
+                    .message()
+                    .await
+                    .expect("read HeartbeatAck")
+                    .expect("HeartbeatAck")
+            )
+            .expect("decode HeartbeatAck"),
+            QueryControlEvent::HeartbeatAck { sequence: 77 }
+        );
+        commands
+            .send(encode_query_control_command(&QueryControlCommand::Abort {
+                reason: "live loopback cancellation".to_string(),
+            }))
+            .await
+            .expect("send Abort");
+        assert_eq!(
+            decode_query_control_event(
+                &events
+                    .message()
+                    .await
+                    .expect("read TerminationAccepted")
+                    .expect("TerminationAccepted")
+            )
+            .expect("decode TerminationAccepted"),
+            QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorAbort
+            }
+        );
+        drop(events);
+        drop(commands);
+        host.shutdown().expect("native backend shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_query_control_heartbeat_timeout_fails_closed_with_open_socket() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let mut config = backend_config(grpc_port, grpc_port);
+        config.config.runtime.query_control_heartbeat_interval_ms = 50;
+        config.config.runtime.query_control_heartbeat_timeout_ms = 250;
+        let host = BackendApplicationHost::open(config).expect("native backend host starts");
+        let mut client = connect_live_client(grpc_port).await;
+        let heartbeat = client
+            .heartbeat(HeartbeatRequest {
+                assigned_be_id: 7,
+                fe_epoch: 1,
+            })
+            .await
+            .expect("bind backend identity")
+            .into_inner();
+        let init = live_query_init_request(heartbeat.start_epoch, 902);
+        client
+            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .await
+            .expect("InitQuery succeeds");
+        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
+            .expect("valid Attach");
+        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
+        commands
+            .send(encode_query_control_attach(&attach))
+            .await
+            .expect("send Attach");
+        let mut events = client
+            .query_control_stream(ReceiverStream::new(command_rx))
+            .await
+            .expect("attach QueryControlStream")
+            .into_inner();
+        let _ = events
+            .message()
+            .await
+            .expect("read ControlReady")
+            .expect("ControlReady");
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let termination = client
+            .abort_query(encode_abort_query_request(
+                &QueryAbortRequest::new(
+                    init.manifest().execution_id(),
+                    init.digest(),
+                    "probe latched timeout",
+                )
+                .expect("valid abort request"),
+            ))
+            .await
+            .expect("AbortQuery observes termination")
+            .into_inner();
+        assert_eq!(
+            termination.accepted_reason,
+            novarocks::proto::novarocks::QueryTerminationReason::
+                QueryTerminationCoordinatorHeartbeatTimeout as i32
+        );
+
+        drop(events);
+        drop(commands);
         host.shutdown().expect("native backend shutdown");
     }
 

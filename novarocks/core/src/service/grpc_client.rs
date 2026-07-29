@@ -644,6 +644,7 @@ mod pr3_tests {
             });
             let service = GrpcService::with_fragment_execution(
                 crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+                crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
                 report_handler,
             );
             tokio::spawn(
@@ -1000,6 +1001,8 @@ mod lookup_tests {
                         proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
                             GrpcService::with_fragment_execution(
                                 crate::service::grpc_server::rejecting_test_native_fragment_ingress(
+                                ),
+                                crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(
                                 ),
                                 Arc::new(super::pr3_tests::DelayedReportHandler(Duration::ZERO)),
                             ),
