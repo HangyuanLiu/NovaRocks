@@ -305,13 +305,15 @@ mod tests {
         let right = manifest_with_orders(1, [ParticipantRole::FragmentExecutor], [7, 9], 0.75);
         assert_eq!(digest_v1(&left), digest_v1(&right));
 
-        let next_attempt = right.with_execution_id(
-            QueryExecutionId::new(
-                right.execution_id().query_id(),
-                AttemptId::new(2).expect("nonzero attempt"),
+        let next_attempt = right
+            .with_execution_id(
+                QueryExecutionId::new(
+                    right.execution_id().query_id(),
+                    AttemptId::new(2).expect("nonzero attempt"),
+                )
+                .expect("valid execution id"),
             )
-            .expect("valid execution id"),
-        );
+            .expect("manifest without runtime filter accepts a new attempt");
         assert_ne!(digest_v1(&left), digest_v1(&next_attempt));
     }
 

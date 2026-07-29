@@ -419,10 +419,21 @@ impl ParticipantManifest {
         digest_v1(self)
     }
 
-    pub fn with_execution_id(&self, execution_id: QueryExecutionId) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_execution_id(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<Self, QueryLifecycleError> {
+        if self.runtime_filter.as_ref().is_some_and(|contribution| {
+            contribution.install().epoch().get() != execution_id.attempt_id().get()
+        }) {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "runtime filter deployment epoch must equal query attempt id",
+            ));
+        }
         let mut next = self.clone();
         next.execution_id = execution_id;
-        next
+        Ok(next)
     }
 }
 
@@ -451,17 +462,23 @@ const fn is_missing_unique_id(id: UniqueId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use super::{
         ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions, ParticipantRole,
-        QueryControlEndpoint,
+        QueryControlEndpoint, RuntimeFilterContribution,
     };
     use crate::common::types::UniqueId;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::contract::QueryLifecycleErrorCode;
     use crate::query_execution::lifecycle::identity::{AttemptId, QueryExecutionId};
     use crate::runtime::query_options::QueryOptions;
+    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+    use crate::runtime_filter::port::install::{
+        RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+    };
+    use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -514,6 +531,53 @@ mod tests {
             endpoint(9031),
         )
         .expect_err("duplicate fragment ids must be rejected");
+
+        assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+    }
+
+    #[test]
+    fn participant_manifest_execution_id_change_rejects_runtime_filter_epoch_mismatch() {
+        let participant = RuntimeFilterParticipantId::new(3);
+        let epoch = DeploymentEpoch::new(1);
+        let install = RuntimeFilterParticipantInstall::new(
+            RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
+            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
+                .expect("empty routing shard is structurally valid"),
+        );
+        let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
+            delivery_expire: Duration::from_secs(5),
+            query_expire: Duration::from_secs(30),
+            transport_retry_interval: Duration::from_millis(200),
+            transport_max_attempts: 3,
+            transport_deadline: Duration::from_secs(2),
+            transport_max_pending_entries: 1024,
+            transport_max_pending_bytes: 1 << 20,
+        };
+        let manifest = ParticipantManifest::new(
+            execution_id(),
+            backend(),
+            [ParticipantRole::RuntimeFilterService],
+            [],
+            ParticipantQueryOptions::new(QueryOptions::default()),
+            1_000,
+            [],
+            Some(
+                RuntimeFilterContribution::new(3, lifecycle, install, [0x5a; 32])
+                    .expect("valid contribution"),
+            ),
+            Duration::from_secs(30),
+            endpoint(9031),
+        )
+        .expect("valid manifest");
+        let next_execution_id = QueryExecutionId::new(
+            manifest.execution_id().query_id(),
+            AttemptId::new(2).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+
+        let error = manifest
+            .with_execution_id(next_execution_id)
+            .expect_err("runtime filter epoch must remain bound to the attempt");
 
         assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
     }

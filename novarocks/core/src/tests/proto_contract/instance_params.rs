@@ -169,6 +169,10 @@ fn query_options() -> novarocks::QueryOptions {
         runtime_profile_report_interval: 7,
         enable_join_runtime_bitset_filter: Some(true),
         global_runtime_filter_build_max_size: 1 << 20,
+        orc_use_column_names: true,
+        enable_file_metacache: true,
+        enable_file_pagecache: true,
+        enable_parquet_reader_page_index: true,
         ..Default::default()
     }
 }
@@ -191,8 +195,8 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
 
     assert_eq!(
         fields,
-        (1..=25).collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=25"
+        (1..=29).collect::<Vec<_>>(),
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29"
     );
 }
 

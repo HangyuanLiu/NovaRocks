@@ -931,6 +931,10 @@ mod tests {
             pipeline_dop: Some(4),
             exec_mem_limit: Some(1 << 30),
             connector_io_tasks_per_scan_operator: Some(8),
+            orc_use_column_names: true,
+            enable_file_metacache: true,
+            enable_file_pagecache: true,
+            enable_parquet_reader_page_index: true,
             runtime_filter_scan_wait_time_ms: Some(250),
             runtime_filter_wait_timeout_ms: Some(500),
             allow_throw_exception: true,
@@ -984,13 +988,18 @@ mod tests {
     }
 
     #[test]
-    fn proto_query_lifecycle_round_trips_service_only_runtime_filter_manifest() {
+    fn proto_query_lifecycle_round_trips_all_query_options() {
         let request = service_only_request();
         let wire = encode_query_init_request(&request).expect("request encodes");
         let decoded = decode_query_init_request(&wire).expect("request decodes");
 
         assert_eq!(decoded.manifest(), request.manifest());
         assert_eq!(decoded.digest(), request.digest());
+        let options = decoded.manifest().query_options().native();
+        assert!(options.orc_use_column_names);
+        assert!(options.enable_file_metacache);
+        assert!(options.enable_file_pagecache);
+        assert!(options.enable_parquet_reader_page_index);
     }
 
     #[test]

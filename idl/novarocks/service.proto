@@ -376,6 +376,10 @@ message QueryOptions {
   int64 runtime_profile_report_interval = 23;
   optional bool enable_join_runtime_bitset_filter = 24;
   int64 global_runtime_filter_build_max_size = 25;
+  bool orc_use_column_names = 26;
+  bool enable_file_metacache = 27;
+  bool enable_file_pagecache = 28;
+  bool enable_parquet_reader_page_index = 29;
 }
 
 // Spill options consumed by NovaRocks native runtime.

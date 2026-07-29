@@ -246,6 +246,10 @@ pub(crate) fn encode_query_options(src: &QueryOptions) -> novarocks::QueryOption
         global_runtime_filter_build_max_size: src
             .global_runtime_filter_build_max_size
             .unwrap_or_default(),
+        orc_use_column_names: src.orc_use_column_names,
+        enable_file_metacache: src.enable_file_metacache,
+        enable_file_pagecache: src.enable_file_pagecache,
+        enable_parquet_reader_page_index: src.enable_parquet_reader_page_index,
     }
 }
 

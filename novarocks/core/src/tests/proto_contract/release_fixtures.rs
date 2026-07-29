@@ -155,6 +155,10 @@ fn release_query_options() -> novarocks::QueryOptions {
         runtime_profile_report_interval: 7,
         enable_join_runtime_bitset_filter: Some(true),
         global_runtime_filter_build_max_size: 1 << 20,
+        orc_use_column_names: false,
+        enable_file_metacache: false,
+        enable_file_pagecache: false,
+        enable_parquet_reader_page_index: false,
     }
 }
 

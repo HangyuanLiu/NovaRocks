@@ -80,10 +80,10 @@ pub(crate) fn decode_query_options(
         exec_mem_limit: (src.query_mem_limit > 0).then_some(src.query_mem_limit),
         connector_io_tasks_per_scan_operator: (src.connector_io_tasks_per_scan_operator > 0)
             .then_some(src.connector_io_tasks_per_scan_operator),
-        orc_use_column_names: false,
-        enable_file_metacache: false,
-        enable_file_pagecache: false,
-        enable_parquet_reader_page_index: false,
+        orc_use_column_names: src.orc_use_column_names,
+        enable_file_metacache: src.enable_file_metacache,
+        enable_file_pagecache: src.enable_file_pagecache,
+        enable_parquet_reader_page_index: src.enable_parquet_reader_page_index,
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
         allow_throw_exception: src.allow_throw_exception,
@@ -455,6 +455,25 @@ mod tests {
         assert_eq!(decoded.group_concat_max_len, Some(0));
         assert_eq!(decoded.cache.datacache_evict_probability, Some(0));
         assert_eq!(decoded.enable_join_runtime_bitset_filter, None);
+    }
+
+    #[test]
+    fn query_options_round_trip_preserves_file_reader_flags() {
+        let options = QueryOptions {
+            orc_use_column_names: true,
+            enable_file_metacache: true,
+            enable_file_pagecache: true,
+            enable_parquet_reader_page_index: true,
+            ..Default::default()
+        };
+
+        let decoded = decode_query_options(&encode_query_options(&options))
+            .expect("round trip native query options");
+
+        assert!(decoded.orc_use_column_names);
+        assert!(decoded.enable_file_metacache);
+        assert!(decoded.enable_file_pagecache);
+        assert!(decoded.enable_parquet_reader_page_index);
     }
 
     #[test]
