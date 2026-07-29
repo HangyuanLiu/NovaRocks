@@ -1138,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_scan_ranges() {
+    fn legacy_iceberg_scan_rejects_before_scan_range_validation() {
         let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
             plan::IcebergDataFiles {
                 table: Some(table_info()),
@@ -1150,11 +1150,14 @@ mod tests {
             .with_connector_registry(Arc::new(ConnectorRegistry::default()));
         let mut arena = ExprArena::default();
         let err = decode_node(&node, &mut arena, &ctx).unwrap_err();
-        assert!(err.contains("missing scan ranges"), "err={err}");
+        assert!(
+            err.contains("legacy IcebergDataFiles must be materialized as ConnectorReadSource"),
+            "err={err}"
+        );
     }
 
     #[test]
-    fn predicate_only_required_column_uses_read_layout_and_projects_outputs() {
+    fn legacy_iceberg_scan_rejects_even_with_predicate_only_required_columns() {
         let node = scan_node_with(
             vec![output_column(1, "id", DataType::Int64)],
             vec![column_ref(2, "flag", DataType::Boolean)],
@@ -1169,19 +1172,10 @@ mod tests {
             .with_connector_registry(Arc::new(ConnectorRegistry::default()))
             .with_scan_ranges(10, vec![file_range()]);
         let mut arena = ExprArena::default();
-        let lowered = decode_node(&node, &mut arena, &ctx).expect("lower native scan");
-        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(1)]);
-        let ExecNodeKind::Project(project) = lowered.node.kind else {
-            panic!("expected scan wrapper project");
-        };
-        assert!(project.is_subordinate);
-        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
-        let ExecNodeKind::Scan(scan) = project.input.kind else {
-            panic!("expected project input scan");
-        };
-        assert_eq!(
-            scan.output_chunk_schema().slot_ids(),
-            &[SlotId::new(1), SlotId::new(2)]
+        let err = decode_node(&node, &mut arena, &ctx).unwrap_err();
+        assert!(
+            err.contains("legacy IcebergDataFiles must be materialized as ConnectorReadSource"),
+            "err={err}"
         );
     }
 }
