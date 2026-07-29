@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-07-29
 provenance:
-  - "PR: pending"
+  - "PR: #763"
 code-anchors:
   - "novarocks/frontend/src/query.rs (FrontendQueryService)"
   - "novarocks/core/src/query_execution/session.rs (QuerySessionFactory)"
