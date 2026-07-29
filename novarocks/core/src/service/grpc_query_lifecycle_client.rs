@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -166,22 +165,18 @@ impl QueryLifecycleTransport for GrpcQueryLifecycleTransport {
         .map_err(|error| unavailable("drive QueryControl Attach", error))?
         .map_err(|error| rpc_error("QueryControl Attach", error, false))?;
         let (event_tx, event_rx) = mpsc::channel(QUERY_CONTROL_CHANNEL_CAPACITY);
-        let commands = Arc::new(Mutex::new(Some(command_tx)));
-        let inflight = Arc::new(AtomicUsize::new(0));
+        let commands = Arc::new(Mutex::new(QueryControlCommandState::new(command_tx)));
         let commands_for_bridge = Arc::clone(&commands);
-        let inflight_for_bridge = Arc::clone(&inflight);
         let bridge = data_runtime_handle()
             .map_err(|error| unavailable("start QueryControl bridge", error))?
             .spawn(run_query_control_bridge(
                 stream,
                 event_tx,
                 commands_for_bridge,
-                inflight_for_bridge,
             ));
         Ok(Arc::new(GrpcQueryControlSession {
             commands,
             events: Mutex::new(event_rx),
-            inflight,
             bridge: Mutex::new(Some(bridge)),
         }))
     }
@@ -211,43 +206,46 @@ impl QueryLifecycleTransport for GrpcQueryLifecycleTransport {
 }
 
 struct GrpcQueryControlSession {
-    commands: Arc<Mutex<Option<mpsc::Sender<crate::proto::novarocks::QueryControlRequest>>>>,
+    commands: Arc<Mutex<QueryControlCommandState>>,
     events: Mutex<mpsc::Receiver<Result<QueryControlEvent, QueryLifecycleTransportError>>>,
-    inflight: Arc<AtomicUsize>,
     bridge: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl QueryControlSession for GrpcQueryControlSession {
     fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
-        reserve_inflight(&self.inflight)?;
-        let result = (|| {
-            let commands = self
-                .commands
-                .lock()
-                .map_err(|_| unavailable("lock QueryControl command channel", "poisoned lock"))?;
-            let sender = commands.as_ref().ok_or_else(|| {
+        let mut state = self
+            .commands
+            .lock()
+            .map_err(|_| unavailable("lock QueryControl command channel", "poisoned lock"))?;
+        let sender = state.sender.as_ref().ok_or_else(|| {
+            state.terminal_error.clone().unwrap_or_else(|| {
                 transport_error(
                     QueryLifecycleTransportErrorKind::StreamClosed,
                     "query control stream is closed",
                 )
-            })?;
-            sender
-                .try_send(encode_query_control_command(&command))
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => transport_error(
-                        QueryLifecycleTransportErrorKind::Backpressure,
-                        "query control command capacity is exhausted",
-                    ),
-                    mpsc::error::TrySendError::Closed(_) => transport_error(
-                        QueryLifecycleTransportErrorKind::StreamClosed,
-                        "query control command stream is closed",
-                    ),
-                })
-        })();
-        if let Err(error) = result {
-            release_inflight(&self.inflight);
-            return Err(error);
+            })
+        })?;
+        if state.pending.len() >= QUERY_CONTROL_CHANNEL_CAPACITY {
+            return Err(transport_error(
+                QueryLifecycleTransportErrorKind::Backpressure,
+                "query control pending command capacity is exhausted",
+            ));
         }
+        sender
+            .try_send(encode_query_control_command(&command))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => transport_error(
+                    QueryLifecycleTransportErrorKind::Backpressure,
+                    "query control command capacity is exhausted",
+                ),
+                mpsc::error::TrySendError::Closed(_) => transport_error(
+                    QueryLifecycleTransportErrorKind::StreamClosed,
+                    "query control command stream is closed",
+                ),
+            })?;
+        state
+            .pending
+            .push_back(PendingQueryControlCommand::from(&command));
         Ok(())
     }
 
@@ -281,8 +279,11 @@ impl QueryControlSession for GrpcQueryControlSession {
 
 impl Drop for GrpcQueryControlSession {
     fn drop(&mut self) {
-        if let Ok(mut commands) = self.commands.lock() {
-            commands.take();
+        if let Ok(mut state) = self.commands.lock() {
+            state.close(transport_error(
+                QueryLifecycleTransportErrorKind::StreamClosed,
+                "query control session was dropped",
+            ));
         }
         if let Ok(bridge) = self.bridge.get_mut()
             && let Some(bridge) = bridge.take()
@@ -295,11 +296,10 @@ impl Drop for GrpcQueryControlSession {
 async fn run_query_control_bridge(
     mut stream: tonic::Streaming<crate::proto::novarocks::QueryControlResponse>,
     events: mpsc::Sender<Result<QueryControlEvent, QueryLifecycleTransportError>>,
-    commands: Arc<Mutex<Option<mpsc::Sender<crate::proto::novarocks::QueryControlRequest>>>>,
-    inflight: Arc<AtomicUsize>,
+    commands: Arc<Mutex<QueryControlCommandState>>,
 ) {
     loop {
-        let next = match stream.message().await {
+        let decoded = match stream.message().await {
             Ok(Some(response)) => match decode_query_control_event(&response) {
                 Ok(event) => Ok(event),
                 Err(error) => Err(invalid_response("decode QueryControl event", error)),
@@ -310,48 +310,174 @@ async fn run_query_control_bridge(
             )),
             Err(status) => Err(status_error("QueryControl stream", status, true)),
         };
-        let terminal = match &next {
-            Ok(QueryControlEvent::ControlReady) | Ok(QueryControlEvent::HeartbeatAck { .. }) => {
-                false
-            }
-            Ok(QueryControlEvent::LocalFailure { .. })
-            | Ok(QueryControlEvent::TerminationAccepted { .. })
-            | Err(_) => true,
-        };
-        if matches!(
-            next,
-            Ok(QueryControlEvent::HeartbeatAck { .. })
-                | Ok(QueryControlEvent::TerminationAccepted { .. })
-        ) {
-            release_inflight(&inflight);
+        let (next, terminal) = prepare_query_control_event(decoded, &commands);
+        if events.send(next).await.is_err() {
+            close_query_control_commands(
+                &commands,
+                transport_error(
+                    QueryLifecycleTransportErrorKind::StreamClosed,
+                    "query control event receiver was dropped",
+                ),
+            );
+            break;
         }
-        if events.send(next).await.is_err() || terminal {
+        if terminal {
             break;
         }
     }
-    if let Ok(mut commands) = commands.lock() {
-        commands.take();
+}
+
+struct QueryControlCommandState {
+    sender: Option<mpsc::Sender<crate::proto::novarocks::QueryControlRequest>>,
+    pending: VecDeque<PendingQueryControlCommand>,
+    terminal_error: Option<QueryLifecycleTransportError>,
+}
+
+impl QueryControlCommandState {
+    fn new(sender: mpsc::Sender<crate::proto::novarocks::QueryControlRequest>) -> Self {
+        Self {
+            sender: Some(sender),
+            pending: VecDeque::new(),
+            terminal_error: None,
+        }
+    }
+
+    fn close(&mut self, error: QueryLifecycleTransportError) {
+        self.sender.take();
+        self.terminal_error.get_or_insert(error);
     }
 }
 
-fn reserve_inflight(inflight: &AtomicUsize) -> Result<(), QueryLifecycleTransportError> {
-    inflight
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < QUERY_CONTROL_CHANNEL_CAPACITY).then_some(current + 1)
-        })
-        .map(|_| ())
-        .map_err(|_| {
-            transport_error(
-                QueryLifecycleTransportErrorKind::Backpressure,
-                "query control inflight capacity is exhausted",
-            )
-        })
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingQueryControlCommand {
+    Heartbeat { sequence: u64 },
+    Abort,
+    Finalize,
 }
 
-fn release_inflight(inflight: &AtomicUsize) {
-    let _ = inflight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        (current > 0).then_some(current - 1)
-    });
+impl From<&QueryControlCommand> for PendingQueryControlCommand {
+    fn from(command: &QueryControlCommand) -> Self {
+        match command {
+            QueryControlCommand::Heartbeat { sequence, .. } => Self::Heartbeat {
+                sequence: *sequence,
+            },
+            QueryControlCommand::Abort { .. } => Self::Abort,
+            QueryControlCommand::Finalize => Self::Finalize,
+        }
+    }
+}
+
+fn prepare_query_control_event(
+    decoded: Result<QueryControlEvent, QueryLifecycleTransportError>,
+    commands: &Mutex<QueryControlCommandState>,
+) -> (
+    Result<QueryControlEvent, QueryLifecycleTransportError>,
+    bool,
+) {
+    let mut state = match commands.lock() {
+        Ok(state) => state,
+        Err(_) => {
+            return (
+                Err(unavailable(
+                    "lock QueryControl command state",
+                    "poisoned lock",
+                )),
+                true,
+            );
+        }
+    };
+    let next = match decoded {
+        Ok(event) => match validate_query_control_event(&event, &mut state) {
+            Ok(()) => Ok(event),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    let terminal = matches!(
+        next,
+        Ok(QueryControlEvent::LocalFailure { .. })
+            | Ok(QueryControlEvent::TerminationAccepted { .. })
+            | Err(_)
+    );
+    if terminal {
+        let terminal_error = terminal_command_error(&next);
+        state.close(terminal_error);
+    }
+    (next, terminal)
+}
+
+fn validate_query_control_event(
+    event: &QueryControlEvent,
+    state: &mut QueryControlCommandState,
+) -> Result<(), QueryLifecycleTransportError> {
+    match event {
+        QueryControlEvent::ControlReady | QueryControlEvent::LocalFailure { .. } => Ok(()),
+        QueryControlEvent::HeartbeatAck { sequence } => match state.pending.front() {
+            Some(PendingQueryControlCommand::Heartbeat {
+                sequence: expected,
+            }) if sequence == expected => {
+                state.pending.pop_front();
+                Ok(())
+            }
+            Some(expected) => Err(invalid_response(
+                "validate QueryControl HeartbeatAck",
+                format!("expected {expected:?}, received heartbeat sequence {sequence}"),
+            )),
+            None => Err(invalid_response(
+                "validate QueryControl HeartbeatAck",
+                format!("received unsolicited heartbeat sequence {sequence}"),
+            )),
+        },
+        QueryControlEvent::TerminationAccepted { reason } => match state.pending.front() {
+            Some(PendingQueryControlCommand::Abort) => {
+                state.pending.pop_front();
+                Ok(())
+            }
+            Some(PendingQueryControlCommand::Finalize)
+                if *reason == crate::query_execution::lifecycle::QueryTerminationReason::CoordinatorFinalize =>
+            {
+                state.pending.pop_front();
+                Ok(())
+            }
+            Some(expected) => Err(invalid_response(
+                "validate QueryControl TerminationAccepted",
+                format!("expected {expected:?}, received termination reason {reason:?}"),
+            )),
+            None => Err(invalid_response(
+                "validate QueryControl TerminationAccepted",
+                format!("received unsolicited termination reason {reason:?}"),
+            )),
+        },
+    }
+}
+
+fn terminal_command_error(
+    event: &Result<QueryControlEvent, QueryLifecycleTransportError>,
+) -> QueryLifecycleTransportError {
+    match event {
+        Err(error) => error.clone(),
+        Ok(QueryControlEvent::LocalFailure { code, detail }) => transport_error(
+            QueryLifecycleTransportErrorKind::StreamClosed,
+            format!("query control stream terminated by local failure {code}: {detail}"),
+        ),
+        Ok(QueryControlEvent::TerminationAccepted { reason }) => transport_error(
+            QueryLifecycleTransportErrorKind::StreamClosed,
+            format!("query control stream terminated with {reason:?}"),
+        ),
+        Ok(_) => transport_error(
+            QueryLifecycleTransportErrorKind::StreamClosed,
+            "query control stream terminated",
+        ),
+    }
+}
+
+fn close_query_control_commands(
+    commands: &Mutex<QueryControlCommandState>,
+    error: QueryLifecycleTransportError,
+) {
+    if let Ok(mut state) = commands.lock() {
+        state.close(error);
+    }
 }
 
 fn validate_init_target(
@@ -395,27 +521,27 @@ fn rpc_error(
     stream: bool,
 ) -> QueryLifecycleTransportError {
     match error {
-        QueryLifecycleRpcError::DeadlineExceeded(detail) => {
+        QueryLifecycleRpcError::PreSubmission(detail) => {
+            transport_error(QueryLifecycleTransportErrorKind::Unavailable, detail)
+        }
+        QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(detail) => {
             transport_error(QueryLifecycleTransportErrorKind::DeadlineExceeded, detail)
         }
-        QueryLifecycleRpcError::Status(status) => status_error(operation, status, stream),
-        QueryLifecycleRpcError::Transport(detail) => transport_error(
-            if stream {
-                QueryLifecycleTransportErrorKind::StreamClosed
-            } else {
-                QueryLifecycleTransportErrorKind::Unavailable
-            },
-            detail,
-        ),
+        QueryLifecycleRpcError::PostSubmissionStatus(status) => {
+            status_error(operation, status, stream)
+        }
     }
 }
 
 fn init_rpc_error(operation: &str, error: QueryLifecycleRpcError) -> QueryLifecycleTransportError {
     match error {
-        QueryLifecycleRpcError::DeadlineExceeded(detail) => {
+        QueryLifecycleRpcError::PreSubmission(detail) => {
+            transport_error(QueryLifecycleTransportErrorKind::Unavailable, detail)
+        }
+        QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(detail) => {
             transport_error(QueryLifecycleTransportErrorKind::DeadlineExceeded, detail)
         }
-        QueryLifecycleRpcError::Status(status)
+        QueryLifecycleRpcError::PostSubmissionStatus(status)
             if matches!(
                 status.code(),
                 tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown
@@ -430,9 +556,8 @@ fn init_rpc_error(operation: &str, error: QueryLifecycleRpcError) -> QueryLifecy
                 ),
             )
         }
-        QueryLifecycleRpcError::Status(status) => status_error(operation, status, false),
-        QueryLifecycleRpcError::Transport(detail) => {
-            transport_error(QueryLifecycleTransportErrorKind::Unavailable, detail)
+        QueryLifecycleRpcError::PostSubmissionStatus(status) => {
+            status_error(operation, status, false)
         }
     }
 }
@@ -513,7 +638,10 @@ mod tests {
     use crate::service::grpc_server::{GrpcService, rejecting_test_native_fragment_ingress};
     use futures::stream;
 
-    use super::{init_rpc_error, new_grpc_query_lifecycle_transport};
+    use super::{
+        PendingQueryControlCommand, QueryControlCommandState, init_rpc_error,
+        new_grpc_query_lifecycle_transport, prepare_query_control_event,
+    };
 
     #[test]
     fn grpc_query_lifecycle_client_rejects_empty_topology() {
@@ -548,11 +676,53 @@ mod tests {
         ] {
             let error = init_rpc_error(
                 "InitQuery",
-                QueryLifecycleRpcError::Status(tonic::Status::new(code, "lost acknowledgement")),
+                QueryLifecycleRpcError::PostSubmissionStatus(tonic::Status::new(
+                    code,
+                    "lost acknowledgement",
+                )),
             );
             assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed);
             assert!(error.is_unknown_init_outcome());
         }
+    }
+
+    #[test]
+    fn grpc_query_lifecycle_client_closes_commands_while_preparing_terminal_event() {
+        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(32);
+        let commands = Mutex::new(QueryControlCommandState::new(command_tx));
+        commands
+            .lock()
+            .expect("command state")
+            .pending
+            .push_back(PendingQueryControlCommand::Finalize);
+
+        let (next, terminal) = prepare_query_control_event(
+            Ok(QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorFinalize,
+            }),
+            &commands,
+        );
+
+        assert!(terminal);
+        assert_eq!(
+            next.expect("terminal event remains observable"),
+            QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorFinalize,
+            }
+        );
+        let state = commands.lock().expect("command state");
+        assert!(
+            state.sender.is_none(),
+            "command sender must close before terminal event publication"
+        );
+        assert_eq!(
+            state
+                .terminal_error
+                .as_ref()
+                .expect("terminal command error")
+                .kind(),
+            QueryLifecycleTransportErrorKind::StreamClosed
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

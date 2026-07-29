@@ -1269,6 +1269,280 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
     server.await.expect("join live lifecycle server");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal_is_observed() {
+    let ingress = Arc::new(LiveLifecycleIngress::default());
+    let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
+    let backend = LiveBackendTarget::new(7, endpoint, 89);
+    let target = QueryLifecycleTarget::new(7, endpoint, 89);
+    let request = live_init_request(backend, 803);
+    let execution_id = request.manifest().execution_id();
+    let digest = request.digest();
+    let transport =
+        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    transport
+        .init_query(target, request, Duration::from_secs(2))
+        .expect("InitQuery");
+    let session = transport
+        .attach_control(
+            target,
+            QueryControlAttach::new(execution_id, digest, 11).expect("attach"),
+            Duration::from_secs(2),
+        )
+        .expect("attach");
+    assert_eq!(
+        session
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ControlReady"),
+        QueryControlEvent::ControlReady
+    );
+
+    session
+        .send(QueryControlCommand::Finalize)
+        .expect("send finalize");
+    assert_eq!(
+        session
+            .recv_timeout(Duration::from_secs(2))
+            .expect("TerminationAccepted"),
+        QueryControlEvent::TerminationAccepted {
+            reason: QueryTerminationReason::CoordinatorFinalize,
+        }
+    );
+    let error = session
+        .send(QueryControlCommand::Heartbeat {
+            sequence: 1,
+            sent_mono_ns: 1,
+        })
+        .expect_err("terminal observation must imply a closed command side");
+    assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed);
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_command() {
+    let ingress = Arc::new(LiveLifecycleIngress {
+        manual_heartbeat_acks: true,
+        ..Default::default()
+    });
+    let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
+    let backend = LiveBackendTarget::new(7, endpoint, 90);
+    let target = QueryLifecycleTarget::new(7, endpoint, 90);
+    let request = live_init_request(backend, 804);
+    let execution_id = request.manifest().execution_id();
+    let digest = request.digest();
+    let transport =
+        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    transport
+        .init_query(target, request, Duration::from_secs(2))
+        .expect("InitQuery");
+    let session = transport
+        .attach_control(
+            target,
+            QueryControlAttach::new(execution_id, digest, 12).expect("attach"),
+            Duration::from_secs(2),
+        )
+        .expect("attach");
+    assert_eq!(
+        session
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ControlReady"),
+        QueryControlEvent::ControlReady
+    );
+
+    for sequence in 0..32 {
+        session
+            .send(QueryControlCommand::Heartbeat {
+                sequence,
+                sent_mono_ns: sequence,
+            })
+            .expect("fill pending command capacity");
+    }
+    assert_eq!(
+        session
+            .send(QueryControlCommand::Heartbeat {
+                sequence: 32,
+                sent_mono_ns: 32,
+            })
+            .expect_err("33rd pending command must backpressure")
+            .kind(),
+        QueryLifecycleTransportErrorKind::Backpressure
+    );
+
+    ingress.send_control_event(QueryControlEvent::HeartbeatAck { sequence: 0 });
+    assert_eq!(
+        session
+            .recv_timeout(Duration::from_secs(2))
+            .expect("matching heartbeat acknowledgement"),
+        QueryControlEvent::HeartbeatAck { sequence: 0 }
+    );
+    session
+        .send(QueryControlCommand::Heartbeat {
+            sequence: 32,
+            sent_mono_ns: 32,
+        })
+        .expect("one matching acknowledgement releases exactly one slot");
+    assert_eq!(
+        session
+            .send(QueryControlCommand::Heartbeat {
+                sequence: 33,
+                sent_mono_ns: 33,
+            })
+            .expect_err("only one slot was released")
+            .kind(),
+        QueryLifecycleTransportErrorKind::Backpressure
+    );
+
+    ingress.send_control_event(QueryControlEvent::HeartbeatAck { sequence: 0 });
+    let error = session
+        .recv_timeout(Duration::from_secs(2))
+        .expect_err("duplicate acknowledgement must terminate the invalid stream");
+    assert_eq!(
+        error.kind(),
+        QueryLifecycleTransportErrorKind::InvalidResponse
+    );
+    assert_eq!(
+        session
+            .send(QueryControlCommand::Heartbeat {
+                sequence: 33,
+                sent_mono_ns: 33,
+            })
+            .expect_err("duplicate acknowledgement must not release capacity")
+            .kind(),
+        QueryLifecycleTransportErrorKind::InvalidResponse
+    );
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack() {
+    let ingress = Arc::new(LiveLifecycleIngress {
+        manual_terminal_acks: true,
+        ..Default::default()
+    });
+    let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
+    let backend = LiveBackendTarget::new(7, endpoint, 91);
+    let target = QueryLifecycleTarget::new(7, endpoint, 91);
+    let request = live_init_request(backend, 805);
+    let execution_id = request.manifest().execution_id();
+    let digest = request.digest();
+    let transport =
+        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    transport
+        .init_query(target, request, Duration::from_secs(2))
+        .expect("InitQuery");
+    let session = transport
+        .attach_control(
+            target,
+            QueryControlAttach::new(execution_id, digest, 13).expect("attach"),
+            Duration::from_secs(2),
+        )
+        .expect("attach");
+    assert_eq!(
+        session
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ControlReady"),
+        QueryControlEvent::ControlReady
+    );
+
+    session
+        .send(QueryControlCommand::Finalize)
+        .expect("send finalize");
+    ingress.send_control_event(QueryControlEvent::TerminationAccepted {
+        reason: QueryTerminationReason::CoordinatorAbort,
+    });
+    let error = session
+        .recv_timeout(Duration::from_secs(2))
+        .expect_err("Finalize must not accept an Abort acknowledgement");
+    assert_eq!(
+        error.kind(),
+        QueryLifecycleTransportErrorKind::InvalidResponse
+    );
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_query_lifecycle_live_transport_pre_submission_timeout_is_definite() {
+    let ingress = Arc::new(LiveLifecycleIngress::default());
+    let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress).await;
+    let backend = LiveBackendTarget::new(7, endpoint, 92);
+    let target = QueryLifecycleTarget::new(7, endpoint, 92);
+    let request = live_init_request(backend, 806);
+    let transport =
+        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+
+    let error = transport
+        .init_query(target, request, Duration::ZERO)
+        .expect_err("channel acquisition deadline is a definite pre-submission failure");
+    assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::Unavailable);
+    assert!(!error.is_unknown_init_outcome());
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unknown() {
+    let ingress = Arc::new(LiveLifecycleIngress::default());
+    let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
+    let backend = LiveBackendTarget::new(7, endpoint, 93);
+    let target = QueryLifecycleTarget::new(7, endpoint, 93);
+    let transport =
+        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+
+    transport
+        .init_query(
+            target,
+            live_init_request(backend, 807),
+            Duration::from_secs(2),
+        )
+        .expect("warm the channel before the delayed request");
+    *ingress.init_delay.lock().expect("init delay") = Some(Duration::from_millis(100));
+    let error = transport
+        .init_query(
+            target,
+            live_init_request(backend, 808),
+            Duration::from_millis(20),
+        )
+        .expect_err("submitted InitQuery must time out while the server is handling it");
+    assert!(matches!(
+        error.kind(),
+        QueryLifecycleTransportErrorKind::DeadlineExceeded
+            | QueryLifecycleTransportErrorKind::StreamClosed
+    ));
+    assert!(error.is_unknown_init_outcome());
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
+}
+
+fn live_init_request(backend: LiveBackendTarget, finst_high: i64) -> QueryInitRequest {
+    let execution_id = query_execution_id();
+    QueryInitRequest::from_manifest(
+        ParticipantManifest::new(
+            execution_id,
+            ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
+            [ParticipantRole::FragmentExecutor],
+            [UniqueId {
+                hi: finst_high,
+                lo: 1,
+            }],
+            ParticipantQueryOptions::new(QueryOptions::default()),
+            1_900_000_000_000,
+            [],
+            None,
+            Duration::from_secs(30),
+            QueryControlEndpoint::new("127.0.0.1", 19_000).expect("report endpoint"),
+        )
+        .expect("live manifest"),
+    )
+}
+
 async fn spawn_frontend_live_server(
     ingress: Arc<dyn QueryLifecycleIngress>,
 ) -> (
@@ -1317,6 +1591,22 @@ struct LiveLifecycleIngress {
     initialized_backend: Mutex<Option<ParticipantBackendIdentity>>,
     finalized: Arc<std::sync::atomic::AtomicBool>,
     gate: Option<Arc<LiveHeartbeatGate>>,
+    manual_heartbeat_acks: bool,
+    manual_terminal_acks: bool,
+    init_delay: Mutex<Option<Duration>>,
+    control_events: Mutex<Option<tokio::sync::mpsc::Sender<QueryControlEvent>>>,
+}
+
+impl LiveLifecycleIngress {
+    fn send_control_event(&self, event: QueryControlEvent) {
+        self.control_events
+            .lock()
+            .expect("control events")
+            .as_ref()
+            .expect("attached control stream")
+            .try_send(event)
+            .expect("inject control event");
+    }
 }
 
 impl QueryLifecycleIngress for LiveLifecycleIngress {
@@ -1325,6 +1615,9 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
     }
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
+        if let Some(delay) = *self.init_delay.lock().expect("init delay") {
+            std::thread::sleep(delay);
+        }
         let execution_id = request.manifest().execution_id();
         let digest = request.digest();
         *self
@@ -1361,11 +1654,14 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
         events
             .try_send(QueryControlEvent::ControlReady)
             .expect("ControlReady");
+        *self.control_events.lock().expect("control events") = Some(events.clone());
         Ok(QueryControlAttachment {
             control: Arc::new(LiveBackendControl {
                 events,
                 finalized: Arc::clone(&self.finalized),
                 gate: self.gate.clone(),
+                manual_heartbeat_acks: self.manual_heartbeat_acks,
+                manual_terminal_acks: self.manual_terminal_acks,
             }),
             events: receiver,
         })
@@ -1376,6 +1672,8 @@ struct LiveBackendControl {
     events: tokio::sync::mpsc::Sender<QueryControlEvent>,
     finalized: Arc<std::sync::atomic::AtomicBool>,
     gate: Option<Arc<LiveHeartbeatGate>>,
+    manual_heartbeat_acks: bool,
+    manual_terminal_acks: bool,
 }
 
 impl BackendQueryControl for LiveBackendControl {
@@ -1391,12 +1689,18 @@ impl BackendQueryControl for LiveBackendControl {
                 "reset live test stream",
             ));
         }
+        if self.manual_heartbeat_acks {
+            return Ok(());
+        }
         self.events
             .try_send(QueryControlEvent::HeartbeatAck { sequence })
             .map_err(live_control_error)
     }
 
     fn abort(&self, _reason: String) -> Result<(), QueryLifecycleError> {
+        if self.manual_terminal_acks {
+            return Ok(());
+        }
         self.events
             .try_send(QueryControlEvent::TerminationAccepted {
                 reason: QueryTerminationReason::CoordinatorAbort,
@@ -1407,6 +1711,9 @@ impl BackendQueryControl for LiveBackendControl {
     fn finalize(&self) -> Result<(), QueryLifecycleError> {
         self.finalized
             .store(true, std::sync::atomic::Ordering::Release);
+        if self.manual_terminal_acks {
+            return Ok(());
+        }
         self.events
             .try_send(QueryControlEvent::TerminationAccepted {
                 reason: QueryTerminationReason::CoordinatorFinalize,

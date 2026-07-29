@@ -21,18 +21,22 @@ reconnect、takeover 或隐藏重试；这些边界继续由 Task 7 负责。
 - Init/Abort 使用 global async data runtime 与调用方 deadline；adapter 本身不重试。
   request/response decode、unknown enum、execution id 或 digest 不一致均返回
   `InvalidResponse`。
-- Init 已提交后收到 `Unavailable`、`Cancelled` 或 `Unknown` status 时归类为
-  `StreamClosed` unknown outcome，让 Task 5 只以完全相同 request/digest 决定一次
-  幂等重试；channel acquisition 失败仍是 definite `Unavailable`。
+- channel acquisition timeout/failure 与 RPC submit 前已耗尽的 deadline 归类为
+  definite `Unavailable`，不会触发 unknown-outcome retry。Init 已提交后收到
+  timeout、`Unavailable`、`Cancelled` 或 `Unknown` status 时才归类为
+  `DeadlineExceeded`/`StreamClosed` unknown outcome，让 Task 5 只以完全相同
+  request/digest 决定一次幂等重试。
 
 ### bounded bidirectional session bridge
 
-- command/event channel 均固定容量 32；额外用 pending-command 计数确保 server
+- command/event channel 均固定容量 32；有界 pending-command FIFO 确保 server
   暂停读取或 HTTP/2 预取时，第 33 条未 ACK command 仍确定返回 typed
-  `Backpressure`。
-- bridge 在 global data runtime 上按序 decode response；heartbeat/finalize ACK
-  释放 inflight slot，LocalFailure、TerminationAccepted、wire error 或 stream reset
-  first-wins 交付一个 terminal item 后关闭 command side。
+  `Backpressure`。只有与 FIFO front 类型和 heartbeat sequence 精确匹配的 ACK
+  才核销一个 permit。
+- bridge 在 global data runtime 上按序 decode response；重复、unsolicited、
+  wrong-sequence 或 wrong-terminal ACK 返回 `InvalidResponse`，不释放 capacity。
+  LocalFailure、TerminationAccepted、wire error 或 stream reset first-wins 保存
+  typed terminal error，并在 event 对调用者可见前先关闭 command side。
 - `recv_timeout` 区分本地 deadline 与 event channel/remote stream closure；
   session Drop 关闭 command sender 并 abort owned join handle，不留下 detached task。
 - attach timeout 只限制 channel acquisition 与 stream 建立，不把短期 attach deadline
@@ -125,3 +129,79 @@ QLC-1A cancellation cutover与旧 RF owner 删除均未实现。
   的 Core tests；目前由 Frontend generated-service 测试提供等价 live 证据。
 - Task 7 必须删除 `legacy_runtime_filter_dispatcher_override` 与临时派生逻辑，
   并让 production submit 强制消费本任务注入的 lifecycle transport。
+
+## Review fix round 1/5
+
+本轮关闭三个并发与 transport classification finding，且没有修改 Task 7 的
+submission/cancellation cutover。
+
+### Terminal publish 的线性化
+
+- `QueryControlCommandState` 在一个 mutex 内同时拥有 sender、pending FIFO 和
+  first-wins terminal error。
+- bridge 对 LocalFailure、TerminationAccepted、wire/status error 先在锁内 drop
+  sender 并保存 terminal error，再释放锁并向 event channel publish。因此 caller
+  一旦观察到 terminal，后续 `send` 必然返回保存的 typed terminal error。
+- Core 确定性单元回归直接调用 terminal preparation 边界，并在任何 event
+  publication 之前断言 sender 已关闭且保存了 `StreamClosed`；Frontend live
+  回归再从公开 session API 断言观察到 terminal 后不可继续 send。
+- mutex 不跨 event channel 的 async send；Drop 同样先关闭 command state，再
+  abort owned bridge task。
+
+### command-specific pending permit
+
+- scalar inflight counter 改为容量 32 的 typed FIFO：
+  `Heartbeat(sequence)`、`Abort`、`Finalize`。
+- command 只有 wire `try_send` 成功后才入 FIFO；ACK 只有匹配 FIFO front 才 pop。
+  一条合法 HeartbeatAck 只释放一个 slot。
+- duplicate、unsolicited、wrong-sequence、wrong-order ACK 都变成 terminal
+  `InvalidResponse`，不释放任何 permit。Finalize 只接受
+  `CoordinatorFinalize`；Abort 保留 Task 5 first-wins termination reason 语义。
+
+### pre/post submission deadline
+
+- `QueryLifecycleRpcError` 明确拆成 `PreSubmission`、
+  `PostSubmissionDeadlineExceeded` 与 `PostSubmissionStatus`。
+- channel acquisition timeout/failure 和 submit 前 deadline 耗尽是 definite
+  `Unavailable`，`is_unknown_init_outcome == false`。
+- 已提交 Init 的本地/remote timeout，以及 post-submit
+  `Unavailable`/`Cancelled`/`Unknown` 是 retryable unknown outcome。
+
+### RED/GREEN
+
+真实 generated-service RED：
+
+```text
+frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_command
+FAILED: duplicate ACK was returned as HeartbeatAck
+
+frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
+FAILED: Finalize accepted CoordinatorAbort
+
+frontend_query_lifecycle_live_transport_pre_submission_timeout_is_definite
+FAILED: got DeadlineExceeded, expected Unavailable
+```
+
+GREEN 与最终验证：
+
+```text
+cargo test -p novarocks-frontend --lib frontend_query_lifecycle_live_transport -- --nocapture
+test result: ok. 8 passed; 0 failed
+
+cargo test -p novarocks-frontend --lib -- --nocapture
+test result: ok. 123 passed; 0 failed
+
+cargo check -p novarocks
+exit 0
+
+cargo check -p novarocks-frontend
+exit 0
+
+cargo check -p novarocks --features compat
+exit 0
+```
+
+Core filtered test target 仍被同一组 7 个既有 Iceberg optimize API 编译错误阻塞；
+没有 Task 6 新错误。独立 fix-round review 未发现 Critical、Important 或 Minor，
+并确认 terminal close 不持锁跨 await、FIFO capacity 严格为 32、Abort first-wins
+语义保留、Drop 无 detached task。
