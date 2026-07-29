@@ -435,7 +435,14 @@ mod tests {
             .bind(context.captured_ranges_for_test(node.node_id))
             .expect("bind generic connector source");
         let rows = op
-            .execute_iter(ScanMorsel::ConnectorSplit { index: 0 }, None, None)
+            .execute_iter(
+                ScanMorsel::ConnectorSplit {
+                    index: 0,
+                    row_position: None,
+                },
+                None,
+                None,
+            )
             .expect("open typed reader")
             .collect::<Result<Vec<_>, _>>()
             .expect("read typed split");
@@ -504,7 +511,7 @@ mod tests {
         let morsels = op.build_morsels().expect("build generic connector morsels");
         assert!(matches!(
             &morsels.morsels[..],
-            [ScanMorsel::ConnectorSplit { index: 0 }]
+            [ScanMorsel::ConnectorSplit { index: 0, .. }]
         ));
     }
 

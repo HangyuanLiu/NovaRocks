@@ -258,12 +258,19 @@ fn read_scan_source_opens_a_typed_split_and_adapts_its_batches() {
     assert!(matches!(
         morsels.morsels.as_slice(),
         [
-            ScanMorsel::ConnectorSplit { index: 0 },
-            ScanMorsel::ConnectorSplit { index: 1 }
+            ScanMorsel::ConnectorSplit { index: 0, .. },
+            ScanMorsel::ConnectorSplit { index: 1, .. }
         ]
     ));
     let chunks = op
-        .execute_iter(ScanMorsel::ConnectorSplit { index: 0 }, None, None)
+        .execute_iter(
+            ScanMorsel::ConnectorSplit {
+                index: 0,
+                row_position: None,
+            },
+            None,
+            None,
+        )
         .expect("execute reader")
         .collect::<Result<Vec<_>, _>>()
         .expect("reader chunks");
@@ -372,14 +379,14 @@ fn incremental_connector_source_appends_only_new_connector_morsels() {
             .expect("initial morsels")
             .morsels
             .as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 0 }]
+        [ScanMorsel::ConnectorSplit { index: 0, .. }]
     ));
     let appended = op
         .build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
         .expect("append connector split");
     assert!(matches!(
         appended.morsels.as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 1 }]
+        [ScanMorsel::ConnectorSplit { index: 1, .. }]
     ));
     assert!(!appended.has_more);
 }
@@ -505,7 +512,7 @@ fn incremental_connector_source_rejects_append_after_eos_without_calling_provide
             .expect("morsels after rejected append")
             .morsels
             .as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 0 }]
+        [ScanMorsel::ConnectorSplit { index: 0, .. }]
     ));
 }
 
@@ -565,7 +572,7 @@ fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically(
             .expect("morsels after rejected append")
             .morsels
             .as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 0 }]
+        [ScanMorsel::ConnectorSplit { index: 0, .. }]
     ));
 }
 
