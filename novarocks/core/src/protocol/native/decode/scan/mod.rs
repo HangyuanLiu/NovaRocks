@@ -81,12 +81,6 @@ pub(crate) fn lower_scan_node(
             )
             .map_err(|error| error.into_native(source_path.field("iceberg_metadata_table")))
         }
-        plan::scan_source::Kind::IcebergDeltaTable(_) => {
-            Err(NativeFragmentDecodeError::unsupported(
-                source_path.field("iceberg_delta_table"),
-                "legacy IcebergDeltaTable must be materialized as ConnectorReadSource before native decoding",
-            ))
-        }
         plan::scan_source::Kind::IcebergVersionTable(_) => {
             Err(NativeFragmentDecodeError::unsupported(
                 source_path.field("iceberg_version_table"),
@@ -868,37 +862,6 @@ mod tests {
         }
     }
 
-    fn iceberg_delta_table_source() -> plan::scan_source::Kind {
-        plan::scan_source::Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
-            table: Some(table_info()),
-            from_snapshot_id: 1,
-            to_snapshot_id: 2,
-            delta_plan: Some(plan::IcebergDeltaScanPlan {
-                table_location: "file:///tmp/novarocks-delta-table".to_string(),
-                data_columns: vec![plan::IcebergDeltaDataColumn {
-                    name: "id".to_string(),
-                    field_id: 10,
-                }],
-                cloud_properties: HashMap::new(),
-                change_files: vec![plan::IcebergDeltaSourceFile {
-                    path: "file:///tmp/novarocks-delta-table/data-1.parquet".to_string(),
-                    size: 10,
-                    role: plan::IcebergDeltaSourceRole::DataFile as i32,
-                    partition_spec_id: Some(0),
-                    partition_key: None,
-                    first_row_id: Some(100),
-                    data_sequence_number: Some(7),
-                    row_id_allow_list: Vec::new(),
-                    position_deletes: Vec::new(),
-                    equality_field_ids: Vec::new(),
-                    equality_targets: Vec::new(),
-                    deleted_file_visibility: None,
-                }],
-                delete_side: None,
-            }),
-        })
-    }
-
     fn iceberg_metadata_table_source() -> plan::scan_source::Kind {
         plan::scan_source::Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
             table: Some(table_info()),
@@ -979,22 +942,6 @@ mod tests {
         let mut invalid = output_column(1, "id", DataType::Int64);
         invalid.r#type = Some(common::TypeDesc::default());
         assert_scan_column_type_error(vec![invalid], Vec::new(), 0);
-    }
-
-    #[test]
-    fn rejects_legacy_iceberg_delta_table_before_provider_binding() {
-        let node = scan_node(iceberg_delta_table_source());
-        let error = decode_node(
-            &node,
-            &mut ExprArena::default(),
-            &NativePlanDecodeContext::default(),
-        )
-        .expect_err("legacy delta source must not bypass ConnectorReadSource");
-        assert!(
-            error
-                .to_string()
-                .contains("legacy IcebergDeltaTable must be materialized as ConnectorReadSource")
-        );
     }
 
     #[test]

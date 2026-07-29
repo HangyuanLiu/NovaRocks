@@ -995,13 +995,14 @@ message ScanSource {
   oneof kind {
     IcebergDataFiles iceberg_data_files = 1;              // Iceberg data-file scan.
     IcebergMetadataTable iceberg_metadata_table = 2;      // Iceberg metadata-table scan.
-    IcebergDeltaTable iceberg_delta_table = 3;            // Iceberg delta scan.
     IcebergVersionTable iceberg_version_table = 4;        // pinned Iceberg snapshot scan.
     IcebergMvTargetState iceberg_mv_target_state = 5;     // IMV target-state scan.
     IcebergMvTargetLocator iceberg_mv_target_locator = 6; // IMV target-locator scan.
     StarRocksTableSource starrocks_table = 7;              // StarRocks tablet scan.
     ConnectorReadSource connector_read = 8;                // provider-owned opaque scan and splits.
   }
+  reserved 3;
+  reserved "iceberg_delta_table"; // former core-owned Iceberg delta carrier.
 }
 
 // A provider-neutral, already-planned connector read. The opaque handles are
@@ -1016,7 +1017,8 @@ message ConnectorReadSource {
   uint64 max_batch_bytes = 5;          // required nonzero reader batch budget.
   uint64 max_handle_payload_bytes = 6; // required bounded provider-handle budget.
   uint64 max_total_payload_bytes = 7;  // required bounded request aggregate budget.
-  reserved 8; // former provider_id; host lookup is keyed only by instance_id.
+  reserved 8;
+  reserved "provider_id"; // host lookup is keyed only by instance_id.
   bytes expected_schema_ipc = 9; // bounded Arrow IPC schema expected from the provider.
 }
 
@@ -1025,7 +1027,8 @@ message ConnectorReadSplit {
   string split_id = 1;                 // provider-assigned stable split identity.
   bytes split_payload = 2;             // bounded provider-owned split handle.
   optional uint64 estimated_bytes = 3; // optional scheduler hint.
-  reserved 4; // former file_execution; provider payload owns file semantics.
+  reserved 4;
+  reserved "file_execution"; // provider payload owns file semantics.
 }
 
 // Native StarRocks table identity and physical-column metadata.
@@ -1088,7 +1091,8 @@ message IcebergDataFiles {
   IcebergTableInfo table = 1;                      // Iceberg table identity and schema.
   repeated IcebergDataFileInfo files = 2;          // explicit data files, possibly empty.
   IcebergDataFileBinding binding = 4;              // current-snapshot vs explicit-file binding.
-  reserved 3; // former cloud_properties; credentials never enter a read carrier.
+  reserved 3;
+  reserved "cloud_properties"; // credentials never enter a read carrier.
 }
 
 // Iceberg data-file binding provenance.

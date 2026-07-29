@@ -3067,6 +3067,27 @@ fn rfd5b_hash_join_reserves_old_intent_field_by_number_and_name() {
 }
 
 #[test]
+fn spi3r2_connector_carrier_reserves_legacy_delta_and_core_fields() {
+    let schema = parse_current_novarocks_proto_schema().expect("parse current native proto schema");
+    let plan = &schema.files["idl/novarocks/plan.proto"];
+
+    let scan_source = &plan.messages["ScanSource"];
+    assert!(!scan_source.fields.contains_key(&3));
+    assert!(scan_source.reserved_numbers.contains(&3));
+    assert!(scan_source.reserved_names.contains("iceberg_delta_table"));
+
+    let connector_read = &plan.messages["ConnectorReadSource"];
+    assert!(!connector_read.fields.contains_key(&8));
+    assert!(connector_read.reserved_numbers.contains(&8));
+    assert!(connector_read.reserved_names.contains("provider_id"));
+
+    let connector_split = &plan.messages["ConnectorReadSplit"];
+    assert!(!connector_split.fields.contains_key(&4));
+    assert!(connector_split.reserved_numbers.contains(&4));
+    assert!(connector_split.reserved_names.contains("file_execution"));
+}
+
+#[test]
 fn rfd5b_old_runtime_filter_messages_are_unreachable_tombstones() {
     const OLD_PROTO_TOMBSTONES: &[&str] = &[
         "RuntimeFilterBuild",
