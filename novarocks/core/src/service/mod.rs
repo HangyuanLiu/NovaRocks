@@ -34,7 +34,6 @@ pub mod grpc_server;
 pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
 pub(crate) mod internal_rpc_transport;
-pub mod load_tracking_http;
 pub(crate) mod metrics_http;
 pub mod native_fragment_ingress;
 #[cfg(test)]
@@ -42,11 +41,3 @@ pub(crate) mod native_fragment_service_test_fixture;
 pub(crate) mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks_sink_commit_wire;
-#[cfg(feature = "compat")]
-pub mod stream_load;
-#[cfg(feature = "compat")]
-pub mod stream_load_http;
-#[cfg(feature = "compat")]
-pub(crate) mod stream_load_registry;

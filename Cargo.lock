@@ -3281,13 +3281,16 @@ name = "novarocks-compat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "hex",
  "novarocks",
  "novarocks-fs",
  "prost 0.13.5",
+ "rand 0.8.5",
  "serde_json",
  "thrift",
+ "tokio",
 ]
 
 [[package]]

@@ -18,33 +18,102 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde_json::{Map, Value, json};
 
-use crate::protocol::starrocks::thrift_codec::thrift_binary_serialize;
-use crate::runtime::fragment::io::SyncFragmentExecutor;
-use crate::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
-use crate::runtime::{backend_id, sink_commit};
-use crate::service::disk_report;
-use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::service::starrocks_sink_commit_wire;
-use crate::service::stream_load_registry::{
-    register_stream_load_file, unregister_stream_load_file,
+use novarocks::protocol::starrocks::thrift_codec::thrift_binary_serialize;
+use novarocks::runtime::fragment::io::SyncFragmentExecutor;
+use novarocks::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
+use novarocks::runtime::{backend_id, sink_commit};
+use novarocks::service::frontend_rpc;
+use novarocks::thrift::frontend_service::{
+    TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest, TLoadTxnCommitResult,
+    TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest, TStreamLoadPutResult,
 };
-use crate::thrift::frontend_service::{
-    TFrontendServiceSyncClient, TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest,
-    TLoadTxnCommitResult, TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest,
-    TStreamLoadPutResult,
-};
-use crate::thrift::plan_nodes::TFileFormatType;
-use crate::thrift::status::TStatus;
-use crate::thrift::status_code::TStatusCode;
-use crate::thrift::types::{self, TPartialUpdateMode, TUniqueId};
+use novarocks::thrift::plan_nodes::TFileFormatType;
+use novarocks::thrift::status::TStatus;
+use novarocks::thrift::status_code::TStatusCode;
+use novarocks::thrift::types::{self, TPartialUpdateMode, TUniqueId};
+
+use super::registry::CompatLoadRegistry;
 
 pub(crate) type HttpHeaders = HashMap<String, String>;
+
+pub(crate) struct CompatLoadService {
+    registry: Arc<CompatLoadRegistry>,
+    txn_contexts: Mutex<HashMap<String, Arc<Mutex<TxnContext>>>>,
+    fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
+    accepting: AtomicBool,
+}
+
+struct StreamLoadFileLease {
+    registry: Arc<CompatLoadRegistry>,
+    path: PathBuf,
+    load_id: Option<TUniqueId>,
+}
+
+impl StreamLoadFileLease {
+    fn new(registry: Arc<CompatLoadRegistry>, path: PathBuf) -> Self {
+        Self {
+            registry,
+            path,
+            load_id: None,
+        }
+    }
+
+    fn register(&mut self, load_id: TUniqueId) {
+        self.registry
+            .register_stream_load_file(&load_id, &self.path);
+        self.load_id = Some(load_id);
+    }
+}
+
+impl Drop for StreamLoadFileLease {
+    fn drop(&mut self) {
+        if let Some(load_id) = self.load_id.as_ref() {
+            self.registry.unregister_stream_load_file(load_id);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl CompatLoadService {
+    pub(crate) fn new(
+        registry: Arc<CompatLoadRegistry>,
+        fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
+    ) -> Self {
+        Self {
+            registry,
+            txn_contexts: Mutex::new(HashMap::new()),
+            fragment_sync_executor,
+            accepting: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<CompatLoadRegistry> {
+        &self.registry
+    }
+
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn finish_shutdown(&self) {
+        self.txn_contexts
+            .lock()
+            .expect("txn context store lock")
+            .clear();
+        self.registry.clear();
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ApiError {
@@ -156,11 +225,6 @@ impl TxnContext {
         }
         self.last_active.elapsed() >= Duration::from_secs(timeout_sec as u64)
     }
-}
-
-fn txn_contexts() -> &'static Mutex<HashMap<String, Arc<Mutex<TxnContext>>>> {
-    static CONTEXTS: OnceLock<Mutex<HashMap<String, Arc<Mutex<TxnContext>>>>> = OnceLock::new();
-    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn get_header<'a>(headers: &'a HttpHeaders, key: &str) -> Option<&'a str> {
@@ -501,21 +565,16 @@ fn ensure_ok_status(status: &TStatus) -> Result<(), ApiError> {
     }
 }
 
-fn with_frontend_client<T, F>(f: F) -> Result<T, ApiError>
-where
-    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-{
-    let fe_addr = disk_report::latest_fe_addr().ok_or_else(|| {
-        ApiError::new(
+fn frontend_error(error: frontend_rpc::LoadFrontendRpcError) -> ApiError {
+    match error {
+        frontend_rpc::LoadFrontendRpcError::MissingFeAddress => ApiError::new(
             TStatusCode::INTERNAL_ERROR,
             "missing FE address (heartbeat not established yet)",
-        )
-    })?;
-    FrontendRpcManager::shared()
-        .call(FrontendRpcKind::Control, &fe_addr, move |client| {
-            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
-        })
-        .map_err(|e| ApiError::new(TStatusCode::THRIFT_RPC_ERROR, e.to_string()))
+        ),
+        frontend_rpc::LoadFrontendRpcError::Rpc(error) => {
+            ApiError::new(TStatusCode::THRIFT_RPC_ERROR, error.to_string())
+        }
+    }
 }
 
 fn random_unique_id() -> TUniqueId {
@@ -582,7 +641,7 @@ fn begin_txn(
         warehouse.map(ToString::to_string),
         backend_id::backend_id(),
     );
-    with_frontend_client(|client| client.load_txn_begin(request).map_err(|e| e.to_string()))
+    frontend_rpc::load_txn_begin(request).map_err(frontend_error)
 }
 
 fn build_put_request(
@@ -649,7 +708,7 @@ fn build_put_request(
 }
 
 fn stream_load_put(request: TStreamLoadPutRequest) -> Result<TStreamLoadPutResult, ApiError> {
-    with_frontend_client(|client| client.stream_load_put(request).map_err(|e| e.to_string()))
+    frontend_rpc::stream_load_put(request).map_err(frontend_error)
 }
 
 fn commit_txn(
@@ -665,12 +724,12 @@ fn commit_txn(
 ) -> Result<TLoadTxnCommitResult, ApiError> {
     let txn_commit_attachment =
         stats.map(
-            |stats| crate::thrift::frontend_service::TTxnCommitAttachment {
+            |stats| novarocks::thrift::frontend_service::TTxnCommitAttachment {
                 load_type: types::TLoadType::MANUAL_LOAD,
                 rl_task_txn_commit_attachment: None,
                 ml_txn_commit_attachment: None,
                 manual_load_txn_commit_attachment: Some(
-                    crate::thrift::frontend_service::TManualLoadTxnCommitAttachment::new(
+                    novarocks::thrift::frontend_service::TManualLoadTxnCommitAttachment::new(
                         Some(stats.number_loaded_rows),
                         Some(stats.number_filtered_rows),
                         Option::<String>::None,
@@ -693,21 +752,17 @@ fn commit_txn(
         auth.user_ip.clone(),
         txn_id,
         true,
-        Some(starrocks_sink_commit_wire::tablet_commit_infos_to_thrift(
-            commit_infos,
-        )),
+        Some(tablet_commit_infos_to_thrift(commit_infos)),
         Option::<i64>::None,
         txn_commit_attachment,
         Some(5_000),
-        Some(starrocks_sink_commit_wire::tablet_fail_infos_to_thrift(
-            fail_infos,
-        )),
+        Some(tablet_fail_infos_to_thrift(fail_infos)),
         prepared_timeout,
     );
     if prepare_only {
-        with_frontend_client(|client| client.load_txn_prepare(request).map_err(|e| e.to_string()))
+        frontend_rpc::load_txn_prepare(request).map_err(frontend_error)
     } else {
-        with_frontend_client(|client| client.load_txn_commit(request).map_err(|e| e.to_string()))
+        frontend_rpc::load_txn_commit(request).map_err(frontend_error)
     }
 }
 
@@ -730,15 +785,31 @@ fn rollback_txn(
         txn_id,
         Some(reason.to_string()),
         Option::<i64>::None,
-        Option::<crate::thrift::frontend_service::TTxnCommitAttachment>::None,
-        Some(starrocks_sink_commit_wire::tablet_fail_infos_to_thrift(
-            fail_infos,
-        )),
-        Some(starrocks_sink_commit_wire::tablet_commit_infos_to_thrift(
-            commit_infos,
-        )),
+        Option::<novarocks::thrift::frontend_service::TTxnCommitAttachment>::None,
+        Some(tablet_fail_infos_to_thrift(fail_infos)),
+        Some(tablet_commit_infos_to_thrift(commit_infos)),
     );
-    with_frontend_client(|client| client.load_txn_rollback(request).map_err(|e| e.to_string()))
+    frontend_rpc::load_txn_rollback(request).map_err(frontend_error)
+}
+
+fn tablet_commit_infos_to_thrift(
+    infos: impl IntoIterator<Item = TabletCommitInfo>,
+) -> Vec<types::TTabletCommitInfo> {
+    infos
+        .into_iter()
+        .map(|info| {
+            types::TTabletCommitInfo::new(info.tablet_id, info.backend_id, None, None, None)
+        })
+        .collect()
+}
+
+fn tablet_fail_infos_to_thrift(
+    infos: impl IntoIterator<Item = TabletFailInfo>,
+) -> Vec<types::TTabletFailInfo> {
+    infos
+        .into_iter()
+        .map(|info| types::TTabletFailInfo::new(Some(info.tablet_id), Some(info.backend_id)))
+        .collect()
 }
 
 fn dedup_extend_commit_infos(target: &mut Vec<TabletCommitInfo>, source: Vec<TabletCommitInfo>) {
@@ -797,11 +868,12 @@ fn ensure_txn_extensions_supported(options: &LoadHeaderOptions) -> Result<(), Ap
 }
 
 fn with_txn_context_for_update<T>(
+    service: &CompatLoadService,
     label: &str,
     f: impl FnOnce(&mut TxnContext) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     let context = {
-        let guard = txn_contexts().lock().expect("txn context store lock");
+        let guard = service.txn_contexts.lock().expect("txn context store lock");
         guard.get(label).cloned()
     }
     .ok_or_else(|| {
@@ -819,7 +891,7 @@ fn with_txn_context_for_update<T>(
     })?;
     if context_guard.is_idle_expired() {
         drop(context_guard);
-        let mut store = txn_contexts().lock().expect("txn context store lock");
+        let mut store = service.txn_contexts.lock().expect("txn context store lock");
         store.remove(label);
         return Err(ApiError::new(
             TStatusCode::TXN_NOT_EXISTS,
@@ -986,11 +1058,11 @@ fn stream_load_response(
 }
 
 pub(crate) fn handle_stream_load(
+    service: &CompatLoadService,
     db: String,
     table: String,
     headers: HttpHeaders,
     body: Vec<u8>,
-    fragment_sync_executor: &dyn SyncFragmentExecutor,
 ) -> Value {
     let started = Instant::now();
     let auth = match parse_basic_auth(&headers) {
@@ -1031,9 +1103,8 @@ pub(crate) fn handle_stream_load(
 
     let mut txn_id = 0_i64;
     let mut begin_ok = false;
-    let mut temp_path: Option<PathBuf> = None;
-    let mut stream_load_id: Option<TUniqueId> = None;
-    let mut finst_id: Option<crate::common::types::UniqueId> = None;
+    let mut file_lease: Option<StreamLoadFileLease> = None;
+    let mut finst_id: Option<novarocks::common::types::UniqueId> = None;
     let mut commit_infos: Vec<TabletCommitInfo> = Vec::new();
     let mut fail_infos: Vec<TabletFailInfo> = Vec::new();
     let mut final_error: Option<ApiError> = None;
@@ -1064,10 +1135,10 @@ pub(crate) fn handle_stream_load(
 
         let (path, read_ms) = write_request_body_to_temp_file(&body)?;
         stats.read_data_time_ms = read_ms;
-        temp_path = Some(path.clone());
+        let mut lease = StreamLoadFileLease::new(Arc::clone(&service.registry), path.clone());
         let load_id = random_unique_id();
-        register_stream_load_file(&load_id, &path);
-        stream_load_id = Some(load_id.clone());
+        lease.register(load_id.clone());
+        file_lease = Some(lease);
 
         let put_request = build_put_request(
             &auth,
@@ -1097,7 +1168,8 @@ pub(crate) fn handle_stream_load(
                 format!("execute plan fragment failed: {e}"),
             )
         })?;
-        let fragment_instance_id = fragment_sync_executor
+        let fragment_instance_id = service
+            .fragment_sync_executor
             .execute_encoded(&encoded_plan_params)
             .map_err(|e| {
                 ApiError::new(
@@ -1107,9 +1179,10 @@ pub(crate) fn handle_stream_load(
             })?;
         stats.write_data_time_ms = execute_started.elapsed().as_millis() as i64;
         finst_id = Some(fragment_instance_id);
-        commit_infos = sink_commit::list_tablet_commit_infos(fragment_instance_id);
-        fail_infos = sink_commit::list_tablet_fail_infos(fragment_instance_id);
-        let (loaded_rows, _loaded_bytes) = sink_commit::get_load_counters(fragment_instance_id);
+        let snapshot = sink_commit::report_snapshot(fragment_instance_id);
+        commit_infos = snapshot.tablet_commit_infos;
+        fail_infos = snapshot.tablet_fail_infos;
+        let loaded_rows = snapshot.load_stats.loaded_rows;
         let loaded_rows = loaded_rows.max(0);
         stats.number_loaded_rows = stats.number_loaded_rows.saturating_add(loaded_rows);
         stats.number_total_rows = stats.number_total_rows.saturating_add(loaded_rows);
@@ -1133,12 +1206,7 @@ pub(crate) fn handle_stream_load(
         Ok(())
     })();
 
-    if let Some(path) = temp_path {
-        let _ = std::fs::remove_file(path);
-    }
-    if let Some(load_id) = stream_load_id.as_ref() {
-        unregister_stream_load_file(load_id);
-    }
+    drop(file_lease);
     if let Some(finst_id) = finst_id {
         sink_commit::unregister(finst_id);
     }
@@ -1182,9 +1250,9 @@ pub(crate) fn handle_stream_load(
 }
 
 pub(crate) fn handle_transaction_load(
+    service: &CompatLoadService,
     headers: HttpHeaders,
     body: Vec<u8>,
-    fragment_sync_executor: &dyn SyncFragmentExecutor,
 ) -> Value {
     let options = match parse_load_headers(&headers).and_then(|opts| {
         ensure_txn_extensions_supported(&opts)?;
@@ -1231,7 +1299,7 @@ pub(crate) fn handle_transaction_load(
         }
     };
 
-    let result = with_txn_context_for_update(&label, |ctx| {
+    let result = with_txn_context_for_update(service, &label, |ctx| {
         if ctx.db != db {
             return Err(ApiError::new(
                 TStatusCode::INVALID_ARGUMENT,
@@ -1252,12 +1320,12 @@ pub(crate) fn handle_transaction_load(
         }
 
         let (temp_path, read_ms) = write_request_body_to_temp_file(&body)?;
-        let mut finst_id: Option<crate::common::types::UniqueId> = None;
-        let mut stream_load_id: Option<TUniqueId> = None;
+        let mut file_lease =
+            StreamLoadFileLease::new(Arc::clone(&service.registry), temp_path.clone());
+        let mut finst_id: Option<novarocks::common::types::UniqueId> = None;
         let load_work = (|| -> Result<(), ApiError> {
             let load_id = random_unique_id();
-            register_stream_load_file(&load_id, &temp_path);
-            stream_load_id = Some(load_id.clone());
+            file_lease.register(load_id.clone());
             let put_request = build_put_request(
                 &ctx.auth,
                 &ctx.db,
@@ -1285,7 +1353,8 @@ pub(crate) fn handle_transaction_load(
                     format!("execute plan fragment failed: {e}"),
                 )
             })?;
-            let fragment_instance_id = fragment_sync_executor
+            let fragment_instance_id = service
+                .fragment_sync_executor
                 .execute_encoded(&encoded_plan_params)
                 .map_err(|e| {
                     ApiError::new(
@@ -1295,9 +1364,10 @@ pub(crate) fn handle_transaction_load(
                 })?;
             let write_ms = execute_started.elapsed().as_millis() as i64;
             finst_id = Some(fragment_instance_id);
-            let commit_infos = sink_commit::list_tablet_commit_infos(fragment_instance_id);
-            let fail_infos = sink_commit::list_tablet_fail_infos(fragment_instance_id);
-            let (loaded_rows, _loaded_bytes) = sink_commit::get_load_counters(fragment_instance_id);
+            let snapshot = sink_commit::report_snapshot(fragment_instance_id);
+            let commit_infos = snapshot.tablet_commit_infos;
+            let fail_infos = snapshot.tablet_fail_infos;
+            let loaded_rows = snapshot.load_stats.loaded_rows;
             dedup_extend_commit_infos(&mut ctx.commit_infos, commit_infos);
             dedup_extend_fail_infos(&mut ctx.fail_infos, fail_infos);
             let loaded_rows = loaded_rows.max(0);
@@ -1315,10 +1385,7 @@ pub(crate) fn handle_transaction_load(
             Ok(())
         })();
 
-        let _ = std::fs::remove_file(&temp_path);
-        if let Some(load_id) = stream_load_id.as_ref() {
-            unregister_stream_load_file(load_id);
-        }
+        drop(file_lease);
         if let Some(finst_id) = finst_id {
             sink_commit::unregister(finst_id);
         }
@@ -1328,9 +1395,10 @@ pub(crate) fn handle_transaction_load(
 
     match result {
         Ok(()) => {
-            let (txn_id, stats) =
-                with_txn_context_for_update(&label, |ctx| Ok((ctx.txn_id, ctx.stats.clone())))
-                    .unwrap_or((0, LoadStats::default()));
+            let (txn_id, stats) = with_txn_context_for_update(service, &label, |ctx| {
+                Ok((ctx.txn_id, ctx.stats.clone()))
+            })
+            .unwrap_or((0, LoadStats::default()));
             txn_response(
                 "load",
                 TStatusCode::OK,
@@ -1359,7 +1427,11 @@ pub(crate) fn handle_transaction_load(
     }
 }
 
-fn handle_transaction_begin(headers: &HttpHeaders, options: LoadHeaderOptions) -> Value {
+fn handle_transaction_begin(
+    service: &CompatLoadService,
+    headers: &HttpHeaders,
+    options: LoadHeaderOptions,
+) -> Value {
     let label = match parse_required_label(&options) {
         Ok(v) => v,
         Err(e) => {
@@ -1386,7 +1458,7 @@ fn handle_transaction_begin(headers: &HttpHeaders, options: LoadHeaderOptions) -
     };
 
     {
-        let contexts = txn_contexts().lock().expect("txn context store lock");
+        let contexts = service.txn_contexts.lock().expect("txn context store lock");
         if contexts.contains_key(&label) {
             return txn_response(
                 "begin",
@@ -1490,7 +1562,7 @@ fn handle_transaction_begin(headers: &HttpHeaders, options: LoadHeaderOptions) -
         last_active: Instant::now(),
         finished_channels: HashSet::new(),
     };
-    let mut contexts = txn_contexts().lock().expect("txn context store lock");
+    let mut contexts = service.txn_contexts.lock().expect("txn context store lock");
     if contexts.contains_key(&label) {
         let _ = rollback_txn(
             &context.auth,
@@ -1531,6 +1603,7 @@ fn handle_transaction_begin(headers: &HttpHeaders, options: LoadHeaderOptions) -
 }
 
 fn handle_transaction_prepare_or_commit(
+    service: &CompatLoadService,
     headers: &HttpHeaders,
     options: &LoadHeaderOptions,
     prepare_only: bool,
@@ -1550,7 +1623,7 @@ fn handle_transaction_prepare_or_commit(
             );
         }
     };
-    let result = with_txn_context_for_update(&label, |ctx| {
+    let result = with_txn_context_for_update(service, &label, |ctx| {
         if ctx.db != db {
             return Err(ApiError::new(
                 TStatusCode::INVALID_ARGUMENT,
@@ -1591,7 +1664,7 @@ fn handle_transaction_prepare_or_commit(
     match result {
         Ok((txn_id, stats)) => {
             if !prepare_only {
-                let mut contexts = txn_contexts().lock().expect("txn context store lock");
+                let mut contexts = service.txn_contexts.lock().expect("txn context store lock");
                 contexts.remove(&label);
             }
             txn_response(
@@ -1622,7 +1695,11 @@ fn handle_transaction_prepare_or_commit(
     }
 }
 
-fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOptions) -> Value {
+fn handle_transaction_rollback(
+    service: &CompatLoadService,
+    headers: &HttpHeaders,
+    options: &LoadHeaderOptions,
+) -> Value {
     let label = match parse_required_label(options) {
         Ok(v) => v,
         Err(e) => {
@@ -1633,7 +1710,7 @@ fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOption
     };
     let requested_db = get_header(headers, "db").map(ToString::to_string);
     let requested_table = get_header(headers, "table").map(ToString::to_string);
-    let result = with_txn_context_for_update(&label, |ctx| {
+    let result = with_txn_context_for_update(service, &label, |ctx| {
         if let Some(db) = requested_db.as_deref()
             && ctx.db != db
         {
@@ -1671,7 +1748,7 @@ fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOption
 
     match result {
         Ok(_txn_id) => {
-            let mut contexts = txn_contexts().lock().expect("txn context store lock");
+            let mut contexts = service.txn_contexts.lock().expect("txn context store lock");
             contexts.remove(&label);
             txn_response(
                 "rollback",
@@ -1701,9 +1778,9 @@ fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOption
     }
 }
 
-fn handle_transaction_list() -> Value {
+fn handle_transaction_list(service: &CompatLoadService) -> Value {
     let contexts = {
-        let guard = txn_contexts().lock().expect("txn context store lock");
+        let guard = service.txn_contexts.lock().expect("txn context store lock");
         guard.values().cloned().collect::<Vec<_>>()
     };
     let mut entries = Vec::with_capacity(contexts.len());
@@ -1742,7 +1819,11 @@ fn handle_transaction_list() -> Value {
     Value::Array(entries)
 }
 
-pub(crate) fn handle_transaction_op(txn_op: String, headers: HttpHeaders) -> Value {
+pub(crate) fn handle_transaction_op(
+    service: &CompatLoadService,
+    txn_op: String,
+    headers: HttpHeaders,
+) -> Value {
     let txn_op = txn_op.to_ascii_lowercase();
     let options = match parse_load_headers(&headers).and_then(|opts| {
         ensure_txn_extensions_supported(&opts)?;
@@ -1765,11 +1846,11 @@ pub(crate) fn handle_transaction_op(txn_op: String, headers: HttpHeaders) -> Val
         }
     };
     match txn_op.as_str() {
-        "begin" => handle_transaction_begin(&headers, options),
-        "prepare" => handle_transaction_prepare_or_commit(&headers, &options, true),
-        "commit" => handle_transaction_prepare_or_commit(&headers, &options, false),
-        "rollback" => handle_transaction_rollback(&headers, &options),
-        "list" => handle_transaction_list(),
+        "begin" => handle_transaction_begin(service, &headers, options),
+        "prepare" => handle_transaction_prepare_or_commit(service, &headers, &options, true),
+        "commit" => handle_transaction_prepare_or_commit(service, &headers, &options, false),
+        "rollback" => handle_transaction_rollback(service, &headers, &options),
+        "list" => handle_transaction_list(service),
         other => txn_response(
             other,
             TStatusCode::INVALID_ARGUMENT,
@@ -1785,55 +1866,47 @@ pub(crate) fn handle_transaction_op(txn_op: String, headers: HttpHeaders) -> Val
     }
 }
 
-pub(crate) fn finish_stream_load_channel(
-    label: Option<&str>,
-    table_name: Option<&str>,
-    channel_id: Option<i32>,
-) -> TStatus {
-    let Some(label) = label.map(str::trim).filter(|v| !v.is_empty()) else {
-        return TStatus::new(
-            TStatusCode::TXN_NOT_EXISTS,
-            Some(vec!["missing stream load label".to_string()]),
-        );
-    };
-    let Some(table_name) = table_name.map(str::trim).filter(|v| !v.is_empty()) else {
-        return TStatus::new(
-            TStatusCode::TXN_NOT_EXISTS,
-            Some(vec!["missing stream load table name".to_string()]),
-        );
-    };
-    let context = {
-        let contexts = txn_contexts().lock().expect("txn context store lock");
-        contexts.get(label).cloned()
-    };
-    let Some(context) = context else {
-        return TStatus::new(
-            TStatusCode::TXN_NOT_EXISTS,
-            Some(vec![format!(
-                "stream load transaction `{label}` does not exist"
-            )]),
-        );
-    };
-    let mut context = context.lock().expect("txn context lock");
-    if context.table != table_name {
-        return TStatus::new(
-            TStatusCode::TXN_NOT_EXISTS,
-            Some(vec![format!(
+impl novarocks::service::backend_service::LoadChannelFinisher for CompatLoadService {
+    fn finish(
+        &self,
+        label: Option<&str>,
+        table_name: Option<&str>,
+        channel_id: Option<i32>,
+    ) -> Result<(), String> {
+        if !self.is_accepting() {
+            return Err("stream load service is shutting down".to_string());
+        }
+        let Some(label) = label.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Err("missing stream load label".to_string());
+        };
+        let Some(table_name) = table_name.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Err("missing stream load table name".to_string());
+        };
+        let context = {
+            let contexts = self.txn_contexts.lock().expect("txn context store lock");
+            contexts.get(label).cloned()
+        };
+        let Some(context) = context else {
+            return Err(format!("stream load transaction `{label}` does not exist"));
+        };
+        let mut context = context.lock().expect("txn context lock");
+        if context.table != table_name {
+            return Err(format!(
                 "stream load transaction `{label}` does not match table `{table_name}`"
-            )]),
-        );
+            ));
+        }
+        if let Some(channel_id) = channel_id {
+            context.finished_channels.insert(channel_id);
+        }
+        context.last_active = Instant::now();
+        Ok(())
     }
-    if let Some(channel_id) = channel_id {
-        context.finished_channels.insert(channel_id);
-    }
-    context.last_active = Instant::now();
-    TStatus::new(TStatusCode::OK, None)
 }
 
 #[cfg(test)]
 mod sink_commit_domain_tests {
     use super::dedup_extend_commit_infos;
-    use crate::runtime::sink_commit::TabletCommitInfo;
+    use novarocks::runtime::sink_commit::TabletCommitInfo;
 
     #[test]
     fn stream_load_keeps_domain_tablet_commits_deduplicated_before_wire_encoding() {
@@ -1858,5 +1931,37 @@ mod sink_commit_domain_tests {
         assert_eq!(target.len(), 2);
         assert_eq!(target[1].tablet_id, 102);
         assert_eq!(target[1].backend_id, 201);
+    }
+}
+
+#[cfg(test)]
+mod file_lease_tests {
+    use super::*;
+
+    #[test]
+    fn registered_stream_file_is_removed_when_lease_drops() {
+        let registry = Arc::new(CompatLoadRegistry::default());
+        let path = std::env::temp_dir().join(format!(
+            "novarocks_stream_load_lease_test_{}_{}.data",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        File::create(&path)
+            .expect("create stream load lease test file")
+            .write_all(b"payload")
+            .expect("write stream load lease test file");
+        let load_id = TUniqueId::new(911, 912);
+
+        let mut lease = StreamLoadFileLease::new(Arc::clone(&registry), path.clone());
+        lease.register(load_id.clone());
+        assert_eq!(
+            registry.resolve_stream_load_file_path(&load_id),
+            Some(path.to_string_lossy().to_string())
+        );
+
+        drop(lease);
+
+        assert_eq!(registry.resolve_stream_load_file_path(&load_id), None);
+        assert!(!path.exists());
     }
 }

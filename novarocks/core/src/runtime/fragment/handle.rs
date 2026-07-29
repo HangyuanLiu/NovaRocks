@@ -31,7 +31,7 @@ use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
-    ResultPresentation, ResultWriteSpec,
+    LoadTrackingLogSink, ResultPresentation, ResultWriteSpec,
 };
 #[cfg(test)]
 use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
@@ -55,6 +55,7 @@ pub struct FragmentPrepareContext {
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
+    load_tracking_sink: Option<Arc<dyn LoadTrackingLogSink>>,
     result_spec: Option<ResultWriteSpec>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
@@ -78,6 +79,7 @@ impl Default for FragmentPrepareContext {
             lookup_client: Arc::new(UnavailableFragmentLookupClient),
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
+            load_tracking_sink: None,
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -109,6 +111,7 @@ impl FragmentPrepareContext {
             lookup_client,
             result_writer,
             event_sink,
+            load_tracking_sink: None,
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -142,6 +145,11 @@ impl FragmentPrepareContext {
         )
     }
 
+    pub fn with_load_tracking_sink(mut self, sink: Arc<dyn LoadTrackingLogSink>) -> Self {
+        self.load_tracking_sink = Some(sink);
+        self
+    }
+
     pub(crate) fn new_with_execution_overrides(
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
@@ -161,6 +169,7 @@ impl FragmentPrepareContext {
             lookup_client,
             result_writer,
             event_sink,
+            load_tracking_sink: None,
             result_spec,
             root_sink_dop,
             group_execution_scan_dop,
@@ -467,6 +476,7 @@ pub fn prepare_fragment(
                 backend_num: Some(instance.backend_num().get()),
                 mem_tracker: context.mem_tracker.clone(),
                 native_runtime_filter_context: context.runtime_filter.clone(),
+                load_tracking_sink: context.load_tracking_sink.clone(),
             },
             context.profiler.as_ref(),
         )

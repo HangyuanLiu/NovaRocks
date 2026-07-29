@@ -43,8 +43,8 @@ use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cach
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::protocol::starrocks::thrift_codec::thrift_named_json;
 use crate::runtime::starlet_shard_registry;
+use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::service::{disk_report, stream_load};
 use crate::thrift::master_service;
 use crate::thrift::{
     agent_service,
@@ -73,9 +73,19 @@ struct BackendServerState {
     wake_addr: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+pub trait LoadChannelFinisher: Send + Sync + 'static {
+    fn finish(
+        &self,
+        label: Option<&str>,
+        table_name: Option<&str>,
+        channel_id: Option<i32>,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone)]
 struct BackendHandler {
     peer: Option<std::net::SocketAddr>,
+    load_channel_finisher: Arc<dyn LoadChannelFinisher>,
 }
 
 fn stub_status(method: &str) -> TStatus {
@@ -695,11 +705,15 @@ impl BackendServiceSyncHandler for BackendHandler {
             channel = %json_summary(&stream_load_channel),
             "Received BackendService.finish_stream_load_channel"
         );
-        Ok(stream_load::finish_stream_load_channel(
+        let result = self.load_channel_finisher.finish(
             stream_load_channel.label.as_deref(),
             stream_load_channel.table_name.as_deref(),
             stream_load_channel.channel_id,
-        ))
+        );
+        Ok(match result {
+            Ok(()) => ok_status(),
+            Err(message) => TStatus::new(TStatusCode::TXN_NOT_EXISTS, Some(vec![message])),
+        })
     }
 
     fn handle_open_scanner(
@@ -765,7 +779,10 @@ impl BackendServiceSyncHandler for BackendHandler {
     }
 }
 
-pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String> {
+pub fn start_backend_service(
+    config: BackendServiceConfig,
+    load_channel_finisher: Arc<dyn LoadChannelFinisher>,
+) -> Result<(), String> {
     let host = if config.host.is_empty() {
         "0.0.0.0".to_string()
     } else {
@@ -803,6 +820,7 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
                             tracing::warn!("failed to switch accepted be_port socket to blocking mode: {err}");
                             continue;
                         }
+                        let load_channel_finisher = Arc::clone(&load_channel_finisher);
                         worker_pool.execute(move || {
                             let peer = s.peer_addr().ok();
 
@@ -827,7 +845,10 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
                                 TBufferedWriteTransportFactory::new().create(Box::new(w_chan));
                             let mut o_prot = TBinaryOutputProtocolFactory::new().create(w_tran);
 
-                            let handler = BackendHandler { peer };
+                            let handler = BackendHandler {
+                                peer,
+                                load_channel_finisher,
+                            };
                             let processor = BackendServiceSyncProcessor::new(handler);
 
                             loop {
@@ -925,7 +946,32 @@ fn join_backend_service_thread(handle: thread::JoinHandle<()>) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use crate::thrift::backend_service::TStreamLoadChannel;
+    use crate::thrift::status_code::TStatusCode;
+
+    #[derive(Default)]
+    struct RecordingLoadChannelFinisher {
+        calls: Mutex<Vec<(Option<String>, Option<String>, Option<i32>)>>,
+        error: Option<String>,
+    }
+
+    impl super::LoadChannelFinisher for RecordingLoadChannelFinisher {
+        fn finish(
+            &self,
+            label: Option<&str>,
+            table_name: Option<&str>,
+            channel_id: Option<i32>,
+        ) -> Result<(), String> {
+            self.calls.lock().expect("load finisher calls lock").push((
+                label.map(str::to_owned),
+                table_name.map(str::to_owned),
+                channel_id,
+            ));
+            self.error.clone().map_or(Ok(()), Err)
+        }
+    }
 
     fn lock_server_state_test() -> MutexGuard<'static, ()> {
         static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -992,5 +1038,57 @@ mod tests {
         assert_eq!(error, "lock backend service state failed");
         state.clear_poison();
         reset_server_state();
+    }
+
+    #[test]
+    fn finish_stream_load_channel_delegates_to_compat_finisher() {
+        let finisher = Arc::new(RecordingLoadChannelFinisher::default());
+        let handler = super::BackendHandler {
+            peer: None,
+            load_channel_finisher: finisher.clone(),
+        };
+
+        let status = handler
+            .handle_finish_stream_load_channel(TStreamLoadChannel::new(
+                Some("load-1".to_string()),
+                Some(7),
+                Some("orders".to_string()),
+            ))
+            .expect("finish channel response");
+
+        assert_eq!(status.status_code, TStatusCode::OK);
+        assert_eq!(
+            finisher
+                .calls
+                .lock()
+                .expect("load finisher calls lock")
+                .as_slice(),
+            &[(
+                Some("load-1".to_string()),
+                Some("orders".to_string()),
+                Some(7)
+            )]
+        );
+    }
+
+    #[test]
+    fn finish_stream_load_channel_maps_compat_error_to_txn_not_exists() {
+        let handler = super::BackendHandler {
+            peer: None,
+            load_channel_finisher: Arc::new(RecordingLoadChannelFinisher {
+                calls: Mutex::new(Vec::new()),
+                error: Some("stream load transaction `load-1` does not exist".to_string()),
+            }),
+        };
+
+        let status = handler
+            .handle_finish_stream_load_channel(TStreamLoadChannel::new(None, None, None))
+            .expect("finish channel response");
+
+        assert_eq!(status.status_code, TStatusCode::TXN_NOT_EXISTS);
+        assert_eq!(
+            status.error_msgs.as_deref(),
+            Some(["stream load transaction `load-1` does not exist"].as_slice())
+        );
     }
 }

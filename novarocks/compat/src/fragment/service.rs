@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 use novarocks::novarocks_logging::{error, info, warn};
@@ -36,7 +36,7 @@ use novarocks::protocol::starrocks::decode::{
 use novarocks::runtime::exchange;
 use novarocks::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentReportRegistration,
-    FragmentResultWriter, FragmentTerminalReport, SyncFragmentExecutor,
+    FragmentResultWriter, FragmentTerminalReport, LoadTrackingLogSink, SyncFragmentExecutor,
 };
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
@@ -57,6 +57,7 @@ use crate::fragment::admission::{
     PrelaunchRegistry,
 };
 use crate::fragment::dependency::resolve_dependencies;
+use crate::load::CompatLoadRegistry;
 use crate::report::{self, CompatReportService};
 
 pub struct CompatFragmentService {
@@ -69,6 +70,8 @@ pub struct CompatFragmentService {
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
     report_service: Arc<CompatReportService>,
+    load_registry: Arc<CompatLoadRegistry>,
+    load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
 }
 
 impl CompatFragmentService {
@@ -78,6 +81,44 @@ impl CompatFragmentService {
         lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         report_service: Arc<CompatReportService>,
+    ) -> Self {
+        Self::new_with_load_registry(
+            queries,
+            exchange_transmitter,
+            lookup_client,
+            result_writer,
+            report_service,
+            Arc::new(CompatLoadRegistry::default()),
+        )
+    }
+
+    pub(crate) fn new_with_load_registry(
+        queries: StarRocksFragmentQueryRuntime,
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
+        result_writer: Arc<dyn FragmentResultWriter>,
+        report_service: Arc<CompatReportService>,
+        load_registry: Arc<CompatLoadRegistry>,
+    ) -> Self {
+        Self::new_with_load_dependencies(
+            queries,
+            exchange_transmitter,
+            lookup_client,
+            result_writer,
+            report_service,
+            load_registry,
+            Arc::new(crate::load::LoadTrackingStore::default()),
+        )
+    }
+
+    pub(crate) fn new_with_load_dependencies(
+        queries: StarRocksFragmentQueryRuntime,
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
+        result_writer: Arc<dyn FragmentResultWriter>,
+        report_service: Arc<CompatReportService>,
+        load_registry: Arc<CompatLoadRegistry>,
+        load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
     ) -> Self {
         Self {
             queries,
@@ -89,6 +130,8 @@ impl CompatFragmentService {
             result_writer,
             event_sink: crate::fragment::compat_fragment_event_sink(Arc::clone(&report_service)),
             report_service,
+            load_registry,
+            load_tracking_sink,
         }
     }
 
@@ -638,6 +681,7 @@ struct StarRocksFragmentDraftEnvelope {
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_starrocks_draft(
+    load_registry: &CompatLoadRegistry,
     fragment: &planner::TPlanFragment,
     descriptor: Option<&descriptors::TDescriptorTable>,
     params: &internal_service::TPlanFragmentExecParams,
@@ -653,7 +697,7 @@ fn prepare_starrocks_draft(
     typed_result_sink: bool,
 ) -> Result<StarRocksFragmentDraftEnvelope, String> {
     validate_internal_addresses(params, Some(fragment))?;
-    let facts = snapshot_decode_facts(params)?;
+    let facts = snapshot_decode_facts(resolve_stream_load_paths(load_registry, params)?)?;
     let novarocks_report_endpoint = novarocks_report_addr
         .map(|address| {
             decode_runtime_endpoint(
@@ -684,6 +728,45 @@ fn prepare_starrocks_draft(
         draft,
         total_fragments: params.instances_number.map(|value| value.max(0) as usize),
     })
+}
+
+fn resolve_stream_load_paths(
+    load_registry: &CompatLoadRegistry,
+    params: &internal_service::TPlanFragmentExecParams,
+) -> Result<BTreeMap<UniqueId, String>, String> {
+    let mut paths = BTreeMap::new();
+    for ranges in params.per_node_scan_ranges.values() {
+        for params in ranges {
+            let Some(broker) = params.scan_range.broker_scan_range.as_ref() else {
+                continue;
+            };
+            for range in &broker.ranges {
+                if range.file_type != types::TFileType::FILE_STREAM {
+                    continue;
+                }
+                let load_id = range
+                    .load_id
+                    .as_ref()
+                    .ok_or_else(|| "FILE_STREAM range is missing load_id".to_string())?;
+                let path = load_registry
+                    .resolve_stream_load_file_path(load_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "no registered local file for FILE_STREAM load_id={}:{}",
+                            load_id.hi, load_id.lo
+                        )
+                    })?;
+                paths.insert(
+                    UniqueId {
+                        hi: load_id.hi,
+                        lo: load_id.lo,
+                    },
+                    path,
+                );
+            }
+        }
+    }
+    Ok(paths)
 }
 
 fn resolve_starrocks_draft(
@@ -902,15 +985,18 @@ fn launch_prepared_fragments(
         if prepared.submission.uses_split_data_stream_sink() {
             eprintln!("compat_fragment_sink sink=SPLIT_DATA_STREAM_SINK stage=materialized");
         }
-        let prepare_context = prepared.metadata.into_prepare_context(
-            profiler.clone(),
-            Some(Arc::clone(&fragment_mem_tracker)),
-            Arc::clone(&service.exchange_transmitter),
-            Arc::clone(&service.lookup_client),
-            Arc::clone(&service.result_writer),
-            Arc::clone(&service.event_sink),
-            finst_id,
-        );
+        let prepare_context = prepared
+            .metadata
+            .into_prepare_context(
+                profiler.clone(),
+                Some(Arc::clone(&fragment_mem_tracker)),
+                Arc::clone(&service.exchange_transmitter),
+                Arc::clone(&service.lookup_client),
+                Arc::clone(&service.result_writer),
+                Arc::clone(&service.event_sink),
+                finst_id,
+            )
+            .with_load_tracking_sink(Arc::clone(&service.load_tracking_sink));
         let dormant = match prepare_fragment(prepared.submission, prepare_context) {
             Ok(dormant) => dormant,
             Err(error) => {
@@ -1723,6 +1809,7 @@ fn submit_exec_batch_plan_fragments_with(
     let mut drafts = Vec::with_capacity(envelopes.len());
     for entry in envelopes {
         drafts.push(prepare_starrocks_draft(
+            &service.load_registry,
             entry.0,
             descriptor_preparation.descriptor(),
             &entry.1,
@@ -1811,6 +1898,7 @@ fn submit_exec_plan_fragment_with(
     );
     let token = guard.cancellation_token();
     let draft = prepare_starrocks_draft(
+        &service.load_registry,
         fragment,
         descriptor_preparation.descriptor(),
         &params,
@@ -1872,6 +1960,7 @@ fn execute_plan_fragment_sync_with(
     );
     let token = guard.cancellation_token();
     let draft = prepare_starrocks_draft(
+        &service.load_registry,
         fragment,
         descriptor_preparation.descriptor(),
         &params,
@@ -1913,15 +2002,18 @@ fn execute_plan_fragment_sync_with(
         handoff.cache_options(),
     )?;
     let fragment_mem_tracker = admission.fragment_mem_tracker(finst_id);
-    let prepare_context = prepared.metadata.into_prepare_context(
-        None,
-        Some(Arc::clone(&fragment_mem_tracker)),
-        Arc::clone(&service.exchange_transmitter),
-        Arc::clone(&service.lookup_client),
-        Arc::clone(&service.result_writer),
-        Arc::clone(&service.event_sink),
-        finst_id,
-    );
+    let prepare_context = prepared
+        .metadata
+        .into_prepare_context(
+            None,
+            Some(Arc::clone(&fragment_mem_tracker)),
+            Arc::clone(&service.exchange_transmitter),
+            Arc::clone(&service.lookup_client),
+            Arc::clone(&service.result_writer),
+            Arc::clone(&service.event_sink),
+            finst_id,
+        )
+        .with_load_tracking_sink(Arc::clone(&service.load_tracking_sink));
     let dormant = prepare_fragment(prepared.submission, prepare_context)
         .map_err(|error| error.to_string())?;
     let start_gate = Arc::new(BatchStartGate::default());

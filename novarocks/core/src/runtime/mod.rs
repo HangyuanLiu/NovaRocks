@@ -25,7 +25,6 @@ pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;
 pub mod global_async_runtime;
 pub mod io;
-pub mod load_tracking;
 pub mod lookup;
 pub mod mem_tracker;
 pub mod native_fragment_query;

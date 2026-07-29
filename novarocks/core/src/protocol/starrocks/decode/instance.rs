@@ -357,40 +357,8 @@ impl StarRocksDecodeFacts {
 /// This remains with the decoder until RCI-5F moves the protocol owner to
 /// `novarocks-compat`; it is deliberately not part of fragment admission state.
 pub fn snapshot_decode_facts(
-    exec_params: &internal_service::TPlanFragmentExecParams,
+    stream_load_paths: BTreeMap<UniqueId, String>,
 ) -> Result<StarRocksDecodeFacts, String> {
-    let mut stream_load_paths = BTreeMap::new();
-    for ranges in exec_params.per_node_scan_ranges.values() {
-        for params in ranges {
-            let Some(broker) = params.scan_range.broker_scan_range.as_ref() else {
-                continue;
-            };
-            for range in &broker.ranges {
-                if range.file_type != types::TFileType::FILE_STREAM {
-                    continue;
-                }
-                let load_id = range
-                    .load_id
-                    .as_ref()
-                    .ok_or_else(|| "FILE_STREAM range is missing load_id".to_string())?;
-                let path =
-                    crate::service::stream_load_registry::resolve_stream_load_file_path(load_id)
-                        .ok_or_else(|| {
-                            format!(
-                                "no registered local file for FILE_STREAM load_id={}:{}",
-                                load_id.hi, load_id.lo
-                            )
-                        })?;
-                stream_load_paths.insert(
-                    UniqueId {
-                        hi: load_id.hi,
-                        lo: load_id.lo,
-                    },
-                    path,
-                );
-            }
-        }
-    }
     let config = crate::common::app_config::config().map_err(|error| error.to_string())?;
     let rewrite = &config.runtime.path_rewrite;
     let path_rewrite = rewrite.enable.then(|| {

@@ -9,7 +9,6 @@ struct FakePorts {
     fail_start: Option<&'static str>,
     fail_stops: HashSet<&'static str>,
     polls: Arc<Mutex<VecDeque<Result<Option<String>, String>>>>,
-    grpc_fragment_services: Arc<Mutex<Vec<usize>>>,
     brpc_fragment_contexts: Arc<Mutex<Vec<usize>>>,
     native_report_rejection:
         Arc<Mutex<Option<novarocks::query_execution::report::NativeReportHandlerError>>>,
@@ -22,7 +21,6 @@ impl FakePorts {
             fail_start: None,
             fail_stops: HashSet::new(),
             polls: Arc::new(Mutex::new(VecDeque::new())),
-            grpc_fragment_services: Arc::new(Mutex::new(Vec::new())),
             brpc_fragment_contexts: Arc::new(Mutex::new(Vec::new())),
             native_report_rejection: Arc::new(Mutex::new(None)),
         }
@@ -59,13 +57,9 @@ impl CompatPorts for FakePorts {
     fn start_grpc(
         &mut self,
         _host: &str,
-        fragment_sync_executor: Arc<dyn novarocks::runtime::fragment::io::SyncFragmentExecutor>,
+        _compat_routes: axum::Router,
         report_handler: Arc<dyn novarocks::query_execution::report::NativeReportHandler>,
     ) -> Result<(), String> {
-        self.grpc_fragment_services
-            .lock()
-            .unwrap()
-            .push(Arc::as_ptr(&fragment_sync_executor) as *const () as usize);
         let rejection = report_handler
             .handle_native_report(Default::default())
             .expect_err("compat host must inject a rejecting native report handler");
@@ -83,6 +77,7 @@ impl CompatPorts for FakePorts {
     fn start_backend(
         &mut self,
         _config: novarocks::service::backend_service::BackendServiceConfig,
+        _load_channel_finisher: Arc<dyn novarocks::service::backend_service::LoadChannelFinisher>,
     ) -> Result<(), String> {
         self.start("backend")
     }
@@ -158,7 +153,6 @@ fn compat_backend_rejects_native_coordinator_reports_with_role_error() {
 fn starts_ports_in_frozen_order_and_preserves_marker_and_summary() {
     let ports = FakePorts::new();
     let events = ports.events.clone();
-    let grpc_fragment_services = ports.grpc_fragment_services.clone();
     let brpc_fragment_contexts = ports.brpc_fragment_contexts.clone();
     let host = CompatApplicationHost::open_with_ports(test_config(), ports)
         .expect("open compat application");
@@ -184,11 +178,7 @@ fn starts_ports_in_frozen_order_and_preserves_marker_and_summary() {
         host.startup_summary(),
         "novarocksd started (bind_host=127.0.0.1, advertise_host=be.example.test, advertise_port=19071, heartbeat_port=19050, be_port=19060, brpc_port=18060, http_port=18040, grpc_port=19080, starlet_port=19070)"
     );
-    assert_eq!(
-        *grpc_fragment_services.lock().unwrap(),
-        *brpc_fragment_contexts.lock().unwrap(),
-        "gRPC and BRPC must receive the same explicitly composed fragment service"
-    );
+    assert_eq!(brpc_fragment_contexts.lock().unwrap().len(), 1);
 
     host.shutdown().expect("shutdown compat application");
 }
