@@ -248,7 +248,7 @@ impl StarRocksObjectStoreDefaults {
         }
     }
 
-    pub(crate) fn apply_to(&self, config: &mut crate::fs::object_store::ObjectStoreConfig) {
+    pub(crate) fn apply_to(&self, config: &mut novarocks_fs::ObjectStoreConfig) {
         config.retry_max_times = config.retry_max_times.or(self.retry_max_times);
         config.retry_min_delay_ms = config.retry_min_delay_ms.or(self.retry_min_delay_ms);
         config.retry_max_delay_ms = config.retry_max_delay_ms.or(self.retry_max_delay_ms);

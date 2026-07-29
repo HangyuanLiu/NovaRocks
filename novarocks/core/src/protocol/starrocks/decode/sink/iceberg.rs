@@ -766,12 +766,12 @@ fn resolve_sink_s3_config(
     sink: &data_sinks::TIcebergTableSink,
     data_location: &str,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
-    if !crate::fs::access::is_object_store_location_parse_only(data_location)
+    if !novarocks_fs::is_object_store_location_parse_only(data_location)
         .map_err(|e| format!("parse iceberg sink data_location {data_location}: {e}"))?
     {
         return Ok(None);
     }
-    let (bucket, _data_root) = crate::fs::access::parse_object_store_path_parse_only(data_location)
+    let (bucket, _data_root) = novarocks_fs::parse_object_store_path_parse_only(data_location)
         .map_err(|e| {
             format!("parse iceberg sink object-store data_location {data_location}: {e}")
         })?;

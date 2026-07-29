@@ -425,7 +425,7 @@ fn object_store_config_from_cloud_configuration(
     cloud: Option<&crate::thrift::cloud_configuration::TCloudConfiguration>,
     _table_location: &str,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
-) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
+) -> Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
     let Some(cloud) = cloud else {
         return Ok(None);
     };

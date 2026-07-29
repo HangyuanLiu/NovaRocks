@@ -1584,7 +1584,7 @@ pub(crate) fn build_staged_file_io(
     data_location: &str,
     s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<iceberg::io::FileIO, String> {
-    if crate::fs::access::is_object_store_location_parse_only(data_location)
+    if novarocks_fs::is_object_store_location_parse_only(data_location)
         .map_err(|e| format!("parse staged iceberg data_location {data_location}: {e}"))?
     {
         let s3 = s3_config.ok_or_else(|| {
@@ -1625,7 +1625,7 @@ fn write_parquet_file(
         .set_compression(compression)
         .build();
 
-    if crate::fs::access::is_object_store_location_parse_only(path)
+    if novarocks_fs::is_object_store_location_parse_only(path)
         .map_err(|e| format!("parse iceberg parquet output path {path}: {e}"))?
     {
         let (data, write_result) = write_parquet_to_bytes(schema, batch, props)?;

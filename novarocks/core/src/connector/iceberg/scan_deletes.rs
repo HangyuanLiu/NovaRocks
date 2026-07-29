@@ -77,7 +77,7 @@ fn normalize_local_fs_path_owned(path: &str) -> Result<String, ChangeError> {
 #[cfg(test)]
 pub(crate) fn read_delete_positions_per_data_file(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
 ) -> Result<HashMap<String, RoaringTreemap>, ChangeError> {
     read_delete_positions_per_data_file_with_path_normalizer(
         delete_files,
@@ -88,14 +88,12 @@ pub(crate) fn read_delete_positions_per_data_file(
 
 fn read_delete_positions_per_data_file_with_path_normalizer<N>(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: &N,
 ) -> Result<HashMap<String, RoaringTreemap>, ChangeError>
 where
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use crate::cache::CachedRangeReader;
-    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
     use arrow::array::{Int64Array, StringArray};
 
     let mut positions_per_file: HashMap<String, RoaringTreemap> = HashMap::new();
@@ -107,54 +105,17 @@ where
             None
         };
         let delete_file_path = normalize_path(&delete_file.delete_file_path)?;
-        let reader = factory
-            .open_with_len(&delete_file_path, length)
-            .map_err(|e| {
-                ChangeError::InternalInconsistency(format!(
-                    "open iceberg position-delete file {} failed: {e}",
-                    delete_file.delete_file_path
-                ))
-            })?;
-        let reader = ParquetCachedReader::new(
-            CachedRangeReader::new(reader, None),
-            ParquetReadCachePolicy::with_flags(false, false, None),
-        );
-        let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "read position-delete file {} metadata failed: {e}",
-                delete_file.delete_file_path
-            ))
-        })?;
-        let arrow_schema = builder.schema();
-        let file_path_idx = arrow_schema.index_of(FILE_PATH_COLUMN).map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "position-delete file {} missing `{}`: {e}",
-                delete_file.delete_file_path, FILE_PATH_COLUMN
-            ))
-        })?;
-        let pos_idx = arrow_schema.index_of(POS_COLUMN).map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "position-delete file {} missing `{}`: {e}",
-                delete_file.delete_file_path, POS_COLUMN
-            ))
-        })?;
-        let projection = ProjectionMask::leaves(
-            builder.parquet_schema(),
-            [file_path_idx, pos_idx].iter().copied(),
-        );
-        let reader = builder.with_projection(projection).build().map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "build position-delete reader for {} failed: {e}",
-                delete_file.delete_file_path
-            ))
-        })?;
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| {
-                ChangeError::InternalInconsistency(format!(
-                    "read position-delete file {} batch failed: {e}",
-                    delete_file.delete_file_path
-                ))
-            })?;
+        let batches = crate::connector::file_execution::read_foundation_parquet_batches(
+            factory,
+            &delete_file_path,
+            length,
+            novarocks_fs::FileProjection::RootNames(vec![
+                FILE_PATH_COLUMN.to_string(),
+                POS_COLUMN.to_string(),
+            ]),
+        )
+        .map_err(ChangeError::InternalInconsistency)?;
+        for batch in batches {
             let batch_schema = batch.schema();
             let fp_idx = batch_schema.index_of(FILE_PATH_COLUMN).map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
@@ -258,6 +219,64 @@ fn positions_to_row_selection(positions: &RoaringTreemap) -> Result<RowSelection
     }
 
     Ok(RowSelection::from(selectors))
+}
+
+fn read_foundation_batches_at_positions(
+    data_file_path: &str,
+    normalized_data_file_path: &str,
+    data_file_size: Option<u64>,
+    positions: &RoaringTreemap,
+    access: &novarocks_fs::FsAccessHandle,
+) -> Result<Vec<(RecordBatch, Vec<u64>)>, ChangeError> {
+    use arrow::array::BooleanArray;
+    use arrow::compute::filter_record_batch;
+
+    let batches = crate::connector::file_execution::read_foundation_parquet_file_batches(
+        access,
+        normalized_data_file_path,
+        data_file_size,
+        novarocks_fs::FileProjection::All,
+    )
+    .map_err(ChangeError::InternalInconsistency)?;
+    let mut out = Vec::new();
+    for batch in batches {
+        let physical_positions = batch.physical_row_positions.ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "foundation omitted physical row positions for {data_file_path}"
+            ))
+        })?;
+        if physical_positions.len() != batch.batch.num_rows() {
+            return Err(ChangeError::InternalInconsistency(format!(
+                "foundation returned {} positions for {} rows from {data_file_path}",
+                physical_positions.len(),
+                batch.batch.num_rows()
+            )));
+        }
+        let mut selected_positions = Vec::new();
+        let mask = BooleanArray::from(
+            physical_positions
+                .values()
+                .iter()
+                .map(|position| {
+                    let selected = positions.contains(*position);
+                    if selected {
+                        selected_positions.push(*position);
+                    }
+                    selected
+                })
+                .collect::<Vec<_>>(),
+        );
+        if selected_positions.is_empty() {
+            continue;
+        }
+        let filtered = filter_record_batch(&batch.batch, &mask).map_err(|error| {
+            ChangeError::InternalInconsistency(format!(
+                "filter selected positions from {data_file_path}: {error}"
+            ))
+        })?;
+        out.push((filtered, selected_positions));
+    }
+    Ok(out)
 }
 
 /// Append (or rebuild) the `_row_id` column on a delete-side reverse-
@@ -512,7 +531,7 @@ pub(crate) fn read_data_file_at_positions(
     data_file_path: &str,
     data_file_size: Option<u64>,
     positions: &RoaringTreemap,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
 ) -> Result<Vec<RecordBatch>, ChangeError> {
     read_data_file_at_positions_with_path_normalizer(
         data_file_path,
@@ -527,59 +546,25 @@ fn read_data_file_at_positions_with_path_normalizer<N>(
     data_file_path: &str,
     data_file_size: Option<u64>,
     positions: &RoaringTreemap,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: &N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use crate::cache::CachedRangeReader;
-    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
-
     if positions.is_empty() {
         return Ok(Vec::new());
     }
 
     let normalized_data_file_path = normalize_path(data_file_path)?;
-    let reader = factory
-        .open_with_len(&normalized_data_file_path, data_file_size)
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "open iceberg data file {data_file_path} for delete reverse projection: {e}"
-            ))
-        })?;
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
-        ChangeError::InternalInconsistency(format!(
-            "read iceberg data file {data_file_path} metadata for delete reverse projection: {e}"
-        ))
-    })?;
-    let row_selection = positions_to_row_selection(positions)?;
-    let reader = builder
-        .with_row_selection(row_selection)
-        .build()
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "build parquet reader for {data_file_path}: {e}"
-            ))
-        })?;
-
-    let mut out: Vec<RecordBatch> = Vec::new();
-    for batch_result in reader {
-        let batch = batch_result.map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "read iceberg data file {data_file_path} batch for delete reverse projection: {e}"
-            ))
-        })?;
-        if batch.num_rows() > 0 {
-            out.push(batch);
-        }
-    }
-
-    Ok(out)
+    read_foundation_batches_at_positions(
+        data_file_path,
+        &normalized_data_file_path,
+        data_file_size,
+        positions,
+        factory,
+    )
+    .map(|batches| batches.into_iter().map(|(batch, _)| batch).collect())
 }
 
 fn read_data_file_at_positions_with_base_row_id_and_path_normalizer<N>(
@@ -587,83 +572,30 @@ fn read_data_file_at_positions_with_base_row_id_and_path_normalizer<N>(
     data_file_size: Option<u64>,
     positions: &RoaringTreemap,
     first_row_id: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: &N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use crate::cache::CachedRangeReader;
-    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
-
     if positions.is_empty() {
         return Ok(Vec::new());
     }
 
     let normalized_data_file_path = normalize_path(data_file_path)?;
-    let reader = factory
-        .open_with_len(&normalized_data_file_path, data_file_size)
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "open iceberg data file {data_file_path} for delete reverse projection: {e}"
-            ))
-        })?;
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
-        ChangeError::InternalInconsistency(format!(
-            "read iceberg data file {data_file_path} metadata for delete reverse projection: {e}"
-        ))
-    })?;
-    let row_selection = positions_to_row_selection(positions)?;
-    let reader = builder
-        .with_row_selection(row_selection)
-        .build()
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "build parquet reader for {data_file_path}: {e}"
-            ))
-        })?;
-
-    let ordered_positions: Vec<u64> = positions.iter().collect();
-    let mut position_offset = 0_usize;
     let mut out: Vec<RecordBatch> = Vec::new();
-    for batch_result in reader {
-        let batch = batch_result.map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "read iceberg data file {data_file_path} batch for delete reverse projection: {e}"
-            ))
-        })?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let end = position_offset
-            .checked_add(batch.num_rows())
-            .ok_or_else(|| {
-                ChangeError::InternalInconsistency(format!(
-                    "delete reverse projection row count overflow for {data_file_path}"
-                ))
-            })?;
-        let batch_positions = ordered_positions.get(position_offset..end).ok_or_else(|| {
-            ChangeError::InternalInconsistency(format!(
-                "delete reverse projection for {data_file_path} returned more rows than selected positions"
-            ))
-        })?;
+    for (batch, batch_positions) in read_foundation_batches_at_positions(
+        data_file_path,
+        &normalized_data_file_path,
+        data_file_size,
+        positions,
+        factory,
+    )? {
         out.push(append_base_row_id_column(
             &batch,
             first_row_id,
-            batch_positions,
+            &batch_positions,
         )?);
-        position_offset = end;
-    }
-    if position_offset != ordered_positions.len() {
-        return Err(ChangeError::InternalInconsistency(format!(
-            "delete reverse projection for {data_file_path} returned {} rows for {} selected positions",
-            position_offset,
-            ordered_positions.len()
-        )));
     }
 
     Ok(out)
@@ -678,7 +610,7 @@ where
 /// input must be split by the caller (`scan_deletes` handles this).
 pub(crate) async fn read_dv_positions_per_data_file(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
 ) -> Result<HashMap<String, RoaringTreemap>, ChangeError> {
     use crate::connector::iceberg::commit::read_deletion_vector_puffin_with_range_reader;
     use iceberg::spec::DataFileFormat;
@@ -738,7 +670,7 @@ pub(crate) async fn read_dv_positions_per_data_file(
 pub(crate) fn previously_deleted_positions_at_snapshot<N, P>(
     table: &iceberg::table::Table,
     snapshot_id: i64,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     delete_file_path_normalizer: &N,
     data_file_path_filter: P,
 ) -> Result<HashMap<String, RoaringTreemap>, ChangeError>
@@ -879,7 +811,7 @@ where
 #[cfg(test)]
 pub(crate) fn scan_deletes<F>(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     data_file_size_lookup: F,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
@@ -895,7 +827,7 @@ where
 
 pub(crate) fn scan_deletes_with_path_normalizer<F, N>(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     data_file_size_lookup: F,
     normalize_path: N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
@@ -955,7 +887,7 @@ where
 #[cfg(test)]
 pub(crate) fn scan_deletes_with_base_row_id_lookup<F, R>(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     data_file_size_lookup: F,
     first_row_id_lookup: R,
 ) -> Result<Vec<RecordBatch>, ChangeError>
@@ -993,7 +925,7 @@ where
 /// the previous one; data files absent from the map are scanned in full.
 pub(crate) fn scan_deletes_with_base_row_id_lookup_and_path_normalizer<F, R, N>(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     data_file_size_lookup: F,
     first_row_id_lookup: R,
     suppressed_data_files: &std::collections::HashSet<String>,
@@ -1082,7 +1014,7 @@ where
 /// backed by `base_data_file_lineage_index`).
 pub(crate) fn scan_deletes_with_lineage_lookup_and_path_normalizer<F, R, N>(
     delete_files: &[PositionDeleteRef],
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     data_file_size_lookup: F,
     lineage_lookup: R,
     suppressed_data_files: &std::collections::HashSet<String>,
@@ -1178,85 +1110,32 @@ fn read_data_file_at_positions_with_v3_lineage_and_path_normalizer<N>(
     data_file_size: Option<u64>,
     positions: &RoaringTreemap,
     lineage: crate::exec::node::iceberg_delta_scan::BaseDataFileLineage,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    factory: &novarocks_fs::FsAccessHandle,
     normalize_path: &N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use crate::cache::CachedRangeReader;
-    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
-
     if positions.is_empty() {
         return Ok(Vec::new());
     }
 
     let normalized_data_file_path = normalize_path(data_file_path)?;
-    let reader = factory
-        .open_with_len(&normalized_data_file_path, data_file_size)
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "open iceberg data file {data_file_path} for delete reverse projection: {e}"
-            ))
-        })?;
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
-        ChangeError::InternalInconsistency(format!(
-            "read iceberg data file {data_file_path} metadata for delete reverse projection: {e}"
-        ))
-    })?;
-    let row_selection = positions_to_row_selection(positions)?;
-    let reader = builder
-        .with_row_selection(row_selection)
-        .build()
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "build parquet reader for {data_file_path}: {e}"
-            ))
-        })?;
-
-    let ordered_positions: Vec<u64> = positions.iter().collect();
-    let mut position_offset = 0_usize;
     let mut out: Vec<RecordBatch> = Vec::new();
-    for batch_result in reader {
-        let batch = batch_result.map_err(|e| {
-            ChangeError::InternalInconsistency(format!(
-                "read iceberg data file {data_file_path} batch for delete reverse projection: {e}"
-            ))
-        })?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let end = position_offset
-            .checked_add(batch.num_rows())
-            .ok_or_else(|| {
-                ChangeError::InternalInconsistency(format!(
-                    "delete reverse projection row count overflow for {data_file_path}"
-                ))
-            })?;
-        let batch_positions = ordered_positions.get(position_offset..end).ok_or_else(|| {
-            ChangeError::InternalInconsistency(format!(
-                "delete reverse projection for {data_file_path} returned more rows than selected positions"
-            ))
-        })?;
+    for (batch, batch_positions) in read_foundation_batches_at_positions(
+        data_file_path,
+        &normalized_data_file_path,
+        data_file_size,
+        positions,
+        factory,
+    )? {
         out.push(append_iceberg_v3_row_lineage_columns(
             &batch,
             data_file_path,
-            batch_positions,
+            &batch_positions,
             lineage.first_row_id,
             lineage.data_sequence_number,
         )?);
-        position_offset = end;
-    }
-    if position_offset != ordered_positions.len() {
-        return Err(ChangeError::InternalInconsistency(format!(
-            "delete reverse projection for {data_file_path} returned {} rows for {} selected positions",
-            position_offset,
-            ordered_positions.len()
-        )));
     }
 
     Ok(out)
@@ -1281,7 +1160,6 @@ mod tests {
     };
     use crate::connector::iceberg::changes::PositionDeleteRef;
     use crate::connector::iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
-    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
 
     fn write_data_parquet(path: &std::path::Path, ids: &[i32], names: &[&str]) {
         let schema = Arc::new(Schema::new(vec![
@@ -1322,9 +1200,10 @@ mod tests {
     /// Build a factory rooted at `dir`; relative paths inside the parquet
     /// fixtures are resolved against this root, mirroring
     /// `position_delete::tests::factory_for_dir`.
-    fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
-        let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("fs operator");
-        OpendalRangeReaderFactory::from_operator(op).expect("factory")
+    fn factory_for_dir(dir: &std::path::Path) -> novarocks_fs::FsAccessHandle {
+        novarocks_fs::FsAccessResolver::new()
+            .resolve_location(dir.join("__binding__").to_string_lossy(), None)
+            .expect("access")
     }
 
     fn make_local_file_io(location: &str) -> iceberg::io::FileIO {

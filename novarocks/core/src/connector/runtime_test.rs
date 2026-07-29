@@ -32,11 +32,11 @@ use super::runtime::{
     ConnectorScheduledSplit, ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
 use crate::common::ids::SlotId;
+use crate::connector::file_execution::FileScanRange;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanOp, ScanSource,
 };
-use crate::fs::scan_context::FileScanRange;
 
 struct FakeReader {
     batches: Vec<Result<Option<RecordBatch>, ConnectorError>>,

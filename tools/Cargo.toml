@@ -31,10 +31,16 @@ path = "src/bin/oss_parquet_probe.rs"
 [dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-arrow = { version = "57.1.0", features = ["prettyprint", "ipc", "ipc_compression"] }
+arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
 bytes = "1"
 futures = "0.3"
-opendal = { version = "0.52", features = ["services-oss", "services-fs", "services-s3"] }
-parquet = { version = "57.1.0", features = ["arrow"] }
-novarocks = { path = ".." }
+opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3"] }
+parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
+novarocks = { path = "../novarocks/core", features = ["compat"] }
+novarocks-fs = { path = "../novarocks/fs" }
 prost = "0.13.5"
+
+[patch.crates-io]
+iceberg = { path = "../vendor/iceberg-0.9.0" }
+iceberg-catalog-rest = { path = "../vendor/iceberg-catalog-rest-0.9.0" }
+iceberg-catalog-hms = { path = "../vendor/iceberg-catalog-hms-0.9.0" }

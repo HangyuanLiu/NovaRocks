@@ -1332,7 +1332,7 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
             .to_string();
         let fs = access.operator();
         let mapper: CleanupPathMapper = Arc::new(move |path| {
-            crate::fs::access::parse_object_store_path_parse_only(path)
+            novarocks_fs::parse_object_store_path_parse_only(path)
                 .ok()
                 .and_then(|(actual_bucket, key)| {
                     if actual_bucket == bucket {
@@ -1349,8 +1349,10 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
         });
     }
 
-    let fs = crate::fs::local::build_fs_operator("/")
-        .map_err(|e| format!("build local-FS operator failed: {e}"))?;
+    let fs = novarocks_fs::FsAccessResolver::new()
+        .resolve_location("/__novarocks_local_root__", None)
+        .map_err(|error| format!("build local-FS operator failed: {error}"))?
+        .operator();
     let mapper: CleanupPathMapper =
         Arc::new(|path: &str| path.strip_prefix("file://").unwrap_or(path).to_string());
     Ok(AbortCleanupOperator {

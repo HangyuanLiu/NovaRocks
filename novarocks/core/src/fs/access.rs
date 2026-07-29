@@ -274,7 +274,7 @@ impl FsAccessResolver {
     pub fn resolve_location(
         &self,
         location: impl AsRef<str>,
-        object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+        object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     ) -> Result<FsAccessHandle, String> {
         self.resolve_locations(std::iter::once(location), object_store_config)
     }
@@ -282,7 +282,7 @@ impl FsAccessResolver {
     pub fn resolve_locations<I, S>(
         &self,
         locations: I,
-        object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+        object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     ) -> Result<FsAccessHandle, String>
     where
         I: IntoIterator<Item = S>,
@@ -334,7 +334,7 @@ impl FsAccessResolver {
     fn resolve_object_store_locations(
         &self,
         locations: Vec<FsLocation>,
-        object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+        object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     ) -> Result<FsAccessHandle, String> {
         let cfg = object_store_config
             .ok_or_else(|| "object-store location requires object store config".to_string())?;
@@ -677,8 +677,8 @@ mod tests {
         }
     }
 
-    fn test_object_store_config() -> crate::fs::object_store::ObjectStoreConfig {
-        crate::fs::object_store::ObjectStoreConfig {
+    fn test_object_store_config() -> novarocks_fs::ObjectStoreConfig {
+        novarocks_fs::ObjectStoreConfig {
             endpoint: "http://localhost:9000".to_string(),
             access_key_id: "ak".to_string(),
             access_key_secret: "sk".to_string(),

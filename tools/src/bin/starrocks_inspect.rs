@@ -23,7 +23,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 
 use novarocks::formats::starrocks::metadata::load_tablet_snapshot_with_object_store_config;
-use novarocks::formats::starrocks::plan::build_native_read_plan;
+use novarocks::formats::starrocks::plan::build_native_read_plan_without_tablet_schema;
 use novarocks::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
 
 #[derive(Debug)]
@@ -137,7 +137,7 @@ fn parse_args() -> Result<InspectConfig, String> {
 
 fn decode_footers_from_snapshot_with_io(
     snapshot: &novarocks::formats::starrocks::metadata::StarRocksTabletSnapshot,
-    object_store_config: Option<&novarocks::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<StarRocksSegmentFooter>, String> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("create tokio runtime for inspect failed: {e}"))?;
@@ -202,7 +202,7 @@ fn decode_footers_from_snapshot_with_io(
 
 fn read_all_bytes(
     rt: &tokio::runtime::Runtime,
-    access: &novarocks::fs::access::FsAccessHandle,
+    access: &novarocks_fs::FsAccessHandle,
     path: &str,
 ) -> Result<Vec<u8>, String> {
     let op = access.operator();
@@ -213,7 +213,7 @@ fn read_all_bytes(
 
 fn read_range_bytes(
     rt: &tokio::runtime::Runtime,
-    access: &novarocks::fs::access::FsAccessHandle,
+    access: &novarocks_fs::FsAccessHandle,
     path: &str,
     start: u64,
     end: u64,
@@ -300,7 +300,7 @@ fn main() {
             .map(|name| Field::new(name, DataType::Int64, true))
             .collect::<Vec<_>>(),
     ));
-    match build_native_read_plan(&snapshot, &footers, &output_schema) {
+    match build_native_read_plan_without_tablet_schema(&snapshot, &footers, &output_schema) {
         Ok(plan) => {
             println!(
                 "read_plan: tablet_id={}, version={}, estimated_rows={}, projected_columns={}",

@@ -500,7 +500,7 @@ pub struct ConnectorConfig {
 impl ConnectorConfig {
     pub fn object_store_config(
         &self,
-    ) -> std::result::Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
+    ) -> std::result::Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
         let Some(object_store) = self.object_store.as_ref() else {
             return Ok(None);
         };

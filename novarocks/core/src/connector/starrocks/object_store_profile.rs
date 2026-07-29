@@ -17,11 +17,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::fs::object_store::ObjectStoreConfig;
 use crate::fs::object_store_credentials::{
     AWS_S3_ENDPOINT_KEYS, ObjectStoreCredentials, ObjectStoreCredentialsSource,
 };
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
+use novarocks_fs::ObjectStoreConfig;
 
 const UNSUPPORTED_OBJECT_STORE_PREFIXES: [&str; 7] = [
     "fs.s3a.",

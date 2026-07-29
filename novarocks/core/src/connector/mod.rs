@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub(crate) mod backend;
+pub(crate) mod file_execution;
 pub mod hdfs;
 pub(crate) mod host;
 pub mod iceberg;
@@ -238,10 +239,10 @@ pub(crate) fn metadata_load_table(
 
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 
+pub use crate::connector::file_execution::FileScanRange;
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
-pub use crate::fs::scan_context::FileScanRange;
 pub use hdfs::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 pub use jdbc::JdbcScanConfig;
 #[cfg(feature = "compat")]
@@ -283,8 +284,8 @@ mod starrocks_table_stub {
             if warehouse_uri.is_empty() {
                 return Err("standalone StarRocks table warehouse_uri is empty".to_string());
             }
-            let (bucket, _) =
-                crate::fs::access::parse_object_store_path_parse_only(&warehouse_uri)?;
+            let (bucket, _) = novarocks_fs::parse_object_store_path_parse_only(&warehouse_uri)
+                .map_err(|error| error.to_string())?;
             let mv_default_storage_engine = config
                 .mv_default_storage_engine
                 .as_deref()
@@ -459,7 +460,7 @@ impl ConnectorRegistry {
         provider_id: &ConnectorProviderId,
         instance_id: ConnectorInstanceId,
         scan_payload: bytes::Bytes,
-        file_ranges: &[crate::fs::scan_context::FileScanRange],
+        file_ranges: &[crate::connector::file_execution::FileScanRange],
         output_schema: crate::exec::chunk::ChunkSchemaRef,
     ) -> Result<ConnectorInstance, ConnectorHostError> {
         self.connector_host

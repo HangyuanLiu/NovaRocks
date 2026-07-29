@@ -31,7 +31,8 @@ mod runtime;
 
 pub use access::{
     BoundFile, FileIdentity, FsAccessHandle, FsAccessResolver, FsLocation, FsScheme,
-    ObjectStoreConfig, ResolvedFsPath,
+    ObjectStoreConfig, ResolvedFsPath, is_object_store_location_parse_only,
+    parse_object_store_path_parse_only,
 };
 pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,
@@ -52,7 +53,7 @@ pub use read::{
 };
 pub use runtime::{
     FileBytesFuture, FileCancellation, FileIoRuntime, FileTask, FileTaskFuture, FileTaskSpawner,
-    TokioFileIoRuntime, TokioFileTaskSpawner,
+    FileU64Future, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 
 // Design: ADR-0011 (docs/adr/ADR-0011-connector-neutral-file-foundation.md)

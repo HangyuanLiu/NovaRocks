@@ -27,8 +27,8 @@ use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     BoundFile, FileBatch, FileBatchReader, FileBytesFuture, FileCancellation, FileFormat,
     FileIdentity, FileIoRuntime, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FileResult, FileTask, FileTaskFuture, FileTaskSpawner, FsAccessResolver,
-    PhysicalPruning,
+    FileReadRequest, FileResult, FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future,
+    FsAccessResolver, PhysicalPruning,
 };
 use orc_rust::ArrowWriterBuilder;
 use parquet::arrow::ArrowWriter;
@@ -53,6 +53,10 @@ impl TestIo {
 
 impl FileIoRuntime for TestIo {
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<bytes::Bytes> {
+        self.runtime.block_on(future)
+    }
+
+    fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64> {
         self.runtime.block_on(future)
     }
 }

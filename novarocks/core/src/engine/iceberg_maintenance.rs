@@ -41,7 +41,7 @@ use crate::engine::StandaloneState;
 use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
 };
-use crate::fs::object_store::ObjectStoreConfig;
+use novarocks_fs::ObjectStoreConfig;
 
 /// Connector handles shared by synchronous and worker-driven maintenance.
 pub(crate) type MaintenanceCatalogTriple =

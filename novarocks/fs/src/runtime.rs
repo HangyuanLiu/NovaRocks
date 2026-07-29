@@ -63,9 +63,11 @@ impl std::fmt::Debug for FileCancellation {
 
 pub type FileTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub type FileBytesFuture = Pin<Box<dyn Future<Output = FileResult<Bytes>> + Send + 'static>>;
+pub type FileU64Future = Pin<Box<dyn Future<Output = FileResult<u64>> + Send + 'static>>;
 
 pub trait FileIoRuntime: Send + Sync {
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<Bytes>;
+    fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64>;
 }
 
 pub trait FileTaskSpawner: Send + Sync {
@@ -111,6 +113,10 @@ impl TokioFileIoRuntime {
 
 impl FileIoRuntime for TokioFileIoRuntime {
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<Bytes> {
+        self.handle.block_on(future)
+    }
+
+    fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64> {
         self.handle.block_on(future)
     }
 }

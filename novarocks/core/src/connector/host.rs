@@ -24,8 +24,8 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorInstance, ConnectorInstanceId, ConnectorProviderId,
 };
 
+use crate::connector::file_execution::FileScanRange;
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::fs::scan_context::FileScanRange;
 
 /// Rehydrates a provider-owned reader instance from a native transport carrier.
 ///

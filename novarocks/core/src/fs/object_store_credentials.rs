@@ -14,7 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::fs::object_store::{ObjectStoreConfig, ObjectStoreRetrySettings};
+use crate::fs::object_store::ObjectStoreRetrySettings;
+use novarocks_fs::ObjectStoreConfig;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 

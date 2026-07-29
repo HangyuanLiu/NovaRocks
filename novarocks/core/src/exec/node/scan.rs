@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
+use crate::connector::file_execution::FileScanRange;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 #[cfg(feature = "compat")]
@@ -29,7 +30,6 @@ use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
-use crate::fs::scan_context::FileScanRange;
 use crate::runtime::profile::RuntimeProfile;
 
 #[derive(Clone, Debug)]
@@ -452,7 +452,7 @@ pub struct RowPositionScanConfig {
     pub enable_file_pagecache: bool,
     /// OSS credentials for re-scanning the source file during late-materialisation lookups.
     /// `None` for local / HDFS paths; must be `Some` for `oss://` / `s3://` paths.
-    pub oss_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    pub oss_config: Option<novarocks_fs::ObjectStoreConfig>,
 }
 
 #[derive(Clone)]
@@ -666,8 +666,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{RuntimeFilterContext, ScanMorsel};
+    use crate::connector::file_execution::FileScanRange;
     use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
-    use crate::fs::scan_context::FileScanRange;
 
     #[test]
     fn runtime_filter_context_preserves_min_max_filters() {

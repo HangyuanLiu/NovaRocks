@@ -255,12 +255,100 @@ impl FsAccessHandle {
         })
     }
 
+    /// Bind another file covered by this already-authorized access handle.
+    ///
+    /// The new location must remain in the same filesystem domain (local
+    /// root, object-store bucket, or HDFS authority). This lets a connector
+    /// open table-format side files without carrying credentials in a read
+    /// request or constructing a second storage client.
+    pub fn bind_location(
+        &self,
+        location: impl AsRef<str>,
+        identity: FileIdentity,
+    ) -> FileResult<BoundFile> {
+        let location = FsLocation::parse(location)?;
+        if location.scheme() != self.scheme {
+            return Err(FileError::invalid(
+                "bound file location uses a different filesystem scheme",
+            ));
+        }
+        let operator_relative_path = match self.scheme {
+            FsScheme::Local => {
+                let root = self.root.as_deref().ok_or_else(|| {
+                    FileError::new(FileErrorKind::Internal, "local access handle has no root")
+                })?;
+                let path = Path::new(location.path());
+                let relative = if root == "." {
+                    path.to_path_buf()
+                } else {
+                    path.strip_prefix(root)
+                        .map(Path::to_path_buf)
+                        .map_err(|_| {
+                            FileError::new(
+                                FileErrorKind::Permission,
+                                format!(
+                                    "local file {} is outside authorized root {root}",
+                                    location.original()
+                                ),
+                            )
+                        })?
+                };
+                relative.to_string_lossy().to_string()
+            }
+            FsScheme::ObjectStore => {
+                if location.authority() != self.authority.as_deref() {
+                    return Err(FileError::new(
+                        FileErrorKind::Permission,
+                        "object-store file uses a different bucket",
+                    ));
+                }
+                location.path().trim_start_matches('/').to_string()
+            }
+            FsScheme::Hdfs => {
+                if location.authority() != self.authority.as_deref() {
+                    return Err(FileError::new(
+                        FileErrorKind::Permission,
+                        "HDFS file uses a different authority",
+                    ));
+                }
+                location.path().trim_start_matches('/').to_string()
+            }
+        };
+        let path = ResolvedFsPath::new(location, operator_relative_path)?;
+        Ok(BoundFile {
+            access: self.clone(),
+            path,
+            identity,
+        })
+    }
+
     pub fn operator_relative_paths(&self) -> Vec<&str> {
         self.paths
             .iter()
             .map(ResolvedFsPath::operator_relative_path)
             .collect()
     }
+}
+
+pub fn is_object_store_location_parse_only(location: &str) -> FileResult<bool> {
+    Ok(FsLocation::parse(location)?.scheme() == FsScheme::ObjectStore)
+}
+
+pub fn parse_object_store_path_parse_only(location: &str) -> FileResult<(String, String)> {
+    let location = FsLocation::parse(location)?;
+    if location.scheme() != FsScheme::ObjectStore {
+        return Err(FileError::invalid(format!(
+            "location is not an object-store URI: {}",
+            location.original()
+        )));
+    }
+    let bucket = location
+        .authority()
+        .ok_or_else(|| FileError::invalid("object-store location missing bucket"))?;
+    Ok((
+        bucket.to_string(),
+        location.path().trim_start_matches('/').to_string(),
+    ))
 }
 
 impl Debug for FsAccessHandle {

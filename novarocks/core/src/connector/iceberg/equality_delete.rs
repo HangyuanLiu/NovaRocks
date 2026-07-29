@@ -26,14 +26,13 @@ use arrow::array::{
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::cache::CachedRangeReader;
+use crate::connector::file_execution::read_foundation_parquet_batches;
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
-use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
-use crate::fs::opendal::OpendalRangeReaderFactory;
+use novarocks_fs::{FileProjection, FsAccessHandle};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EqualityValue {
@@ -64,7 +63,7 @@ struct EqualityColumnRef {
 
 pub(crate) fn load_equality_delete_sets(
     specs: &[IcebergDeleteFileSpec],
-    factory: &OpendalRangeReaderFactory,
+    access: &FsAccessHandle,
 ) -> Result<Vec<EqualityDeleteSet>, String> {
     let mut sets = Vec::new();
     for spec in specs {
@@ -83,25 +82,11 @@ pub(crate) fn load_equality_delete_sets(
                 spec.path
             ));
         }
-        let reader = factory
-            .open_with_len(&spec.path, spec.length)
-            .map_err(|e| {
-                format!(
-                    "open iceberg equality-delete file {} failed: {e}",
-                    spec.path
-                )
-            })?;
-        let reader = ParquetCachedReader::new(
-            CachedRangeReader::new(reader, None),
-            ParquetReadCachePolicy::with_flags(false, false, None),
-        );
-        let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
-            format!(
-                "read iceberg equality-delete file {} metadata failed: {e}",
-                spec.path
-            )
-        })?;
-        let schema = builder.schema();
+        let batches =
+            read_foundation_parquet_batches(access, &spec.path, spec.length, FileProjection::All)?;
+        let Some(schema) = batches.first().map(RecordBatch::schema) else {
+            continue;
+        };
         if schema.fields().is_empty() {
             return Err(format!(
                 "iceberg equality-delete file {} has no equality columns",
@@ -113,20 +98,8 @@ pub(crate) fn load_equality_delete_sets(
             .iter()
             .map(|field| equality_column_ref(field.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let reader = builder.build().map_err(|e| {
-            format!(
-                "build iceberg equality-delete reader for {} failed: {e}",
-                spec.path
-            )
-        })?;
         let mut keys = HashSet::new();
-        for batch in reader {
-            let batch = batch.map_err(|e| {
-                format!(
-                    "read iceberg equality-delete file {} batch failed: {e}",
-                    spec.path
-                )
-            })?;
+        for batch in batches {
             if batch.num_columns() != columns.len() {
                 return Err(format!(
                     "equality-delete batch from {} has {} columns, expected {}",
@@ -171,7 +144,7 @@ pub(crate) fn read_data_file_matching_equality_deletes_with_path_normalizer<N>(
     data_file_path: &str,
     data_file_size: Option<u64>,
     sets: &[EqualityDeleteSet],
-    factory: &OpendalRangeReaderFactory,
+    access: &FsAccessHandle,
     normalize_path: N,
 ) -> Result<Vec<RecordBatch>, String>
 where
@@ -182,37 +155,15 @@ where
     }
 
     let normalized_path = normalize_path(data_file_path)?;
-    let reader = factory
-        .open_with_len(&normalized_path, data_file_size)
-        .map_err(|e| {
-            format!(
-                "open iceberg data file {data_file_path} for equality-delete reverse projection failed: {e}"
-            )
-        })?;
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-    let reader = ParquetRecordBatchReaderBuilder::try_new(reader)
-        .map_err(|e| {
-            format!(
-                "read iceberg data file {data_file_path} metadata for equality-delete reverse projection failed: {e}"
-            )
-        })?
-        .build()
-        .map_err(|e| {
-            format!(
-                "build iceberg data reader for equality-delete reverse projection {data_file_path} failed: {e}"
-            )
-        })?;
+    let batches = read_foundation_parquet_batches(
+        access,
+        &normalized_path,
+        data_file_size,
+        FileProjection::All,
+    )?;
 
     let mut out = Vec::new();
-    for batch in reader {
-        let batch = batch.map_err(|e| {
-            format!(
-                "read iceberg data file {data_file_path} batch for equality-delete reverse projection failed: {e}"
-            )
-        })?;
+    for batch in batches {
         let Some(keep_mask) = equality_delete_keep_mask(&batch, sets)? else {
             continue;
         };
@@ -456,7 +407,6 @@ mod tests {
     use crate::connector::iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
-    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
 
     fn temp_dir_for(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
@@ -470,9 +420,10 @@ mod tests {
         dir
     }
 
-    fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
-        let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("operator");
-        OpendalRangeReaderFactory::from_operator(op).expect("factory")
+    fn factory_for_dir(dir: &std::path::Path) -> novarocks_fs::FsAccessHandle {
+        novarocks_fs::FsAccessResolver::new()
+            .resolve_location(dir.join("__binding__").to_string_lossy(), None)
+            .expect("access")
     }
 
     fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> Field {

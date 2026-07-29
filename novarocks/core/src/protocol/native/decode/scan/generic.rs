@@ -28,11 +28,11 @@ use novarocks_spi::connector::{
     ConnectorProviderId, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
 };
 
+use crate::connector::file_execution::FileScanRange;
 use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::fs::scan_context::FileScanRange;
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};

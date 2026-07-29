@@ -47,8 +47,8 @@ use super::snapshot_lifecycle_helpers::{
 };
 
 use crate::connector::iceberg::fs_io;
-use crate::fs::access::{FsLocation, FsScheme};
-use crate::fs::object_store::ObjectStoreConfig;
+use novarocks_fs::ObjectStoreConfig;
+use novarocks_fs::{FsLocation, FsScheme};
 
 /// Result of a successful REMOVE ORPHAN FILES execution.
 #[derive(Debug)]

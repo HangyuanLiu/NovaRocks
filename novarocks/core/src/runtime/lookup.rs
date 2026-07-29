@@ -17,6 +17,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int32Array, Int64Array, UInt32Array, new_empty_array};
 use arrow::compute::{concat, take};
@@ -25,16 +26,16 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
+use crate::connector::file_execution::FileScanRange;
+use crate::connector::hdfs::{HdfsFileBatchReader, HdfsScanConfig};
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::read_starrocks_batches;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::row_position::RowPositionType;
 use crate::formats::{
-    build_format_iter, parquet::ParquetReadCachePolicy, parquet::ParquetScanConfig,
-    parquet::ParquetSlotKind,
+    parquet::ParquetReadCachePolicy, parquet::ParquetScanConfig, parquet::ParquetSlotKind,
 };
-use crate::fs::scan_context::{FileScanContext, FileScanRange};
 #[cfg(feature = "compat")]
 use crate::novarocks_connectors::StarRocksScanConfig;
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
@@ -43,6 +44,18 @@ use crate::runtime::descriptor_snapshot::{
 };
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use novarocks_fs::DataCacheManager;
+use novarocks_spi::connector::{
+    ConnectorBatchReader, ConnectorCancellation, ConnectorRequestContext,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+
+struct LookupCancellation;
+
+impl ConnectorCancellation for LookupCancellation {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct GlobalLateMaterializationContext {
@@ -250,7 +263,7 @@ pub fn execute_lookup_request(
 
         let parquet_cfg = ParquetScanConfig {
             columns,
-            chunk_schema,
+            chunk_schema: Arc::clone(&chunk_schema),
             slot_kinds,
             case_sensitive: scan_cfg.case_sensitive,
             enable_page_index: false,
@@ -271,15 +284,35 @@ pub fn execute_lookup_request(
             query_global_dicts: Default::default(),
         };
         let format = lookup_file_format_config(scan_cfg.file_format, parquet_cfg)?;
-
-        let scan =
-            FileScanContext::build(vec![scan_range.clone()], None, scan_cfg.oss_config.as_ref())?;
-        let iter = build_format_iter(scan, format, None, None, None)?;
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(3600),
+            Arc::new(LookupCancellation),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut reader = HdfsFileBatchReader::new(
+            HdfsScanConfig {
+                ranges: vec![scan_range.clone()],
+                original_range_count: 1,
+                has_more: false,
+                limit: None,
+                profile_label: None,
+                format: Some(format),
+                object_store_config: scan_cfg.oss_config.clone(),
+                iceberg_table_locations: HashMap::new(),
+                query_global_dicts: Default::default(),
+                iceberg_runtime_pruning: None,
+            },
+            context,
+            scan_cfg.batch_size.unwrap_or(4096).max(1),
+            64 * 1024 * 1024,
+        )
+        .map_err(|error| error.to_string())?;
 
         let mut row_offset = 0i64;
-        for next in iter {
-            let chunk = next?;
-            let row_count = chunk.len();
+        while let Some(batch) = reader.next_batch().map_err(|error| error.to_string())? {
+            let row_count = batch.num_rows();
             if row_count == 0 {
                 continue;
             }
@@ -300,7 +333,10 @@ pub fn execute_lookup_request(
             }
             let indices_array = UInt32Array::from(indices);
             for slot in lookup_slots.iter() {
-                let column = chunk.column_by_slot_id(*slot)?;
+                let slot_index = chunk_schema
+                    .index_of(*slot)
+                    .ok_or_else(|| format!("lookup output missing slot {slot}"))?;
+                let column = batch.column(slot_index);
                 let taken =
                     take(column.as_ref(), &indices_array, None).map_err(|e| e.to_string())?;
                 column_chunks.entry(*slot).or_default().push(taken);

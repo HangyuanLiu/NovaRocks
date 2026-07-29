@@ -503,7 +503,7 @@ fn build_iceberg_runtime(
 
 fn build_delta_delete_side_from_payload(
     payload: Option<DeltaScanDeleteSidePayload>,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Option<DeltaScanDeleteSide>, String> {
     let Some(payload) = payload else {
         return Ok(None);

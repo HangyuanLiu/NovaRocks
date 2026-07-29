@@ -25,6 +25,7 @@ use csv::{ReaderBuilder, Terminator, Trim};
 use serde_json::Value;
 
 use crate::common::ids::SlotId;
+use crate::connector::file_execution::FileScanRange;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::program::ScanAssignmentKind;
@@ -32,7 +33,6 @@ use crate::exec::node::scan::{
     BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp, ScanSource,
 };
 use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind};
-use crate::fs::scan_context::FileScanRange;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
@@ -238,9 +238,8 @@ impl FileLoadScanOp {
             builder.escape(Some(escape));
         }
 
-        let mut reader = builder
-            .from_path(path)
-            .map_err(|e| format!("FILE_SCAN failed to open csv file `{path}`: {e}"))?;
+        let payload = read_file_payload(path)?;
+        let mut reader = builder.from_reader(payload.as_ref());
 
         let expected_columns = self.cfg.source_chunk_schema.slot_ids().len();
         let mut columns: Vec<Vec<Option<String>>> =
@@ -276,8 +275,8 @@ impl FileLoadScanOp {
             .json
             .as_ref()
             .ok_or_else(|| "FILE_SCAN missing JSON read options".to_string())?;
-        let payload = std::fs::read_to_string(path)
-            .map_err(|e| format!("FILE_SCAN failed to open json file `{path}`: {e}"))?;
+        let payload = String::from_utf8(read_file_payload(path)?.to_vec())
+            .map_err(|error| format!("FILE_SCAN json file `{path}` is not UTF-8: {error}"))?;
         if payload.trim().is_empty() {
             return Ok((0..self.cfg.source_chunk_schema.slot_ids().len())
                 .map(|_| Vec::new())
@@ -376,6 +375,26 @@ impl FileLoadScanOp {
             self.cfg.output_chunk_schema.clone(),
         )?))
     }
+}
+
+fn read_file_payload(path: &str) -> Result<bytes::Bytes, String> {
+    let access = novarocks_fs::FsAccessResolver::new()
+        .resolve_location(path, None)
+        .map_err(|error| error.to_string())?;
+    let cancellation = novarocks_fs::FileCancellation::new();
+    let provisional = access
+        .bind(0, novarocks_fs::FileIdentity::new(path, 0, None))
+        .map_err(|error| error.to_string())?;
+    let size =
+        crate::runtime::global_async_runtime::data_block_on(provisional.stat(&cancellation))?
+            .map_err(|error| error.to_string())?;
+    let file = access
+        .bind(0, novarocks_fs::FileIdentity::new(path, size, None))
+        .map_err(|error| error.to_string())?;
+    crate::runtime::global_async_runtime::data_block_on(
+        file.read(novarocks_fs::FileReadRange::WholeFile, &cancellation),
+    )?
+    .map_err(|error| error.to_string())
 }
 
 impl ScanOp for FileLoadScanOp {
@@ -1049,10 +1068,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::FileLoadScanSource;
+    use crate::connector::file_execution::FileScanRange;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
-    use crate::fs::scan_context::FileScanRange;
     use crate::thrift::plan_nodes;
 
     fn source_for_test() -> FileLoadScanSource {

@@ -20,7 +20,8 @@ use std::fs;
 use prost::Message;
 
 use novarocks::formats::starrocks::writer::layout::{txn_log_file_path, txn_log_file_path_with_load_id};
-use novarocks::service::grpc_client::proto::starrocks::{PUniqueId, TxnLogPb};
+use novarocks::service::grpc_client::proto::starrocks::TxnLogPb;
+use novarocks::UniqueId;
 
 #[derive(Debug)]
 struct ProbeConfig {
@@ -124,7 +125,7 @@ fn parse_args() -> Result<ProbeConfig, String> {
 fn main() -> Result<(), String> {
     let cfg = parse_args()?;
     let path = if let (Some(hi), Some(lo)) = (cfg.load_id_hi, cfg.load_id_lo) {
-        let load_id = PUniqueId { hi, lo };
+        let load_id = UniqueId { hi, lo };
         txn_log_file_path_with_load_id(&cfg.root, cfg.tablet_id, cfg.txn_id, &load_id)?
     } else {
         txn_log_file_path(&cfg.root, cfg.tablet_id, cfg.txn_id)?

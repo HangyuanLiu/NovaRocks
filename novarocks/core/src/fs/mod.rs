@@ -23,4 +23,3 @@ pub mod object_store;
 pub mod object_store_credentials;
 pub mod opendal;
 pub mod range_plan;
-pub mod scan_context;

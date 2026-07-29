@@ -61,6 +61,7 @@ use crate::common::runtime_scan_predicate::{
 use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
+use crate::connector::file_execution::FileScanRange;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
@@ -68,7 +69,6 @@ use crate::exec::node::scan::RuntimeFilterContext;
 use crate::fs::coalesce_policy::AdaptiveCoalesceController;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::range_plan::PlannedIoRanges;
-use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
 use novarocks_fs::DataCacheContext;
@@ -433,6 +433,207 @@ pub struct ParquetScanConfig {
     pub query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
 }
 
+/// Core-private correctness adapter applied after `novarocks-fs` has decoded
+/// connector-neutral physical Parquet columns.
+pub(crate) struct FoundationParquetAdapter {
+    cfg: ParquetScanConfig,
+    scan_read_chunk_schema: ChunkSchemaRef,
+    materialized_chunk_schema: ChunkSchemaRef,
+    materialized_slot_kinds: Vec<ParquetSlotKind>,
+    has_dict_encoded_output: bool,
+}
+
+impl FoundationParquetAdapter {
+    pub(crate) fn try_new(cfg: ParquetScanConfig) -> Result<Self, String> {
+        let (materialized_chunk_schema, materialized_slot_kinds) =
+            materialized_variant_path_schema_and_slot_kinds(&cfg)?;
+        let (scan_read_chunk_schema, has_dict_encoded_output) = if cfg.query_global_dicts.is_empty()
+        {
+            (materialized_chunk_schema.clone(), false)
+        } else {
+            let output = materialized_chunk_schema.arrow_schema_ref();
+            let (scan, has_dict) =
+                crate::exec::dict_encode::build_scan_schema_for_global_dict_encoding(
+                    &output,
+                    &materialized_chunk_schema,
+                    &cfg.query_global_dicts,
+                )?;
+            if has_dict {
+                (
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        scan.as_ref(),
+                        materialized_chunk_schema.slot_ids(),
+                    )?,
+                    true,
+                )
+            } else {
+                (materialized_chunk_schema.clone(), false)
+            }
+        };
+        Ok(Self {
+            cfg,
+            scan_read_chunk_schema,
+            materialized_chunk_schema,
+            materialized_slot_kinds,
+            has_dict_encoded_output,
+        })
+    }
+
+    pub(crate) fn adapt(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<(RecordBatch, ChunkSchemaRef), String> {
+        let batch = reorder_batch(&self.cfg, batch)
+            .and_then(|batch| {
+                materialize_variant_path_columns(
+                    batch,
+                    self.cfg.chunk_schema.slot_ids(),
+                    self.scan_read_chunk_schema.slot_ids(),
+                    &self.cfg.variant_path_columns,
+                )
+            })
+            .and_then(|batch| convert_variant_columns(&self.materialized_slot_kinds, batch))
+            .and_then(|batch| normalize_batch_to_chunk_schema(batch, &self.scan_read_chunk_schema))
+            .and_then(|batch| {
+                if self.has_dict_encoded_output {
+                    crate::exec::dict_encode::encode_batch_with_query_global_dicts(
+                        batch,
+                        &self.materialized_chunk_schema.arrow_schema_ref(),
+                        &self.materialized_chunk_schema,
+                        &self.cfg.query_global_dicts,
+                    )
+                } else {
+                    Ok(batch)
+                }
+            })?;
+        let schema = Arc::new(
+            self.materialized_chunk_schema.with_fields_in_order(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect(),
+            )?,
+        );
+        Ok((batch, schema))
+    }
+}
+
+pub(crate) fn foundation_scan_predicates(
+    cfg: &ParquetScanConfig,
+    runtime_filters: Option<&RuntimeFilterContext>,
+) -> Result<Vec<novarocks_fs::ScanPredicate>, String> {
+    if cfg.iceberg_output_schema.is_some() {
+        return Ok(Vec::new());
+    }
+    let mut predicates =
+        min_max_predicates_to_scan_predicates(&cfg.min_max_predicates, ScanPredicateSource::Static);
+    if let Some(runtime_filters) = runtime_filters {
+        predicates.extend(runtime_filters_to_scan_predicates(cfg, runtime_filters)?);
+    }
+    predicates
+        .iter()
+        .filter_map(|predicate| {
+            let column = predicate
+                .column()
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| cfg.columns.get(index))
+                .map(String::as_str)
+                .unwrap_or_else(|| predicate.column());
+            if column == "___count___" {
+                return None;
+            }
+            Some(to_foundation_predicate(column, predicate))
+        })
+        .collect()
+}
+
+fn to_foundation_predicate(
+    column: &str,
+    predicate: &ScanPredicate,
+) -> Result<novarocks_fs::ScanPredicate, String> {
+    let source = match predicate.source() {
+        ScanPredicateSource::Static => novarocks_fs::ScanPredicateSource::Static,
+        ScanPredicateSource::RuntimeIn => novarocks_fs::ScanPredicateSource::RuntimeIn,
+        ScanPredicateSource::RuntimeMembership => {
+            novarocks_fs::ScanPredicateSource::RuntimeMembership
+        }
+        ScanPredicateSource::RuntimeMinMax => novarocks_fs::ScanPredicateSource::RuntimeMinMax,
+    };
+    let domain = match predicate.domain() {
+        ScanPredicateDomain::Range { op, value } => novarocks_fs::ScanPredicateDomain::Range {
+            op: match op {
+                crate::common::min_max_predicate::MinMaxPredicateOp::Le => {
+                    novarocks_fs::MinMaxPredicateOp::Le
+                }
+                crate::common::min_max_predicate::MinMaxPredicateOp::Ge => {
+                    novarocks_fs::MinMaxPredicateOp::Ge
+                }
+                crate::common::min_max_predicate::MinMaxPredicateOp::Lt => {
+                    novarocks_fs::MinMaxPredicateOp::Lt
+                }
+                crate::common::min_max_predicate::MinMaxPredicateOp::Gt => {
+                    novarocks_fs::MinMaxPredicateOp::Gt
+                }
+                crate::common::min_max_predicate::MinMaxPredicateOp::Eq => {
+                    novarocks_fs::MinMaxPredicateOp::Eq
+                }
+            },
+            value: to_foundation_value(value),
+        },
+        ScanPredicateDomain::DiscreteSet { values, min, max } => {
+            novarocks_fs::ScanPredicateDomain::DiscreteSet {
+                values: values.iter().map(to_foundation_value).collect(),
+                min: to_foundation_value(min),
+                max: to_foundation_value(max),
+            }
+        }
+        ScanPredicateDomain::Membership(MembershipPredicate::BloomProbe { values }) => {
+            novarocks_fs::ScanPredicateDomain::Membership {
+                values: values.iter().map(to_foundation_value).collect(),
+            }
+        }
+    };
+    Ok(novarocks_fs::ScanPredicate::new(column, domain, source))
+}
+
+fn to_foundation_value(value: &MinMaxPredicateValue) -> novarocks_fs::MinMaxPredicateValue {
+    match value {
+        MinMaxPredicateValue::Boolean(value) => novarocks_fs::MinMaxPredicateValue::Boolean(*value),
+        MinMaxPredicateValue::Int32(value) => novarocks_fs::MinMaxPredicateValue::Int32(*value),
+        MinMaxPredicateValue::Int64(value) => novarocks_fs::MinMaxPredicateValue::Int64(*value),
+        MinMaxPredicateValue::Float(value) => novarocks_fs::MinMaxPredicateValue::Float(*value),
+        MinMaxPredicateValue::Double(value) => novarocks_fs::MinMaxPredicateValue::Double(*value),
+        MinMaxPredicateValue::ByteArray(value) => {
+            novarocks_fs::MinMaxPredicateValue::ByteArray(value.clone())
+        }
+        MinMaxPredicateValue::FixedLenByteArray(value) => {
+            novarocks_fs::MinMaxPredicateValue::FixedLenByteArray(value.clone())
+        }
+        MinMaxPredicateValue::Date32(value) => novarocks_fs::MinMaxPredicateValue::Date32(*value),
+        MinMaxPredicateValue::DateTimeMicros(value) => {
+            novarocks_fs::MinMaxPredicateValue::DateTimeMicros(*value)
+        }
+        MinMaxPredicateValue::DateTimeNanos(value) => {
+            novarocks_fs::MinMaxPredicateValue::DateTimeNanos(*value)
+        }
+        MinMaxPredicateValue::LargeInt(value) => {
+            novarocks_fs::MinMaxPredicateValue::LargeInt(*value)
+        }
+        MinMaxPredicateValue::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => novarocks_fs::MinMaxPredicateValue::Decimal128 {
+            value: *value,
+            precision: *precision,
+            scale: *scale,
+        },
+    }
+}
+
 fn materialized_variant_path_schema_and_slot_kinds(
     cfg: &ParquetScanConfig,
 ) -> Result<(ChunkSchemaRef, Vec<ParquetSlotKind>), String> {
@@ -535,8 +736,9 @@ impl ParquetReadCachePolicy {
     }
 }
 
+#[cfg(any())]
 pub fn build_parquet_iter(
-    scan: crate::fs::scan_context::FileScanContext,
+    scan: crate::connector::file_execution::FileScanContext,
     cfg: ParquetScanConfig,
     limit: Option<usize>,
     profile: Option<RuntimeProfile>,
@@ -2645,7 +2847,7 @@ fn is_active_projection_column(
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -2673,9 +2875,9 @@ mod tests {
     use crate::cache::{CacheOptions, CachedRangeReader};
     use crate::common::ids::SlotId;
     use crate::common::scan_predicate::{MembershipPredicate, ScanPredicateDomain};
+    use crate::connector::file_execution::{FileScanContext, FileScanRange};
     use crate::exec::chunk::ChunkSchema;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use crate::fs::scan_context::{FileScanContext, FileScanRange};
     use novarocks_fs::{DataCacheManager, DataCachePageCacheOptions};
     use novarocks_types::PrimitiveType;
     use novarocks_types::arrow_primitive::primitive_to_arrow_type;

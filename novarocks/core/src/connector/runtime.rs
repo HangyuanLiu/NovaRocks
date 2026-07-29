@@ -27,6 +27,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::common::ids::SlotId;
+use crate::connector::file_execution::FileScanRange;
 use crate::connector::host::ConnectorInstanceLease;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -35,7 +36,6 @@ use crate::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
     ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanSource,
 };
-use crate::fs::scan_context::FileScanRange;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
 

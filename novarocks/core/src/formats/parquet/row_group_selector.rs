@@ -26,7 +26,7 @@ use parquet::file::statistics::Statistics;
 use crate::common::scan_predicate::{
     ColumnStats, ScanLayer, ScanPredicate, ScanPredicateDomainKind, ScanPruner, UnitId, prune_units,
 };
-use crate::fs::scan_context::FileScanRange;
+use crate::connector::file_execution::FileScanRange;
 use crate::novarocks_logging::debug;
 
 use super::{

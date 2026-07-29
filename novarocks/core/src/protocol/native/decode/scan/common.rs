@@ -25,12 +25,12 @@ use super::super::layout::Layout;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
-use crate::fs::object_store::ObjectStoreConfig;
 use crate::proto::{common, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_fs::ObjectStoreConfig;
 
 #[derive(Clone, Debug)]
 pub(super) struct ProvenancedOutputColumn {

@@ -39,6 +39,9 @@ use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::RuntimeScanPredicateCounters;
 use crate::connector::ConnectorRegistry;
+use crate::connector::file_execution::{
+    FileScanContext, FileScanRange, bind_foundation_file, foundation_read_context,
+};
 use crate::connector::host::ConnectorTransportFactory;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
@@ -47,19 +50,24 @@ use crate::connector::runtime::{
     ConnectorReadAuxiliary, ConnectorReadCoreFacet, ConnectorReadScanSource,
     ConnectorScheduledSplit, ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
-use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
     HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
     ScanMorselPruneDecision, ScanMorsels, ScanSource,
 };
-use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
-use crate::formats::{FileFormatConfig, build_format_iter};
-use crate::fs::scan_context::{FileScanContext, FileScanRange};
+use crate::formats::FileFormatConfig;
+use crate::formats::parquet::{
+    FoundationParquetAdapter, ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind,
+    foundation_scan_predicates,
+};
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
-use novarocks_fs::DataCacheContext;
+use novarocks_fs::{
+    DataCacheContext, FileBatchReader as FoundationBatchReader, FileCancellation, FileError,
+    FileErrorKind, FileFormat, FileProjection, FileReadBudget, FileReadContext, FileReadRequest,
+    FileTask, PhysicalPruning, open_file_reader,
+};
 
 const HDFS_SPI_PROVIDER_ID: &str = "hdfs";
 
@@ -709,7 +717,7 @@ impl ConnectorRead for HdfsConnectorInstance {
             request.context,
             request.batch.max_rows.get(),
             request.batch.max_bytes.get(),
-        )))
+        )?))
     }
 }
 
@@ -729,58 +737,6 @@ fn apply_parquet_pruning_gate_for_delete_files(
         parquet_cfg.runtime_min_max_filter_columns.clear();
         parquet_cfg.variant_path_predicates.clear();
     }
-}
-
-/// Opens one provider-owned file range without depending on the core `ScanOp`
-/// contract. Both the transitional HDFS scan op and the SPI batch reader use
-/// this seam so position-delete pruning behavior stays identical.
-pub(crate) fn build_hdfs_range_iter(
-    cfg: &HdfsScanConfig,
-    range: FileScanRange,
-    profile: Option<RuntimeProfile>,
-    runtime_filters: Option<&RuntimeFilterContext>,
-) -> Result<BoxedExecIter, String> {
-    let external_datacache = range.external_datacache.clone();
-    let file_external_datacache = external_datacache
-        .as_ref()
-        .map(novarocks_fs::ExternalDataCacheRangeOptions::from);
-    let scan = FileScanContext::build(
-        vec![range],
-        profile.clone(),
-        cfg.object_store_config.as_ref(),
-    )?;
-    if let Some(profile) = profile.as_ref() {
-        profile.add_info_string(
-            "OriginalRangeCount",
-            format!("{}", cfg.original_range_count),
-        );
-        profile.add_info_string("RangeCount", format!("{}", scan.ranges.len()));
-    }
-    let current_delete_files = scan
-        .ranges
-        .first()
-        .map(|range| range.delete_files.as_slice())
-        .unwrap_or(&[]);
-    let Some(mut format) = cfg.format.clone() else {
-        return Err("hdfs scan missing file format for non-empty morsel".to_string());
-    };
-    format = match format {
-        FileFormatConfig::Parquet(mut parquet_cfg) => {
-            parquet_cfg.datacache = parquet_cfg
-                .datacache
-                .with_external_range_options(file_external_datacache.as_ref())?;
-            parquet_cfg.query_global_dicts = cfg.query_global_dicts.clone();
-            apply_parquet_pruning_gate_for_delete_files(&mut parquet_cfg, current_delete_files);
-            FileFormatConfig::Parquet(parquet_cfg)
-        }
-        FileFormatConfig::Orc(mut orc_cfg) => {
-            orc_cfg.datacache = orc_cfg
-                .datacache
-                .with_external_range_options(file_external_datacache.as_ref())?;
-            FileFormatConfig::Orc(orc_cfg)
-        }
-    };
-    build_format_iter(scan, format, None, profile, runtime_filters)
 }
 
 fn exact_ordered_file_candidates(
@@ -915,7 +871,7 @@ pub struct HdfsScanConfig {
     /// OSS credentials supplied by FE via `THdfsScanNode.cloud_configuration`.
     /// Used as a fallback when the shard registry has no entry for the scanned path
     /// (typical for Iceberg external tables whose files are not tracked as lake tablets).
-    pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    pub object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
     /// Cached Iceberg table locations keyed by `table_id`, used to resolve incremental
     /// scan ranges that only carry `relative_path`.
     pub iceberg_table_locations: HashMap<i64, String>,
@@ -932,11 +888,57 @@ pub struct HdfsScanConfig {
 pub(crate) struct HdfsFileBatchReader {
     cfg: HdfsScanConfig,
     ranges: VecDeque<FileScanRange>,
-    current: Option<BoxedExecIter>,
+    current: Option<FoundationCurrentReader>,
     context: ConnectorRequestContext,
+    file_context: FileReadContext,
+    cancellation_watch: Option<FileTask>,
     max_rows: usize,
     max_bytes: usize,
     closed: bool,
+}
+
+enum FoundationCurrentReader {
+    Parquet {
+        reader: Box<dyn FoundationBatchReader>,
+        adapter: FoundationParquetAdapter,
+    },
+    Orc {
+        reader: Box<dyn FoundationBatchReader>,
+        cfg: crate::formats::orc::OrcScanConfig,
+    },
+}
+
+impl FoundationCurrentReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        match self {
+            Self::Parquet { reader, adapter } => reader
+                .next_batch()
+                .map_err(map_file_error)?
+                .map(|physical| {
+                    adapter
+                        .adapt(physical.batch)
+                        .map(|(batch, _)| batch)
+                        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+                })
+                .transpose(),
+            Self::Orc { reader, cfg } => reader
+                .next_batch()
+                .map_err(map_file_error)?
+                .map(|physical| {
+                    crate::formats::orc::adapt_foundation_batch(cfg, physical.batch)
+                        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+                })
+                .transpose(),
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        match self {
+            Self::Parquet { reader, .. } | Self::Orc { reader, .. } => {
+                reader.close().map_err(map_file_error)
+            }
+        }
+    }
 }
 
 impl HdfsFileBatchReader {
@@ -945,21 +947,44 @@ impl HdfsFileBatchReader {
         context: ConnectorRequestContext,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Self {
+    ) -> Result<Self, ConnectorError> {
         let ranges = std::mem::take(&mut cfg.ranges);
-        Self {
+        let cancellation = FileCancellation::new();
+        let file_context = foundation_read_context(cancellation.clone(), Some(context.deadline()))
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+        let spi_cancellation = Arc::clone(context.cancellation());
+        let watch_cancellation = cancellation.clone();
+        let cancellation_watch = file_context
+            .task_spawner
+            .spawn(Box::pin(async move {
+                loop {
+                    if spi_cancellation.is_cancelled() {
+                        watch_cancellation.cancel();
+                        break;
+                    }
+                    if watch_cancellation.is_cancelled() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }))
+            .map_err(map_file_error)?;
+        Ok(Self {
             cfg,
             ranges: VecDeque::from(ranges),
             current: None,
             context,
+            file_context,
+            cancellation_watch: Some(cancellation_watch),
             max_rows,
             max_bytes,
             closed: false,
-        }
+        })
     }
 
     fn validate_context(&self) -> Result<(), ConnectorError> {
         if self.context.cancellation().is_cancelled() {
+            self.file_context.cancellation.cancel();
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled",
@@ -973,6 +998,85 @@ impl HdfsFileBatchReader {
         }
         Ok(())
     }
+
+    fn open_range(&self, range: FileScanRange) -> Result<FoundationCurrentReader, ConnectorError> {
+        let external_datacache = range
+            .external_datacache
+            .as_ref()
+            .map(novarocks_fs::ExternalDataCacheRangeOptions::from);
+        let (file, read_range) = bind_foundation_file(
+            &range,
+            self.cfg.object_store_config.as_ref(),
+            &self.file_context,
+        )
+        .map_err(map_file_error)?;
+        let format = self.cfg.format.clone().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "file reader is missing its physical format",
+            )
+        })?;
+        let budget = FileReadBudget {
+            max_rows: NonZeroUsize::new(self.max_rows).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "file reader row budget must be positive",
+                )
+            })?,
+            max_bytes: NonZeroUsize::new(self.max_bytes).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "file reader byte budget must be positive",
+                )
+            })?,
+        };
+        match format {
+            FileFormatConfig::Parquet(mut cfg) => {
+                cfg.datacache = cfg
+                    .datacache
+                    .with_external_range_options(external_datacache.as_ref())
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                cfg.query_global_dicts = self.cfg.query_global_dicts.clone();
+                apply_parquet_pruning_gate_for_delete_files(&mut cfg, &range.delete_files);
+                let predicates = foundation_scan_predicates(&cfg, None)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                let adapter = FoundationParquetAdapter::try_new(cfg.clone())
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                let reader = open_file_reader(FileReadRequest {
+                    file,
+                    format: FileFormat::Parquet,
+                    range: read_range,
+                    projection: FileProjection::All,
+                    budget,
+                    predicates,
+                    pruning: PhysicalPruning::default(),
+                    cache: Some(cfg.datacache),
+                    context: self.file_context.clone(),
+                })
+                .map_err(map_file_error)?;
+                Ok(FoundationCurrentReader::Parquet { reader, adapter })
+            }
+            FileFormatConfig::Orc(mut cfg) => {
+                cfg.datacache = cfg
+                    .datacache
+                    .with_external_range_options(external_datacache.as_ref())
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                let reader = open_file_reader(FileReadRequest {
+                    file,
+                    format: FileFormat::Orc,
+                    range: read_range,
+                    projection: FileProjection::All,
+                    budget,
+                    predicates: Vec::new(),
+                    pruning: PhysicalPruning::default(),
+                    cache: Some(cfg.datacache.clone()),
+                    context: self.file_context.clone(),
+                })
+                .map_err(map_file_error)?;
+                Ok(FoundationCurrentReader::Orc { reader, cfg })
+            }
+        }
+    }
 }
 
 impl ConnectorBatchReader for HdfsFileBatchReader {
@@ -983,9 +1087,8 @@ impl ConnectorBatchReader for HdfsFileBatchReader {
         }
         loop {
             if let Some(current) = self.current.as_mut() {
-                match current.next() {
-                    Some(Ok(chunk)) => {
-                        let batch = chunk.batch;
+                match current.next_batch()? {
+                    Some(batch) => {
                         if batch.num_rows() > self.max_rows
                             || batch.get_array_memory_size() > self.max_bytes
                         {
@@ -996,41 +1099,141 @@ impl ConnectorBatchReader for HdfsFileBatchReader {
                         }
                         return Ok(Some(batch));
                     }
-                    Some(Err(error)) => {
-                        return Err(ConnectorError::new(ConnectorErrorKind::Internal, error));
+                    None => {
+                        current.close()?;
+                        self.current = None;
                     }
-                    None => self.current = None,
                 }
             }
             let Some(range) = self.ranges.pop_front() else {
                 self.closed = true;
                 return Ok(None);
             };
-            self.current = Some(
-                build_hdfs_range_iter(&self.cfg, range, None, None)
-                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?,
-            );
+            self.current = Some(self.open_range(range)?);
         }
     }
 
     fn close(&mut self) -> Result<(), ConnectorError> {
+        self.file_context.cancellation.cancel();
+        if let Some(current) = self.current.as_mut() {
+            current.close()?;
+        }
         self.current = None;
         self.ranges.clear();
+        if let Some(mut watch) = self.cancellation_watch.take() {
+            watch.abort();
+        }
         self.closed = true;
         Ok(())
+    }
+}
+
+impl Drop for HdfsFileBatchReader {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn map_file_error(error: FileError) -> ConnectorError {
+    let kind = match error.kind() {
+        FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
+        FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
+        FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
+        FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
+        FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
+        FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
+        FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
+        FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
+        FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
+        FileErrorKind::Internal => ConnectorErrorKind::Internal,
+    };
+    let mapped = ConnectorError::new(kind, error.to_string());
+    if error.kind() == FileErrorKind::Transient {
+        mapped.with_retryable_before_progress()
+    } else {
+        mapped
+    }
+}
+
+#[cfg(test)]
+mod file_read_contract_tests {
+    use super::*;
+
+    fn assert_error_mapping(file_kind: FileErrorKind, connector_kind: ConnectorErrorKind) {
+        let mapped = map_file_error(FileError::new(file_kind, "contract"));
+        assert_eq!(mapped.kind(), connector_kind);
+    }
+
+    #[test]
+    fn file_read_maps_invalid_error() {
+        assert_error_mapping(FileErrorKind::Invalid, ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn file_read_maps_unsupported_error() {
+        assert_error_mapping(FileErrorKind::Unsupported, ConnectorErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn file_read_maps_not_found_error() {
+        assert_error_mapping(FileErrorKind::NotFound, ConnectorErrorKind::NotFound);
+    }
+
+    #[test]
+    fn file_read_maps_permission_error() {
+        assert_error_mapping(
+            FileErrorKind::Permission,
+            ConnectorErrorKind::PermissionDenied,
+        );
+    }
+
+    #[test]
+    fn file_read_maps_corrupt_error() {
+        assert_error_mapping(FileErrorKind::Corrupt, ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn file_read_maps_resource_error() {
+        assert_error_mapping(
+            FileErrorKind::ResourceExhausted,
+            ConnectorErrorKind::ResourceExhausted,
+        );
+    }
+
+    #[test]
+    fn file_read_maps_cancelled_error() {
+        assert_error_mapping(FileErrorKind::Cancelled, ConnectorErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn file_read_maps_deadline_error() {
+        assert_error_mapping(
+            FileErrorKind::DeadlineExceeded,
+            ConnectorErrorKind::DeadlineExceeded,
+        );
+    }
+
+    #[test]
+    fn file_read_maps_transient_error_as_retryable_unavailable() {
+        let mapped = map_file_error(FileError::new(FileErrorKind::Transient, "retry"));
+        assert_eq!(mapped.kind(), ConnectorErrorKind::Unavailable);
+        assert!(mapped.retryable_before_progress());
+    }
+
+    #[test]
+    fn file_read_maps_internal_error() {
+        assert_error_mapping(FileErrorKind::Internal, ConnectorErrorKind::Internal);
     }
 }
 
 /// Provider-private Iceberg delete-file loader. It keeps credential resolution
 /// in the HDFS provider while the core scan runner owns delete filtering.
 pub(crate) struct HdfsDeleteAuxiliary {
-    object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
 }
 
 impl HdfsDeleteAuxiliary {
-    pub(crate) fn new(
-        object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
-    ) -> Self {
+    pub(crate) fn new(object_store_config: Option<novarocks_fs::ObjectStoreConfig>) -> Self {
         Self {
             object_store_config,
         }
@@ -1043,7 +1246,7 @@ impl HdfsDeleteAuxiliary {
         (
             String,
             Vec<IcebergDeleteFileSpec>,
-            crate::fs::scan_context::FileScanContext,
+            crate::connector::file_execution::FileScanContext,
         ),
         String,
     > {
@@ -1107,7 +1310,7 @@ impl ConnectorReadAuxiliary for HdfsDeleteAuxiliary {
             return Ok(None);
         }
         let (data_file_path, delete_specs, context) = self.normalized_delete_specs(range)?;
-        let deleted = load_position_deletes(&delete_specs, &data_file_path, &context.factory)?;
+        let deleted = load_position_deletes(&delete_specs, &data_file_path, &context.access)?;
         Ok((!deleted.is_empty()).then_some(deleted))
     }
 
@@ -1126,7 +1329,7 @@ impl ConnectorReadAuxiliary for HdfsDeleteAuxiliary {
         let (_, delete_specs, context) = self.normalized_delete_specs(range)?;
         let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
             &delete_specs,
-            &context.factory,
+            &context.access,
         )?;
         Ok((!sets.is_empty()).then_some(sets))
     }
@@ -1596,6 +1799,7 @@ mod tests {
     use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+    use crate::connector::file_execution::FileScanRange;
     use crate::connector::iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
@@ -1617,7 +1821,6 @@ mod tests {
     use crate::formats::parquet::{
         ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
     };
-    use crate::fs::scan_context::FileScanRange;
     use crate::runtime_filter::exec::ordered_range_predicate::{
         NativeOrderedRangePredicate, OrderedRangePredicateContract,
     };

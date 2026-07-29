@@ -188,7 +188,7 @@ fn file_cache_flags_from_query_options(query_opts: &QueryOptions) -> (bool, bool
 fn resolve_cloud_object_store_config<S>(
     cloud_props: Option<&std::collections::BTreeMap<S, S>>,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
-) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String>
+) -> Result<Option<novarocks_fs::ObjectStoreConfig>, String>
 where
     S: std::borrow::Borrow<str> + Ord,
 {

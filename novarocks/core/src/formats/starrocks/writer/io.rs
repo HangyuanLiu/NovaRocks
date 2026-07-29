@@ -19,7 +19,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::formats::starrocks::fs_access::resolve_format_path;
-use crate::fs::access::FsScheme;
+use novarocks_fs::FsScheme;
 use opendal::ErrorKind;
 
 pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<(), String> {

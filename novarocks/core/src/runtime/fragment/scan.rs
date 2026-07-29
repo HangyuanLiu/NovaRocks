@@ -145,6 +145,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::common::types::UniqueId;
+    use crate::connector::file_execution::FileScanRange;
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::{
         FragmentContractVersion, FragmentNodeId, FragmentProgram, FragmentProgramOptions,
@@ -156,7 +157,6 @@ mod tests {
         ScanSource,
     };
     use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind, ExecPlan};
-    use crate::fs::scan_context::FileScanRange;
     use crate::runtime::fragment::error::{FragmentLaunchErrorKind, FragmentLaunchStage};
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,

@@ -685,7 +685,7 @@ impl ConnectorRead for IcebergConnectorInstance {
             request.context,
             request.batch.max_rows.get(),
             request.batch.max_bytes.get(),
-        )))
+        )?))
     }
 }
 

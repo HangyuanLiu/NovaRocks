@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use novarocks_fs::{
     FileBytesFuture, FileCancellation, FileErrorKind, FileFormat, FileIoRuntime, FileProjection,
-    FileResult, FileTask, FileTaskFuture, FileTaskSpawner, open_file_reader,
+    FileResult, FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future, open_file_reader,
 };
 
 use common::Fixture;
@@ -78,6 +78,10 @@ impl FileIoRuntime for ControlledIo {
         if self.armed.load(Ordering::Acquire) {
             self.cancellation.cancel();
         }
+        self.runtime.block_on(future)
+    }
+
+    fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64> {
         self.runtime.block_on(future)
     }
 }
