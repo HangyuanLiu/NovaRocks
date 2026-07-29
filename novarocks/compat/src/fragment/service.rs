@@ -35,8 +35,8 @@ use novarocks::protocol::starrocks::decode::{
 };
 use novarocks::runtime::exchange;
 use novarocks::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
-    SyncFragmentExecutor,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentReportRegistration,
+    FragmentResultWriter, FragmentTerminalReport, SyncFragmentExecutor,
 };
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
@@ -50,7 +50,6 @@ use novarocks::runtime::starrocks_fragment_query::{
     StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentPreStartHandoff,
     StarRocksFragmentQueryRuntime,
 };
-use novarocks::service::fe_report;
 use novarocks::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
 use crate::fragment::admission::{
@@ -58,6 +57,7 @@ use crate::fragment::admission::{
     PrelaunchRegistry,
 };
 use crate::fragment::dependency::resolve_dependencies;
+use crate::report::{self, CompatReportService};
 
 pub struct CompatFragmentService {
     queries: StarRocksFragmentQueryRuntime,
@@ -68,15 +68,16 @@ pub struct CompatFragmentService {
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
+    report_service: Arc<CompatReportService>,
 }
 
 impl CompatFragmentService {
-    pub fn new(
+    pub(crate) fn new(
         queries: StarRocksFragmentQueryRuntime,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
-        event_sink: Arc<dyn FragmentEventSink>,
+        report_service: Arc<CompatReportService>,
     ) -> Self {
         Self {
             queries,
@@ -86,7 +87,8 @@ impl CompatFragmentService {
             exchange_transmitter,
             lookup_client,
             result_writer,
-            event_sink,
+            event_sink: crate::fragment::compat_fragment_event_sink(Arc::clone(&report_service)),
+            report_service,
         }
     }
 
@@ -939,6 +941,7 @@ fn launch_prepared_fragments(
         queries.clone(),
         Arc::clone(&service.controls),
         Arc::clone(&start_gate),
+        Arc::clone(&service.report_service),
     )?;
     let worker_finst_ids = workers
         .iter()
@@ -979,10 +982,11 @@ fn launch_prepared_fragments(
         &committed_query_mem_tracker,
         &admission.query_mem_tracker()
     ));
-    let registered_reports = match register_fragment_reports(&workers, execution) {
+    let registered_reports = match register_fragment_reports(service, &workers, execution) {
         Ok(registered) => registered,
         Err((error, registered)) => {
             rollback_committed_launch(
+                &service.report_service,
                 workers,
                 &start_gate,
                 pre_start.take().expect("committed pre-start handoff"),
@@ -1000,6 +1004,7 @@ fn launch_prepared_fragments(
             .start();
     }) {
         rollback_committed_launch(
+            &service.report_service,
             workers,
             &start_gate,
             pre_start.take().expect("aborted pre-start handoff"),
@@ -1017,6 +1022,7 @@ fn launch_prepared_fragments(
 }
 
 fn register_fragment_reports(
+    service: &CompatFragmentService,
     workers: &[DormantWorker],
     execution: StarRocksFragmentExecution,
 ) -> Result<Vec<UniqueId>, (String, Vec<UniqueId>)> {
@@ -1038,31 +1044,35 @@ fn register_fragment_reports(
         }
         match worker.report_destination.as_ref() {
             Some(StarRocksReportDestination::NovaRocks(endpoint)) => {
-                fe_report::register_novarocks_instance(
-                    worker.finst_id,
-                    query_id,
+                report::register_novarocks_report(
+                    FragmentReportRegistration::new(
+                        worker.finst_id,
+                        query_id,
+                        worker.backend_num,
+                        worker.enable_profile,
+                        worker.profiler.clone(),
+                        Some(Arc::clone(&worker.fragment_mem_tracker)),
+                        Some(Arc::clone(&worker.query_mem_tracker)),
+                        worker.report_interval_ns,
+                    ),
                     endpoint.clone(),
-                    worker.backend_num,
-                    worker.enable_profile,
-                    worker.profiler.clone(),
-                    Some(Arc::clone(&worker.fragment_mem_tracker)),
-                    Some(Arc::clone(&worker.query_mem_tracker)),
-                    worker.report_interval_ns,
                 );
                 registered.push(worker.finst_id);
                 record_report_registration(query_id, worker.finst_id);
             }
             Some(StarRocksReportDestination::Coordinator(endpoint)) => {
-                fe_report::register_instance(
-                    worker.finst_id,
-                    query_id,
+                service.report_service.register(
+                    FragmentReportRegistration::new(
+                        worker.finst_id,
+                        query_id,
+                        worker.backend_num,
+                        worker.enable_profile,
+                        worker.profiler.clone(),
+                        Some(Arc::clone(&worker.fragment_mem_tracker)),
+                        Some(Arc::clone(&worker.query_mem_tracker)),
+                        worker.report_interval_ns,
+                    ),
                     types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port()),
-                    worker.backend_num,
-                    worker.enable_profile,
-                    worker.profiler.clone(),
-                    Some(Arc::clone(&worker.fragment_mem_tracker)),
-                    Some(Arc::clone(&worker.query_mem_tracker)),
-                    worker.report_interval_ns,
                 );
                 registered.push(worker.finst_id);
                 record_report_registration(query_id, worker.finst_id);
@@ -1077,21 +1087,44 @@ fn register_fragment_reports(
     Ok(registered)
 }
 
-fn unregister_fragment_reports(query_id: QueryId, registered: &[UniqueId]) {
+fn unregister_fragment_reports(
+    report_service: &CompatReportService,
+    query_id: QueryId,
+    workers: &[DormantWorker],
+    registered: &[UniqueId],
+) {
     for finst_id in registered.iter().rev() {
-        fe_report::unregister_instance(*finst_id);
+        match workers
+            .iter()
+            .find(|worker| worker.finst_id == *finst_id)
+            .and_then(|worker| worker.report_destination.as_ref())
+        {
+            Some(StarRocksReportDestination::NovaRocks(_)) => {
+                report::unregister_novarocks_report(*finst_id);
+            }
+            Some(StarRocksReportDestination::Coordinator(_)) => {
+                report_service.unregister(*finst_id);
+            }
+            None => {}
+        }
         record_report_unregistration(query_id, *finst_id);
     }
 }
 
 fn rollback_committed_launch(
+    report_service: &CompatReportService,
     workers: Vec<DormantWorker>,
     start_gate: &BatchStartGate,
     pre_start: StarRocksFragmentPreStartHandoff,
     pending_routes: PendingFragmentRoutes,
     registered_reports: &[UniqueId],
 ) {
-    unregister_fragment_reports(pre_start.execution().query_id(), registered_reports);
+    unregister_fragment_reports(
+        report_service,
+        pre_start.execution().query_id(),
+        &workers,
+        registered_reports,
+    );
     let rolled_back = pre_start.rollback();
     debug_assert!(
         rolled_back,
@@ -1396,6 +1429,7 @@ fn spawn_dormant_workers(
     queries: StarRocksFragmentQueryRuntime,
     controls: Arc<CompatFragmentControls>,
     start_gate: Arc<BatchStartGate>,
+    report_service: Arc<CompatReportService>,
 ) -> Result<Vec<DormantWorker>, String> {
     let mut workers: Vec<DormantWorker> = Vec::with_capacity(launches.len());
     for launch in launches {
@@ -1405,6 +1439,8 @@ fn spawn_dormant_workers(
         let queries = queries.clone();
         let controls = Arc::clone(&controls);
         let worker_start_gate = Arc::clone(&start_gate);
+        let report_service = Arc::clone(&report_service);
+        let report_destination = launch.report_destination.clone();
         let join = match std::thread::Builder::new()
             .name(format!(
                 "compat-fragment-{:x}-{:x}",
@@ -1477,11 +1513,19 @@ fn spawn_dormant_workers(
                     },
                     || queries.finish_fragment_for_report(execution),
                     |error, decision| {
-                        fe_report::report_fragment_done(
-                            finst_id,
+                        let terminal = FragmentTerminalReport::new(
                             error,
                             decision.include_runtime_filter_profile(),
                         );
+                        match report_destination.as_ref() {
+                            Some(StarRocksReportDestination::NovaRocks(_)) => {
+                                report::report_novarocks_terminal(finst_id, terminal);
+                            }
+                            Some(StarRocksReportDestination::Coordinator(_)) => {
+                                report_service.report_terminal(finst_id, terminal);
+                            }
+                            None => {}
+                        }
                     },
                     || exchange::remove_fragment(finst_id.hi, finst_id.lo),
                     || queries.unregister_fragment(finst_id, execution),
@@ -2011,7 +2055,7 @@ mod tests {
             crate::fragment::brpc_exchange_transmitter(),
             crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
-            crate::fragment::compat_fragment_event_sink(),
+            crate::report::new_report_service(),
         )
     }
 
@@ -2295,7 +2339,7 @@ mod tests {
             crate::fragment::brpc_exchange_transmitter(),
             crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
-            crate::fragment::compat_fragment_event_sink(),
+            crate::report::new_report_service(),
         ));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -2345,7 +2389,7 @@ mod tests {
             crate::fragment::brpc_exchange_transmitter(),
             crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
-            crate::fragment::compat_fragment_event_sink(),
+            crate::report::new_report_service(),
         ));
         let execution_service = Arc::clone(&service);
         let payload = thrift_binary_serialize(&blocking_exchange_request(query, finst))

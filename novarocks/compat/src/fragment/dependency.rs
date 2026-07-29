@@ -67,7 +67,7 @@ pub(crate) fn resolve_dependencies(
         token,
         |endpoint, query_id| {
             let address = TNetworkAddress::new(endpoint.host().to_string(), endpoint.port());
-            novarocks::service::fe_report::fetch_query_profile(&address, query_id)
+            crate::report::fetch_query_profile(&address, query_id)
         },
         |request| novarocks::connector::starrocks::resolve_lake_meta_storage(request),
     )

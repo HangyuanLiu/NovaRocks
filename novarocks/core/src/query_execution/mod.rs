@@ -26,6 +26,7 @@ pub mod contract;
 pub mod contract_test_support;
 pub mod control;
 pub mod fragment_transport;
+pub mod native_fragment_report;
 pub(crate) mod outcome;
 pub(crate) mod preparation;
 pub(crate) mod profile;

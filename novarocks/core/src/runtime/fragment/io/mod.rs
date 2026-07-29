@@ -4,6 +4,7 @@ pub mod exchange;
 pub(crate) mod exchange_metrics;
 pub(crate) mod exchange_queue;
 pub mod lookup;
+pub mod report;
 pub mod result;
 pub mod result_format;
 pub mod sync;
@@ -17,6 +18,9 @@ pub use exchange::{ExchangeFrame, ExchangeFrameTransmitter};
 pub use lookup::{
     FragmentLookupClient, LookupBatch, LookupColumn, LookupKind, LookupRequest, LookupTarget,
     UnavailableFragmentLookupClient,
+};
+pub use report::{
+    FragmentReportHandle, FragmentReportRegistration, FragmentReportSink, FragmentTerminalReport,
 };
 pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,

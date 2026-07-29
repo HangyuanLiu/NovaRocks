@@ -11,7 +11,9 @@ struct NativeFragmentEventSink;
 impl FragmentEventSink for NativeFragmentEventSink {
     fn record(&self, event: FragmentEvent) {
         if let FragmentEvent::Progress(progress) = event {
-            novarocks::service::fe_report::report_exec_state(progress.fragment_instance_id());
+            novarocks::query_execution::native_fragment_report::report_progress(
+                progress.fragment_instance_id(),
+            );
         }
     }
 }

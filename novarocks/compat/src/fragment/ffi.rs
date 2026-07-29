@@ -117,7 +117,7 @@ mod tests {
             crate::fragment::brpc_exchange_transmitter(),
             crate::fragment::brpc_fragment_lookup_client(),
             crate::fragment::compat_result_writer(),
-            crate::fragment::compat_fragment_event_sink(),
+            crate::report::new_report_service(),
         );
         let context = std::ptr::from_ref(&service).cast();
         let malformed_payload = [0_u8];

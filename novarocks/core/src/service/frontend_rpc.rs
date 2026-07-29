@@ -598,6 +598,60 @@ impl FrontendRpcManager {
     }
 }
 
+/// Narrow StarRocks FE operations used by compat-owned protocol adapters.
+/// The pooled Thrift client remains private to the core transport owner.
+pub fn fetch_query_profile(
+    coord: &types::TNetworkAddress,
+    query_id: &str,
+) -> Result<String, String> {
+    let request =
+        crate::thrift::frontend_service::TGetProfileRequest::new(Some(vec![query_id.to_string()]));
+    let result = FrontendRpcManager::shared()
+        .call(FrontendRpcKind::SchemaQuery, coord, |client| {
+            client
+                .get_query_profile(request.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map_err(|error| format!("getQueryProfile RPC failed: {error}"))?;
+    if let Some(status) = result.status
+        && status.status_code != crate::thrift::status_code::TStatusCode::OK
+    {
+        return Err(format!("FE returned error: {status:?}"));
+    }
+    Ok(result
+        .query_result
+        .and_then(|mut profiles| profiles.drain(..).next())
+        .unwrap_or_default())
+}
+
+pub fn batch_report_exec_status(
+    coord: &types::TNetworkAddress,
+    params: crate::thrift::frontend_service::TBatchReportExecStatusParams,
+) -> Result<Option<Vec<crate::thrift::status::TStatus>>, String> {
+    FrontendRpcManager::shared()
+        .call(FrontendRpcKind::ExecStatus, coord, |client| {
+            client
+                .batch_report_exec_status(params.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map(|response| response.status_list)
+        .map_err(|error| error.to_string())
+}
+
+pub fn report_exec_status(
+    coord: &types::TNetworkAddress,
+    params: crate::thrift::frontend_service::TReportExecStatusParams,
+) -> Result<Option<crate::thrift::status::TStatus>, String> {
+    FrontendRpcManager::shared()
+        .call(FrontendRpcKind::ExecStatus, coord, |client| {
+            client
+                .report_exec_status(params.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map(|response| response.status)
+        .map_err(|error| error.to_string())
+}
+
 pub fn init_frontend_rpc_manager() {
     let _ = FrontendRpcManager::shared();
 }
