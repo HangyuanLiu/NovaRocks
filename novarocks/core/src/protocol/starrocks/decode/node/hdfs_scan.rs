@@ -48,7 +48,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
 };
-use crate::novarocks_connectors::{ConnectorRegistry, FileFormatConfig, FileScanRange, OrcScanConfig, ParquetScanConfig};
+use crate::novarocks_connectors::{ConnectorRegistry, FileFormatConfig, OrcScanConfig, ParquetScanConfig};
 use crate::novarocks_logging::{debug, warn};
 use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thrift;
 use crate::protocol::starrocks::decode::layout::{Layout, layout_from_slot_ids};
@@ -79,22 +79,26 @@ impl ConnectorCancellation for CompatIcebergQueryCancellation {
     }
 }
 
-fn compat_iceberg_files_from_ranges(
+fn compat_iceberg_file_from_wire(
     node_id: i32,
-    ranges: Vec<FileScanRange>,
-) -> Result<Vec<IcebergDataFileInfo>, String> {
-    ranges
+    path: String,
+    file_len: u64,
+    offset: u64,
+    length: u64,
+    first_row_id: Option<i64>,
+    data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
+    included_positions: Option<Vec<i64>>,
+    delete_files: Vec<IcebergDeleteFileSpec>,
+) -> Result<IcebergDataFileInfo, String> {
+    if offset != 0 || (length != 0 && length != file_len) {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={node_id} Iceberg compatibility scan range must cover one complete data file"
+        ));
+    }
+    let delete_files = delete_files
         .into_iter()
-        .map(|range| {
-            if range.offset != 0 || (range.length != 0 && range.length != range.file_len) {
-                return Err(format!(
-                    "HDFS_SCAN_NODE node_id={node_id} Iceberg compatibility scan range must cover one complete data file"
-                ));
-            }
-            let delete_files = range
-                .delete_files
-                .into_iter()
-                .map(|delete| Ok(IcebergDeleteFileInfo {
+        .map(|delete| Ok(IcebergDeleteFileInfo {
                     path: delete.path,
                     file_format: match delete.file_format {
                         IcebergFileFormat::Parquet => IcebergDeleteFileFormat::Parquet,
@@ -118,25 +122,23 @@ fn compat_iceberg_files_from_ranges(
                     partition_key: None,
                     equality_column_names: Vec::new(),
                     equality_field_ids: Vec::new(),
-                }))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(IcebergDataFileInfo {
-                path: range.path,
-                size: i64::try_from(range.file_len).map_err(|_| "Iceberg data file length exceeds Int64")?,
-                row_count: None,
-                column_stats: None,
-                partition_spec_id: None,
-                partition_key: None,
-                first_row_id: range.first_row_id,
-                data_sequence_number: range.data_sequence_number,
-                ivm_change_op: range.ivm_change_op,
-                included_positions: range.included_positions,
-                delete_files,
-                manifest_path: None,
-                partition_values: Vec::new(),
-            })
-        })
-        .collect()
+        }))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IcebergDataFileInfo {
+        path,
+        size: i64::try_from(file_len).map_err(|_| "Iceberg data file length exceeds Int64")?,
+        row_count: None,
+        column_stats: None,
+        partition_spec_id: None,
+        partition_key: None,
+        first_row_id,
+        data_sequence_number,
+        ivm_change_op,
+        included_positions,
+        delete_files,
+        manifest_path: None,
+        partition_values: Vec::new(),
+    })
 }
 
 struct CompatIcebergDataReadPlan {
@@ -276,82 +278,6 @@ fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
         PARQUET_FIELD_ID_META_KEY.to_string(),
         field_id.to_string(),
     )]))
-}
-
-fn apply_path_rewrite(
-    ranges: &mut [FileScanRange],
-    rewrite: Option<&crate::protocol::starrocks::decode::instance::StarRocksPathRewriteFacts>,
-) -> Result<(), String> {
-    let Some(rewrite) = rewrite else {
-        return Ok(());
-    };
-
-    let from = rewrite.from_prefix().trim();
-    let to = rewrite.to_prefix().trim();
-    if from.is_empty() || to.is_empty() {
-        return Err(
-            "path rewrite enabled but runtime.path_rewrite.from_prefix/to_prefix is empty"
-                .to_string(),
-        );
-    }
-    if !to.starts_with('/') {
-        return Err(format!(
-            "path rewrite to_prefix must be absolute path, got: {}",
-            to
-        ));
-    }
-
-    let from = from.trim_end_matches('/');
-    let to = to.trim_end_matches('/');
-
-    let mut matched = 0usize;
-    let mut rewritten = Vec::with_capacity(ranges.len());
-    for range in ranges.iter() {
-        let original = range.path.trim();
-        if let Some(rest) = original.strip_prefix(from) {
-            let rest = rest.trim_start_matches('/');
-            let new_path = if rest.is_empty() {
-                to.to_string()
-            } else {
-                format!("{}/{}", to, rest)
-            };
-            rewritten.push(Some((original.to_string(), new_path)));
-            matched += 1;
-        } else {
-            rewritten.push(None);
-        }
-    }
-
-    if matched != ranges.len() {
-        let first_unmatched = ranges
-            .iter()
-            .map(|r| r.path.trim())
-            .find(|p| !p.starts_with(from))
-            .unwrap_or("<unknown>");
-        return Err(format!(
-            "path rewrite enabled but not all paths match prefix: prefix={} first_unmatched={}",
-            from, first_unmatched
-        ));
-    }
-
-    for (range, item) in ranges.iter_mut().zip(rewritten.into_iter()) {
-        let Some((original, new_path)) = item else {
-            continue;
-        };
-        debug!("HDFS_SCAN path rewrite: {} -> {}", original, new_path);
-        range.path = new_path;
-    }
-
-    Ok(())
-}
-
-fn scan_ranges_have_position_delete_files(ranges: &[FileScanRange]) -> bool {
-    ranges.iter().any(|range| {
-        range
-            .delete_files
-            .iter()
-            .any(|delete_file| delete_file.file_content == IcebergFileContent::PositionDeletes)
-    })
 }
 
 fn file_cache_flags_from_query_options(query_opts: &QueryOptions) -> (bool, bool) {
@@ -1207,7 +1133,7 @@ pub(crate) fn lower_hdfs_scan_node(
     // iceberg-rust's `TableMetadata`. The SPI reader rejects flavors the native path does
     // not yet implement (Files / Manifests / LogicalIcebergMetadata).
     let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
-    let mut ranges: Vec<FileScanRange> = Vec::new();
+    let mut iceberg_files: Vec<IcebergDataFileInfo> = Vec::new();
     let mut iceberg_metadata_ranges: Vec<IcebergMetadataScanRange> = Vec::new();
     let mut has_more = false;
     let mut scan_format: Option<descriptors::THdfsFileFormat> = None;
@@ -1392,35 +1318,6 @@ pub(crate) fn lower_hdfs_scan_node(
         } else {
             None
         };
-        let external_datacache = {
-            let range_datacache_options = hdfs_range.datacache_options.as_ref();
-            let candidate_node = hdfs_range
-                .candidate_node
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let options = ExternalDataCacheRangeOptions {
-                modification_time: hdfs_range.modification_time,
-                enable_populate_datacache: range_datacache_options
-                    .and_then(|opts| opts.enable_populate_datacache),
-                datacache_priority: range_datacache_options.and_then(|opts| opts.priority),
-                candidate_node,
-            };
-            if options.modification_time.is_some()
-                || options.enable_populate_datacache.is_some()
-                || options.datacache_priority.is_some()
-                || options.candidate_node.is_some()
-            {
-                // Validate range-level cache options early in lowering.
-                let _ = cache_options.with_external_range_options(Some(&options))?;
-                Some(options)
-            } else {
-                None
-            }
-        };
-        let iceberg_file_pruning = None;
-
         // data_sequence_number is populated from THdfsScanRange field 38
         // when the NovaRocks iceberg codegen path (standalone SQL) fills it in.
         // For FE-sent scan ranges that do not carry field 38, this will be
@@ -1435,22 +1332,8 @@ pub(crate) fn lower_hdfs_scan_node(
             ));
         }
 
-        if let Some(fp) = hdfs_range.full_path.as_ref().filter(|s| !s.is_empty()) {
-            ranges.push(FileScanRange {
-                path: fp.clone(),
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions: (!hdfs_range.included_positions.is_empty())
-                    .then(|| hdfs_range.included_positions.clone()),
-                external_datacache: external_datacache.clone(),
-                delete_files: iceberg_delete_files.clone(),
-                iceberg_file_pruning: iceberg_file_pruning.clone(),
-            });
+        let path = if let Some(fp) = hdfs_range.full_path.as_ref().filter(|s| !s.is_empty()) {
+            fp.clone()
         } else if let Some(rp) = hdfs_range.relative_path.as_ref().filter(|s| !s.is_empty()) {
             let table_id = hdfs_range.table_id.ok_or_else(|| {
                 format!(
@@ -1466,22 +1349,26 @@ pub(crate) fn lower_hdfs_scan_node(
             })?;
             let base = loc.trim_end_matches('/');
             let rel = rp.trim_start_matches('/');
-            ranges.push(FileScanRange {
-                path: format!("{base}/{rel}"),
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions: (!hdfs_range.included_positions.is_empty())
-                    .then(|| hdfs_range.included_positions.clone()),
-                external_datacache,
-                delete_files: iceberg_delete_files,
-                iceberg_file_pruning,
-            });
-        }
+            format!("{base}/{rel}")
+        } else {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={} Iceberg scan range requires full_path or relative_path",
+                node.node_id
+            ));
+        };
+        let _ = scan_range_id;
+        iceberg_files.push(compat_iceberg_file_from_wire(
+            node.node_id,
+            path,
+            file_len,
+            offset,
+            length,
+            first_row_id,
+            data_sequence_number,
+            ivm_change_op,
+            (!hdfs_range.included_positions.is_empty()).then(|| hdfs_range.included_positions.clone()),
+            iceberg_delete_files,
+        )?);
     }
     if let Some(metadata_table_type) = iceberg_metadata_table_type {
         let batch_size: usize = query_opts
@@ -1525,25 +1412,23 @@ pub(crate) fn lower_hdfs_scan_node(
             layout: out_layout,
         });
     }
-    let original_range_count = ranges.len();
-    apply_path_rewrite(&mut ranges, decode_facts.path_rewrite())?;
     if is_iceberg_table {
         let query_id = query_id.ok_or_else(|| {
             "HDFS_SCAN_NODE requires a query identity for connector cancellation".to_string()
         })?;
         let output_chunk_schema = chunk_schema_for_snapshot_layout(&out_layout, &slot_info_map)?;
         let row_position_ids = row_position_spec.as_ref().map(|_| {
-            ranges
+            iceberg_files
                 .iter()
-                .map(|range| range.scan_range_id)
+                .enumerate()
+                .map(|(index, _)| i32::try_from(index).unwrap_or(i32::MAX))
                 .collect::<Vec<_>>()
         });
-        let files = compat_iceberg_files_from_ranges(node.node_id, ranges)?;
         let planned = plan_compat_iceberg_data_read_source(
             connectors,
             query_id,
             output_chunk_schema.clone(),
-            files,
+            iceberg_files,
             row_position_ids,
             row_position_spec.as_ref(),
             query_opts,
@@ -1596,58 +1481,47 @@ mod tests {
 
     #[test]
     fn compat_iceberg_normalization_preserves_delete_and_lineage_facts() {
-        let files = compat_iceberg_files_from_ranges(
+        let file = compat_iceberg_file_from_wire(
             7,
-            vec![FileScanRange {
-                path: "s3://warehouse/data.parquet".to_string(),
-                file_len: 128,
-                offset: 0,
-                length: 128,
-                scan_range_id: -1,
-                first_row_id: Some(100),
-                data_sequence_number: Some(9),
-                ivm_change_op: None,
-                included_positions: Some(vec![4, 8]),
-                external_datacache: None,
-                delete_files: vec![IcebergDeleteFileSpec::puffin_position_delete(
-                    "s3://warehouse/delete.puffin".to_string(),
-                    Some(64),
-                    12,
-                    34,
-                )],
-                iceberg_file_pruning: None,
-            }],
+            "s3://warehouse/data.parquet".to_string(),
+            128,
+            0,
+            128,
+            Some(100),
+            Some(9),
+            None,
+            Some(vec![4, 8]),
+            vec![IcebergDeleteFileSpec::puffin_position_delete(
+                "s3://warehouse/delete.puffin".to_string(),
+                Some(64),
+                12,
+                34,
+            )],
         )
         .expect("normalize Iceberg compatibility facts");
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].first_row_id, Some(100));
-        assert_eq!(files[0].data_sequence_number, Some(9));
-        assert_eq!(files[0].included_positions, Some(vec![4, 8]));
-        assert_eq!(files[0].delete_files.len(), 1);
+        assert_eq!(file.first_row_id, Some(100));
+        assert_eq!(file.data_sequence_number, Some(9));
+        assert_eq!(file.included_positions, Some(vec![4, 8]));
+        assert_eq!(file.delete_files.len(), 1);
         assert_eq!(
-            files[0].delete_files[0].file_format,
+            file.delete_files[0].file_format,
             IcebergDeleteFileFormat::Puffin
         );
     }
 
     #[test]
     fn compat_iceberg_normalization_rejects_partial_data_file() {
-        let error = compat_iceberg_files_from_ranges(
+        let error = compat_iceberg_file_from_wire(
             8,
-            vec![FileScanRange {
-                path: "file:///tmp/data.parquet".to_string(),
-                file_len: 128,
-                offset: 64,
-                length: 64,
-                scan_range_id: -1,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            }],
+            "file:///tmp/data.parquet".to_string(),
+            128,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
         )
         .expect_err("partial compatibility range must not bypass Iceberg coordinates");
         assert!(error.contains("complete data file"));
