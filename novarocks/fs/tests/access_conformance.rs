@@ -1,0 +1,108 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use novarocks_fs::{
+    FileErrorKind, FileIdentity, FileReadRange, FsLocation, FsScheme, ObjectStoreConfig,
+};
+
+#[test]
+fn parses_local_path() {
+    let location = FsLocation::parse("/tmp/a.parquet").expect("local path");
+    assert_eq!(location.scheme(), FsScheme::Local);
+}
+
+#[test]
+fn parses_file_uri() {
+    let location = FsLocation::parse("file:///tmp/a.parquet").expect("file URI");
+    assert_eq!(location.scheme(), FsScheme::Local);
+    assert_eq!(location.path(), "/tmp/a.parquet");
+}
+
+#[test]
+fn parses_object_store_schemes() {
+    for location in [
+        "s3://bucket/a.parquet",
+        "s3a://bucket/a.parquet",
+        "oss://bucket/a.parquet",
+    ] {
+        assert_eq!(
+            FsLocation::parse(location).expect(location).scheme(),
+            FsScheme::ObjectStore
+        );
+    }
+}
+
+#[test]
+fn parses_hdfs_uri() {
+    let location = FsLocation::parse("hdfs://namenode/a.parquet").expect("hdfs URI");
+    assert_eq!(location.scheme(), FsScheme::Hdfs);
+    assert_eq!(location.authority(), Some("namenode"));
+}
+
+#[test]
+fn rejects_unsupported_scheme_with_structured_error() {
+    let error = FsLocation::parse("ftp://host/a.parquet").expect_err("unsupported");
+    assert_eq!(error.kind(), FileErrorKind::Unsupported);
+}
+
+#[test]
+fn bounded_range_rejects_zero_and_overflow() {
+    assert_eq!(
+        FileReadRange::bounded(0, 0).expect_err("zero").kind(),
+        FileErrorKind::Invalid
+    );
+    assert_eq!(
+        FileReadRange::bounded(u64::MAX, 1)
+            .expect_err("overflow")
+            .kind(),
+        FileErrorKind::Invalid
+    );
+}
+
+#[test]
+fn object_store_debug_redacts_secrets() {
+    let config = ObjectStoreConfig {
+        endpoint: "http://localhost:9000".to_string(),
+        access_key_id: "visible-key".to_string(),
+        access_key_secret: "visible-secret".to_string(),
+        session_token: Some("visible-token".to_string()),
+        enable_path_style_access: Some(true),
+        region: Some("us-east-1".to_string()),
+        retry_max_times: None,
+        retry_min_delay_ms: None,
+        retry_max_delay_ms: None,
+        timeout_ms: None,
+        io_timeout_ms: None,
+    };
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("visible-key"));
+    assert!(!debug.contains("visible-secret"));
+    assert!(!debug.contains("visible-token"));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn file_identity_cache_tail_is_stable() {
+    let identity = FileIdentity::new("a.parquet", 42, None);
+    assert_eq!(identity.starrocks_cache_tail(), 42);
+    assert_eq!(
+        identity
+            .with_modification_time_override(Some(512 << 9))
+            .starrocks_cache_tail(),
+        512
+    );
+}

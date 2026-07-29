@@ -3313,6 +3313,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-fs"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "opendal",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
