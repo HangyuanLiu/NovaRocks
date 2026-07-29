@@ -2273,7 +2273,11 @@ fn collect_set_user_variable_assignments(
     Ok(())
 }
 
-pub(crate) fn substitute_user_variables(
+/// Substitute frontend-session user variables before SQL compilation.
+///
+/// The frontend owns connection state; the parser owns SQL-token-aware
+/// substitution so router code does not reimplement lexical rules.
+pub fn substitute_user_variables(
     sql: &str,
     assignments: &[(String, String)],
 ) -> Result<String, String> {

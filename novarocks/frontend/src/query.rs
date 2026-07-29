@@ -17,12 +17,13 @@
 
 //! Frontend-owned SQL session admission and routing boundary.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
-use novarocks::engine::{StandaloneNovaRocks, StatementResult};
+use novarocks::engine::{PreparedQueryOperation, StandaloneNovaRocks, StatementResult};
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
 use novarocks::query_execution::control::{
@@ -32,9 +33,10 @@ use novarocks::query_execution::control::{
 use novarocks::query_execution::request_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
+use novarocks::query_execution::service::QueryExecutionService;
 use novarocks::query_execution::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
-    QuerySessionOpenRequest,
+    QuerySessionOpenRequest, SessionExecutionSettings,
 };
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
@@ -47,6 +49,7 @@ const DEFAULT_CATALOG: &str = "default_catalog";
 pub struct FrontendQueryService {
     engine: StandaloneNovaRocks,
     query_control: QueryControlService,
+    query_execution: QueryExecutionService,
     role: ClusterRole,
     topology: BackendTopologyService,
 }
@@ -55,12 +58,14 @@ impl FrontendQueryService {
     pub fn new(
         engine: StandaloneNovaRocks,
         query_control: QueryControlService,
+        query_execution: QueryExecutionService,
         role: ClusterRole,
         topology: BackendTopologyService,
     ) -> Self {
         Self {
             engine,
             query_control,
+            query_execution,
             role,
             topology,
         }
@@ -100,8 +105,9 @@ impl QuerySessionFactory for FrontendQueryService {
 struct FrontendSessionState {
     current_catalog: Option<String>,
     current_database: String,
-    query_timeout_secs: Option<u64>,
+    execution_settings: SessionExecutionSettings,
     optimizer_settings: SessionOptimizerSettings,
+    user_variables: BTreeMap<String, String>,
 }
 
 impl Default for FrontendSessionState {
@@ -109,8 +115,9 @@ impl Default for FrontendSessionState {
         Self {
             current_catalog: None,
             current_database: DEFAULT_DATABASE.to_string(),
-            query_timeout_secs: None,
+            execution_settings: SessionExecutionSettings::default(),
             optimizer_settings: SessionOptimizerSettings::default(),
+            user_variables: BTreeMap::new(),
         }
     }
 }
@@ -201,6 +208,14 @@ impl FrontendQuerySession {
         let Some((raw_name, raw_value)) = assignment.split_once('=') else {
             return Ok(true);
         };
+        if raw_name.trim().starts_with('@') && !raw_name.trim().starts_with("@@") {
+            let mut state = self.state.lock().map_err(poisoned_state)?;
+            state.user_variables.insert(
+                raw_name.trim().to_ascii_lowercase(),
+                raw_value.trim().to_string(),
+            );
+            return Ok(true);
+        }
         let name = raw_name
             .trim()
             .trim_start_matches("@@")
@@ -230,25 +245,72 @@ impl FrontendQuerySession {
                         "invalid query_timeout",
                     )
                 })?;
-                state.query_timeout_secs = (seconds > 0).then_some(seconds);
+                state.execution_settings.set_query_timeout_secs(seconds);
+            }
+            "group_concat_max_len" => {
+                let value = value.parse::<i64>().map_err(|_| {
+                    QueryServiceError::new(
+                        QueryServiceErrorKind::InvalidValue,
+                        "invalid group_concat_max_len",
+                    )
+                })?;
+                state.execution_settings.set_group_concat_max_len(value)?;
+            }
+            "pipeline_dop" => {
+                let value = value.parse::<i32>().map_err(|_| {
+                    QueryServiceError::new(
+                        QueryServiceErrorKind::InvalidValue,
+                        "invalid pipeline_dop",
+                    )
+                })?;
+                state.execution_settings.set_pipeline_dop(value);
+            }
+            "runtime_filter_scan_wait_time" => {
+                let value = value.parse::<i64>().map_err(|_| {
+                    QueryServiceError::new(
+                        QueryServiceErrorKind::InvalidValue,
+                        "invalid runtime_filter_scan_wait_time",
+                    )
+                })?;
+                state
+                    .execution_settings
+                    .set_runtime_filter_scan_wait_time_ms(value)?;
+            }
+            "global_runtime_filter_wait_timeout" => {
+                let value = value.parse::<i32>().map_err(|_| {
+                    QueryServiceError::new(
+                        QueryServiceErrorKind::InvalidValue,
+                        "invalid global_runtime_filter_wait_timeout",
+                    )
+                })?;
+                state
+                    .execution_settings
+                    .set_runtime_filter_wait_timeout_ms(value)?;
             }
             "disable_optimizer_rules" | "cbo_disabled_rules" => {
-                state.optimizer_settings.disabled_rules = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|rule| !rule.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect();
+                state.optimizer_settings.set_disabled_rules(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|rule| !rule.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                );
             }
             "enable_eliminate_agg" => {
-                state.optimizer_settings.enable_eliminate_agg = parse_bool(value)?;
+                state
+                    .optimizer_settings
+                    .set_enable_eliminate_agg(parse_bool(value)?);
             }
             "enable_ukfk_opt" => {
-                state.optimizer_settings.enable_ukfk_opt = parse_bool(value)?;
+                state
+                    .optimizer_settings
+                    .set_enable_ukfk_opt(parse_bool(value)?);
             }
             "cbo_broadcast_backend_count" => {
-                state.optimizer_settings.cbo_broadcast_backend_count =
-                    Some(value.parse().map_err(|_| {
+                state
+                    .optimizer_settings
+                    .set_broadcast_backend_count(value.parse().map_err(|_| {
                         QueryServiceError::new(
                             QueryServiceErrorKind::InvalidValue,
                             "invalid cbo_broadcast_backend_count",
@@ -262,6 +324,13 @@ impl FrontendQuerySession {
 
     async fn execute_admitted(&self, sql: String) -> Result<StatementResult, QueryServiceError> {
         let state = self.state.lock().map_err(poisoned_state)?.clone();
+        let assignments = state
+            .user_variables
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let sql = novarocks::sql::parser::dialect::substitute_user_variables(&sql, &assignments)
+            .map_err(classify_engine_error)?;
         let token = self.token()?;
         let mut active = self
             .service
@@ -274,7 +343,8 @@ impl FrontendQuerySession {
                 )
             })?;
         let cancellation = active.cancellation().clone();
-        let deadline = match state.query_timeout_secs {
+        let query_timeout_secs = state.execution_settings.query_timeout_secs();
+        let deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()
                 .checked_add(Duration::from_secs(seconds))
                 .ok_or_else(|| {
@@ -285,7 +355,7 @@ impl FrontendQuerySession {
                 })?,
             None => Instant::now(),
         };
-        let deadline = state.query_timeout_secs.map(|_| deadline);
+        let deadline = query_timeout_secs.map(|_| deadline);
         let topology = match self.service.topology.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -307,17 +377,21 @@ impl FrontendQuerySession {
         ));
         let compiler = self.service.engine.query_compiler();
         let command_executor = self.service.engine.command_executor();
+        let query_execution = self.service.query_execution.clone();
+        let query_options = state.execution_settings.query_options();
         let is_query = is_query_statement(&sql);
         let worker = task::spawn_blocking(move || {
             let result = if is_query {
-                compiler.execute(&sql, &context, None)
+                compiler
+                    .prepare(&sql, &context, Some(query_options))
+                    .and_then(|operation| execute_prepared_query(operation, &query_execution))
             } else {
-                command_executor.execute(&sql, &context, None)
+                command_executor.execute(&sql, &context, Some(query_options))
             };
             let completion = active.finish();
             (result, completion)
         });
-        let result = if let Some(seconds) = state.query_timeout_secs {
+        let result = if let Some(seconds) = query_timeout_secs {
             match tokio::time::timeout(Duration::from_secs(seconds), worker).await {
                 Ok(result) => result.map_err(|error| internal_error(error.to_string()))?,
                 Err(_) => {
@@ -344,6 +418,22 @@ impl FrontendQuerySession {
             StatementFinishOutcome::Completed | StatementFinishOutcome::Stale => {
                 result.map_err(classify_engine_error)
             }
+        }
+    }
+}
+
+fn execute_prepared_query(
+    operation: PreparedQueryOperation,
+    query_execution: &QueryExecutionService,
+) -> Result<StatementResult, String> {
+    match operation {
+        PreparedQueryOperation::Immediate(operation) => Ok(operation.into_result()),
+        PreparedQueryOperation::Distributed(operation) => {
+            let (request, completion) = operation.into_parts();
+            let outcome = query_execution
+                .execute(request)
+                .map_err(|error| error.to_string())?;
+            completion.complete(outcome)
         }
     }
 }

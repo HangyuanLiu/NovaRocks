@@ -86,6 +86,7 @@ where
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let query_control = services.query_control.clone();
+    let query_execution = services.query_execution.clone();
     let topology = services.backend_topology.clone();
     let role = services.execution_role;
     let server =
@@ -100,6 +101,7 @@ where
                     novarocks_frontend::FrontendQueryService::new(
                         engine,
                         query_control,
+                        query_execution,
                         role,
                         topology,
                     ),

@@ -142,6 +142,7 @@ where
         move |host| standalone_open_services(system_catalog, host, &topology_config),
         move |config, services, shutdown| async move {
             let query_control = services.query_control.clone();
+            let query_execution = services.query_execution.clone();
             let topology = services.backend_topology.clone();
             let role = services.execution_role;
             novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
@@ -154,6 +155,7 @@ where
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
+                        query_execution,
                         role,
                         topology,
                     )))
@@ -189,6 +191,7 @@ where
         move |host| standalone_open_services(system_catalog, host, &topology_config),
         move |config, services, shutdown| async move {
             let query_control = services.query_control.clone();
+            let query_execution = services.query_execution.clone();
             let topology = services.backend_topology.clone();
             let role = services.execution_role;
             novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
@@ -201,6 +204,7 @@ where
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
+                        query_execution,
                         role,
                         topology,
                     )))
