@@ -1484,6 +1484,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             step.query_number, order_sensitive, epsilon
         );
 
+        let compat_deadline = compat_directive::step_evidence_deadline(&step.meta);
         if fault_injection::has_fault(&step.meta) {
             let fault_result = ctx
                 .server_handle
@@ -1512,7 +1513,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         );
 
         let compat_snapshot = match ctx.server_handle.lock() {
-            Ok(server_handle) => compat_directive::snapshot(&step.meta, server_handle.as_ref()),
+            Ok(server_handle) => compat_directive::snapshot_with_deadline(
+                &step.meta,
+                server_handle.as_ref(),
+                compat_deadline,
+            ),
             Err(_) => Err(anyhow::anyhow!("server handle mutex is poisoned")),
         };
         let compat_snapshot = match compat_snapshot {

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::{
     QueryControlAttach, QueryControlEvent, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
@@ -97,11 +98,13 @@ pub(crate) struct FrontendQueryLifecycleBarrier {
     registry: Arc<FrontendQueryRegistry>,
     config: FrontendQueryLifecycleConfig,
     metrics: Arc<FrontendLifecycleMetrics>,
+    cancellation: Option<QueryCancellationView>,
 }
 
 pub(super) struct PreReadyAttemptGuard {
     control: Arc<AttemptControl>,
     registry_binding: Option<ActiveQueryAttemptBinding>,
+    supervisor: Option<std::thread::JoinHandle<()>>,
     armed: bool,
 }
 
@@ -113,15 +116,24 @@ impl PreReadyAttemptGuard {
         Self {
             control,
             registry_binding: Some(registry_binding),
+            supervisor: None,
             armed: true,
         }
     }
 
-    fn into_lease(mut self, supervisor: std::thread::JoinHandle<()>) -> QueryLifecycleLease {
+    fn start_supervisor(&mut self) {
+        self.supervisor = Some(spawn_supervisor(&self.control));
+    }
+
+    fn into_lease(mut self) -> QueryLifecycleLease {
         let registry_binding = self
             .registry_binding
             .take()
             .expect("pre-ready lifecycle guard registry binding");
+        let supervisor = self
+            .supervisor
+            .take()
+            .expect("pre-ready lifecycle supervisor");
         let lease = FrontendQueryLifecycleLeaseGuard::lease(
             Arc::clone(&self.control),
             supervisor,
@@ -146,6 +158,9 @@ impl Drop for PreReadyAttemptGuard {
                 "frontend query lifecycle pre-ready guard cleaned up interrupted attempt"
             );
         }
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
+        }
     }
 }
 
@@ -159,8 +174,17 @@ impl FrontendQueryLifecycleBarrier {
             transport,
             registry,
             config,
+            #[cfg(test)]
             metrics: Arc::new(FrontendLifecycleMetrics::default()),
+            #[cfg(not(test))]
+            metrics: FrontendLifecycleMetrics::process_shared(),
+            cancellation: None,
         }
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancellation: QueryCancellationView) -> Self {
+        self.cancellation = Some(cancellation);
+        self
     }
 
     #[cfg(test)]
@@ -168,6 +192,13 @@ impl FrontendQueryLifecycleBarrier {
         &self,
     ) -> novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    fn cancellation_message(&self) -> Option<String> {
+        self.cancellation
+            .as_ref()
+            .and_then(QueryCancellationView::reason)
+            .map(|reason| format!("query lifecycle request cancelled: {reason:?}"))
     }
 }
 
@@ -233,11 +264,9 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
                 return Err(DistributedQueryError::new(error.kind(), message));
             }
         };
-        let pre_ready_guard = PreReadyAttemptGuard::new(Arc::clone(&control), registry_binding);
-        if !control.is_active() {
-            return Err(failed(
-                "query lifecycle attempt was cancelled before InitQuery",
-            ));
+        let mut pre_ready_guard = PreReadyAttemptGuard::new(Arc::clone(&control), registry_binding);
+        if let Some(reason) = self.cancellation_message() {
+            return Err(failed(control.abort_before_ready(reason)));
         }
         if !control.is_active() {
             return Err(failed(
@@ -255,12 +284,16 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             let message = control.abort_before_ready(primary);
             return Err(failed(message));
         }
+        if let Some(reason) = self.cancellation_message() {
+            return Err(failed(control.abort_before_ready(reason)));
+        }
         if !control.is_active() {
             return Err(failed(control.abort_before_ready(
                 "query lifecycle attempt was cancelled during InitQuery".to_string(),
             )));
         }
 
+        pre_ready_guard.start_supervisor();
         let attach_errors = attach_all(
             self.transport.as_ref(),
             &materialized.participants,
@@ -273,14 +306,16 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             let message = control.abort_before_ready(primary);
             return Err(failed(message));
         }
+        if let Some(reason) = self.cancellation_message() {
+            return Err(failed(control.abort_before_ready(reason)));
+        }
         if !control.is_active() {
             return Err(failed(control.abort_before_ready(
                 "query lifecycle attempt was cancelled during control attach".to_string(),
             )));
         }
 
-        let supervisor = spawn_supervisor(&control);
-        Ok(pre_ready_guard.into_lease(supervisor))
+        Ok(pre_ready_guard.into_lease())
     }
 }
 
@@ -478,7 +513,12 @@ fn attach_all(
                         latency_micros = latency.as_micros() as u64,
                         "frontend query lifecycle control attach completed"
                     );
-                    (participant.target.backend_idx(), outcome)
+                    match &outcome {
+                        Ok(session) => control.add_session(session.clone()),
+                        Err((Some(session), _)) => control.add_session(session.clone()),
+                        Err((None, _)) => {}
+                    }
+                    outcome
                 })
             })
             .collect::<Vec<_>>();
@@ -486,28 +526,19 @@ fn attach_all(
             .into_iter()
             .map(|handle| {
                 handle.join().unwrap_or_else(|_| {
-                    (
-                        usize::MAX,
-                        Err((
-                            None,
-                            "query lifecycle control attach worker panicked".to_string(),
-                        )),
-                    )
+                    Err((
+                        None,
+                        "query lifecycle control attach worker panicked".to_string(),
+                    ))
                 })
             })
             .collect::<Vec<_>>()
     });
 
     let mut errors = Vec::new();
-    for (_, outcome) in outcomes {
-        match outcome {
-            Ok(session) => control.add_session(session),
-            Err((session, error)) => {
-                if let Some(session) = session {
-                    control.add_session(session);
-                }
-                errors.push(error);
-            }
+    for outcome in outcomes {
+        if let Err((_, error)) = outcome {
+            errors.push(error);
         }
     }
     errors

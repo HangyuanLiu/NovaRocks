@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -120,6 +120,11 @@ pub(super) struct FrontendLifecycleMetrics {
 }
 
 impl FrontendLifecycleMetrics {
+    pub(super) fn process_shared() -> Arc<Self> {
+        static METRICS: OnceLock<Arc<FrontendLifecycleMetrics>> = OnceLock::new();
+        Arc::clone(METRICS.get_or_init(|| Arc::new(Self::default())))
+    }
+
     pub fn attempt_created(&self) {
         self.update(|snapshot| snapshot.active_attempts += 1);
     }

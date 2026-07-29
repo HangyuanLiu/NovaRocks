@@ -602,7 +602,8 @@ impl FrontendDistributedQueryCoordinator {
             Arc::clone(&backend_services.lifecycle_transport),
             Arc::clone(&self.registry),
             lifecycle_config,
-        );
+        )
+        .with_cancellation(parts.cancellation.clone());
         let init_options = QueryInitOptions::new(
             execution_id,
             backend_services.live_backends,

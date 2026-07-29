@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
 use novarocks::query_execution::backend::LiveBackendTarget;
+use novarocks::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
 use novarocks::query_execution::contract::{DistributedQueryIntent, QueryId};
 use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
@@ -186,6 +187,7 @@ struct RecordingTransportState {
     abort_calls: Vec<(QueryLifecycleTarget, QueryAbortRequest)>,
     abort_results:
         BTreeMap<usize, VecDeque<Result<QueryTerminationAck, QueryLifecycleTransportError>>>,
+    cancel_on_init: Option<QueryCancellationSource>,
 }
 
 impl RecordingTransport {
@@ -257,7 +259,7 @@ impl QueryLifecycleTransport for RecordingTransport {
     ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
         state.init_calls.push((target, request));
-        state
+        let result = state
             .init_results
             .get_mut(&target.backend_idx())
             .and_then(VecDeque::pop_front)
@@ -266,7 +268,13 @@ impl QueryLifecycleTransport for RecordingTransport {
                     QueryLifecycleTransportErrorKind::InvalidResponse,
                     "unexpected InitQuery call",
                 ))
-            })
+            });
+        let cancellation = state.cancel_on_init.take();
+        drop(state);
+        if let Some(cancellation) = cancellation {
+            cancellation.request(QueryCancellationReason::ClientDisconnected);
+        }
+        result
     }
 
     fn attach_control(
@@ -451,6 +459,224 @@ fn query_control_barrier_initializes_every_participant() {
     assert_eq!(sorted(transport.attach_targets()), vec![0, 1, 2]);
     assert_eq!(transport.init_calls().len(), 3);
     lease.finalize().expect("finalize lifecycle fixture");
+}
+
+#[test]
+fn request_cancellation_before_barrier_prevents_init_fanout() {
+    let plan = query_init_plan(None);
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let cancellation = QueryCancellationSource::new();
+    cancellation.request(QueryCancellationReason::ClientDisconnected);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config())
+            .with_cancellation(cancellation.view());
+
+    let error = barrier
+        .initialize_all(plan)
+        .err()
+        .expect("request cancellation must stop the lifecycle barrier");
+
+    assert!(error.message().contains("ClientDisconnected"), "{error}");
+    assert!(transport.init_calls().is_empty());
+}
+
+#[test]
+fn request_cancellation_during_init_aborts_before_control_attach() {
+    let plan = query_init_plan(None);
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let cancellation = QueryCancellationSource::new();
+    transport
+        .state
+        .lock()
+        .expect("recording transport lock")
+        .cancel_on_init = Some(cancellation.clone());
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config())
+            .with_cancellation(cancellation.view());
+
+    let error = barrier
+        .initialize_all(plan)
+        .err()
+        .expect("cancellation observed after Init must abort the attempt");
+
+    assert!(error.message().contains("ClientDisconnected"), "{error}");
+    assert!(
+        transport.attach_targets().is_empty(),
+        "a cancelled request must not enter control attach"
+    );
+    assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+}
+
+#[derive(Clone)]
+struct HeartbeatGateSession {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    wait_for_heartbeat_before_ready: bool,
+    state: Arc<Mutex<HeartbeatGateSessionState>>,
+}
+
+#[derive(Default)]
+struct HeartbeatGateSessionState {
+    ready_sent: bool,
+    events: VecDeque<QueryControlEvent>,
+    commands: Vec<QueryControlCommand>,
+}
+
+impl HeartbeatGateSession {
+    fn early(gate: Arc<(Mutex<bool>, Condvar)>) -> Self {
+        Self {
+            gate,
+            wait_for_heartbeat_before_ready: false,
+            state: Arc::new(Mutex::new(HeartbeatGateSessionState::default())),
+        }
+    }
+
+    fn slow(gate: Arc<(Mutex<bool>, Condvar)>) -> Self {
+        Self {
+            gate,
+            wait_for_heartbeat_before_ready: true,
+            state: Arc::new(Mutex::new(HeartbeatGateSessionState::default())),
+        }
+    }
+
+    fn heartbeat_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("heartbeat gate state")
+            .commands
+            .iter()
+            .filter(|command| matches!(command, QueryControlCommand::Heartbeat { .. }))
+            .count()
+    }
+}
+
+impl QueryControlSession for HeartbeatGateSession {
+    fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
+        let mut state = self.state.lock().expect("heartbeat gate state");
+        match &command {
+            QueryControlCommand::Heartbeat { sequence, .. } => {
+                state.events.push_back(QueryControlEvent::HeartbeatAck {
+                    sequence: *sequence,
+                });
+                let mut released = self.gate.0.lock().expect("heartbeat gate");
+                *released = true;
+                self.gate.1.notify_all();
+            }
+            QueryControlCommand::Abort { .. } => {
+                state
+                    .events
+                    .push_back(QueryControlEvent::TerminationAccepted {
+                        reason: QueryTerminationReason::CoordinatorAbort,
+                    });
+            }
+            QueryControlCommand::Finalize => {
+                state
+                    .events
+                    .push_back(QueryControlEvent::TerminationAccepted {
+                        reason: QueryTerminationReason::CoordinatorFinalize,
+                    });
+            }
+        }
+        state.commands.push(command);
+        Ok(())
+    }
+
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<QueryControlEvent, QueryLifecycleTransportError> {
+        {
+            let mut state = self.state.lock().expect("heartbeat gate state");
+            if !state.ready_sent && !self.wait_for_heartbeat_before_ready {
+                state.ready_sent = true;
+                return Ok(QueryControlEvent::ControlReady);
+            }
+            if let Some(event) = state.events.pop_front() {
+                return Ok(event);
+            }
+        }
+        if self.wait_for_heartbeat_before_ready {
+            let released = self.gate.0.lock().expect("heartbeat gate");
+            let (released, _) = self
+                .gate
+                .1
+                .wait_timeout_while(released, timeout, |released| !*released)
+                .expect("heartbeat gate wait");
+            if *released {
+                let mut state = self.state.lock().expect("heartbeat gate state");
+                if !state.ready_sent {
+                    state.ready_sent = true;
+                    return Ok(QueryControlEvent::ControlReady);
+                }
+                if let Some(event) = state.events.pop_front() {
+                    return Ok(event);
+                }
+            }
+        }
+        Err(transport_error(
+            QueryLifecycleTransportErrorKind::DeadlineExceeded,
+            "heartbeat gate receive timed out",
+        ))
+    }
+}
+
+#[test]
+fn early_control_ready_session_is_heartbeated_while_other_attach_is_slow() {
+    let plan = query_init_plan(None);
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let early = HeartbeatGateSession::early(Arc::clone(&gate));
+    let slow = HeartbeatGateSession::slow(Arc::clone(&gate));
+    let peer = HeartbeatGateSession::early(Arc::clone(&gate));
+    {
+        let mut state = transport.state.lock().expect("recording transport lock");
+        state.attach_results.insert(
+            0,
+            VecDeque::from([Ok(Arc::new(early.clone()) as Arc<dyn QueryControlSession>)]),
+        );
+        state.attach_results.insert(
+            1,
+            VecDeque::from([Ok(Arc::new(slow.clone()) as Arc<dyn QueryControlSession>)]),
+        );
+        state.attach_results.insert(
+            2,
+            VecDeque::from([Ok(Arc::new(peer) as Arc<dyn QueryControlSession>)]),
+        );
+    }
+    let (registry, _query) = registry_for(&plan);
+    let live_config = FrontendQueryLifecycleConfig::new(
+        Duration::from_millis(5),
+        Duration::from_millis(15),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+    )
+    .expect("heartbeat gate config");
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, live_config);
+
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("an early ready session must retain its heartbeat lease");
+
+    assert!(
+        early.heartbeat_count() > 0,
+        "the early ControlReady session was not heartbeated during the slow attach"
+    );
+    lease.finalize().expect("finalize heartbeat gate fixture");
+}
+
+#[test]
+fn process_metrics_keep_other_active_query_when_one_terminates() {
+    let first = FrontendLifecycleMetrics::process_shared();
+    let second = FrontendLifecycleMetrics::process_shared();
+    let baseline = first.snapshot().active_attempts;
+
+    first.attempt_created();
+    second.attempt_created();
+    first.attempt_terminated();
+
+    assert_eq!(second.snapshot().active_attempts, baseline + 1);
+    second.attempt_terminated();
 }
 
 #[test]

@@ -95,12 +95,34 @@ pub(crate) fn snapshot(
     meta: &QueryMeta,
     server_handle: &dyn ServerHandle,
 ) -> Result<BeLogSnapshot> {
-    let evidence_deadline = (meta.kill_be_after_fragment_start.is_some()
+    snapshot_with_deadline(meta, server_handle, step_evidence_deadline(meta))
+}
+
+pub(crate) fn query_lifecycle_step_deadline(meta: &QueryMeta) -> Option<Instant> {
+    is_query_lifecycle_step(meta).then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT)
+}
+
+pub(crate) fn step_evidence_deadline(meta: &QueryMeta) -> Option<Instant> {
+    (meta.kill_be_after_fragment_start.is_some()
         || meta.fail_fragment_after_start_be_index.is_some()
+        || is_query_lifecycle_step(meta))
+    .then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT)
+}
+
+fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
+    meta.drop_next_init_ack_be_index.is_some()
+        || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.restart_be_after_init_ack_index.is_some()
-        || meta.kill_query_after_control_ready_count.is_some())
-    .then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT);
+        || meta.kill_query_after_control_ready_count.is_some()
+        || meta.query_control_fragment_backend_limit.is_some()
+}
+
+pub(crate) fn snapshot_with_deadline(
+    meta: &QueryMeta,
+    server_handle: &dyn ServerHandle,
+    evidence_deadline: Option<Instant>,
+) -> Result<BeLogSnapshot> {
     if !has_directives(meta) {
         return Ok(BeLogSnapshot {
             evidence_deadline,
@@ -256,12 +278,7 @@ fn lifecycle_evidence(
     snapshot: &BeLogSnapshot,
     endpoint_count: usize,
 ) -> Result<Option<LogEvidenceCheck>> {
-    let lifecycle_step = step.meta.drop_next_init_ack_be_index.is_some()
-        || step.meta.stop_query_control_heartbeat_be_index.is_some()
-        || step.meta.kill_fe_after_control_ready_count.is_some()
-        || step.meta.restart_be_after_init_ack_index.is_some()
-        || step.meta.kill_query_after_control_ready_count.is_some()
-        || step.meta.query_control_fragment_backend_limit.is_some();
+    let lifecycle_step = is_query_lifecycle_step(&step.meta);
     if !lifecycle_step {
         return Ok(None);
     }
@@ -1400,6 +1417,41 @@ mod tests {
         writer.join().expect("delayed log writer");
 
         assert!(log.contains("actual=2 required=2"), "{log}");
+    }
+
+    #[test]
+    fn every_query_lifecycle_hook_receives_one_shared_deadline() {
+        for meta in [
+            QueryMeta {
+                drop_next_init_ack_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                stop_query_control_heartbeat_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                kill_fe_after_control_ready_count: Some(1),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                restart_be_after_init_ack_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                kill_query_after_control_ready_count: Some(1),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                query_control_fragment_backend_limit: Some(1),
+                ..QueryMeta::default()
+            },
+        ] {
+            assert!(
+                query_lifecycle_step_deadline(&meta).is_some(),
+                "lifecycle hook did not receive the shared deadline: {meta:?}"
+            );
+        }
     }
 
     #[test]
