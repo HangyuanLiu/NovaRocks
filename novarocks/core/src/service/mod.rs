@@ -36,7 +36,6 @@ pub(crate) mod grpc_fragment_dispatcher;
 pub(crate) mod grpc_query_lifecycle_adapter;
 pub mod grpc_query_lifecycle_client;
 pub(crate) mod grpc_runtime_filter_adapter;
-pub(crate) mod grpc_runtime_filter_install_adapter;
 pub(crate) mod grpc_runtime_filter_sender;
 pub mod grpc_server;
 #[cfg(feature = "compat")]

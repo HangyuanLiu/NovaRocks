@@ -36,9 +36,7 @@ pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
 }
 
 struct ActiveQuery {
-    query_id: QueryId,
     intent: DistributedQueryIntent,
-    dispatcher: Arc<dyn FragmentDispatcher>,
     scheduled_backends: BTreeMap<usize, u64>,
     attempted: BTreeMap<usize, Vec<UniqueId>>,
     writer_instances: BTreeMap<UniqueId, i32>,
@@ -95,16 +93,14 @@ impl FrontendQueryRegistry {
         self: &Arc<Self>,
         query_id: QueryId,
         intent: DistributedQueryIntent,
-        dispatcher: Arc<dyn FragmentDispatcher>,
+        _dispatcher: Arc<dyn FragmentDispatcher>,
     ) -> Result<ActiveQueryGuard, DistributedQueryError> {
         let key = query_key(query_id);
         let mut active = self.active.lock().expect("frontend query registry lock");
         match active.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(ActiveQuery {
-                    query_id,
                     intent,
-                    dispatcher,
                     scheduled_backends: BTreeMap::new(),
                     attempted: BTreeMap::new(),
                     writer_instances: BTreeMap::new(),
@@ -368,18 +364,14 @@ impl FrontendQueryRegistry {
     }
 
     pub(crate) fn finish_attempt(&self, query_id: QueryId) -> Result<(), DistributedQueryError> {
-        let cancellation = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            let query = active
-                .get_mut(&query_key(query_id))
-                .ok_or_else(|| inactive_query(query_id))?;
-            query.submissions_inflight =
-                query.submissions_inflight.checked_sub(1).ok_or_else(|| {
-                    contract_violation("frontend query submission accounting underflow")
-                })?;
-            cancellation_if_ready(query)
-        };
-        dispatch_fragment_cancellation(cancellation);
+        let mut active = self.active.lock().expect("frontend query registry lock");
+        let query = active
+            .get_mut(&query_key(query_id))
+            .ok_or_else(|| inactive_query(query_id))?;
+        query.submissions_inflight = query
+            .submissions_inflight
+            .checked_sub(1)
+            .ok_or_else(|| contract_violation("frontend query submission accounting underflow"))?;
         Ok(())
     }
 
@@ -718,54 +710,28 @@ impl Drop for ActiveQueryGuard {
     }
 }
 
-type DispatcherCancellation = (
-    Arc<dyn FragmentDispatcher>,
-    QueryId,
-    Vec<(usize, Vec<UniqueId>)>,
-);
-
 struct CancellationDispatch {
-    fragments: Option<DispatcherCancellation>,
     active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
     reason: String,
 }
 
 fn request_cancellation(query: &mut ActiveQuery) -> CancellationDispatch {
     query.cancellation_requested = true;
+    let active_attempt = if query.cancellation_dispatched {
+        None
+    } else {
+        let control = query.active_attempt.clone();
+        if control.is_some() {
+            query.cancellation_dispatched = true;
+        }
+        control
+    };
     CancellationDispatch {
-        fragments: cancellation_if_ready(query),
-        active_attempt: query.active_attempt.clone(),
+        active_attempt,
         reason: query
             .first_failure
             .clone()
             .unwrap_or_else(|| "frontend query cancellation requested".to_string()),
-    }
-}
-
-fn cancellation_if_ready(query: &mut ActiveQuery) -> Option<DispatcherCancellation> {
-    if !query.cancellation_requested
-        || query.cancellation_dispatched
-        || query.submissions_inflight != 0
-    {
-        return None;
-    }
-    query.cancellation_dispatched = true;
-    Some((
-        Arc::clone(&query.dispatcher),
-        query.query_id,
-        query
-            .attempted
-            .iter()
-            .map(|(&backend_idx, finst_ids)| (backend_idx, finst_ids.clone()))
-            .collect(),
-    ))
-}
-
-fn dispatch_fragment_cancellation(cancellation: Option<DispatcherCancellation>) {
-    if let Some((dispatcher, query_id, attempted)) = cancellation {
-        for (backend_idx, finst_ids) in attempted {
-            dispatcher.cancel_fragments(backend_idx, query_id, &finst_ids);
-        }
     }
 }
 
@@ -774,7 +740,6 @@ fn dispatch_cancellation(cancellation: Option<CancellationDispatch>) {
         if let Some(control) = cancellation.active_attempt {
             control.request_abort(cancellation.reason);
         }
-        dispatch_fragment_cancellation(cancellation.fragments);
     }
 }
 

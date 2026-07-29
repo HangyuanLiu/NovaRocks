@@ -20,15 +20,11 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use novarocks::query_execution::artifact::{
-    LegacyPreparedNativeExecutionParts, NativeSubmissionContext, RuntimeFilterDeploymentDispatcher,
-    RuntimeFilterDeploymentEpoch, RuntimeFilterDeploymentOptions,
-    new_grpc_runtime_filter_deployment_dispatcher,
-};
+use novarocks::query_execution::artifact::PreparedNativeExecutionParts;
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{
@@ -39,14 +35,16 @@ use novarocks::query_execution::contract::{
 use novarocks::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
 };
-use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId, QueryLifecycleTransport};
+use novarocks::query_execution::lifecycle::{
+    AttemptId, QueryExecutionId, QueryInitOptions, QueryLifecycleTransport,
+};
 use novarocks::query_execution::write::WriteReportBuilder;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 
 use super::backend_events::BackendQueryActivity;
+use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
 use super::query_registry::FrontendQueryRegistry;
 use super::report::FrontendCoordinatorReportHandler;
-use super::runtime_filter::FrontendRuntimeFilterDeployment;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 
 trait QueryIdSource: Send + Sync + 'static {
@@ -194,8 +192,8 @@ enum BackendServicesSource {
 struct QueryBackendServices {
     scheduler: FrontendFragmentScheduler,
     dispatcher: Arc<dyn FragmentDispatcher>,
-    #[allow(dead_code)]
     lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
+    live_backends: Vec<LiveBackendTarget>,
 }
 
 #[cfg(test)]
@@ -204,7 +202,119 @@ pub(crate) fn unavailable_lifecycle_transport_for_test() -> Arc<dyn QueryLifecyc
 }
 
 #[cfg(test)]
+pub(crate) fn ready_lifecycle_transport_for_test() -> Arc<dyn QueryLifecycleTransport> {
+    Arc::new(ReadyLifecycleTransportForTest)
+}
+
+#[cfg(test)]
 struct UnavailableLifecycleTransportForTest;
+
+#[cfg(test)]
+struct ReadyLifecycleTransportForTest;
+
+#[cfg(test)]
+struct ReadyLifecycleSessionForTest {
+    events: Mutex<VecDeque<novarocks::query_execution::lifecycle::QueryControlEvent>>,
+}
+
+#[cfg(test)]
+impl novarocks::query_execution::lifecycle::QueryControlSession for ReadyLifecycleSessionForTest {
+    fn send(
+        &self,
+        command: novarocks::query_execution::lifecycle::QueryControlCommand,
+    ) -> Result<(), novarocks::query_execution::lifecycle::QueryLifecycleTransportError> {
+        use novarocks::query_execution::lifecycle::{
+            QueryControlCommand, QueryControlEvent, QueryTerminationReason,
+        };
+        let event = match command {
+            QueryControlCommand::Heartbeat { sequence, .. } => {
+                QueryControlEvent::HeartbeatAck { sequence }
+            }
+            QueryControlCommand::Abort { .. } => QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorAbort,
+            },
+            QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorFinalize,
+            },
+        };
+        self.events
+            .lock()
+            .expect("ready lifecycle session")
+            .push_back(event);
+        Ok(())
+    }
+
+    fn recv_timeout(
+        &self,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryControlEvent,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        self.events
+            .lock()
+            .expect("ready lifecycle session")
+            .pop_front()
+            .ok_or_else(|| {
+                novarocks::query_execution::lifecycle::QueryLifecycleTransportError::new(
+                    novarocks::query_execution::lifecycle::QueryLifecycleTransportErrorKind::DeadlineExceeded,
+                    "ready lifecycle session has no pending event",
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
+    fn init_query(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        request: novarocks::query_execution::lifecycle::QueryInitRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryInitAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(novarocks::query_execution::lifecycle::QueryInitAck::new(
+            request.manifest().execution_id(),
+            request.digest(),
+            novarocks::query_execution::lifecycle::QueryInitOutcome::Applied,
+        ))
+    }
+
+    fn attach_control(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _attach: novarocks::query_execution::lifecycle::QueryControlAttach,
+        _timeout: Duration,
+    ) -> Result<
+        Arc<dyn novarocks::query_execution::lifecycle::QueryControlSession>,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(Arc::new(ReadyLifecycleSessionForTest {
+            events: Mutex::new(VecDeque::from([
+                novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady,
+            ])),
+        }))
+    }
+
+    fn abort_query(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        request: novarocks::query_execution::lifecycle::QueryAbortRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryTerminationAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(
+            novarocks::query_execution::lifecycle::QueryTerminationAck::new(
+                request.execution_id(),
+                novarocks::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
+            ),
+        )
+    }
+}
 
 #[cfg(test)]
 impl QueryLifecycleTransport for UnavailableLifecycleTransportForTest {
@@ -265,12 +375,13 @@ impl BackendServicesSource {
                     .collect::<Vec<_>>();
                 let lifecycle_transport =
                     new_grpc_query_lifecycle_transport(&targets).map_err(failed)?;
-                let snapshot = FrontendBackendSnapshot::from_live_targets(targets)?;
+                let snapshot = FrontendBackendSnapshot::from_live_targets(targets.clone())?;
                 let dispatcher = new_grpc_fragment_dispatcher(&entries).map_err(failed)?;
                 Ok(QueryBackendServices {
                     scheduler: FrontendFragmentScheduler::new(snapshot),
                     dispatcher,
                     lifecycle_transport,
+                    live_backends: targets,
                 })
             }
             #[cfg(test)]
@@ -282,21 +393,27 @@ impl BackendServicesSource {
                 scheduler: scheduler.clone(),
                 dispatcher: Arc::clone(dispatcher),
                 lifecycle_transport: Arc::clone(lifecycle_transport),
+                live_backends: scheduler.live_targets(),
             }),
             #[cfg(test)]
             Self::Sequence {
                 schedulers,
                 dispatcher,
                 lifecycle_transport,
-            } => Ok(QueryBackendServices {
-                scheduler: schedulers
+            } => {
+                let scheduler = schedulers
                     .lock()
                     .expect("frontend test backend sequence lock")
                     .pop_front()
-                    .expect("frontend test backend sequence exhausted"),
-                dispatcher: Arc::clone(dispatcher),
-                lifecycle_transport: Arc::clone(lifecycle_transport),
-            }),
+                    .expect("frontend test backend sequence exhausted");
+                let live_backends = scheduler.live_targets();
+                Ok(QueryBackendServices {
+                    scheduler,
+                    dispatcher: Arc::clone(dispatcher),
+                    lifecycle_transport: Arc::clone(lifecycle_transport),
+                    live_backends,
+                })
+            }
         }
     }
 }
@@ -306,11 +423,7 @@ pub struct FrontendDistributedQueryCoordinator {
     live_topology: Arc<FrontendLiveBackendTopology>,
     backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     backend_services: BackendServicesSource,
-    legacy_runtime_filter_dispatcher_override: Option<Arc<dyn RuntimeFilterDeploymentDispatcher>>,
     runtime_filter_worker_count: NonZeroUsize,
-    next_runtime_filter_epoch: AtomicU64,
-    #[cfg(test)]
-    runtime_filter_barrier_calls: Arc<AtomicU64>,
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
 }
@@ -331,11 +444,7 @@ impl FrontendDistributedQueryCoordinator {
             live_topology: Arc::clone(&live_topology),
             backend_topology,
             backend_services: BackendServicesSource::Live(live_topology),
-            legacy_runtime_filter_dispatcher_override: None,
             runtime_filter_worker_count,
-            next_runtime_filter_epoch: AtomicU64::new(1),
-            #[cfg(test)]
-            runtime_filter_barrier_calls: Arc::new(AtomicU64::new(0)),
             query_ids: Arc::new(UniqueQueryIdSource::default()),
             registry: Arc::new(FrontendQueryRegistry::default()),
         }
@@ -348,7 +457,7 @@ impl FrontendDistributedQueryCoordinator {
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
-        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     ) -> Self {
         Self::new_for_test_with_topology(
@@ -357,7 +466,7 @@ impl FrontendDistributedQueryCoordinator {
             scheduler,
             dispatcher,
             runtime_filter_worker_count,
-            runtime_filter_dispatcher,
+            _test_fixture,
             lifecycle_transport,
             Arc::new(crate::topology::FrontendTopologyController::new(1)),
         )
@@ -370,7 +479,7 @@ impl FrontendDistributedQueryCoordinator {
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
-        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     ) -> Self {
@@ -386,10 +495,7 @@ impl FrontendDistributedQueryCoordinator {
                 dispatcher,
                 lifecycle_transport,
             },
-            legacy_runtime_filter_dispatcher_override: Some(runtime_filter_dispatcher),
             runtime_filter_worker_count,
-            next_runtime_filter_epoch: AtomicU64::new(1),
-            runtime_filter_barrier_calls: Arc::new(AtomicU64::new(0)),
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
         }
@@ -402,7 +508,7 @@ impl FrontendDistributedQueryCoordinator {
         schedulers: Vec<FrontendFragmentScheduler>,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
-        runtime_filter_dispatcher: Arc<dyn RuntimeFilterDeploymentDispatcher>,
+        _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     ) -> Self {
         let live_topology = Arc::new(FrontendLiveBackendTopology::new());
@@ -417,10 +523,7 @@ impl FrontendDistributedQueryCoordinator {
                 dispatcher,
                 lifecycle_transport,
             },
-            legacy_runtime_filter_dispatcher_override: Some(runtime_filter_dispatcher),
             runtime_filter_worker_count,
-            next_runtime_filter_epoch: AtomicU64::new(1),
-            runtime_filter_barrier_calls: Arc::new(AtomicU64::new(0)),
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
         }
@@ -440,33 +543,11 @@ impl FrontendDistributedQueryCoordinator {
         self.report_endpoint.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn runtime_filter_barrier_calls(&self) -> u64 {
-        self.runtime_filter_barrier_calls.load(Ordering::SeqCst)
-    }
-
     pub fn execute(
         &self,
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.execute_request(request)
-    }
-
-    fn next_runtime_filter_epoch(
-        &self,
-    ) -> Result<RuntimeFilterDeploymentEpoch, DistributedQueryError> {
-        let epoch = self
-            .next_runtime_filter_epoch
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::Rejected,
-                    "frontend runtime-filter deployment epoch space is exhausted",
-                )
-            })?;
-        RuntimeFilterDeploymentEpoch::new(epoch)
     }
 
     fn execute_request(
@@ -487,18 +568,7 @@ impl FrontendDistributedQueryCoordinator {
         let parts = request.into_parts();
         let intent = parts.completion.intent();
         let backend_services = self.backend_services.resolve()?;
-        // Task 7 removes this pre-lifecycle runtime-filter deployment. Until that
-        // cutover, derive the production adapter from this query's frozen
-        // scheduler snapshot; tests inject their explicit legacy fake.
-        let legacy_runtime_filter_dispatcher = match &self.legacy_runtime_filter_dispatcher_override
-        {
-            Some(dispatcher) => Arc::clone(dispatcher),
-            None => new_grpc_runtime_filter_deployment_dispatcher(
-                backend_services.scheduler.backend_entries(),
-            )
-            .map_err(failed)?,
-        };
-        let dispatcher = backend_services.dispatcher;
+        let dispatcher = Arc::clone(&backend_services.dispatcher);
         let _query = self
             .registry
             .register(query_id, intent, Arc::clone(&dispatcher))?;
@@ -511,37 +581,50 @@ impl FrontendDistributedQueryCoordinator {
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
         let scheduled = parts.artifacts.bind_schedule(schedule)?;
-        #[cfg(test)]
-        let runtime_filters = FrontendRuntimeFilterDeployment::with_barrier_counter(
-            legacy_runtime_filter_dispatcher,
-            Arc::clone(&self.runtime_filter_barrier_calls),
+        let timeout_ms = parts.options.timeout_ms().max(0);
+        let query_deadline_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| failed(format!("system clock precedes Unix epoch: {error}")))?
+            .as_millis()
+            .saturating_add(u128::from(timeout_ms.max(1) as u64))
+            .try_into()
+            .map_err(|_| failed("query deadline exceeds u64 milliseconds"))?;
+        let runtime = &novarocks::common::app_config::config()
+            .map_err(|error| failed(format!("load query lifecycle config: {error}")))?
+            .runtime;
+        let lifecycle_config = FrontendQueryLifecycleConfig::new(
+            Duration::from_millis(runtime.query_control_heartbeat_interval_ms),
+            Duration::from_millis(runtime.query_control_heartbeat_timeout_ms),
+            Duration::from_millis(runtime.query_control_init_rpc_timeout_ms),
+            Duration::from_millis(runtime.query_control_attach_timeout_ms),
+        )?;
+        let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
+            Arc::clone(&backend_services.lifecycle_transport),
+            Arc::clone(&self.registry),
+            lifecycle_config,
         );
-        #[cfg(not(test))]
-        let runtime_filters =
-            FrontendRuntimeFilterDeployment::new(legacy_runtime_filter_dispatcher);
-        let runtime_filter_options = RuntimeFilterDeploymentOptions::new(
-            self.next_runtime_filter_epoch()?,
-            backend_services.scheduler.backend_entries().to_vec(),
+        let init_options = QueryInitOptions::new(
+            execution_id,
+            backend_services.live_backends,
             self.runtime_filter_worker_count.get(),
             parts.options.runtime_filter_lifecycle(),
-        )?;
-        let context = NativeSubmissionContext::new(
-            query_id,
             &parts.options,
+            query_deadline_unix_ms,
+            Duration::from_millis(runtime.query_control_pre_start_timeout_ms),
             self.report_endpoint.resolve()?,
             dispatcher.needs_fragment_status_report() || intent == DistributedQueryIntent::Profile,
-        );
-        let ready =
-            scheduled.prepare_legacy_runtime_filters(runtime_filter_options, &runtime_filters)?;
-        let execution = ready.assemble(context)?;
-        let LegacyPreparedNativeExecutionParts {
+        )?;
+        let execution = scheduled
+            .initialize_query(init_options, &lifecycle_barrier)?
+            .assemble()?;
+        let PreparedNativeExecutionParts {
             submissions,
             root_fetch,
             writer_registrations,
             expected_output,
-            runtime_filter_lease,
+            query_lifecycle_lease,
         } = execution.into_parts();
-        let mut runtime_filter_lease = Some(runtime_filter_lease);
+        let mut query_lifecycle_lease = Some(query_lifecycle_lease);
         let submitted_instance_ids = submissions
             .iter()
             .map(|submission| submission.fragment_instance_id())
@@ -554,18 +637,17 @@ impl FrontendDistributedQueryCoordinator {
         {
             let kind = error.kind();
             let message =
-                abort_runtime_filters(&mut runtime_filter_lease, error.message().to_string());
+                abort_query_lifecycle(&mut query_lifecycle_lease, error.message().to_string());
             return Err(DistributedQueryError::new(kind, message));
         }
-        let timeout_ms = parts.options.timeout_ms().max(0);
 
         let submission_count = submissions.len();
         let mut submitted = 0usize;
         for submission in submissions {
             if parts.cancellation.is_cancelled() {
-                let error = self.fail_cancel_then_abort_runtime_filters(
+                let error = self.fail_cancel_then_abort_query_lifecycle(
                     query_id,
-                    &mut runtime_filter_lease,
+                    &mut query_lifecycle_lease,
                     "query cancelled before fragment submission",
                 );
                 if intent == DistributedQueryIntent::Write {
@@ -579,7 +661,7 @@ impl FrontendDistributedQueryCoordinator {
                 .registry
                 .record_attempt(query_id, backend_idx, finst_id)
             {
-                let message = abort_runtime_filters(&mut runtime_filter_lease, error.to_string());
+                let message = abort_query_lifecycle(&mut query_lifecycle_lease, error.to_string());
                 let _ = self
                     .registry
                     .preserve_failure_context(query_id, message.clone());
@@ -590,7 +672,7 @@ impl FrontendDistributedQueryCoordinator {
             }
             let submit_result = dispatcher.submit_fragment(backend_idx, submission.into_envelope());
             if let Err(error) = self.registry.finish_attempt(query_id) {
-                let message = abort_runtime_filters(&mut runtime_filter_lease, error.to_string());
+                let message = abort_query_lifecycle(&mut query_lifecycle_lease, error.to_string());
                 let _ = self
                     .registry
                     .preserve_failure_context(query_id, message.clone());
@@ -600,9 +682,9 @@ impl FrontendDistributedQueryCoordinator {
                 return Err(failed(message));
             }
             if let Err(error) = submit_result {
-                let error = self.fail_cancel_then_abort_runtime_filters(
+                let error = self.fail_cancel_then_abort_query_lifecycle(
                     query_id,
-                    &mut runtime_filter_lease,
+                    &mut query_lifecycle_lease,
                     error,
                 );
                 if intent == DistributedQueryIntent::Write {
@@ -615,22 +697,17 @@ impl FrontendDistributedQueryCoordinator {
             submitted += 1;
             if let Some(message) = self.registry.first_failure(query_id) {
                 if intent != DistributedQueryIntent::Write {
-                    let message = abort_runtime_filters(&mut runtime_filter_lease, message);
+                    let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
                     return Err(failed(message));
                 }
                 break;
             }
         }
         let submission_failure = self.registry.first_failure(query_id);
-        if submitted == submission_count
-            && submission_failure.is_none()
-            && !parts.cancellation.is_cancelled()
+        if submitted != submission_count
+            || submission_failure.is_some()
+            || parts.cancellation.is_cancelled()
         {
-            runtime_filter_lease
-                .take()
-                .expect("runtime-filter lease is present through fragment submission")
-                .release();
-        } else {
             let message = submission_failure.unwrap_or_else(|| {
                 if parts.cancellation.is_cancelled() {
                     "query cancelled during fragment submission".to_string()
@@ -639,19 +716,23 @@ impl FrontendDistributedQueryCoordinator {
                 }
             });
             if self.registry.first_failure(query_id).is_some() {
-                let message = abort_runtime_filters(&mut runtime_filter_lease, message);
+                let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
                 let _ = self.registry.preserve_failure_context(query_id, message);
             } else {
-                let _ = self.fail_cancel_then_abort_runtime_filters(
+                let _ = self.fail_cancel_then_abort_query_lifecycle(
                     query_id,
-                    &mut runtime_filter_lease,
+                    &mut query_lifecycle_lease,
                     message,
                 );
             }
         }
 
         if parts.cancellation.is_cancelled() {
-            let error = self.fail_and_cancel(query_id, "query cancelled after fragment submission");
+            let error = self.fail_cancel_then_abort_query_lifecycle(
+                query_id,
+                &mut query_lifecycle_lease,
+                "query cancelled after fragment submission",
+            );
             if intent != DistributedQueryIntent::Write {
                 return Err(error);
             }
@@ -659,6 +740,7 @@ impl FrontendDistributedQueryCoordinator {
         if let Some(message) = self.registry.first_failure(query_id)
             && intent != DistributedQueryIntent::Write
         {
+            let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
             return Err(failed(message));
         }
 
@@ -667,17 +749,21 @@ impl FrontendDistributedQueryCoordinator {
         if root_fetch.uses_result_buffer() {
             loop {
                 if parts.cancellation.is_cancelled() {
-                    return Err(
-                        self.fail_and_cancel(query_id, "query cancelled while fetching result")
-                    );
+                    return Err(self.fail_cancel_then_abort_query_lifecycle(
+                        query_id,
+                        &mut query_lifecycle_lease,
+                        "query cancelled while fetching result",
+                    ));
                 }
                 if let Some(message) = self.registry.first_failure(query_id) {
+                    let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
                     return Err(failed(message));
                 }
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(self.fail_and_cancel(
+                    return Err(self.fail_cancel_then_abort_query_lifecycle(
                         query_id,
+                        &mut query_lifecycle_lease,
                         format!("query timed out after {timeout_ms} ms"),
                     ));
                 }
@@ -692,14 +778,24 @@ impl FrontendDistributedQueryCoordinator {
                     Some(expected_output.fetch_view()),
                 ) {
                     Ok(fetch) => fetch,
-                    Err(error) => return Err(self.fail_and_cancel(query_id, error)),
+                    Err(error) => {
+                        return Err(self.fail_cancel_then_abort_query_lifecycle(
+                            query_id,
+                            &mut query_lifecycle_lease,
+                            error,
+                        ));
+                    }
                 };
                 match fetch {
                     FetchOutcome::Ready(batch) => batches.push(batch),
                     FetchOutcome::NotReady => continue,
                     FetchOutcome::Eof => break,
                     FetchOutcome::Err(error) => {
-                        return Err(self.fail_and_cancel(query_id, error));
+                        return Err(self.fail_cancel_then_abort_query_lifecycle(
+                            query_id,
+                            &mut query_lifecycle_lease,
+                            error,
+                        ));
                     }
                 }
             }
@@ -722,20 +818,42 @@ impl FrontendDistributedQueryCoordinator {
                             .registry
                             .latch_failure_and_cancel(query_id, error.message().to_string());
                     }
+                    let _ = abort_query_lifecycle(
+                        &mut query_lifecycle_lease,
+                        error.message().to_string(),
+                    );
                 }
             }
-            DistributedQueryIntent::Profile => self.wait_for_reports(
-                query_id,
-                &submitted_instance_ids,
-                deadline,
-                timeout_ms,
-                &parts.cancellation,
-                false,
-                "fragment profile reports",
-            )?,
+            DistributedQueryIntent::Profile => {
+                if let Err(error) = self.wait_for_reports(
+                    query_id,
+                    &submitted_instance_ids,
+                    deadline,
+                    timeout_ms,
+                    &parts.cancellation,
+                    false,
+                    "fragment profile reports",
+                ) {
+                    let kind = error.kind();
+                    let message = abort_query_lifecycle(
+                        &mut query_lifecycle_lease,
+                        error.message().to_string(),
+                    );
+                    return Err(DistributedQueryError::new(kind, message));
+                }
+            }
         }
 
-        let (query_failure, reports) = self.registry.seal_and_take_completion(query_id)?;
+        let (query_failure, reports) = match self.registry.seal_and_take_completion(query_id) {
+            Ok(completion) => completion,
+            Err(error) => {
+                let kind = error.kind();
+                let message =
+                    abort_query_lifecycle(&mut query_lifecycle_lease, error.message().to_string());
+                return Err(DistributedQueryError::new(kind, message));
+            }
+        };
+        let mut lifecycle_failure = query_failure.clone();
         let outcome = (|| {
             let result = expected_output.into_query_result(batches)?;
             match intent {
@@ -750,6 +868,7 @@ impl FrontendDistributedQueryCoordinator {
                     }
                     let report_outcome = builder.finish()?;
                     if let Some(reason) = report_outcome.abort_reason() {
+                        lifecycle_failure = Some(reason.to_string());
                         let _ = self
                             .registry
                             .latch_failure_and_cancel(query_id, reason.to_string());
@@ -770,6 +889,18 @@ impl FrontendDistributedQueryCoordinator {
             let _ = self
                 .registry
                 .latch_failure_and_cancel(query_id, error.message().to_string());
+            let kind = error.kind();
+            let message =
+                abort_query_lifecycle(&mut query_lifecycle_lease, error.message().to_string());
+            return Err(DistributedQueryError::new(kind, message));
+        }
+        if let Some(message) = lifecycle_failure {
+            let _ = abort_query_lifecycle(&mut query_lifecycle_lease, message);
+        } else {
+            query_lifecycle_lease
+                .take()
+                .expect("query lifecycle lease is present through query completion")
+                .finalize()?;
         }
         outcome
     }
@@ -840,14 +971,14 @@ impl FrontendDistributedQueryCoordinator {
         }
     }
 
-    fn fail_cancel_then_abort_runtime_filters(
+    fn fail_cancel_then_abort_query_lifecycle(
         &self,
         query_id: QueryId,
-        lease: &mut Option<novarocks::query_execution::artifact::RuntimeFilterInstallLease>,
+        lease: &mut Option<novarocks::query_execution::lifecycle::QueryLifecycleLease>,
         message: impl Into<String>,
     ) -> DistributedQueryError {
         let primary = self.fail_and_cancel(query_id, message);
-        let enriched = abort_runtime_filters(lease, primary.message().to_string());
+        let enriched = abort_query_lifecycle(lease, primary.message().to_string());
         let _ = self
             .registry
             .preserve_failure_context(query_id, enriched.clone());
@@ -868,8 +999,8 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
 
-fn abort_runtime_filters(
-    lease: &mut Option<novarocks::query_execution::artifact::RuntimeFilterInstallLease>,
+fn abort_query_lifecycle(
+    lease: &mut Option<novarocks::query_execution::lifecycle::QueryLifecycleLease>,
     message: impl Into<String>,
 ) -> String {
     let message = message.into();

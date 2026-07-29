@@ -22,6 +22,8 @@ mod manifest;
 #[cfg(test)]
 mod tests;
 
+pub(super) use barrier::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
+
 pub use novarocks::query_execution::lifecycle::{
     QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
     QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,

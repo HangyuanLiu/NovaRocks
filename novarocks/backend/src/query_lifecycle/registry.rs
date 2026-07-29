@@ -29,6 +29,7 @@ use novarocks::query_execution::lifecycle::{
     QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryLifecycleIngress, QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
 };
+use novarocks::runtime::fragment::FragmentOutcome;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 
@@ -124,6 +125,7 @@ pub(crate) struct QueryLifecycleRegistry {
 
 struct QueryLifecycleRegistryState {
     entries: BTreeMap<QueryExecutionId, Arc<QueryLifecycleEntry>>,
+    fragment_executions: BTreeMap<UniqueId, QueryExecutionId>,
     tombstones: VecDeque<QueryExecutionId>,
     active_entries: usize,
     init_conflicts: u64,
@@ -144,6 +146,7 @@ impl Default for QueryLifecycleRegistryState {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
+            fragment_executions: BTreeMap::new(),
             tombstones: VecDeque::new(),
             active_entries: 0,
             init_conflicts: 0,
@@ -164,6 +167,7 @@ struct InitWorkspace {
 }
 
 pub(crate) struct FragmentAdmissionPermit {
+    registry: Weak<QueryLifecycleRegistry>,
     execution_id: QueryExecutionId,
     fragment_instance_id: UniqueId,
     entry: Arc<QueryLifecycleEntry>,
@@ -684,6 +688,7 @@ impl QueryLifecycleRegistry {
         }
         drop(state);
         Ok(FragmentAdmissionPermit {
+            registry: self.self_weak.clone(),
             execution_id,
             fragment_instance_id,
             entry,
@@ -770,6 +775,15 @@ impl QueryLifecycleRegistry {
         entry: Arc<QueryLifecycleEntry>,
         requested_reason: QueryTerminationReason,
     ) -> QueryTerminationReason {
+        self.request_termination_with_event(entry, requested_reason, None)
+    }
+
+    fn request_termination_with_event(
+        &self,
+        entry: Arc<QueryLifecycleEntry>,
+        requested_reason: QueryTerminationReason,
+        terminal_event: Option<QueryControlEvent>,
+    ) -> QueryTerminationReason {
         let (execution_id, expected_instances, initializing, terminal_event_permit) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if let Some(reason) = state.termination_reason {
@@ -795,9 +809,11 @@ impl QueryLifecycleRegistry {
         };
 
         if let Some(permit) = terminal_event_permit {
-            drop(permit.send(QueryControlEvent::TerminationAccepted {
-                reason: requested_reason,
-            }));
+            drop(permit.send(
+                terminal_event.unwrap_or(QueryControlEvent::TerminationAccepted {
+                    reason: requested_reason,
+                }),
+            ));
         }
         self.publish_metrics();
         self.local_runtime
@@ -811,6 +827,55 @@ impl QueryLifecycleRegistry {
             self.publish_tombstone(&entry, execution_id, requested_reason);
         }
         requested_reason
+    }
+
+    pub(crate) fn record_fragment_terminal(
+        &self,
+        fragment_instance_id: UniqueId,
+        outcome: &FragmentOutcome,
+    ) {
+        let execution_id = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .fragment_executions
+            .remove(&fragment_instance_id);
+        if matches!(outcome, FragmentOutcome::Succeeded) {
+            return;
+        }
+        let Some(execution_id) = execution_id else {
+            warn!(
+                target: "novarocks::query_lifecycle",
+                finst_id = %fragment_instance_id,
+                "fragment terminal fact has no committed query lifecycle admission"
+            );
+            return;
+        };
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return;
+        };
+        let (code, detail) = match outcome {
+            FragmentOutcome::Failed(error) => {
+                ("FRAGMENT_EXECUTION_FAILED".to_string(), error.to_string())
+            }
+            FragmentOutcome::Cancelled { reason } => (
+                "FRAGMENT_CANCELLED".to_string(),
+                reason.detail().to_string(),
+            ),
+            FragmentOutcome::Succeeded => return,
+        };
+        self.request_termination_with_event(
+            entry,
+            QueryTerminationReason::LocalFailure,
+            Some(QueryControlEvent::LocalFailure { code, detail }),
+        );
     }
 
     fn try_complete_runtime_filter_cleanup(
@@ -1276,6 +1341,30 @@ impl FragmentAdmissionPermit {
         }
         state.accepted_fragments.insert(self.fragment_instance_id);
         state.pre_start_deadline = None;
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?;
+        let mut registry_state = registry
+            .state
+            .lock()
+            .expect("query lifecycle registry lock");
+        let previous = registry_state
+            .fragment_executions
+            .insert(self.fragment_instance_id, self.execution_id);
+        if let Some(previous_execution_id) = previous {
+            registry_state
+                .fragment_executions
+                .insert(self.fragment_instance_id, previous_execution_id);
+            drop(registry_state);
+            state.accepted_fragments.remove(&self.fragment_instance_id);
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "fragment instance already belongs to a committed query lifecycle admission",
+            ));
+        }
+        drop(registry_state);
+        drop(state);
         self.committed = true;
         Ok(())
     }

@@ -24,7 +24,6 @@ mod execution;
 mod query_lifecycle;
 mod query_registry;
 mod report;
-mod runtime_filter;
 mod scheduler;
 
 pub use backend_events::BackendQueryActivity;

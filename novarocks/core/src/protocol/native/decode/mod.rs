@@ -46,7 +46,7 @@ pub(in crate::protocol::native) use runtime_filter::{
 pub(crate) use scan::scan_read_binding_for_test;
 pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_program};
 #[allow(unused_imports)]
-pub(crate) use submission::decode_fragment_submission;
+pub(crate) use submission::{decode_fragment_submission, decode_query_execution_id};
 
 #[cfg(test)]
 mod tests {

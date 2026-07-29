@@ -27,6 +27,9 @@ use novarocks::query_execution::lifecycle::{
     QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
     QueryLifecycleErrorCode, QueryTerminationReason, RuntimeFilterContribution,
 };
+use novarocks::runtime::fragment::{
+    FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
+};
 use novarocks::runtime::query_options::QueryOptions;
 
 use super::entry::QueryLifecyclePhase;
@@ -726,7 +729,7 @@ fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
 }
 
 #[test]
-fn query_lifecycle_admission_commit_after_abort_returns_terminated() {
+fn query_abort_submit_race() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let expected = UniqueId { hi: 75, lo: 1 };
     let request = fragment_init_request_fixture(75, &[expected]);
@@ -753,6 +756,55 @@ fn query_lifecycle_admission_commit_after_abort_returns_terminated() {
             .expect_err("late permit commit must not authorize fragment start")
             .code(),
         QueryLifecycleErrorCode::Terminated
+    );
+    assert_eq!(
+        registry
+            .admit_fragment(execution_id, expected)
+            .expect_err("abort must reject every later fragment request")
+            .code(),
+        QueryLifecycleErrorCode::Terminated
+    );
+}
+
+#[test]
+fn fragment_failure_emits_query_local_failure() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let expected = UniqueId { hi: 76, lo: 1 };
+    let request = fragment_init_request_fixture(76, &[expected]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    assert_eq!(
+        attachment.events.try_recv().expect("ControlReady event"),
+        QueryControlEvent::ControlReady
+    );
+    registry
+        .admit_fragment(execution_id, expected)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+
+    registry.record_fragment_terminal(
+        expected,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "pipeline worker failed",
+        )),
+    );
+
+    assert_eq!(
+        attachment.events.try_recv().expect("LocalFailure event"),
+        QueryControlEvent::LocalFailure {
+            code: "FRAGMENT_EXECUTION_FAILED".to_string(),
+            detail: "fragment execution error (pipeline): pipeline worker failed".to_string(),
+        }
+    );
+    assert_eq!(
+        registry.termination_reason(execution_id),
+        Some(QueryTerminationReason::LocalFailure)
     );
 }
 

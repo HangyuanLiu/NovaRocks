@@ -279,15 +279,18 @@ fn submit_fragment_request_carries_native_fields_only() {
             report_endpoint: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,
         }),
-        ..Default::default()
+        execution_id: Some(novarocks::QueryExecutionId {
+            query_id: Some(id(1, 2)),
+            attempt_id: 1,
+        }),
     };
     let fields = encoded_field_numbers(&request);
 
     assert!(fields.contains(&1), "plan must use reset tag 1");
     assert!(fields.contains(&2), "instance_params must use reset tag 2");
     assert!(
-        !fields.contains(&3),
-        "pre-release reset must not keep old instance_params tag 3"
+        fields.contains(&3),
+        "execution_id must use SubmitFragmentRequest tag 3"
     );
 
     let decoded: novarocks::SubmitFragmentRequest = roundtrip_message(&request);

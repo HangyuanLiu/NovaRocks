@@ -347,6 +347,10 @@ fn release_submit_fragment_request() -> novarocks::SubmitFragmentRequest {
             report_endpoint: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,
         }),
+        execution_id: Some(novarocks::QueryExecutionId {
+            query_id: Some(id(1, 2)),
+            attempt_id: 1,
+        }),
     }
 }
 

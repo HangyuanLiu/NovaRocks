@@ -124,6 +124,10 @@ impl FrontendFragmentScheduler {
         self.backends.entries()
     }
 
+    pub(crate) fn live_targets(&self) -> Vec<LiveBackendTarget> {
+        self.backends.live_targets()
+    }
+
     pub(crate) fn scheduled_backend_ownership(
         &self,
         backend_ids: &[usize],

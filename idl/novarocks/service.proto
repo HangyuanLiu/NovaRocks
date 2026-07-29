@@ -44,12 +44,6 @@ service NovaRocksGrpc {
   // Native runtime-filter envelope propagation.
   rpc TransmitRuntimeFilterEnvelope(novarocks.filter.RuntimeFilterEnvelope)
       returns (novarocks.filter.RuntimeFilterEnvelopeResponse);
-  rpc InstallRuntimeFilterDeployment(
-      novarocks.filter.InstallRuntimeFilterDeploymentRequest)
-      returns (novarocks.filter.InstallRuntimeFilterDeploymentResponse);
-  rpc AbortRuntimeFilterDeployment(
-      novarocks.filter.AbortRuntimeFilterDeploymentRequest)
-      returns (novarocks.filter.AbortRuntimeFilterDeploymentResponse);
   // Point lookup (fetch-by-key).
   rpc Lookup(novarocks.filter.LookupRequest)
       returns (novarocks.filter.LookupResponse);
@@ -246,6 +240,7 @@ message ExchangeResponse {
 message SubmitFragmentRequest {
   novarocks.plan.PlanFragment plan = 1;        // native static plan shared across instances
   InstanceParams instance_params = 2;          // native per-instance dynamic parameters
+  QueryExecutionId execution_id = 3;           // required immutable query-attempt identity
 }
 
 // Native per-instance fragment parameters. Complements the static PlanFragment

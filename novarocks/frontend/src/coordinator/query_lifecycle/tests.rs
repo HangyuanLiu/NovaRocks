@@ -437,6 +437,23 @@ fn frontend_query_lifecycle_config_requires_three_heartbeat_intervals() {
 }
 
 #[test]
+fn query_control_barrier_precedes_submission() {
+    let plan = query_init_plan(Some(2));
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all Init and ControlReady acknowledgements precede submission eligibility");
+
+    assert_eq!(sorted(transport.attach_targets()), vec![0, 1, 2]);
+    assert_eq!(transport.init_calls().len(), 3);
+    lease.finalize().expect("finalize lifecycle fixture");
+}
+
+#[test]
 fn frontend_query_lifecycle_pre_ready_guard_unwind_aborts_and_unbinds() {
     let plan = query_init_plan(None);
     let execution_id = plan.execution_id();
@@ -1128,6 +1145,94 @@ fn frontend_query_lifecycle_query_registry_service_only_backend_loss_aborts_atte
                 .any(|command| matches!(command, QueryControlCommand::Abort { .. }))
         );
     }
+    drop(lease);
+}
+
+#[derive(Default)]
+struct RecordingLegacyCancellationDispatcher {
+    cancellations: std::sync::atomic::AtomicUsize,
+}
+
+impl FragmentDispatcher for RecordingLegacyCancellationDispatcher {
+    fn submit_fragment(
+        &self,
+        _backend_idx: usize,
+        _submission: NativeFragmentEnvelope,
+    ) -> Result<(), String> {
+        unreachable!("cancellation test does not submit fragments")
+    }
+
+    fn fetch_result(
+        &self,
+        _backend_idx: usize,
+        _finst_id: UniqueId,
+        _max_wait_ms: i64,
+        _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
+    ) -> Result<FetchOutcome, String> {
+        unreachable!("cancellation test does not fetch fragments")
+    }
+
+    fn cancel_fragments(&self, _backend_idx: usize, _query_id: QueryId, _finst_ids: &[UniqueId]) {
+        self.cancellations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn backend_count(&self) -> usize {
+        3
+    }
+}
+
+#[test]
+fn query_cancel_aborts_all_participants() {
+    let plan = query_init_plan(Some(2));
+    let execution_id = plan.execution_id();
+    let query_id = execution_id.query_id();
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    let dispatcher = Arc::new(RecordingLegacyCancellationDispatcher::default());
+    let registry = Arc::new(FrontendQueryRegistry::default());
+    let _query = registry
+        .register(query_id, DistributedQueryIntent::Result, dispatcher.clone())
+        .expect("register cancellation fixture");
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport), Arc::clone(&registry), config());
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants become control-ready");
+    let submitted = manifest(execution_id, 0, false)
+        .expected_fragment_instance_ids()
+        .iter()
+        .next()
+        .copied()
+        .expect("fragment participant has one instance");
+    registry
+        .record_attempt(query_id, 0, submitted)
+        .expect("record the only submitted fragment");
+    registry
+        .finish_attempt(query_id)
+        .expect("finish the only submission");
+
+    registry
+        .latch_failure_and_cancel(query_id, "client requested statement cancellation")
+        .expect("first cancellation wins");
+
+    for session in sessions.values() {
+        assert_eq!(
+            session
+                .commands()
+                .iter()
+                .filter(|command| matches!(command, QueryControlCommand::Abort { .. }))
+                .count(),
+            1,
+            "every initialized participant, including service-only, receives one stream Abort"
+        );
+    }
+    assert_eq!(
+        dispatcher
+            .cancellations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "QLC-1A cancellation must not fall back to attempted fragment cancellation"
+    );
     drop(lease);
 }
 

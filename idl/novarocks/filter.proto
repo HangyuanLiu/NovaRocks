@@ -298,39 +298,9 @@ message InstallRuntimeFilterDeploymentRequest {
   RuntimeFilterParticipantInstall install = 5;
 }
 
-enum RuntimeFilterDeploymentResponseStatus {
-  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_UNSPECIFIED = 0;
-  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_APPLIED = 1;
-  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_IDEMPOTENT = 2;
-  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_REJECTED = 3;
-}
-
-enum RuntimeFilterDeploymentRejectionCode {
-  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_UNSPECIFIED = 0;
-  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INVALID_REQUEST = 1;
-  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_STALE_EPOCH = 2;
-  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_CONFLICTING_DEPLOYMENT = 3;
-  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_QUERY_ABORTED = 4;
-  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_ACTIVE_FRAGMENTS = 5;
-  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INTERNAL = 6;
-}
-
-message RuntimeFilterDeploymentRejection {
-  RuntimeFilterDeploymentRejectionCode code = 1;
-  string reason = 2;
-}
-
-message InstallRuntimeFilterDeploymentResponse {
-  RuntimeFilterDeploymentResponseStatus status = 1;
-  optional RuntimeFilterDeploymentRejection rejection = 2;
-}
-
+// Internal canonical codec envelope retained for lifecycle manifests and
+// rollback validation. It is no longer an RPC request.
 message AbortRuntimeFilterDeploymentRequest {
   novarocks.common.UniqueId query_id = 1;
   uint64 deployment_epoch = 2;
-}
-
-message AbortRuntimeFilterDeploymentResponse {
-  RuntimeFilterDeploymentResponseStatus status = 1;
-  optional RuntimeFilterDeploymentRejection rejection = 2;
 }

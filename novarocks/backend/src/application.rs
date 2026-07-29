@@ -156,19 +156,20 @@ impl Drop for QueryLifecycleSweepTask {
 
 fn compose_backend_application_services(config: &NovaRocksConfig) -> BackendApplicationServices {
     let controls = Arc::new(FragmentControlRegistry::default());
-    let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
-        grpc_exchange_transmitter(),
-        grpc_fragment_lookup_client(),
-        native_result_writer(),
-        native_fragment_event_sink(),
-        Arc::clone(&controls),
-    ));
-    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(controls));
+    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(Arc::clone(&controls)));
     let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound(
         novarocks::runtime::start_epoch::start_epoch(),
         local_runtime,
         QueryLifecycleRegistryConfig::from_runtime_config(&config.runtime),
     );
+    let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
+        grpc_exchange_transmitter(),
+        grpc_fragment_lookup_client(),
+        native_result_writer(),
+        native_fragment_event_sink(),
+        controls,
+        Arc::clone(&query_lifecycle_registry),
+    ));
     BackendApplicationServices {
         native_fragment_service,
         query_lifecycle_registry,
@@ -539,8 +540,8 @@ mod tests {
 
         assert_eq!(
             Arc::strong_count(&services.query_lifecycle_registry),
-            1,
-            "application composition must be the single registry owner before ingress injection"
+            2,
+            "application composition and fragment ingress must share exactly one registry"
         );
     }
 

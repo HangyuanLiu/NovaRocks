@@ -22,12 +22,14 @@ use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::proto;
 use crate::protocol::native::decode::decode_fragment_submission;
+use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 
 pub struct NativeFragmentRequest {
+    execution_id: QueryExecutionId,
     submission: FragmentSubmission,
     backend_num: i32,
     report_endpoint: Option<RuntimeEndpoint>,
@@ -35,12 +37,20 @@ pub struct NativeFragmentRequest {
 
 impl NativeFragmentRequest {
     pub fn try_decode(
+        execution_id: QueryExecutionId,
         fragment: proto::plan::PlanFragment,
         instance_params: proto::novarocks::InstanceParams,
     ) -> Result<Self, NativeFragmentIngressError> {
         let decoded = decode_fragment_submission(&fragment, &instance_params)
             .map_err(NativeFragmentIngressError::new)?;
         let (submission, metadata) = decoded.into_parts();
+        if execution_id.query_id().high() != submission.instance().query_id().hi()
+            || execution_id.query_id().low() != submission.instance().query_id().lo()
+        {
+            return Err(NativeFragmentIngressError::new(
+                "native fragment execution_id query_id does not match instance_params query_id",
+            ));
+        }
         debug_assert_eq!(
             metadata.typed_result_sink(),
             submission.instance().runtime_options().typed_result_sink()
@@ -50,10 +60,15 @@ impl NativeFragmentRequest {
             submission.instance().backend_num().get()
         );
         Ok(Self {
+            execution_id,
             submission,
             backend_num: metadata.backend_num(),
             report_endpoint: metadata.report_endpoint().cloned(),
         })
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
     }
 
     pub const fn query_id(&self) -> QueryId {

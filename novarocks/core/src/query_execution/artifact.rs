@@ -54,13 +54,6 @@ use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
 };
 
-pub use crate::query_execution::runtime_filter::{
-    RuntimeFilterAbortEnvelope, RuntimeFilterDeploymentDispatcher, RuntimeFilterDeploymentEpoch,
-    RuntimeFilterDeploymentOptions, RuntimeFilterInstallBarrier, RuntimeFilterInstallEnvelope,
-    RuntimeFilterInstallLease, RuntimeFilterInstallLeaseGuard, RuntimeFilterInstallPlan,
-    RuntimeFilterParticipantInstallPlan, new_grpc_runtime_filter_deployment_dispatcher,
-};
-
 pub type FragmentId = u32;
 pub type PlanNodeId = i32;
 
@@ -166,31 +159,6 @@ impl ScheduleBoundDistributedQuery {
             query_lifecycle_lease,
         })
     }
-
-    /// Transitional Task 7 dependency for the production coordinator.
-    ///
-    /// This legacy RF-only path is deliberately not a query-lifecycle owner.
-    pub fn prepare_legacy_runtime_filters(
-        self,
-        options: RuntimeFilterDeploymentOptions,
-        barrier: &dyn RuntimeFilterInstallBarrier,
-    ) -> Result<LegacyRuntimeFilterReadyDistributedQuery, DistributedQueryError> {
-        let plan = crate::query_execution::runtime_filter::compile_install_plan(
-            self.schedule.execution_id.query_id(),
-            self.prepared.runtime_filter_graph(),
-            self.prepared.runtime_filter_join_progress(),
-            self.prepared.scheduling_view().edges(),
-            &self.schedule.inner,
-            options,
-        )?;
-        let runtime_filter_lease = barrier.install_all(plan)?;
-        Ok(LegacyRuntimeFilterReadyDistributedQuery {
-            prepared: self.prepared,
-            native_bundle: self.native_bundle,
-            schedule: self.schedule,
-            runtime_filter_lease,
-        })
-    }
 }
 
 /// The only query-control typestate that can assemble native submissions.
@@ -233,58 +201,6 @@ impl ControlReadyDistributedQuery {
                 let kind = error.kind();
                 let message = self
                     .query_lifecycle_lease
-                    .abort_preserving(error.message().to_string());
-                Err(DistributedQueryError::new(kind, message))
-            }
-        }
-    }
-}
-
-/// Transitional RF-only production handoff pending the Task 7 cutover.
-///
-/// It owns only a legacy runtime-filter lease and must never be treated as
-/// evidence that query-wide Init/ControlReady completed.
-pub struct LegacyRuntimeFilterReadyDistributedQuery {
-    prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentBundle,
-    schedule: ValidatedFragmentSchedule,
-    runtime_filter_lease: RuntimeFilterInstallLease,
-}
-
-impl LegacyRuntimeFilterReadyDistributedQuery {
-    pub fn assemble(
-        self,
-        context: NativeSubmissionContext,
-    ) -> Result<LegacyPreparedNativeExecution, DistributedQueryError> {
-        if context.query_id != self.schedule.execution_id.query_id() {
-            let error = contract_error(
-                "native submission context query id does not match validated schedule",
-            );
-            let kind = error.kind();
-            let message = self
-                .runtime_filter_lease
-                .abort_preserving(error.message().to_string());
-            return Err(DistributedQueryError::new(kind, message));
-        }
-        let assembled = assemble_native_execution(
-            self.prepared,
-            self.native_bundle,
-            self.schedule.inner,
-            self.schedule.execution_id,
-            context,
-        );
-        match assembled {
-            Ok(assembled) => Ok(LegacyPreparedNativeExecution {
-                submissions: assembled.submissions,
-                root_fetch: assembled.root_fetch,
-                writer_registrations: assembled.writer_registrations,
-                expected_output: assembled.expected_output,
-                runtime_filter_lease: self.runtime_filter_lease,
-            }),
-            Err(error) => {
-                let kind = error.kind();
-                let message = self
-                    .runtime_filter_lease
                     .abort_preserving(error.message().to_string());
                 Err(DistributedQueryError::new(kind, message))
             }
@@ -1021,36 +937,6 @@ pub struct PreparedNativeExecutionParts {
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
-}
-
-/// Transitional Task 7 production result. It is intentionally distinct from
-/// `PreparedNativeExecution` and cannot carry a query-wide lifecycle lease.
-pub struct LegacyPreparedNativeExecution {
-    submissions: Vec<ValidatedNativeSubmission>,
-    root_fetch: RootFetchMetadata,
-    writer_registrations: WriterRegistrationSet,
-    expected_output: ExpectedOutputSchema,
-    runtime_filter_lease: RuntimeFilterInstallLease,
-}
-
-impl LegacyPreparedNativeExecution {
-    pub fn into_parts(self) -> LegacyPreparedNativeExecutionParts {
-        LegacyPreparedNativeExecutionParts {
-            submissions: self.submissions,
-            root_fetch: self.root_fetch,
-            writer_registrations: self.writer_registrations,
-            expected_output: self.expected_output,
-            runtime_filter_lease: self.runtime_filter_lease,
-        }
-    }
-}
-
-pub struct LegacyPreparedNativeExecutionParts {
-    pub submissions: Vec<ValidatedNativeSubmission>,
-    pub root_fetch: RootFetchMetadata,
-    pub writer_registrations: WriterRegistrationSet,
-    pub expected_output: ExpectedOutputSchema,
-    pub runtime_filter_lease: RuntimeFilterInstallLease,
 }
 
 fn assemble_native_execution(
