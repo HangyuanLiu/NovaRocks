@@ -133,7 +133,8 @@ pub(super) struct ScanAsyncRunner {
 struct RowPositionState {
     spec: RowPositionSpec,
     scan_range_id: i32,
-    first_row_id: i64,
+    row_id_from_provider: bool,
+    legacy_first_row_id: Option<i64>,
     next_row_offset: i64,
 }
 
@@ -548,8 +549,17 @@ impl ScanAsyncRunner {
         let Some(spec) = self.scan.row_position() else {
             return Ok(None);
         };
+        if let Some(position) = morsel.connector_row_position() {
+            return Ok(Some(RowPositionState {
+                spec: spec.clone(),
+                scan_range_id: position.scan_range_id,
+                row_id_from_provider: true,
+                legacy_first_row_id: None,
+                next_row_offset: 0,
+            }));
+        }
         let Some(range) = morsel.file_range() else {
-            return Err("row position requires file range morsels".to_string());
+            return Err("row position requires a connector range identity or legacy file range".to_string());
         };
         let first_row_id = range
             .first_row_id
@@ -557,7 +567,8 @@ impl ScanAsyncRunner {
         Ok(Some(RowPositionState {
             spec: spec.clone(),
             scan_range_id: range.scan_range_id,
-            first_row_id,
+            row_id_from_provider: false,
+            legacy_first_row_id: Some(first_row_id),
             next_row_offset: 0,
         }))
     }
@@ -1022,13 +1033,31 @@ impl ScanAsyncRunner {
         let scan_range_array =
             Arc::new(Int32Array::from(vec![state.scan_range_id; row_count])) as ArrayRef;
 
-        let start_row_id = state.first_row_id + state.next_row_offset;
-        let row_id_values = (0..row_count)
-            .map(|idx| start_row_id + idx as i64)
-            .collect::<Vec<_>>();
-        // Row ids must be computed before runtime filters; downstream predicates will drop rows.
-        state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
-        let row_id_array = Arc::new(Int64Array::from(row_id_values)) as ArrayRef;
+        let provider_row_id = state
+            .row_id_from_provider
+            .then(|| chunk.column_by_slot_id(state.spec.row_id_slot))
+            .transpose()?;
+        let row_id_array = if let Some(row_id) = provider_row_id {
+            if row_id.data_type() != state.spec.row_id_field.data_type() {
+                return Err(format!(
+                    "connector row id type {:?} does not match {:?}",
+                    row_id.data_type(),
+                    state.spec.row_id_field.data_type()
+                ));
+            }
+            row_id
+        } else {
+            let start_row_id = state
+                .legacy_first_row_id
+                .ok_or_else(|| "legacy row position is missing first_row_id".to_string())?
+                .checked_add(state.next_row_offset)
+                .ok_or_else(|| "legacy row id overflow".to_string())?;
+            let row_id_values = (0..row_count)
+                .map(|idx| start_row_id + idx as i64)
+                .collect::<Vec<_>>();
+            state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
+            Arc::new(Int64Array::from(row_id_values)) as ArrayRef
+        };
 
         let mut field_map = HashMap::new();
         let chunk_schema = chunk.schema();

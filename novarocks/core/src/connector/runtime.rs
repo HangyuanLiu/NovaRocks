@@ -34,7 +34,7 @@ use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::ExecResult;
 use crate::exec::node::scan::{
-    BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
+    BoundScanRanges, ConnectorRowPosition, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
     ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanSource,
 };
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
@@ -58,9 +58,17 @@ struct ConnectorReaderGroup {
 
 #[derive(Default)]
 struct ConnectorReaderGroupState {
-    terminating: bool,
+    phase: ConnectorReaderGroupPhase,
     next_reader_id: usize,
     readers: BTreeMap<usize, Arc<Mutex<Option<Box<dyn ConnectorBatchReader>>>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ConnectorReaderGroupPhase {
+    #[default]
+    Open,
+    Terminating,
+    Closed,
 }
 
 impl ConnectorReaderGroup {
@@ -74,8 +82,11 @@ impl ConnectorReaderGroup {
                 .state
                 .lock()
                 .map_err(|_| "connector reader group lock poisoned".to_string())?;
-            if state.terminating {
-                return Err("connector reader group is terminating".to_string());
+            if state.phase != ConnectorReaderGroupPhase::Open {
+                return Err(format!(
+                    "connector reader group is {:?}",
+                    state.phase
+                ));
             }
             let reader_id = state.next_reader_id;
             state.next_reader_id = state.next_reader_id.saturating_add(1);
@@ -101,10 +112,10 @@ impl ConnectorReaderGroup {
                 .state
                 .lock()
                 .map_err(|_| "connector reader group lock poisoned".to_string())?;
-            if state.terminating {
+            if state.phase != ConnectorReaderGroupPhase::Open {
                 return Ok(());
             }
-            state.terminating = true;
+            state.phase = ConnectorReaderGroupPhase::Terminating;
             std::mem::take(&mut state.readers)
                 .into_values()
                 .collect::<Vec<_>>()
@@ -121,6 +132,16 @@ impl ConnectorReaderGroup {
             if let Err(error) = result {
                 cleanup_errors.push(error);
             }
+        }
+        let closed = self
+            .state
+            .lock()
+            .map_err(|_| "connector reader group lock poisoned".to_string())
+            .map(|mut state| {
+                state.phase = ConnectorReaderGroupPhase::Closed;
+            });
+        if let Err(error) = closed {
+            cleanup_errors.push(error);
         }
         if cleanup_errors.is_empty() {
             Ok(())
@@ -284,21 +305,37 @@ impl ConnectorSplitAppend {
 #[derive(Clone)]
 pub(crate) struct ConnectorScheduledSplit {
     split: ConnectorSplit,
-    file_range: Option<FileScanRange>,
+    row_position: Option<ConnectorRowPosition>,
+    legacy_file_range: Option<FileScanRange>,
 }
 
 impl ConnectorScheduledSplit {
     pub(crate) fn plain(split: ConnectorSplit) -> Self {
         Self {
             split,
-            file_range: None,
+            row_position: None,
+            legacy_file_range: None,
         }
     }
 
+    pub(crate) fn with_row_position(
+        split: ConnectorSplit,
+        row_position: ConnectorRowPosition,
+    ) -> Self {
+        Self {
+            split,
+            row_position: Some(row_position),
+            legacy_file_range: None,
+        }
+    }
+
+    /// Temporary compatibility path for the legacy raw-file owner. It is not
+    /// used by ConnectorRead sources produced for Iceberg.
     pub(crate) fn file(split: ConnectorSplit, file_range: FileScanRange) -> Self {
         Self {
             split,
-            file_range: Some(file_range),
+            row_position: None,
+            legacy_file_range: Some(file_range),
         }
     }
 
@@ -307,16 +344,19 @@ impl ConnectorScheduledSplit {
     }
 
     pub(crate) fn file_range(&self) -> Option<&FileScanRange> {
-        self.file_range.as_ref()
+        self.legacy_file_range.as_ref()
     }
 
     fn morsel(&self, index: usize) -> ScanMorsel {
-        match &self.file_range {
+        match &self.legacy_file_range {
             Some(range) => ScanMorsel::ConnectorFileSplit {
                 index,
                 range: range.clone(),
             },
-            None => ScanMorsel::ConnectorSplit { index },
+            None => ScanMorsel::ConnectorSplit {
+                index,
+                row_position: self.row_position,
+            },
         }
     }
 }
@@ -783,7 +823,7 @@ impl ScanOp for ConnectorReadScanOp {
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<crate::exec::node::BoxedExecIter, String> {
         let index = match morsel {
-            ScanMorsel::ConnectorSplit { index } | ScanMorsel::ConnectorFileSplit { index, .. } => {
+            ScanMorsel::ConnectorSplit { index, .. } | ScanMorsel::ConnectorFileSplit { index, .. } => {
                 index
             }
             _ => {

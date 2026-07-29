@@ -68,10 +68,10 @@ pub enum ScanMorsel {
     /// in the core morsel contract.
     ConnectorSplit {
         index: usize,
+        row_position: Option<ConnectorRowPosition>,
     },
-    /// A scheduled SPI split with file metadata retained by core. The opaque
-    /// provider payload is selected by `index`; `range` remains available to
-    /// core row-position, virtual-column, and delete filtering logic.
+    /// Transitional legacy physical-file morsel. New connector reads use
+    /// `ConnectorSplit` and never expose their file details here.
     ConnectorFileSplit {
         index: usize,
         range: FileScanRange,
@@ -121,9 +121,16 @@ impl ScanMorsel {
             ScanMorsel::IcebergMetadata { index } => {
                 format!("iceberg_metadata_index={index}")
             }
-            ScanMorsel::ConnectorSplit { index } => {
-                format!("connector_split_index={index}")
-            }
+            ScanMorsel::ConnectorSplit {
+                index,
+                row_position,
+            } => format!(
+                "connector_split_index={index} row_position_range={}",
+                row_position
+                    .as_ref()
+                    .map(|position| position.scan_range_id.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
             ScanMorsel::ConnectorFileSplit { index, range } => format!(
                 "connector_file_split_index={index} path={} offset={} length={}",
                 range.path, range.offset, range.length
@@ -133,8 +140,8 @@ impl ScanMorsel {
         }
     }
 
-    /// Returns the core-owned file metadata for both legacy and SPI-scheduled
-    /// file morsels. It intentionally excludes every provider payload.
+    /// Returns legacy file metadata. Connector splits never expose provider
+    /// file details to core execution.
     pub fn file_range(&self) -> Option<FileScanRange> {
         match self {
             Self::FileRange {
@@ -168,6 +175,18 @@ impl ScanMorsel {
             _ => None,
         }
     }
+
+    pub fn connector_row_position(&self) -> Option<&ConnectorRowPosition> {
+        match self {
+            Self::ConnectorSplit { row_position, .. } => row_position.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorRowPosition {
+    pub scan_range_id: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -671,8 +690,7 @@ impl std::fmt::Debug for ScanNode {
 mod tests {
     use std::sync::Arc;
 
-    use super::{RuntimeFilterContext, ScanMorsel};
-    use crate::connector::file_execution::FileScanRange;
+    use super::{ConnectorRowPosition, RuntimeFilterContext, ScanMorsel};
     use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
 
     #[test]
@@ -693,28 +711,15 @@ mod tests {
     }
 
     #[test]
-    fn connector_file_split_preserves_core_file_metadata() {
-        let morsel = ScanMorsel::ConnectorFileSplit {
+    fn connector_split_keeps_only_generic_row_position_metadata() {
+        let morsel = ScanMorsel::ConnectorSplit {
             index: 3,
-            range: FileScanRange {
-                path: "s3://bucket/data.parquet".to_string(),
-                file_len: 99,
-                offset: 7,
-                length: 11,
-                scan_range_id: 5,
-                first_row_id: Some(13),
-                data_sequence_number: Some(17),
-                ivm_change_op: Some(2),
-                included_positions: Some(vec![1, 4]),
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            },
+            row_position: Some(ConnectorRowPosition { scan_range_id: 5 }),
         };
-        let range = morsel.file_range().expect("file metadata");
-        assert_eq!(range.path, "s3://bucket/data.parquet");
-        assert_eq!(range.scan_range_id, 5);
-        assert_eq!(range.first_row_id, Some(13));
-        assert_eq!(range.included_positions, Some(vec![1, 4]));
+        assert_eq!(
+            morsel.connector_row_position(),
+            Some(&ConnectorRowPosition { scan_range_id: 5 })
+        );
+        assert!(morsel.file_range().is_none());
     }
 }
