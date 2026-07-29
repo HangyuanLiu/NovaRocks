@@ -262,6 +262,18 @@ impl ScanSourceOperator {
             self.row_position_registered = true;
             return Ok(());
         };
+        if let Some(lookup) = self.scan.connector_row_position_lookup() {
+            let query_id = state
+                .query_id()
+                .ok_or_else(|| "row position requires query_id".to_string())?;
+            crate::runtime::query_context::query_context_manager().register_connector_glm(
+                query_id,
+                spec.row_source_slot,
+                lookup.clone(),
+            )?;
+            self.row_position_registered = true;
+            return Ok(());
+        }
         let Some(ranges) = self.scan.row_position_ranges() else {
             return Err("row position ranges missing".to_string());
         };

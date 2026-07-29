@@ -39,6 +39,7 @@ use crate::exec::row_position::RowPositionDescriptor;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
+use crate::exec::node::scan::ConnectorRowPositionLookup;
 use crate::runtime::mem_tracker::{self, MemTracker};
 pub(crate) use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::runtime_filter_observability::{
@@ -212,6 +213,7 @@ pub(crate) struct QueryContext {
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
     pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
+    pub(crate) connector_glm_contexts: HashMap<SlotId, ConnectorRowPositionLookup>,
     #[cfg(feature = "compat")]
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
@@ -412,6 +414,7 @@ impl QueryContext {
             row_pos_descs: HashMap::new(),
             lookup_fetchers: HashMap::new(),
             glm_contexts: HashMap::new(),
+            connector_glm_contexts: HashMap::new(),
             #[cfg(feature = "compat")]
             lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
@@ -632,6 +635,37 @@ impl QueryContext {
             .entry(row_source_slot)
             .or_insert_with(|| GlobalLateMaterializationContext::new(row_source_slot, scan_cfg));
         ctx.register_ranges(ranges);
+    }
+
+    pub(crate) fn register_connector_glm(
+        &mut self,
+        row_source_slot: SlotId,
+        lookup: ConnectorRowPositionLookup,
+    ) -> Result<(), String> {
+        if let Some(existing) = self.connector_glm_contexts.get(&row_source_slot) {
+            if existing.instance.descriptor() != lookup.instance.descriptor()
+                || existing.splits != lookup.splits
+            {
+                return Err(format!(
+                    "conflicting connector late-materialization binding for row source slot {row_source_slot}"
+                ));
+            }
+            return Ok(());
+        }
+        self.connector_glm_contexts.insert(row_source_slot, lookup);
+        Ok(())
+    }
+
+    pub(crate) fn connector_glm_split(
+        &self,
+        row_source_slot: SlotId,
+        scan_range_id: i32,
+    ) -> Option<(Arc<novarocks_spi::connector::ConnectorInstance>, novarocks_spi::connector::ConnectorSplit)> {
+        let lookup = self.connector_glm_contexts.get(&row_source_slot)?;
+        Some((
+            Arc::clone(&lookup.instance),
+            lookup.splits.get(&scan_range_id)?.clone(),
+        ))
     }
 
     pub(crate) fn glm_scan_range(
@@ -2499,6 +2533,17 @@ impl QueryContextManager {
         })
     }
 
+    pub(crate) fn register_connector_glm(
+        &self,
+        query_id: QueryId,
+        row_source_slot: SlotId,
+        lookup: ConnectorRowPositionLookup,
+    ) -> Result<(), String> {
+        self.with_context_mut(query_id, |ctx| {
+            ctx.register_connector_glm(row_source_slot, lookup)
+        })
+    }
+
     pub(crate) fn row_pos_desc(
         &self,
         query_id: QueryId,
@@ -2524,6 +2569,20 @@ impl QueryContextManager {
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
             .and_then(|ctx| ctx.glm_scan_range(row_source_slot, scan_range_id))
+    }
+
+    pub(crate) fn connector_glm_split(
+        &self,
+        query_id: QueryId,
+        row_source_slot: SlotId,
+        scan_range_id: i32,
+    ) -> Option<(Arc<novarocks_spi::connector::ConnectorInstance>, novarocks_spi::connector::ConnectorSplit)> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .and_then(|ctx| ctx.connector_glm_split(row_source_slot, scan_range_id))
     }
 
     pub(crate) fn glm_scan_config(

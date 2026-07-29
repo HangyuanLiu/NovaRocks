@@ -38,10 +38,13 @@ use crate::connector::iceberg::{
     IcebergMetadataScanRange, IcebergMetadataTableType,
     build_projected_output_schema_from_descriptor, plan_compat_iceberg_metadata_read_source,
 };
-use crate::connector::runtime::ConnectorReadScanSource;
+use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::fragment::program::ScanAssignmentKind;
-use crate::exec::node::scan::{BoundScanRanges, ScanNode};
+use crate::exec::node::scan::{
+    BoundScanRanges, ConnectorRowPosition, ConnectorRowPositionLookup, ScanNode,
+};
+use crate::exec::row_position::RowPositionSpec;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
@@ -140,13 +143,39 @@ fn compat_iceberg_files_from_ranges(
         .collect()
 }
 
+struct CompatIcebergDataReadPlan {
+    source: Arc<dyn crate::exec::node::scan::ScanSource>,
+    row_position_lookup: Option<ConnectorRowPositionLookup>,
+}
+
+fn provider_schema_for_compat_iceberg(
+    output_schema: &ChunkSchemaRef,
+    row_position: Option<&RowPositionSpec>,
+) -> Result<ChunkSchemaRef, String> {
+    let Some(row_position) = row_position else {
+        return Ok(Arc::clone(output_schema));
+    };
+    let slots = output_schema
+        .slots()
+        .iter()
+        .filter(|slot| {
+            slot.slot_id() != row_position.row_source_slot
+                && slot.slot_id() != row_position.scan_range_slot
+        })
+        .cloned()
+        .collect();
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+}
+
 fn plan_compat_iceberg_data_read_source(
     connectors: &ConnectorRegistry,
     query_id: QueryId,
     output_schema: ChunkSchemaRef,
     files: Vec<IcebergDataFileInfo>,
+    row_position_ids: Option<Vec<i32>>,
+    row_position: Option<&RowPositionSpec>,
     query_options: &QueryOptions,
-) -> Result<Arc<dyn crate::exec::node::scan::ScanSource>, String> {
+) -> Result<CompatIcebergDataReadPlan, String> {
     let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)
         .map_err(|error| error.to_string())?;
     let instance = connectors
@@ -166,11 +195,41 @@ fn plan_compat_iceberg_data_read_source(
     )
     .map_err(|error| error.to_string())?;
     let splits = build_compat_read_splits(files).map_err(|error| error.to_string())?;
-    Ok(Arc::new(ConnectorReadScanSource::new(
-        instance,
-        splits,
+    let provider_schema = provider_schema_for_compat_iceberg(&output_schema, row_position)?;
+    let row_position_lookup = match row_position_ids {
+        Some(ids) => {
+            if ids.len() != splits.len() {
+                return Err("compat Iceberg row-position split count mismatch".to_string());
+            }
+            Some(ConnectorRowPositionLookup {
+                instance: Arc::clone(&instance),
+                splits: ids.into_iter().zip(splits.iter().cloned()).collect(),
+            })
+        }
+        None => None,
+    };
+    let scheduled = splits
+        .into_iter()
+        .enumerate()
+        .map(|(index, split)| match row_position_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.splits.iter().find_map(|(range_id, candidate)| {
+                (candidate.split_id() == split.split_id()).then_some(*range_id)
+            }))
+        {
+            Some(scan_range_id) => ConnectorScheduledSplit::with_row_position(
+                split,
+                ConnectorRowPosition { scan_range_id },
+            ),
+            None => ConnectorScheduledSplit::plain(split),
+        })
+        .collect();
+    Ok(CompatIcebergDataReadPlan {
+        source: Arc::new(ConnectorReadScanSource::new_scheduled(
+            instance,
+            scheduled,
         ConnectorOpenReaderRequest {
-            expected_schema: output_schema.arrow_schema_ref(),
+            expected_schema: provider_schema.arrow_schema_ref(),
             batch: ConnectorBatchBudget {
                 max_rows: rows,
                 max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
@@ -178,8 +237,10 @@ fn plan_compat_iceberg_data_read_source(
             },
             context,
         },
-        output_schema,
-    )))
+            provider_schema,
+        )),
+        row_position_lookup,
+    })
 }
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
@@ -1472,31 +1533,35 @@ pub(crate) fn lower_hdfs_scan_node(
     let original_range_count = ranges.len();
     apply_path_rewrite(&mut ranges, decode_facts.path_rewrite())?;
     if is_iceberg_table {
-        if row_position_spec.is_some() {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} Iceberg late row-position lookup is not yet carried as an opaque connector split",
-                node.node_id
-            ));
-        }
         let query_id = query_id.ok_or_else(|| {
             "HDFS_SCAN_NODE requires a query identity for connector cancellation".to_string()
         })?;
         let output_chunk_schema = chunk_schema_for_snapshot_layout(&out_layout, &slot_info_map)?;
+        let row_position_ids = row_position_spec.as_ref().map(|_| {
+            ranges
+                .iter()
+                .map(|range| range.scan_range_id)
+                .collect::<Vec<_>>()
+        });
         let files = compat_iceberg_files_from_ranges(node.node_id, ranges)?;
-        let source = plan_compat_iceberg_data_read_source(
+        let planned = plan_compat_iceberg_data_read_source(
             connectors,
             query_id,
             output_chunk_schema.clone(),
             files,
+            row_position_ids,
+            row_position_spec.as_ref(),
             query_opts,
         )?;
         scan_ranges.capture(node.node_id, BoundScanRanges::None);
-        let scan = ScanNode::new(source)
+        let scan = ScanNode::new(planned.source)
             .with_node_id(node.node_id)
             .with_output_chunk_schema(output_chunk_schema)
             .with_limit(limit)
             .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
-            .with_accept_empty_scan_ranges(true);
+            .with_accept_empty_scan_ranges(true)
+            .with_row_position(row_position_spec)
+            .with_connector_row_position_lookup(planned.row_position_lookup);
         return Ok(Lowered {
             node: ExecNode {
                 kind: ExecNodeKind::Scan(scan),

@@ -16,6 +16,7 @@
 // under the License.
 #[cfg(feature = "compat")]
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
@@ -31,6 +32,7 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::profile::RuntimeProfile;
+use novarocks_spi::connector::{ConnectorInstance, ConnectorSplit};
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -187,6 +189,15 @@ impl ScanMorsel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectorRowPosition {
     pub scan_range_id: i32,
+}
+
+/// Query-local core binding for an engine late-materialization lookup. It is
+/// deliberately provider-neutral: the split remains opaque and the bound
+/// instance owns every table-format read semantic.
+#[derive(Clone)]
+pub(crate) struct ConnectorRowPositionLookup {
+    pub(crate) instance: Arc<ConnectorInstance>,
+    pub(crate) splits: HashMap<i32, ConnectorSplit>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -496,6 +507,7 @@ pub struct ScanNode {
     row_position: Option<RowPositionSpec>,
     row_position_scan: Option<RowPositionScanConfig>,
     row_position_ranges: Option<Vec<FileScanRange>>,
+    connector_row_position_lookup: Option<ConnectorRowPositionLookup>,
     lake_row_position: Option<LakeRowPositionSpec>,
     #[cfg(feature = "compat")]
     lake_glm_info: Option<LakeGlmScanInfo>,
@@ -529,6 +541,7 @@ impl ScanNode {
             row_position: None,
             row_position_scan: None,
             row_position_ranges: None,
+            connector_row_position_lookup: None,
             lake_row_position: None,
             #[cfg(feature = "compat")]
             lake_glm_info: None,
@@ -587,6 +600,14 @@ impl ScanNode {
 
     pub fn with_row_position_ranges(mut self, ranges: Option<Vec<FileScanRange>>) -> Self {
         self.row_position_ranges = ranges;
+        self
+    }
+
+    pub(crate) fn with_connector_row_position_lookup(
+        mut self,
+        lookup: Option<ConnectorRowPositionLookup>,
+    ) -> Self {
+        self.connector_row_position_lookup = lookup;
         self
     }
 
@@ -662,6 +683,10 @@ impl ScanNode {
 
     pub fn row_position_ranges(&self) -> Option<&[FileScanRange]> {
         self.row_position_ranges.as_deref()
+    }
+
+    pub(crate) fn connector_row_position_lookup(&self) -> Option<&ConnectorRowPositionLookup> {
+        self.connector_row_position_lookup.as_ref()
     }
 
     pub fn lake_row_position(&self) -> Option<&LakeRowPositionSpec> {
