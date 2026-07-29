@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 
+use novarocks_fs::DataCacheManager;
+
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -395,9 +397,7 @@ pub fn snapshot_decode_facts(
         StarRocksPathRewriteFacts::new(rewrite.from_prefix.clone(), rewrite.to_prefix.clone())
     });
     let datacache_available = config.runtime.cache.datacache_enable
-        && crate::cache::DataCacheManager::instance()
-            .block_cache()
-            .is_some();
+        && DataCacheManager::instance().block_cache().is_some();
     let jdbc = config.jdbc_config().map(|jdbc| {
         StarRocksJdbcFacts::new(
             jdbc.url.clone(),
