@@ -329,7 +329,7 @@ impl FrontendQuerySession {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let sql = novarocks::sql::parser::dialect::substitute_user_variables(&sql, &assignments)
+        let sql = novarocks::sql::substitute_user_variables(&sql, &assignments)
             .map_err(classify_engine_error)?;
         let token = self.token()?;
         let mut active = self

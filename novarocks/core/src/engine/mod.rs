@@ -1166,11 +1166,10 @@ impl StandaloneSession {
         self.execute_in_context(sql, None, current_database, None)
     }
 
-    /// Executes a statement using the immutable context created at server
-    /// admission. Production callers must use this entrypoint so planning and
-    /// coordinator submission share one topology, deadline and cancellation.
-    /// Core SQL/compiler and command kernel entry.  Frontend QueryService
-    /// performs session admission before calling this boundary.
+    /// Legacy test seam retained only while core parser fixtures migrate to
+    /// frontend QuerySession fixtures. Production callers use the compiler or
+    /// command kernels above.
+    #[cfg(test)]
     pub fn execute_with_context(
         &self,
         sql: &str,
