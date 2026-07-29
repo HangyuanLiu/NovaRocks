@@ -20,9 +20,10 @@
 //! Scheduling policy belongs to the frontend. Core only consumes this sealed
 //! description while preparing protocol payloads and runtime-filter routes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::types::UniqueId;
+use crate::query_execution::lifecycle::ExchangeRouteManifest;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::FragmentId;
@@ -60,5 +61,31 @@ impl SchedulingPlan {
         fragment_id: FragmentId,
     ) -> Option<&[FragmentInstancePlacement]> {
         self.by_fragment.get(&fragment_id).map(Vec::as_slice)
+    }
+}
+
+/// Immutable lifecycle-only projection of a validated schedule.
+///
+/// It deliberately contains neither the mutable scheduling plan nor the
+/// native plan tree.
+#[derive(Clone, Debug)]
+pub(crate) struct FragmentLifecycleProjection {
+    pub(crate) instances_by_backend: BTreeMap<usize, BTreeSet<UniqueId>>,
+    pub(crate) endpoints_by_backend: BTreeMap<usize, RuntimeEndpoint>,
+    pub(crate) exchange_routes: Vec<ExchangeRouteManifest>,
+}
+
+impl FragmentLifecycleProjection {
+    pub(crate) fn new(
+        instances_by_backend: BTreeMap<usize, BTreeSet<UniqueId>>,
+        endpoints_by_backend: BTreeMap<usize, RuntimeEndpoint>,
+        mut exchange_routes: Vec<ExchangeRouteManifest>,
+    ) -> Self {
+        exchange_routes.sort();
+        Self {
+            instances_by_backend,
+            endpoints_by_backend,
+            exchange_routes,
+        }
     }
 }

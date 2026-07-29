@@ -600,6 +600,7 @@ mod tests {
 
     use crate::proto;
     use crate::query_execution::contract::QueryId;
+    use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
     use arrow::array::Int32Array;
     use proto::filter::{LookupRequest, LookupResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
@@ -618,6 +619,11 @@ mod tests {
 
     fn make_submission(hi: i64, lo: i64) -> NativeFragmentEnvelope {
         NativeFragmentEnvelope::new(
+            QueryExecutionId::new(
+                QueryId::new(hi, 99),
+                AttemptId::new(1).expect("nonzero attempt"),
+            )
+            .expect("valid execution id"),
             crate::proto::plan::PlanFragment::default(),
             crate::proto::novarocks::InstanceParams {
                 query_id: Some(ProtoUniqueId { hi, lo: 99 }),

@@ -28,6 +28,11 @@ use crate::query_execution::contract::{
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
     build_distributed_query_request,
 };
+use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+use crate::query_execution::lifecycle::{
+    QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLifecycleLease,
+    QueryLifecycleLeaseGuard,
+};
 use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
@@ -72,6 +77,59 @@ struct RecordingRuntimeFilterBarrier {
     participants: Arc<AtomicUsize>,
     releases: Arc<AtomicUsize>,
     aborts: Arc<AtomicUsize>,
+}
+
+struct RecordingQueryLifecycleGuard {
+    finalizes: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
+    fn finalize(mut self: Box<Self>) -> Result<(), DistributedQueryError> {
+        self.armed = false;
+        self.finalizes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> String {
+        self.armed = false;
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        format!("{primary_error}; query lifecycle rollback completed")
+    }
+}
+
+impl Drop for RecordingQueryLifecycleGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+struct RecordingQueryInitBarrier {
+    calls: Arc<AtomicUsize>,
+    participants: Arc<AtomicUsize>,
+    finalizes: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+}
+
+impl QueryInitBarrier for RecordingQueryInitBarrier {
+    fn initialize_all(
+        &self,
+        plan: QueryInitPlan,
+    ) -> Result<QueryLifecycleLease, DistributedQueryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.participants
+            .store(plan.participant_count(), Ordering::SeqCst);
+        Ok(QueryLifecycleLease::new(Box::new(
+            RecordingQueryLifecycleGuard {
+                finalizes: self.finalizes.clone(),
+                aborts: self.aborts.clone(),
+                armed: true,
+            },
+        )))
+    }
 }
 
 impl RuntimeFilterInstallBarrier for RecordingRuntimeFilterBarrier {
@@ -144,6 +202,11 @@ fn real_execution_artifacts() -> (
     (prepared, native_bundle)
 }
 
+fn execution_id(query_id: crate::query_execution::contract::QueryId) -> QueryExecutionId {
+    QueryExecutionId::new(query_id, AttemptId::new(9).expect("nonzero attempt"))
+        .expect("valid execution id")
+}
+
 #[test]
 fn request_owns_prepared_and_native_artifacts() {
     let (prepared, native_bundle) = real_execution_artifacts();
@@ -179,6 +242,76 @@ fn request_owns_prepared_and_native_artifacts() {
 }
 
 #[test]
+fn query_control_typestate_initializes_before_native_assembly() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let participants = Arc::new(AtomicUsize::new(0));
+    let finalizes = Arc::new(AtomicUsize::new(0));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let barrier = RecordingQueryInitBarrier {
+        calls: calls.clone(),
+        participants: participants.clone(),
+        finalizes: finalizes.clone(),
+        aborts: aborts.clone(),
+    };
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let request = build_distributed_query_request(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Result,
+        QueryCancellationView::never_cancelled(),
+    )
+    .expect("build request");
+    let parts = request.into_parts();
+    let query_id = crate::query_execution::contract::QueryId::new(41, 73);
+    let execution_id = execution_id(query_id);
+    let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
+    let mut draft = FragmentScheduleDraft::new();
+    draft
+        .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
+        .expect("assign fragment");
+    let schedule =
+        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), execution_id, draft)
+            .expect("validate schedule");
+    let options = QueryInitOptions::new(
+        execution_id,
+        vec![crate::query_execution::backend::LiveBackendTarget::new(
+            3, endpoint, 11,
+        )],
+        2,
+        parts.options.runtime_filter_lifecycle(),
+        &parts.options,
+        1_000,
+        std::time::Duration::from_secs(30),
+        crate::query_execution::backend::CoordinatorReportEndpoint::from_socket_addr(
+            "127.0.0.1:19030".parse().expect("valid report endpoint"),
+        ),
+        false,
+    )
+    .expect("valid init options");
+
+    let execution = parts
+        .artifacts
+        .bind_schedule(schedule)
+        .expect("bind schedule")
+        .initialize_query(options, &barrier)
+        .expect("initialize query")
+        .assemble()
+        .expect("assemble after control ready")
+        .into_parts();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(participants.load(Ordering::SeqCst), 1);
+    assert_eq!(execution.submissions[0].execution_id(), execution_id);
+    assert_eq!(aborts.load(Ordering::SeqCst), 0);
+    execution
+        .query_lifecycle_lease
+        .finalize()
+        .expect("finalize lifecycle");
+    assert_eq!(finalizes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
     let calls = Arc::new(AtomicUsize::new(0));
     let participants = Arc::new(AtomicUsize::new(usize::MAX));
@@ -206,9 +339,12 @@ fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
     draft
         .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
         .unwrap();
-    let schedule =
-        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), query_id, draft)
-            .unwrap();
+    let schedule = ValidatedFragmentSchedule::validate(
+        parts.artifacts.scheduling_view(),
+        execution_id(query_id),
+        draft,
+    )
+    .unwrap();
     let scheduled = parts.artifacts.bind_schedule(schedule).unwrap();
     let deployment_options = RuntimeFilterDeploymentOptions::new(
         RuntimeFilterDeploymentEpoch::new(9).unwrap(),
@@ -237,7 +373,10 @@ fn empty_runtime_filter_graph_requires_explicit_barrier_before_assembly() {
     let execution = execution.into_parts();
     assert_eq!(releases.load(Ordering::SeqCst), 0);
     assert_eq!(aborts.load(Ordering::SeqCst), 0);
-    execution.runtime_filter_lease.release();
+    execution
+        .query_lifecycle_lease
+        .finalize()
+        .expect("finalize lifecycle");
     assert_eq!(releases.load(Ordering::SeqCst), 1);
 }
 
@@ -271,7 +410,7 @@ fn assembly_failure_aborts_the_lease_and_preserves_rollback_context() {
         .unwrap();
     let schedule = ValidatedFragmentSchedule::validate(
         parts.artifacts.scheduling_view(),
-        scheduled_query_id,
+        execution_id(scheduled_query_id),
         draft,
     )
     .unwrap();
@@ -349,9 +488,12 @@ fn nonempty_runtime_filter_graph_is_compiled_before_the_install_barrier() {
             )],
         )
         .unwrap();
-    let schedule =
-        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), query_id, draft)
-            .unwrap();
+    let schedule = ValidatedFragmentSchedule::validate(
+        parts.artifacts.scheduling_view(),
+        execution_id(query_id),
+        draft,
+    )
+    .unwrap();
     let scheduled = parts.artifacts.bind_schedule(schedule).unwrap();
     let options = RuntimeFilterDeploymentOptions::new(
         RuntimeFilterDeploymentEpoch::new(17).unwrap(),

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::Field;
+use sha2::{Digest, Sha256};
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -34,10 +35,16 @@ use crate::query_execution::contract::{
 use crate::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchedQueryBatch, NativeFragmentEnvelope,
 };
+use crate::query_execution::lifecycle::{
+    ExchangeRouteManifest, QueryExecutionId, QueryInitBarrier, QueryInitOptions,
+    QueryLifecycleLease, QueryLifecycleLeaseGuard,
+};
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
 };
-use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+use crate::query_execution::schedule::{
+    FragmentInstancePlacement, FragmentLifecycleProjection, SchedulingPlan,
+};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::analysis::cte::CteId;
@@ -105,19 +112,16 @@ impl PreparedDistributedQuery {
 }
 
 /// A core artifact bound to one validated schedule. This type deliberately has
-/// no `assemble` method: runtime-filter compilation and the frontend-owned
-/// install/ACK barrier must first produce `RuntimeFilterReadyDistributedQuery`.
+/// no `assemble` method: query initialization and the frontend-owned control
+/// readiness barrier must first produce `ControlReadyDistributedQuery`.
 ///
 /// ```compile_fail
-/// use novarocks::query_execution::artifact::{
-///     NativeSubmissionContext, ScheduleBoundDistributedQuery,
-/// };
+/// use novarocks::query_execution::artifact::ScheduleBoundDistributedQuery;
 ///
-/// fn assemble_too_early(
+/// fn query_control_typestate_prevents_submission_before_ready(
 ///     scheduled: ScheduleBoundDistributedQuery,
-///     context: NativeSubmissionContext,
 /// ) {
-///     let _ = scheduled.assemble(context);
+///     let _ = scheduled.assemble();
 /// }
 /// ```
 pub struct ScheduleBoundDistributedQuery {
@@ -127,13 +131,48 @@ pub struct ScheduleBoundDistributedQuery {
 }
 
 impl ScheduleBoundDistributedQuery {
+    pub fn initialize_query(
+        self,
+        options: QueryInitOptions,
+        barrier: &dyn QueryInitBarrier,
+    ) -> Result<ControlReadyDistributedQuery, DistributedQueryError> {
+        if options.execution_id() != self.schedule.execution_id {
+            return Err(contract_error(
+                "query initialization execution id does not match validated schedule",
+            ));
+        }
+        let runtime_filters = crate::query_execution::runtime_filter::compile_contribution_plan(
+            options.execution_id(),
+            self.prepared.runtime_filter_graph(),
+            self.prepared.runtime_filter_join_progress(),
+            self.prepared.scheduling_view().edges(),
+            &self.schedule.inner,
+            options.live_backends(),
+            options.runtime_filter_worker_count(),
+            options.runtime_filter_lifecycle(),
+        )?;
+        let plan = crate::query_execution::lifecycle::init_plan::compile_query_init_plan(
+            self.schedule.lifecycle_projection(),
+            runtime_filters,
+            &options,
+        )?;
+        let query_lifecycle_lease = barrier.initialize_all(plan)?;
+        Ok(ControlReadyDistributedQuery {
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            options,
+            query_lifecycle_lease,
+        })
+    }
+
     pub fn prepare_runtime_filters(
         self,
         options: RuntimeFilterDeploymentOptions,
         barrier: &dyn RuntimeFilterInstallBarrier,
     ) -> Result<RuntimeFilterReadyDistributedQuery, DistributedQueryError> {
         let plan = crate::query_execution::runtime_filter::compile_install_plan(
-            self.schedule.query_id,
+            self.schedule.execution_id.query_id(),
             self.prepared.runtime_filter_graph(),
             self.prepared.runtime_filter_join_progress(),
             self.prepared.scheduling_view().edges(),
@@ -150,6 +189,53 @@ impl ScheduleBoundDistributedQuery {
     }
 }
 
+/// The only query-control typestate that can assemble native submissions.
+pub struct ControlReadyDistributedQuery {
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    schedule: ValidatedFragmentSchedule,
+    options: QueryInitOptions,
+    query_lifecycle_lease: QueryLifecycleLease,
+}
+
+impl ControlReadyDistributedQuery {
+    pub fn assemble(self) -> Result<PreparedNativeExecution, DistributedQueryError> {
+        let context = match self.options.native_submission_context() {
+            Ok(context) => context,
+            Err(error) => {
+                let kind = error.kind();
+                let message = self
+                    .query_lifecycle_lease
+                    .abort_preserving(error.message().to_string());
+                return Err(DistributedQueryError::new(kind, message));
+            }
+        };
+        let assembled = assemble_native_execution(
+            self.prepared,
+            self.native_bundle,
+            self.schedule.inner,
+            self.schedule.execution_id,
+            context,
+        );
+        match assembled {
+            Ok(assembled) => Ok(PreparedNativeExecution {
+                submissions: assembled.submissions,
+                root_fetch: assembled.root_fetch,
+                writer_registrations: assembled.writer_registrations,
+                expected_output: assembled.expected_output,
+                query_lifecycle_lease: self.query_lifecycle_lease,
+            }),
+            Err(error) => {
+                let kind = error.kind();
+                let message = self
+                    .query_lifecycle_lease
+                    .abort_preserving(error.message().to_string());
+                Err(DistributedQueryError::new(kind, message))
+            }
+        }
+    }
+}
+
 /// The only typestate that can assemble native submissions.
 pub struct RuntimeFilterReadyDistributedQuery {
     prepared: PreparedFragmentSet,
@@ -163,7 +249,7 @@ impl RuntimeFilterReadyDistributedQuery {
         self,
         context: NativeSubmissionContext,
     ) -> Result<PreparedNativeExecution, DistributedQueryError> {
-        if context.query_id != self.schedule.query_id {
+        if context.query_id != self.schedule.execution_id.query_id() {
             let error = contract_error(
                 "native submission context query id does not match validated schedule",
             );
@@ -177,6 +263,7 @@ impl RuntimeFilterReadyDistributedQuery {
             self.prepared,
             self.native_bundle,
             self.schedule.inner,
+            self.schedule.execution_id,
             context,
         );
         match assembled {
@@ -185,7 +272,9 @@ impl RuntimeFilterReadyDistributedQuery {
                 root_fetch: assembled.root_fetch,
                 writer_registrations: assembled.writer_registrations,
                 expected_output: assembled.expected_output,
-                runtime_filter_lease: self.runtime_filter_lease,
+                query_lifecycle_lease: QueryLifecycleLease::new(Box::new(
+                    RuntimeFilterLeaseAsQueryLifecycleGuard(self.runtime_filter_lease),
+                )),
             }),
             Err(error) => {
                 let kind = error.kind();
@@ -195,6 +284,19 @@ impl RuntimeFilterReadyDistributedQuery {
                 Err(DistributedQueryError::new(kind, message))
             }
         }
+    }
+}
+
+struct RuntimeFilterLeaseAsQueryLifecycleGuard(RuntimeFilterInstallLease);
+
+impl QueryLifecycleLeaseGuard for RuntimeFilterLeaseAsQueryLifecycleGuard {
+    fn finalize(self: Box<Self>) -> Result<(), DistributedQueryError> {
+        self.0.release();
+        Ok(())
+    }
+
+    fn abort_preserving(self: Box<Self>, primary_error: String) -> String {
+        self.0.abort_preserving(primary_error)
     }
 }
 
@@ -362,14 +464,15 @@ impl Default for FragmentScheduleDraft {
 /// without the immutable view from the same prepared handoff.
 pub struct ValidatedFragmentSchedule {
     handoff_id: u64,
-    query_id: QueryId,
+    execution_id: QueryExecutionId,
     inner: SchedulingPlan,
+    lifecycle: FragmentLifecycleProjection,
 }
 
 impl ValidatedFragmentSchedule {
     pub fn validate(
         view: FragmentSchedulingView<'_>,
-        query_id: QueryId,
+        execution_id: QueryExecutionId,
         draft: FragmentScheduleDraft,
     ) -> Result<Self, DistributedQueryError> {
         let expected = view.fragment_ids().collect::<BTreeSet<_>>();
@@ -380,7 +483,6 @@ impl ValidatedFragmentSchedule {
             )));
         }
 
-        let native_query_id = query_id.into_unique_id();
         let mut by_fragment = BTreeMap::new();
         for (fragment_id, placements) in draft.by_fragment {
             if placements.is_empty() {
@@ -407,10 +509,11 @@ impl ValidatedFragmentSchedule {
                     Ok(FragmentInstancePlacement {
                         fragment_id,
                         instance_index,
-                        finst_id: UniqueId {
-                            hi: native_query_id.hi,
-                            lo: (i64::from(fragment_id) << 16) | instance_index as i64,
-                        },
+                        finst_id: derive_fragment_instance_id(
+                            execution_id,
+                            fragment_id,
+                            instance_index,
+                        )?,
                         backend_idx: placement.backend_idx,
                         endpoint: RuntimeEndpoint::from_socket_addr(placement.endpoint),
                         scan_ranges: BTreeMap::new(),
@@ -476,11 +579,17 @@ impl ValidatedFragmentSchedule {
         };
         populate_destinations(&mut inner, view.inner.edges());
         populate_sender_counts(&mut inner, view.inner.edges());
+        let lifecycle = build_fragment_lifecycle_projection(&inner, view.inner.edges())?;
         Ok(Self {
             handoff_id: view.handoff_id,
-            query_id,
+            execution_id,
             inner,
+            lifecycle,
         })
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
     }
 
     pub fn backend_ids(&self) -> Vec<usize> {
@@ -493,6 +602,125 @@ impl ValidatedFragmentSchedule {
             .into_iter()
             .collect()
     }
+
+    pub fn fragment_instance_ids(&self) -> Vec<UniqueId> {
+        self.inner
+            .by_fragment
+            .values()
+            .flatten()
+            .map(|placement| placement.finst_id)
+            .collect()
+    }
+
+    pub(crate) const fn lifecycle_projection(&self) -> &FragmentLifecycleProjection {
+        &self.lifecycle
+    }
+}
+
+const FRAGMENT_INSTANCE_ID_DOMAIN: &[u8] = b"novarocks.query-lifecycle.fragment-instance.v1\0";
+
+fn derive_fragment_instance_id(
+    execution_id: QueryExecutionId,
+    fragment_id: FragmentId,
+    instance_index: usize,
+) -> Result<UniqueId, DistributedQueryError> {
+    let instance_index = u64::try_from(instance_index)
+        .map_err(|_| contract_error("fragment instance index exceeds u64 width"))?;
+    let mut digest = Sha256::new();
+    digest.update(FRAGMENT_INSTANCE_ID_DOMAIN);
+    digest.update(execution_id.query_id().high().to_be_bytes());
+    digest.update(execution_id.query_id().low().to_be_bytes());
+    digest.update(execution_id.attempt_id().get().to_be_bytes());
+    digest.update(fragment_id.to_be_bytes());
+    digest.update(instance_index.to_be_bytes());
+    let bytes = digest.finalize();
+    let hi = i64::from_be_bytes(
+        bytes[0..8]
+            .try_into()
+            .expect("SHA-256 prefix contains eight high bytes"),
+    );
+    let mut lo = i64::from_be_bytes(
+        bytes[8..16]
+            .try_into()
+            .expect("SHA-256 prefix contains eight low bytes"),
+    );
+    if hi == 0 && lo == 0 {
+        lo = 1;
+    }
+    Ok(UniqueId { hi, lo })
+}
+
+fn build_fragment_lifecycle_projection(
+    schedule: &SchedulingPlan,
+    edges: &[crate::sql::planner::distributed::FragmentEdge],
+) -> Result<FragmentLifecycleProjection, DistributedQueryError> {
+    let mut instances_by_backend = BTreeMap::<usize, BTreeSet<UniqueId>>::new();
+    let mut endpoints_by_backend = BTreeMap::<usize, RuntimeEndpoint>::new();
+    for placement in schedule.by_fragment.values().flatten() {
+        instances_by_backend
+            .entry(placement.backend_idx)
+            .or_default()
+            .insert(placement.finst_id);
+        match endpoints_by_backend.entry(placement.backend_idx) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(placement.endpoint.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get() != &placement.endpoint =>
+            {
+                return Err(contract_error(format!(
+                    "scheduled backend {} has inconsistent endpoints",
+                    placement.backend_idx
+                )));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+
+    let mut exchange_routes = Vec::new();
+    for edge in edges {
+        let sources = schedule
+            .by_fragment
+            .get(&edge.source_fragment_id)
+            .ok_or_else(|| {
+                contract_error(format!(
+                    "exchange source fragment {} is absent from schedule",
+                    edge.source_fragment_id
+                ))
+            })?;
+        let destinations = schedule
+            .by_fragment
+            .get(&edge.target_fragment_id)
+            .ok_or_else(|| {
+                contract_error(format!(
+                    "exchange destination fragment {} is absent from schedule",
+                    edge.target_fragment_id
+                ))
+            })?;
+        let sender_count = u32::try_from(sources.len())
+            .map_err(|_| contract_error("exchange sender count exceeds u32 width"))?;
+        for (sender_ordinal, source) in sources.iter().enumerate() {
+            let sender_ordinal = u32::try_from(sender_ordinal)
+                .map_err(|_| contract_error("exchange sender ordinal exceeds u32 width"))?;
+            for destination in destinations {
+                exchange_routes.push(
+                    ExchangeRouteManifest::new(
+                        source.finst_id,
+                        destination.finst_id,
+                        edge.target_exchange_node_id,
+                        sender_ordinal,
+                        sender_count,
+                    )
+                    .map_err(|error| contract_error(error.to_string()))?,
+                );
+            }
+        }
+    }
+    Ok(FragmentLifecycleProjection::new(
+        instances_by_backend,
+        endpoints_by_backend,
+        exchange_routes,
+    ))
 }
 
 fn populate_destinations(
@@ -540,10 +768,10 @@ fn populate_sender_counts(
 
 /// Owned core input for per-placement native submission assembly.
 pub struct NativeSubmissionContext {
-    query_id: QueryId,
-    options: crate::runtime::query_options::QueryOptions,
-    report_endpoint: RuntimeEndpoint,
-    needs_fragment_status_report: bool,
+    pub(crate) query_id: QueryId,
+    pub(crate) options: crate::runtime::query_options::QueryOptions,
+    pub(crate) report_endpoint: RuntimeEndpoint,
+    pub(crate) needs_fragment_status_report: bool,
 }
 
 impl NativeSubmissionContext {
@@ -575,6 +803,10 @@ impl ValidatedNativeSubmission {
 
     pub const fn fragment_instance_id(&self) -> UniqueId {
         self.finst_id
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.envelope.execution_id()
     }
 
     pub fn into_envelope(self) -> NativeFragmentEnvelope {
@@ -689,7 +921,7 @@ pub struct PreparedNativeExecution {
     root_fetch: RootFetchMetadata,
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
-    runtime_filter_lease: RuntimeFilterInstallLease,
+    query_lifecycle_lease: QueryLifecycleLease,
 }
 
 struct AssembledNativeExecution {
@@ -706,7 +938,7 @@ impl PreparedNativeExecution {
             root_fetch: self.root_fetch,
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
-            runtime_filter_lease: self.runtime_filter_lease,
+            query_lifecycle_lease: self.query_lifecycle_lease,
         }
     }
 }
@@ -718,13 +950,14 @@ pub struct PreparedNativeExecutionParts {
     pub root_fetch: RootFetchMetadata,
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
-    pub runtime_filter_lease: RuntimeFilterInstallLease,
+    pub query_lifecycle_lease: QueryLifecycleLease,
 }
 
 fn assemble_native_execution(
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: SchedulingPlan,
+    execution_id: QueryExecutionId,
     context: NativeSubmissionContext,
 ) -> Result<AssembledNativeExecution, DistributedQueryError> {
     crate::query_execution::assembly::validate_prepared_native_payloads(&prepared, &native_bundle)
@@ -922,7 +1155,11 @@ fn assemble_native_execution(
                 Ok(ValidatedNativeSubmission {
                     backend_idx: placement.backend_idx,
                     finst_id: placement.finst_id,
-                    envelope: NativeFragmentEnvelope::new(native_fragment, instance_params),
+                    envelope: NativeFragmentEnvelope::new(
+                        execution_id,
+                        native_fragment,
+                        instance_params,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, DistributedQueryError>>()?;
@@ -993,4 +1230,34 @@ fn build_expected_output_schema(
         output_columns,
         chunk_schema,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_fragment_instance_id;
+    use crate::query_execution::contract::QueryId;
+    use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+
+    #[test]
+    fn fragment_instance_identity_is_stable_and_attempt_bound() {
+        let query_id = QueryId::new(41, 73);
+        let first_attempt =
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("valid attempt"))
+                .expect("valid execution id");
+        let second_attempt =
+            QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid attempt"))
+                .expect("valid execution id");
+
+        let first =
+            derive_fragment_instance_id(first_attempt, 9, 3).expect("first fragment instance id");
+        assert_eq!(
+            derive_fragment_instance_id(first_attempt, 9, 3)
+                .expect("repeated fragment instance id"),
+            first
+        );
+        assert_ne!(
+            derive_fragment_instance_id(second_attempt, 9, 3).expect("second fragment instance id"),
+            first
+        );
+    }
 }

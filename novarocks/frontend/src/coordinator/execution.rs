@@ -39,6 +39,7 @@ use novarocks::query_execution::contract::{
 use novarocks::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
 };
+use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId, QueryLifecycleLease};
 use novarocks::query_execution::write::WriteReportBuilder;
 
 use super::backend_events::BackendQueryActivity;
@@ -407,6 +408,16 @@ impl FrontendDistributedQueryCoordinator {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let query_id = self.query_ids.next_query_id();
+        let execution_id = QueryExecutionId::new(
+            query_id,
+            AttemptId::new(1).expect("the initial query attempt is nonzero"),
+        )
+        .map_err(|error| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?;
         let parts = request.into_parts();
         let intent = parts.completion.intent();
         let backend_services = self.backend_services.resolve()?;
@@ -416,7 +427,7 @@ impl FrontendDistributedQueryCoordinator {
             .register(query_id, intent, Arc::clone(&dispatcher))?;
         let schedule = backend_services
             .scheduler
-            .schedule(parts.artifacts.scheduling_view(), query_id)?;
+            .schedule(parts.artifacts.scheduling_view(), execution_id)?;
         let scheduled_backend_ownership = backend_services
             .scheduler
             .scheduled_backend_ownership(&schedule.backend_ids())?;
@@ -450,9 +461,9 @@ impl FrontendDistributedQueryCoordinator {
             root_fetch,
             writer_registrations,
             expected_output,
-            runtime_filter_lease,
+            query_lifecycle_lease,
         } = execution.into_parts();
-        let mut runtime_filter_lease = Some(runtime_filter_lease);
+        let mut runtime_filter_lease = Some(query_lifecycle_lease);
         let submitted_instance_ids = submissions
             .iter()
             .map(|submission| submission.fragment_instance_id())
@@ -540,7 +551,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_lease
                 .take()
                 .expect("runtime-filter lease is present through fragment submission")
-                .release();
+                .finalize()?;
         } else {
             let message = submission_failure.unwrap_or_else(|| {
                 if parts.cancellation.is_cancelled() {
@@ -754,7 +765,7 @@ impl FrontendDistributedQueryCoordinator {
     fn fail_cancel_then_abort_runtime_filters(
         &self,
         query_id: QueryId,
-        lease: &mut Option<novarocks::query_execution::artifact::RuntimeFilterInstallLease>,
+        lease: &mut Option<QueryLifecycleLease>,
         message: impl Into<String>,
     ) -> DistributedQueryError {
         let primary = self.fail_and_cancel(query_id, message);
@@ -780,7 +791,7 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
 }
 
 fn abort_runtime_filters(
-    lease: &mut Option<novarocks::query_execution::artifact::RuntimeFilterInstallLease>,
+    lease: &mut Option<QueryLifecycleLease>,
     message: impl Into<String>,
 ) -> String {
     let message = message.into();

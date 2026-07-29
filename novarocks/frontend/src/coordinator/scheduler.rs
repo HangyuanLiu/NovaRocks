@@ -23,9 +23,8 @@ use novarocks::query_execution::artifact::{
     SchedulingStreamKind, ValidatedFragmentSchedule,
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
-use novarocks::query_execution::contract::{
-    DistributedQueryError, DistributedQueryErrorKind, QueryId,
-};
+use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use novarocks::query_execution::lifecycle::QueryExecutionId;
 
 #[derive(Clone)]
 pub struct FrontendBackendSnapshot {
@@ -133,7 +132,7 @@ impl FrontendFragmentScheduler {
     pub fn schedule(
         &self,
         view: FragmentSchedulingView<'_>,
-        query_id: QueryId,
+        execution_id: QueryExecutionId,
     ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
         let fragments = view
             .fragments()
@@ -219,7 +218,7 @@ impl FrontendFragmentScheduler {
             counts.insert(root_fragment_id, 1);
         }
 
-        let preferred = (query_id.low() as usize) % backend_count;
+        let preferred = (execution_id.query_id().low() as usize) % backend_count;
         let mut draft = FragmentScheduleDraft::new();
         for (&fragment_id, &count) in &counts {
             let placements = (0..count)
@@ -237,6 +236,55 @@ impl FrontendFragmentScheduler {
                 .collect();
             draft.assign_fragment(fragment_id, placements)?;
         }
-        ValidatedFragmentSchedule::validate(view, query_id, draft)
+        ValidatedFragmentSchedule::validate(view, execution_id, draft)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+    use novarocks::query_execution::contract::QueryId;
+    use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+
+    fn execution_id(attempt: u64) -> QueryExecutionId {
+        QueryExecutionId::new(
+            QueryId::new(41, 73),
+            AttemptId::new(attempt).expect("nonzero attempt"),
+        )
+        .expect("valid execution id")
+    }
+
+    #[test]
+    fn scheduler_attempt_identity_is_stable_within_attempt_and_changes_between_attempts() {
+        let fixture =
+            novarocks::query_execution::contract_test_support::non_empty_runtime_filter_contract_fixture();
+        let snapshot =
+            FrontendBackendSnapshot::new(fixture.backends().to_vec()).expect("valid backends");
+        let scheduler = FrontendFragmentScheduler::new(snapshot);
+        let request = fixture.into_request();
+        let parts = request.into_parts();
+        let view = parts.artifacts.scheduling_view();
+
+        let first = scheduler
+            .schedule(view, execution_id(1))
+            .expect("first schedule");
+        let repeated = scheduler
+            .schedule(view, execution_id(1))
+            .expect("repeated schedule");
+        let next = scheduler
+            .schedule(view, execution_id(2))
+            .expect("next-attempt schedule");
+
+        assert_eq!(
+            first.fragment_instance_ids(),
+            repeated.fragment_instance_ids()
+        );
+        assert!(
+            first
+                .fragment_instance_ids()
+                .iter()
+                .zip(next.fragment_instance_ids())
+                .all(|(left, right)| left != &right)
+        );
     }
 }

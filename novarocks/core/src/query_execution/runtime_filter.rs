@@ -26,11 +26,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
-use crate::query_execution::backend::LiveBackendSnapshot;
+use crate::query_execution::backend::{LiveBackendSnapshot, LiveBackendTarget};
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, QueryId, RuntimeFilterLifecycleView,
 };
+use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::query_execution::schedule::SchedulingPlan;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime_filter::deployment::{
     RuntimeFilterDeploymentPolicy, RuntimeFilterQueryDeploymentPolicy,
     RuntimeFilterQueryTransportPolicy,
@@ -392,6 +394,179 @@ pub trait RuntimeFilterInstallBarrier: Send + Sync + 'static {
         &self,
         plan: RuntimeFilterInstallPlan,
     ) -> Result<RuntimeFilterInstallLease, DistributedQueryError>;
+}
+
+/// One participant-local runtime-filter contribution for `InitQuery`.
+///
+/// Transport deadlines, ACK aggregation, and rollback ownership belong to the
+/// query lifecycle barrier rather than this compiler output.
+pub(crate) struct RuntimeFilterContributionPlan {
+    backend_idx: usize,
+    participant_id: u32,
+    lifecycle: RuntimeFilterQueryLifecycleOptions,
+    install: RuntimeFilterParticipantInstall,
+}
+
+impl RuntimeFilterContributionPlan {
+    pub(crate) fn new(
+        backend_idx: usize,
+        participant_id: u32,
+        lifecycle: RuntimeFilterQueryLifecycleOptions,
+        install: RuntimeFilterParticipantInstall,
+    ) -> Result<Self, DistributedQueryError> {
+        if participant_id == 0 {
+            return Err(contract_error(
+                "runtime filter contribution participant id must be nonzero",
+            ));
+        }
+        if install.local_participant_id().get() != participant_id {
+            return Err(contract_error(
+                "runtime filter contribution participant id does not match typed install",
+            ));
+        }
+        Ok(Self {
+            backend_idx,
+            participant_id,
+            lifecycle,
+            install,
+        })
+    }
+
+    pub(crate) const fn backend_idx(&self) -> usize {
+        self.backend_idx
+    }
+
+    pub(crate) const fn participant_id(&self) -> u32 {
+        self.participant_id
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        usize,
+        u32,
+        RuntimeFilterQueryLifecycleOptions,
+        RuntimeFilterParticipantInstall,
+    ) {
+        (
+            self.backend_idx,
+            self.participant_id,
+            self.lifecycle,
+            self.install,
+        )
+    }
+}
+
+pub(crate) fn compile_contribution_plan(
+    execution_id: QueryExecutionId,
+    graph: &RuntimeFilterGraph,
+    join_progress: &JoinBuildProgressCatalog,
+    edges: &[FragmentEdge],
+    schedule: &SchedulingPlan,
+    live_backends: &[LiveBackendTarget],
+    runtime_worker_count: usize,
+    lifecycle: RuntimeFilterLifecycleView,
+) -> Result<Vec<RuntimeFilterContributionPlan>, DistributedQueryError> {
+    if runtime_worker_count == 0 {
+        return Err(contract_error(
+            "runtime filter deployment worker count must be nonzero",
+        ));
+    }
+    if live_backends.is_empty() {
+        return Err(contract_error(
+            "runtime filter deployment requires an explicit nonempty live-backend snapshot",
+        ));
+    }
+    let mut backend_by_id = BTreeMap::new();
+    let mut endpoints = BTreeSet::new();
+    let mut live_entries = Vec::with_capacity(live_backends.len());
+    for target in live_backends {
+        if target.start_epoch() == 0 {
+            return Err(contract_error(format!(
+                "runtime filter live backend {} has zero start epoch",
+                target.backend_idx()
+            )));
+        }
+        if backend_by_id
+            .insert(target.backend_idx(), target.endpoint())
+            .is_some()
+        {
+            return Err(contract_error(format!(
+                "runtime filter live-backend snapshot repeats backend {}",
+                target.backend_idx()
+            )));
+        }
+        if !endpoints.insert(target.endpoint()) {
+            return Err(contract_error(format!(
+                "runtime filter live-backend snapshot repeats endpoint {}",
+                target.endpoint()
+            )));
+        }
+        live_entries.push((target.backend_idx(), target.endpoint()));
+    }
+    for placement in schedule.by_fragment.values().flatten() {
+        let endpoint = backend_by_id.get(&placement.backend_idx).ok_or_else(|| {
+            contract_error(format!(
+                "scheduled backend {} is absent from the runtime filter live-backend snapshot",
+                placement.backend_idx
+            ))
+        })?;
+        if RuntimeEndpoint::from_socket_addr(*endpoint) != placement.endpoint {
+            return Err(contract_error(format!(
+                "scheduled backend {} endpoint {} differs from runtime filter snapshot endpoint {}",
+                placement.backend_idx,
+                placement.endpoint.as_host_port(),
+                endpoint
+            )));
+        }
+    }
+    if graph.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let live_snapshot = LiveBackendSnapshot::new(live_entries);
+    let policy = derive_deployment_policy(graph, &live_snapshot, runtime_worker_count)
+        .map_err(|error| failed(format!("runtime filter deployment policy failed: {error}")))?;
+    let epoch = DeploymentEpoch::new(execution_id.attempt_id().get());
+    let compiled = crate::runtime_filter::deployment::compiler::compile_with_join_progress(
+        graph,
+        schedule,
+        edges,
+        join_progress,
+        &live_snapshot,
+        &policy.compiler,
+        epoch,
+    )
+    .map_err(|error| failed(format!("runtime filter deployment compile failed: {error}")))?;
+    let installs =
+        crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&compiled)
+            .map_err(|error| {
+                failed(format!(
+                    "runtime filter participant install projection failed: {error}"
+                ))
+            })?;
+    let lifecycle = RuntimeFilterQueryLifecycleOptions {
+        delivery_expire: lifecycle.delivery_expire(),
+        query_expire: lifecycle.query_expire(),
+        transport_retry_interval: policy.transport.retry_interval,
+        transport_max_attempts: policy.transport.max_attempts,
+        transport_deadline: policy.transport.deadline,
+        transport_max_pending_entries: policy.transport.max_pending_entries,
+        transport_max_pending_bytes: policy.transport.max_pending_bytes,
+    };
+    let mut participants = Vec::with_capacity(installs.len());
+    for (participant, install) in installs {
+        let (backend_idx, _) = participant_backend(participant, live_snapshot.entries())?;
+        participants.push(RuntimeFilterContributionPlan::new(
+            backend_idx,
+            participant.get(),
+            lifecycle,
+            install,
+        )?);
+    }
+    participants.sort_by_key(RuntimeFilterContributionPlan::participant_id);
+    Ok(participants)
 }
 
 pub(crate) fn compile_install_plan(

@@ -18,6 +18,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use prost::Message;
+use sha2::{Digest, Sha256};
+
 use crate::common::types::UniqueId;
 use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
 use crate::runtime::query_options::QueryOptions;
@@ -253,6 +256,24 @@ impl RuntimeFilterContribution {
 
     pub const fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+
+    pub(crate) fn from_compiled(
+        execution_id: QueryExecutionId,
+        participant_id: u32,
+        lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
+        install: RuntimeFilterParticipantInstall,
+    ) -> Result<Self, QueryLifecycleError> {
+        let envelope = crate::protocol::native::encode_participant_install(
+            execution_id.query_id().into_unique_id(),
+            lifecycle,
+            &install,
+        )
+        .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?;
+        let mut digest = Sha256::new();
+        digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
+        digest.update(envelope.encode_to_vec());
+        Self::new(participant_id, lifecycle, install, digest.finalize().into())
     }
 }
 

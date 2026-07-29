@@ -1,0 +1,546 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
+use crate::query_execution::contract::{
+    DistributedQueryError, DistributedQueryErrorKind, ResolvedQueryOptions,
+    RuntimeFilterLifecycleView,
+};
+use crate::query_execution::runtime_filter::RuntimeFilterContributionPlan;
+use crate::query_execution::schedule::FragmentLifecycleProjection;
+use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime::query_options::QueryOptions;
+
+use super::QueryExecutionId;
+use super::manifest::{
+    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
+    ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,
+};
+
+fn contract_error(message: impl Into<String>) -> DistributedQueryError {
+    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
+}
+
+pub struct QueryInitOptions {
+    execution_id: QueryExecutionId,
+    live_backends: Vec<LiveBackendTarget>,
+    runtime_filter_worker_count: usize,
+    runtime_filter_lifecycle: RuntimeFilterLifecycleView,
+    query_options: QueryOptions,
+    query_deadline_unix_ms: u64,
+    pre_start_timeout: Duration,
+    report_endpoint: QueryControlEndpoint,
+    needs_fragment_status_report: bool,
+}
+
+impl QueryInitOptions {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: QueryExecutionId,
+        live_backends: Vec<LiveBackendTarget>,
+        runtime_filter_worker_count: usize,
+        runtime_filter_lifecycle: RuntimeFilterLifecycleView,
+        query_options: &ResolvedQueryOptions,
+        query_deadline_unix_ms: u64,
+        pre_start_timeout: Duration,
+        report_endpoint: CoordinatorReportEndpoint,
+        needs_fragment_status_report: bool,
+    ) -> Result<Self, DistributedQueryError> {
+        if live_backends.is_empty() {
+            return Err(contract_error(
+                "query initialization requires at least one live backend",
+            ));
+        }
+        if runtime_filter_worker_count == 0 {
+            return Err(contract_error(
+                "query initialization runtime-filter worker count must be nonzero",
+            ));
+        }
+        if query_deadline_unix_ms == 0 {
+            return Err(contract_error(
+                "query initialization deadline must be nonzero",
+            ));
+        }
+        if pre_start_timeout.is_zero() {
+            return Err(contract_error(
+                "query initialization pre-start timeout must be nonzero",
+            ));
+        }
+        let mut backend_ids = BTreeSet::new();
+        let mut endpoints = BTreeSet::new();
+        for target in &live_backends {
+            if target.start_epoch() == 0 {
+                return Err(contract_error(format!(
+                    "query initialization live backend {} has zero start epoch",
+                    target.backend_idx()
+                )));
+            }
+            if !backend_ids.insert(target.backend_idx()) {
+                return Err(contract_error(format!(
+                    "query initialization live snapshot repeats backend {}",
+                    target.backend_idx()
+                )));
+            }
+            if !endpoints.insert(target.endpoint()) {
+                return Err(contract_error(format!(
+                    "query initialization live snapshot repeats endpoint {}",
+                    target.endpoint()
+                )));
+            }
+        }
+        let report_endpoint = QueryControlEndpoint::try_from(report_endpoint).map_err(|error| {
+            contract_error(format!(
+                "query initialization report endpoint is invalid: {error}"
+            ))
+        })?;
+        Ok(Self {
+            execution_id,
+            live_backends,
+            runtime_filter_worker_count,
+            runtime_filter_lifecycle,
+            query_options: query_options.runtime_options().clone(),
+            query_deadline_unix_ms,
+            pre_start_timeout,
+            report_endpoint,
+            needs_fragment_status_report,
+        })
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+
+    pub fn live_backends(&self) -> &[LiveBackendTarget] {
+        &self.live_backends
+    }
+
+    pub const fn runtime_filter_worker_count(&self) -> usize {
+        self.runtime_filter_worker_count
+    }
+
+    pub const fn runtime_filter_lifecycle(&self) -> RuntimeFilterLifecycleView {
+        self.runtime_filter_lifecycle
+    }
+
+    pub(crate) fn native_submission_context(
+        &self,
+    ) -> Result<crate::query_execution::artifact::NativeSubmissionContext, DistributedQueryError>
+    {
+        let report_endpoint = RuntimeEndpoint::new(
+            self.report_endpoint.host(),
+            i32::from(self.report_endpoint.port()),
+        )
+        .map_err(contract_error)?;
+        Ok(crate::query_execution::artifact::NativeSubmissionContext {
+            query_id: self.execution_id.query_id(),
+            options: self.query_options.clone(),
+            report_endpoint,
+            needs_fragment_status_report: self.needs_fragment_status_report,
+        })
+    }
+}
+
+pub struct QueryInitPlan {
+    execution_id: QueryExecutionId,
+    participants: Vec<QueryInitParticipant>,
+}
+
+impl QueryInitPlan {
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
+
+    pub fn backend_ids(&self) -> Vec<usize> {
+        self.participants
+            .iter()
+            .map(QueryInitParticipant::backend_idx)
+            .collect()
+    }
+
+    pub fn participant(&self, backend_idx: usize) -> Option<&QueryInitParticipant> {
+        self.participants
+            .iter()
+            .find(|participant| participant.backend_idx() == backend_idx)
+    }
+
+    pub fn into_participants(self) -> Vec<QueryInitParticipant> {
+        self.participants
+    }
+}
+
+pub struct QueryInitParticipant {
+    backend_idx: usize,
+    backend: ParticipantBackendIdentity,
+    manifest: ParticipantManifest,
+    digest: ParticipantManifestDigest,
+}
+
+impl QueryInitParticipant {
+    pub const fn backend_idx(&self) -> usize {
+        self.backend_idx
+    }
+
+    pub const fn backend(&self) -> &ParticipantBackendIdentity {
+        &self.backend
+    }
+
+    pub const fn manifest(&self) -> &ParticipantManifest {
+        &self.manifest
+    }
+
+    pub const fn digest(&self) -> ParticipantManifestDigest {
+        self.digest
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        usize,
+        ParticipantBackendIdentity,
+        ParticipantManifest,
+        ParticipantManifestDigest,
+    ) {
+        (self.backend_idx, self.backend, self.manifest, self.digest)
+    }
+}
+
+pub trait QueryInitBarrier: Send + Sync + 'static {
+    fn initialize_all(
+        &self,
+        plan: QueryInitPlan,
+    ) -> Result<QueryLifecycleLease, DistributedQueryError>;
+}
+
+pub trait QueryLifecycleLeaseGuard: Send + 'static {
+    fn finalize(self: Box<Self>) -> Result<(), DistributedQueryError>;
+
+    fn abort_preserving(self: Box<Self>, primary_error: String) -> String;
+}
+
+#[must_use = "query lifecycle must be finalized or aborted"]
+pub struct QueryLifecycleLease {
+    guard: Option<Box<dyn QueryLifecycleLeaseGuard>>,
+}
+
+impl QueryLifecycleLease {
+    pub fn new(guard: Box<dyn QueryLifecycleLeaseGuard>) -> Self {
+        Self { guard: Some(guard) }
+    }
+
+    pub fn finalize(mut self) -> Result<(), DistributedQueryError> {
+        self.guard
+            .take()
+            .expect("query lifecycle lease is consumed exactly once")
+            .finalize()
+    }
+
+    pub fn abort_preserving(mut self, primary_error: String) -> String {
+        self.guard
+            .take()
+            .expect("query lifecycle lease is consumed exactly once")
+            .abort_preserving(primary_error)
+    }
+}
+
+pub(crate) fn compile_query_init_plan(
+    fragments: &FragmentLifecycleProjection,
+    runtime_filters: Vec<RuntimeFilterContributionPlan>,
+    options: &QueryInitOptions,
+) -> Result<QueryInitPlan, DistributedQueryError> {
+    let live_by_backend = options
+        .live_backends
+        .iter()
+        .map(|target| (target.backend_idx(), *target))
+        .collect::<BTreeMap<_, _>>();
+    for (&backend_idx, endpoint) in &fragments.endpoints_by_backend {
+        let target = live_by_backend.get(&backend_idx).ok_or_else(|| {
+            contract_error(format!(
+                "scheduled backend {backend_idx} is absent from query initialization live snapshot"
+            ))
+        })?;
+        if RuntimeEndpoint::from_socket_addr(target.endpoint()) != *endpoint {
+            return Err(contract_error(format!(
+                "scheduled backend {backend_idx} endpoint {} differs from query initialization snapshot endpoint {}",
+                endpoint.as_host_port(),
+                target.endpoint()
+            )));
+        }
+    }
+
+    let mut runtime_filter_by_backend = BTreeMap::new();
+    for contribution in runtime_filters {
+        let backend_idx = contribution.backend_idx();
+        if !live_by_backend.contains_key(&backend_idx) {
+            return Err(contract_error(format!(
+                "runtime filter backend {backend_idx} is absent from query initialization live snapshot"
+            )));
+        }
+        if runtime_filter_by_backend
+            .insert(backend_idx, contribution)
+            .is_some()
+        {
+            return Err(contract_error(format!(
+                "runtime filter contribution repeats backend {backend_idx}"
+            )));
+        }
+    }
+
+    let participant_ids = fragments
+        .instances_by_backend
+        .keys()
+        .copied()
+        .chain(runtime_filter_by_backend.keys().copied())
+        .collect::<BTreeSet<_>>();
+    let mut participants = Vec::with_capacity(participant_ids.len());
+    for backend_idx in participant_ids {
+        let target = *live_by_backend.get(&backend_idx).ok_or_else(|| {
+            contract_error(format!(
+                "query initialization participant backend {backend_idx} is not live"
+            ))
+        })?;
+        let backend = ParticipantBackendIdentity::from_live_backend(target).map_err(|error| {
+            contract_error(format!(
+                "query initialization backend identity is invalid: {error}"
+            ))
+        })?;
+        let mut roles = BTreeSet::new();
+        let expected_instances = fragments
+            .instances_by_backend
+            .get(&backend_idx)
+            .cloned()
+            .unwrap_or_default();
+        if !expected_instances.is_empty() {
+            roles.insert(ParticipantRole::FragmentExecutor);
+        }
+        let runtime_filter = runtime_filter_by_backend
+            .remove(&backend_idx)
+            .map(|contribution| {
+                roles.insert(ParticipantRole::RuntimeFilterService);
+                let (_, participant_id, lifecycle, install) = contribution.into_parts();
+                RuntimeFilterContribution::from_compiled(
+                    options.execution_id,
+                    participant_id,
+                    lifecycle,
+                    install,
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                contract_error(format!(
+                    "query initialization runtime filter contribution is invalid: {error}"
+                ))
+            })?;
+        let manifest = ParticipantManifest::new(
+            options.execution_id,
+            backend.clone(),
+            roles,
+            expected_instances,
+            ParticipantQueryOptions::new(options.query_options.clone()),
+            options.query_deadline_unix_ms,
+            fragments.exchange_routes.iter().cloned(),
+            runtime_filter,
+            options.pre_start_timeout,
+            options.report_endpoint.clone(),
+        )
+        .map_err(|error| {
+            contract_error(format!(
+                "query initialization participant manifest is invalid: {error}"
+            ))
+        })?;
+        let digest = manifest.digest();
+        participants.push(QueryInitParticipant {
+            backend_idx,
+            backend,
+            manifest,
+            digest,
+        });
+    }
+    Ok(QueryInitPlan {
+        execution_id: options.execution_id,
+        participants,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::Duration;
+
+    use super::{QueryInitOptions, compile_query_init_plan};
+    use crate::common::types::UniqueId;
+    use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
+    use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
+    use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryExecutionId};
+    use crate::query_execution::runtime_filter::RuntimeFilterContributionPlan;
+    use crate::query_execution::schedule::FragmentLifecycleProjection;
+    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+    use crate::runtime_filter::port::install::{
+        RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+    };
+    use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
+
+    fn execution_id() -> QueryExecutionId {
+        QueryExecutionId::new(
+            QueryId::new(41, 73),
+            AttemptId::new(7).expect("nonzero attempt"),
+        )
+        .expect("nonzero query id")
+    }
+
+    fn backend(backend_idx: usize) -> LiveBackendTarget {
+        LiveBackendTarget::new(
+            backend_idx,
+            format!("127.0.0.1:{}", 19040 + backend_idx)
+                .parse()
+                .expect("valid endpoint"),
+            100 + backend_idx as u64,
+        )
+    }
+
+    fn runtime_filter(backend_idx: usize) -> RuntimeFilterContributionPlan {
+        let participant =
+            RuntimeFilterParticipantId::new(u32::try_from(backend_idx + 1).expect("participant"));
+        let epoch = DeploymentEpoch::new(execution_id().attempt_id().get());
+        let install = RuntimeFilterParticipantInstall::new(
+            RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
+            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
+                .expect("empty routing shard"),
+        );
+        RuntimeFilterContributionPlan::new(
+            backend_idx,
+            participant.get(),
+            crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
+                delivery_expire: Duration::from_secs(5),
+                query_expire: Duration::from_secs(30),
+                transport_retry_interval: Duration::from_millis(200),
+                transport_max_attempts: 3,
+                transport_deadline: Duration::from_secs(2),
+                transport_max_pending_entries: 1024,
+                transport_max_pending_bytes: 1 << 20,
+            },
+            install,
+        )
+        .expect("valid contribution")
+    }
+
+    #[test]
+    fn query_init_plan_unions_fragment_and_runtime_filter_participants() {
+        let fragment_zero = UniqueId { hi: 10, lo: 1 };
+        let fragment_one = UniqueId { hi: 10, lo: 2 };
+        let fragments = FragmentLifecycleProjection::new(
+            BTreeMap::from([
+                (0, BTreeSet::from([fragment_zero])),
+                (1, BTreeSet::from([fragment_one])),
+            ]),
+            BTreeMap::from([
+                (
+                    0,
+                    crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
+                        backend(0).endpoint(),
+                    ),
+                ),
+                (
+                    1,
+                    crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
+                        backend(1).endpoint(),
+                    ),
+                ),
+            ]),
+            Vec::new(),
+        );
+        let resolved = ResolvedQueryOptions::from_upstream(None);
+        let options = QueryInitOptions::new(
+            execution_id(),
+            vec![backend(0), backend(1), backend(2)],
+            2,
+            resolved.runtime_filter_lifecycle(),
+            &resolved,
+            1_000,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+            false,
+        )
+        .expect("valid init options");
+
+        let plan = compile_query_init_plan(
+            &fragments,
+            vec![runtime_filter(1), runtime_filter(2)],
+            &options,
+        )
+        .expect("valid init plan");
+
+        assert_eq!(plan.backend_ids(), vec![0, 1, 2]);
+        assert_eq!(
+            plan.participant(2)
+                .expect("service-only participant")
+                .manifest()
+                .expected_fragment_instance_ids(),
+            &BTreeSet::new()
+        );
+        assert_eq!(
+            plan.participant(2)
+                .expect("service-only participant")
+                .manifest()
+                .roles(),
+            &BTreeSet::from([ParticipantRole::RuntimeFilterService])
+        );
+    }
+
+    #[test]
+    fn runtime_filter_contribution_is_bound_to_outer_attempt() {
+        let fragments =
+            FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new());
+        let resolved = ResolvedQueryOptions::from_upstream(None);
+        let options = QueryInitOptions::new(
+            execution_id(),
+            vec![backend(2)],
+            2,
+            resolved.runtime_filter_lifecycle(),
+            &resolved,
+            1_000,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+            false,
+        )
+        .expect("valid init options");
+
+        let plan = compile_query_init_plan(&fragments, vec![runtime_filter(2)], &options)
+            .expect("valid init plan");
+        let contribution = plan
+            .participant(2)
+            .expect("runtime filter participant")
+            .manifest()
+            .runtime_filter()
+            .expect("runtime filter contribution");
+
+        assert_eq!(
+            contribution.install().epoch().get(),
+            execution_id().attempt_id().get()
+        );
+    }
+}

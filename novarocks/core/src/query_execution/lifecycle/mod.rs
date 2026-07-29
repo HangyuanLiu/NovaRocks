@@ -18,6 +18,7 @@
 pub mod contract;
 pub mod digest;
 pub mod identity;
+pub mod init_plan;
 pub mod manifest;
 pub mod metrics;
 
@@ -28,6 +29,10 @@ pub use contract::{
     QueryTerminationReason,
 };
 pub use identity::{AttemptId, QueryExecutionId};
+pub use init_plan::{
+    QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan, QueryLifecycleLease,
+    QueryLifecycleLeaseGuard,
+};
 pub use manifest::{
     ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantManifestDigest, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
