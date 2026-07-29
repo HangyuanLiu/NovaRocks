@@ -314,6 +314,7 @@ impl NovaRocksConfig {
             .try_into()
             .with_context(|| format!("parse toml: {}", path.display()))?;
         validate_state_store_configuration(&cfg)?;
+        validate_query_control_config(&cfg.runtime)?;
         Ok(cfg)
     }
 
@@ -679,6 +680,22 @@ pub struct RuntimeConfig {
     pub exchange_io_threads: usize,
     #[serde(default = "default_exchange_io_max_inflight_bytes")]
     pub exchange_io_max_inflight_bytes: usize,
+    #[serde(default = "default_query_control_heartbeat_interval_ms")]
+    pub query_control_heartbeat_interval_ms: u64,
+    #[serde(default = "default_query_control_heartbeat_timeout_ms")]
+    pub query_control_heartbeat_timeout_ms: u64,
+    #[serde(default = "default_query_control_init_rpc_timeout_ms")]
+    pub query_control_init_rpc_timeout_ms: u64,
+    #[serde(default = "default_query_control_attach_timeout_ms")]
+    pub query_control_attach_timeout_ms: u64,
+    #[serde(default = "default_query_control_pre_start_timeout_ms")]
+    pub query_control_pre_start_timeout_ms: u64,
+    #[serde(default = "default_query_control_tombstone_retention_ms")]
+    pub query_control_tombstone_retention_ms: u64,
+    #[serde(default = "default_query_control_tombstone_capacity")]
+    pub query_control_tombstone_capacity: usize,
+    #[serde(default = "default_query_control_max_active_entries")]
+    pub query_control_max_active_entries: usize,
     #[serde(default = "default_mem_limit")]
     pub mem_limit: String,
     #[serde(default = "default_be_mem_limit_bytes")]
@@ -905,6 +922,90 @@ fn default_exchange_io_max_inflight_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+fn default_query_control_heartbeat_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_query_control_heartbeat_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_init_rpc_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_attach_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_pre_start_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_query_control_tombstone_retention_ms() -> u64 {
+    120_000
+}
+
+fn default_query_control_tombstone_capacity() -> usize {
+    16_384
+}
+
+fn default_query_control_max_active_entries() -> usize {
+    4_096
+}
+
+fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
+    let nonzero_durations = [
+        (
+            "runtime.query_control_heartbeat_interval_ms",
+            runtime.query_control_heartbeat_interval_ms,
+        ),
+        (
+            "runtime.query_control_heartbeat_timeout_ms",
+            runtime.query_control_heartbeat_timeout_ms,
+        ),
+        (
+            "runtime.query_control_init_rpc_timeout_ms",
+            runtime.query_control_init_rpc_timeout_ms,
+        ),
+        (
+            "runtime.query_control_attach_timeout_ms",
+            runtime.query_control_attach_timeout_ms,
+        ),
+        (
+            "runtime.query_control_pre_start_timeout_ms",
+            runtime.query_control_pre_start_timeout_ms,
+        ),
+        (
+            "runtime.query_control_tombstone_retention_ms",
+            runtime.query_control_tombstone_retention_ms,
+        ),
+    ];
+    for (field, value) in nonzero_durations {
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
+    }
+    if runtime.query_control_tombstone_capacity == 0 {
+        bail!("runtime.query_control_tombstone_capacity must be greater than 0");
+    }
+    if runtime.query_control_max_active_entries == 0 {
+        bail!("runtime.query_control_max_active_entries must be greater than 0");
+    }
+    let minimum_timeout = runtime
+        .query_control_heartbeat_interval_ms
+        .checked_mul(3)
+        .ok_or_else(|| {
+            anyhow::anyhow!("runtime.query_control_heartbeat_interval_ms is too large to validate")
+        })?;
+    if runtime.query_control_heartbeat_timeout_ms < minimum_timeout {
+        bail!(
+            "runtime.query_control_heartbeat_timeout_ms must be at least 3 times runtime.query_control_heartbeat_interval_ms"
+        );
+    }
+    Ok(())
+}
+
 fn default_mem_limit() -> String {
     DEFAULT_MEM_LIMIT_SPEC.to_string()
 }
@@ -1096,6 +1197,14 @@ impl Default for RuntimeConfig {
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
             exchange_io_max_inflight_bytes: default_exchange_io_max_inflight_bytes(),
+            query_control_heartbeat_interval_ms: default_query_control_heartbeat_interval_ms(),
+            query_control_heartbeat_timeout_ms: default_query_control_heartbeat_timeout_ms(),
+            query_control_init_rpc_timeout_ms: default_query_control_init_rpc_timeout_ms(),
+            query_control_attach_timeout_ms: default_query_control_attach_timeout_ms(),
+            query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),
+            query_control_tombstone_retention_ms: default_query_control_tombstone_retention_ms(),
+            query_control_tombstone_capacity: default_query_control_tombstone_capacity(),
+            query_control_max_active_entries: default_query_control_max_active_entries(),
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
@@ -1597,7 +1706,101 @@ mod tests {
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
         StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
+        validate_query_control_config,
     };
+
+    #[test]
+    fn query_control_config_defaults_are_fixed() {
+        let runtime = RuntimeConfig::default();
+
+        assert_eq!(runtime.query_control_heartbeat_interval_ms, 1_000);
+        assert_eq!(runtime.query_control_heartbeat_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_init_rpc_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_attach_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_pre_start_timeout_ms, 30_000);
+        assert_eq!(runtime.query_control_tombstone_retention_ms, 120_000);
+        assert_eq!(runtime.query_control_tombstone_capacity, 16_384);
+        assert_eq!(runtime.query_control_max_active_entries, 4_096);
+    }
+
+    #[test]
+    fn query_control_config_rejects_zero_values() {
+        let cases: [(&str, fn(&mut RuntimeConfig)); 8] = [
+            ("query_control_heartbeat_interval_ms", |runtime| {
+                runtime.query_control_heartbeat_interval_ms = 0;
+            }),
+            ("query_control_heartbeat_timeout_ms", |runtime| {
+                runtime.query_control_heartbeat_timeout_ms = 0;
+            }),
+            ("query_control_init_rpc_timeout_ms", |runtime| {
+                runtime.query_control_init_rpc_timeout_ms = 0;
+            }),
+            ("query_control_attach_timeout_ms", |runtime| {
+                runtime.query_control_attach_timeout_ms = 0;
+            }),
+            ("query_control_pre_start_timeout_ms", |runtime| {
+                runtime.query_control_pre_start_timeout_ms = 0;
+            }),
+            ("query_control_tombstone_retention_ms", |runtime| {
+                runtime.query_control_tombstone_retention_ms = 0;
+            }),
+            ("query_control_tombstone_capacity", |runtime| {
+                runtime.query_control_tombstone_capacity = 0;
+            }),
+            ("query_control_max_active_entries", |runtime| {
+                runtime.query_control_max_active_entries = 0;
+            }),
+        ];
+
+        for (field, mutate) in cases {
+            let mut runtime = RuntimeConfig::default();
+            mutate(&mut runtime);
+            let error = validate_query_control_config(&runtime)
+                .expect_err("zero query-control values must be rejected");
+            assert!(
+                error.to_string().contains(field),
+                "error must identify {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_control_config_rejects_short_heartbeat_timeout() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.query_control_heartbeat_interval_ms = 1_000;
+        runtime.query_control_heartbeat_timeout_ms = 2_999;
+
+        let error = validate_query_control_config(&runtime)
+            .expect_err("heartbeat timeout must cover at least three intervals");
+        assert!(
+            error
+                .to_string()
+                .contains("query_control_heartbeat_timeout_ms")
+        );
+    }
+
+    #[test]
+    fn query_control_config_load_rejects_invalid_capacity() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            temp.path(),
+            r#"
+[runtime]
+query_control_max_active_entries = 0
+"#,
+        )?;
+
+        let error = match NovaRocksConfig::load_from_file(temp.path()) {
+            Ok(_) => panic!("load must validate query-control capacity"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("query_control_max_active_entries")
+        );
+        Ok(())
+    }
 
     #[test]
     fn state_store_config_loads_explicit_sqlite_provider() -> anyhow::Result<()> {

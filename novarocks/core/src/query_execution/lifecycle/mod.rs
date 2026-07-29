@@ -15,26 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod artifact;
-pub(crate) mod assembly;
-pub mod backend;
-#[cfg(test)]
-pub(crate) mod backend_registry;
-pub mod cancellation;
 pub mod contract;
-#[cfg(feature = "query-execution-contract-test-support")]
-pub mod contract_test_support;
-pub mod control;
-pub mod fragment_transport;
-pub mod lifecycle;
-pub(crate) mod outcome;
-pub(crate) mod preparation;
-pub(crate) mod profile;
-pub mod report;
-mod runtime_filter;
-pub(crate) mod schedule;
-pub mod service;
-pub mod write;
+pub mod digest;
+pub mod identity;
+pub mod manifest;
+pub mod metrics;
 
-#[cfg(test)]
-mod tests;
+pub use contract::{
+    BackendQueryControl, QueryAbortRequest, QueryControlAttach, QueryControlAttachment,
+    QueryControlCommand, QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminationAck,
+    QueryTerminationReason,
+};
+pub use identity::{AttemptId, QueryExecutionId};
+pub use manifest::{
+    ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantManifestDigest, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
+    RuntimeFilterContribution,
+};
