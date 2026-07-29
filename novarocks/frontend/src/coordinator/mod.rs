@@ -18,6 +18,10 @@
 mod backend_events;
 mod contract_probe;
 mod execution;
+// Task 5 deliberately lands the lifecycle client seam before Task 6 wires the
+// production transport and Task 7 cuts over coordinator submission.
+#[allow(dead_code)]
+mod query_lifecycle;
 mod query_registry;
 mod report;
 mod runtime_filter;

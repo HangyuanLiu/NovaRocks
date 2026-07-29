@@ -226,6 +226,58 @@ impl QueryInitPlan {
     pub fn into_participants(self) -> Vec<QueryInitParticipant> {
         self.participants
     }
+
+    #[cfg(feature = "query-execution-contract-test-support")]
+    pub fn from_manifests_for_contract_test(
+        execution_id: QueryExecutionId,
+        manifests: impl IntoIterator<Item = (usize, ParticipantManifest)>,
+    ) -> Result<Self, DistributedQueryError> {
+        let mut participants = manifests
+            .into_iter()
+            .map(|(backend_idx, manifest)| {
+                if manifest.execution_id() != execution_id {
+                    return Err(contract_error(
+                        "contract-test participant execution id differs from query init plan",
+                    ));
+                }
+                if manifest.backend().backend_id() != backend_idx as u64 {
+                    return Err(contract_error(
+                        "contract-test participant backend identity differs from backend index",
+                    ));
+                }
+                let digest = manifest.digest();
+                Ok(QueryInitParticipant {
+                    backend_idx,
+                    backend: manifest.backend().clone(),
+                    manifest,
+                    digest,
+                })
+            })
+            .collect::<Result<Vec<_>, DistributedQueryError>>()?;
+        participants.sort_by_key(QueryInitParticipant::backend_idx);
+        if participants
+            .windows(2)
+            .any(|pair| pair[0].backend_idx() == pair[1].backend_idx())
+        {
+            return Err(contract_error(
+                "contract-test query init plan repeats a backend index",
+            ));
+        }
+        if participants.is_empty() {
+            return Err(contract_error(
+                "contract-test query init plan requires a participant",
+            ));
+        }
+        Ok(Self {
+            execution_id,
+            query_deadline_unix_ms: participants[0].manifest().query_deadline_unix_ms(),
+            runtime_filter_strategy: participants
+                .iter()
+                .find_map(|participant| participant.manifest().runtime_filter())
+                .map(RuntimeFilterContribution::lifecycle),
+            participants,
+        })
+    }
 }
 
 pub struct QueryInitParticipant {

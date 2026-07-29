@@ -162,6 +162,12 @@ pub enum QueryInitOutcome {
     RejectedTerminated,
 }
 
+impl QueryInitOutcome {
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::Applied | Self::AlreadyApplied)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryInitAck {
     execution_id: QueryExecutionId,

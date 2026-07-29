@@ -87,6 +87,41 @@ static BACKEND_QUERY_LIFECYCLE_TERMINATIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_backend_query_lifecycle_terminations")
 });
 
+static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "novarocks_frontend_query_lifecycle_active_attempts",
+        "Number of frontend-owned query lifecycle attempts."
+    )
+    .expect("register novarocks_frontend_query_lifecycle_active_attempts")
+});
+
+static FRONTEND_QUERY_LIFECYCLE_INIT: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_frontend_query_lifecycle_init_total",
+        "Cumulative frontend query initialization outcomes.",
+        &["outcome"]
+    )
+    .expect("register novarocks_frontend_query_lifecycle_init_total")
+});
+
+static FRONTEND_QUERY_LIFECYCLE_CONTROL: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_frontend_query_lifecycle_control_total",
+        "Cumulative frontend query control outcomes.",
+        &["outcome"]
+    )
+    .expect("register novarocks_frontend_query_lifecycle_control_total")
+});
+
+static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_frontend_query_lifecycle_latency_micros",
+        "Cumulative frontend query lifecycle latency and sample counts.",
+        &["phase", "measure"]
+    )
+    .expect("register novarocks_frontend_query_lifecycle_latency_micros")
+});
+
 pub(crate) fn observe_fragment_scheduled() {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc();
 }
@@ -146,6 +181,49 @@ pub fn publish_backend_query_lifecycle_metrics(
         BACKEND_QUERY_LIFECYCLE_TERMINATIONS
             .with_label_values(&[reason])
             .set(count as i64);
+    }
+}
+
+pub fn publish_frontend_query_lifecycle_metrics(
+    snapshot: crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+) {
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS).set(snapshot.active_attempts as i64);
+    for (outcome, count) in [
+        ("applied", snapshot.init_applied),
+        ("already_applied", snapshot.init_idempotent),
+        ("failed", snapshot.init_failed),
+    ] {
+        FRONTEND_QUERY_LIFECYCLE_INIT
+            .with_label_values(&[outcome])
+            .set(count as i64);
+    }
+    for (outcome, count) in [
+        ("control_ready", snapshot.control_ready),
+        ("heartbeat_timeout", snapshot.heartbeat_timeouts),
+        ("coordinator_lost", snapshot.coordinator_lost),
+    ] {
+        FRONTEND_QUERY_LIFECYCLE_CONTROL
+            .with_label_values(&[outcome])
+            .set(count as i64);
+    }
+    for (phase, total, samples) in [
+        (
+            "init",
+            snapshot.init_latency_micros_total,
+            snapshot.init_latency_samples,
+        ),
+        (
+            "attach",
+            snapshot.attach_latency_micros_total,
+            snapshot.attach_latency_samples,
+        ),
+    ] {
+        FRONTEND_QUERY_LIFECYCLE_LATENCY
+            .with_label_values(&[phase, "total"])
+            .set(total as i64);
+        FRONTEND_QUERY_LIFECYCLE_LATENCY
+            .with_label_values(&[phase, "samples"])
+            .set(samples as i64);
     }
 }
 
@@ -243,6 +321,10 @@ fn refresh_backend_gauges() {
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_LATENCY);
 }
 
 #[cfg(test)]
@@ -310,5 +392,48 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 == Some("novarocks_fragment_scheduled_total")
         }));
+    }
+
+    #[test]
+    fn frontend_query_lifecycle_metrics_publish_structured_snapshot() {
+        publish_frontend_query_lifecycle_metrics(
+            crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot {
+                active_attempts: 2,
+                init_applied: 3,
+                init_idempotent: 4,
+                init_failed: 5,
+                init_latency_micros_total: 6,
+                init_latency_samples: 7,
+                control_ready: 8,
+                attach_latency_micros_total: 9,
+                attach_latency_samples: 10,
+                heartbeat_timeouts: 11,
+                coordinator_lost: 12,
+            },
+        );
+
+        let body = render_metrics().expect("render frontend query lifecycle metrics");
+        assert!(
+            body.contains("novarocks_frontend_query_lifecycle_active_attempts 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_init_total{outcome=\"already_applied\"} 4"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"heartbeat_timeout\"} 11"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_latency_micros{measure=\"samples\",phase=\"attach\"} 10"
+            ),
+            "{body}"
+        );
     }
 }

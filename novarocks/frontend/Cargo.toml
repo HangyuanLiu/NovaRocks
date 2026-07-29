@@ -23,6 +23,7 @@ serde_json = "1"
 sha2 = "0.10"
 sqlparser = "0.61.0"
 tokio = { version = "1", features = ["rt-multi-thread", "signal"] }
+tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
