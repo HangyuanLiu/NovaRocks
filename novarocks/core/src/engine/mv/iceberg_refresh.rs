@@ -3305,7 +3305,25 @@ pub(crate) fn recover_iceberg_mv_refreshes(state: &Arc<StandaloneState>) -> Resu
         .list_unfinished_branch_staged_iceberg_refreshes()
         .map_err(|e| format!("load unfinished iceberg MV refreshes failed: {e}"))?;
     for refresh in unfinished {
-        recover_one_iceberg_mv_refresh(state, refresh)?;
+        recover_one_iceberg_mv_refresh(state, refresh, None)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_iceberg_mv_refreshes_with_connector_context(
+    state: &Arc<StandaloneState>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    crate::connector::validate_request_context(connector_context)?;
+    if !state.mv_repository.availability().is_available() {
+        return Ok(());
+    }
+    let unfinished = state
+        .mv_repository
+        .list_unfinished_branch_staged_iceberg_refreshes()
+        .map_err(|e| format!("load unfinished iceberg MV refreshes failed: {e}"))?;
+    for refresh in unfinished {
+        recover_one_iceberg_mv_refresh(state, refresh, Some(connector_context))?;
     }
     Ok(())
 }
@@ -3313,6 +3331,7 @@ pub(crate) fn recover_iceberg_mv_refreshes(state: &Arc<StandaloneState>) -> Resu
 fn recover_one_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     refresh: StoredMvRefresh,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     let target =
         IcebergMvTarget {
@@ -3328,7 +3347,15 @@ fn recover_one_iceberg_mv_refresh(
                 .ok_or_else(|| format!("mv refresh {} missing target table", refresh.refresh_id))?,
         };
     let (entry, catalog, loaded) = load_iceberg_mv_target(state, &target)?;
-    reconcile_iceberg_mv_refresh(state, refresh, &target, &entry, &catalog, &loaded.table)
+    reconcile_iceberg_mv_refresh(
+        state,
+        refresh,
+        &target,
+        &entry,
+        &catalog,
+        &loaded.table,
+        connector_context,
+    )
 }
 
 pub(crate) fn resolve_refresh_target(
@@ -3485,7 +3512,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
         );
     };
     let _refresh_guard = acquire_mv_refresh_lock()?;
-    recover_iceberg_mv_refreshes(state)?;
+    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)?;
 
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
@@ -5694,7 +5721,8 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
 
     crate::connector::validate_request_context(connector_context)
         .map_err(RefreshError::pre_commit)?;
-    recover_iceberg_mv_refreshes(state).map_err(RefreshError::pre_commit)?;
+    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)
+        .map_err(RefreshError::pre_commit)?;
     let mv_definition =
         load_iceberg_mv_definition_by_target(state, &iceberg_target).map_err(RefreshError::user)?;
     let (_, _, target_loaded) =
@@ -7158,7 +7186,8 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
     let _refresh_guard = acquire_mv_refresh_lock().map_err(RefreshError::pre_commit)?;
     // Recovery may complete or roll back historical attempts before validating
     // this plan. The no-write guarantee below applies to the current attempt.
-    recover_iceberg_mv_refreshes(state).map_err(RefreshError::pre_commit)?;
+    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)
+        .map_err(RefreshError::pre_commit)?;
 
     let payload_target = resolve_refresh_target(
         plan.current_catalog.as_deref(),
@@ -8120,6 +8149,7 @@ fn reconcile_iceberg_mv_refresh(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     _catalog: &Arc<dyn iceberg::Catalog>,
     table: &iceberg::table::Table,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     if matches!(
         refresh.state,
@@ -8152,6 +8182,7 @@ fn reconcile_iceberg_mv_refresh(
                         entry,
                         staging_branch,
                         staging_snapshot_id,
+                        connector_context,
                     )
                 }
                 Ok(StagingDisposition::Diverged) => rollback_iceberg_mv_staging_branch(
@@ -8162,6 +8193,7 @@ fn reconcile_iceberg_mv_refresh(
                     table,
                     staging_branch,
                     staging_snapshot_id,
+                    connector_context,
                 ),
                 // The classifier's only `Err` is the sole-writer violation:
                 // `main` is on the staged snapshot id but its refresh marker
@@ -8191,6 +8223,7 @@ fn converge_published_iceberg_mv_staging_branch(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     staging_branch: &str,
     staging_snapshot_id: i64,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     // The publish landing is a lake fact (the classifier proved the staged
     // snapshot is on `main`'s lineage). The ledger row is only a derived cache
@@ -8202,7 +8235,17 @@ fn converge_published_iceberg_mv_staging_branch(
     if refresh.state == MvRefreshState::StagingCommitted {
         record_iceberg_mv_publish_commit(state, refresh.refresh_id, staging_snapshot_id)?;
     }
-    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    if let Some(connector_context) = connector_context {
+        drop_iceberg_mv_staging_branch_with_connector_context(
+            state,
+            target,
+            entry,
+            staging_branch,
+            connector_context,
+        )?;
+    } else {
+        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    }
     finalize_recovered_iceberg_mv_refresh(state, refresh)
 }
 
@@ -8223,6 +8266,7 @@ fn rollback_iceberg_mv_staging_branch(
     table: &iceberg::table::Table,
     staging_branch: &str,
     staging_snapshot_id: i64,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     // The staged snapshot's parent is the pre-repartition `main` snapshot; its
     // data manifests witness the old default partition spec id.
@@ -8238,7 +8282,17 @@ fn rollback_iceberg_mv_staging_branch(
         table,
         reference_snapshot_id,
     )?;
-    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    if let Some(connector_context) = connector_context {
+        drop_iceberg_mv_staging_branch_with_connector_context(
+            state,
+            target,
+            entry,
+            staging_branch,
+            connector_context,
+        )?;
+    } else {
+        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    }
     mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)
 }
 
@@ -9247,6 +9301,36 @@ fn drop_iceberg_mv_staging_branch(
     .map(|_| ())?;
     register_iceberg_mv_target_in_catalog(state, target)?;
     Ok(())
+}
+
+fn drop_iceberg_mv_staging_branch_with_connector_context(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    staging_branch: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterRef {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            action: novarocks_spi::connector::ConnectorRefAction::Drop {
+                kind: novarocks_spi::connector::ConnectorRefKind::Branch,
+                name: Arc::from(staging_branch),
+                policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+            },
+        },
+        connector_context.clone(),
+    )?;
+    target_entry.invalidate_table_cache(&target.namespace, &target.table);
+    register_iceberg_mv_target_in_catalog(state, target)
 }
 
 fn prepare_first_refresh_chunks_or_abort<F>(
@@ -25585,7 +25669,11 @@ mod tests {
             )
         };
 
-        recover_iceberg_mv_refreshes(&env.state).expect("recover");
+        recover_iceberg_mv_refreshes_with_connector_context(
+            &env.state,
+            &crate::connector::test_request_context(),
+        )
+        .expect("recover");
 
         let provider = env.state.metadata_provider.as_ref().expect("provider");
         let read = provider.begin_read().expect("read");
