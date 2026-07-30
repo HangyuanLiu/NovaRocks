@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn ensure_request_rejects_invalid_incarnation_length() {
         let error = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
-            execution_id: None,
+            execution_id: Some(crate::proto::novarocks::QueryExecutionId {
+                query_id: Some(crate::proto::common::UniqueId { hi: 7, lo: 9 }),
+                attempt_id: 1,
+            }),
             provider_id: "iceberg".to_string(),
             instance_id: "catalog.analytics".to_string(),
             incarnation: vec![7; 15],
