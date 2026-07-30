@@ -1518,6 +1518,16 @@ impl StandaloneSession {
                 }
             });
         }
+        if crate::sql::parser::procedure::looks_like_call_procedure(&normalized) {
+            let statement = crate::sql::parser::procedure::parse_call_procedure_sql(&normalized)?;
+            if statement.procedure == crate::engine::mv::stateless_rebuild::PROCEDURE_NAME {
+                return crate::engine::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
+                    &self.inner,
+                    &statement,
+                    current_database,
+                );
+            }
+        }
         if let Some(result) = self.inner.table_maintenance_service.try_handle_statement(
             self.inner.as_ref(),
             &normalized,
