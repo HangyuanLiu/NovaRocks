@@ -87,6 +87,15 @@ static BACKEND_QUERY_LIFECYCLE_TERMINATIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_backend_query_lifecycle_terminations")
 });
 
+static BACKEND_QUERY_LIFECYCLE_TERMINAL: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_lifecycle_terminal_total",
+        "Cumulative backend query terminal lifecycle outcomes.",
+        &["outcome"]
+    )
+    .expect("register novarocks_backend_query_lifecycle_terminal_total")
+});
+
 static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
         "novarocks_frontend_query_lifecycle_active_attempts",
@@ -165,6 +174,10 @@ pub fn publish_backend_query_lifecycle_metrics(
         ("admission", snapshot.admission_rejected),
         ("init_conflict", snapshot.init_conflicts),
         ("heartbeat_timeout", snapshot.heartbeat_timeouts),
+        (
+            "terminal_fallback_rejected",
+            snapshot.terminal_fallback_rejected,
+        ),
     ] {
         BACKEND_QUERY_LIFECYCLE_REJECTIONS
             .with_label_values(&[reason])
@@ -180,6 +193,29 @@ pub fn publish_backend_query_lifecycle_metrics(
     ] {
         BACKEND_QUERY_LIFECYCLE_TERMINATIONS
             .with_label_values(&[reason])
+            .set(count as i64);
+    }
+    for (outcome, count) in [
+        ("terminal_fact", snapshot.terminal_facts),
+        ("terminal_local_drained", snapshot.terminal_locally_drained),
+        ("terminal_record_frozen", snapshot.terminal_records_frozen),
+        ("terminal_acknowledged", snapshot.terminal_acknowledged),
+        (
+            "terminal_retention_expired",
+            snapshot.terminal_retention_expired,
+        ),
+        (
+            "terminal_fallback_accepted",
+            snapshot.terminal_fallback_accepted,
+        ),
+        ("terminal_retained", snapshot.terminal_retained as u64),
+        (
+            "terminal_retained_bytes",
+            snapshot.terminal_retained_bytes as u64,
+        ),
+    ] {
+        BACKEND_QUERY_LIFECYCLE_TERMINAL
+            .with_label_values(&[outcome])
             .set(count as i64);
     }
 }
@@ -207,6 +243,26 @@ pub fn publish_frontend_query_lifecycle_metrics(
         ("local_failure", snapshot.local_failures),
         ("backend_epoch_mismatch", snapshot.backend_epoch_mismatches),
         ("cleanup_failure", snapshot.cleanup_failures),
+        (
+            "terminal_locally_drained",
+            snapshot.terminal_locally_drained,
+        ),
+        (
+            "terminal_snapshot_accepted",
+            snapshot.terminal_snapshots_accepted,
+        ),
+        (
+            "terminal_snapshot_idempotent",
+            snapshot.terminal_snapshots_idempotent,
+        ),
+        (
+            "terminal_snapshot_conflict",
+            snapshot.terminal_snapshot_conflicts,
+        ),
+        (
+            "terminal_finalize_failure",
+            snapshot.terminal_finalize_failures,
+        ),
     ] {
         FRONTEND_QUERY_LIFECYCLE_CONTROL
             .with_label_values(&[outcome])
@@ -330,6 +386,7 @@ fn refresh_backend_gauges() {
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS);
+    Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
@@ -424,12 +481,23 @@ mod tests {
                 local_failures: 16,
                 backend_epoch_mismatches: 17,
                 cleanup_failures: 18,
+                terminal_locally_drained: 19,
+                terminal_snapshots_accepted: 20,
+                terminal_snapshots_idempotent: 21,
+                terminal_snapshot_conflicts: 22,
+                terminal_finalize_failures: 23,
             },
         );
 
         let body = render_metrics().expect("render frontend query lifecycle metrics");
         assert!(
             body.contains("novarocks_frontend_query_lifecycle_active_attempts 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"terminal_snapshot_accepted\"} 20"
+            ),
             "{body}"
         );
         assert!(

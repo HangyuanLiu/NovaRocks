@@ -331,6 +331,13 @@ struct QueryLifecycleRegistryState {
     pre_init_tombstones: BTreeMap<QueryExecutionId, PreInitTombstone>,
     terminal_retained: BTreeMap<QueryExecutionId, usize>,
     terminal_retained_bytes: usize,
+    terminal_facts: u64,
+    terminal_locally_drained: u64,
+    terminal_records_frozen: u64,
+    terminal_acknowledged: u64,
+    terminal_retention_expired: u64,
+    terminal_fallback_accepted: u64,
+    terminal_fallback_rejected: u64,
 }
 
 struct PreInitTombstone {
@@ -367,6 +374,13 @@ impl Default for QueryLifecycleRegistryState {
             pre_init_tombstones: BTreeMap::new(),
             terminal_retained: BTreeMap::new(),
             terminal_retained_bytes: 0,
+            terminal_facts: 0,
+            terminal_locally_drained: 0,
+            terminal_records_frozen: 0,
+            terminal_acknowledged: 0,
+            terminal_retention_expired: 0,
+            terminal_fallback_accepted: 0,
+            terminal_fallback_rejected: 0,
         }
     }
 }
@@ -1460,6 +1474,10 @@ impl QueryLifecycleRegistry {
                     state.terminal_record = None;
                 }
                 self.release_terminal_record(entry.manifest.execution_id());
+                self.increment_terminal_metric(|metrics| {
+                    metrics.terminal_retention_expired =
+                        metrics.terminal_retention_expired.saturating_add(1);
+                });
                 self.publish_tombstone(
                     &entry,
                     entry.manifest.execution_id(),
@@ -1537,10 +1555,12 @@ impl QueryLifecycleRegistry {
             }
             state.termination_reason = Some(requested_reason);
             let initializing = state.phase == QueryLifecyclePhase::Initializing;
+            let running = state.phase == QueryLifecyclePhase::Running;
+            let has_admitted_fragments = !state.accepted_fragments.is_empty();
             // A termination after Start must retain a complete immutable
             // terminal record, even when the coordinator initiated the
             // abort. Pre-start failures remain QLC-3 cleanup only.
-            let schedule_failure_drain = !initializing
+            let schedule_failure_drain = (running || has_admitted_fragments)
                 && requested_reason != QueryTerminationReason::CoordinatorFinalize
                 && !state.failure_drain_scheduled;
             if schedule_failure_drain {
@@ -1731,8 +1751,15 @@ impl QueryLifecycleRegistry {
             local_drained
         };
         if let Some(events) = local_drained {
+            self.increment_terminal_metric(|metrics| {
+                metrics.terminal_locally_drained =
+                    metrics.terminal_locally_drained.saturating_add(1);
+            });
             let _ = events.try_send(QueryControlEvent::LocalDrained);
         }
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_facts = metrics.terminal_facts.saturating_add(1);
+        });
         if matches!(outcome, FragmentTerminalOutcome::Succeeded) {
             return;
         }
@@ -1863,6 +1890,9 @@ impl QueryLifecycleRegistry {
             });
         }
         self.schedule_terminal_fallback(entry, record.snapshot().clone());
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_records_frozen = metrics.terminal_records_frozen.saturating_add(1);
+        });
     }
 
     fn finalize_from_control(
@@ -1944,6 +1974,9 @@ impl QueryLifecycleRegistry {
             });
         }
         self.schedule_terminal_fallback(entry, record.snapshot().clone());
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_records_frozen = metrics.terminal_records_frozen.saturating_add(1);
+        });
         Ok(())
     }
 
@@ -2019,6 +2052,11 @@ impl QueryLifecycleRegistry {
                                     | QueryTerminalReportOutcome::AlreadyAccepted
                             ) =>
                         {
+                            registry.increment_terminal_metric(|metrics| {
+                                metrics.terminal_fallback_accepted = metrics
+                                    .terminal_fallback_accepted
+                                    .saturating_add(1);
+                            });
                             if query_lifecycle_test_markers_enabled() {
                                 eprintln!(
                                     "NOVAROCKS_QUERY_TERMINAL_FALLBACK_ACCEPTED execution_id={} backend_id={} attempt={} outcome={:?}",
@@ -2034,6 +2072,11 @@ impl QueryLifecycleRegistry {
                             return;
                         }
                         Ok(ack) => {
+                            registry.increment_terminal_metric(|metrics| {
+                                metrics.terminal_fallback_rejected = metrics
+                                    .terminal_fallback_rejected
+                                    .saturating_add(1);
+                            });
                             if query_lifecycle_test_markers_enabled() {
                                 eprintln!(
                                     "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} backend_id={} attempt={} outcome={:?} detail={}",
@@ -2053,6 +2096,11 @@ impl QueryLifecycleRegistry {
                             );
                         }
                         Err(error) => {
+                            registry.increment_terminal_metric(|metrics| {
+                                metrics.terminal_fallback_rejected = metrics
+                                    .terminal_fallback_rejected
+                                    .saturating_add(1);
+                            });
                             if query_lifecycle_test_markers_enabled() {
                                 eprintln!(
                                     "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} backend_id={} attempt={} transport_error={}",
@@ -2125,6 +2173,9 @@ impl QueryLifecycleRegistry {
         }
         state.terminal_record = None;
         drop(state);
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_acknowledged = metrics.terminal_acknowledged.saturating_add(1);
+        });
         self.release_terminal_record(ack.execution_id());
         self.publish_tombstone(
             &entry,
@@ -2469,6 +2520,14 @@ impl QueryLifecycleRegistry {
             fold_metrics_locked(&state)
         };
         self.metrics.publish(snapshot, termination_reasons);
+    }
+
+    fn increment_terminal_metric(&self, update: impl FnOnce(&mut QueryLifecycleRegistryState)) {
+        {
+            let mut state = self.state.lock().expect("query lifecycle registry lock");
+            update(&mut state);
+        }
+        self.publish_metrics();
     }
 
     fn log_init(&self, ack: &QueryInitAck) {
@@ -2909,6 +2968,15 @@ fn fold_metrics_locked(
         init_conflicts: state.init_conflicts,
         heartbeat_timeouts: state.heartbeat_timeouts,
         terminations: state.terminations,
+        terminal_facts: state.terminal_facts,
+        terminal_locally_drained: state.terminal_locally_drained,
+        terminal_records_frozen: state.terminal_records_frozen,
+        terminal_acknowledged: state.terminal_acknowledged,
+        terminal_retention_expired: state.terminal_retention_expired,
+        terminal_fallback_accepted: state.terminal_fallback_accepted,
+        terminal_fallback_rejected: state.terminal_fallback_rejected,
+        terminal_retained: state.terminal_retained.len(),
+        terminal_retained_bytes: state.terminal_retained_bytes,
         ..BackendQueryLifecycleMetricsSnapshot::default()
     };
     for entry in state.entries.values() {

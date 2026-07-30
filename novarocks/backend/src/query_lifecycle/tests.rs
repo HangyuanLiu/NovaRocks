@@ -1300,6 +1300,10 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
             .outcome(),
         FragmentTerminalOutcome::Failed { .. }
     ));
+    let metrics = registry.metrics_snapshot();
+    assert_eq!(metrics.terminal_facts, 1);
+    assert_eq!(metrics.terminal_records_frozen, 1);
+    assert_eq!(metrics.terminal_locally_drained, 0);
 }
 
 #[test]

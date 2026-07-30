@@ -207,6 +207,27 @@ impl FrontendLifecycleMetrics {
         self.update(|snapshot| snapshot.cleanup_failures += 1);
     }
 
+    pub fn terminal_locally_drained(&self) {
+        self.update(|snapshot| snapshot.terminal_locally_drained += 1);
+    }
+
+    pub fn terminal_snapshot_stored(&self, outcome: TerminalSnapshotStoreOutcome) {
+        self.update(|snapshot| match outcome {
+            TerminalSnapshotStoreOutcome::Accepted => snapshot.terminal_snapshots_accepted += 1,
+            TerminalSnapshotStoreOutcome::AlreadyAccepted => {
+                snapshot.terminal_snapshots_idempotent += 1
+            }
+        });
+    }
+
+    pub fn terminal_snapshot_conflict(&self) {
+        self.update(|snapshot| snapshot.terminal_snapshot_conflicts += 1);
+    }
+
+    pub fn terminal_finalize_failure(&self) {
+        self.update(|snapshot| snapshot.terminal_finalize_failures += 1);
+    }
+
     #[cfg(test)]
     pub fn snapshot(&self) -> FrontendQueryLifecycleMetricsSnapshot {
         *self.snapshot.lock().expect("frontend lifecycle metrics")
@@ -361,6 +382,8 @@ impl AttemptControl {
                 TerminalSnapshotStoreOutcome::AlreadyAccepted
             }
             Some(_) => {
+                drop(terminal);
+                self.metrics.terminal_snapshot_conflict();
                 return Err(contract_violation(
                     "query terminal snapshot conflicts with an already stored participant snapshot",
                 ));
@@ -371,6 +394,8 @@ impl AttemptControl {
             }
         };
         self.terminal.1.notify_all();
+        drop(terminal);
+        self.metrics.terminal_snapshot_stored(outcome);
         Ok(outcome)
     }
 
@@ -752,8 +777,10 @@ impl AttemptControl {
                 )
             })?;
         self.stop_supervisor();
-        self.wait_for_all_drained(self.config.terminal_drain_timeout())
-            .map_err(failed)?;
+        if let Err(error) = self.wait_for_all_drained(self.config.terminal_drain_timeout()) {
+            self.metrics.terminal_finalize_failure();
+            return Err(failed(error));
+        }
         let sessions = self.sessions();
         let errors = std::thread::scope(|scope| {
             let handles = sessions
@@ -778,9 +805,14 @@ impl AttemptControl {
         });
         self.metrics.attempt_terminated();
         if errors.is_empty() {
-            let terminal_set = self
-                .wait_for_all_snapshots(self.config.terminal_ack_timeout())
-                .map_err(failed)?;
+            let terminal_set = match self.wait_for_all_snapshots(self.config.terminal_ack_timeout())
+            {
+                Ok(terminal_set) => terminal_set,
+                Err(error) => {
+                    self.metrics.terminal_finalize_failure();
+                    return Err(failed(error));
+                }
+            };
             self.state.store(FINALIZED, Ordering::Release);
             tracing::info!(
                 query_id_high = self.execution_id.query_id().high(),
@@ -790,6 +822,7 @@ impl AttemptControl {
             );
             Ok(terminal_set)
         } else {
+            self.metrics.terminal_finalize_failure();
             self.state.store(ABORTED, Ordering::Release);
             let primary = format!("query lifecycle finalize failed: {}", errors.join("; "));
             let cleanup = self.abort_targets(true, &primary);
@@ -892,12 +925,16 @@ impl AttemptControl {
                 Ok(())
             }
             QueryControlEvent::LocalDrained => {
-                self.terminal
+                let newly_drained = self
+                    .terminal
                     .0
                     .lock()
                     .expect("query terminal state")
                     .locally_drained
                     .insert(session.target.backend_idx());
+                if newly_drained {
+                    self.metrics.terminal_locally_drained();
+                }
                 self.terminal.1.notify_all();
                 Ok(())
             }

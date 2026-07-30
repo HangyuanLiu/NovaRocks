@@ -34,6 +34,11 @@ pub struct FrontendQueryLifecycleMetricsSnapshot {
     pub local_failures: u64,
     pub backend_epoch_mismatches: u64,
     pub cleanup_failures: u64,
+    pub terminal_locally_drained: u64,
+    pub terminal_snapshots_accepted: u64,
+    pub terminal_snapshots_idempotent: u64,
+    pub terminal_snapshot_conflicts: u64,
+    pub terminal_finalize_failures: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -47,4 +52,13 @@ pub struct BackendQueryLifecycleMetricsSnapshot {
     pub init_conflicts: u64,
     pub heartbeat_timeouts: u64,
     pub terminations: u64,
+    pub terminal_facts: u64,
+    pub terminal_locally_drained: u64,
+    pub terminal_records_frozen: u64,
+    pub terminal_acknowledged: u64,
+    pub terminal_retention_expired: u64,
+    pub terminal_fallback_accepted: u64,
+    pub terminal_fallback_rejected: u64,
+    pub terminal_retained: usize,
+    pub terminal_retained_bytes: usize,
 }
