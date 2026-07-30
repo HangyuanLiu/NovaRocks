@@ -658,8 +658,8 @@ mod tests {
 
         assert_eq!(
             Arc::strong_count(&services.query_lifecycle_registry),
-            2,
-            "application composition and fragment ingress must share exactly one registry"
+            3,
+            "application, Stage ingress, and fragment service must share exactly one registry"
         );
     }
 
