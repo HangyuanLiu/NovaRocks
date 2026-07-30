@@ -45,8 +45,8 @@ use novarocks_spi::connector::{
     ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector, ConnectorScan,
     ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
     ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
-    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,7 @@ use super::catalog::registry::{
     IcebergCatalogRegistry, create_namespace, create_table, drop_namespace, drop_table,
     extract_data_files_with_stats_at, list_tables, load_table, namespace_exists,
 };
+use super::catalog::views;
 use super::reader::IcebergBatchReader;
 use super::scan_model::IcebergDataFileInfo;
 
@@ -848,6 +849,80 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         .map(|()| ExternalMutationEffect::Applied)
                         .map_err(map_iceberg_error),
                     Err(error) => Err(error),
+                }
+            }
+            ConnectorCatalogMutationOperation::CreateView {
+                view,
+                columns,
+                definition,
+                comment,
+                properties,
+                policy,
+            } => {
+                if view.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "view mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                match views::view_exists(&entry, &view.namespace, &view.view) {
+                    Ok(true) if policy == CreateOrReplacePolicy::NoOpIfExists => {
+                        Ok(ExternalMutationEffect::NoOp)
+                    }
+                    Ok(true) if policy == CreateOrReplacePolicy::FailIfExists => {
+                        Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "view already exists",
+                        ))
+                    }
+                    Ok(existing) => views::create_view(
+                        &entry,
+                        &view.namespace,
+                        &view.view,
+                        &columns
+                            .iter()
+                            .map(lower_column)
+                            .collect::<Result<Vec<_>, _>>()?,
+                        &definition.sql,
+                        comment.as_deref(),
+                        existing && policy == CreateOrReplacePolicy::ReplaceIfExists,
+                        &properties
+                            .iter()
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .map(|()| ExternalMutationEffect::Applied)
+                    .map_err(map_iceberg_error),
+                    Err(error) => Err(map_iceberg_error(error)),
+                }
+            }
+            ConnectorCatalogMutationOperation::DropView { view, policy } => {
+                if view.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "view mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                match views::view_exists(&entry, &view.namespace, &view.view) {
+                    Ok(false) if policy == DropPolicy::NoOpIfMissing => {
+                        Ok(ExternalMutationEffect::NoOp)
+                    }
+                    Ok(false) => Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "view does not exist",
+                    )),
+                    Ok(true) => views::drop_view(&entry, &view.namespace, &view.view)
+                        .map(|()| ExternalMutationEffect::Applied)
+                        .map_err(map_iceberg_error),
+                    Err(error) => Err(map_iceberg_error(error)),
                 }
             }
             _ => Err(ConnectorError::new(
