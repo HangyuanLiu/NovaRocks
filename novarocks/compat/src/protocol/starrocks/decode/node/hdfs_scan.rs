@@ -1352,14 +1352,9 @@ pub(crate) fn lower_hdfs_scan_node(
             output_columns,
             profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         };
-        let source = plan_compat_iceberg_metadata_read_source(
-            connectors,
-            query_id,
-            node.node_id,
-            cfg,
-            query_opts,
-        )
-        .map_err(|error| error.to_string())?;
+        let source =
+            plan_compat_iceberg_metadata_read_source(query_id, node.node_id, cfg, query_opts)
+                .map_err(|error| error.to_string())?;
         scan_ranges.capture(node.node_id, BoundScanRanges::None);
         let scan = ScanNode::new(source)
             .with_node_id(node.node_id)

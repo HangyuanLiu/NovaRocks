@@ -67,20 +67,15 @@ pub(super) fn lower_iceberg_metadata_scan(
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
     let query_options = ctx.query_options().cloned().unwrap_or_default();
-    let source = plan_native_iceberg_metadata_read_source(
-        ctx.connectors()?,
-        ctx.query_id(),
-        node.node_id,
-        cfg,
-        &query_options,
-    )
-    .map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "serialized_table",
-            error,
-        )
-    })?;
+    let source =
+        plan_native_iceberg_metadata_read_source(ctx.query_id(), node.node_id, cfg, &query_options)
+            .map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "serialized_table",
+                    error,
+                )
+            })?;
     ctx.capture_scan_ranges(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
     let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
