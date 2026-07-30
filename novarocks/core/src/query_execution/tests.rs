@@ -30,7 +30,7 @@ use crate::query_execution::contract::{
 };
 use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryExecutionId};
 use crate::query_execution::lifecycle::{
-    QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLifecycleLease,
+    QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease,
     QueryLifecycleLeaseGuard,
 };
 use crate::query_execution::outcome::QueryOutcomeFactory;
@@ -140,6 +140,24 @@ impl QueryInitBarrier for RecordingQueryInitBarrier {
                 armed: true,
             },
         )))
+    }
+}
+
+struct RecordingQueryLaunchBarrier;
+
+impl QueryLaunchBarrier for RecordingQueryLaunchBarrier {
+    fn stage_all(
+        &self,
+        _batches: &[crate::query_execution::lifecycle::StageBatch],
+    ) -> Result<(), DistributedQueryError> {
+        Ok(())
+    }
+
+    fn start_all(
+        &self,
+        _batches: &[crate::query_execution::lifecycle::StageBatch],
+    ) -> Result<(), DistributedQueryError> {
+        Ok(())
     }
 }
 
@@ -300,13 +318,17 @@ fn query_control_typestate_initializes_before_native_assembly() {
         .expect("initialize query")
         .prepare_connector_bindings(&NoopConnectorBindingBarrier)
         .expect("install empty connector bindings")
-        .assemble()
-        .expect("assemble after control ready")
+        .prepare_stage()
+        .expect("prepare exact stage batches")
+        .stage(&RecordingQueryLaunchBarrier)
+        .expect("stage after control ready")
+        .start(&RecordingQueryLaunchBarrier)
+        .expect("start after all participants stage")
         .into_parts();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(participants.load(Ordering::SeqCst), 1);
-    assert_eq!(execution.submissions[0].execution_id(), execution_id);
+    assert_eq!(execution.root_fetch.fragment_id(), 7);
     assert_eq!(aborts.load(Ordering::SeqCst), 0);
     execution
         .query_lifecycle_lease

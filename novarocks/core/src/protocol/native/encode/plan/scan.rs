@@ -977,7 +977,7 @@ fn encode_iceberg_data_file_info(
                 entries: stats
                     .iter()
                     .map(|(name, stats)| (name.clone(), encode_iceberg_column_stats(stats)))
-                    .collect::<BTreeMap<_, _>>(),
+                    .collect::<HashMap<_, _>>(),
             }),
         partition_spec_id: src.partition_spec_id,
         partition_key: src.partition_key.clone(),

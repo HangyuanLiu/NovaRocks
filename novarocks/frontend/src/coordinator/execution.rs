@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
-    DispatchingConnectorBindingBarrier, PreparedNativeExecutionParts,
+    DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
     new_grpc_connector_binding_dispatcher,
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
@@ -856,7 +856,7 @@ impl FrontendDistributedQueryCoordinator {
             );
         }
         let execution = staged.start(&lifecycle_barrier)?;
-        let PreparedNativeExecutionParts {
+        let RunningNativeExecutionParts {
             root_fetch,
             writer_registrations,
             expected_output,

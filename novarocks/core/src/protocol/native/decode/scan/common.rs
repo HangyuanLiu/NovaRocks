@@ -314,7 +314,7 @@ pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragme
 /// startup. Native fragment payloads must not carry credentials or endpoint
 /// configuration because every BE receives the same deployment configuration.
 pub(super) fn resolve_native_connector_object_store_config(
-    cloud_properties: &BTreeMap<String, String>,
+    cloud_properties: &HashMap<String, String>,
 ) -> Result<Option<ObjectStoreConfig>, NativeFragmentLeafDecodeError> {
     reject_native_connector_cloud_properties(cloud_properties)?;
     crate::common::app_config::config()
@@ -337,7 +337,7 @@ pub(super) fn resolve_native_connector_object_store_config(
 }
 
 pub(super) fn reject_native_connector_cloud_properties(
-    cloud_properties: &BTreeMap<String, String>,
+    cloud_properties: &HashMap<String, String>,
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     if cloud_properties.is_empty() {
         Ok(())
@@ -360,13 +360,13 @@ pub(super) fn table_location_map(table: &plan::IcebergTableInfo) -> HashMap<i64,
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::HashMap;
 
     use super::reject_native_connector_cloud_properties;
 
     #[test]
     fn native_connector_scan_rejects_plan_object_store_properties() {
-        let error = reject_native_connector_cloud_properties(&BTreeMap::from([(
+        let error = reject_native_connector_cloud_properties(&HashMap::from([(
             "aws.s3.access_key".to_string(),
             "not-for-the-plan".to_string(),
         )]))

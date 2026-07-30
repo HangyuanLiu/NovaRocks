@@ -229,7 +229,7 @@ pub(super) fn schema_has_reserved_row_lineage_columns(
 
 pub(crate) fn resolve_native_sink_s3_config(
     data_location: &str,
-    cloud_properties: &BTreeMap<String, String>,
+    cloud_properties: &HashMap<String, String>,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, NativeFragmentLeafDecodeError> {
     if !novarocks_fs::is_object_store_location_parse_only(data_location).map_err(|e| {
         NativeFragmentLeafDecodeError::at_field(
