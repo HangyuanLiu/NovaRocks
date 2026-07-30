@@ -16,6 +16,7 @@
 // under the License.
 
 //! FE-only provider-neutral catalog mutation contract.
+// Design: ADR-0017 (docs/adr/ADR-0017-connector-catalog-mutation-outcomes.md)
 
 use std::fmt;
 use std::sync::{Arc, Mutex};

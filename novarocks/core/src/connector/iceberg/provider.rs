@@ -518,6 +518,7 @@ impl IcebergControlProvider {
                 descriptor,
                 incarnation,
             }),
+            None,
         )
     }
 
@@ -2270,6 +2271,7 @@ pub(crate) fn register_planned_table_files_fixture(
                 descriptor,
                 incarnation,
             }),
+            None,
         )
         .expect("fixture connector control binding"),
     );
