@@ -405,8 +405,15 @@ pub(crate) fn lower_lake_scan_node(
     );
 
     let query_id = query_id.ok_or_else(|| "LAKE_SCAN_NODE missing query id".to_string())?;
-    let properties = lake_scan_execution_properties(Some(query_id), &table_identity, &refs)
-        .map_err(|e| {
+    let starlet_metadata_provider =
+        external_dependencies.and_then(|draft| draft.starlet_metadata_provider());
+    let properties = lake_scan_execution_properties(
+        Some(query_id),
+        &table_identity,
+        &refs,
+        starlet_metadata_provider.as_deref(),
+    )
+    .map_err(|e| {
             format!(
                 "LAKE_SCAN_NODE resolve tablet paths failed for catalog={} db_name={} table_name={} db_id={} table_id={} schema_id={}: {}",
                 table_identity.catalog,
@@ -491,6 +498,10 @@ pub(crate) fn lower_lake_scan_node(
             }),
             native_tablet_schema: None,
             native_column_hints: None,
+            table_schema_provider: external_dependencies
+                .and_then(|draft| draft.table_schema_provider()),
+            storage_metadata_provider: external_dependencies
+                .and_then(|draft| draft.storage_metadata_provider()),
         }),
         deferred_lake_resolution: None,
         topn_filter_column_map,

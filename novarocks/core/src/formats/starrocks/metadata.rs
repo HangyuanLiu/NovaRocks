@@ -28,9 +28,13 @@ use opendal::{ErrorKind, Operator};
 use prost::Message;
 
 use crate::connector::starrocks::ObjectStoreProfile;
+use crate::connector::starrocks::lake::storage_domain::{
+    StorageBundleMetadata, StorageDelvecPage, StorageRowset, StorageTabletMetadata,
+};
 use crate::connector::starrocks::lake::storage_schema_wire::{
     decode_tablet_schema, validate_encoded_tablet_schema,
 };
+use crate::connector::starrocks::ports::StorageMetadataProvider;
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_cache_put};
 use crate::formats::starrocks::fs_access::{
@@ -151,6 +155,37 @@ pub fn load_tablet_snapshot(
     load_tablet_snapshot_from_root(tablet_id, version, &access, rt.as_ref())
 }
 
+/// Load a tablet snapshot through an injected storage wire codec. Compat owns
+/// protobuf parsing; this module only consumes the decoded storage domain.
+pub fn load_tablet_snapshot_with_metadata_provider(
+    tablet_id: i64,
+    version: i64,
+    tablet_root_path: &str,
+    object_store_profile: Option<&ObjectStoreProfile>,
+    metadata_provider: &dyn StorageMetadataProvider,
+) -> Result<StarRocksTabletSnapshot, String> {
+    if tablet_id <= 0 {
+        return Err(format!(
+            "invalid tablet_id for metadata loader: {tablet_id}"
+        ));
+    }
+    if version <= 0 {
+        return Err(format!(
+            "invalid tablet version for metadata loader: {version}"
+        ));
+    }
+
+    let access = resolve_format_tablet_access(tablet_root_path, object_store_profile)?;
+    let rt = data_runtime()?;
+    load_tablet_snapshot_at_version_with_metadata_provider(
+        tablet_id,
+        version,
+        &access,
+        rt.as_ref(),
+        metadata_provider,
+    )
+}
+
 pub fn load_tablet_snapshot_with_object_store_config(
     tablet_id: i64,
     version: i64,
@@ -238,6 +273,69 @@ fn load_tablet_snapshot_at_version(
                 access,
                 &metadata_path,
                 &metadata_bytes,
+            );
+        }
+    }
+    Err(format!("metadata file not found: {}", bundle_metadata_rel))
+}
+
+fn load_tablet_snapshot_at_version_with_metadata_provider(
+    tablet_id: i64,
+    version: i64,
+    access: &StarRocksFormatTabletAccess,
+    rt: &tokio::runtime::Runtime,
+    metadata_provider: &dyn StorageMetadataProvider,
+) -> Result<StarRocksTabletSnapshot, String> {
+    let op = access.operator();
+    let standalone_metadata_rel = metadata_rel_path(tablet_id, version)?;
+    for candidate_rel in metadata_rel_path_candidates(tablet_id, &standalone_metadata_rel) {
+        let candidate_operator_rel = access.operator_relative_path(&candidate_rel);
+        if object_exists(rt, &op, &candidate_operator_rel)? {
+            let metadata_bytes = read_all_bytes(rt, &op, &candidate_operator_rel)?;
+            let metadata_path = access.join_relative_path(&candidate_rel);
+            return parse_standalone_snapshot_from_domain(
+                tablet_id,
+                version,
+                access,
+                &metadata_path,
+                &metadata_bytes,
+                metadata_provider,
+            );
+        }
+    }
+
+    if version == INITIAL_VERSION && tablet_id != 0 {
+        let initial_metadata_rel = metadata_rel_path(0, INITIAL_VERSION)?;
+        for candidate_rel in metadata_rel_path_candidates(tablet_id, &initial_metadata_rel) {
+            let candidate_operator_rel = access.operator_relative_path(&candidate_rel);
+            if object_exists(rt, &op, &candidate_operator_rel)? {
+                let metadata_bytes = read_all_bytes(rt, &op, &candidate_operator_rel)?;
+                let metadata_path = access.join_relative_path(&candidate_rel);
+                return parse_initial_snapshot_from_domain(
+                    tablet_id,
+                    version,
+                    access,
+                    &metadata_path,
+                    &metadata_bytes,
+                    metadata_provider,
+                );
+            }
+        }
+    }
+
+    let bundle_metadata_rel = metadata_rel_path(0, version)?;
+    for candidate_rel in metadata_rel_path_candidates(tablet_id, &bundle_metadata_rel) {
+        let candidate_operator_rel = access.operator_relative_path(&candidate_rel);
+        if object_exists(rt, &op, &candidate_operator_rel)? {
+            let metadata_bytes = read_all_bytes(rt, &op, &candidate_operator_rel)?;
+            let metadata_path = access.join_relative_path(&candidate_rel);
+            return parse_bundle_snapshot_from_domain(
+                tablet_id,
+                version,
+                access,
+                &metadata_path,
+                &metadata_bytes,
+                metadata_provider,
             );
         }
     }
@@ -419,6 +517,104 @@ fn build_standalone_snapshot(
     })
 }
 
+fn parse_standalone_snapshot_from_domain(
+    tablet_id: i64,
+    version: i64,
+    access: &StarRocksFormatTabletAccess,
+    metadata_path: &str,
+    metadata_bytes: &[u8],
+    metadata_provider: &dyn StorageMetadataProvider,
+) -> Result<StarRocksTabletSnapshot, String> {
+    let metadata = metadata_provider
+        .decode_tablet_metadata(metadata_bytes)
+        .map_err(|error| {
+            format!(
+                "decode standalone TabletMetadataPB failed: path={}, error={error}",
+                metadata_path
+            )
+        })?;
+    build_snapshot_from_storage_domain(tablet_id, version, access, metadata_path, metadata)
+}
+
+fn parse_initial_snapshot_from_domain(
+    tablet_id: i64,
+    version: i64,
+    access: &StarRocksFormatTabletAccess,
+    metadata_path: &str,
+    metadata_bytes: &[u8],
+    metadata_provider: &dyn StorageMetadataProvider,
+) -> Result<StarRocksTabletSnapshot, String> {
+    let mut metadata = metadata_provider
+        .decode_tablet_metadata(metadata_bytes)
+        .map_err(|error| {
+            format!(
+                "decode initial TabletMetadataPB failed: path={}, error={error}",
+                metadata_path
+            )
+        })?;
+    metadata.id = Some(tablet_id);
+    build_snapshot_from_storage_domain(tablet_id, version, access, metadata_path, metadata)
+}
+
+fn build_snapshot_from_storage_domain(
+    tablet_id: i64,
+    version: i64,
+    access: &StarRocksFormatTabletAccess,
+    metadata_path: &str,
+    metadata: StorageTabletMetadata,
+) -> Result<StarRocksTabletSnapshot, String> {
+    ensure_storage_domain_tablet_identity(&metadata, tablet_id, version, metadata_path)?;
+    let tablet_schema = metadata.schema.clone().ok_or_else(|| {
+        format!(
+            "tablet schema missing in standalone metadata: tablet_id={}, path={}",
+            tablet_id, metadata_path
+        )
+    })?;
+    validate_storage_domain_schema(
+        &tablet_schema,
+        tablet_id,
+        tablet_schema.id.unwrap_or(-1),
+        "tablet",
+        metadata_path,
+    )?;
+    for (rowset_schema_id, rowset_schema) in &metadata.historical_schemas {
+        validate_storage_domain_schema(
+            rowset_schema,
+            tablet_id,
+            *rowset_schema_id,
+            "rowset",
+            metadata_path,
+        )?;
+    }
+    let (segment_files, delete_predicates) =
+        collect_segment_files_from_storage_domain(access, &metadata)?;
+    let total_num_rows =
+        collect_total_num_rows_from_storage_domain(&metadata, tablet_id, metadata_path)?;
+    let delvec_meta = collect_delvec_meta_from_storage_domain(access, &metadata)?;
+    let mut historical_schemas = metadata
+        .historical_schemas
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    if let Some(schema_id) = tablet_schema.id {
+        historical_schemas
+            .entry(schema_id)
+            .or_insert_with(|| tablet_schema.clone());
+    }
+
+    Ok(StarRocksTabletSnapshot {
+        tablet_id,
+        version,
+        metadata_path: metadata_path.to_string(),
+        tablet_schema,
+        historical_schemas,
+        total_num_rows,
+        rowset_count: metadata.rowsets.len(),
+        segment_files,
+        delete_predicates,
+        delvec_meta,
+    })
+}
+
 fn parse_bundle_snapshot(
     tablet_id: i64,
     version: i64,
@@ -473,6 +669,180 @@ fn parse_bundle_snapshot(
         delete_predicates,
         delvec_meta,
     })
+}
+
+fn parse_bundle_snapshot_from_domain(
+    tablet_id: i64,
+    version: i64,
+    access: &StarRocksFormatTabletAccess,
+    metadata_path: &str,
+    metadata_bytes: &[u8],
+    metadata_provider: &dyn StorageMetadataProvider,
+) -> Result<StarRocksTabletSnapshot, String> {
+    let bundle_bytes = bundle_metadata_payload(metadata_path, metadata_bytes)?;
+    let bundle = metadata_provider
+        .decode_bundle_metadata(bundle_bytes)
+        .map_err(|error| {
+            format!(
+                "decode BundleTabletMetadataPB failed: path={}, error={error}",
+                metadata_path
+            )
+        })?;
+    let page = bundle.tablet_meta_pages.get(&tablet_id).ok_or_else(|| {
+        format!(
+            "bundle metadata does not contain tablet page: tablet_id={}, path={}",
+            tablet_id, metadata_path
+        )
+    })?;
+    let page_bytes =
+        tablet_metadata_page_bytes(metadata_path, metadata_bytes, page.offset, page.size)?;
+    let mut metadata = metadata_provider
+        .decode_tablet_metadata(page_bytes)
+        .map_err(|error| {
+            format!(
+                "decode TabletMetadataPB failed: path={}, offset={}, size={}, error={error}",
+                metadata_path, page.offset, page.size
+            )
+        })?;
+    ensure_storage_domain_tablet_identity(&metadata, tablet_id, version, metadata_path)?;
+    hydrate_storage_domain_schema_from_bundle(tablet_id, &bundle, &mut metadata, metadata_path)?;
+    build_snapshot_from_storage_domain(tablet_id, version, access, metadata_path, metadata)
+}
+
+fn bundle_metadata_payload<'a>(metadata_path: &str, bytes: &'a [u8]) -> Result<&'a [u8], String> {
+    if bytes.len() < BUNDLE_METADATA_FOOTER_SIZE {
+        return Err(format!(
+            "invalid bundle metadata file: {} (file too small, size={})",
+            metadata_path,
+            bytes.len()
+        ));
+    }
+    let footer_offset = bytes.len() - BUNDLE_METADATA_FOOTER_SIZE;
+    let bundle_meta_size = u64::from_le_bytes(
+        bytes[footer_offset..]
+            .try_into()
+            .map_err(|_| "decode bundle footer failed".to_string())?,
+    ) as usize;
+    if bundle_meta_size == 0 || bundle_meta_size > footer_offset {
+        return Err(format!(
+            "invalid bundle metadata footer: path={}, file_size={}, bundle_meta_size={}",
+            metadata_path,
+            bytes.len(),
+            bundle_meta_size
+        ));
+    }
+    Ok(&bytes[footer_offset - bundle_meta_size..footer_offset])
+}
+
+fn tablet_metadata_page_bytes<'a>(
+    metadata_path: &str,
+    file_bytes: &'a [u8],
+    page_offset: u64,
+    page_size: u32,
+) -> Result<&'a [u8], String> {
+    let offset = usize::try_from(page_offset).map_err(|_| {
+        format!(
+            "invalid tablet metadata page offset: path={}, offset={}",
+            metadata_path, page_offset
+        )
+    })?;
+    let size = usize::try_from(page_size).map_err(|_| {
+        format!(
+            "invalid tablet metadata page size: path={}, size={}",
+            metadata_path, page_size
+        )
+    })?;
+    let end = offset.saturating_add(size);
+    if offset > file_bytes.len() || end > file_bytes.len() {
+        return Err(format!(
+            "tablet metadata page out of range: path={}, offset={}, size={}, file_size={}",
+            metadata_path,
+            offset,
+            size,
+            file_bytes.len()
+        ));
+    }
+    Ok(&file_bytes[offset..end])
+}
+
+fn ensure_storage_domain_tablet_identity(
+    metadata: &StorageTabletMetadata,
+    tablet_id: i64,
+    version: i64,
+    metadata_path: &str,
+) -> Result<(), String> {
+    if metadata.id != Some(tablet_id) {
+        return Err(format!(
+            "tablet id mismatch in metadata page: expected={}, actual={:?}, path={}",
+            tablet_id, metadata.id, metadata_path
+        ));
+    }
+    if metadata.version != Some(version) {
+        return Err(format!(
+            "tablet version mismatch in metadata page: expected={}, actual={:?}, path={}",
+            version, metadata.version, metadata_path
+        ));
+    }
+    Ok(())
+}
+
+fn validate_storage_domain_schema(
+    schema: &StarRocksTabletSchema,
+    tablet_id: i64,
+    schema_id: i64,
+    schema_kind: &str,
+    metadata_path: &str,
+) -> Result<(), String> {
+    schema.validate().map_err(|error| {
+        format!(
+            "invalid tablet schema: tablet_id={tablet_id}, schema_id={schema_id}, schema_kind={schema_kind}, path={metadata_path}, error={error}"
+        )
+    })
+}
+
+fn hydrate_storage_domain_schema_from_bundle(
+    tablet_id: i64,
+    bundle: &StorageBundleMetadata,
+    metadata: &mut StorageTabletMetadata,
+    metadata_path: &str,
+) -> Result<(), String> {
+    let schema_id = bundle.tablet_to_schema.get(&tablet_id).ok_or_else(|| {
+        format!(
+            "tablet schema id missing in bundle metadata: tablet_id={}, path={}",
+            tablet_id, metadata_path
+        )
+    })?;
+    let schema = bundle.schemas.get(schema_id).ok_or_else(|| {
+        format!(
+            "tablet schema not found in bundle metadata: tablet_id={}, schema_id={}, path={}",
+            tablet_id, schema_id, metadata_path
+        )
+    })?;
+    validate_storage_domain_schema(schema, tablet_id, *schema_id, "tablet", metadata_path)?;
+    metadata.schema = Some(schema.clone());
+    metadata
+        .historical_schemas
+        .insert(*schema_id, schema.clone());
+
+    for rowset_schema_id in metadata.rowset_to_schema.values() {
+        let rowset_schema = bundle.schemas.get(rowset_schema_id).ok_or_else(|| {
+            format!(
+                "rowset schema not found in bundle metadata: tablet_id={}, schema_id={}, path={}",
+                tablet_id, rowset_schema_id, metadata_path
+            )
+        })?;
+        validate_storage_domain_schema(
+            rowset_schema,
+            tablet_id,
+            *rowset_schema_id,
+            "rowset",
+            metadata_path,
+        )?;
+        metadata
+            .historical_schemas
+            .insert(*rowset_schema_id, rowset_schema.clone());
+    }
+    Ok(())
 }
 
 fn decode_bundle_metadata(
@@ -947,6 +1317,329 @@ fn parse_delvec_page(
         version,
         offset,
         size,
+        crc32c: page.crc32c,
+        crc32c_gen_version: page.crc32c_gen_version,
+    })
+}
+
+fn collect_total_num_rows_from_storage_domain(
+    metadata: &StorageTabletMetadata,
+    tablet_id: i64,
+    metadata_path: &str,
+) -> Result<u64, String> {
+    let mut total_rows = 0_u64;
+    for (idx, rowset) in metadata.rowsets.iter().enumerate() {
+        let num_rows = rowset.num_rows.ok_or_else(|| {
+            format!(
+                "rowset num_rows is missing in tablet metadata: tablet_id={}, rowset_index={}, path={}",
+                tablet_id, idx, metadata_path
+            )
+        })?;
+        if num_rows < 0 {
+            return Err(format!(
+                "rowset num_rows is negative in tablet metadata: tablet_id={}, rowset_index={}, num_rows={}, path={}",
+                tablet_id, idx, num_rows, metadata_path
+            ));
+        }
+        total_rows = total_rows.checked_add(num_rows as u64).ok_or_else(|| {
+            format!(
+                "rowset num_rows overflow in tablet metadata: tablet_id={}, rowset_index={}, path={}",
+                tablet_id, idx, metadata_path
+            )
+        })?;
+    }
+    Ok(total_rows)
+}
+
+fn collect_segment_files_from_storage_domain(
+    access: &StarRocksFormatTabletAccess,
+    metadata: &StorageTabletMetadata,
+) -> Result<(Vec<StarRocksSegmentFile>, Vec<StarRocksDeletePredicateRaw>), String> {
+    let mut files = Vec::new();
+    let delete_predicates = collect_delete_predicates_from_storage_domain(metadata)?;
+    for (rowset_index, rowset) in metadata.rowsets.iter().enumerate() {
+        let rowset_version =
+            lake_rowset_visibility_version_from_storage_domain(rowset, rowset_index)?;
+        if !rowset.segment_size.is_empty() && rowset.segment_size.len() != rowset.segments.len() {
+            return Err(format!(
+                "invalid rowset segment_size: segments={}, segment_size={}",
+                rowset.segments.len(),
+                rowset.segment_size.len()
+            ));
+        }
+        if !rowset.bundle_file_offsets.is_empty()
+            && rowset.bundle_file_offsets.len() != rowset.segments.len()
+        {
+            return Err(format!(
+                "invalid rowset bundle_file_offsets: segments={}, bundle_file_offsets={}",
+                rowset.segments.len(),
+                rowset.bundle_file_offsets.len()
+            ));
+        }
+        if !rowset.bundle_file_offsets.is_empty()
+            && rowset.segment_size.len() != rowset.segments.len()
+        {
+            return Err(format!(
+                "bundle rowset missing segment_size: segments={}, segment_size={}",
+                rowset.segments.len(),
+                rowset.segment_size.len()
+            ));
+        }
+        let rowset_schema_id = rowset
+            .id
+            .and_then(|rowset_id| metadata.rowset_to_schema.get(&rowset_id).copied())
+            .or_else(|| metadata.schema.as_ref().and_then(|schema| schema.id));
+        for (index, raw_name) in rowset.segments.iter().enumerate() {
+            let name = raw_name.trim().trim_start_matches('/').to_string();
+            if name.is_empty() {
+                return Err("empty segment file name in rowset metadata".to_string());
+            }
+            let segment_id = match rowset.id {
+                Some(rowset_id) => {
+                    let ordinal = u32::try_from(index).map_err(|_| {
+                        format!(
+                            "segment index overflow while deriving segment_id: rowset_id={}, index={}",
+                            rowset_id, index
+                        )
+                    })?;
+                    Some(rowset_id.checked_add(ordinal).ok_or_else(|| {
+                        format!(
+                            "segment_id overflow while deriving rowset_id+segment_index: rowset_id={}, index={}",
+                            rowset_id, index
+                        )
+                    })?)
+                }
+                None => None,
+            };
+            let bundle_file_offset = rowset.bundle_file_offsets.get(index).copied();
+            if let Some(offset) = bundle_file_offset
+                && offset < 0
+            {
+                return Err(format!(
+                    "invalid negative bundle_file_offset in rowset metadata: segment={}, offset={}",
+                    name, offset
+                ));
+            }
+            let segment_size = rowset
+                .segment_size
+                .get(index)
+                .copied()
+                .filter(|size| *size > 0);
+            if bundle_file_offset.is_some() && segment_size.is_none() {
+                return Err(format!(
+                    "missing segment_size for bundle segment in rowset metadata: segment={}",
+                    name
+                ));
+            }
+            let rel_path = format!("{DATA_DIR}/{name}");
+            files.push(StarRocksSegmentFile {
+                name,
+                relative_path: access.operator_relative_path(&rel_path),
+                path: access.join_relative_path(&rel_path),
+                rowset_version,
+                schema_id: rowset_schema_id,
+                segment_id,
+                bundle_file_offset,
+                segment_size,
+            });
+        }
+    }
+    Ok((files, delete_predicates))
+}
+
+fn lake_rowset_visibility_version_from_storage_domain(
+    rowset: &StorageRowset,
+    rowset_index: usize,
+) -> Result<i64, String> {
+    let rowset_version = i64::try_from(rowset_index).map_err(|_| {
+        format!(
+            "rowset index overflow while deriving delete visibility version: rowset_id={:?}, rowset_index={}",
+            rowset.id, rowset_index
+        )
+    })?;
+    if rowset_version < 0 {
+        return Err(format!(
+            "invalid rowset version in tablet metadata: rowset_id={:?}, version={}",
+            rowset.id, rowset_version
+        ));
+    }
+    Ok(rowset_version)
+}
+
+fn collect_delete_predicates_from_storage_domain(
+    metadata: &StorageTabletMetadata,
+) -> Result<Vec<StarRocksDeletePredicateRaw>, String> {
+    let mut delete_predicates = Vec::new();
+    for (rowset_index, rowset) in metadata.rowsets.iter().enumerate() {
+        let rowset_version =
+            lake_rowset_visibility_version_from_storage_domain(rowset, rowset_index)?;
+        let Some(delete_predicate) = rowset.delete_predicate.as_ref() else {
+            continue;
+        };
+        delete_predicates.push(StarRocksDeletePredicateRaw {
+            version: rowset_version,
+            sub_predicates: Vec::new(),
+            in_predicates: delete_predicate
+                .in_predicates
+                .iter()
+                .map(|predicate| {
+                    let column_name = non_empty_predicate_field(
+                        predicate.column_name.as_deref(),
+                        "delete in predicate column_name",
+                        rowset.id,
+                        rowset_version,
+                    )?;
+                    Ok(StarRocksInPredicateRaw {
+                        column_name,
+                        is_not_in: predicate.is_not_in.unwrap_or(false),
+                        values: predicate.values.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            binary_predicates: delete_predicate
+                .binary_predicates
+                .iter()
+                .map(|predicate| {
+                    let column_name = non_empty_predicate_field(
+                        predicate.column_name.as_deref(),
+                        "delete binary predicate column_name",
+                        rowset.id,
+                        rowset_version,
+                    )?;
+                    let op = predicate
+                        .op
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            format!(
+                                "delete binary predicate op is missing: rowset_id={:?}, version={}, column_name={}",
+                                rowset.id, rowset_version, column_name
+                            )
+                        })?;
+                    let value = predicate
+                        .value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            format!(
+                                "delete binary predicate value is missing: rowset_id={:?}, version={}, column_name={}, op={}",
+                                rowset.id, rowset_version, column_name, op
+                            )
+                        })?;
+                    Ok(StarRocksBinaryPredicateRaw {
+                        column_name,
+                        op,
+                        value,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            is_null_predicates: delete_predicate
+                .is_null_predicates
+                .iter()
+                .map(|predicate| {
+                    Ok(StarRocksIsNullPredicateRaw {
+                        column_name: non_empty_predicate_field(
+                            predicate.column_name.as_deref(),
+                            "delete is-null predicate column_name",
+                            rowset.id,
+                            rowset_version,
+                        )?,
+                        is_not_null: predicate.is_not_null.unwrap_or(false),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        });
+    }
+    Ok(delete_predicates)
+}
+
+fn non_empty_predicate_field(
+    value: Option<&str>,
+    field: &str,
+    rowset_id: Option<u32>,
+    version: i64,
+) -> Result<String, String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{field} is missing: rowset_id={rowset_id:?}, version={version}"))
+}
+
+fn collect_delvec_meta_from_storage_domain(
+    access: &StarRocksFormatTabletAccess,
+    metadata: &StorageTabletMetadata,
+) -> Result<StarRocksDelvecMetaRaw, String> {
+    let mut out = StarRocksDelvecMetaRaw::default();
+    let Some(raw) = metadata.delvec_meta.as_ref() else {
+        return Ok(out);
+    };
+    for (version, file) in &raw.version_to_file {
+        if *version < 0 {
+            return Err(format!(
+                "invalid delvec file version in metadata: {version}"
+            ));
+        }
+        let name = file
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("delvec file name is missing for version {version}"))?;
+        let rel =
+            access.operator_relative_path(&format!("{DATA_DIR}/{}", name.trim_start_matches('/')));
+        if out
+            .version_to_file_rel_path
+            .insert(*version, rel.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "duplicated delvec file version in metadata: version={}, path={}",
+                version, rel
+            ));
+        }
+    }
+    for (segment_id, page) in &raw.delvecs {
+        let parsed = parse_storage_domain_delvec_page(*segment_id, page)?;
+        if out
+            .segment_delvec_pages
+            .insert(*segment_id, parsed)
+            .is_some()
+        {
+            return Err(format!(
+                "duplicated delvec page for segment_id in metadata: segment_id={}",
+                segment_id
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn parse_storage_domain_delvec_page(
+    segment_id: u32,
+    page: &StorageDelvecPage,
+) -> Result<StarRocksDelvecPageRaw, String> {
+    let version = page
+        .version
+        .ok_or_else(|| format!("missing delvec page version for segment_id {segment_id}"))?;
+    if version < 0 {
+        return Err(format!(
+            "invalid delvec page version for segment_id {}: {}",
+            segment_id, version
+        ));
+    }
+    Ok(StarRocksDelvecPageRaw {
+        version,
+        offset: page
+            .offset
+            .ok_or_else(|| format!("missing delvec page offset for segment_id {segment_id}"))?,
+        size: page
+            .size
+            .ok_or_else(|| format!("missing delvec page size for segment_id {segment_id}"))?,
         crc32c: page.crc32c,
         crc32c_gen_version: page.crc32c_gen_version,
     })

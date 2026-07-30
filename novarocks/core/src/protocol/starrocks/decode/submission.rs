@@ -80,6 +80,15 @@ pub struct StarRocksDecodeInput<'a> {
     /// HDFS_SCAN_NODE is only a wire label and must never cause a decoder to
     /// construct a query-local connector registry.
     pub connectors: &'a crate::connector::ConnectorRegistry,
+    pub table_schema_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::TableSchemaProvider>>,
+    pub schema_load_provider: Option<Arc<dyn crate::connector::schema::SchemaLoadProvider>>,
+    pub sink_frontend_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::SinkFrontendProvider>>,
+    pub starlet_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
+    pub storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
 #[derive(Debug)]
@@ -242,8 +251,15 @@ pub fn prepare_fragment_submission(
     input: StarRocksDecodeInput<'_>,
 ) -> Result<StarRocksFragmentDraft, StarRocksFragmentDecodeError> {
     let instance = decode_input_instance(&input)?;
-    let dependencies =
-        StarRocksExternalDependencyDraft::new(instance.report_endpoint.clone(), BTreeMap::new());
+    let dependencies = StarRocksExternalDependencyDraft::new_with_table_schema_provider(
+        instance.report_endpoint.clone(),
+        BTreeMap::new(),
+        input.table_schema_provider.clone(),
+        input.schema_load_provider.clone(),
+        input.sink_frontend_provider.clone(),
+    )
+    .with_starlet_metadata_provider(input.starlet_metadata_provider.clone())
+    .with_storage_metadata_provider(input.storage_metadata_provider.clone());
     let parts = decode_draft_parts(&input, instance, &dependencies)?;
     let external_dependencies = dependencies.external_dependencies();
     let query_profile_patches = dependencies.query_profile_patches();
@@ -1394,6 +1410,9 @@ mod tests {
                     tablets: Vec::new(),
                 },
                 nodes: SinkNodesDescriptor { nodes: Vec::new() },
+                frontend_provider: None,
+                starlet_metadata_provider: None,
+                storage_metadata_provider: None,
             },
             output_projection: Some(SinkOutputProjectionPlan {
                 arena: Arc::new(output_arena),
@@ -1468,6 +1487,11 @@ mod tests {
             typed_result_sink: false,
             facts: &EMPTY_DECODE_FACTS,
             connectors: test_connectors(),
+            table_schema_provider: None,
+            schema_load_provider: None,
+            sink_frontend_provider: None,
+            starlet_metadata_provider: None,
+            storage_metadata_provider: None,
         }
     }
 

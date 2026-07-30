@@ -21,15 +21,15 @@ use reqwest::blocking::Client;
 use serde_json::Value as JsonValue;
 use thrift::OrderedFloat;
 
-use crate::thrift::frontend_service;
-use crate::thrift::types;
+use novarocks::thrift::frontend_service;
+use novarocks::thrift::types;
 
-use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
-use super::frontend::{
+use crate::schema_frontend::{
     build_auth_info, effective_current_user_ident, ensure_ok_status, extract_db_name,
     forward_show_result, with_frontend_client,
 };
-use super::{SchemaScanContext, SchemaTable};
+use novarocks::connector::schema::{SchemaRow, SchemaValue, normalize_column_key};
+use novarocks::connector::schema::{SchemaScanContext, SchemaTable};
 
 const DEFAULT_TABLE_CATALOG: &str = "def";
 

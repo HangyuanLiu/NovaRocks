@@ -185,6 +185,12 @@ pub(crate) fn lower_starrocks_table_sink(
             partition,
             location,
             nodes,
+            frontend_provider: external_dependencies
+                .and_then(StarRocksExternalDependencyDraft::sink_frontend_provider),
+            starlet_metadata_provider: external_dependencies
+                .and_then(StarRocksExternalDependencyDraft::starlet_metadata_provider),
+            storage_metadata_provider: external_dependencies
+                .and_then(StarRocksExternalDependencyDraft::storage_metadata_provider),
         },
         output_projection,
         output_expr_slot_name_map,
@@ -1743,6 +1749,7 @@ mod tests {
             partition,
             location,
             nodes,
+            ..
         } = descriptor;
 
         assert_eq!(name, "OLAP_TABLE_SINK");

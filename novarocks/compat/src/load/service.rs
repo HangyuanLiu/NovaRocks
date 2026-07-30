@@ -25,11 +25,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde_json::{Map, Value, json};
 
+use crate::frontend_rpc;
 use novarocks::protocol::starrocks::thrift_codec::thrift_binary_serialize;
 use novarocks::runtime::fragment::io::SyncFragmentExecutor;
 use novarocks::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
 use novarocks::runtime::{backend_id, sink_commit};
-use novarocks::service::frontend_rpc;
 use novarocks::thrift::frontend_service::{
     TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest, TLoadTxnCommitResult,
     TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest, TStreamLoadPutResult,

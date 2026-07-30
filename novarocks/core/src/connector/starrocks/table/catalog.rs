@@ -27,6 +27,7 @@ use crate::connector::starrocks::lake::context::{
 };
 use crate::connector::starrocks::lake::storage_schema_wire::decode_tablet_schema_bytes;
 use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
+use crate::connector::starrocks::table::schema_payload;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
@@ -169,13 +170,17 @@ impl StarRocksTableCatalog {
 
         let mut schemas_by_id = HashMap::new();
         for schema in &snapshot.schemas {
-            let decoded =
-                decode_tablet_schema_bytes(schema.tablet_schema_pb.as_slice()).map_err(|e| {
-                    format!(
-                        "decode StarRocks tablet_schema_pb failed for schema_id={}: {e}",
-                        schema.schema_id
-                    )
-                })?;
+            let decoded = match schema_payload::decode(schema.tablet_schema_pb.as_slice())? {
+                Some(schema) => schema,
+                None => decode_tablet_schema_bytes(schema.tablet_schema_pb.as_slice()).map_err(
+                    |error| {
+                        format!(
+                            "decode legacy StarRocks tablet_schema_pb failed for schema_id={}: {error}",
+                            schema.schema_id
+                        )
+                    },
+                )?,
+            };
             schemas_by_id.insert(schema.schema_id, (schema.clone(), decoded));
         }
 
@@ -370,6 +375,7 @@ impl StarRocksTableCatalog {
                     tablet_root_path: tablet.tablet_root_path.clone(),
                     tablet_schema: runtime.tablet_schema.clone(),
                     s3_config: Some(config.s3.clone()),
+                    storage_metadata_provider: None,
                     partial_update: Default::default(),
                 };
                 register_tablet_runtime(&ctx)?;

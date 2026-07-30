@@ -50,15 +50,12 @@ impl FakePorts {
 }
 
 impl CompatPorts for FakePorts {
-    fn init_frontend_rpc(&mut self) {
-        self.record("init-frontend-rpc");
-    }
-
     fn start_grpc(
         &mut self,
         _host: &str,
         _compat_routes: axum::Router,
         report_handler: Arc<dyn novarocks::query_execution::report::NativeReportHandler>,
+        _starlet_control: Arc<dyn novarocks::service::grpc_server::StarletControl>,
     ) -> Result<(), String> {
         let rejection = report_handler
             .handle_native_report(Default::default())
@@ -70,6 +67,7 @@ impl CompatPorts for FakePorts {
     fn start_heartbeat(
         &mut self,
         _config: novarocks::service::heartbeat_service::HeartbeatConfig,
+        _disk_report_sender: Arc<dyn novarocks::service::disk_report::DiskReportSender>,
     ) -> Result<(), String> {
         self.start("heartbeat")
     }
@@ -78,6 +76,10 @@ impl CompatPorts for FakePorts {
         &mut self,
         _config: novarocks::service::backend_service::BackendServiceConfig,
         _load_channel_finisher: Arc<dyn novarocks::service::backend_service::LoadChannelFinisher>,
+        _finish_task_sender: Arc<dyn novarocks::service::backend_service::FinishTaskSender>,
+        _lake_agent_task_adapter: Arc<
+            dyn novarocks::service::backend_service::LakeAgentTaskAdapter,
+        >,
     ) -> Result<(), String> {
         self.start("backend")
     }
@@ -160,7 +162,6 @@ fn starts_ports_in_frozen_order_and_preserves_marker_and_summary() {
     assert_eq!(
         events.lock().unwrap().as_slice(),
         [
-            "init-frontend-rpc",
             "start-grpc",
             "start-heartbeat",
             "start-backend",
@@ -188,12 +189,7 @@ fn heartbeat_start_failure_rolls_back_grpc_only() {
     assert_start_failure_rollback(
         "heartbeat",
         CompatApplicationErrorKind::HeartbeatStart,
-        &[
-            "init-frontend-rpc",
-            "start-grpc",
-            "start-heartbeat",
-            "stop-grpc",
-        ],
+        &["start-grpc", "start-heartbeat", "stop-grpc"],
     );
 }
 
@@ -203,7 +199,6 @@ fn backend_start_failure_rolls_back_heartbeat_then_grpc() {
         "backend",
         CompatApplicationErrorKind::BackendServiceStart,
         &[
-            "init-frontend-rpc",
             "start-grpc",
             "start-heartbeat",
             "start-backend",
@@ -219,7 +214,6 @@ fn brpc_start_failure_rolls_back_backend_heartbeat_and_grpc() {
         "brpc",
         CompatApplicationErrorKind::BrpcStart,
         &[
-            "init-frontend-rpc",
             "start-grpc",
             "start-heartbeat",
             "start-backend",
@@ -266,7 +260,7 @@ fn cleanup_failure_does_not_skip_later_stops() {
     assert!(error.to_string().contains("backend cleanup failed"));
     assert!(error.to_string().contains("grpc cleanup failed"));
     assert_eq!(
-        &events.lock().unwrap()[5..],
+        &events.lock().unwrap()[4..],
         ["stop-brpc", "stop-backend", "stop-heartbeat", "stop-grpc",]
     );
 }

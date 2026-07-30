@@ -21,6 +21,7 @@ use novarocks::novarocks_logging::{error, info, warn};
 
 use novarocks::common::app_config;
 use novarocks::common::config::debug_exec_batch_plan_json;
+use novarocks::connector::starrocks::ports::LakeMetaStorageResolver;
 use novarocks::protocol::starrocks::thrift_codec::{thrift_binary_deserialize, thrift_named_json};
 
 use novarocks::cache::CacheOptions;
@@ -56,7 +57,7 @@ use crate::fragment::admission::{
     DescriptorPreparation, DescriptorTransportCache, PrelaunchCancellationToken, PrelaunchGuard,
     PrelaunchRegistry,
 };
-use crate::fragment::dependency::resolve_dependencies;
+use crate::fragment::dependency::{lake_meta_storage_resolver, resolve_dependencies};
 use crate::load::CompatLoadRegistry;
 use crate::report::{self, CompatReportService};
 
@@ -73,6 +74,16 @@ pub struct CompatFragmentService {
     load_registry: Arc<CompatLoadRegistry>,
     load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
     connectors: Arc<novarocks::connector::ConnectorRegistry>,
+    lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
+    table_schema_provider:
+        Option<Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>>,
+    schema_load_provider: Option<Arc<dyn novarocks::connector::schema::SchemaLoadProvider>>,
+    sink_frontend_provider:
+        Option<Arc<dyn novarocks::connector::starrocks::ports::SinkFrontendProvider>>,
+    starlet_metadata_provider:
+        Option<Arc<dyn novarocks::connector::starrocks::ports::StarletMetadataProvider>>,
+    storage_metadata_provider:
+        Option<Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
 impl CompatFragmentService {
@@ -121,6 +132,51 @@ impl CompatFragmentService {
         load_registry: Arc<CompatLoadRegistry>,
         load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
     ) -> Self {
+        let starlet_metadata_provider = crate::starlet_metadata::starlet_metadata_provider();
+        let storage_metadata_provider = crate::storage_wire::storage_metadata_provider();
+        Self::new_with_connector_dependencies(
+            queries,
+            exchange_transmitter,
+            lookup_client,
+            result_writer,
+            report_service,
+            load_registry,
+            load_tracking_sink,
+            lake_meta_storage_resolver(
+                starlet_metadata_provider.clone(),
+                storage_metadata_provider.clone(),
+            ),
+            None,
+            None,
+            None,
+            Some(starlet_metadata_provider),
+            Some(storage_metadata_provider),
+        )
+    }
+
+    pub(crate) fn new_with_connector_dependencies(
+        queries: StarRocksFragmentQueryRuntime,
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
+        result_writer: Arc<dyn FragmentResultWriter>,
+        report_service: Arc<CompatReportService>,
+        load_registry: Arc<CompatLoadRegistry>,
+        load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
+        lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
+        table_schema_provider: Option<
+            Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>,
+        >,
+        schema_load_provider: Option<Arc<dyn novarocks::connector::schema::SchemaLoadProvider>>,
+        sink_frontend_provider: Option<
+            Arc<dyn novarocks::connector::starrocks::ports::SinkFrontendProvider>,
+        >,
+        starlet_metadata_provider: Option<
+            Arc<dyn novarocks::connector::starrocks::ports::StarletMetadataProvider>,
+        >,
+        storage_metadata_provider: Option<
+            Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>,
+        >,
+    ) -> Self {
         Self {
             queries,
             controls: Arc::new(CompatFragmentControls::default()),
@@ -134,6 +190,12 @@ impl CompatFragmentService {
             load_registry,
             load_tracking_sink,
             connectors: Arc::new(novarocks::connector::ConnectorRegistry::default()),
+            lake_meta_resolver,
+            table_schema_provider,
+            schema_load_provider,
+            sink_frontend_provider,
+            starlet_metadata_provider,
+            storage_metadata_provider,
         }
     }
 
@@ -711,6 +773,19 @@ fn prepare_starrocks_draft(
     batch_exchange_sender_counts: &HashMap<i32, usize>,
     typed_result_sink: bool,
     connectors: &novarocks::connector::ConnectorRegistry,
+    table_schema_provider: Option<
+        Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>,
+    >,
+    schema_load_provider: Option<Arc<dyn novarocks::connector::schema::SchemaLoadProvider>>,
+    sink_frontend_provider: Option<
+        Arc<dyn novarocks::connector::starrocks::ports::SinkFrontendProvider>,
+    >,
+    starlet_metadata_provider: Option<
+        Arc<dyn novarocks::connector::starrocks::ports::StarletMetadataProvider>,
+    >,
+    storage_metadata_provider: Option<
+        Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
 ) -> Result<StarRocksFragmentDraftEnvelope, String> {
     validate_internal_addresses(params, Some(fragment))?;
     let facts = snapshot_decode_facts(resolve_stream_load_paths(load_registry, params)?)?;
@@ -739,6 +814,11 @@ fn prepare_starrocks_draft(
         typed_result_sink,
         facts: &facts,
         connectors,
+        table_schema_provider,
+        schema_load_provider,
+        sink_frontend_provider,
+        starlet_metadata_provider,
+        storage_metadata_provider,
     })
     .map_err(|error| error.to_string())?;
     Ok(StarRocksFragmentDraftEnvelope {
@@ -789,9 +869,14 @@ fn resolve_stream_load_paths(
 fn resolve_starrocks_draft(
     draft: &StarRocksFragmentDraftEnvelope,
     token: &PrelaunchCancellationToken,
+    lake_meta_resolver: &dyn LakeMetaStorageResolver,
 ) -> Result<novarocks::protocol::starrocks::decode::StarRocksResolvedDependencies, String> {
-    resolve_dependencies(draft.draft.external_dependencies(), token)
-        .map_err(|error| error.to_string())
+    resolve_dependencies(
+        draft.draft.external_dependencies(),
+        token,
+        lake_meta_resolver,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn finish_starrocks_draft(
@@ -1841,12 +1926,17 @@ fn submit_exec_batch_plan_fragments_with(
             &sender_counts,
             entry.10,
             service.connectors.as_ref(),
+            service.table_schema_provider.clone(),
+            service.schema_load_provider.clone(),
+            service.sink_frontend_provider.clone(),
+            service.starlet_metadata_provider.clone(),
+            service.storage_metadata_provider.clone(),
         )?);
     }
     token.check(0).map_err(|error| error.to_string())?;
     let resolutions = drafts
         .iter()
-        .map(|draft| resolve_starrocks_draft(draft, &token))
+        .map(|draft| resolve_starrocks_draft(draft, &token, service.lake_meta_resolver.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     token.check(0).map_err(|error| error.to_string())?;
     let prepared = drafts
@@ -1931,8 +2021,13 @@ fn submit_exec_plan_fragment_with(
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
         service.connectors.as_ref(),
+        service.table_schema_provider.clone(),
+        service.schema_load_provider.clone(),
+        service.sink_frontend_provider.clone(),
+        service.starlet_metadata_provider.clone(),
+        service.storage_metadata_provider.clone(),
     )?;
-    let resolved = resolve_starrocks_draft(&draft, &token)?;
+    let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
     launch_prepared_fragments(service, vec![prepared], descriptor_preparation, guard)?;
     Ok(())
@@ -1994,8 +2089,13 @@ fn execute_plan_fragment_sync_with(
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
         service.connectors.as_ref(),
+        service.table_schema_provider.clone(),
+        service.schema_load_provider.clone(),
+        service.sink_frontend_provider.clone(),
+        service.starlet_metadata_provider.clone(),
+        service.storage_metadata_provider.clone(),
     )?;
-    let resolved = resolve_starrocks_draft(&draft, &token)?;
+    let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
 
     let lookup_close_targets = prepared

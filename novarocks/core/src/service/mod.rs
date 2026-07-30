@@ -23,8 +23,6 @@ pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
 pub mod fragment_control;
-#[cfg(feature = "compat")]
-pub mod frontend_rpc;
 pub mod grpc_client;
 pub(crate) mod grpc_fragment_dispatcher;
 pub(crate) mod grpc_query_lifecycle_adapter;
@@ -46,3 +44,5 @@ pub(crate) mod native_fragment_service_test_fixture;
 pub(crate) mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
+#[cfg(feature = "compat")]
+pub mod starlet_metadata;

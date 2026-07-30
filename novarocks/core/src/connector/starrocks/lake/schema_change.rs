@@ -24,20 +24,19 @@ use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, new_empty_array, 
 use arrow::compute::{cast, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use prost::Message;
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, get_tablet_runtime, register_tablet_runtime,
     update_tablet_runtime_schema, with_txn_log_append_lock,
 };
-use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
-use crate::connector::starrocks::lake::storage_schema_wire::{
-    decode_tablet_schema, encode_tablet_schema,
-};
+use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_from_thrift;
 use crate::connector::starrocks::lake::txn_log::{
     build_tablet_output_schema, load_rowset_batch_for_partial_update_with_delete_predicates,
     parse_default_literal_to_singleton_array, read_txn_log_if_exists, write_txn_log_file,
 };
+use crate::connector::starrocks::ports::StorageMetadataProvider;
 use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
 };
@@ -46,8 +45,8 @@ use crate::formats::starrocks::metadata::{
     collect_delete_predicates, lake_rowset_visibility_version,
 };
 use crate::formats::starrocks::writer::bundle_meta::{
-    empty_tablet_metadata, load_tablet_metadata_at_version, write_initial_meta_file,
-    write_standalone_meta_file,
+    empty_tablet_metadata, load_tablet_metadata_at_version, write_initial_meta_file_with_provider,
+    write_standalone_meta_file_with_provider,
 };
 use crate::formats::starrocks::writer::io::{read_bytes_if_exists, write_bytes};
 use crate::formats::starrocks::writer::layout::{
@@ -60,8 +59,8 @@ use crate::formats::starrocks::writer::{
 };
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
-    CompactionStrategyPb, FlatJsonConfigPb, MetadataUpdateInfoPb, PersistentIndexTypePb,
-    RowsetMetadataPb, TabletMetadataPb, TxnLogPb, txn_log_pb,
+    CompactionStrategyPb, PersistentIndexTypePb, RowsetMetadataPb, TabletMetadataPb, TxnLogPb,
+    txn_log_pb,
 };
 use crate::thrift::agent_service::{
     TAlterJobType, TAlterMaterializedViewParam, TAlterTabletReqV2, TCompactionStrategy,
@@ -97,7 +96,14 @@ fn normalize_slot_name(name: &str) -> String {
     s.to_ascii_lowercase()
 }
 
-pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(), String> {
+/// Executes a lake schema-change task with the storage codec selected by the
+/// composition root.  Compat must pass this explicitly: a tablet may not be
+/// registered yet when the agent task arrives, so consulting the runtime
+/// registry here would make the protobuf fallback observable on cold paths.
+pub(crate) fn execute_alter_tablet_task_with_storage_metadata_provider(
+    request: &TAlterTabletReqV2,
+    storage_metadata_provider: Arc<dyn StorageMetadataProvider>,
+) -> Result<(), String> {
     let alter_mode = validate_schema_change_request(request)?;
 
     let base_tablet_id = request.base_tablet_id;
@@ -195,13 +201,14 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     )?;
 
     let base_read_schema = if let Some(read_schema) = request.base_tablet_read_schema.as_ref() {
-        build_tablet_schema_pb_from_thrift(read_schema)?
+        build_tablet_schema_from_thrift(read_schema)?
     } else {
         resolve_tablet_schema_from_metadata_or_runtime(
             "alter_base_tablet",
             &base_metadata,
             base_tablet_id,
             alter_version,
+            storage_metadata_provider.as_ref(),
         )?
     };
     let new_metadata_schema = resolve_tablet_schema_from_metadata_or_runtime(
@@ -209,6 +216,7 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         &new_metadata,
         new_tablet_id,
         1,
+        storage_metadata_provider.as_ref(),
     )?;
     tracing::info!(
         base_schema_columns = base_read_schema.column.len(),
@@ -234,6 +242,8 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         )?;
     }
 
+    let base_storage_metadata_provider = Arc::clone(&storage_metadata_provider);
+    let new_storage_metadata_provider = storage_metadata_provider;
     let base_ctx = TabletWriteContext {
         db_id: 0,
         table_id: 0,
@@ -241,6 +251,7 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         tablet_root_path: base_root_path,
         tablet_schema: base_read_schema.clone(),
         s3_config: base_s3,
+        storage_metadata_provider: Some(base_storage_metadata_provider),
         partial_update: PartialUpdateWritePolicy::default(),
     };
     let new_ctx = TabletWriteContext {
@@ -250,6 +261,7 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         tablet_root_path: new_root_path,
         tablet_schema: new_schema.clone(),
         s3_config: new_s3,
+        storage_metadata_provider: Some(new_storage_metadata_provider),
         partial_update: PartialUpdateWritePolicy::default(),
     };
     // Some rollup/sc tablets may not have been pre-registered in runtime registry (for example
@@ -257,23 +269,53 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     // later publish_version lookup consistent.
     register_tablet_runtime(&base_ctx)?;
     register_tablet_runtime(&new_ctx)?;
-    if should_patch_initial_metadata_schema(&new_metadata, &new_schema) {
-        let mut patched_meta = new_metadata.clone();
-        patched_meta.schema = Some(encode_tablet_schema(&new_schema));
-        patched_meta.id = Some(new_tablet_id);
-        patched_meta.version = Some(1);
+    if should_patch_initial_metadata_schema(
+        &new_metadata,
+        &new_schema,
+        new_ctx
+            .storage_metadata_provider
+            .as_deref()
+            .expect("compat schema-change context installs storage metadata provider"),
+    ) {
+        let patched_meta = new_metadata.clone();
+        let provider = new_ctx
+            .storage_metadata_provider
+            .as_deref()
+            .expect("compat schema-change context installs storage metadata provider");
+        let mut domain_metadata = provider
+            .decode_tablet_metadata(&patched_meta.encode_to_vec())
+            .map_err(|error| {
+                format!(
+                    "decode schema-change initial metadata through compat codec failed: tablet_id={} error={error}",
+                    new_tablet_id
+                )
+            })?;
+        domain_metadata.schema = Some(new_schema.clone());
+        if let Some(schema_id) = new_schema.id.filter(|id| *id > 0) {
+            domain_metadata
+                .historical_schemas
+                .entry(schema_id)
+                .or_insert_with(|| new_schema.clone());
+        }
+        domain_metadata.id = Some(new_tablet_id);
+        domain_metadata.version = Some(1);
         let initial_path = initial_meta_file_path(&new_ctx.tablet_root_path)?;
         if read_bytes_if_exists(&initial_path)?.is_some() {
-            write_initial_meta_file(&new_ctx.tablet_root_path, &patched_meta)?;
+            write_initial_meta_file_with_provider(
+                &new_ctx.tablet_root_path,
+                &domain_metadata,
+                provider,
+            )?;
         } else {
             let standalone_path =
                 standalone_meta_file_path(&new_ctx.tablet_root_path, new_tablet_id, 1)?;
             if read_bytes_if_exists(&standalone_path)?.is_some() {
-                write_standalone_meta_file(
+                write_standalone_meta_file_with_provider(
                     &new_ctx.tablet_root_path,
                     new_tablet_id,
                     1,
-                    &patched_meta,
+                    &domain_metadata,
+                    provider,
                 )?;
             } else {
                 return Err(format!(
@@ -318,8 +360,12 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     )
 }
 
-pub(crate) fn execute_update_tablet_meta_info_task(
+/// Executes a lake metadata update through the storage codec selected by the
+/// composition root. Compat always supplies a codec rather than discovering
+/// one from global runtime state.
+pub(crate) fn execute_update_tablet_meta_info_task_with_storage_metadata_provider(
     request: &TUpdateTabletMetaInfoReq,
+    storage_metadata_provider: Arc<dyn StorageMetadataProvider>,
 ) -> Result<(), String> {
     let tablet_type = request.tablet_type.unwrap_or(TTabletType::TABLET_TYPE_DISK);
     if tablet_type != TTabletType::TABLET_TYPE_LAKE {
@@ -340,7 +386,11 @@ pub(crate) fn execute_update_tablet_meta_info_task(
         .as_ref()
         .ok_or_else(|| "update_tablet_meta_info missing tablet_meta_infos".to_string())?;
     for tablet_meta_info in tablet_meta_infos {
-        execute_single_tablet_meta_update(tablet_meta_info, txn_id)?;
+        execute_single_tablet_meta_update(
+            tablet_meta_info,
+            txn_id,
+            storage_metadata_provider.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -414,6 +464,7 @@ fn load_tablet_metadata_for_alter_with_retry(
 fn execute_single_tablet_meta_update(
     tablet_meta_info: &TTabletMetaInfo,
     txn_id: i64,
+    storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> Result<(), String> {
     let tablet_id = tablet_meta_info
         .tablet_id
@@ -424,49 +475,54 @@ fn execute_single_tablet_meta_update(
         ));
     }
     let (tablet_root_path, _s3) = resolve_tablet_location("update_tablet_meta_info", tablet_id)?;
-    let metadata_update_info = build_metadata_update_info(tablet_meta_info)?;
-    let updated_schema = metadata_update_info.tablet_schema.clone();
-    write_update_tablet_meta_txn_log(&tablet_root_path, tablet_id, txn_id, metadata_update_info)?;
+    let updated_schema = tablet_meta_info
+        .tablet_schema
+        .as_ref()
+        .map(build_tablet_schema_from_thrift)
+        .transpose()?;
+    write_update_tablet_meta_txn_log_with_provider(
+        &tablet_root_path,
+        tablet_id,
+        txn_id,
+        build_storage_metadata_update(tablet_meta_info)?,
+        storage_metadata_provider,
+    )?;
     if let Some(schema) = updated_schema.as_ref() {
-        let schema = decode_tablet_schema(schema.clone())?;
-        update_tablet_runtime_schema(tablet_id, &schema)?;
+        update_tablet_runtime_schema(tablet_id, schema)?;
     }
     Ok(())
 }
 
-fn build_metadata_update_info(
+fn build_storage_metadata_update(
     tablet_meta_info: &TTabletMetaInfo,
-) -> Result<MetadataUpdateInfoPb, String> {
-    let tablet_schema = tablet_meta_info
-        .tablet_schema
-        .as_ref()
-        .map(build_tablet_schema_pb_from_thrift)
-        .transpose()?;
-    let persistent_index_type = tablet_meta_info
-        .persistent_index_type
-        .map(map_update_tablet_meta_persistent_index_type)
-        .transpose()?;
-    let compaction_strategy = tablet_meta_info
-        .compaction_strategy
-        .map(map_update_tablet_meta_compaction_strategy)
-        .transpose()?;
-    let flat_json_config = tablet_meta_info
-        .flat_json_config
-        .as_ref()
-        .map(|cfg| FlatJsonConfigPb {
-            flat_json_enable: cfg.flat_json_enable,
-            flat_json_null_factor: cfg.flat_json_null_factor.map(|v| v.0),
-            flat_json_sparsity_factor: cfg.flat_json_sparsity_factor.map(|v| v.0),
-            flat_json_max_column_max: cfg.flat_json_column_max,
-        });
-    Ok(MetadataUpdateInfoPb {
-        enable_persistent_index: tablet_meta_info.enable_persistent_index,
-        tablet_schema: tablet_schema.as_ref().map(encode_tablet_schema),
-        persistent_index_type,
-        bundle_tablet_metadata: tablet_meta_info.bundle_tablet_metadata,
-        compaction_strategy,
-        flat_json_config,
-    })
+) -> Result<crate::connector::starrocks::lake::storage_domain::StorageMetadataUpdate, String> {
+    Ok(
+        crate::connector::starrocks::lake::storage_domain::StorageMetadataUpdate {
+            enable_persistent_index: tablet_meta_info.enable_persistent_index,
+            persistent_index_type: tablet_meta_info
+                .persistent_index_type
+                .map(map_update_tablet_meta_persistent_index_type)
+                .transpose()?,
+            bundle_tablet_metadata: tablet_meta_info.bundle_tablet_metadata,
+            compaction_strategy: tablet_meta_info
+                .compaction_strategy
+                .map(map_update_tablet_meta_compaction_strategy)
+                .transpose()?,
+            flat_json_config: tablet_meta_info.flat_json_config.as_ref().map(|cfg| {
+                crate::connector::starrocks::lake::storage_domain::StorageFlatJsonConfig {
+                    enabled: cfg.flat_json_enable,
+                    null_factor: cfg.flat_json_null_factor.map(|value| value.0),
+                    sparsity_factor: cfg.flat_json_sparsity_factor.map(|value| value.0),
+                    max_column_max: cfg.flat_json_column_max,
+                }
+            }),
+            tablet_schema: tablet_meta_info
+                .tablet_schema
+                .as_ref()
+                .map(build_tablet_schema_from_thrift)
+                .transpose()?,
+        },
+    )
 }
 
 fn map_update_tablet_meta_persistent_index_type(
@@ -497,26 +553,25 @@ fn map_update_tablet_meta_compaction_strategy(
     ))
 }
 
-fn write_update_tablet_meta_txn_log(
+fn write_update_tablet_meta_txn_log_with_provider(
     tablet_root_path: &str,
     tablet_id: i64,
     txn_id: i64,
-    metadata_update_info: MetadataUpdateInfoPb,
+    metadata_update: crate::connector::starrocks::lake::storage_domain::StorageMetadataUpdate,
+    storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> Result<(), String> {
+    use crate::connector::starrocks::lake::storage_domain::{
+        StorageAlterMetadataOperation, StorageTransactionLog,
+    };
+
     let txn_log_path = txn_log_file_path(tablet_root_path, tablet_id, txn_id)?;
     with_txn_log_append_lock(tablet_id, txn_id, || {
-        let mut txn_log = match read_txn_log_if_exists(&txn_log_path)? {
-            Some(existing) => existing,
-            None => TxnLogPb {
+        let mut txn_log = match read_bytes_if_exists(&txn_log_path)? {
+            Some(bytes) => storage_metadata_provider.decode_transaction_log(&bytes)?,
+            None => StorageTransactionLog {
                 tablet_id: Some(tablet_id),
                 txn_id: Some(txn_id),
-                op_write: None,
-                op_compaction: None,
-                op_schema_change: None,
-                op_alter_metadata: None,
-                op_replication: None,
-                partition_id: None,
-                load_id: None,
+                ..StorageTransactionLog::default()
             },
         };
         if txn_log.tablet_id != Some(tablet_id) {
@@ -531,10 +586,10 @@ fn write_update_tablet_meta_txn_log(
                 txn_id, txn_log.txn_id
             ));
         }
-        if txn_log.op_write.is_some()
-            || txn_log.op_compaction.is_some()
-            || txn_log.op_schema_change.is_some()
-            || txn_log.op_replication.is_some()
+        if txn_log.write.is_some()
+            || txn_log.compaction.is_some()
+            || txn_log.schema_change.is_some()
+            || txn_log.replication.is_some()
         {
             return Err(format!(
                 "update_tablet_meta_info does not support mixed txn log operation: tablet_id={} txn_id={}",
@@ -542,13 +597,14 @@ fn write_update_tablet_meta_txn_log(
             ));
         }
         txn_log
-            .op_alter_metadata
-            .get_or_insert_with(|| txn_log_pb::OpAlterMetadata {
-                metadata_update_infos: Vec::new(),
+            .alter_metadata
+            .get_or_insert_with(|| StorageAlterMetadataOperation {
+                metadata_updates: Vec::new(),
             })
-            .metadata_update_infos
-            .push(metadata_update_info);
-        write_txn_log_file(&txn_log_path, &txn_log)
+            .metadata_updates
+            .push(metadata_update);
+        let encoded = storage_metadata_provider.encode_transaction_log(&txn_log)?;
+        write_bytes(&txn_log_path, encoded)
     })
 }
 
@@ -572,8 +628,12 @@ fn is_expected_initial_metadata_without_schema(metadata: &TabletMetadataPb, vers
 fn should_patch_initial_metadata_schema(
     metadata: &TabletMetadataPb,
     target_schema: &StarRocksTabletSchema,
+    storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> bool {
-    metadata.schema.as_ref() != Some(&encode_tablet_schema(target_schema))
+    storage_metadata_provider
+        .decode_tablet_metadata(&metadata.encode_to_vec())
+        .map(|metadata| metadata.schema.as_ref() != Some(target_schema))
+        .unwrap_or(true)
 }
 
 fn resolve_tablet_schema_from_metadata_or_runtime(
@@ -581,9 +641,21 @@ fn resolve_tablet_schema_from_metadata_or_runtime(
     metadata: &TabletMetadataPb,
     tablet_id: i64,
     version: i64,
+    storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> Result<StarRocksTabletSchema, String> {
-    if let Some(schema) = metadata.schema.clone() {
-        return decode_tablet_schema(schema);
+    if metadata.schema.is_some() {
+        let domain_metadata = storage_metadata_provider
+            .decode_tablet_metadata(&metadata.encode_to_vec())
+            .map_err(|error| {
+                format!(
+                    "{op} decode tablet schema through compat codec failed: tablet_id={tablet_id} version={version} error={error}"
+                )
+            })?;
+        return domain_metadata.schema.ok_or_else(|| {
+            format!(
+                "{op} compat-decoded tablet metadata missing schema: tablet_id={tablet_id} version={version}"
+            )
+        });
     }
     let runtime = get_tablet_runtime(tablet_id).map_err(|runtime_err| {
         format!(
@@ -1672,4 +1744,34 @@ fn write_schema_change_txn_log(
         });
         write_txn_log_file(&txn_log_path, &txn_log)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_update_domain_facts_preserve_optional_task_values() {
+        let request = TTabletMetaInfo {
+            enable_persistent_index: Some(true),
+            persistent_index_type: Some(TPersistentIndexType::CLOUD_NATIVE),
+            bundle_tablet_metadata: Some(true),
+            compaction_strategy: Some(TCompactionStrategy::REAL_TIME),
+            ..TTabletMetaInfo::default()
+        };
+
+        let update = build_storage_metadata_update(&request).expect("domain update facts");
+
+        assert_eq!(update.enable_persistent_index, Some(true));
+        assert_eq!(
+            update.persistent_index_type,
+            Some(PersistentIndexTypePb::CloudNative as i32)
+        );
+        assert_eq!(update.bundle_tablet_metadata, Some(true));
+        assert_eq!(
+            update.compaction_strategy,
+            Some(CompactionStrategyPb::RealTime as i32)
+        );
+        assert!(update.tablet_schema.is_none());
+    }
 }

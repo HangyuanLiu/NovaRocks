@@ -352,6 +352,7 @@ impl ConnectorSplitAppend {
 pub(crate) struct ConnectorScheduledSplit {
     split: ConnectorSplit,
     row_position: Option<ConnectorRowPosition>,
+    storage_tablet_id: Option<i64>,
 }
 
 impl ConnectorScheduledSplit {
@@ -359,6 +360,17 @@ impl ConnectorScheduledSplit {
         Self {
             split,
             row_position: None,
+            storage_tablet_id: None,
+        }
+    }
+
+    /// Attach a protocol-neutral storage tablet identity for execution paths
+    /// that synthesize per-row positions. The provider payload stays opaque.
+    pub(crate) fn storage_tablet(split: ConnectorSplit, tablet_id: i64) -> Self {
+        Self {
+            split,
+            row_position: None,
+            storage_tablet_id: Some(tablet_id),
         }
     }
 
@@ -369,11 +381,16 @@ impl ConnectorScheduledSplit {
         Self {
             split,
             row_position: Some(row_position),
+            storage_tablet_id: None,
         }
     }
 
     pub(crate) fn split(&self) -> &ConnectorSplit {
         &self.split
+    }
+
+    fn storage_tablet_id(&self) -> Option<i64> {
+        self.storage_tablet_id
     }
 
     fn morsel(&self, index: usize) -> ScanMorsel {
@@ -737,6 +754,19 @@ impl ScanOp for ConnectorReadScanOp {
             Arc::clone(&self.chunk_schema),
             profile,
         )))
+    }
+
+    fn storage_tablet_id(&self, morsel: &ScanMorsel) -> Result<Option<i64>, String> {
+        let ScanMorsel::ConnectorSplit { index, .. } = morsel else {
+            return Ok(None);
+        };
+        self.splits
+            .read()
+            .map_err(|_| "SPI connector split state lock poisoned".to_string())?
+            .scheduled
+            .get(*index)
+            .map(ConnectorScheduledSplit::storage_tablet_id)
+            .ok_or_else(|| format!("SPI connector scan split index {index} is out of bounds"))
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {

@@ -48,8 +48,6 @@ use crate::common::config::starlet_port;
 use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 #[cfg(feature = "compat")]
-use crate::connector::starrocks::starmgr;
-#[cfg(feature = "compat")]
 use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 use crate::query_execution::lifecycle::QueryLifecycleIngress;
@@ -68,6 +66,8 @@ use crate::service::internal_rpc;
 use crate::service::metrics_http;
 use crate::service::native_fragment_ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
+#[cfg(feature = "compat")]
+use prost::Message;
 
 pub(crate) use crate::common::engine_error::{
     REPORT_EXEC_STATUS_OK, REPORT_EXEC_STATUS_QUERY_GONE,
@@ -1401,8 +1401,33 @@ fn emit_grpc_typed_fetch_marker(status: i32) {
 }
 
 #[cfg(feature = "compat")]
-#[derive(Default)]
-pub struct StarletGrpcService;
+/// Temporary compat composition port for the Starlet listener.
+///
+/// The core listener retains generated gRPC request handling until RCI-5G,
+/// while compat owns the StarOS protobuf interpretation and StarManager
+/// control-plane state.
+pub trait StarletControl: Send + Sync {
+    fn parse_file_path_s3_profile(
+        &self,
+        encoded_file_path: &[u8],
+    ) -> Result<Option<starlet_shard_registry::S3StoreConfig>, String>;
+
+    fn observe_service(&self, service_id: &str);
+
+    fn observe_heartbeat(
+        &self,
+        leader_addr: &str,
+        service_id: &str,
+        worker_group_id: u64,
+        worker_id: u64,
+    );
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone)]
+pub struct StarletGrpcService {
+    control: Arc<dyn StarletControl>,
+}
 
 #[cfg(feature = "compat")]
 fn staros_ok_status() -> proto::staros::StarStatus {
@@ -1415,9 +1440,10 @@ fn staros_ok_status() -> proto::staros::StarStatus {
 
 #[cfg(feature = "compat")]
 fn parse_add_shard_s3_config(
+    control: &dyn StarletControl,
     path_info: &proto::staros::FilePathInfo,
 ) -> Result<Option<starlet_shard_registry::S3StoreConfig>, String> {
-    starmgr::parse_s3_config_from_file_path_info(path_info)
+    control.parse_file_path_s3_profile(&path_info.encode_to_vec())
 }
 
 #[cfg(feature = "compat")]
@@ -1506,10 +1532,11 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
         request: tonic::Request<proto::staros::AddShardRequest>,
     ) -> Result<tonic::Response<proto::staros::AddShardResponse>, tonic::Status> {
         let req = request.into_inner();
-        starmgr::observe_starlet_service(&req.service_id);
+        self.control.observe_service(&req.service_id);
         let worker_id = req.worker_id;
         let shard_count = req.shard_info.len();
         let shard_infos = req.shard_info;
+        let control = Arc::clone(&self.control);
 
         // AddShard may carry very large batches. Process in background so
         // heartbeat RPCs are not blocked by shard registry updates.
@@ -1534,7 +1561,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
                     missing_full_path += 1;
                     continue;
                 }
-                let s3 = match parse_add_shard_s3_config(path_info) {
+                let s3 = match parse_add_shard_s3_config(control.as_ref(), path_info) {
                     Ok(v) => v,
                     Err(err) => {
                         invalid_s3_config += 1;
@@ -1549,15 +1576,16 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
                 };
                 if let Some(cfg) = s3.as_ref() {
                     s3_config_count = s3_config_count.saturating_add(1);
-                    *s3_endpoint_counts.entry(cfg.endpoint.clone()).or_insert(0) += 1;
-                    *s3_bucket_counts.entry(cfg.bucket.clone()).or_insert(0) += 1;
+                    *s3_endpoint_counts
+                        .entry(cfg.endpoint().to_string())
+                        .or_insert(0) += 1;
+                    *s3_bucket_counts
+                        .entry(cfg.bucket().to_string())
+                        .or_insert(0) += 1;
                 }
                 updates.push((
                     shard_id,
-                    starlet_shard_registry::StarletShardInfo {
-                        full_path: path_info.full_path.clone(),
-                        s3,
-                    },
+                    starlet_shard_registry::StarletShardInfo::new(path_info.full_path.clone(), s3),
                 ));
             }
             let upserted = starlet_shard_registry::upsert_many_infos(updates);
@@ -1592,7 +1620,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
         request: tonic::Request<proto::staros::RemoveShardRequest>,
     ) -> Result<tonic::Response<proto::staros::RemoveShardResponse>, tonic::Status> {
         let req = request.into_inner();
-        starmgr::observe_starlet_service(&req.service_id);
+        self.control.observe_service(&req.service_id);
         let tablet_ids = req
             .shard_ids
             .iter()
@@ -1617,7 +1645,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
         request: tonic::Request<proto::staros::StarletHeartbeatRequest>,
     ) -> Result<tonic::Response<proto::staros::StarletHeartbeatResponse>, tonic::Status> {
         let req = request.into_inner();
-        starmgr::observe_starlet_heartbeat(
+        self.control.observe_heartbeat(
             &req.star_mgr_leader,
             &req.service_id,
             req.worker_group_id,
@@ -1660,6 +1688,7 @@ pub fn start_grpc_server(
     host: &str,
     compat_routes: Router,
     report_handler: Arc<dyn NativeReportHandler>,
+    starlet_control: Arc<dyn StarletControl>,
 ) -> Result<(), String> {
     start_grpc_server_on_ports(
         host,
@@ -1668,6 +1697,7 @@ pub fn start_grpc_server(
         starlet_port(),
         compat_routes,
         report_handler,
+        starlet_control,
     )
 }
 
@@ -1845,6 +1875,7 @@ fn start_grpc_server_on_ports(
     starlet_port: u16,
     compat_routes: Router,
     report_handler: Arc<dyn NativeReportHandler>,
+    starlet_control: Arc<dyn StarletControl>,
 ) -> Result<(), String> {
     {
         let state = grpc_server_state()
@@ -1925,9 +1956,11 @@ fn start_grpc_server_on_ports(
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                 let starlet_svc =
-                    proto::staros::starlet_server::StarletServer::new(StarletGrpcService)
-                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                    proto::staros::starlet_server::StarletServer::new(StarletGrpcService {
+                        control: starlet_control,
+                    })
+                    .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
 
                 let mut http_shutdown = shutdown_rx.clone();
                 let mut grpc_shutdown = shutdown_rx.clone();

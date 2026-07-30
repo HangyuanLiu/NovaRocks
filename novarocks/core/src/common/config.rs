@@ -175,63 +175,63 @@ pub(crate) fn optimizer_effective_backend_count() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn fe_rpc_connect_timeout_ms() -> u64 {
+pub fn fe_rpc_connect_timeout_ms() -> u64 {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_connect_timeout_ms)
         .unwrap_or(5_000)
 }
 
-pub(crate) fn fe_rpc_timeout_ms() -> u64 {
+pub fn fe_rpc_timeout_ms() -> u64 {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_timeout_ms)
         .unwrap_or(5_000)
 }
 
-pub(crate) fn fe_rpc_retry_interval_ms() -> u64 {
+pub fn fe_rpc_retry_interval_ms() -> u64 {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_retry_interval_ms)
         .unwrap_or(100)
 }
 
-pub(crate) fn fe_rpc_pool_max_idle_per_host() -> usize {
+pub fn fe_rpc_pool_max_idle_per_host() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_pool_max_idle_per_host.max(1))
         .unwrap_or(10)
 }
 
-pub(crate) fn fe_rpc_max_inflight_total() -> usize {
+pub fn fe_rpc_max_inflight_total() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_max_inflight_total.max(1))
         .unwrap_or(32)
 }
 
-pub(crate) fn fe_rpc_max_inflight_schema() -> usize {
+pub fn fe_rpc_max_inflight_schema() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_max_inflight_schema.max(1))
         .unwrap_or(8)
 }
 
-pub(crate) fn fe_rpc_max_inflight_exec_status() -> usize {
+pub fn fe_rpc_max_inflight_exec_status() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_max_inflight_exec_status.max(1))
         .unwrap_or(4)
 }
 
-pub(crate) fn fe_rpc_max_inflight_control() -> usize {
+pub fn fe_rpc_max_inflight_control() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_max_inflight_control.max(1))
         .unwrap_or(4)
 }
 
-pub(crate) fn fe_rpc_max_inflight_schema_query() -> usize {
+pub fn fe_rpc_max_inflight_schema_query() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.fe_rpc_max_inflight_schema_query.max(1))

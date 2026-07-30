@@ -19,21 +19,33 @@ mod be_tablet_write_log_store;
 mod be_txn_store;
 mod chunk_builder;
 mod context;
-#[cfg(feature = "compat")]
-mod fe_tables;
-#[cfg(feature = "compat")]
-mod frontend;
-#[cfg(feature = "compat")]
-mod load_tracking_logs;
-#[cfg(feature = "compat")]
-mod loads;
 mod op;
 
 pub(crate) use be_tablet_write_log_store::BeTabletWriteLoadLogRecord;
 pub(crate) use be_txn_store::BeTxnActiveRecord;
-pub(crate) use context::SchemaScanContext;
+pub use chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
+
+pub trait SchemaLoadProvider: Send + Sync {
+    fn fetch_load_rows(
+        &self,
+        context: &SchemaScanContext,
+        endpoint: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
+    ) -> Result<Vec<SchemaRow>, String>;
+    fn fetch_tracking_load_log_rows(
+        &self,
+        context: &SchemaScanContext,
+        endpoint: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
+    ) -> Result<Vec<SchemaRow>, String>;
+    fn fetch_fe_table_rows(
+        &self,
+        table: &SchemaTable,
+        context: &SchemaScanContext,
+        endpoint: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
+    ) -> Result<Vec<SchemaRow>, String>;
+}
+pub use context::SchemaScanContext;
 #[cfg(feature = "compat")]
-pub(crate) use context::{SchemaFrontend, SchemaUserIdentity, SchemaUserRoles};
+pub use context::{SchemaFrontend, SchemaUserIdentity, SchemaUserRoles};
 // Re-exported for the StarRocks (compat) schema-scan decoder; in non-compat
 // builds these are reached directly via the `op` module (e.g. from tests).
 #[cfg(feature = "compat")]
@@ -93,7 +105,7 @@ impl BeSchemaTable {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SchemaTable {
+pub enum SchemaTable {
     Loads,
     LoadTrackingLogs,
     AnalyzeStatus,
@@ -211,7 +223,7 @@ impl SchemaTable {
         }
     }
 
-    pub(crate) fn table_name(&self) -> &str {
+    pub fn table_name(&self) -> &str {
         match self {
             Self::Loads => "loads",
             Self::LoadTrackingLogs => "load_tracking_logs",

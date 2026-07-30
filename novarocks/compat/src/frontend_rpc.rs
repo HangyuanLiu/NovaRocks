@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
@@ -28,10 +28,16 @@ use thrift::transport::{
     TTcpChannel, WriteHalf as TWriteHalf,
 };
 
-use crate::common::config;
-use crate::novarocks_logging::{debug, info, warn};
-use crate::thrift::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
-use crate::thrift::types;
+use novarocks::common::config;
+use novarocks::connector::starrocks::lake::schema_adapter::build_lake_scan_table_schema_from_thrift;
+use novarocks::connector::starrocks::ports::{
+    ConnectorWireError, ConnectorWireErrorKind, TableSchemaProvider, TableSchemaRequest,
+    TableSchemaRequestSource,
+};
+use novarocks::novarocks_logging::{debug, info, warn};
+use novarocks::thrift::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
+use novarocks::thrift::types;
+use novarocks::thrift::{descriptors, frontend_service, status, status_code};
 
 type FrontendRpcClientInner = FrontendServiceSyncClient<
     TBinaryInputProtocol<TBufferedReadTransport<TReadHalf<TTcpChannel>>>,
@@ -182,9 +188,10 @@ fn call_latest_control<T, F>(mut call: F) -> Result<T, LoadFrontendRpcError>
 where
     F: FnMut(&mut dyn TFrontendServiceSyncClient) -> Result<T, FrontendRpcError>,
 {
-    let fe_addr = crate::service::disk_report::latest_fe_addr()
+    let fe_addr = novarocks::service::disk_report::latest_fe_addr()
         .ok_or(LoadFrontendRpcError::MissingFeAddress)?;
-    FrontendRpcManager::shared()
+    shared()
+        .map_err(|error| LoadFrontendRpcError::Rpc(error.to_string()))?
         .call(FrontendRpcKind::Control, &fe_addr, |client| call(client))
         .map_err(|error| LoadFrontendRpcError::Rpc(error.to_string()))
 }
@@ -304,9 +311,8 @@ impl FrontendRpcManager {
         }
     }
 
-    pub(crate) fn shared() -> &'static Self {
-        static INSTANCE: OnceLock<FrontendRpcManager> = OnceLock::new();
-        INSTANCE.get_or_init(|| FrontendRpcManager::new(FrontendRpcSettings::from_config()))
+    fn from_current_config() -> Arc<Self> {
+        Arc::new(FrontendRpcManager::new(FrontendRpcSettings::from_config()))
     }
 
     pub(crate) fn call<T, F>(
@@ -631,15 +637,62 @@ impl FrontendRpcManager {
     }
 }
 
+type ManagerSlot = RwLock<Option<Arc<FrontendRpcManager>>>;
+
+static ACTIVE_MANAGER: OnceLock<ManagerSlot> = OnceLock::new();
+
+fn manager_slot() -> &'static ManagerSlot {
+    ACTIVE_MANAGER.get_or_init(|| RwLock::new(None))
+}
+
+/// Creates the sole FE transport manager for a compat application host.
+pub(crate) fn create_manager() -> Arc<FrontendRpcManager> {
+    FrontendRpcManager::from_current_config()
+}
+
+/// Installs a host-owned manager for the duration of a compat application.
+pub(crate) fn install(manager: Arc<FrontendRpcManager>) -> Result<(), String> {
+    let mut slot = manager_slot()
+        .write()
+        .map_err(|_| "Frontend RPC manager lock is poisoned".to_string())?;
+    if slot.is_some() {
+        return Err("Frontend RPC manager is already installed".to_string());
+    }
+    *slot = Some(manager);
+    Ok(())
+}
+
+pub(crate) fn clear() -> Result<(), String> {
+    let mut slot = manager_slot()
+        .write()
+        .map_err(|_| "Frontend RPC manager lock is poisoned".to_string())?;
+    slot.take();
+    Ok(())
+}
+
+fn shared() -> Result<Arc<FrontendRpcManager>, FrontendRpcError> {
+    manager_slot()
+        .read()
+        .map_err(|_| FrontendRpcError::application("Frontend RPC manager lock is poisoned"))?
+        .clone()
+        .ok_or_else(|| {
+            FrontendRpcError::application(
+                "Frontend RPC capability is unavailable because no compat application host is running",
+            )
+        })
+}
+
 /// Narrow StarRocks FE operations used by compat-owned protocol adapters.
-/// The pooled Thrift client remains private to the core transport owner.
+/// The pooled Thrift client remains private to this compat transport owner.
 pub fn fetch_query_profile(
     coord: &types::TNetworkAddress,
     query_id: &str,
 ) -> Result<String, String> {
-    let request =
-        crate::thrift::frontend_service::TGetProfileRequest::new(Some(vec![query_id.to_string()]));
-    let result = FrontendRpcManager::shared()
+    let request = novarocks::thrift::frontend_service::TGetProfileRequest::new(Some(vec![
+        query_id.to_string(),
+    ]));
+    let result = shared()
+        .map_err(|error| format!("getQueryProfile RPC failed: {error}"))?
         .call(FrontendRpcKind::SchemaQuery, coord, |client| {
             client
                 .get_query_profile(request.clone())
@@ -647,7 +700,7 @@ pub fn fetch_query_profile(
         })
         .map_err(|error| format!("getQueryProfile RPC failed: {error}"))?;
     if let Some(status) = result.status
-        && status.status_code != crate::thrift::status_code::TStatusCode::OK
+        && status.status_code != novarocks::thrift::status_code::TStatusCode::OK
     {
         return Err(format!("FE returned error: {status:?}"));
     }
@@ -660,8 +713,8 @@ pub fn fetch_query_profile(
 /// Temporary compat transport seam for the stream-load ingress owner.
 /// RCI-5G moves the FE client pool out of core and removes these operations.
 pub fn load_txn_begin(
-    request: crate::thrift::frontend_service::TLoadTxnBeginRequest,
-) -> Result<crate::thrift::frontend_service::TLoadTxnBeginResult, LoadFrontendRpcError> {
+    request: novarocks::thrift::frontend_service::TLoadTxnBeginRequest,
+) -> Result<novarocks::thrift::frontend_service::TLoadTxnBeginResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_begin(request.clone())
@@ -671,8 +724,8 @@ pub fn load_txn_begin(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn stream_load_put(
-    request: crate::thrift::frontend_service::TStreamLoadPutRequest,
-) -> Result<crate::thrift::frontend_service::TStreamLoadPutResult, LoadFrontendRpcError> {
+    request: novarocks::thrift::frontend_service::TStreamLoadPutRequest,
+) -> Result<novarocks::thrift::frontend_service::TStreamLoadPutResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .stream_load_put(request.clone())
@@ -682,8 +735,8 @@ pub fn stream_load_put(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn load_txn_prepare(
-    request: crate::thrift::frontend_service::TLoadTxnCommitRequest,
-) -> Result<crate::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
+    request: novarocks::thrift::frontend_service::TLoadTxnCommitRequest,
+) -> Result<novarocks::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_prepare(request.clone())
@@ -693,8 +746,8 @@ pub fn load_txn_prepare(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn load_txn_commit(
-    request: crate::thrift::frontend_service::TLoadTxnCommitRequest,
-) -> Result<crate::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
+    request: novarocks::thrift::frontend_service::TLoadTxnCommitRequest,
+) -> Result<novarocks::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_commit(request.clone())
@@ -704,8 +757,8 @@ pub fn load_txn_commit(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn load_txn_rollback(
-    request: crate::thrift::frontend_service::TLoadTxnRollbackRequest,
-) -> Result<crate::thrift::frontend_service::TLoadTxnRollbackResult, LoadFrontendRpcError> {
+    request: novarocks::thrift::frontend_service::TLoadTxnRollbackRequest,
+) -> Result<novarocks::thrift::frontend_service::TLoadTxnRollbackResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_rollback(request.clone())
@@ -715,9 +768,10 @@ pub fn load_txn_rollback(
 
 pub fn batch_report_exec_status(
     coord: &types::TNetworkAddress,
-    params: crate::thrift::frontend_service::TBatchReportExecStatusParams,
-) -> Result<Option<Vec<crate::thrift::status::TStatus>>, String> {
-    FrontendRpcManager::shared()
+    params: novarocks::thrift::frontend_service::TBatchReportExecStatusParams,
+) -> Result<Option<Vec<novarocks::thrift::status::TStatus>>, String> {
+    shared()
+        .map_err(|error| error.to_string())?
         .call(FrontendRpcKind::ExecStatus, coord, |client| {
             client
                 .batch_report_exec_status(params.clone())
@@ -729,9 +783,10 @@ pub fn batch_report_exec_status(
 
 pub fn report_exec_status(
     coord: &types::TNetworkAddress,
-    params: crate::thrift::frontend_service::TReportExecStatusParams,
-) -> Result<Option<crate::thrift::status::TStatus>, String> {
-    FrontendRpcManager::shared()
+    params: novarocks::thrift::frontend_service::TReportExecStatusParams,
+) -> Result<Option<novarocks::thrift::status::TStatus>, String> {
+    shared()
+        .map_err(|error| error.to_string())?
         .call(FrontendRpcKind::ExecStatus, coord, |client| {
             client
                 .report_exec_status(params.clone())
@@ -739,10 +794,6 @@ pub fn report_exec_status(
         })
         .map(|response| response.status)
         .map_err(|error| error.to_string())
-}
-
-pub fn init_frontend_rpc_manager() {
-    let _ = FrontendRpcManager::shared();
 }
 
 struct FrontendRpcClient<'a> {
@@ -869,6 +920,250 @@ fn log_nofile_limit(limit: NoFileLimit) {
             hard_nofile = limit.hard,
             required_soft_nofile = FE_RPC_LOW_NOFILE_WARNING,
             "RLIMIT_NOFILE soft limit is lower than the recommended FE RPC floor"
+        );
+    }
+}
+
+/// Compat-only wrappers for service callback seams. They preserve the typed
+/// result mapping while keeping the pooled transport private to this module.
+pub(crate) fn finish_task(
+    coord: &types::TNetworkAddress,
+    request: novarocks::thrift::master_service::TFinishTaskRequest,
+) -> Result<novarocks::thrift::master_service::TMasterResult, String> {
+    shared()
+        .map_err(|error| error.to_string())?
+        .call(FrontendRpcKind::Control, coord, |client| {
+            client
+                .finish_task(request.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn report_disk(
+    coord: &types::TNetworkAddress,
+    request: novarocks::thrift::master_service::TReportRequest,
+) -> Result<(), String> {
+    let result = shared()
+        .map_err(|error| error.to_string())?
+        .call(FrontendRpcKind::Control, coord, |client| {
+            client
+                .report(request.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map_err(|error| error.to_string())?;
+    if result.status.status_code == status_code::TStatusCode::OK {
+        Ok(())
+    } else {
+        Err(format!("FE returned error: {:?}", result.status))
+    }
+}
+
+pub(crate) fn is_transport_error(error: &str) -> bool {
+    looks_like_transport_message(error)
+}
+
+pub(crate) fn with_client<T, F>(
+    endpoint: &types::TNetworkAddress,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
+{
+    shared()
+        .map_err(|error| error.to_string())?
+        .call(FrontendRpcKind::SchemaQuery, endpoint, |client| {
+            operation.clone()(client).map_err(FrontendRpcError::from_message_guess)
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn with_control_client<T, F>(
+    endpoint: &types::TNetworkAddress,
+    transport_retries: usize,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
+{
+    shared()
+        .map_err(|error| error.to_string())?
+        .call_with_options(
+            FrontendRpcKind::Control,
+            endpoint,
+            FrontendRpcCallOptions { transport_retries },
+            |client| operation.clone()(client).map_err(FrontendRpcError::from_message_guess),
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// Compat-owned FE table-schema wire adapter. The core cache/singleflight
+/// invokes this narrow domain provider; generated request/response values do
+/// not cross the port.
+pub(crate) fn table_schema_provider() -> Arc<dyn TableSchemaProvider> {
+    Arc::new(CompatTableSchemaProvider)
+}
+
+struct CompatTableSchemaProvider;
+
+impl TableSchemaProvider for CompatTableSchemaProvider {
+    fn fetch_table_schema(
+        &self,
+        request: &TableSchemaRequest,
+    ) -> Result<novarocks::connector::starrocks::schema::LakeScanTableSchema, ConnectorWireError>
+    {
+        let source = match request.source {
+            TableSchemaRequestSource::Scan => frontend_service::TTableSchemaRequestSource::SCAN,
+            TableSchemaRequestSource::Load => frontend_service::TTableSchemaRequestSource::LOAD,
+        };
+        let thrift_request = frontend_service::TBatchGetTableSchemaRequest {
+            requests: Some(vec![frontend_service::TGetTableSchemaRequest {
+                schema_key: Some(descriptors::TTableSchemaKey {
+                    db_id: Some(request.db_id),
+                    table_id: Some(request.table_id),
+                    schema_id: Some(request.schema_id),
+                }),
+                source: Some(source),
+                tablet_id: request.tablet_id,
+                query_id: request
+                    .query_id
+                    .map(|id| types::TUniqueId::new(id.hi, id.lo)),
+                txn_id: request.txn_id,
+            }]),
+        };
+        let endpoint =
+            types::TNetworkAddress::new(request.endpoint.host.clone(), request.endpoint.port);
+        let response = call_schema_rpc(&endpoint, |client| {
+            client
+                .get_table_schema(thrift_request.clone())
+                .map_err(|error| error.to_string())
+        })?;
+        ensure_ok_status(
+            response.status.as_ref(),
+            "FE getTableSchema returned non-OK top-level status",
+        )?;
+        let mut responses = response.responses.unwrap_or_default();
+        if responses.len() != 1 {
+            return Err(ConnectorWireError::new(
+                ConnectorWireErrorKind::Invalid,
+                format!(
+                    "FE getTableSchema returned unexpected response count: expected=1 actual={}",
+                    responses.len()
+                ),
+            ));
+        }
+        let item = responses.pop().expect("exact response count was checked");
+        ensure_ok_status(
+            item.status.as_ref(),
+            "FE getTableSchema response item returned non-OK",
+        )?;
+        let schema = item.schema.ok_or_else(|| {
+            ConnectorWireError::new(
+                ConnectorWireErrorKind::Invalid,
+                "FE getTableSchema response item missing schema",
+            )
+        })?;
+        build_lake_scan_table_schema_from_thrift(&schema)
+            .map_err(|message| ConnectorWireError::new(ConnectorWireErrorKind::Invalid, message))
+    }
+}
+
+fn call_schema_rpc<T>(
+    endpoint: &types::TNetworkAddress,
+    mut call: impl FnMut(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
+) -> Result<T, ConnectorWireError> {
+    shared()
+        .map_err(|error| {
+            ConnectorWireError::new(ConnectorWireErrorKind::Unavailable, error.to_string())
+        })?
+        .call(FrontendRpcKind::SchemaMeta, endpoint, |client| {
+            call(client).map_err(FrontendRpcError::from_message_guess)
+        })
+        .map_err(|error| {
+            let message = error.to_string();
+            let kind = if message.to_ascii_lowercase().contains("not found") {
+                ConnectorWireErrorKind::NotFound
+            } else if error.is_transport() {
+                ConnectorWireErrorKind::Transport
+            } else {
+                ConnectorWireErrorKind::Failed
+            };
+            ConnectorWireError::new(kind, message)
+        })
+}
+
+fn ensure_ok_status(
+    status: Option<&status::TStatus>,
+    context: &str,
+) -> Result<(), ConnectorWireError> {
+    let status = status.ok_or_else(|| {
+        ConnectorWireError::new(
+            ConnectorWireErrorKind::Invalid,
+            format!("{context}: empty status"),
+        )
+    })?;
+    if status.status_code == status_code::TStatusCode::OK {
+        return Ok(());
+    }
+    let detail = status
+        .error_msgs
+        .as_ref()
+        .map(|messages| messages.join("; "))
+        .unwrap_or_default();
+    let kind = if status.status_code == status_code::TStatusCode::NOT_FOUND
+        || detail.to_ascii_lowercase().contains("table")
+            && detail.to_ascii_lowercase().contains("not found")
+    {
+        ConnectorWireErrorKind::NotFound
+    } else {
+        ConnectorWireErrorKind::Failed
+    };
+    let message = if detail.is_empty() {
+        format!("{context}: {status:?}")
+    } else {
+        format!("{context}: status={:?}, error={detail}", status.status_code)
+    };
+    Err(ConnectorWireError::new(kind, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_transport_and_emfile_errors() {
+        let error = FrontendRpcError::from_message_guess("connect FE failed: Too many open files");
+
+        assert!(error.is_transport());
+        assert!(error.is_emfile());
+    }
+
+    #[test]
+    fn rejects_missing_table_schema_status() {
+        let error = ensure_ok_status(None, "FE getTableSchema response")
+            .expect_err("missing status must be rejected");
+
+        assert_eq!(error.kind(), ConnectorWireErrorKind::Invalid);
+        assert_eq!(
+            error.to_string(),
+            "FE getTableSchema response: empty status"
+        );
+    }
+
+    #[test]
+    fn preserves_non_ok_status_detail() {
+        let status = status::TStatus::new(
+            status_code::TStatusCode::INTERNAL_ERROR,
+            Some(vec!["upstream rejected schema request".to_string()]),
+        );
+
+        let error = ensure_ok_status(Some(&status), "FE getTableSchema response")
+            .expect_err("non-OK status must be rejected");
+
+        assert_eq!(error.kind(), ConnectorWireErrorKind::Failed);
+        assert_eq!(
+            error.to_string(),
+            "FE getTableSchema response: status=TStatusCode(6), error=upstream rejected schema request"
         );
     }
 }

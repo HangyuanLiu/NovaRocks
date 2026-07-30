@@ -15,27 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use prost::Message;
 
 use crate::connector::starrocks::lake::context::{TabletWriteContext, register_tablet_runtime};
 use crate::connector::starrocks::lake::schema_adapter::{
-    build_create_tablet_schema, map_create_tablet_compaction_strategy,
+    DEFAULT_COMPACTION_STRATEGY, build_create_tablet_schema, map_create_tablet_compaction_strategy,
     map_create_tablet_persistent_index_type,
+};
+use crate::connector::starrocks::lake::storage_domain::{
+    StorageFlatJsonConfig, StorageTabletMetadata,
 };
 use crate::connector::starrocks::lake::storage_schema_wire::encode_tablet_schema;
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::writer::bundle_meta::{
-    empty_tablet_metadata, load_latest_tablet_metadata, write_initial_meta_file,
-    write_standalone_meta_file,
+    empty_tablet_metadata, load_latest_tablet_metadata, load_latest_tablet_metadata_with_provider,
+    write_initial_meta_file, write_initial_meta_file_with_provider, write_standalone_meta_file,
+    write_standalone_meta_file_with_provider,
 };
 use crate::formats::starrocks::writer::io::read_bytes_if_exists;
 use crate::formats::starrocks::writer::layout::{
     initial_meta_file_path, standalone_meta_file_path,
 };
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::service::grpc_client::proto::starrocks::{
-    CompactionStrategyPb, FlatJsonConfigPb, TabletMetadataPb,
-};
+use crate::service::grpc_client::proto::starrocks::{FlatJsonConfigPb, TabletMetadataPb};
 
 pub(crate) fn create_lake_tablet_from_req(
     request: &crate::thrift::agent_service::TCreateTabletReq,
@@ -45,10 +49,43 @@ pub(crate) fn create_lake_tablet_from_req(
     create_lake_tablet_from_req_with_schema_patch(request, tablet_root_path, s3_config, |_| Ok(()))
 }
 
+/// Installs the compat file-boundary codec into the tablet runtime created by
+/// a BackendService lake-agent task. Initial metadata, scans, publishes, and
+/// transaction logs all cross that codec as domain facts.
+pub(crate) fn create_lake_tablet_from_req_with_storage_metadata_provider(
+    request: &crate::thrift::agent_service::TCreateTabletReq,
+    tablet_root_path: &str,
+    s3_config: Option<S3StoreConfig>,
+    storage_metadata_provider: Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+) -> Result<(), String> {
+    create_lake_tablet_from_req_inner(
+        request,
+        tablet_root_path,
+        s3_config,
+        Some(storage_metadata_provider),
+        |_| Ok(()),
+    )
+}
+
 pub(crate) fn create_lake_tablet_from_req_with_schema_patch<P>(
     request: &crate::thrift::agent_service::TCreateTabletReq,
     tablet_root_path: &str,
     s3_config: Option<S3StoreConfig>,
+    patch: P,
+) -> Result<(), String>
+where
+    P: FnOnce(&mut StarRocksTabletSchema) -> Result<(), String>,
+{
+    create_lake_tablet_from_req_inner(request, tablet_root_path, s3_config, None, patch)
+}
+
+fn create_lake_tablet_from_req_inner<P>(
+    request: &crate::thrift::agent_service::TCreateTabletReq,
+    tablet_root_path: &str,
+    s3_config: Option<S3StoreConfig>,
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
     patch: P,
 ) -> Result<(), String>
 where
@@ -70,19 +107,30 @@ where
         tablet_root_path: tablet_root_path.to_string(),
         tablet_schema: tablet_schema.clone(),
         s3_config,
+        storage_metadata_provider: storage_metadata_provider.clone(),
         partial_update: Default::default(),
     };
     register_tablet_runtime(&runtime_ctx)?;
 
+    if let Some(provider) = storage_metadata_provider.as_deref() {
+        return create_lake_tablet_metadata_with_provider(
+            request,
+            tablet_root_path,
+            tablet_id,
+            &tablet_schema,
+            provider,
+        );
+    }
+
     let persistent_index_type = match request.persistent_index_type {
-        Some(v) => Some(map_create_tablet_persistent_index_type(v)? as i32),
+        Some(v) => Some(map_create_tablet_persistent_index_type(v)?),
         None => None,
     };
     let compaction_strategy = request
         .compaction_strategy
         .map(map_create_tablet_compaction_strategy)
         .transpose()?
-        .or(Some(CompactionStrategyPb::Default as i32));
+        .or(Some(DEFAULT_COMPACTION_STRATEGY));
     let flat_json_config = request
         .flat_json_config
         .as_ref()
@@ -137,6 +185,92 @@ where
     }
 }
 
+fn create_lake_tablet_metadata_with_provider(
+    request: &crate::thrift::agent_service::TCreateTabletReq,
+    tablet_root_path: &str,
+    tablet_id: i64,
+    tablet_schema: &StarRocksTabletSchema,
+    provider: &dyn crate::connector::starrocks::ports::StorageMetadataProvider,
+) -> Result<(), String> {
+    let persistent_index_type = request
+        .persistent_index_type
+        .map(map_create_tablet_persistent_index_type)
+        .transpose()?;
+    let compaction_strategy = request
+        .compaction_strategy
+        .map(map_create_tablet_compaction_strategy)
+        .transpose()?
+        .or(Some(DEFAULT_COMPACTION_STRATEGY));
+    let mut tablet_meta = StorageTabletMetadata {
+        id: Some(tablet_id),
+        version: Some(1),
+        enable_persistent_index: request.enable_persistent_index,
+        persistent_index_type,
+        gtid: Some(request.gtid.unwrap_or(0)),
+        compaction_strategy,
+        flat_json_config: request
+            .flat_json_config
+            .as_ref()
+            .map(|cfg| StorageFlatJsonConfig {
+                enabled: cfg.flat_json_enable,
+                null_factor: cfg.flat_json_null_factor.map(|value| value.0),
+                sparsity_factor: cfg.flat_json_sparsity_factor.map(|value| value.0),
+                max_column_max: cfg.flat_json_column_max,
+            }),
+        ..Default::default()
+    };
+    seed_storage_tablet_metadata_schema(&mut tablet_meta, tablet_schema);
+
+    let standalone_v1_path = standalone_meta_file_path(tablet_root_path, tablet_id, 1)?;
+    if read_bytes_if_exists(&standalone_v1_path)?.is_some() {
+        let (_, existing) =
+            load_latest_tablet_metadata_with_provider(tablet_root_path, tablet_id, provider)?;
+        if existing.schema.as_ref() == Some(tablet_schema) {
+            return Ok(());
+        }
+        return write_standalone_meta_file_with_provider(
+            tablet_root_path,
+            tablet_id,
+            1,
+            &tablet_meta,
+            provider,
+        );
+    }
+
+    let latest_version =
+        match load_latest_tablet_metadata_with_provider(tablet_root_path, tablet_id, provider) {
+            Ok((version, _)) => version,
+            Err(err) if is_missing_tablet_page_in_bundle_error(&err) => 0,
+            Err(err) => return Err(err),
+        };
+    if latest_version > 1 {
+        return Ok(());
+    }
+
+    if request.enable_tablet_creation_optimization.unwrap_or(false) {
+        let initial_path = initial_meta_file_path(tablet_root_path)?;
+        if read_bytes_if_exists(&initial_path)?.is_some() {
+            write_standalone_meta_file_with_provider(
+                tablet_root_path,
+                tablet_id,
+                1,
+                &tablet_meta,
+                provider,
+            )
+        } else {
+            write_initial_meta_file_with_provider(tablet_root_path, &tablet_meta, provider)
+        }
+    } else {
+        write_standalone_meta_file_with_provider(
+            tablet_root_path,
+            tablet_id,
+            1,
+            &tablet_meta,
+            provider,
+        )
+    }
+}
+
 fn seed_tablet_metadata_schema(
     metadata: &mut TabletMetadataPb,
     tablet_schema: &StarRocksTabletSchema,
@@ -148,6 +282,19 @@ fn seed_tablet_metadata_schema(
             .historical_schemas
             .entry(schema_id)
             .or_insert(wire_schema);
+    }
+}
+
+fn seed_storage_tablet_metadata_schema(
+    metadata: &mut StorageTabletMetadata,
+    tablet_schema: &StarRocksTabletSchema,
+) {
+    metadata.schema = Some(tablet_schema.clone());
+    if let Some(schema_id) = tablet_schema.id.filter(|id| *id > 0) {
+        metadata
+            .historical_schemas
+            .entry(schema_id)
+            .or_insert_with(|| tablet_schema.clone());
     }
 }
 

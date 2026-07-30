@@ -219,7 +219,7 @@ impl ScanAsyncRunner {
                 }
                 self.current_morsel = Some(morsel.clone());
                 self.row_position_state = self.build_row_position_state(&morsel)?;
-                self.lake_row_position_state = self.build_lake_row_position_state(&morsel);
+                self.lake_row_position_state = self.build_lake_row_position_state(&morsel)?;
                 let start = Instant::now();
                 // Preserve the old `ScanNode::execute_iter` behavior: an `Empty`
                 // morsel yields an empty iterator without touching the op.
@@ -374,24 +374,36 @@ impl ScanAsyncRunner {
         Err("row position requires a connector split with provider-owned row identity".to_string())
     }
 
-    fn build_lake_row_position_state(&self, morsel: &ScanMorsel) -> Option<LakeRowPositionState> {
+    fn build_lake_row_position_state(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<LakeRowPositionState>, String> {
         #[cfg(not(feature = "compat"))]
         {
             let _ = morsel;
-            return None;
+            return Ok(None);
         }
         #[cfg(feature = "compat")]
         {
-            let spec = self.scan.lake_row_position()?;
-            let ScanMorsel::StarRocksRange { tablet_id, index } = morsel else {
-                return None;
+            let Some(spec) = self.scan.lake_row_position() else {
+                return Ok(None);
             };
-            Some(LakeRowPositionState {
+            let (tablet_id, index) = match morsel {
+                ScanMorsel::StarRocksRange { tablet_id, index } => (*tablet_id, *index),
+                ScanMorsel::ConnectorSplit { index, .. } => {
+                    let Some(tablet_id) = self.op.storage_tablet_id(morsel)? else {
+                        return Ok(None);
+                    };
+                    (tablet_id, *index)
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(LakeRowPositionState {
                 spec: spec.clone(),
-                tablet_id: *tablet_id,
-                range_idx: i32::try_from(*index).unwrap_or(i32::MAX),
+                tablet_id,
+                range_idx: i32::try_from(index).unwrap_or(i32::MAX),
                 next_row_offset: 0,
-            })
+            }))
         }
     }
 

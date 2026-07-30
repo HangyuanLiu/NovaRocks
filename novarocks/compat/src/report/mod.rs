@@ -360,7 +360,7 @@ pub(crate) fn fetch_query_profile(
     coord: &types::TNetworkAddress,
     query_id: &str,
 ) -> Result<String, String> {
-    novarocks::service::frontend_rpc::fetch_query_profile(coord, query_id)
+    crate::frontend_rpc::fetch_query_profile(coord, query_id)
 }
 
 pub(crate) fn register_novarocks_report(

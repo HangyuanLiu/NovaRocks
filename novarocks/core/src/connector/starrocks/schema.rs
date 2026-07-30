@@ -17,114 +17,116 @@
 
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StarRocksKeysType {
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum StarRocksKeysType {
     Duplicate,
     Unique,
     Aggregate,
     Primary,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksScalarType {
-    pub(crate) r#type: i32,
-    pub(crate) len: Option<i32>,
-    pub(crate) precision: Option<i32>,
-    pub(crate) scale: Option<i32>,
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksScalarType {
+    pub r#type: i32,
+    pub len: Option<i32>,
+    pub precision: Option<i32>,
+    pub scale: Option<i32>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksStructField {
-    pub(crate) name: String,
-    pub(crate) comment: Option<String>,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksStructField {
+    pub name: String,
+    pub comment: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksTypeNode {
-    pub(crate) r#type: i32,
-    pub(crate) scalar_type: Option<StarRocksScalarType>,
-    pub(crate) struct_fields: Vec<StarRocksStructField>,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksTypeNode {
+    pub r#type: i32,
+    pub scalar_type: Option<StarRocksScalarType>,
+    pub struct_fields: Vec<StarRocksStructField>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksTypeDesc {
-    pub(crate) types: Vec<StarRocksTypeNode>,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksTypeDesc {
+    pub types: Vec<StarRocksTypeNode>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksAggStateDesc {
-    pub(crate) agg_func_name: Option<String>,
-    pub(crate) arg_types: Vec<StarRocksTypeDesc>,
-    pub(crate) ret_type: Option<StarRocksTypeDesc>,
-    pub(crate) is_result_nullable: Option<bool>,
-    pub(crate) func_version: Option<i32>,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksAggStateDesc {
+    pub agg_func_name: Option<String>,
+    pub arg_types: Vec<StarRocksTypeDesc>,
+    pub ret_type: Option<StarRocksTypeDesc>,
+    pub is_result_nullable: Option<bool>,
+    pub func_version: Option<i32>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksColumnSchema {
-    pub(crate) unique_id: i32,
-    pub(crate) name: Option<String>,
-    pub(crate) r#type: String,
-    pub(crate) is_key: Option<bool>,
-    pub(crate) aggregation: Option<String>,
-    pub(crate) is_nullable: Option<bool>,
-    pub(crate) default_value: Option<Vec<u8>>,
-    pub(crate) precision: Option<i32>,
-    pub(crate) frac: Option<i32>,
-    pub(crate) length: Option<i32>,
-    pub(crate) index_length: Option<i32>,
-    pub(crate) is_bf_column: Option<bool>,
-    pub(crate) referenced_column_id: Option<i32>,
-    pub(crate) referenced_column: Option<String>,
-    pub(crate) has_bitmap_index: Option<bool>,
-    pub(crate) visible: Option<bool>,
-    pub(crate) children_columns: Vec<StarRocksColumnSchema>,
-    pub(crate) is_auto_increment: Option<bool>,
-    pub(crate) agg_state_desc: Option<StarRocksAggStateDesc>,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksColumnSchema {
+    pub unique_id: i32,
+    pub name: Option<String>,
+    pub r#type: String,
+    pub is_key: Option<bool>,
+    pub aggregation: Option<String>,
+    pub is_nullable: Option<bool>,
+    pub default_value: Option<Vec<u8>>,
+    pub precision: Option<i32>,
+    pub frac: Option<i32>,
+    pub length: Option<i32>,
+    pub index_length: Option<i32>,
+    pub is_bf_column: Option<bool>,
+    pub referenced_column_id: Option<i32>,
+    pub referenced_column: Option<String>,
+    pub has_bitmap_index: Option<bool>,
+    pub visible: Option<bool>,
+    pub children_columns: Vec<StarRocksColumnSchema>,
+    pub is_auto_increment: Option<bool>,
+    pub agg_state_desc: Option<StarRocksAggStateDesc>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksTabletIndex {
-    pub(crate) index_id: Option<i64>,
-    pub(crate) index_name: Option<String>,
-    pub(crate) index_type: Option<i32>,
-    pub(crate) col_unique_id: Vec<i32>,
-    pub(crate) index_properties: Option<String>,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksTabletIndex {
+    pub index_id: Option<i64>,
+    pub index_name: Option<String>,
+    pub index_type: Option<i32>,
+    pub col_unique_id: Vec<i32>,
+    pub index_properties: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct StarRocksTabletSchema {
-    pub(crate) keys_type: Option<StarRocksKeysType>,
-    pub(crate) column: Vec<StarRocksColumnSchema>,
-    pub(crate) num_short_key_columns: Option<i32>,
-    pub(crate) num_rows_per_row_block: Option<i32>,
-    pub(crate) bf_fpp: Option<f64>,
-    pub(crate) next_column_unique_id: Option<u32>,
-    pub(crate) deprecated_is_in_memory: Option<bool>,
-    pub(crate) deprecated_id: Option<i64>,
-    pub(crate) compression_type: Option<i32>,
-    pub(crate) sort_key_idxes: Vec<u32>,
-    pub(crate) schema_version: Option<i32>,
-    pub(crate) sort_key_unique_ids: Vec<u32>,
-    pub(crate) table_indices: Vec<StarRocksTabletIndex>,
-    pub(crate) compression_level: Option<i32>,
-    pub(crate) id: Option<i64>,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StarRocksTabletSchema {
+    pub keys_type: Option<StarRocksKeysType>,
+    pub column: Vec<StarRocksColumnSchema>,
+    pub num_short_key_columns: Option<i32>,
+    pub num_rows_per_row_block: Option<i32>,
+    pub bf_fpp: Option<f64>,
+    pub next_column_unique_id: Option<u32>,
+    pub deprecated_is_in_memory: Option<bool>,
+    pub deprecated_id: Option<i64>,
+    pub compression_type: Option<i32>,
+    pub sort_key_idxes: Vec<u32>,
+    pub schema_version: Option<i32>,
+    pub sort_key_unique_ids: Vec<u32>,
+    pub table_indices: Vec<StarRocksTabletIndex>,
+    pub compression_level: Option<i32>,
+    pub id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct LakeScanColumnHint {
-    pub(crate) unique_id: Option<u32>,
-    pub(crate) default_value: Option<String>,
+pub struct LakeScanColumnHint {
+    pub unique_id: Option<u32>,
+    pub default_value: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct LakeScanTableSchema {
-    pub(crate) tablet_schema: StarRocksTabletSchema,
-    pub(crate) column_hints: HashMap<String, LakeScanColumnHint>,
+pub struct LakeScanTableSchema {
+    pub tablet_schema: StarRocksTabletSchema,
+    pub column_hints: HashMap<String, LakeScanColumnHint>,
 }
 
 impl StarRocksTabletSchema {
-    pub(crate) fn try_new(
+    pub fn try_new(
         id: Option<i64>,
         keys_type: Option<StarRocksKeysType>,
         column: Vec<StarRocksColumnSchema>,
@@ -139,7 +141,7 @@ impl StarRocksTabletSchema {
         Ok(schema)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.keys_type.is_none() {
             return Err("StarRocks tablet schema keys type is missing".to_string());
         }
@@ -194,7 +196,7 @@ impl StarRocksTabletSchema {
         Ok(())
     }
 
-    pub(crate) const fn is_primary_keys(&self) -> bool {
+    pub const fn is_primary_keys(&self) -> bool {
         matches!(self.keys_type, Some(StarRocksKeysType::Primary))
     }
 }

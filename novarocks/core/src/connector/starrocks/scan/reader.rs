@@ -17,16 +17,17 @@
 
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
-use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
 use crate::connector::starrocks::schema::{
     LakeScanColumnHint, StarRocksAggStateDesc, StarRocksColumnSchema, StarRocksKeysType,
     StarRocksTabletIndex, StarRocksTabletSchema, StarRocksTypeDesc, StarRocksTypeNode,
 };
+use crate::connector::starrocks::table_schema_service::fetch_table_schema_for_lake_scan;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;
 use crate::formats::starrocks::metadata::{
     StarRocksTabletSnapshot, load_bundle_segment_footers, load_tablet_snapshot,
+    load_tablet_snapshot_with_metadata_provider,
 };
 use crate::formats::starrocks::plan::{
     StarRocksOutputColumnHint, StarRocksPhysicalColumnBinding,
@@ -344,6 +345,7 @@ fn maybe_refresh_snapshot_schema_for_lake_scan(
     }
 
     let fe_schema = fetch_table_schema_for_lake_scan(
+        meta.table_schema_provider.as_deref(),
         meta.fe_addr.as_ref(),
         meta.db_id,
         meta.table_id,
@@ -392,12 +394,21 @@ impl StarRocksNativeReader {
         lake_schema_meta: Option<&LakeScanSchemaMeta>,
     ) -> Result<Self, String> {
         let output_schema = output_chunk_schema.arrow_schema_ref();
-        let snapshot = match load_tablet_snapshot(
-            tablet_id,
-            version,
-            storage_path,
-            object_store_profile,
-        ) {
+        let snapshot_result = lake_schema_meta
+            .and_then(|meta| meta.storage_metadata_provider.as_deref())
+            .map_or_else(
+                || load_tablet_snapshot(tablet_id, version, storage_path, object_store_profile),
+                |provider| {
+                    load_tablet_snapshot_with_metadata_provider(
+                        tablet_id,
+                        version,
+                        storage_path,
+                        object_store_profile,
+                        provider,
+                    )
+                },
+            );
+        let snapshot = match snapshot_result {
             Ok(snapshot) => snapshot,
             Err(err)
                 if should_treat_missing_tablet_metadata_as_empty(storage_path, version, &err) =>
@@ -774,6 +785,7 @@ fn build_output_column_hints(
                 )
             } else {
                 let fe_schema = fetch_table_schema_for_lake_scan(
+                    meta.table_schema_provider.as_deref(),
                     meta.fe_addr.as_ref(),
                     meta.db_id,
                     meta.table_id,

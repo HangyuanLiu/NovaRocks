@@ -42,13 +42,13 @@ use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset
 use crate::connector::starrocks::lake::{
     TabletWriteContext, append_lake_txn_log_with_chunk_rowset,
 };
+use crate::connector::starrocks::ports::{AutomaticPartitionRequest, SinkFrontendAddress};
 use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_ids;
 use crate::connector::starrocks::sink::factory::{
     OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, SinkIndexWritePlan, TabletWriteTarget,
-    resolve_s3_for_sink_tablet,
+    automatic_partition_result_from_port, resolve_s3_for_sink_tablet,
 };
-use crate::connector::starrocks::sink::frontend_wire::create_automatic_partitions;
 use crate::connector::starrocks::sink::partition_key::{
     PartitionKeySource, PartitionMode, PartitionRoutingEntry, build_partition_key_arrays,
     partition_key_source_len, validate_partition_key_length,
@@ -444,7 +444,12 @@ fn materialize_auto_increment_for_sink_batch(
         let fe_addr = auto_policy.fe_addr.as_ref().ok_or_else(|| {
             "OLAP_TABLE_SINK cannot allocate auto_increment id without FE address".to_string()
         })?;
-        allocate_auto_increment_ids(fe_addr, table_id, alloc_rows)?
+        allocate_auto_increment_ids(
+            auto_policy.frontend_provider.as_deref(),
+            fe_addr,
+            table_id,
+            alloc_rows,
+        )?
     };
 
     let mut next_alloc = 0usize;
@@ -606,7 +611,15 @@ fn fill_auto_increment_in_chunk_before_routing(
             .ok_or_else(|| {
                 "OLAP_TABLE_SINK cannot allocate auto_increment id without FE address".to_string()
             })?;
-        allocate_auto_increment_ids(fe_addr, plan.table_id, alloc_rows)?
+        let provider = plan.write_targets.values().next().and_then(|target| {
+            target
+                .context
+                .partial_update
+                .auto_increment
+                .frontend_provider
+                .as_deref()
+        });
+        allocate_auto_increment_ids(provider, fe_addr, plan.table_id, alloc_rows)?
     };
 
     // When null_expr_in_auto_increment is true, we consumed IDs from the counter
@@ -1261,15 +1274,21 @@ impl OlapTableSinkOperator {
                 partition_values = ?partition_values,
                 "OLAP_TABLE_SINK runtime createPartition for stream load"
             );
-            let response = create_automatic_partitions(
-                &auto_partition.fe_addr,
-                auto_partition.db_id,
-                auto_partition.table_id,
-                auto_partition.txn_id,
-                auto_partition.dynamic_overwrite,
-                vec![partition_values.clone()],
-            )
-            .map_err(|e| format!("OLAP_TABLE_SINK runtime automatic partition failed: {e}"))?;
+            let response = auto_partition
+                .frontend_provider
+                .create_automatic_partitions(&AutomaticPartitionRequest {
+                    frontend: SinkFrontendAddress {
+                        host: auto_partition.fe_addr.hostname.clone(),
+                        port: auto_partition.fe_addr.port,
+                    },
+                    db_id: auto_partition.db_id,
+                    table_id: auto_partition.table_id,
+                    txn_id: auto_partition.txn_id,
+                    is_temp: auto_partition.dynamic_overwrite,
+                    partition_values: vec![partition_values.clone()],
+                })
+                .map(automatic_partition_result_from_port)
+                .map_err(|e| format!("OLAP_TABLE_SINK runtime automatic partition failed: {e}"))?;
             self.ingest_auto_partition_response(&auto_partition, response)?;
             self.seen_partition_values.insert(partition_values);
         }
@@ -1444,8 +1463,12 @@ impl OlapTableSinkOperator {
                     tablet_id: *tablet_id,
                 })
                 .collect::<Vec<_>>();
-            let path_map =
-                resolve_tablet_paths_for_olap_sink(None, &self.plan.table_identity, &refs)?;
+            let path_map = resolve_tablet_paths_for_olap_sink(
+                None,
+                &self.plan.table_identity,
+                &refs,
+                self.plan.starlet_metadata_provider.as_deref(),
+            )?;
             let shard_infos = starlet_shard_registry::select_infos(&new_tablets);
             for index_plan in &mut self.index_write_plans {
                 let Some(index_new_tablets) = new_tablets_by_index.get(&index_plan.index_id) else {

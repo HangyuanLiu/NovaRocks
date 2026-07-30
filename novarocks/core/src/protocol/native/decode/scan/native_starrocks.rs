@@ -84,6 +84,7 @@ pub(super) fn decode_starrocks_scan_preparation(
                 schema_id: source.schema_id,
             },
             tablet_refs,
+            None,
         );
         Ok(DecodedStarRocksScanPreparation {
             properties: BTreeMap::new(),

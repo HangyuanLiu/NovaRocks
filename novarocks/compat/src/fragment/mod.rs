@@ -25,6 +25,7 @@ mod result_io;
 mod service;
 mod statistic_result;
 
+pub(crate) use dependency::lake_meta_storage_resolver;
 pub(crate) use event_io::compat_fragment_event_sink;
 pub(crate) use io::brpc_exchange_transmitter;
 pub(crate) use lookup_io::brpc_fragment_lookup_client;

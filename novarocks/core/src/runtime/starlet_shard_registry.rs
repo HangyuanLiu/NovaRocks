@@ -27,7 +27,7 @@ use std::sync::{Mutex, OnceLock};
 /// `full_path` and operator path state to drift apart and resolve to the wrong
 /// object.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct S3StoreConfig {
+pub struct S3StoreConfig {
     pub(crate) endpoint: String,
     pub(crate) bucket: String,
     pub(crate) access_key_id: String,
@@ -37,6 +37,48 @@ pub(crate) struct S3StoreConfig {
 }
 
 impl S3StoreConfig {
+    pub fn new(
+        endpoint: impl Into<String>,
+        bucket: impl Into<String>,
+        access_key_id: impl Into<String>,
+        access_key_secret: impl Into<String>,
+        region: Option<String>,
+        enable_path_style_access: Option<bool>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            bucket: bucket.into(),
+            access_key_id: access_key_id.into(),
+            access_key_secret: access_key_secret.into(),
+            region,
+            enable_path_style_access,
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    pub fn access_key_secret(&self) -> &str {
+        &self.access_key_secret
+    }
+
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
+    }
+
+    pub const fn enable_path_style_access(&self) -> Option<bool> {
+        self.enable_path_style_access
+    }
+
     pub(crate) fn to_object_store_config(&self) -> novarocks_fs::ObjectStoreConfig {
         let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
             crate::fs::object_store_credentials::ObjectStoreCredentialsSource::StarletProfile,
@@ -74,9 +116,26 @@ impl S3StoreConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StarletShardInfo {
+pub struct StarletShardInfo {
     pub(crate) full_path: String,
     pub(crate) s3: Option<S3StoreConfig>,
+}
+
+impl StarletShardInfo {
+    pub fn new(full_path: impl Into<String>, s3: Option<S3StoreConfig>) -> Self {
+        Self {
+            full_path: full_path.into(),
+            s3,
+        }
+    }
+
+    pub fn full_path(&self) -> &str {
+        &self.full_path
+    }
+
+    pub fn s3(&self) -> Option<&S3StoreConfig> {
+        self.s3.as_ref()
+    }
 }
 
 #[derive(Default)]
@@ -135,9 +194,10 @@ pub(crate) fn upsert_many(entries: impl IntoIterator<Item = (i64, String)>) -> u
     upsert_many_infos(mapped)
 }
 
-pub(crate) fn upsert_many_infos(
-    entries: impl IntoIterator<Item = (i64, StarletShardInfo)>,
-) -> usize {
+/// Updates the neutral shard cache with metadata obtained from a control-plane
+/// provider. The caller supplies domain facts only; transport ownership stays
+/// outside the runtime.
+pub fn upsert_many_infos(entries: impl IntoIterator<Item = (i64, StarletShardInfo)>) -> usize {
     let Ok(mut guard) = shard_registry().lock() else {
         return 0;
     };

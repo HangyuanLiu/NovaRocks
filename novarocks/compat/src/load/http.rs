@@ -125,7 +125,11 @@ async fn handle_load_tracking_log(
         Some(log) => (StatusCode::OK, format!("{log}\n")).into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            format!("tracking log is not available for query_id={query_id}"),
+            format!(
+                "tracking log is not available for query_id={:016x}:{:016x}",
+                query_id.hi(),
+                query_id.lo()
+            ),
         )
             .into_response(),
     }

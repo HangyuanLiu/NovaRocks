@@ -30,8 +30,9 @@ use roaring::RoaringBitmap;
 use sha2::{Digest, Sha256};
 
 use crate::connector::starrocks::ObjectStoreProfile;
-use crate::connector::starrocks::lake::txn_log::{
-    ensure_rowset_segment_meta_consistency, normalize_rowset_shared_segments,
+use crate::connector::starrocks::lake::storage_domain::{
+    StorageDeleteFile, StorageDelvecMetadata, StorageDelvecPage, StorageFile, StorageRowset,
+    StorageTabletMetadata, StorageWriteOperation,
 };
 use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
@@ -42,15 +43,10 @@ use crate::formats::starrocks::metadata::{
 };
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
-use crate::formats::starrocks::writer::bundle_meta::next_rowset_id;
 use crate::formats::starrocks::writer::io::{read_bytes, write_bytes};
 use crate::formats::starrocks::writer::layout::{DATA_DIR, join_tablet_path};
 use crate::formats::starrocks::writer::read_bundle_parquet_snapshot_if_any;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::service::grpc_client::proto::starrocks::{
-    DelfileWithRowsetId, DelvecMetadataPb, DelvecPagePb, FileMetaPb, RowsetMetadataPb,
-    TabletMetadataPb, txn_log_pb,
-};
 
 const DELVEC_FORMAT_VERSION_V1: u8 = 0x01;
 const CRC32C_MASK_DELTA: u32 = 0xa282_ead8;
@@ -69,8 +65,8 @@ struct SegmentKeyRows {
 }
 
 pub(crate) fn apply_primary_key_write_log_to_metadata(
-    metadata: &mut TabletMetadataPb,
-    op_write: &txn_log_pb::OpWrite,
+    metadata: &mut StorageTabletMetadata,
+    op_write: &StorageWriteOperation,
     schema_id: i64,
     tablet_schema: &StarRocksTabletSchema,
     tablet_root_path: &str,
@@ -91,7 +87,7 @@ pub(crate) fn apply_primary_key_write_log_to_metadata(
         ));
     }
 
-    let mut maybe_new_rowset: Option<RowsetMetadataPb> = None;
+    let mut maybe_new_rowset: Option<StorageRowset> = None;
     let mut rowset_id_for_append: Option<u32> = None;
     if let Some(rowset) = op_write.rowset.as_ref() {
         if rowset.delete_predicate.is_some() {
@@ -113,11 +109,11 @@ pub(crate) fn apply_primary_key_write_log_to_metadata(
         let should_append_rowset = rowset.num_rows.unwrap_or(0) > 0 || !op_write.dels.is_empty();
         if should_append_rowset {
             let mut new_rowset = rowset.clone();
-            ensure_rowset_segment_meta_consistency(&new_rowset)?;
-            normalize_rowset_shared_segments(&mut new_rowset);
+            ensure_storage_rowset_segment_meta_consistency(&new_rowset)?;
+            normalize_storage_rowset_shared_segments(&mut new_rowset);
             let rowset_id = working
                 .next_rowset_id
-                .unwrap_or_else(|| next_rowset_id(&working.rowsets));
+                .unwrap_or_else(|| next_storage_rowset_id(&working.rowsets));
             new_rowset.id = Some(rowset_id);
             attach_op_write_delete_files_to_rowset(&mut new_rowset, rowset_id, op_write)?;
             rowset_id_for_append = Some(rowset_id);
@@ -338,7 +334,7 @@ fn primary_key_arrow_type(column: &StarRocksColumnSchema) -> Result<DataType, St
 }
 
 fn build_visible_primary_key_index(
-    metadata: &TabletMetadataPb,
+    metadata: &StorageTabletMetadata,
     tablet_schema: &StarRocksTabletSchema,
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
@@ -387,7 +383,7 @@ fn build_visible_primary_key_index(
 }
 
 fn scan_rowset_primary_key_rows(
-    rowset: &RowsetMetadataPb,
+    rowset: &StorageRowset,
     rowset_id: u32,
     tablet_schema: &StarRocksTabletSchema,
     tablet_root_path: &str,
@@ -743,9 +739,9 @@ fn encode_slice_key_bytes(
 }
 
 fn attach_op_write_delete_files_to_rowset(
-    rowset: &mut RowsetMetadataPb,
+    rowset: &mut StorageRowset,
     rowset_id: u32,
-    op_write: &txn_log_pb::OpWrite,
+    op_write: &StorageWriteOperation,
 ) -> Result<(), String> {
     if op_write.dels.is_empty() {
         return Ok(());
@@ -772,7 +768,7 @@ fn attach_op_write_delete_files_to_rowset(
         } else {
             None
         };
-        rowset.del_files.push(DelfileWithRowsetId {
+        rowset.del_files.push(StorageDeleteFile {
             name: Some(del_name.clone()),
             origin_rowset_id: Some(rowset_id),
             op_offset: Some(op_offset),
@@ -784,7 +780,7 @@ fn attach_op_write_delete_files_to_rowset(
 }
 
 fn load_delete_keys_from_op_write_files(
-    op_write: &txn_log_pb::OpWrite,
+    op_write: &StorageWriteOperation,
     tablet_root_path: &str,
     key_output_schema: &SchemaRef,
 ) -> Result<Vec<Vec<u8>>, String> {
@@ -836,7 +832,7 @@ fn decode_delete_keys_payload(
 }
 
 fn load_segment_delvec_bitmap(
-    metadata: &TabletMetadataPb,
+    metadata: &StorageTabletMetadata,
     tablet_root_path: &str,
     segment_id: u32,
 ) -> Result<RoaringBitmap, String> {
@@ -922,7 +918,7 @@ fn load_segment_delvec_bitmap(
 }
 
 fn persist_delvec_updates(
-    metadata: &mut TabletMetadataPb,
+    metadata: &mut StorageTabletMetadata,
     tablet_root_path: &str,
     apply_version: i64,
     txn_id: i64,
@@ -975,7 +971,7 @@ fn persist_delvec_updates(
         file_bytes.extend_from_slice(&payload);
         pages.insert(
             segment_id,
-            DelvecPagePb {
+            StorageDelvecPage {
                 version: Some(apply_version),
                 offset: Some(offset),
                 size: Some(size),
@@ -1000,7 +996,7 @@ fn persist_delvec_updates(
     let delvec_meta = working_delvec_meta(metadata);
     delvec_meta.version_to_file.insert(
         apply_version,
-        FileMetaPb {
+        StorageFile {
             name: Some(file_name),
             ..Default::default()
         },
@@ -1012,7 +1008,7 @@ fn persist_delvec_updates(
 }
 
 fn existing_delvec_file_name_for_version(
-    metadata: &TabletMetadataPb,
+    metadata: &StorageTabletMetadata,
     apply_version: i64,
 ) -> Result<Option<String>, String> {
     let Some(delvec_meta) = metadata.delvec_meta.as_ref() else {
@@ -1083,10 +1079,35 @@ fn deterministic_uuid_v4_from_seed(seed: &str) -> String {
     )
 }
 
-fn working_delvec_meta(metadata: &mut TabletMetadataPb) -> &mut DelvecMetadataPb {
+fn working_delvec_meta(metadata: &mut StorageTabletMetadata) -> &mut StorageDelvecMetadata {
     metadata
         .delvec_meta
-        .get_or_insert_with(DelvecMetadataPb::default)
+        .get_or_insert_with(StorageDelvecMetadata::default)
+}
+
+fn next_storage_rowset_id(rowsets: &[StorageRowset]) -> u32 {
+    rowsets
+        .iter()
+        .filter_map(|rowset| rowset.id)
+        .max()
+        .map(|id| id.saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn normalize_storage_rowset_shared_segments(rowset: &mut StorageRowset) {
+    rowset.shared_segments.resize(rowset.segments.len(), false);
+    rowset.shared_segments.truncate(rowset.segments.len());
+}
+
+fn ensure_storage_rowset_segment_meta_consistency(rowset: &StorageRowset) -> Result<(), String> {
+    if rowset.segment_metas.is_empty() || rowset.segment_metas.len() == rowset.segments.len() {
+        return Ok(());
+    }
+    Err(format!(
+        "rowset segment_metas/segments length mismatch: segment_metas={} segments={}",
+        rowset.segment_metas.len(),
+        rowset.segments.len()
+    ))
 }
 
 fn encode_delvec_bitmap(bitmap: &RoaringBitmap) -> Result<Vec<u8>, String> {
@@ -1133,4 +1154,37 @@ fn crc32c_mask(crc: u32) -> u32 {
 
 fn crc32c_unmask(masked: u32) -> u32 {
     masked.wrapping_sub(CRC32C_MASK_DELTA).rotate_right(17)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_key_domain_write_requires_rowset_for_delete_files() {
+        let mut metadata = StorageTabletMetadata::default();
+        let schema = StarRocksTabletSchema {
+            keys_type: Some(StarRocksKeysType::Primary),
+            ..StarRocksTabletSchema::default()
+        };
+        let error = apply_primary_key_write_log_to_metadata(
+            &mut metadata,
+            &StorageWriteOperation {
+                dels: vec!["delete-keys.dat".to_string()],
+                ..StorageWriteOperation::default()
+            },
+            1,
+            &schema,
+            "/tmp/tablet",
+            None,
+            1,
+            1,
+        )
+        .expect_err("delete files without a rowset are invalid");
+
+        assert_eq!(
+            error,
+            "primary key publish requires op_write.rowset when op_write.dels is non-empty"
+        );
+    }
 }

@@ -334,6 +334,12 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
+
+    /// Return the storage-tablet identity associated with a provider-neutral
+    /// scheduled split, when that split participates in lake row positioning.
+    fn storage_tablet_id(&self, _morsel: &ScanMorsel) -> Result<Option<i64>, String> {
+        Ok(None)
+    }
 }
 
 /// Instance-decoded, proto-free connector ranges handed to [`ScanSource::bind`].

@@ -21,10 +21,11 @@ use crate::connector::starrocks::lake::abort_policy::{
     AbortTxnLogSource, decide_abort_txn_log_source,
 };
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
+use crate::connector::starrocks::lake::storage_domain::StorageTransactionLog;
 use crate::connector::starrocks::lake::txn_log::{
     read_combined_txn_log_if_exists, read_txn_log_if_exists,
 };
-use crate::formats::starrocks::writer::io::delete_path_if_exists;
+use crate::formats::starrocks::writer::io::{delete_path_if_exists, read_bytes_if_exists};
 use crate::formats::starrocks::writer::layout::{
     DATA_DIR, combined_txn_log_file_path, join_tablet_path, txn_log_file_path,
 };
@@ -47,7 +48,19 @@ pub(crate) fn abort_one_tablet(
         match decide_abort_txn_log_source(txn_info) {
             AbortTxnLogSource::Combined => {
                 let combined_log_path = combined_txn_log_file_path(&runtime.root_path, txn_id)?;
-                if let Some(combined_log) = read_combined_txn_log_if_exists(&combined_log_path)? {
+                if let Some(provider) = runtime.storage_metadata_provider.as_deref() {
+                    if let Some(bytes) = read_bytes_if_exists(&combined_log_path)? {
+                        let combined_log = provider.decode_combined_transaction_log(&bytes)?;
+                        for txn_log in &combined_log.transaction_logs {
+                            if txn_log.tablet_id == Some(tablet_id) {
+                                abort_one_domain_txn_log(&runtime.root_path, tablet_id, txn_log)?;
+                            }
+                        }
+                        combined_logs_to_delete.insert(combined_log_path);
+                    }
+                } else if let Some(combined_log) =
+                    read_combined_txn_log_if_exists(&combined_log_path)?
+                {
                     for txn_log in &combined_log.txn_logs {
                         if txn_log.tablet_id == Some(tablet_id) {
                             abort_one_txn_log(&runtime.root_path, tablet_id, txn_log)?;
@@ -58,12 +71,74 @@ pub(crate) fn abort_one_tablet(
             }
             AbortTxnLogSource::PerTablet => {
                 let log_path = txn_log_file_path(&runtime.root_path, tablet_id, txn_id)?;
-                if let Some(txn_log) = read_txn_log_if_exists(&log_path)? {
+                if let Some(provider) = runtime.storage_metadata_provider.as_deref() {
+                    if let Some(bytes) = read_bytes_if_exists(&log_path)? {
+                        let txn_log = provider.decode_transaction_log(&bytes)?;
+                        abort_one_domain_txn_log(&runtime.root_path, tablet_id, &txn_log)?;
+                        delete_path_if_exists(&log_path)?;
+                    }
+                } else if let Some(txn_log) = read_txn_log_if_exists(&log_path)? {
                     abort_one_txn_log(&runtime.root_path, tablet_id, &txn_log)?;
                     delete_path_if_exists(&log_path)?;
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn abort_one_domain_txn_log(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    txn_log: &StorageTransactionLog,
+) -> Result<(), String> {
+    if let Some(op_write) = txn_log.write.as_ref() {
+        if let Some(rowset) = op_write.rowset.as_ref() {
+            for segment in &rowset.segments {
+                let path = join_tablet_path(tablet_root_path, &format!("{DATA_DIR}/{segment}"))?;
+                delete_path_if_exists(&path)?;
+            }
+        }
+        for del_file in &op_write.dels {
+            let path = join_tablet_path(tablet_root_path, &format!("{DATA_DIR}/{del_file}"))?;
+            delete_path_if_exists(&path)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(op_schema_change) = txn_log.schema_change.as_ref() {
+        if !op_schema_change.linked_segment.unwrap_or(false) {
+            for rowset in &op_schema_change.rowsets {
+                for segment in &rowset.segments {
+                    let path =
+                        join_tablet_path(tablet_root_path, &format!("{DATA_DIR}/{segment}"))?;
+                    delete_path_if_exists(&path)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(op_compaction) = txn_log.compaction.as_ref() {
+        if let Some(output_rowset) = op_compaction.output_rowset.as_ref() {
+            for segment in output_rowset
+                .segments
+                .iter()
+                .skip(op_compaction.new_segment_offset.unwrap_or(0).max(0) as usize)
+                .take(op_compaction.new_segment_count.unwrap_or(i32::MAX).max(0) as usize)
+            {
+                let path = join_tablet_path(tablet_root_path, &format!("{DATA_DIR}/{segment}"))?;
+                delete_path_if_exists(&path)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if txn_log.alter_metadata.is_some() || txn_log.replication.is_some() {
+        return Err(format!(
+            "abort_txn unsupported txn log operation: tablet_id={} txn_id={:?}",
+            tablet_id, txn_log.txn_id
+        ));
     }
     Ok(())
 }

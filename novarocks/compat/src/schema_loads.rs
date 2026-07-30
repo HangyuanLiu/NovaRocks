@@ -16,12 +16,12 @@
 // under the License.
 use chrono::NaiveDateTime;
 
-use crate::thrift::frontend_service;
-use crate::thrift::types;
+use novarocks::thrift::frontend_service;
+use novarocks::thrift::types;
 
-use super::SchemaScanContext;
-use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
-use super::frontend::with_frontend_client;
+use crate::schema_frontend::with_frontend_client;
+use novarocks::connector::schema::SchemaScanContext;
+use novarocks::connector::schema::{SchemaRow, SchemaValue, normalize_column_key};
 
 pub(crate) fn fetch_rows(
     ctx: &SchemaScanContext,
@@ -44,7 +44,9 @@ pub(crate) fn fetch_rows(
         None::<String>,
     );
     let response = with_frontend_client(fe_addr, |client| {
-        client.get_loads(request).map_err(|err| err.to_string())
+        client
+            .get_loads(request.clone())
+            .map_err(|err| err.to_string())
     })?;
     Ok(response
         .loads
