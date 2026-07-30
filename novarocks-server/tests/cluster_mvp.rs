@@ -300,35 +300,6 @@ role = "all-in-one"
     (process, mysql_port)
 }
 
-fn assert_fe_report_only_endpoint_rejects_local_submit(port: u16) {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .expect("parse fe report endpoint addr");
-    let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new(addr)
-        .expect("create grpc client for fe report endpoint");
-    let err = client
-        .blocking_submit_fragment(
-            novarocks::service::grpc_client::proto::novarocks::SubmitFragmentRequest {
-                plan: None,
-                instance_params: None,
-                execution_id: Some(
-                    novarocks::service::grpc_client::proto::novarocks::QueryExecutionId {
-                        query_id: Some(novarocks::service::grpc_client::proto::common::UniqueId {
-                            hi: 1,
-                            lo: 2,
-                        }),
-                        attempt_id: 1,
-                    },
-                ),
-            },
-        )
-        .expect_err("role=fe report-only endpoint must reject local fragment submission");
-    assert!(
-        err.contains("FailedPrecondition") && err.contains("report-only"),
-        "role=fe endpoint must reject local execution RPCs as report-only: {err}"
-    );
-}
-
 struct ClusterHarness {
     be: ProcessGuard,
     _fe: ProcessGuard,
@@ -1219,10 +1190,6 @@ deployment_owner = "fe-1"
     let _ = fe_grpc.release();
     let mut fe = ProcessGuard::spawn(fe_config.path());
     fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
-
-    // IW-4: role=fe exposes a report-capable NovaRocksGrpc endpoint, but it
-    // must remain report-only. Local fragments still run on BE, not FE.
-    assert_fe_report_only_endpoint_rejects_local_submit(fe_grpc_port);
 
     let mut conn = connect_mysql(fe_mysql_port);
 

@@ -26,6 +26,7 @@ pub(super) const FRAGMENT_EXECUTOR_FAILURE_MESSAGE: &str =
 const FRAGMENT_FAILURE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAGMENT_FAILURE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+#[cfg(test)]
 pub(super) fn start_with_configured_fragment_failure_trigger(
     dormant: DormantFragmentHandle,
     failure_injection_eligible: bool,
@@ -47,6 +48,7 @@ pub(super) fn claim_configured_fragment_failure_trigger(
     consume_fragment_failure_trigger(trigger.as_deref())
 }
 
+#[cfg(test)]
 pub(super) fn start_with_fragment_failure_trigger(
     dormant: DormantFragmentHandle,
     failure_trigger: Option<&Path>,

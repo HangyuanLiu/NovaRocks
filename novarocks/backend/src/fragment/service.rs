@@ -46,9 +46,10 @@ use novarocks_spi::connector::{
 };
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
+#[cfg(test)]
+use super::failure_injection::start_with_configured_fragment_failure_trigger;
 use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
-    start_with_configured_fragment_failure_trigger,
 };
 use crate::ConnectorExecutionHost;
 use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
