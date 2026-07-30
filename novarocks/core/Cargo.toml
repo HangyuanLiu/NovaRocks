@@ -79,6 +79,7 @@ bytes = "1"
 csv = "1"
 hashbrown = { version = "0.14", features = ["raw"] }
 prost = "0.13"
+prost-reflect = "0.14"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"

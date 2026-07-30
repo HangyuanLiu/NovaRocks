@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use prost::Message;
 
@@ -215,8 +215,8 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
         query_id: Some(id(1, 2)),
         fragment_instance_id: Some(id(3, 4)),
         backend_num: 1,
-        per_node_scan_ranges: BTreeMap::new(),
-        per_exch_num_senders: BTreeMap::new(),
+        per_node_scan_ranges: HashMap::new(),
+        per_exch_num_senders: HashMap::new(),
         destinations: vec![destination()],
         query_options: Some(query_options()),
         report_endpoint: Some("10.0.0.10:9070".to_string()),
@@ -247,13 +247,13 @@ fn instance_params_survives_proto_roundtrip() {
         query_id: Some(id(1, 2)),
         fragment_instance_id: Some(id(3, 4)),
         backend_num: 9,
-        per_node_scan_ranges: BTreeMap::from([(
+        per_node_scan_ranges: HashMap::from([(
             10,
             novarocks::ScanRangeList {
                 ranges: vec![file_scan_range()],
             },
         )]),
-        per_exch_num_senders: BTreeMap::from([(20, 3)]),
+        per_exch_num_senders: HashMap::from([(20, 3)]),
         destinations: vec![destination()],
         query_options: Some(query_options()),
         report_endpoint: Some("10.0.0.10:9070".to_string()),
@@ -280,8 +280,8 @@ fn stage_fragment_request_carries_native_fields_only() {
                 query_id: Some(id(1, 2)),
                 fragment_instance_id: Some(id(3, 4)),
                 backend_num: 1,
-                per_node_scan_ranges: BTreeMap::new(),
-                per_exch_num_senders: BTreeMap::new(),
+                per_node_scan_ranges: HashMap::new(),
+                per_exch_num_senders: HashMap::new(),
                 destinations: vec![destination()],
                 query_options: Some(query_options()),
                 report_endpoint: Some("10.0.0.10:9070".to_string()),

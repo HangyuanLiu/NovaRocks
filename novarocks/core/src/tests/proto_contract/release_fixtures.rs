@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use prost::Message;
 
@@ -343,13 +343,13 @@ fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
                 query_id: Some(id(1, 2)),
                 fragment_instance_id: Some(id(3, 4)),
                 backend_num: 9,
-                per_node_scan_ranges: BTreeMap::from([(
+                per_node_scan_ranges: HashMap::from([(
                     11,
                     novarocks::ScanRangeList {
                         ranges: vec![release_scan_range()],
                     },
                 )]),
-                per_exch_num_senders: BTreeMap::from([(12, 3)]),
+                per_exch_num_senders: HashMap::from([(12, 3)]),
                 destinations: vec![release_destination()],
                 query_options: Some(release_query_options()),
                 report_endpoint: Some("10.0.0.10:9070".to_string()),

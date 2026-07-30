@@ -20,7 +20,9 @@
 //! Typed query-stage contracts shared by the coordinator and backend lifecycle
 //! owners.  This module deliberately does not prepare or start fragments.
 
+use once_cell::sync::Lazy;
 use prost::Message;
+use prost_reflect::{DescriptorPool, DynamicMessage, MapKey, Value};
 use sha2::{Digest, Sha256};
 
 use std::collections::BTreeSet;
@@ -81,9 +83,9 @@ impl StageDigest {
         &self.0
     }
 
-    /// Computes the V1 digest over decoded semantic values. Native plan and
-    /// instance map fields are generated as `BTreeMap` values, so Prost's
-    /// encoding here is stable across the FE and BE process boundary. The
+    /// Computes the V1 digest over decoded semantic values. The canonical
+    /// encoder walks the native protobuf descriptor in field-number order,
+    /// sorts map keys, and preserves all ordinary repeated-field order. The
     /// outer StageFragments wire framing is deliberately not included.
     pub fn compute_v1(
         execution_id: QueryExecutionId,
@@ -116,24 +118,209 @@ impl StageDigest {
             let finst = fragment.fragment_instance_id();
             hasher.update(finst.hi.to_be_bytes());
             hasher.update(finst.lo.to_be_bytes());
-            hash_message(&mut hasher, fragment.plan());
-            hash_message(&mut hasher, fragment.instance_params());
+            hash_message(&mut hasher, "novarocks.plan.PlanFragment", fragment.plan())?;
+            hash_message(
+                &mut hasher,
+                "novarocks.InstanceParams",
+                fragment.instance_params(),
+            )?;
         }
         Ok(Self(hasher.finalize().into()))
     }
 }
 
-fn hash_message<M: Message>(hasher: &mut Sha256, message: &M) {
+static NATIVE_DESCRIPTOR_POOL: Lazy<DescriptorPool> = Lazy::new(|| {
+    DescriptorPool::decode(
+        include_bytes!(concat!(env!("OUT_DIR"), "/novarocks_descriptor.bin")).as_ref(),
+    )
+    .expect("native protobuf descriptor set is valid")
+});
+
+/// Hash a decoded protobuf message through the Stage-owned canonical semantic
+/// projection. This intentionally does not reuse protobuf wire bytes: map
+/// entry order is wire-insignificant while ordered repeated fields are not.
+fn hash_message<M: Message>(
+    hasher: &mut Sha256,
+    message_name: &str,
+    message: &M,
+) -> Result<(), QueryLifecycleError> {
+    let descriptor = NATIVE_DESCRIPTOR_POOL
+        .get_message_by_name(message_name)
+        .ok_or_else(|| {
+            QueryLifecycleError::new(
+                QueryLifecycleErrorCode::InvalidManifest,
+                format!("missing Stage digest descriptor for {message_name}"),
+            )
+        })?;
     let mut bytes = Vec::with_capacity(message.encoded_len());
-    message
-        .encode(&mut bytes)
-        .expect("Vec has enough capacity for prost encoding");
-    hasher.update(
-        u64::try_from(bytes.len())
-            .expect("message length fits u64")
-            .to_be_bytes(),
+    message.encode(&mut bytes).expect("Vec has enough capacity");
+    let dynamic = DynamicMessage::decode(descriptor, bytes.as_slice()).map_err(|error| {
+        QueryLifecycleError::new(
+            QueryLifecycleErrorCode::InvalidManifest,
+            format!("cannot decode {message_name} for Stage digest: {error}"),
+        )
+    })?;
+    canonical_message(hasher, &dynamic)
+}
+
+const VALUE_BOOL: u8 = 1;
+const VALUE_I32: u8 = 2;
+const VALUE_I64: u8 = 3;
+const VALUE_U32: u8 = 4;
+const VALUE_U64: u8 = 5;
+const VALUE_F32: u8 = 6;
+const VALUE_F64: u8 = 7;
+const VALUE_STRING: u8 = 8;
+const VALUE_BYTES: u8 = 9;
+const VALUE_ENUM: u8 = 10;
+const VALUE_MESSAGE: u8 = 11;
+const VALUE_LIST: u8 = 12;
+const VALUE_MAP: u8 = 13;
+
+fn canonical_message(
+    hasher: &mut Sha256,
+    message: &DynamicMessage,
+) -> Result<(), QueryLifecycleError> {
+    let mut fields = message.fields().collect::<Vec<_>>();
+    fields.sort_by_key(|(field, _)| field.number());
+    hash_u64(
+        hasher,
+        u64::try_from(fields.len()).expect("field count fits u64"),
+    );
+    for (field, value) in fields {
+        hash_u32(hasher, field.number());
+        canonical_value(hasher, value)?;
+    }
+    Ok(())
+}
+
+fn canonical_value(hasher: &mut Sha256, value: &Value) -> Result<(), QueryLifecycleError> {
+    match value {
+        Value::Bool(value) => {
+            hasher.update([VALUE_BOOL, u8::from(*value)]);
+        }
+        Value::I32(value) => {
+            hasher.update([VALUE_I32]);
+            hasher.update(value.to_be_bytes());
+        }
+        Value::I64(value) => {
+            hasher.update([VALUE_I64]);
+            hasher.update(value.to_be_bytes());
+        }
+        Value::U32(value) => {
+            hasher.update([VALUE_U32]);
+            hasher.update(value.to_be_bytes());
+        }
+        Value::U64(value) => {
+            hasher.update([VALUE_U64]);
+            hasher.update(value.to_be_bytes());
+        }
+        Value::F32(value) => {
+            if !value.is_finite() {
+                return Err(non_finite_stage_value("float"));
+            }
+            hasher.update([VALUE_F32]);
+            hasher.update(value.to_bits().to_be_bytes());
+        }
+        Value::F64(value) => {
+            if !value.is_finite() {
+                return Err(non_finite_stage_value("double"));
+            }
+            hasher.update([VALUE_F64]);
+            hasher.update(value.to_bits().to_be_bytes());
+        }
+        Value::String(value) => {
+            hasher.update([VALUE_STRING]);
+            hash_bytes(hasher, value.as_bytes());
+        }
+        Value::Bytes(value) => {
+            hasher.update([VALUE_BYTES]);
+            hash_bytes(hasher, value);
+        }
+        Value::EnumNumber(value) => {
+            hasher.update([VALUE_ENUM]);
+            hasher.update(value.to_be_bytes());
+        }
+        Value::Message(value) => {
+            hasher.update([VALUE_MESSAGE]);
+            canonical_message(hasher, value)?;
+        }
+        Value::List(values) => {
+            hasher.update([VALUE_LIST]);
+            hash_u64(
+                hasher,
+                u64::try_from(values.len()).expect("list length fits u64"),
+            );
+            // Repeated protobuf fields are semantic sequences unless their
+            // descriptor says they are maps (which use Value::Map below).
+            for value in values {
+                canonical_value(hasher, value)?;
+            }
+        }
+        Value::Map(values) => {
+            hasher.update([VALUE_MAP]);
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            hash_u64(
+                hasher,
+                u64::try_from(entries.len()).expect("map length fits u64"),
+            );
+            for (key, value) in entries {
+                canonical_map_key(hasher, key);
+                canonical_value(hasher, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_map_key(hasher: &mut Sha256, key: &MapKey) {
+    match key {
+        MapKey::Bool(value) => hasher.update([VALUE_BOOL, u8::from(*value)]),
+        MapKey::I32(value) => {
+            hasher.update([VALUE_I32]);
+            hasher.update(value.to_be_bytes());
+        }
+        MapKey::I64(value) => {
+            hasher.update([VALUE_I64]);
+            hasher.update(value.to_be_bytes());
+        }
+        MapKey::U32(value) => {
+            hasher.update([VALUE_U32]);
+            hasher.update(value.to_be_bytes());
+        }
+        MapKey::U64(value) => {
+            hasher.update([VALUE_U64]);
+            hasher.update(value.to_be_bytes());
+        }
+        MapKey::String(value) => {
+            hasher.update([VALUE_STRING]);
+            hash_bytes(hasher, value.as_bytes());
+        }
+    }
+}
+
+fn hash_u32(hasher: &mut Sha256, value: u32) {
+    hasher.update(value.to_be_bytes());
+}
+
+fn hash_u64(hasher: &mut Sha256, value: u64) {
+    hasher.update(value.to_be_bytes());
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hash_u64(
+        hasher,
+        u64::try_from(bytes.len()).expect("byte length fits u64"),
     );
     hasher.update(bytes);
+}
+
+fn non_finite_stage_value(kind: &str) -> QueryLifecycleError {
+    QueryLifecycleError::new(
+        QueryLifecycleErrorCode::InvalidManifest,
+        format!("Stage digest rejects non-finite {kind} values"),
+    )
 }
 
 /// One static native plan and its per-instance dynamic parameters.
@@ -575,6 +762,8 @@ fn fragment_instance_id(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::identity::AttemptId;
@@ -592,6 +781,38 @@ mod tests {
             plan::PlanFragment::default(),
             novarocks::InstanceParams {
                 fragment_instance_id: Some(crate::proto::common::UniqueId { hi: 1, lo }),
+                ..Default::default()
+            },
+        )
+        .expect("valid fragment")
+    }
+
+    fn fragment_with_maps(lo: i64, reverse_insert: bool) -> StageFragment {
+        let mut per_node_scan_ranges = HashMap::new();
+        let mut per_exch_num_senders = HashMap::new();
+        let entries = if reverse_insert {
+            [(9, 90), (3, 30)]
+        } else {
+            [(3, 30), (9, 90)]
+        };
+        for (key, value) in entries {
+            per_node_scan_ranges.insert(
+                key,
+                novarocks::ScanRangeList {
+                    ranges: vec![novarocks::ScanRangeParams {
+                        volume_id: Some(value),
+                        ..Default::default()
+                    }],
+                },
+            );
+            per_exch_num_senders.insert(key, value);
+        }
+        StageFragment::new(
+            plan::PlanFragment::default(),
+            novarocks::InstanceParams {
+                fragment_instance_id: Some(crate::proto::common::UniqueId { hi: 1, lo }),
+                per_node_scan_ranges,
+                per_exch_num_senders,
                 ..Default::default()
             },
         )
@@ -648,5 +869,87 @@ mod tests {
                 .expect("digest"),
             StageDigest::compute_v1(execution_id, init_digest, &[second, first]).expect("digest")
         );
+    }
+
+    #[test]
+    fn digest_v1_sorts_maps_but_preserves_repeated_semantic_order() {
+        let execution_id = execution_id();
+        let init_digest = ParticipantManifestDigest::new([2; 32]);
+        assert_eq!(
+            StageDigest::compute_v1(execution_id, init_digest, &[fragment_with_maps(3, false)],)
+                .expect("digest"),
+            StageDigest::compute_v1(execution_id, init_digest, &[fragment_with_maps(3, true)],)
+                .expect("digest")
+        );
+
+        let mut first = fragment(3).into_parts().1;
+        first.destinations = vec![
+            novarocks::Destination {
+                endpoint: "be-a:9020".to_string(),
+                ..Default::default()
+            },
+            novarocks::Destination {
+                endpoint: "be-b:9020".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut second = first.clone();
+        second.destinations.reverse();
+        let first = StageFragment::new(plan::PlanFragment::default(), first).expect("fragment");
+        let second = StageFragment::new(plan::PlanFragment::default(), second).expect("fragment");
+        assert_ne!(
+            StageDigest::compute_v1(execution_id, init_digest, &[first]).expect("digest"),
+            StageDigest::compute_v1(execution_id, init_digest, &[second]).expect("digest")
+        );
+    }
+
+    #[test]
+    fn digest_v1_preserves_optional_presence_and_rejects_non_finite_values() {
+        let execution_id = execution_id();
+        let init_digest = ParticipantManifestDigest::new([2; 32]);
+        let mut absent = fragment(3).into_parts().1;
+        absent.query_options = Some(novarocks::QueryOptions::default());
+        let mut present = absent.clone();
+        present
+            .query_options
+            .as_mut()
+            .expect("query options")
+            .runtime_filter_wait_timeout_ms = Some(0);
+        let absent = StageFragment::new(plan::PlanFragment::default(), absent).expect("fragment");
+        let present = StageFragment::new(plan::PlanFragment::default(), present).expect("fragment");
+        assert_ne!(
+            StageDigest::compute_v1(execution_id, init_digest, &[absent]).expect("digest"),
+            StageDigest::compute_v1(execution_id, init_digest, &[present]).expect("digest")
+        );
+
+        let mut non_finite = fragment(3).into_parts().1;
+        non_finite.per_node_scan_ranges.insert(
+            1,
+            novarocks::ScanRangeList {
+                ranges: vec![novarocks::ScanRangeParams {
+                    range: Some(novarocks::ScanRange {
+                        kind: Some(novarocks::scan_range::Kind::File(
+                            novarocks::FileScanRange {
+                                file_pruning_min_max_values: HashMap::from([(
+                                    1,
+                                    novarocks::FilePruningMinMaxValue {
+                                        min_float_value: Some(f64::NAN),
+                                        ..Default::default()
+                                    },
+                                )]),
+                                ..Default::default()
+                            },
+                        )),
+                    }),
+                    ..Default::default()
+                }],
+            },
+        );
+        let non_finite =
+            StageFragment::new(plan::PlanFragment::default(), non_finite).expect("fragment");
+        let error = StageDigest::compute_v1(execution_id, init_digest, &[non_finite])
+            .expect_err("NaN must not enter a Stage digest");
+        assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+        assert!(error.detail().contains("non-finite"));
     }
 }

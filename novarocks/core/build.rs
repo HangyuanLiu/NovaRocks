@@ -584,13 +584,12 @@ static C++ runtime is required.",
         .build_client(true)
         .build_server(true)
         .codec_path("crate::protocol::native::codec::NativeProstCodec")
-        // QLC-3 hashes decoded native plans. Keep map iteration stable in the
-        // two payload families that participate in that digest; this does not
-        // alter their protobuf wire schema or the order of repeated fields.
-        .btree_map([
-            ".novarocks.InstanceParams.per_node_scan_ranges",
-            ".novarocks.InstanceParams.per_exch_num_senders",
-        ])
+        // QLC-3's Stage digest owns its own descriptor-driven canonical
+        // projection. Keep generated message maps as their ordinary Rust
+        // HashMap APIs so digest concerns never leak into general proto use.
+        .file_descriptor_set_path(
+            Path::new(&env::var("OUT_DIR").expect("OUT_DIR")).join("novarocks_descriptor.bin"),
+        )
         .compile_protos(&novarocks_protos, &[NOVAROCKS_IDL_DIR])
         .expect("compile novarocks common + expr + filter + plan + service protos");
 

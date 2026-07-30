@@ -17,7 +17,7 @@
 
 //! Deterministic instance sidecar-to-protobuf mapping for the native boundary.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use crate::common::types::UniqueId;
 use crate::exec::spill::{SpillConfig, SpillMode};
@@ -53,7 +53,7 @@ pub(crate) fn encode_instance_params(
                     },
                 ))
             })
-            .collect::<Result<BTreeMap<_, _>, String>>()?,
+            .collect::<Result<HashMap<_, _>, String>>()?,
         per_exch_num_senders: placement
             .per_exch_num_senders
             .iter()
