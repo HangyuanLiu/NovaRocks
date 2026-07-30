@@ -2281,6 +2281,12 @@ pub fn substitute_user_variables(
     sql: &str,
     assignments: &[(String, String)],
 ) -> Result<String, String> {
+    // Most frontend queries have no session user variables. Keep that common
+    // path byte-for-byte intact instead of scanning quoted UTF-8 text.
+    if assignments.is_empty() {
+        return Ok(sql.to_string());
+    }
+
     let assignment_map = assignments
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -3132,6 +3138,14 @@ mod tests {
             normalized,
             "SELECT /*+ set_user_variable(@v1 = 0.5, @v2 = 4096) */ 0.5, 4096 + 1"
         );
+    }
+
+    #[test]
+    fn substitute_user_variables_preserves_utf8_without_assignments() {
+        let sql = "SELECT '中文', 'Grüße'";
+        let rewritten = super::substitute_user_variables(sql, &[])
+            .expect("empty user-variable mapping must preserve query text");
+        assert_eq!(rewritten, sql);
     }
 
     #[test]
