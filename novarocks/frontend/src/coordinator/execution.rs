@@ -294,17 +294,9 @@ struct QueryBackendServices {
 }
 
 #[cfg(test)]
-pub(crate) fn unavailable_lifecycle_transport_for_test() -> Arc<dyn QueryLifecycleTransport> {
-    Arc::new(UnavailableLifecycleTransportForTest)
-}
-
-#[cfg(test)]
 pub(crate) fn ready_lifecycle_transport_for_test() -> Arc<dyn QueryLifecycleTransport> {
     Arc::new(ReadyLifecycleTransportForTest)
 }
-
-#[cfg(test)]
-struct UnavailableLifecycleTransportForTest;
 
 #[cfg(test)]
 struct ReadyLifecycleTransportForTest;
@@ -447,54 +439,6 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
             ),
         )
     }
-}
-
-#[cfg(test)]
-impl QueryLifecycleTransport for UnavailableLifecycleTransportForTest {
-    fn init_query(
-        &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        _request: novarocks::query_execution::lifecycle::QueryInitRequest,
-        _timeout: Duration,
-    ) -> Result<
-        novarocks::query_execution::lifecycle::QueryInitAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
-        Err(unavailable_lifecycle_transport_error_for_test())
-    }
-
-    fn attach_control(
-        &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        _attach: novarocks::query_execution::lifecycle::QueryControlAttach,
-        _timeout: Duration,
-    ) -> Result<
-        Arc<dyn novarocks::query_execution::lifecycle::QueryControlSession>,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
-        Err(unavailable_lifecycle_transport_error_for_test())
-    }
-
-    fn abort_query(
-        &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        _request: novarocks::query_execution::lifecycle::QueryAbortRequest,
-        _timeout: Duration,
-    ) -> Result<
-        novarocks::query_execution::lifecycle::QueryTerminationAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
-        Err(unavailable_lifecycle_transport_error_for_test())
-    }
-}
-
-#[cfg(test)]
-fn unavailable_lifecycle_transport_error_for_test()
--> novarocks::query_execution::lifecycle::QueryLifecycleTransportError {
-    novarocks::query_execution::lifecycle::QueryLifecycleTransportError::new(
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportErrorKind::Unavailable,
-        "test lifecycle transport was not injected",
-    )
 }
 
 #[cfg(test)]
