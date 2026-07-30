@@ -928,7 +928,7 @@ mod tests {
     fn sealed_pure_cycle_round_trips_batch_activation_and_rejects_forged_blocking() {
         let plan = seal_draft(cycle_draft(JoinKind::Inner)).expect("pure cycle draft seals");
         let registry = crate::connector::ConnectorRegistry::new();
-        let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = crate::query_execution::preparation::prepare_fragments(
             &plan,
             &registry,

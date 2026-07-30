@@ -184,7 +184,7 @@ fn real_execution_artifacts() -> (
         runtime_filter_graph: Default::default(),
     };
     let registry = crate::connector::ConnectorRegistry::new();
-    let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &plan,
         &registry,

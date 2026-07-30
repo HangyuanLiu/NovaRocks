@@ -1401,7 +1401,7 @@ mod tests {
         .expect("coalesce plan");
         let optimized_tree = optimize_for_test(plan);
         let connectors = crate::connector::ConnectorRegistry::default();
-        let controls = crate::connector::LegacyFixtureControlResolver::new(connectors.clone());
+        let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
 
         let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
             .and_then(crate::sql::planner::pipeline::build_distributed_plan)

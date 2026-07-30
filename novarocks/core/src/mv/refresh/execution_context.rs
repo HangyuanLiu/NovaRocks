@@ -1410,7 +1410,7 @@ mod tests {
                     &refresh_ctx.rewrite,
                 );
                 let connectors = crate::connector::ConnectorRegistry::default();
-                let controls = crate::connector::LegacyFixtureControlResolver::new(connectors.clone());
+                let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
                 let physical_plan =
                     crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
                         .expect("convert optimizer physical plan");

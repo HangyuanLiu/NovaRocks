@@ -59,7 +59,7 @@ fn build_for_test(
     String,
 > {
     let _ = request.catalog;
-    let controls = crate::connector::LegacyFixtureControlResolver::new(request.connectors.clone());
+    let controls = crate::connector::FixtureControlResolver::new(request.connectors.clone());
     let prepared = prepare_fragments(
         request.distributed_plan,
         request.connectors,

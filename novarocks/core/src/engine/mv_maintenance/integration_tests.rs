@@ -174,7 +174,7 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                 catalog,
-                Arc::new(crate::connector::LegacyFixtureControlResolver::new(
+                Arc::new(crate::connector::FixtureControlResolver::new(
                     connectors.clone(),
                 )),
             ));

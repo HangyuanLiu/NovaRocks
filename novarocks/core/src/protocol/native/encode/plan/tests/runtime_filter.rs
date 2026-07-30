@@ -168,7 +168,7 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
         .expect("build Graph-owned RF plan");
     assert_eq!(distributed.runtime_filter_graph().channel_count(), 1);
     let registry = crate::connector::ConnectorRegistry::new();
-    let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &registry,
@@ -526,7 +526,7 @@ fn native_encoder_emits_explicit_empty_fragment_table() {
     let distributed = two_fragment_stream_plan_for_test();
     assert!(distributed.runtime_filter_graph().is_empty());
     let registry = crate::connector::ConnectorRegistry::new();
-    let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &registry,

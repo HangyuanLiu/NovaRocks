@@ -62,7 +62,7 @@ fn scan_preparation_propagates_caller_cancellation() {
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(true)))
             .expect("cancelled request context");
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
-    let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let err = match super::super::prepare_scan_bindings(
         &plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot)),
         &registry,
@@ -103,7 +103,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
     let context = crate::connector::test_request_context();
-    let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
 
     collect_scan_bindings(
         0,

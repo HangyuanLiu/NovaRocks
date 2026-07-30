@@ -21,8 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstance,
-    ConnectorInstanceDescriptor, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
 };
 
 /// Largest provider-owned declaration accepted by the process binding control
@@ -54,15 +53,6 @@ impl Default for ConnectorInstanceIncarnation {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A redacted, bounded declaration used to install the same logical instance
-/// into another BE process before fragment dispatch.
-#[derive(Clone, Eq, PartialEq)]
-pub struct ConnectorInstanceDeclaration {
-    descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
-    payload: Bytes,
 }
 
 /// Bounded provider declaration carried only by the execution-binding control
@@ -138,86 +128,6 @@ impl fmt::Debug for ConnectorExecutionDeclaration {
     }
 }
 
-impl ConnectorInstanceDeclaration {
-    pub fn try_new(
-        descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
-        payload: Bytes,
-    ) -> Result<Self, ConnectorError> {
-        if payload.len() > MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                format!(
-                    "connector instance declaration payload exceeds {MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES} bytes"
-                ),
-            ));
-        }
-        Ok(Self {
-            descriptor,
-            incarnation,
-            payload,
-        })
-    }
-
-    pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
-        &self.descriptor
-    }
-
-    pub fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
-    }
-
-    pub fn payload(&self) -> &Bytes {
-        &self.payload
-    }
-
-    /// Stable content digest for idempotent install comparison. It is safe to
-    /// log this digest; the provider payload itself intentionally is not.
-    pub fn digest(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(self.descriptor.provider_id.as_str().as_bytes());
-        hasher.update([0]);
-        hasher.update(self.descriptor.instance_id.as_str().as_bytes());
-        hasher.update([0]);
-        hasher.update(self.incarnation.to_bytes());
-        hasher.update(self.payload.as_ref());
-        hasher.finalize().into()
-    }
-}
-
-impl fmt::Debug for ConnectorInstanceDeclaration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ConnectorInstanceDeclaration")
-            .field("descriptor", &self.descriptor)
-            .field("incarnation", &self.incarnation)
-            .field("payload_len", &self.payload.len())
-            .finish()
-    }
-}
-
-/// Capability of a full/planning instance to describe the corresponding
-/// read-only instance that must be installed into remote BE processes.
-pub trait ConnectorInstanceDistribution: Send + Sync {
-    fn declaration(
-        &self,
-        context: &ConnectorRequestContext,
-    ) -> Result<ConnectorInstanceDeclaration, ConnectorError>;
-}
-
-/// Startup-composed provider factory for a read-only connector instance.
-/// Implementations resolve credentials and clients only from local process
-/// bindings, never from the declaration payload.
-pub trait ConnectorInstanceInstaller: Send + Sync {
-    fn provider_id(&self) -> &ConnectorProviderId;
-
-    fn install(
-        &self,
-        declaration: &ConnectorInstanceDeclaration,
-        context: &ConnectorRequestContext,
-    ) -> Result<ConnectorInstance, ConnectorError>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,7 +142,7 @@ mod tests {
 
     #[test]
     fn declaration_debug_is_redacted_and_digest_is_stable() {
-        let declaration = ConnectorInstanceDeclaration::try_new(
+        let declaration = ConnectorExecutionDeclaration::try_new(
             descriptor(),
             ConnectorInstanceIncarnation::from_bytes([7; 16]),
             Bytes::from_static(b"secret=must-not-appear"),
@@ -245,7 +155,7 @@ mod tests {
 
     #[test]
     fn declaration_rejects_oversized_payload() {
-        let error = ConnectorInstanceDeclaration::try_new(
+        let error = ConnectorExecutionDeclaration::try_new(
             descriptor(),
             ConnectorInstanceIncarnation::from_bytes([8; 16]),
             Bytes::from(vec![

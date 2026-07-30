@@ -569,7 +569,7 @@ mod tests {
                 .is_none()
         );
         let registry = crate::connector::ConnectorRegistry::new();
-        let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
             &registry,
@@ -595,7 +595,7 @@ mod tests {
             &mut plan, 7,
         );
         let registry = crate::connector::ConnectorRegistry::new();
-        let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let error = match prepare_fragments(
             &plan,
             &registry,
@@ -625,7 +625,7 @@ mod tests {
             },
         );
         let registry = crate::connector::ConnectorRegistry::new();
-        let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
             &registry,

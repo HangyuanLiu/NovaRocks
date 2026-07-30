@@ -43,16 +43,18 @@ pub(crate) use starrocks_table_stub::{
     runtime_registered,
 };
 
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorInstanceInstaller, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution,
+    ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution,
 };
 
 struct RequestConnectorCancellation {
@@ -525,78 +527,21 @@ impl ConnectorRegistry {
     }
 }
 
-/// Test-only bridge for fixtures which still construct the pre-SPI-4 aggregate
-/// directly. Production code never compiles this adapter: it is deliberately
-/// confined to unit fixtures while those fixtures migrate to explicit control
-/// bindings.
+/// Test-only resolver for fixtures that explicitly register a control binding.
 #[cfg(test)]
-pub(crate) struct LegacyFixtureControlResolver {
+pub(crate) struct FixtureControlResolver {
     registry: ConnectorRegistry,
 }
 
 #[cfg(test)]
-impl LegacyFixtureControlResolver {
+impl FixtureControlResolver {
     pub(crate) fn new(registry: ConnectorRegistry) -> Self {
         Self { registry }
     }
 }
 
 #[cfg(test)]
-#[cfg(any())]
-impl novarocks_spi::connector::ConnectorControlResolver for LegacyFixtureControlResolver {
-    fn acquire_current(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorControlPlanningLease,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        use novarocks_spi::connector::{
-            ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
-            ConnectorExecutionDistribution, ConnectorMetadata, ConnectorScanPlanning,
-        };
-
-        let instance = self
-            .registry
-            .connector_instance(instance_id)
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::NotFound, error.to_string())
-            })?;
-        let descriptor = instance.descriptor().clone();
-        let metadata: Arc<dyn ConnectorMetadata> =
-            instance.metadata().cloned().unwrap_or_else(|| {
-                Arc::new(LegacyFixtureUnavailableMetadata {
-                    instance_id: descriptor.instance_id.clone(),
-                })
-            });
-        let distribution = instance.distribution().cloned().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "legacy fixture connector instance has no distribution capability",
-            )
-        })?;
-        let incarnation = distribution
-            .declaration(&test_request_context())?
-            .incarnation();
-        let planning: Arc<dyn ConnectorScanPlanning> = Arc::new(LegacyFixturePlanning {
-            instance_id: descriptor.instance_id.clone(),
-            read: instance.read().clone(),
-        });
-        let execution_distribution: Arc<dyn ConnectorExecutionDistribution> =
-            Arc::new(LegacyFixtureDistribution { distribution });
-        let binding = ConnectorControlBinding::try_new(
-            descriptor,
-            incarnation,
-            metadata,
-            planning,
-            execution_distribution,
-        )?;
-        Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(Arc::new(binding), || {}))
-    }
-}
-
-#[cfg(test)]
-impl novarocks_spi::connector::ConnectorControlResolver for LegacyFixtureControlResolver {
+impl novarocks_spi::connector::ConnectorControlResolver for FixtureControlResolver {
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -606,116 +551,6 @@ impl novarocks_spi::connector::ConnectorControlResolver for LegacyFixtureControl
     > {
         self.registry.acquire_fixture_control(instance_id)
     }
-}
-
-#[cfg(test)]
-struct LegacyFixturePlanning {
-    instance_id: ConnectorInstanceId,
-    read: Arc<dyn novarocks_spi::connector::ConnectorRead>,
-}
-
-#[cfg(test)]
-impl novarocks_spi::connector::ConnectorScanPlanning for LegacyFixturePlanning {
-    fn instance_id(&self) -> &ConnectorInstanceId {
-        &self.instance_id
-    }
-
-    fn begin_scan(
-        &self,
-        table: &novarocks_spi::connector::ConnectorTableHandle,
-        request: novarocks_spi::connector::ConnectorBeginScanRequest,
-    ) -> Result<novarocks_spi::connector::ConnectorScan, novarocks_spi::connector::ConnectorError>
-    {
-        self.read.begin_scan(table, request)
-    }
-
-    fn plan_splits(
-        &self,
-        scan: &novarocks_spi::connector::ConnectorScanHandle,
-        request: novarocks_spi::connector::ConnectorSplitPlanningRequest,
-    ) -> Result<
-        Vec<novarocks_spi::connector::ConnectorSplit>,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        self.read.plan_splits(scan, request)
-    }
-}
-
-#[cfg(test)]
-struct LegacyFixtureDistribution {
-    distribution: Arc<dyn novarocks_spi::connector::ConnectorInstanceDistribution>,
-}
-
-#[cfg(test)]
-impl novarocks_spi::connector::ConnectorExecutionDistribution for LegacyFixtureDistribution {
-    fn declaration(
-        &self,
-        context: &ConnectorRequestContext,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorExecutionDeclaration,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let declaration = self.distribution.declaration(context)?;
-        novarocks_spi::connector::ConnectorExecutionDeclaration::try_new(
-            declaration.descriptor().clone(),
-            declaration.incarnation(),
-            declaration.payload().clone(),
-        )
-    }
-}
-
-#[cfg(test)]
-struct LegacyFixtureUnavailableMetadata {
-    instance_id: ConnectorInstanceId,
-}
-
-#[cfg(test)]
-impl novarocks_spi::connector::ConnectorMetadata for LegacyFixtureUnavailableMetadata {
-    fn instance_id(&self) -> &ConnectorInstanceId {
-        &self.instance_id
-    }
-
-    fn namespace_exists(
-        &self,
-        _: novarocks_spi::connector::ConnectorNamespaceRequest,
-    ) -> Result<bool, novarocks_spi::connector::ConnectorError> {
-        Err(legacy_fixture_metadata_error())
-    }
-
-    fn table_exists(
-        &self,
-        _: novarocks_spi::connector::ConnectorTableRequest,
-    ) -> Result<bool, novarocks_spi::connector::ConnectorError> {
-        Err(legacy_fixture_metadata_error())
-    }
-
-    fn list_tables(
-        &self,
-        _: novarocks_spi::connector::ConnectorListTablesRequest,
-    ) -> Result<
-        Vec<novarocks_spi::connector::ConnectorTableIdentity>,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(legacy_fixture_metadata_error())
-    }
-
-    fn load_table(
-        &self,
-        _: novarocks_spi::connector::ConnectorTableRequest,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorTableMetadata,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(legacy_fixture_metadata_error())
-    }
-}
-
-#[cfg(test)]
-fn legacy_fixture_metadata_error() -> novarocks_spi::connector::ConnectorError {
-    novarocks_spi::connector::ConnectorError::new(
-        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-        "legacy fixture has no metadata capability",
-    )
 }
 
 /// Compose the BE-only installers used by the execution host. The resulting

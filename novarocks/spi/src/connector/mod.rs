@@ -22,7 +22,6 @@ mod error;
 mod execution;
 mod handle;
 mod identity;
-mod instance;
 mod metadata;
 mod read;
 
@@ -34,8 +33,7 @@ pub use control::{
     ConnectorControlResolver, ConnectorExecutionDistribution, ConnectorScanPlanning,
 };
 pub use distribution::{
-    ConnectorExecutionDeclaration, ConnectorInstanceDeclaration, ConnectorInstanceDistribution,
-    ConnectorInstanceIncarnation, ConnectorInstanceInstaller,
+    ConnectorExecutionDeclaration, ConnectorInstanceIncarnation,
     MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
 };
 pub use error::{ConnectorError, ConnectorErrorKind};
@@ -48,7 +46,6 @@ pub use handle::{
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
-pub use instance::ConnectorInstance;
 pub use metadata::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
     ConnectorNamespaceRequest, ConnectorTableIdentity, ConnectorTableMetadata,
@@ -56,6 +53,6 @@ pub use metadata::{
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
-    ConnectorOpenReaderRequest, ConnectorRead, ConnectorReadSelector,
-    ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorSplitPlanningRequest,
+    ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorReaderMetricsSnapshot,
+    ConnectorScan, ConnectorSplitPlanningRequest,
 };

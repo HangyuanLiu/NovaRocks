@@ -20,10 +20,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use super::{
-    ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorScanHandle,
-    ConnectorSplit, ConnectorTableHandle,
-};
+use super::{ConnectorError, ConnectorRequestContext, ConnectorScanHandle};
 
 #[derive(Clone)]
 pub struct ConnectorScan {
@@ -128,28 +125,6 @@ impl ConnectorReaderMetricsSnapshot {
                 .saturating_sub(previous.delayed_materialization_ranges),
         }
     }
-}
-
-pub trait ConnectorRead: Send + Sync {
-    fn instance_id(&self) -> &ConnectorInstanceId;
-
-    fn begin_scan(
-        &self,
-        table: &ConnectorTableHandle,
-        request: ConnectorBeginScanRequest,
-    ) -> Result<ConnectorScan, ConnectorError>;
-
-    fn plan_splits(
-        &self,
-        scan: &ConnectorScanHandle,
-        request: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError>;
-
-    fn open_reader(
-        &self,
-        split: &ConnectorSplit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError>;
 }
 
 pub trait ConnectorBatchReader: Send {

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorExecutionBinding, ConnectorInstance, ConnectorOpenReaderRequest,
+    ConnectorBatchReader, ConnectorExecutionBinding, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot, ConnectorSplit,
 };
 
@@ -598,7 +598,7 @@ impl Drop for ConnectorBatchReaderIter {
 /// The source owns no provider-specific type.  Wire decoders resolve the
 /// opaque split to its typed host instance, while core owns scheduling and
 /// adapts the returned Arrow batches into `Chunk`s.
-pub(crate) struct ConnectorReadScanSource {
+pub struct ConnectorReadScanSource {
     binding: ConnectorReadBinding,
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
@@ -609,23 +609,18 @@ pub(crate) struct ConnectorReadScanSource {
 
 #[derive(Clone)]
 enum ConnectorReadBinding {
-    /// Transitional source used only while non-Iceberg compat/legacy readers
-    /// migrate in SPI-4B/4C. Native ConnectorReadSource never selects it.
-    Legacy(Arc<ConnectorInstance>),
     Execution(Arc<ConnectorExecutionBinding>),
 }
 
 impl ConnectorReadBinding {
     fn instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
         match self {
-            Self::Legacy(instance) => &instance.descriptor().instance_id,
             Self::Execution(binding) => &binding.key().instance_id,
         }
     }
 
     fn provider_id(&self) -> &str {
         match self {
-            Self::Legacy(instance) => instance.descriptor().provider_id.as_str(),
             Self::Execution(binding) => binding.provider_id().as_str(),
         }
     }
@@ -636,21 +631,20 @@ impl ConnectorReadBinding {
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, novarocks_spi::connector::ConnectorError> {
         match self {
-            Self::Legacy(instance) => instance.read().open_reader(split, request),
             Self::Execution(binding) => binding.read().open_reader(split, request),
         }
     }
 }
 
 impl ConnectorReadScanSource {
-    pub fn new(
-        instance: Arc<ConnectorInstance>,
+    pub(crate) fn new(
+        binding: Arc<ConnectorExecutionBinding>,
         splits: Vec<ConnectorSplit>,
         request: ConnectorOpenReaderRequest,
         chunk_schema: ChunkSchemaRef,
     ) -> Self {
         Self {
-            binding: ConnectorReadBinding::Legacy(instance),
+            binding: ConnectorReadBinding::Execution(binding),
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(
                 plain_scheduled(splits),
                 false,
@@ -662,8 +656,8 @@ impl ConnectorReadScanSource {
         }
     }
 
-    pub fn new_with_incremental(
-        instance: Arc<ConnectorInstance>,
+    pub(crate) fn new_with_incremental(
+        binding: Arc<ConnectorExecutionBinding>,
         splits: Vec<ConnectorSplit>,
         request: ConnectorOpenReaderRequest,
         chunk_schema: ChunkSchemaRef,
@@ -671,7 +665,7 @@ impl ConnectorReadScanSource {
         has_more: bool,
     ) -> Self {
         Self {
-            binding: ConnectorReadBinding::Legacy(instance),
+            binding: ConnectorReadBinding::Execution(binding),
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(
                 plain_scheduled(splits),
                 has_more,
@@ -683,42 +677,7 @@ impl ConnectorReadScanSource {
         }
     }
 
-    pub fn new_scheduled(
-        instance: Arc<ConnectorInstance>,
-        scheduled: Vec<ConnectorScheduledSplit>,
-        request: ConnectorOpenReaderRequest,
-        chunk_schema: ChunkSchemaRef,
-    ) -> Self {
-        Self {
-            binding: ConnectorReadBinding::Legacy(instance),
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
-            request,
-            chunk_schema,
-            incremental: None,
-            reader_group: Arc::new(ConnectorReaderGroup::default()),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_scheduled_with_incremental(
-        instance: Arc<ConnectorInstance>,
-        scheduled: Vec<ConnectorScheduledSplit>,
-        request: ConnectorOpenReaderRequest,
-        chunk_schema: ChunkSchemaRef,
-        incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
-        has_more: bool,
-    ) -> Self {
-        Self {
-            binding: ConnectorReadBinding::Legacy(instance),
-            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
-            request,
-            chunk_schema,
-            incremental,
-            reader_group: Arc::new(ConnectorReaderGroup::default()),
-        }
-    }
-
-    pub(crate) fn new_scheduled_execution(
+    pub(crate) fn new_scheduled(
         binding: Arc<ConnectorExecutionBinding>,
         scheduled: Vec<ConnectorScheduledSplit>,
         request: ConnectorOpenReaderRequest,
@@ -735,7 +694,42 @@ impl ConnectorReadScanSource {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_scheduled_execution_with_incremental(
+    pub(crate) fn new_scheduled_with_incremental(
+        binding: Arc<ConnectorExecutionBinding>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
+        has_more: bool,
+    ) -> Self {
+        Self {
+            binding: ConnectorReadBinding::Execution(binding),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
+            request,
+            chunk_schema,
+            incremental,
+            reader_group: Arc::new(ConnectorReaderGroup::default()),
+        }
+    }
+
+    pub fn new_scheduled_execution(
+        binding: Arc<ConnectorExecutionBinding>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        Self {
+            binding: ConnectorReadBinding::Execution(binding),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
+            request,
+            chunk_schema,
+            incremental: None,
+            reader_group: Arc::new(ConnectorReaderGroup::default()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_scheduled_execution_with_incremental(
         binding: Arc<ConnectorExecutionBinding>,
         scheduled: Vec<ConnectorScheduledSplit>,
         request: ConnectorOpenReaderRequest,

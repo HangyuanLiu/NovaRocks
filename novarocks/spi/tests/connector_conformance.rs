@@ -24,45 +24,34 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::conformance::assert_batch_reader_contract;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError,
-    ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
-    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorReaderMetricsSnapshot,
-    ConnectorScan, ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
 };
 
-struct OwnerRead {
-    instance_id: ConnectorInstanceId,
+struct OwnerExecution {
+    key: ConnectorExecutionBindingKey,
 }
 
-impl OwnerRead {
+impl OwnerExecution {
     fn new(instance_id: &str) -> Self {
         Self {
-            instance_id: ConnectorInstanceId::parse(instance_id).expect("instance ID"),
+            key: ConnectorExecutionBindingKey {
+                instance_id: ConnectorInstanceId::parse(instance_id).expect("instance ID"),
+                incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+            },
         }
     }
 }
 
-impl ConnectorRead for OwnerRead {
-    fn instance_id(&self) -> &ConnectorInstanceId {
-        &self.instance_id
-    }
-
-    fn begin_scan(
-        &self,
-        _table: &ConnectorTableHandle,
-        _request: ConnectorBeginScanRequest,
-    ) -> Result<ConnectorScan, ConnectorError> {
-        unreachable!("instance construction must not begin a scan")
-    }
-
-    fn plan_splits(
-        &self,
-        _scan: &ConnectorScanHandle,
-        _request: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
-        unreachable!("instance construction must not plan splits")
+impl ConnectorReadExecution for OwnerExecution {
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
     }
 
     fn open_reader(
@@ -71,6 +60,50 @@ impl ConnectorRead for OwnerRead {
         _request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
         unreachable!("instance construction must not open a reader")
+    }
+}
+
+struct OwnerPlanning {
+    instance_id: ConnectorInstanceId,
+}
+
+impl ConnectorScanPlanning for OwnerPlanning {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        _: &ConnectorTableHandle,
+        _: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        unreachable!("control binding construction must not begin a scan")
+    }
+
+    fn plan_splits(
+        &self,
+        _: &ConnectorScanHandle,
+        _: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        unreachable!("control binding construction must not plan splits")
+    }
+}
+
+struct OwnerDistribution {
+    descriptor: ConnectorInstanceDescriptor,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl ConnectorExecutionDistribution for OwnerDistribution {
+    fn declaration(
+        &self,
+        _: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+        ConnectorExecutionDeclaration::try_new(
+            self.descriptor.clone(),
+            self.incarnation,
+            bytes::Bytes::new(),
+        )
     }
 }
 
@@ -125,22 +158,32 @@ fn descriptor(instance_id: &str) -> ConnectorInstanceDescriptor {
 }
 
 #[test]
-fn read_only_instances_are_valid_without_metadata_discovery() {
-    let instance =
-        ConnectorInstance::try_new(descriptor("file"), None, Arc::new(OwnerRead::new("file")))
-            .expect("read-only compat provider");
+fn execution_bindings_are_valid_without_control_capabilities() {
+    let key = ConnectorExecutionBindingKey {
+        instance_id: ConnectorInstanceId::parse("file").expect("instance ID"),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+    };
+    let binding = ConnectorExecutionBinding::try_new(
+        ConnectorProviderId::parse("file").expect("provider ID"),
+        key.clone(),
+        Arc::new(OwnerExecution::new("file")),
+    )
+    .expect("read-only execution binding");
 
-    assert!(instance.metadata().is_none());
-    assert_eq!(instance.read().instance_id().as_str(), "file");
+    assert_eq!(binding.key(), &key);
 }
 
 #[test]
-fn instance_rejects_a_read_capability_owned_by_another_instance() {
+fn execution_binding_rejects_a_read_capability_owned_by_another_generation() {
+    let key = ConnectorExecutionBindingKey {
+        instance_id: ConnectorInstanceId::parse("file").expect("instance ID"),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+    };
     assert_eq!(
-        ConnectorInstance::try_new(
-            descriptor("file"),
-            None,
-            Arc::new(OwnerRead::new("foreign")),
+        ConnectorExecutionBinding::try_new(
+            ConnectorProviderId::parse("file").expect("provider ID"),
+            key,
+            Arc::new(OwnerExecution::new("foreign")),
         )
         .err()
         .expect("a host must not attach a foreign read capability")
@@ -150,12 +193,20 @@ fn instance_rejects_a_read_capability_owned_by_another_instance() {
 }
 
 #[test]
-fn instance_rejects_a_metadata_capability_owned_by_another_instance() {
+fn control_binding_rejects_metadata_owned_by_another_instance() {
+    let descriptor = descriptor("file");
     assert_eq!(
-        ConnectorInstance::try_new(
-            descriptor("file"),
-            Some(Arc::new(OwnerMetadata::new("foreign"))),
-            Arc::new(OwnerRead::new("file")),
+        ConnectorControlBinding::try_new(
+            descriptor.clone(),
+            ConnectorInstanceIncarnation::from_bytes([1; 16]),
+            Arc::new(OwnerMetadata::new("foreign")),
+            Arc::new(OwnerPlanning {
+                instance_id: descriptor.instance_id.clone(),
+            }),
+            Arc::new(OwnerDistribution {
+                descriptor,
+                incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+            }),
         )
         .err()
         .expect("a host must not attach foreign metadata")

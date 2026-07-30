@@ -21,10 +21,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError,
-    ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorReaderMetricsSnapshot,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector,
+    ConnectorReaderMetricsSnapshot, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
 };
 
 use super::runtime::{
@@ -73,28 +74,12 @@ fn batch() -> RecordBatch {
 }
 
 struct FakeRead {
-    instance_id: ConnectorInstanceId,
+    key: ConnectorExecutionBindingKey,
 }
 
-impl ConnectorRead for FakeRead {
-    fn instance_id(&self) -> &ConnectorInstanceId {
-        &self.instance_id
-    }
-
-    fn begin_scan(
-        &self,
-        _table: &ConnectorTableHandle,
-        _request: ConnectorBeginScanRequest,
-    ) -> Result<ConnectorScan, ConnectorError> {
-        unreachable!("runtime source starts after split planning")
-    }
-
-    fn plan_splits(
-        &self,
-        _scan: &ConnectorScanHandle,
-        _request: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
-        unreachable!("runtime source starts after split planning")
+impl ConnectorReadExecution for FakeRead {
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
     }
 
     fn open_reader(
@@ -108,6 +93,21 @@ impl ConnectorRead for FakeRead {
             close_calls: Arc::new(Mutex::new(0)),
         }))
     }
+}
+
+fn fake_execution_binding(instance_id: ConnectorInstanceId) -> Arc<ConnectorExecutionBinding> {
+    let key = ConnectorExecutionBindingKey {
+        instance_id,
+        incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+    };
+    Arc::new(
+        ConnectorExecutionBinding::try_new(
+            ConnectorProviderId::parse("test").expect("provider ID"),
+            key.clone(),
+            Arc::new(FakeRead { key }),
+        )
+        .expect("execution binding"),
+    )
 }
 
 fn request_context() -> ConnectorRequestContext {
@@ -221,24 +221,11 @@ fn file_read_profile_receives_metrics_deltas_once() {
 #[test]
 fn read_scan_source_opens_a_typed_split_and_adapts_its_batches() {
     let instance_id = ConnectorInstanceId::parse("test").expect("instance ID");
-    let read = Arc::new(FakeRead {
-        instance_id: instance_id.clone(),
-    });
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            read,
-        )
-        .expect("connector instance"),
-    );
+    let binding = fake_execution_binding(instance_id.clone());
     let split =
         ConnectorSplit::try_new(instance_id, "split", bytes::Bytes::new(), Some(1)).expect("split");
     let source = ConnectorReadScanSource::new(
-        instance,
+        binding,
         vec![split.clone(), split],
         ConnectorOpenReaderRequest {
             expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
@@ -331,19 +318,7 @@ impl IncrementalConnectorSplitAdapter for CommitTrackingIncrementalSplitAdapter 
 #[test]
 fn incremental_connector_source_appends_only_new_connector_morsels() {
     let instance_id = ConnectorInstanceId::parse("test.incremental").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
+    let binding = fake_execution_binding(instance_id.clone());
     let initial =
         ConnectorSplit::try_new(instance_id.clone(), "initial", bytes::Bytes::new(), Some(1))
             .expect("initial split");
@@ -356,7 +331,7 @@ fn incremental_connector_source_appends_only_new_connector_morsels() {
         })),
     });
     let source = ConnectorReadScanSource::new_with_incremental(
-        instance,
+        binding,
         vec![initial],
         ConnectorOpenReaderRequest {
             expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
@@ -391,22 +366,10 @@ fn incremental_connector_source_appends_only_new_connector_morsels() {
 #[test]
 fn incremental_connector_source_rejects_append_after_eos_without_calling_provider() {
     let instance_id = ConnectorInstanceId::parse("test.closed").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
+    let binding = fake_execution_binding(instance_id.clone());
     let calls = Arc::new(Mutex::new(0));
     let source = ConnectorReadScanSource::new_with_incremental(
-        instance,
+        binding,
         vec![
             ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
                 .expect("initial split"),
@@ -443,19 +406,7 @@ fn incremental_connector_source_rejects_append_after_eos_without_calling_provide
 #[test]
 fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically() {
     let instance_id = ConnectorInstanceId::parse("test.duplicate").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
+    let binding = fake_execution_binding(instance_id.clone());
     let next = ConnectorSplit::try_new(
         instance_id.clone(),
         "duplicate",
@@ -464,7 +415,7 @@ fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically(
     )
     .expect("duplicate split");
     let source = ConnectorReadScanSource::new_with_incremental(
-        instance,
+        binding,
         vec![
             ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
                 .expect("initial split"),
@@ -503,19 +454,7 @@ fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically(
 #[test]
 fn incremental_connector_source_does_not_commit_a_rejected_append() {
     let instance_id = ConnectorInstanceId::parse("test.commit.rejected").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
+    let binding = fake_execution_binding(instance_id.clone());
     let duplicate = ConnectorSplit::try_new(
         instance_id.clone(),
         "duplicate",
@@ -525,7 +464,7 @@ fn incremental_connector_source_does_not_commit_a_rejected_append() {
     .expect("duplicate split");
     let commit_calls = Arc::new(Mutex::new(0));
     let source = ConnectorReadScanSource::new_with_incremental(
-        instance,
+        binding,
         vec![
             ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
                 .expect("initial split"),
