@@ -17,13 +17,19 @@
 
 //! Engine dispatch for `ALTER TABLE … (CREATE|DROP) BRANCH|TAG`.
 //!
-//! Bridges parser AST → analyzer → commit/ref_action.
-//! Mirrors the `mv_flow` pattern: no ExecNode, no pipeline, just a small flow function.
+//! Bridges parser AST → connector mutation DTO. The provider owns authoritative
+//! ref/snapshot validation and the external catalog commit.
 
 use std::sync::Arc;
 
 use crate::engine::{StandaloneState, StatementResult};
-use crate::sql::parser::ast::{AlterIcebergRefStmt, ObjectName};
+use crate::sql::parser::ast::{
+    AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
+};
+use novarocks_spi::connector::{
+    ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
+    ConnectorTableIdentity, CreateOrReplacePolicy, DropPolicy,
+};
 
 pub(crate) fn execute(
     state: &Arc<StandaloneState>,
@@ -42,9 +48,8 @@ pub(crate) fn execute(
         .expect("iceberg catalogs read");
     let entry = registry.get(&catalog_name)?;
 
-    // 3. Build a Catalog handle and load the table metadata for the analyzer.
-    //    We use `load_table` (cached) to get metadata for the analyzer, then
-    //    build a fresh HadoopFileSystemCatalog for the async commit path.
+    // Read metadata only for the application-owned MV guard. Ref identity,
+    // snapshot anchor, and compare-and-set validation belong to the provider.
     let loaded =
         crate::connector::iceberg::catalog::registry::load_table(&entry, &namespace, &table_name)?;
     crate::connector::validate_request_context(connector_context)?;
@@ -59,70 +64,84 @@ pub(crate) fn execute(
         loaded.table.metadata().properties(),
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
-    let metadata = loaded.table.metadata();
-
-    // 4. Run the analyzer: validates the action against current snapshot state.
-    let analyzer_plan = crate::sql::analyzer::alter_iceberg_ref::analyze_alter_iceberg_ref(
-        stmt,
-        &catalog_name,
-        &namespace,
-        &table_name,
-        metadata,
+    let instance_id =
+        ConnectorInstanceId::parse(&catalog_name).map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        ConnectorCatalogMutationOperation::AlterRef {
+            table: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(namespace.as_str()),
+                table: Arc::from(table_name.as_str()),
+            },
+            action: connector_ref_action(&stmt.action)?,
+        },
+        connector_context.clone(),
     )?;
-
-    // 5. Translate analyzer-side RefAction to connector-side RefAction.
-    //    Both enums have identical variant/field layouts but live in different modules.
-    //    The connector types are re-exported from `crate::connector::iceberg::commit`.
-    use crate::connector::iceberg::commit::{RefAction, RefActionPlan};
-    use crate::sql::analyzer::alter_iceberg_ref::RefAction as ARefAction;
-    let connector_action = match analyzer_plan.action {
-        ARefAction::CreateBranch {
-            name,
-            snapshot_id,
-            replace,
-            if_not_exists,
-        } => RefAction::CreateBranch {
-            name,
-            snapshot_id,
-            replace,
-            if_not_exists,
-        },
-        ARefAction::CreateTag {
-            name,
-            snapshot_id,
-            replace,
-            if_not_exists,
-        } => RefAction::CreateTag {
-            name,
-            snapshot_id,
-            replace,
-            if_not_exists,
-        },
-        ARefAction::DropBranch { name, if_exists } => RefAction::DropBranch { name, if_exists },
-        ARefAction::DropTag { name, if_exists } => RefAction::DropTag { name, if_exists },
-    };
-    let connector_plan = RefActionPlan {
-        catalog: catalog_name,
-        namespace: namespace.clone(),
-        table: table_name.clone(),
-        action: connector_action,
-    };
-
-    // 6. Execute via async bridge.
-    //    build_iceberg_catalog dispatches Hadoop / REST / Hive.
-    crate::connector::validate_request_context(connector_context)?;
-    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-    crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-        crate::connector::iceberg::commit::execute_ref_action(catalog.as_ref(), &connector_plan)
-            .await
-    })
-    .map_err(|e| format!("iceberg ref: async runtime error: {e}"))??;
-
-    // Invalidate the cached table metadata so subsequent reads (e.g. time-travel
-    // ref resolution in `rewrite_time_travel_refs`) see the updated snapshot refs.
     entry.invalidate_table_cache(&namespace, &table_name);
 
     Ok(StatementResult::Ok)
+}
+
+fn connector_ref_action(action: &AlterIcebergRefAction) -> Result<ConnectorRefAction, String> {
+    let policy = |replace: bool, if_not_exists: bool| {
+        if replace {
+            CreateOrReplacePolicy::ReplaceIfExists
+        } else if if_not_exists {
+            CreateOrReplacePolicy::NoOpIfExists
+        } else {
+            CreateOrReplacePolicy::FailIfExists
+        }
+    };
+    let snapshot_anchor = |anchor: &SnapshotAnchor| match anchor {
+        SnapshotAnchor::SnapshotId(snapshot_id) => Some(*snapshot_id),
+        SnapshotAnchor::CurrentMain => None,
+    };
+    Ok(match action {
+        AlterIcebergRefAction::CreateBranch {
+            name,
+            anchor,
+            if_not_exists,
+            replace,
+            ..
+        } => ConnectorRefAction::Create {
+            kind: ConnectorRefKind::Branch,
+            name: Arc::from(name.as_str()),
+            snapshot_id: snapshot_anchor(anchor),
+            policy: policy(*replace, *if_not_exists),
+        },
+        AlterIcebergRefAction::CreateTag {
+            name,
+            anchor,
+            if_not_exists,
+            replace,
+            ..
+        } => ConnectorRefAction::Create {
+            kind: ConnectorRefKind::Tag,
+            name: Arc::from(name.as_str()),
+            snapshot_id: snapshot_anchor(anchor),
+            policy: policy(*replace, *if_not_exists),
+        },
+        AlterIcebergRefAction::DropBranch { name, if_exists } => ConnectorRefAction::Drop {
+            kind: ConnectorRefKind::Branch,
+            name: Arc::from(name.as_str()),
+            policy: if *if_exists {
+                DropPolicy::NoOpIfMissing
+            } else {
+                DropPolicy::FailIfMissing
+            },
+        },
+        AlterIcebergRefAction::DropTag { name, if_exists } => ConnectorRefAction::Drop {
+            kind: ConnectorRefKind::Tag,
+            name: Arc::from(name.as_str()),
+            policy: if *if_exists {
+                DropPolicy::NoOpIfMissing
+            } else {
+                DropPolicy::FailIfMissing
+            },
+        },
+    })
 }
 
 fn resolve_table_parts(name: &ObjectName) -> Result<(String, String, String), String> {

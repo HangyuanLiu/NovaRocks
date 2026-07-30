@@ -4058,6 +4058,7 @@ pub(crate) fn alter_table_properties(
     stmt: &AlterIcebergPropertiesStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // 1. Resolve target — same helper as alter_table_schema.
     let target =
@@ -4070,10 +4071,7 @@ pub(crate) fn alter_table_properties(
     let target_table = {
         crate::connector::metadata_load_table(
             state.connector_control.as_ref(),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
             &target.table,

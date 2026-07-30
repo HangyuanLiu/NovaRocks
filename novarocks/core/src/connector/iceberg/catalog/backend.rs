@@ -930,8 +930,9 @@ mod tests {
             .expect("registry")
             .get("ice")
             .expect("entry");
-        super::registry::create_namespace(&entry, "db").expect("create namespace");
-        super::registry::create_table(
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, "db")
+            .expect("create namespace");
+        crate::connector::iceberg::catalog::registry::create_table(
             &entry,
             "db",
             "t",
@@ -1072,8 +1073,9 @@ mod tests {
             .expect("registry")
             .get("ice")
             .expect("entry");
-        super::registry::create_namespace(&entry, "db").expect("create namespace");
-        super::registry::create_table(
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, "db")
+            .expect("create namespace");
+        crate::connector::iceberg::catalog::registry::create_table(
             &entry,
             "db",
             "t",

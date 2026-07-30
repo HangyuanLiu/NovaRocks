@@ -1474,6 +1474,7 @@ impl StandaloneSession {
                 &normalized,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
 
@@ -1928,6 +1929,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let stmt = parse_alter_iceberg_properties_sql(sql)?;
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
@@ -1948,6 +1950,7 @@ impl StandaloneSession {
             &stmt,
             current_catalog,
             current_database,
+            connector_context,
         )?;
         Ok(StatementResult::Ok)
     }

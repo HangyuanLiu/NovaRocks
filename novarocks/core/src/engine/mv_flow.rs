@@ -617,6 +617,7 @@ pub(crate) fn alter_mv_with_connector_context(
                 },
                 Some(current_catalog),
                 db,
+                connector_context,
             )?;
             return Ok(StatementResult::Ok);
         }

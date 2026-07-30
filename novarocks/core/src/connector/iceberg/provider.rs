@@ -987,6 +987,43 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 .map(|()| ExternalMutationEffect::Applied)
                 .map_err(map_iceberg_error)
             }
+            ConnectorCatalogMutationOperation::AlterRef { table, action } => {
+                if table.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "ref mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                let loaded = load_table(&entry, &table.namespace, &table.table)
+                    .map_err(map_iceberg_error)?;
+                let action = lower_ref_action(
+                    action,
+                    loaded.table.metadata(),
+                    &table.namespace,
+                    &table.table,
+                    self.instance_id.as_str(),
+                )?;
+                let catalog = super::catalog::registry::build_iceberg_catalog(&entry)
+                    .map_err(map_iceberg_error)?;
+                super::catalog::registry::block_on_iceberg(async {
+                    super::commit::execute_ref_action(catalog.as_ref(), &action).await
+                })
+                .map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        format!("execute Iceberg ref mutation runtime: {error}"),
+                    )
+                })?
+                .map(|outcome| match outcome {
+                    super::commit::RefActionOutcome::Committed => ExternalMutationEffect::Applied,
+                    super::commit::RefActionOutcome::NoOp => ExternalMutationEffect::NoOp,
+                })
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+            }
             _ => Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 format!("Iceberg catalog mutation `{operation_kind}` is not implemented"),
@@ -1200,6 +1237,114 @@ fn lower_partition(
         ConnectorPartitionTransform::Void { column } => IcebergPartitionFieldExpr::Void {
             column: column.to_string(),
         },
+    })
+}
+
+fn lower_ref_action(
+    action: novarocks_spi::connector::ConnectorRefAction,
+    metadata: &iceberg::spec::TableMetadata,
+    namespace: &str,
+    table: &str,
+    catalog: &str,
+) -> Result<super::commit::RefActionPlan, ConnectorError> {
+    use novarocks_spi::connector::{ConnectorRefAction, ConnectorRefKind};
+
+    fn assert_kind(
+        metadata: &iceberg::spec::TableMetadata,
+        name: &str,
+        expected: ConnectorRefKind,
+    ) -> Result<(), ConnectorError> {
+        let Some(existing) = metadata.refs().get(name) else {
+            return Ok(());
+        };
+        let actual = match existing.retention {
+            iceberg::spec::SnapshotRetention::Branch { .. } => ConnectorRefKind::Branch,
+            iceberg::spec::SnapshotRetention::Tag { .. } => ConnectorRefKind::Tag,
+        };
+        if actual == expected {
+            return Ok(());
+        }
+        Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!("Iceberg ref `{name}` has a different kind"),
+        ))
+    }
+
+    let action = match action {
+        ConnectorRefAction::Create {
+            kind,
+            name,
+            snapshot_id,
+            policy,
+        } => {
+            if name.eq_ignore_ascii_case("main") {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg ref `main` is reserved",
+                ));
+            }
+            assert_kind(metadata, &name, kind)?;
+            let snapshot_id = match snapshot_id.or_else(|| metadata.current_snapshot_id()) {
+                Some(snapshot_id) if metadata.snapshot_by_id(snapshot_id).is_some() => snapshot_id,
+                _ => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "Iceberg ref create requires an existing snapshot",
+                    ));
+                }
+            };
+            let (replace, if_not_exists) = match policy {
+                CreateOrReplacePolicy::FailIfExists => (false, false),
+                CreateOrReplacePolicy::NoOpIfExists => (false, true),
+                CreateOrReplacePolicy::ReplaceIfExists => (true, false),
+            };
+            match kind {
+                ConnectorRefKind::Branch => super::commit::RefAction::CreateBranch {
+                    name: name.to_string(),
+                    snapshot_id,
+                    replace,
+                    if_not_exists,
+                },
+                ConnectorRefKind::Tag => super::commit::RefAction::CreateTag {
+                    name: name.to_string(),
+                    snapshot_id,
+                    replace,
+                    if_not_exists,
+                },
+            }
+        }
+        ConnectorRefAction::Drop { kind, name, policy } => {
+            if name.eq_ignore_ascii_case("main") {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg ref `main` is reserved",
+                ));
+            }
+            assert_kind(metadata, &name, kind)?;
+            let if_exists = policy == DropPolicy::NoOpIfMissing;
+            match kind {
+                ConnectorRefKind::Branch => super::commit::RefAction::DropBranch {
+                    name: name.to_string(),
+                    if_exists,
+                },
+                ConnectorRefKind::Tag => super::commit::RefAction::DropTag {
+                    name: name.to_string(),
+                    if_exists,
+                },
+            }
+        }
+        ConnectorRefAction::FastForwardBranch { .. } => {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg branch fast-forward mutation is not implemented",
+            ));
+        }
+    };
+    Ok(super::commit::RefActionPlan {
+        catalog: catalog.to_string(),
+        namespace: namespace.to_string(),
+        table: table.to_string(),
+        action,
     })
 }
 
