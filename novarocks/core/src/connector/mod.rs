@@ -16,7 +16,6 @@
 // under the License.
 pub(crate) mod backend;
 pub mod file_execution;
-pub(crate) mod host;
 pub mod iceberg;
 pub mod runtime;
 pub(crate) mod scan_model;
@@ -55,8 +54,6 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution,
 };
-
-use self::host::{ConnectorHost, ConnectorHostError};
 
 struct RequestConnectorCancellation {
     signal: Arc<AtomicBool>,
@@ -248,8 +245,6 @@ pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange}
 #[cfg(test)]
 mod backend_test;
 #[cfg(test)]
-mod host_test;
-#[cfg(test)]
 mod iceberg_provider_test;
 #[cfg(test)]
 mod runtime_test;
@@ -406,7 +401,7 @@ mod tests {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
-    connector_host: Arc<RwLock<ConnectorHost>>,
+    starrocks_table_state: Option<std::sync::Weak<crate::engine::StandaloneState>>,
     catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
@@ -415,116 +410,29 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
-            connector_host: Arc::new(RwLock::new(ConnectorHost::default())),
+            starrocks_table_state: None,
             catalog_backends: HashMap::new(),
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
         }
     }
 
-    /// Creates an otherwise empty registry with the static Iceberg reader used
-    /// by the StarRocks compatibility path. This is intentionally limited to
-    /// tests that exercise normalized Iceberg scan ranges without a process
-    /// startup configuration or generated connector declaration.
-    #[doc(hidden)]
-    pub fn for_compat_iceberg_decode_test() -> Result<Self, String> {
-        let registry = Self::new();
-        let binding = iceberg::provider::IcebergReadBinding::default_binding(None)
-            .map_err(|error| error.to_string())?;
-        registry
-            .register_connector_instance(
-                iceberg::provider::compose_compat_read_instance(binding)
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(registry)
+    #[cfg(feature = "compat")]
+    pub(crate) fn bind_starrocks_table_state(
+        &mut self,
+        state: &Arc<crate::engine::StandaloneState>,
+    ) {
+        self.starrocks_table_state = Some(Arc::downgrade(state));
     }
 
-    pub(crate) fn register_connector_instance(
+    #[cfg(feature = "compat")]
+    pub(crate) fn starrocks_table_state(
         &self,
-        instance: ConnectorInstance,
-    ) -> Result<(), ConnectorHostError> {
-        self.connector_host
-            .write()
-            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
-            .register(instance)
-    }
-
-    pub(crate) fn unregister_connector_instance(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
-        self.connector_host
-            .write()
-            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
-            .unregister(instance_id)
-    }
-
-    pub fn connector_instance(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
-        self.connector_host
-            .read()
-            .map_err(|_| ConnectorHostError::unavailable("connector host read lock poisoned"))?
-            .resolve(instance_id)
-    }
-
-    pub(crate) fn register_connector_instance_installer(
-        &self,
-        installer: Arc<dyn ConnectorInstanceInstaller>,
-    ) -> Result<(), ConnectorHostError> {
-        self.connector_host
-            .write()
-            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
-            .register_installer(installer)
-    }
-
-    pub(crate) fn install_connector_instance(
-        &self,
-        declaration: &ConnectorInstanceDeclaration,
-        context: &ConnectorRequestContext,
-    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
-        self.connector_host
-            .write()
-            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
-            .install(declaration, context)
-    }
-
-    pub(crate) fn retire_connector_instance(
-        &self,
-        instance_id: &ConnectorInstanceId,
-        incarnation: ConnectorInstanceIncarnation,
-    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
-        self.connector_host
-            .write()
-            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
-            .retire(instance_id, incarnation)
-    }
-
-    /// Installs a startup-bound read-only instance received by the native
-    /// control plane. This is the only composition-facing installation API;
-    /// fragment decoding only resolves instances already present in this host.
-    pub fn install_distributed_instance(
-        &self,
-        declaration: &ConnectorInstanceDeclaration,
-        context: &ConnectorRequestContext,
-    ) -> Result<(), String> {
-        self.install_connector_instance(declaration, context)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
-    /// Marks one distributed instance generation as retiring. Existing reader
-    /// Arcs may drain, while subsequent fragment resolution is rejected.
-    pub fn retire_distributed_instance(
-        &self,
-        instance_id: &ConnectorInstanceId,
-        incarnation: ConnectorInstanceIncarnation,
-    ) -> Result<(), String> {
-        self.retire_connector_instance(instance_id, incarnation)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+    ) -> Result<Arc<crate::engine::StandaloneState>, String> {
+        self.starrocks_table_state
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| "standalone StarRocks table state is unavailable".to_string())
     }
 
     pub(crate) fn register_catalog_backend(&mut self, backend: Arc<dyn CatalogBackend>) {
@@ -749,33 +657,6 @@ fn legacy_fixture_metadata_error() -> novarocks_spi::connector::ConnectorError {
     )
 }
 
-/// Registers the startup-bound installers that a BE process may use through
-/// the connector binding control plane.  Callers supply the already parsed
-/// local configuration; declarations only select the fixed `default` binding
-/// and cannot replace its credentials or endpoint.
-pub fn compose_backend_connector_installers(
-    registry: &ConnectorRegistry,
-    default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
-) -> Result<(), String> {
-    let file_runtime = crate::runtime::global_async_runtime::data_runtime_handle()?;
-    let binding = iceberg::provider::IcebergReadBinding::new(
-        default_object_store,
-        Arc::new(novarocks_fs::TokioFileIoRuntime::new(file_runtime.clone())),
-        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(file_runtime)),
-    );
-    registry
-        .register_connector_instance_installer(Arc::new(
-            iceberg::provider::IcebergConnectorInstaller::new(binding.clone()),
-        ))
-        .map_err(|error| error.to_string())?;
-    registry
-        .register_connector_instance(
-            iceberg::provider::compose_compat_read_instance(binding)
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())
-}
-
 /// Compose the BE-only installers used by the execution host. The resulting
 /// installers are bound entirely from process startup configuration; an
 /// execution declaration can select a named binding but cannot carry a client
@@ -817,12 +698,7 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
             .write()
             .expect("standalone connector registry write lock");
         #[cfg(feature = "compat")]
-        connectors
-            .register_connector_instance(
-                starrocks::table::provider::connector_instance(state)
-                    .expect("create standalone StarRocks connector instance"),
-            )
-            .expect("register standalone StarRocks connector instance");
+        connectors.bind_starrocks_table_state(state);
         connectors.register_catalog_backend(Arc::new(
             iceberg::catalog::IcebergCatalogBackend::new(Arc::clone(&iceberg_catalogs)),
         ));

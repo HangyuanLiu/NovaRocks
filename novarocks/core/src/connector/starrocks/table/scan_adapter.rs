@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
-use std::num::NonZeroUsize;
-
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::starrocks::{
     PlannedNativeStarRocksScan, StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor,
@@ -30,10 +27,8 @@ use crate::connector::starrocks::schema::{
 use crate::runtime::scan_range;
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
-use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorReadSelector,
-    ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableHandle,
-};
+use novarocks_spi::connector::ConnectorRequestContext;
+use std::collections::HashSet;
 
 pub(crate) fn plan_native_starrocks_scan_with_compat(
     scan_node_id: i32,
@@ -54,83 +49,49 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
         }
     }
 
-    let instance_id = super::provider::instance_id().map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
-        .map_err(|error| error.to_string())?;
-    let table_handle = ConnectorTableHandle::try_new(
-        instance_id,
-        serde_json::to_vec(&super::provider::TablePayload {
-            database: scan.database.clone(),
-            table: scan.table.name.clone(),
-            db_id: *db_id,
-            table_id: *table_id,
-        })
-        .map(bytes::Bytes::from)
-        .map_err(|error| format!("encode StarRocks table handle: {error}"))?,
-    )
-    .map_err(|error| error.to_string())?;
-    let planned_scan = instance
+    if context.cancellation().is_cancelled() {
+        return Err("StarRocks scan planning was cancelled".to_string());
+    }
+    if std::time::Instant::now() >= context.deadline() {
+        return Err("StarRocks scan planning deadline elapsed".to_string());
+    }
+    let state = connectors.starrocks_table_state()?;
+    let runtime = state
+        .starrocks_table
         .read()
-        .begin_scan(
-            &table_handle,
-            ConnectorBeginScanRequest {
-                projection: Vec::new(),
-                selector: ConnectorReadSelector::Current,
-                limit: None,
-                batch: ConnectorBatchBudget {
-                    max_rows: NonZeroUsize::new(1).expect("nonzero"),
-                    max_bytes: NonZeroUsize::new(
-                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                    )
-                    .expect("nonzero"),
-                },
-                context: context.clone(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    let handle = super::provider::decode_scan(&planned_scan.handle)?;
-    if handle.table.db_id != *db_id || handle.table.table_id != *table_id {
+        .map_err(|error| format!("StarRocks table catalog read lock: {error}"))?
+        .table(&scan.database, &scan.table.name)?
+        .clone();
+    if runtime.table.db_id != *db_id || runtime.table.table_id != *table_id {
         return Err(format!(
-            "StarRocks ScanNode node_id={scan_node_id} planned scan handle identity mismatch: source=({db_id}, {table_id}) handle=({}, {})",
-            handle.table.db_id, handle.table.table_id
+            "StarRocks ScanNode node_id={scan_node_id} table identity mismatch: source=({db_id}, {table_id}) runtime=({}, {})",
+            runtime.table.db_id, runtime.table.table_id
         ));
     }
 
-    let source = handle.source;
+    let source = source_descriptor(&runtime)?;
     validate_starrocks_source_descriptor(scan_node_id, *db_id, *table_id, &source)?;
 
-    let splits = instance
-        .read()
-        .plan_splits(
-            &planned_scan.handle,
-            ConnectorSplitPlanningRequest {
-                target_parallelism: NonZeroUsize::new(1).expect("parallelism is nonzero"),
-                max_split_bytes: None,
-                context,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    if splits.is_empty() {
+    let scan_tablets = super::catalog::starrocks_scan_tablets(&runtime);
+    if scan_tablets.is_empty() {
         return Err(format!(
             "StarRocks table {}.{} has no selected tablet splits",
             scan.database, scan.table.name
         ));
     }
-    let mut tablets = HashSet::new();
-    let mut ranges = Vec::with_capacity(splits.len());
-    for split in &splits {
-        let split = super::provider::decode_split(split)?;
-        if !tablets.insert(split.tablet_id) {
+    let mut tablet_ids = HashSet::new();
+    let mut ranges = Vec::with_capacity(scan_tablets.len());
+    for tablet in scan_tablets {
+        if !tablet_ids.insert(tablet.tablet_id) {
             return Err(format!(
                 "StarRocks ScanNode node_id={scan_node_id} has duplicate tablet_id={}",
-                split.tablet_id
+                tablet.tablet_id
             ));
         }
         ranges.push(scan_range::ScanRangeParams::starrocks_tablet(
-            split.tablet_id,
-            split.partition_id,
-            split.version,
+            tablet.tablet_id,
+            tablet.partition_id,
+            tablet.version,
         )?);
     }
     Ok(PlannedNativeStarRocksScan { ranges, source })
