@@ -1068,7 +1068,9 @@ fn connector_column_aggregation(
     }
 }
 
-fn connector_table_key(key: &crate::sql::parser::ast::TableKeyDesc) -> ConnectorTableKey {
+pub(crate) fn connector_table_key(
+    key: &crate::sql::parser::ast::TableKeyDesc,
+) -> ConnectorTableKey {
     ConnectorTableKey {
         kind: match key.kind {
             crate::sql::parser::ast::TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
@@ -1084,7 +1086,7 @@ fn connector_table_key(key: &crate::sql::parser::ast::TableKeyDesc) -> Connector
     }
 }
 
-fn connector_partition_transform(
+pub(crate) fn connector_partition_transform(
     field: &crate::sql::parser::ast::IcebergPartitionFieldExpr,
 ) -> ConnectorPartitionTransform {
     use crate::sql::parser::ast::IcebergPartitionFieldExpr;

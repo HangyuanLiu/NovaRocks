@@ -20,10 +20,10 @@
 //!
 //! Five steps (spec §5):
 //!   A. Plan the SELECT and infer the iceberg schema.
-//!   B. Catalog `create_table` (atomic point #1).
+//!   B. Connector mutation `create_table` (atomic point #1).
 //!   C. Drive IcebergSinkPlan over the planned SELECT (atomic point #2).
 //!   D. `run_iceberg_commit(FastAppendCommit)` (atomic point #3).
-//!   E. On C / D failure, drop_table to roll back; on drop_table failure,
+//!   E. On C / D failure, connector `drop_table` to roll back; on failure,
 //!      return the documented combined error.
 //!
 //! Error quadrants (spec §5.3):
@@ -150,18 +150,51 @@ pub(crate) fn execute_iceberg_ctas(
     // values, so injecting here is always the safe path).
     let props_vec = inject_v3_row_lineage(properties);
 
-    // Step B: catalog.create_table (atomic point #1).
-    // Failure here means no table was created; no rollback needed.
-    crate::connector::iceberg::catalog::registry::create_table(
-        &entry,
-        &target.namespace,
-        &target.table,
-        &columns,
-        key_desc.as_ref(),
-        partition_fields,
-        &props_vec,
+    // Step B: create through the generation-fenced mutation lease. The
+    // existence precheck above is only an optimization that avoids planning
+    // SELECT for the common IF NOT EXISTS case; provider policy owns the
+    // correctness decision at the external catalog boundary.
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    let create = crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            columns: columns
+                .iter()
+                .map(crate::engine::statement::connector_column)
+                .collect::<Result<_, _>>()?,
+            key: key_desc
+                .as_ref()
+                .map(crate::engine::statement::connector_table_key),
+            partitioning: partition_fields
+                .iter()
+                .map(crate::engine::statement::connector_partition_transform)
+                .collect(),
+            properties: props_vec
+                .iter()
+                .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
+                .collect(),
+            policy: if stmt.if_not_exists {
+                novarocks_spi::connector::CreatePolicy::NoOpIfExists
+            } else {
+                novarocks_spi::connector::CreatePolicy::FailIfExists
+            },
+        },
+        connector_context.clone(),
     )
-    .map_err(|e| format!("CTAS failed: cannot create table: {e}"))?;
+    .map_err(|error| format!("CTAS failed: cannot create table: {error}"))?;
+    if create.effect == novarocks_spi::connector::ExternalMutationEffect::NoOp {
+        // A concurrent creator can win after the local precheck. The typed
+        // provider policy is authoritative, so CTAS must not write its SELECT
+        // output into that independently-created table.
+        return Ok(StatementResult::Ok);
+    }
 
     // Steps C+D: drive sink + commit over the SELECT. On failure, roll back
     // by dropping the just-created table.
@@ -177,11 +210,22 @@ pub(crate) fn execute_iceberg_ctas(
             Ok(StatementResult::Ok)
         }
         Err(write_err) => {
-            // Step E: attempt drop_table rollback.
-            let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
-                &entry,
-                &target.namespace,
-                &target.table,
+            // Step E: compensate through the same provider route. Data write
+            // and data commit remain owned by their pre-existing path.
+            let drop_result = crate::connector::mutation::execute_catalog_mutation(
+                state.connector_control.as_ref(),
+                &instance_id,
+                novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                    table: novarocks_spi::connector::ConnectorTableIdentity {
+                        instance_id: instance_id.clone(),
+                        namespace: Arc::from(target.namespace.as_str()),
+                        table: Arc::from(target.table.as_str()),
+                    },
+                    policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                    data_disposition:
+                        novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+                },
+                connector_context.clone(),
             );
             match drop_result {
                 Ok(_) => {
