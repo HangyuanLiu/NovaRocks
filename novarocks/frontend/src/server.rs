@@ -653,12 +653,13 @@ mod tests {
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             &host,
         );
-        novarocks::service::grpc_server::start_grpc_exchange_server(
+        novarocks::service::grpc_server::start_grpc_exchange_server_with_terminal_ingress(
             &config.server.host,
             config.server.grpc_port,
             Arc::new(RejectingNativeFragmentIngress),
             Arc::new(ReadyQueryLifecycleIngress),
             Arc::clone(&services.native_report_handler),
+            Some(host.terminal_ingress()),
         )
         .expect("start production-composed all-in-one gRPC endpoint");
         let grpc_port = novarocks::service::grpc_server::grpc_server_bound_port()
