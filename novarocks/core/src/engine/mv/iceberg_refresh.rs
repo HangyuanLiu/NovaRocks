@@ -17922,6 +17922,7 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
         crate::engine::register_iceberg_control_binding(&state, catalog)
             .expect("register Iceberg connector control binding");
         state
@@ -17985,6 +17986,28 @@ mod tests {
         stmt
     }
 
+    fn create_test_iceberg_namespace(state: &Arc<StandaloneState>, catalog: &str, namespace: &str) {
+        let entry = state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg catalogs")
+            .get(catalog)
+            .expect("catalog");
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, namespace)
+            .expect("create test namespace");
+    }
+
+    fn initialize_iceberg_mv_test_namespaces(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        current_db: &str,
+    ) {
+        create_test_iceberg_namespace(state, catalog, current_db);
+        if !current_db.eq_ignore_ascii_case("sales") {
+            create_test_iceberg_namespace(state, catalog, "sales");
+        }
+    }
+
     fn open_test_state_with_iceberg_catalog(catalog: &str, current_db: &str) -> IcebergMvTestState {
         let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
             .expect("install all-in-one loopback backend");
@@ -18017,6 +18040,7 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
         crate::engine::register_iceberg_control_binding(&state, catalog)
             .expect("register Iceberg connector control binding");
         state
@@ -18065,6 +18089,7 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
         crate::engine::register_iceberg_control_binding(&state, catalog)
             .expect("register Iceberg connector control binding");
         state
@@ -18118,6 +18143,7 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
         crate::engine::register_iceberg_control_binding(&state, catalog)
             .expect("register Iceberg connector control binding");
         state
