@@ -36,6 +36,7 @@ pub(crate) enum QueryLifecyclePhase {
     Staging,
     Staged,
     Running,
+    TerminalRetained,
     Terminating,
     Tombstone,
 }

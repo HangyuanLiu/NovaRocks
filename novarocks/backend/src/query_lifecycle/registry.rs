@@ -113,6 +113,7 @@ pub(crate) struct QueryLifecycleRegistryConfig {
     pub(crate) terminal_fallback_max_attempts: usize,
     pub(crate) terminal_fallback_initial_backoff: Duration,
     pub(crate) terminal_fallback_max_backoff: Duration,
+    pub(crate) terminal_retention: Duration,
 }
 
 impl QueryLifecycleRegistryConfig {
@@ -147,6 +148,7 @@ impl QueryLifecycleRegistryConfig {
             terminal_fallback_max_backoff: Duration::from_millis(
                 runtime.query_control_terminal_fallback_max_backoff_ms,
             ),
+            terminal_retention: Duration::from_millis(runtime.query_control_terminal_retention_ms),
         }
     }
 }
@@ -529,6 +531,7 @@ impl QueryLifecycleRegistry {
         assert!(!config.terminal_ack_timeout.is_zero());
         assert!(!config.terminal_fallback_rpc_timeout.is_zero());
         assert!(config.terminal_fallback_max_attempts > 0);
+        assert!(!config.terminal_retention.is_zero());
         Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
@@ -742,9 +745,12 @@ impl QueryLifecycleRegistry {
                 | QueryLifecyclePhase::Running,
                 _,
             ) => QueryInitOutcome::AlreadyApplied,
-            (QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone, _) => {
-                QueryInitOutcome::RejectedTerminated
-            }
+            (
+                QueryLifecyclePhase::TerminalRetained
+                | QueryLifecyclePhase::Terminating
+                | QueryLifecyclePhase::Tombstone,
+                _,
+            ) => QueryInitOutcome::RejectedTerminated,
             (QueryLifecyclePhase::Initializing, _) => state
                 .init_outcome
                 .unwrap_or(QueryInitOutcome::RejectedInvalidManifest),
@@ -862,7 +868,9 @@ impl QueryLifecycleRegistry {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             match state.phase {
                 QueryLifecyclePhase::Initialized => {}
-                QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => {
+                QueryLifecyclePhase::TerminalRetained
+                | QueryLifecyclePhase::Terminating
+                | QueryLifecyclePhase::Tombstone => {
                     let phase = phase_name(state.phase);
                     drop(state);
                     return Err(self.attach_error(
@@ -1042,7 +1050,9 @@ impl QueryLifecycleRegistry {
                             None,
                         )
                     }
-                    QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+                    QueryLifecyclePhase::TerminalRetained
+                    | QueryLifecyclePhase::Terminating
+                    | QueryLifecyclePhase::Tombstone => (
                         QueryStageOutcome::RejectedTerminated,
                         "query lifecycle entry has terminated",
                         None,
@@ -1074,7 +1084,9 @@ impl QueryLifecycleRegistry {
                     )
                 }
             }
-            QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+            QueryLifecyclePhase::TerminalRetained
+            | QueryLifecyclePhase::Terminating
+            | QueryLifecyclePhase::Tombstone => (
                 QueryStageOutcome::RejectedTerminated,
                 "query lifecycle entry has terminated",
                 None,
@@ -1204,7 +1216,9 @@ impl QueryLifecycleRegistry {
                     )
                 }
             }
-            QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+            QueryLifecyclePhase::TerminalRetained
+            | QueryLifecyclePhase::Terminating
+            | QueryLifecyclePhase::Tombstone => (
                 QueryStartOutcome::RejectedTerminated,
                 "query lifecycle entry has terminated",
             ),
@@ -1374,17 +1388,29 @@ impl QueryLifecycleRegistry {
             state.entries.values().cloned().collect::<Vec<_>>()
         };
         for entry in entries {
-            let (termination_retry, expiration) = {
+            let (termination_retry, expiration, terminal_retention_expired) = {
                 let state = entry.state.lock().expect("query lifecycle entry lock");
                 if state.phase == QueryLifecyclePhase::Terminating {
-                    (state.init_outcome.and(state.termination_reason), None)
+                    (
+                        state.init_outcome.and(state.termination_reason),
+                        None,
+                        false,
+                    )
+                } else if state.phase == QueryLifecyclePhase::TerminalRetained {
+                    (
+                        None,
+                        None,
+                        state.terminated_at.is_some_and(|at| {
+                            now.saturating_duration_since(at) >= self.config.terminal_retention
+                        }),
+                    )
                 } else if state.phase == QueryLifecyclePhase::Tombstone {
-                    (None, None)
+                    (None, None, false)
                 } else if state
                     .pre_start_deadline
                     .is_some_and(|deadline| now >= deadline)
                 {
-                    (None, Some(QueryTerminationReason::PreStartTimeout))
+                    (None, Some(QueryTerminationReason::PreStartTimeout), false)
                 } else if matches!(
                     state.phase,
                     QueryLifecyclePhase::ControlAttached
@@ -1397,9 +1423,10 @@ impl QueryLifecycleRegistry {
                     (
                         None,
                         Some(QueryTerminationReason::CoordinatorHeartbeatTimeout),
+                        false,
                     )
                 } else {
-                    (None, None)
+                    (None, None, false)
                 }
             };
             if let Some(reason) = termination_retry {
@@ -1411,6 +1438,18 @@ impl QueryLifecycleRegistry {
             }
             if let Some(reason) = expiration {
                 self.request_termination(entry, reason);
+                continue;
+            }
+            if terminal_retention_expired {
+                {
+                    let mut state = entry.state.lock().expect("query lifecycle entry lock");
+                    state.terminal_record = None;
+                }
+                self.publish_tombstone(
+                    &entry,
+                    entry.manifest.execution_id(),
+                    QueryTerminationReason::CoordinatorFinalize,
+                );
             }
         }
     }
@@ -1703,6 +1742,8 @@ impl QueryLifecycleRegistry {
                 self.config.terminal_max_encoded_bytes,
             )?;
             state.terminal_record = Some(record.clone());
+            state.phase = QueryLifecyclePhase::TerminalRetained;
+            state.terminated_at = Some(self.clock.now());
             (
                 record,
                 expected.iter().copied().collect::<Vec<_>>(),
@@ -1834,9 +1875,13 @@ impl QueryLifecycleRegistry {
                 "query terminal ACK identity conflicts with retained snapshot",
             ));
         }
-        state.phase = QueryLifecyclePhase::Tombstone;
-        state.terminated_at = Some(self.clock.now());
         state.terminal_record = None;
+        drop(state);
+        self.publish_tombstone(
+            &entry,
+            ack.execution_id(),
+            QueryTerminationReason::CoordinatorFinalize,
+        );
         Ok(())
     }
 
@@ -2629,7 +2674,8 @@ fn fold_metrics_locked(
             QueryLifecyclePhase::ControlAttached
             | QueryLifecyclePhase::Staging
             | QueryLifecyclePhase::Staged
-            | QueryLifecyclePhase::Running => snapshot.control_attached += 1,
+            | QueryLifecyclePhase::Running
+            | QueryLifecyclePhase::TerminalRetained => snapshot.control_attached += 1,
             QueryLifecyclePhase::Terminating => snapshot.terminating += 1,
             QueryLifecyclePhase::Tombstone => {}
         }
@@ -2649,6 +2695,7 @@ const fn phase_name(phase: QueryLifecyclePhase) -> &'static str {
         QueryLifecyclePhase::Staging => "staging",
         QueryLifecyclePhase::Staged => "staged",
         QueryLifecyclePhase::Running => "running",
+        QueryLifecyclePhase::TerminalRetained => "terminal_retained",
         QueryLifecyclePhase::Terminating => "terminating",
         QueryLifecyclePhase::Tombstone => "tombstone",
     }

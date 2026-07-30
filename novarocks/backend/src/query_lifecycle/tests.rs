@@ -262,6 +262,7 @@ fn registry_config(max_active_entries: usize) -> QueryLifecycleRegistryConfig {
         terminal_fallback_max_attempts: 5,
         terminal_fallback_initial_backoff: Duration::from_millis(100),
         terminal_fallback_max_backoff: Duration::from_millis(1_000),
+        terminal_retention: Duration::from_millis(120_000),
     }
 }
 
