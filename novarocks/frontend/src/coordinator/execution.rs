@@ -19,8 +19,10 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks::query_execution::artifact::{

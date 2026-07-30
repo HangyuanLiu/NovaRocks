@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 
 use novarocks::common::app_config;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::novarocks_logging::{error, info, warn};
+#[cfg(test)]
+use novarocks::novarocks_logging::warn;
+use novarocks::novarocks_logging::{error, info};
 use novarocks::query_execution::lifecycle::StageFragment;
 use novarocks::query_execution::native_fragment_report;
 use novarocks::runtime::fragment::io::{

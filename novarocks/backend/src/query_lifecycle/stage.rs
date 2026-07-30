@@ -55,6 +55,7 @@ impl StartGate {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> StartGateState {
         *self
             .state

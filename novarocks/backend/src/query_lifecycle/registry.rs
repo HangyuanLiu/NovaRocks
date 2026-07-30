@@ -1798,6 +1798,7 @@ impl QueryLifecycleRegistry {
             || state.pre_init_tombstones.contains_key(&execution_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn metrics_snapshot(&self) -> BackendQueryLifecycleMetricsSnapshot {
         let state = self.state.lock().expect("query lifecycle registry lock");
         fold_metrics_locked(&state).0
