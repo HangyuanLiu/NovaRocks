@@ -1088,7 +1088,7 @@ mod tests {
         assert_eq!(status.status_code, TStatusCode::TXN_NOT_EXISTS);
         assert_eq!(
             status.error_msgs.as_deref(),
-            Some(["stream load transaction `load-1` does not exist"].as_slice())
+            Some([String::from("stream load transaction `load-1` does not exist")].as_slice())
         );
     }
 }

@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::query_execution::artifact::{
-    BackendPlacement, FragmentScheduleDraft, ValidatedFragmentSchedule,
+    BackendPlacement, ConnectorBindingInstallBarrier, ConnectorBindingInstallLease,
+    FragmentScheduleDraft, ValidatedFragmentSchedule,
 };
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::{
@@ -72,6 +73,17 @@ impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
         self.armed = false;
         self.aborts.fetch_add(1, Ordering::SeqCst);
         format!("{primary_error}; query lifecycle rollback completed")
+    }
+}
+
+struct NoopConnectorBindingBarrier;
+
+impl ConnectorBindingInstallBarrier for NoopConnectorBindingBarrier {
+    fn install_all(
+        &self,
+        _plan: crate::query_execution::artifact::ConnectorBindingInstallPlan,
+    ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
+        Ok(ConnectorBindingInstallLease)
     }
 }
 
@@ -173,6 +185,7 @@ fn real_execution_artifacts() -> (
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &plan,
         &crate::connector::ConnectorRegistry::new(),
+        &crate::connector::test_request_context(),
         None,
     )
     .expect("prepare production execution artifact");
@@ -281,6 +294,8 @@ fn query_control_typestate_initializes_before_native_assembly() {
         .expect("bind schedule")
         .initialize_query(options, &barrier)
         .expect("initialize query")
+        .prepare_connector_bindings(&NoopConnectorBindingBarrier)
+        .expect("install empty connector bindings")
         .assemble()
         .expect("assemble after control ready")
         .into_parts();
@@ -293,6 +308,7 @@ fn query_control_typestate_initializes_before_native_assembly() {
         .query_lifecycle_lease
         .finalize()
         .expect("finalize lifecycle");
+    execution.connector_binding_lease.release();
     assert_eq!(finalizes.load(Ordering::SeqCst), 1);
 }
 
