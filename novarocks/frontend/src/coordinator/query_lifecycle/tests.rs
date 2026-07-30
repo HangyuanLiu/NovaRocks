@@ -32,7 +32,7 @@ use novarocks::query_execution::lifecycle::{
     QueryControlAttachment, QueryControlCommand, QueryControlEndpoint, QueryControlEvent,
     QueryExecutionId, QueryInitAck, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
     QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
-    QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
+    QueryTerminalAck, QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
 };
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::query_options::QueryOptions;
@@ -1686,12 +1686,13 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     session
         .send(QueryControlCommand::Finalize)
         .expect("send finalize");
-    assert!(matches!(
-        session
-            .recv_timeout(Duration::from_secs(2))
-            .expect("TerminalSnapshot"),
-        QueryControlEvent::TerminalSnapshot { .. }
-    ));
+    let snapshot = match session
+        .recv_timeout(Duration::from_secs(2))
+        .expect("TerminalSnapshot")
+    {
+        QueryControlEvent::TerminalSnapshot { snapshot } => snapshot,
+        event => panic!("expected TerminalSnapshot, got {event:?}"),
+    };
     assert_eq!(
         session
             .recv_timeout(Duration::from_secs(2))
@@ -1700,6 +1701,15 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
             reason: QueryTerminationReason::CoordinatorFinalize,
         }
     );
+    session
+        .send(QueryControlCommand::TerminalAck {
+            ack: QueryTerminalAck::from_snapshot(&snapshot),
+        })
+        .expect("TerminalAck");
+    let close = session
+        .recv_timeout(Duration::from_secs(2))
+        .expect_err("TerminalAck must close the fake backend control stream");
+    assert_eq!(close.kind(), QueryLifecycleTransportErrorKind::StreamClosed);
     let error = session
         .send(QueryControlCommand::Heartbeat {
             sequence: 1,

@@ -113,6 +113,8 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.drop_next_start_ack_be_index.is_some()
         || meta.suppress_start_ack_be_index.is_some()
         || meta.drop_next_terminal_ack_be_index.is_some()
+        || meta.drop_terminal_snapshot_stream_be_index.is_some()
+        || meta.terminal_snapshot_conflict_be_index.is_some()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta
@@ -157,6 +159,8 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.drop_next_start_ack_be_index.is_some()
         || meta.suppress_start_ack_be_index.is_some()
         || meta.drop_next_terminal_ack_be_index.is_some()
+        || meta.drop_terminal_snapshot_stream_be_index.is_some()
+        || meta.terminal_snapshot_conflict_be_index.is_some()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta
@@ -192,6 +196,8 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.drop_next_start_ack_be_index.is_some(),
         meta.suppress_start_ack_be_index.is_some(),
         meta.drop_next_terminal_ack_be_index.is_some(),
+        meta.drop_terminal_snapshot_stream_be_index.is_some(),
+        meta.terminal_snapshot_conflict_be_index.is_some(),
         meta.kill_query_at_lifecycle_phase.is_some(),
         meta.kill_fe_at_lifecycle_phase.is_some(),
         meta.stop_query_control_heartbeat_after_stage_be_index
@@ -251,6 +257,14 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         (
             "drop_next_terminal_ack_be_index",
             meta.drop_next_terminal_ack_be_index,
+        ),
+        (
+            "drop_terminal_snapshot_stream_be_index",
+            meta.drop_terminal_snapshot_stream_be_index,
+        ),
+        (
+            "terminal_snapshot_conflict_be_index",
+            meta.terminal_snapshot_conflict_be_index,
         ),
         (
             "stop_query_control_heartbeat_after_stage_be_index",
@@ -313,6 +327,9 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     if let Some(index) = meta.drop_terminal_snapshot_stream_be_index {
         server.arm_terminal_snapshot_stream_drop(index)?;
+    }
+    if let Some(index) = meta.terminal_snapshot_conflict_be_index {
+        server.arm_terminal_snapshot_conflict(index)?;
     }
     if let Some(phase) = meta.kill_query_at_lifecycle_phase {
         server.arm_kill_query_at_lifecycle_phase(phase)?;
@@ -770,6 +787,9 @@ where
                     fault,
                     PostQueryFault::KillFrontendAfterControlReady(_)
                         | PostQueryFault::KillQueryAfterControlReady { .. }
+                        | PostQueryFault::KillFrontendAtLifecyclePhase(
+                            crate::types::QueryLifecyclePhase::TerminalRetained
+                        )
                 ) {
                     deadline_cancel_sent = true;
                 }
@@ -800,7 +820,10 @@ where
                     )?;
                     let evidence_ready = match fault {
                         PostQueryFault::KillFrontendAfterControlReady(_)
-                        | PostQueryFault::KillQueryAfterControlReady { .. } => {
+                        | PostQueryFault::KillQueryAfterControlReady { .. }
+                        | PostQueryFault::KillFrontendAtLifecyclePhase(
+                            crate::types::QueryLifecyclePhase::TerminalRetained,
+                        ) => {
                             let execution = evidence_execution
                                 .as_deref()
                                 .context("post-query lifecycle fault has no execution anchor")?;

@@ -1884,6 +1884,7 @@ impl QueryLifecycleRegistry {
             state.events.clone()
         };
         let _ = self.local_runtime.abort_runtime_filter(execution_id);
+        self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
         if let Some(events) = events {
             let _ = events.try_send(QueryControlEvent::TerminalSnapshot {
                 snapshot: record.snapshot().clone(),
@@ -1962,6 +1963,7 @@ impl QueryLifecycleRegistry {
             "query finalized after local drain",
         );
         let _ = self.local_runtime.abort_runtime_filter(execution_id);
+        self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
         if let Some(events) = events {
             let _ = events.try_send(QueryControlEvent::TerminalSnapshot {
                 snapshot: record.snapshot().clone(),
@@ -2009,6 +2011,19 @@ impl QueryLifecycleRegistry {
         let mut state = self.state.lock().expect("query lifecycle registry lock");
         if let Some(bytes) = state.terminal_retained.remove(&execution_id) {
             state.terminal_retained_bytes = state.terminal_retained_bytes.saturating_sub(bytes);
+        }
+    }
+
+    fn emit_terminal_retained_marker(&self, snapshot: &QueryTerminalSnapshot, bytes: usize) {
+        if query_lifecycle_test_markers_enabled() {
+            eprintln!(
+                "NOVAROCKS_QUERY_TERMINAL_RETAINED execution_id={} backend_id={} start_epoch={} digest={:?} bytes={}",
+                format_execution_id(snapshot.execution_id()),
+                self.local_backend_id().unwrap_or_default(),
+                self.local_start_epoch,
+                snapshot.digest(),
+                bytes,
+            );
         }
     }
 

@@ -297,11 +297,17 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 })?;
                 meta.drop_terminal_snapshot_stream_be_index = Some(value);
             }
+            "terminal_snapshot_conflict_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid terminal_snapshot_conflict_be_index: {raw_value}")
+                })?;
+                meta.terminal_snapshot_conflict_be_index = Some(value);
+            }
             "kill_query_at_lifecycle_phase" => {
                 meta.kill_query_at_lifecycle_phase = QueryLifecyclePhase::parse(&raw_value)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "invalid kill_query_at_lifecycle_phase: {raw_value}; expected staging, staged, starting, or running"
+                            "invalid kill_query_at_lifecycle_phase: {raw_value}; expected staging, staged, starting, running, or terminal-retained"
                         )
                     })
                     .map(Some)?;
@@ -309,11 +315,16 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "kill_fe_at_lifecycle_phase" => {
                 let phase = QueryLifecyclePhase::parse(&raw_value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged"
+                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
                     )
                 })?;
-                if phase != QueryLifecyclePhase::Staged {
-                    bail!("invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged");
+                if !matches!(
+                    phase,
+                    QueryLifecyclePhase::Staged | QueryLifecyclePhase::TerminalRetained
+                ) {
+                    bail!(
+                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
+                    );
                 }
                 meta.kill_fe_at_lifecycle_phase = Some(phase);
             }
@@ -504,6 +515,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         drop_terminal_snapshot_stream_be_index: override_meta
             .drop_terminal_snapshot_stream_be_index
             .or(base.drop_terminal_snapshot_stream_be_index),
+        terminal_snapshot_conflict_be_index: override_meta
+            .terminal_snapshot_conflict_be_index
+            .or(base.terminal_snapshot_conflict_be_index),
         kill_query_at_lifecycle_phase: override_meta
             .kill_query_at_lifecycle_phase
             .or(base.kill_query_at_lifecycle_phase),

@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::{
-    QueryControlAttach, QueryControlEvent, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
-    QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStartAck, StageBatch,
+    QueryControlAttach, QueryControlEvent, QueryExecutionId, QueryInitBarrier, QueryInitOutcome,
+    QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStartAck,
+    StageBatch,
 };
 
 use super::QueryLifecycleTransport;
@@ -550,6 +551,18 @@ fn record_lifecycle_phase_marker(
     let Some(execution_id) = batches.first().map(|batch| batch.request().execution_id()) else {
         return Ok(());
     };
+    record_lifecycle_phase_marker_for_execution(phase, execution_id)
+}
+
+/// Runner-only lifecycle barrier.  The terminal snapshot reader uses this
+/// after it has durably stored a participant record but before it sends the
+/// ACK, which lets cross-process tests prove retained-record cleanup without
+/// changing production timing or adding a direct all-in-one path.
+#[cfg(debug_assertions)]
+pub(super) fn record_lifecycle_phase_marker_for_execution(
+    phase: &str,
+    execution_id: QueryExecutionId,
+) -> Result<(), DistributedQueryError> {
     let Some(root) = novarocks::common::app_config::config()
         .ok()
         .and_then(|config| config.debug.query_lifecycle_fault_dir())
@@ -602,6 +615,14 @@ fn record_lifecycle_phase_marker(
             )));
         }
     }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+pub(super) fn record_lifecycle_phase_marker_for_execution(
+    _phase: &str,
+    _execution_id: QueryExecutionId,
+) -> Result<(), DistributedQueryError> {
     Ok(())
 }
 
