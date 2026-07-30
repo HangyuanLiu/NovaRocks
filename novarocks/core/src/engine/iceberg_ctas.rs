@@ -437,7 +437,7 @@ fn drive_data_write(
     query: &sqlparser::ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    // Load the just-created table via the connector registry's CatalogBackend
+    // Load the just-created table through the connector read registry.
     // path — this is the same path used by run_insert and returns the
     // ResolvedTable that execute_iceberg_insert_or_overwrite expects.
     let resolved = {

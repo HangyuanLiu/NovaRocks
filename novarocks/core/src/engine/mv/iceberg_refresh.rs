@@ -19341,7 +19341,7 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_catalog_backend_reads_mv_table_directly_without_alias() {
+    fn iceberg_mv_reader_loads_target_table_without_alias() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
