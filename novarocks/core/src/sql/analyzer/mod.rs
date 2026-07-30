@@ -4989,6 +4989,21 @@ mod tests {
     }
 
     #[test]
+    fn scalar_subquery_in_aggregate_argument_routes_before_aggregate() {
+        let sql = "SELECT sum((SELECT max(c_custkey) FROM customer)) FROM customer";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        let sel = select_body(&resolved);
+        let spec = only_scalar_spec(sel);
+        assert_eq!(spec.clause, ApplyClause::AggregateInput);
+        assert!(
+            sel.projection
+                .iter()
+                .all(|item| !expr_has_placeholder(&item.expr)),
+            "aggregate argument should reference the Apply output column"
+        );
+    }
+
+    #[test]
     fn multiple_subqueries_exists_and_not_exists() {
         // q21 pattern: EXISTS + NOT EXISTS in the same WHERE
         let sql = "SELECT s_name FROM supplier, lineitem l1, orders, nation \

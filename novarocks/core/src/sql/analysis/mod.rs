@@ -415,6 +415,9 @@ pub(crate) enum SubqueryKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyClause {
     Where,
+    /// A scalar subquery nested in an aggregate argument. Its output must be
+    /// produced before the Aggregate consumes that argument.
+    AggregateInput,
     Having,
     Projection,
 }

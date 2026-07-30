@@ -85,6 +85,17 @@ pub(super) fn plan_select_scoped(
         );
     }
 
+    // Scalar subqueries used by aggregate arguments must run below the
+    // Aggregate. A projection Apply would be placed above it and leave the
+    // aggregate argument's synthetic column absent from the child layout.
+    current = wrap_scalar_applies(
+        current,
+        &mut apply_specs,
+        ApplyClause::AggregateInput,
+        cte_registry,
+        factory,
+    )?;
+
     if let Some(mut repeat_info) = select.repeat.take() {
         let grouping_key_aliases = prepare_repeat_input(
             &mut current,

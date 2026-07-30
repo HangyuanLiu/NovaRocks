@@ -1928,6 +1928,7 @@ mod tests {
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
+            logical_type_columns: BTreeMap::new(),
         };
         let payload = SplitPayload {
             version: ICEBERG_SPLIT_V1,

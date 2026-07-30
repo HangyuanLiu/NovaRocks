@@ -21,14 +21,16 @@
 //! intentionally the only place an Iceberg connector reader turns a physical
 //! batch into a provider batch.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, DictionaryArray, Int64Array, StringArray, UInt64Array,
+    new_null_array,
 };
 use arrow::compute::{cast, filter_record_batch};
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileBatchReader, FileCancellation, FileError, FileErrorKind, FileFormat, FileIdentity,
@@ -198,7 +200,7 @@ impl ConnectorBatchReader for IcebergBatchReader {
                     self.included_positions.as_ref(),
                     &self.data_file_path,
                 )?;
-                align_batch_to_schema(
+                let batch = align_batch_to_schema(
                     &self.expected_schema,
                     batch,
                     positions.as_ref(),
@@ -209,8 +211,10 @@ impl ConnectorBatchReader for IcebergBatchReader {
                         ivm_change_op: self.ivm_change_op,
                     },
                 )
-                .map(Some)
-                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+                dictionary_encode_low_cardinality_strings(batch)
+                    .map(Some)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
             }
             None => {
                 self.close()?;
@@ -561,6 +565,75 @@ fn align_batch_to_schema(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| error.to_string())
 }
 
+/// Retain a low-cardinality UTF-8 scan column as an Arrow dictionary carrier.
+///
+/// Parquet decoding normally materializes dictionary pages as flat UTF-8.  Keeping
+/// small domains encoded lets downstream filter and aggregate operators avoid
+/// repeatedly processing the same string values while retaining the logical scan
+/// schema.  High-cardinality columns stay flat so the per-batch dictionary does
+/// not inflate memory use.
+fn dictionary_encode_low_cardinality_strings(batch: RecordBatch) -> Result<RecordBatch, String> {
+    const MAX_DISTINCT_VALUES: usize = 64;
+    const MIN_NON_NULL_VALUES: usize = 2;
+
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let encoded = match column.data_type() {
+            DataType::Utf8 => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| "failed to downcast Iceberg UTF-8 column".to_string())?;
+                let mut distinct = HashSet::new();
+                let mut non_null = 0usize;
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        non_null += 1;
+                        distinct.insert(values.value(row));
+                    }
+                }
+                (non_null >= MIN_NON_NULL_VALUES
+                    && distinct.len() <= MAX_DISTINCT_VALUES
+                    && distinct.len().saturating_mul(5) <= non_null.saturating_mul(4))
+                .then(|| {
+                    Arc::new(
+                        (0..values.len())
+                            .map(|row| (!values.is_null(row)).then(|| values.value(row)))
+                            .collect::<DictionaryArray<Int32Type>>(),
+                    ) as ArrayRef
+                })
+            }
+            _ => None,
+        };
+        if let Some(encoded) = encoded {
+            changed = true;
+            fields.push(Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(encoded.data_type().clone()),
+            ));
+            columns.push(encoded);
+        } else {
+            fields.push(field.clone());
+            columns.push(column.clone());
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            batch.schema().metadata().clone(),
+        )),
+        columns,
+    )
+    .map_err(|error| format!("build dictionary-encoded Iceberg batch failed: {error}"))
+}
+
 fn is_iceberg_virtual(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -736,6 +809,34 @@ mod tests {
             20
         );
         assert_eq!(aligned.column(2).null_count(), 1);
+    }
+
+    #[test]
+    fn dictionary_encodes_low_cardinality_utf8_columns() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "status",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("NEW"),
+                Some("PAID"),
+                Some("PAID"),
+                Some("CANCELLED"),
+                Some("SHIPPED"),
+                None,
+            ])) as ArrayRef],
+        )
+        .expect("source batch");
+
+        let encoded = dictionary_encode_low_cardinality_strings(batch)
+            .expect("dictionary encode low-cardinality status");
+        assert!(matches!(
+            encoded.column(0).data_type(),
+            DataType::Dictionary(key, value)
+                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8
+        ));
     }
 
     #[test]

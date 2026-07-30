@@ -178,8 +178,15 @@ fn cast_array_for_local_schema(
     use arrow::array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
     use arrow::datatypes::DataType;
 
-    fn encode_bytes(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| char::from(*b)).collect()
+    fn bytes_to_text(bytes: &[u8]) -> String {
+        // Some older local Parquet files expose VARCHAR payloads as Binary.
+        // Preserve valid UTF-8 as text; mapping every byte through Latin-1
+        // corrupts multi-byte UTF-8 values such as Chinese characters.  Invalid
+        // binary payloads still need a lossless String carrier for the legacy
+        // local BINARY/VARBINARY representation, so retain the Latin-1 mapping
+        // only as that fallback.
+        String::from_utf8(bytes.to_vec())
+            .unwrap_or_else(|_| bytes.iter().map(|byte| char::from(*byte)).collect())
     }
 
     fn is_numeric_datetime_source(data_type: &DataType) -> bool {
@@ -211,7 +218,7 @@ fn cast_array_for_local_schema(
                 .ok_or_else(|| "failed to downcast BinaryArray".to_string())?;
             Ok(Arc::new(StringArray::from(
                 (0..arr.len())
-                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .map(|row| (!arr.is_null(row)).then(|| bytes_to_text(arr.value(row))))
                     .collect::<Vec<_>>(),
             )) as ArrayRef)
         }
@@ -222,7 +229,7 @@ fn cast_array_for_local_schema(
                 .ok_or_else(|| "failed to downcast LargeBinaryArray".to_string())?;
             Ok(Arc::new(StringArray::from(
                 (0..arr.len())
-                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .map(|row| (!arr.is_null(row)).then(|| bytes_to_text(arr.value(row))))
                     .collect::<Vec<_>>(),
             )) as ArrayRef)
         }
@@ -233,7 +240,7 @@ fn cast_array_for_local_schema(
                 .ok_or_else(|| "failed to downcast BinaryArray".to_string())?;
             Ok(Arc::new(LargeStringArray::from(
                 (0..arr.len())
-                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .map(|row| (!arr.is_null(row)).then(|| bytes_to_text(arr.value(row))))
                     .collect::<Vec<_>>(),
             )) as ArrayRef)
         }
@@ -244,7 +251,7 @@ fn cast_array_for_local_schema(
                 .ok_or_else(|| "failed to downcast LargeBinaryArray".to_string())?;
             Ok(Arc::new(LargeStringArray::from(
                 (0..arr.len())
-                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .map(|row| (!arr.is_null(row)).then(|| bytes_to_text(arr.value(row))))
                     .collect::<Vec<_>>(),
             )) as ArrayRef)
         }
@@ -451,6 +458,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0x00, 0x7f, 0x80, 0xff]
         );
+    }
+
+    #[test]
+    fn cast_batch_to_schema_preserves_utf8_binary_text() {
+        let source = RecordBatch::try_from_iter(vec![(
+            "text",
+            Arc::new(BinaryArray::from_vec(vec!["中文".as_bytes()])) as ArrayRef,
+        )])
+        .expect("build source batch");
+        let target = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+
+        let casted = cast_batch_to_schema(&source, &target).expect("cast UTF-8 binary text");
+        let values = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(values.value(0), "中文");
     }
 
     #[test]

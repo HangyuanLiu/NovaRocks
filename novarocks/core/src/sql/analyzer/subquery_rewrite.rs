@@ -255,6 +255,17 @@ impl<'a> AnalyzerContext<'a> {
                 continue;
             }
 
+            // Scalar subqueries outside the three Apply insertion clauses
+            // (WHERE, HAVING, and projection) still have a relation-local
+            // rewrite path. This notably covers a scalar query nested under a
+            // derived relation, where there is no Apply insertion point in the
+            // enclosing select but the existing scalar join rewrite preserves
+            // the one-row scalar contract.
+            if matches!(sq_info.kind, SubqueryKind::Scalar) {
+                self.rewrite_scalar_subquery(select, scope, sq_info)?;
+                continue;
+            }
+
             if matches!(
                 sq_info.kind,
                 SubqueryKind::Exists { .. } | SubqueryKind::InSubquery { .. }
@@ -474,6 +485,12 @@ impl<'a> AnalyzerContext<'a> {
         match clause {
             ApplyClause::Where => {
                 Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
+            }
+            ApplyClause::AggregateInput => {
+                return Err(
+                    "predicate subquery in an aggregate argument requires value-form rewrite"
+                        .into(),
+                );
             }
             ApplyClause::Having => {
                 Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
@@ -3837,9 +3854,109 @@ fn locate_scalar_placeholder_clause(
         .iter()
         .any(|p| expr_contains_placeholder(&p.expr, placeholder_id))
     {
+        if select
+            .projection
+            .iter()
+            .any(|p| placeholder_is_aggregate_input(&p.expr, placeholder_id))
+        {
+            return Some(crate::sql::analysis::ApplyClause::AggregateInput);
+        }
         return Some(crate::sql::analysis::ApplyClause::Projection);
     }
     None
+}
+
+/// Whether `placeholder_id` occurs below an aggregate call in `expr`.
+///
+/// Projection Apply nodes are normally placed after aggregation. A scalar
+/// subquery used as an aggregate argument instead has to be evaluated on the
+/// aggregate input, otherwise the Aggregate references a column its child does
+/// not produce.
+fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bool {
+    match &expr.kind {
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            args.iter()
+                .any(|arg| expr_contains_placeholder(arg, placeholder_id))
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_placeholder(&item.expr, placeholder_id))
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            placeholder_is_aggregate_input(left, placeholder_id)
+                || placeholder_is_aggregate_input(right, placeholder_id)
+        }
+        ExprKind::UnaryOp { expr: inner, .. }
+        | ExprKind::IsNull { expr: inner, .. }
+        | ExprKind::IsTruthValue { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Nested(inner)
+        | ExprKind::LambdaFunction { body: inner, .. }
+        | ExprKind::Lambda { body: inner, .. } => {
+            placeholder_is_aggregate_input(inner, placeholder_id)
+        }
+        ExprKind::FunctionCall { args, .. } => args
+            .iter()
+            .any(|arg| placeholder_is_aggregate_input(arg, placeholder_id)),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| placeholder_is_aggregate_input(expr, placeholder_id))
+                || when_then.iter().any(|(when, then)| {
+                    placeholder_is_aggregate_input(when, placeholder_id)
+                        || placeholder_is_aggregate_input(then, placeholder_id)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| placeholder_is_aggregate_input(expr, placeholder_id))
+        }
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
+            placeholder_is_aggregate_input(inner, placeholder_id)
+                || list
+                    .iter()
+                    .any(|expr| placeholder_is_aggregate_input(expr, placeholder_id))
+        }
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            placeholder_is_aggregate_input(inner, placeholder_id)
+                || placeholder_is_aggregate_input(low, placeholder_id)
+                || placeholder_is_aggregate_input(high, placeholder_id)
+        }
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            placeholder_is_aggregate_input(inner, placeholder_id)
+                || placeholder_is_aggregate_input(pattern, placeholder_id)
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter()
+                .chain(partition_by.iter())
+                .any(|expr| placeholder_is_aggregate_input(expr, placeholder_id))
+                || order_by
+                    .iter()
+                    .any(|item| placeholder_is_aggregate_input(&item.expr, placeholder_id))
+        }
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => false,
+    }
 }
 
 fn predicate_placeholder_is_value_form(select: &ResolvedSelect, placeholder_id: usize) -> bool {
