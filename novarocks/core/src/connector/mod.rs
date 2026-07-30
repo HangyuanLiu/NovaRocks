@@ -617,6 +617,21 @@ pub fn compose_backend_connector_execution_installers(
     )])
 }
 
+/// Compose the stable compat Iceberg execution binding from BE startup
+/// configuration. It is execution-only: compat never obtains catalog metadata
+/// or planning capability from this value.
+pub fn compose_compat_iceberg_execution_binding(
+    default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
+) -> Result<novarocks_spi::connector::ConnectorExecutionBinding, String> {
+    let file_runtime = crate::runtime::global_async_runtime::data_runtime_handle()?;
+    let binding = iceberg::provider::IcebergReadBinding::new(
+        default_object_store,
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(file_runtime.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(file_runtime)),
+    );
+    iceberg::provider::compose_compat_execution_binding(binding).map_err(|error| error.to_string())
+}
+
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
     let iceberg_catalogs = Arc::clone(&state.iceberg_catalogs);
     {

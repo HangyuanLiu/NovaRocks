@@ -625,9 +625,7 @@ impl QueryContext {
         lookup: ConnectorRowPositionLookup,
     ) -> Result<(), String> {
         if let Some(existing) = self.connector_glm_contexts.get(&row_source_slot) {
-            if existing.instance.descriptor() != lookup.instance.descriptor()
-                || existing.splits != lookup.splits
-            {
+            if existing.binding.key() != lookup.binding.key() || existing.splits != lookup.splits {
                 return Err(format!(
                     "conflicting connector late-materialization binding for row source slot {row_source_slot}"
                 ));
@@ -643,12 +641,12 @@ impl QueryContext {
         row_source_slot: SlotId,
         scan_range_id: i32,
     ) -> Option<(
-        Arc<novarocks_spi::connector::ConnectorInstance>,
+        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
         novarocks_spi::connector::ConnectorSplit,
     )> {
         let lookup = self.connector_glm_contexts.get(&row_source_slot)?;
         Some((
-            Arc::clone(&lookup.instance),
+            Arc::clone(&lookup.binding),
             lookup.splits.get(&scan_range_id)?.clone(),
         ))
     }
@@ -2506,7 +2504,7 @@ impl QueryContextManager {
         row_source_slot: SlotId,
         scan_range_id: i32,
     ) -> Option<(
-        Arc<novarocks_spi::connector::ConnectorInstance>,
+        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
         novarocks_spi::connector::ConnectorSplit,
     )> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");

@@ -91,6 +91,8 @@ pub(crate) struct StarRocksDecodeInput<'a> {
         Option<Arc<dyn novarocks::connector::starrocks::ports::StarletMetadataProvider>>,
     pub(crate) storage_metadata_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>>,
+    pub compat_iceberg_execution:
+        Option<&'a std::sync::Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
 }
 
 #[derive(Debug)]
@@ -605,6 +607,7 @@ fn decode_draft_parts(
         &instance.batch_exchange_sender_counts,
         instance.query_options.clone(),
         input.facts,
+        input.compat_iceberg_execution,
     );
     let last_query_id = input
         .query_globals
@@ -1498,6 +1501,7 @@ mod tests {
             sink_frontend_provider: None,
             starlet_metadata_provider: None,
             storage_metadata_provider: None,
+            compat_iceberg_execution: None,
         }
     }
 

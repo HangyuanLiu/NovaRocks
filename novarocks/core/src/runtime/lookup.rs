@@ -147,7 +147,7 @@ fn execute_connector_lookup_request(
     let mut column_chunks: HashMap<SlotId, Vec<ArrayRef>> = HashMap::new();
     let mut response_positions = Vec::with_capacity(request_len);
     for (scan_range_id, mut positions_map) in range_to_positions.drain() {
-        let (instance, split) = query_context_manager()
+        let (binding, split) = query_context_manager()
             .connector_glm_split(query_id, row_source_slot, scan_range_id)
             .ok_or_else(|| {
                 format!(
@@ -155,7 +155,7 @@ fn execute_connector_lookup_request(
                     scan_range_id
                 )
             })?;
-        let mut reader = instance
+        let mut reader = binding
             .read()
             .open_reader(&split, request.clone())
             .map_err(|error| error.to_string())?;

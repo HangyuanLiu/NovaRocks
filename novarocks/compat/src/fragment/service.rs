@@ -85,6 +85,8 @@ pub struct CompatFragmentService {
         Option<Arc<dyn novarocks::connector::starrocks::ports::StarletMetadataProvider>>,
     storage_metadata_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>>,
+    compat_iceberg_execution:
+        Arc<OnceLock<Arc<novarocks_spi::connector::ConnectorExecutionBinding>>>,
 }
 
 impl CompatFragmentService {
@@ -197,6 +199,7 @@ impl CompatFragmentService {
             sink_frontend_provider,
             starlet_metadata_provider,
             storage_metadata_provider,
+            compat_iceberg_execution: Arc::new(OnceLock::new()),
         }
     }
 
@@ -209,8 +212,13 @@ impl CompatFragmentService {
     ) -> Result<(), String> {
         novarocks::connector::compose_backend_connector_installers(
             self.connectors.as_ref(),
-            default_object_store,
-        )
+            default_object_store.clone(),
+        )?;
+        let binding =
+            novarocks::connector::compose_compat_iceberg_execution_binding(default_object_store)?;
+        self.compat_iceberg_execution
+            .set(Arc::new(binding))
+            .map_err(|_| "compat Iceberg execution binding is already composed".to_string())
     }
 
     pub fn submit_exec_batch_plan_fragments(&self, thrift_bytes: &[u8]) -> Result<usize, String> {
@@ -787,6 +795,7 @@ fn prepare_starrocks_draft(
     storage_metadata_provider: Option<
         Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>,
     >,
+    compat_iceberg_execution: Option<&Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
 ) -> Result<StarRocksFragmentDraftEnvelope, String> {
     validate_internal_addresses(params, Some(fragment))?;
     let facts = snapshot_decode_facts(resolve_stream_load_paths(load_registry, params)?)?;
@@ -820,6 +829,7 @@ fn prepare_starrocks_draft(
         sink_frontend_provider,
         starlet_metadata_provider,
         storage_metadata_provider,
+        compat_iceberg_execution,
     })
     .map_err(|error| error.to_string())?;
     Ok(StarRocksFragmentDraftEnvelope {
@@ -1932,6 +1942,7 @@ fn submit_exec_batch_plan_fragments_with(
             service.sink_frontend_provider.clone(),
             service.starlet_metadata_provider.clone(),
             service.storage_metadata_provider.clone(),
+            service.compat_iceberg_execution.get(),
         )?);
     }
     token.check(0).map_err(|error| error.to_string())?;
@@ -2027,6 +2038,7 @@ fn submit_exec_plan_fragment_with(
         service.sink_frontend_provider.clone(),
         service.starlet_metadata_provider.clone(),
         service.storage_metadata_provider.clone(),
+        service.compat_iceberg_execution.get(),
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
@@ -2095,6 +2107,7 @@ fn execute_plan_fragment_sync_with(
         service.sink_frontend_provider.clone(),
         service.starlet_metadata_provider.clone(),
         service.storage_metadata_provider.clone(),
+        service.compat_iceberg_execution.get(),
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;

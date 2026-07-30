@@ -58,6 +58,7 @@ use novarocks::novarocks_connectors::ConnectorRegistry;
 use novarocks::runtime::scan_range::ScanRangeParams;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::protocol::starrocks::decode::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
@@ -117,6 +118,7 @@ pub(crate) struct StarRocksPlanDecodeContext<'a> {
     batch_sender_counts: &'a HashMap<i32, usize>,
     query_options: novarocks::runtime::query_options::QueryOptions,
     decode_facts: &'a crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+    compat_iceberg_execution: Option<&'a Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
 }
 
 impl<'a> StarRocksPlanDecodeContext<'a> {
@@ -136,6 +138,9 @@ impl<'a> StarRocksPlanDecodeContext<'a> {
         batch_sender_counts: &'a HashMap<i32, usize>,
         query_options: novarocks::runtime::query_options::QueryOptions,
         decode_facts: &'a crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+        compat_iceberg_execution: Option<
+            &'a Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
+        >,
     ) -> Self {
         Self {
             query_id,
@@ -148,6 +153,7 @@ impl<'a> StarRocksPlanDecodeContext<'a> {
             batch_sender_counts,
             query_options,
             decode_facts,
+            compat_iceberg_execution,
         }
     }
 }
@@ -700,6 +706,7 @@ fn lower_node_with_children_typed(
                 context.scan_ranges,
                 &context.query_options,
                 connectors,
+                context.compat_iceberg_execution.cloned(),
                 query_global_dict_map,
                 out_layout,
                 context.decode_facts,
