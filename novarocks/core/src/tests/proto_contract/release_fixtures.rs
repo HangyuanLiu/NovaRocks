@@ -340,20 +340,20 @@ fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
         fragments: vec![novarocks::StageFragment {
             plan: Some(release_plan_fragment()),
             instance_params: Some(novarocks::InstanceParams {
-            query_id: Some(id(1, 2)),
-            fragment_instance_id: Some(id(3, 4)),
-            backend_num: 9,
-            per_node_scan_ranges: BTreeMap::from([(
-                11,
-                novarocks::ScanRangeList {
-                    ranges: vec![release_scan_range()],
-                },
-            )]),
-            per_exch_num_senders: BTreeMap::from([(12, 3)]),
-            destinations: vec![release_destination()],
-            query_options: Some(release_query_options()),
-            report_endpoint: Some("10.0.0.10:9070".to_string()),
-            typed_result_sink: true,
+                query_id: Some(id(1, 2)),
+                fragment_instance_id: Some(id(3, 4)),
+                backend_num: 9,
+                per_node_scan_ranges: BTreeMap::from([(
+                    11,
+                    novarocks::ScanRangeList {
+                        ranges: vec![release_scan_range()],
+                    },
+                )]),
+                per_exch_num_senders: BTreeMap::from([(12, 3)]),
+                destinations: vec![release_destination()],
+                query_options: Some(release_query_options()),
+                report_endpoint: Some("10.0.0.10:9070".to_string()),
+                typed_result_sink: true,
             }),
         }],
     }
@@ -536,7 +536,10 @@ fn release_stage_fragments_request_fixture_decodes() {
         .expect("StageFragmentsRequest fixture decodes");
     assert_eq!(request.stage_digest_version, 1);
     assert_eq!(request.fragments.len(), 1);
-    let fragment = request.fragments.first().expect("StageFragmentsRequest fixture fragment");
+    let fragment = request
+        .fragments
+        .first()
+        .expect("StageFragmentsRequest fixture fragment");
     let plan = fragment
         .plan
         .as_ref()

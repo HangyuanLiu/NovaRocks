@@ -2627,6 +2627,102 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "ConnectorReadSource": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "instance_id",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "scan_payload",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "splits",
+              "type_name": "ConnectorReadSplit",
+              "label": "repeated",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "max_batch_rows",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "max_batch_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "max_handle_payload_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "max_total_payload_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "8": {
+              "number": 8,
+              "name": "provider_id",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "ConnectorReadSplit": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "split_id",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "split_payload",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "estimated_bytes",
+              "type_name": "uint64",
+              "label": "optional",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "file_execution",
+              "type_name": "FileExecutionSidecar",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "CteAnchorNode": {
           "fields": {
             "1": {
@@ -3175,6 +3271,233 @@
               "name": "values",
               "type_name": "novarocks.expr.Expr",
               "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionDeleteFile": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "path",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "file_format",
+              "type_name": "FileExecutionDeleteFileFormat",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "file_content",
+              "type_name": "FileExecutionDeleteFileContent",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "length",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionDeletionVector": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "storage_type",
+              "type_name": "string",
+              "label": "optional",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "path_or_inline_dv",
+              "type_name": "string",
+              "label": "optional",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "offset",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "size_in_bytes",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "cardinality",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionPruningValue": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "value_kind",
+              "type_name": "FileExecutionPruningValueKind",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "has_null",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "all_null",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "min_int_value",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "max_int_value",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "min_float_value",
+              "type_name": "double",
+              "label": "optional",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "max_float_value",
+              "type_name": "double",
+              "label": "optional",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionSidecar": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "version",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "file_format",
+              "type_name": "FileExecutionFormat",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "path",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "file_length",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "offset",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "length",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "delete_files",
+              "type_name": "FileExecutionDeleteFile",
+              "label": "repeated",
+              "oneof": null
+            },
+            "8": {
+              "number": 8,
+              "name": "deletion_vector",
+              "type_name": "FileExecutionDeletionVector",
+              "label": "singular",
+              "oneof": null
+            },
+            "9": {
+              "number": 9,
+              "name": "first_row_id",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "10": {
+              "number": 10,
+              "name": "data_sequence_number",
+              "type_name": "int64",
+              "label": "optional",
+              "oneof": null
+            },
+            "11": {
+              "number": 11,
+              "name": "included_positions",
+              "type_name": "int64",
+              "label": "repeated",
+              "oneof": null
+            },
+            "12": {
+              "number": 12,
+              "name": "change_op",
+              "type_name": "int32",
+              "label": "optional",
+              "oneof": null
+            },
+            "13": {
+              "number": 13,
+              "name": "file_pruning_min_max_values",
+              "type_name": "map<int32, FileExecutionPruningValue>",
+              "label": "singular",
               "oneof": null
             }
           },
@@ -6234,6 +6557,13 @@
               "type_name": "StarRocksTableSource",
               "label": "singular",
               "oneof": "kind"
+            },
+            "8": {
+              "number": 8,
+              "name": "connector_read",
+              "type_name": "ConnectorReadSource",
+              "label": "singular",
+              "oneof": "kind"
             }
           },
           "reserved_numbers": [],
@@ -6975,6 +7305,78 @@
             {
               "number": 3,
               "name": "CHANGE_STREAM_BRANCH_KIND_FRESH_DATA"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionDeleteFileContent": {
+          "values": [
+            {
+              "number": 0,
+              "name": "FILE_EXECUTION_DELETE_FILE_CONTENT_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "FILE_EXECUTION_DELETE_FILE_CONTENT_POSITION"
+            },
+            {
+              "number": 2,
+              "name": "FILE_EXECUTION_DELETE_FILE_CONTENT_EQUALITY"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionDeleteFileFormat": {
+          "values": [
+            {
+              "number": 0,
+              "name": "FILE_EXECUTION_DELETE_FILE_FORMAT_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "FILE_EXECUTION_DELETE_FILE_FORMAT_PARQUET"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionFormat": {
+          "values": [
+            {
+              "number": 0,
+              "name": "FILE_EXECUTION_FORMAT_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "FILE_EXECUTION_FORMAT_PARQUET"
+            },
+            {
+              "number": 2,
+              "name": "FILE_EXECUTION_FORMAT_ORC"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "FileExecutionPruningValueKind": {
+          "values": [
+            {
+              "number": 0,
+              "name": "FILE_EXECUTION_PRUNING_VALUE_KIND_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "FILE_EXECUTION_PRUNING_BOOL"
+            },
+            {
+              "number": 2,
+              "name": "FILE_EXECUTION_PRUNING_INT"
+            },
+            {
+              "number": 3,
+              "name": "FILE_EXECUTION_PRUNING_FLOAT"
             }
           ],
           "reserved_numbers": [],
@@ -9682,6 +10084,108 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "StageFragment": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "plan",
+              "type_name": "novarocks.plan.PlanFragment",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "instance_params",
+              "type_name": "InstanceParams",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "StageFragmentsRequest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "init_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "stage_digest_version",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "stage_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "fragments",
+              "type_name": "StageFragment",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "StageFragmentsResponse": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "stage_digest_version",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "stage_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "outcome",
+              "type_name": "StageFragmentsOutcome",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "detail",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "StarRocksTabletScanRange": {
           "fields": {
             "1": {
@@ -9709,26 +10213,26 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
-        "SubmitFragmentRequest": {
+        "StartPreparedQueryRequest": {
           "fields": {
             "1": {
               "number": 1,
-              "name": "plan",
-              "type_name": "novarocks.plan.PlanFragment",
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
               "label": "singular",
               "oneof": null
             },
             "2": {
               "number": 2,
-              "name": "instance_params",
-              "type_name": "InstanceParams",
+              "name": "stage_digest_version",
+              "type_name": "uint32",
               "label": "singular",
               "oneof": null
             },
             "3": {
               "number": 3,
-              "name": "execution_id",
-              "type_name": "QueryExecutionId",
+              "name": "stage_digest",
+              "type_name": "bytes",
               "label": "singular",
               "oneof": null
             }
@@ -9736,18 +10240,39 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
-        "SubmitFragmentResponse": {
+        "StartPreparedQueryResponse": {
           "fields": {
             "1": {
               "number": 1,
-              "name": "status_code",
-              "type_name": "int32",
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
               "label": "singular",
               "oneof": null
             },
             "2": {
               "number": 2,
-              "name": "message",
+              "name": "stage_digest_version",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "stage_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "outcome",
+              "type_name": "StartPreparedQueryOutcome",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "detail",
               "type_name": "string",
               "label": "singular",
               "oneof": null
@@ -9955,6 +10480,78 @@
           ],
           "reserved_numbers": [],
           "reserved_names": []
+        },
+        "StageFragmentsOutcome": {
+          "values": [
+            {
+              "number": 0,
+              "name": "STAGE_FRAGMENTS_OUTCOME_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "STAGE_FRAGMENTS_APPLIED"
+            },
+            {
+              "number": 2,
+              "name": "STAGE_FRAGMENTS_ALREADY_APPLIED"
+            },
+            {
+              "number": 3,
+              "name": "STAGE_FRAGMENTS_REJECTED_CONFLICT"
+            },
+            {
+              "number": 4,
+              "name": "STAGE_FRAGMENTS_REJECTED_INVALID_STATE"
+            },
+            {
+              "number": 5,
+              "name": "STAGE_FRAGMENTS_REJECTED_INVALID_BATCH"
+            },
+            {
+              "number": 6,
+              "name": "STAGE_FRAGMENTS_REJECTED_CAPACITY"
+            },
+            {
+              "number": 7,
+              "name": "STAGE_FRAGMENTS_REJECTED_TERMINATED"
+            },
+            {
+              "number": 8,
+              "name": "STAGE_FRAGMENTS_REJECTED_LOCAL_FAILURE"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "StartPreparedQueryOutcome": {
+          "values": [
+            {
+              "number": 0,
+              "name": "START_PREPARED_QUERY_OUTCOME_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "START_PREPARED_QUERY_APPLIED"
+            },
+            {
+              "number": 2,
+              "name": "START_PREPARED_QUERY_ALREADY_STARTED"
+            },
+            {
+              "number": 3,
+              "name": "START_PREPARED_QUERY_REJECTED_NOT_STAGED"
+            },
+            {
+              "number": 4,
+              "name": "START_PREPARED_QUERY_REJECTED_CONFLICT"
+            },
+            {
+              "number": 5,
+              "name": "START_PREPARED_QUERY_REJECTED_TERMINATED"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
         }
       },
       "services": {
@@ -10026,9 +10623,15 @@
               "client_streaming": false,
               "server_streaming": false
             },
-            "SubmitFragment": {
-              "request": "SubmitFragmentRequest",
-              "response": "SubmitFragmentResponse",
+            "StageFragments": {
+              "request": "StageFragmentsRequest",
+              "response": "StageFragmentsResponse",
+              "client_streaming": false,
+              "server_streaming": false
+            },
+            "StartPreparedQuery": {
+              "request": "StartPreparedQueryRequest",
+              "response": "StartPreparedQueryResponse",
               "client_streaming": false,
               "server_streaming": false
             },

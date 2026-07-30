@@ -277,22 +277,28 @@ fn stage_fragment_request_carries_native_fields_only() {
         fragments: vec![novarocks::StageFragment {
             plan: Some(plan::PlanFragment::default()),
             instance_params: Some(novarocks::InstanceParams {
-            query_id: Some(id(1, 2)),
-            fragment_instance_id: Some(id(3, 4)),
-            backend_num: 1,
-            per_node_scan_ranges: BTreeMap::new(),
-            per_exch_num_senders: BTreeMap::new(),
-            destinations: vec![destination()],
-            query_options: Some(query_options()),
-            report_endpoint: Some("10.0.0.10:9070".to_string()),
-            typed_result_sink: true,
+                query_id: Some(id(1, 2)),
+                fragment_instance_id: Some(id(3, 4)),
+                backend_num: 1,
+                per_node_scan_ranges: BTreeMap::new(),
+                per_exch_num_senders: BTreeMap::new(),
+                destinations: vec![destination()],
+                query_options: Some(query_options()),
+                report_endpoint: Some("10.0.0.10:9070".to_string()),
+                typed_result_sink: true,
             }),
         }],
     };
     let fields = encoded_field_numbers(&request);
 
-    assert!(fields.contains(&1), "execution_id must use StageFragmentsRequest tag 1");
-    assert!(fields.contains(&5), "fragments must use StageFragmentsRequest tag 5");
+    assert!(
+        fields.contains(&1),
+        "execution_id must use StageFragmentsRequest tag 1"
+    );
+    assert!(
+        fields.contains(&5),
+        "fragments must use StageFragmentsRequest tag 5"
+    );
 
     let decoded: novarocks::StageFragmentsRequest = roundtrip_message(&request);
     assert_eq!(request, decoded);

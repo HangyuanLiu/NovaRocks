@@ -2510,11 +2510,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn generated_server_returns_unimplemented_for_retired_submit_method() {
         let node = IndependentGrpcRuntimeFilterNode::start().expect("start generated gRPC server");
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", node.endpoint()))
-            .expect("retired submit endpoint")
-            .connect()
-            .await
-            .expect("connect retired submit client");
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("http://{}", node.endpoint()))
+                .expect("retired submit endpoint")
+                .connect()
+                .await
+                .expect("connect retired submit client");
         let mut client = tonic::client::Grpc::new(channel);
         client.ready().await.expect("retired submit client ready");
         let error = client

@@ -92,9 +92,7 @@ mod tests {
         BackendQueryEvent, BackendQueryEventSink, LiveBackendTarget,
     };
     use novarocks::query_execution::contract::{DistributedQueryIntent, QueryId};
-    use novarocks::query_execution::fragment_transport::{
-        FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
-    };
+    use novarocks::query_execution::fragment_transport::{FetchOutcome, FragmentDispatcher};
 
     use super::BackendQueryActivity;
     use crate::coordinator::query_registry::FrontendQueryRegistry;
@@ -106,14 +104,6 @@ mod tests {
     }
 
     impl FragmentDispatcher for RecordingDispatcher {
-        fn submit_fragment(
-            &self,
-            _backend_idx: usize,
-            _submission: NativeFragmentEnvelope,
-        ) -> Result<(), String> {
-            panic!("backend-event test must not submit fragments")
-        }
-
         fn fetch_result(
             &self,
             _backend_idx: usize,

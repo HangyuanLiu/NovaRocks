@@ -24,7 +24,7 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
 use novarocks::query_execution::contract::{DistributedQueryIntent, QueryId};
 use novarocks::query_execution::fragment_transport::{
-    ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
+    ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
 use novarocks::query_execution::lifecycle::{
     AttemptId, BackendQueryControl, ParticipantBackendIdentity, ParticipantManifest,
@@ -57,14 +57,6 @@ use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQuer
 struct NoopFragmentDispatcher;
 
 impl FragmentDispatcher for NoopFragmentDispatcher {
-    fn submit_fragment(
-        &self,
-        _backend_idx: usize,
-        _submission: NativeFragmentEnvelope,
-    ) -> Result<(), String> {
-        unreachable!("query lifecycle unit tests do not submit fragments")
-    }
-
     fn fetch_result(
         &self,
         _backend_idx: usize,
@@ -1380,14 +1372,6 @@ struct RecordingLegacyCancellationDispatcher {
 }
 
 impl FragmentDispatcher for RecordingLegacyCancellationDispatcher {
-    fn submit_fragment(
-        &self,
-        _backend_idx: usize,
-        _submission: NativeFragmentEnvelope,
-    ) -> Result<(), String> {
-        unreachable!("cancellation test does not submit fragments")
-    }
-
     fn fetch_result(
         &self,
         _backend_idx: usize,

@@ -17,7 +17,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,19 +36,18 @@ mod tests {
         non_empty_write_contract_fixture_with_query_timeout_seconds,
     };
     use novarocks::query_execution::fragment_transport::{
-        FetchOutcome, FetchedQueryBatch, FragmentDispatcher, NativeFragmentEnvelope,
+        FetchOutcome, FetchedQueryBatch, FragmentDispatcher,
     };
     use novarocks::query_execution::lifecycle::{
         ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
         QueryControlEvent, QueryControlSession, QueryInitAck, QueryInitOutcome, QueryInitRequest,
         QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError, QueryStageAck,
         QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
-        QueryTerminationAck, QueryTerminationReason,
+        QueryTerminationAck, QueryTerminationReason, StageFragment,
     };
     use novarocks::query_execution::write::NativeExecutionReport;
 
     use crate::coordinator::FrontendDistributedQueryCoordinator;
-    use crate::coordinator::execution::ready_lifecycle_transport_for_test;
     use crate::coordinator::query_registry::FrontendQueryRegistry;
     use crate::coordinator::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
     use crate::topology::ClusterBackendService;
@@ -60,12 +59,11 @@ mod tests {
     #[derive(Default)]
     struct RecordingDispatcher {
         submissions: Mutex<Vec<(usize, UniqueId)>>,
-        submission_reporting: Mutex<Vec<(bool, bool)>>,
+        staged_by_backend: Mutex<BTreeMap<usize, Vec<UniqueId>>>,
         fetches: Mutex<Vec<(usize, UniqueId)>>,
         cancellations: Mutex<Vec<(usize, Vec<UniqueId>)>>,
         cancellation_query_ids: Mutex<Vec<QueryId>>,
         outcomes: Mutex<VecDeque<FetchOutcome>>,
-        fail_on_submit: Option<usize>,
         cancel_on_submit: Mutex<
             Option<(
                 usize,
@@ -77,6 +75,62 @@ mod tests {
     }
 
     impl RecordingDispatcher {
+        fn stage_fragments(&self, backend_idx: usize, fragments: &[StageFragment]) {
+            self.staged_by_backend.lock().unwrap().insert(
+                backend_idx,
+                fragments
+                    .iter()
+                    .map(StageFragment::fragment_instance_id)
+                    .collect(),
+            );
+        }
+
+        fn start_staged_fragments(&self, backend_idx: usize) {
+            let fragments = self
+                .staged_by_backend
+                .lock()
+                .unwrap()
+                .remove(&backend_idx)
+                .unwrap_or_default();
+            for fragment_instance_id in fragments {
+                let submission_count = {
+                    let mut submissions = self.submissions.lock().unwrap();
+                    if let Some(events) = &self.events {
+                        events.lock().unwrap().push("start");
+                    }
+                    submissions.push((backend_idx, fragment_instance_id));
+                    submissions.len()
+                };
+                let should_cancel = self
+                    .cancel_on_submit
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|(submit_count, _)| submission_count == *submit_count);
+                if should_cancel {
+                    if let Some((_, cancellation)) = self.cancel_on_submit.lock().unwrap().take() {
+                        let _ = cancellation.request(
+                            novarocks::query_execution::cancellation::QueryCancellationReason::ClientDisconnected,
+                        );
+                    }
+                }
+                let report_callback = {
+                    let mut report_on_submit = self.report_on_submit.lock().unwrap();
+                    if report_on_submit
+                        .as_ref()
+                        .is_some_and(|(submit_count, _)| submission_count == *submit_count)
+                    {
+                        report_on_submit.take().map(|(_, callback)| callback)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(report_callback) = report_callback {
+                    report_callback();
+                }
+            }
+        }
+
         fn with_result(batch: FetchedQueryBatch) -> Self {
             Self {
                 outcomes: Mutex::new(VecDeque::from([
@@ -254,55 +308,6 @@ mod tests {
     }
 
     impl FragmentDispatcher for RecordingDispatcher {
-        fn submit_fragment(
-            &self,
-            backend_idx: usize,
-            submission: NativeFragmentEnvelope,
-        ) -> Result<(), String> {
-            let mut submissions = self.submissions.lock().unwrap();
-            if let Some(events) = &self.events {
-                events.lock().unwrap().push("submit");
-            }
-            submissions.push((backend_idx, submission.fragment_instance_id()?));
-            self.submission_reporting.lock().unwrap().push((
-                submission.has_report_endpoint(),
-                submission.uses_typed_result_sink(),
-            ));
-            let should_cancel = self
-                .cancel_on_submit
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|(submit_count, _)| submissions.len() == *submit_count);
-            if should_cancel {
-                if let Some((_, cancellation)) = self.cancel_on_submit.lock().unwrap().take() {
-                    let _ = cancellation.request(
-                        novarocks::query_execution::cancellation::QueryCancellationReason::ClientDisconnected,
-                    );
-                }
-            }
-            let report_callback = {
-                let mut report_on_submit = self.report_on_submit.lock().unwrap();
-                if report_on_submit
-                    .as_ref()
-                    .is_some_and(|(submit_count, _)| submissions.len() == *submit_count)
-                {
-                    report_on_submit.take().map(|(_, callback)| callback)
-                } else {
-                    None
-                }
-            };
-            drop(submissions);
-            if let Some(report_callback) = report_callback {
-                report_callback();
-            }
-            if self.fail_on_submit == Some(self.submissions.lock().unwrap().len()) {
-                Err("injected submit failure with unknown remote outcome".to_string())
-            } else {
-                Ok(())
-            }
-        }
-
         fn fetch_result(
             &self,
             backend_idx: usize,
@@ -338,6 +343,121 @@ mod tests {
 
         fn needs_fragment_status_report(&self) -> bool {
             true
+        }
+    }
+
+    struct RecordingLifecycleSession {
+        events: Mutex<VecDeque<QueryControlEvent>>,
+    }
+
+    impl QueryControlSession for RecordingLifecycleSession {
+        fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
+            let event = match command {
+                QueryControlCommand::Heartbeat { sequence, .. } => {
+                    QueryControlEvent::HeartbeatAck { sequence }
+                }
+                QueryControlCommand::Abort { .. } => QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorAbort,
+                },
+                QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorFinalize,
+                },
+            };
+            self.events.lock().unwrap().push_back(event);
+            Ok(())
+        }
+
+        fn recv_timeout(
+            &self,
+            _timeout: Duration,
+        ) -> Result<QueryControlEvent, QueryLifecycleTransportError> {
+            self.events.lock().unwrap().pop_front().ok_or_else(|| {
+                QueryLifecycleTransportError::new(
+                    novarocks::query_execution::lifecycle::QueryLifecycleTransportErrorKind::DeadlineExceeded,
+                    "recording lifecycle session has no pending event",
+                )
+            })
+        }
+    }
+
+    struct RecordingLifecycleTransport {
+        dispatcher: Arc<RecordingDispatcher>,
+    }
+
+    impl RecordingLifecycleTransport {
+        fn new(dispatcher: Arc<RecordingDispatcher>) -> Self {
+            Self { dispatcher }
+        }
+    }
+
+    impl QueryLifecycleTransport for RecordingLifecycleTransport {
+        fn init_query(
+            &self,
+            _target: QueryLifecycleTarget,
+            request: QueryInitRequest,
+            _timeout: Duration,
+        ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+            Ok(QueryInitAck::new(
+                request.manifest().execution_id(),
+                request.digest(),
+                QueryInitOutcome::Applied,
+            ))
+        }
+
+        fn attach_control(
+            &self,
+            _target: QueryLifecycleTarget,
+            _attach: QueryControlAttach,
+            _timeout: Duration,
+        ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
+            Ok(Arc::new(RecordingLifecycleSession {
+                events: Mutex::new(VecDeque::from([QueryControlEvent::ControlReady])),
+            }))
+        }
+
+        fn stage_fragments(
+            &self,
+            target: QueryLifecycleTarget,
+            request: &QueryStageRequest,
+            _timeout: Duration,
+        ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+            self.dispatcher
+                .stage_fragments(target.backend_idx(), request.fragments());
+            Ok(QueryStageAck::new(
+                request.execution_id(),
+                request.digest_version(),
+                request.digest(),
+                QueryStageOutcome::Applied,
+                "test participant staged",
+            ))
+        }
+
+        fn start_prepared_query(
+            &self,
+            target: QueryLifecycleTarget,
+            request: &QueryStartRequest,
+            _timeout: Duration,
+        ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
+            self.dispatcher.start_staged_fragments(target.backend_idx());
+            Ok(QueryStartAck::new(
+                request.execution_id(),
+                request.digest_version(),
+                request.digest(),
+                QueryStartOutcome::Applied,
+                "test participant started",
+            ))
+        }
+
+        fn abort_query(
+            &self,
+            _target: QueryLifecycleTarget,
+            request: QueryAbortRequest,
+            _timeout: Duration,
+        ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
+            Ok(QueryTerminationAck::new(
+                request.execution_id(),
+                QueryTerminationReason::CoordinatorAbort,
+            ))
         }
     }
 
@@ -503,64 +623,12 @@ mod tests {
         }
     }
 
-    struct PausingFirstSubmitDispatcher {
-        inner: RecordingDispatcher,
-        boundary: AllReadyBoundary,
-    }
-
-    impl FragmentDispatcher for PausingFirstSubmitDispatcher {
-        fn submit_fragment(
-            &self,
-            backend_idx: usize,
-            submission: NativeFragmentEnvelope,
-        ) -> Result<(), String> {
-            let (lock, ready) = &*self.boundary.state;
-            let mut state = lock.lock().expect("all-ready boundary");
-            if !state.first_submit_entered {
-                state.first_submit_entered = true;
-                state.all_ready_at_first_submit =
-                    !state.initialized.is_empty() && state.ready == state.initialized;
-                ready.notify_all();
-                while !state.release_first_submit {
-                    state = ready.wait(state).expect("release first dispatcher submit");
-                }
-            }
-            drop(state);
-            self.inner.submit_fragment(backend_idx, submission)
-        }
-
-        fn fetch_result(
-            &self,
-            backend_idx: usize,
-            finst_id: UniqueId,
-            max_wait_ms: i64,
-            expected_output_schema: Option<
-                novarocks::query_execution::fragment_transport::ExpectedOutputSchemaView<'_>,
-            >,
-        ) -> Result<FetchOutcome, String> {
-            self.inner
-                .fetch_result(backend_idx, finst_id, max_wait_ms, expected_output_schema)
-        }
-
-        fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]) {
-            self.inner
-                .cancel_fragments(backend_idx, query_id, finst_ids);
-        }
-
-        fn backend_count(&self) -> usize {
-            self.inner.backend_count()
-        }
-
-        fn needs_fragment_status_report(&self) -> bool {
-            self.inner.needs_fragment_status_report()
-        }
-    }
-
     fn test_coordinator(
         query_id: QueryId,
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<RecordingDispatcher>,
     ) -> FrontendDistributedQueryCoordinator {
+        let lifecycle = Arc::new(RecordingLifecycleTransport::new(Arc::clone(&dispatcher)));
         FrontendDistributedQueryCoordinator::new_for_test(
             query_id,
             report_endpoint(),
@@ -568,7 +636,7 @@ mod tests {
             dispatcher,
             NonZeroUsize::new(1).unwrap(),
             Arc::new(()),
-            ready_lifecycle_transport_for_test(),
+            lifecycle,
         )
     }
 
@@ -588,9 +656,7 @@ mod tests {
             .expect("frontend executes fixture");
 
         assert_result_outcome_preserved(outcome, 1).expect("engine consumes Result payload");
-        assert!(dispatcher.submissions.lock().unwrap().is_empty());
-        let reporting = dispatcher.submission_reporting.lock().unwrap();
-        assert!(reporting.is_empty());
+        assert_eq!(dispatcher.submissions.lock().unwrap().len(), 2);
         assert!(!dispatcher.fetches.lock().unwrap().is_empty());
     }
 
@@ -601,12 +667,10 @@ mod tests {
         let batch = fixture.result_batch();
         let request = fixture.into_request();
         let boundary = AllReadyBoundary::default();
-        let dispatcher = Arc::new(PausingFirstSubmitDispatcher {
-            inner: RecordingDispatcher::with_result(batch),
-            boundary: boundary.clone(),
-        });
+        let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
             FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
+        let lifecycle = Arc::new(RecordingLifecycleTransport::new(Arc::clone(&dispatcher)));
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(41, 73),
             report_endpoint(),
@@ -675,6 +739,7 @@ mod tests {
         let topology = Arc::new(ClusterBackendService::from_captured_targets_for_test(
             &scheduler.live_targets(),
         ));
+        let lifecycle = Arc::new(RecordingLifecycleTransport::new(Arc::clone(&dispatcher)));
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
             QueryId::new(41, 73),
             report_endpoint(),
@@ -682,7 +747,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(1).unwrap(),
             Arc::new(()),
-            ready_lifecycle_transport_for_test(),
+            lifecycle,
             topology.clone(),
         );
 
@@ -726,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_resolves_a_fresh_backend_snapshot_for_each_query() {
+    fn frontend_reuses_a_compatible_backend_snapshot_for_each_query() {
         let first = non_empty_result_contract_fixture();
         let backends = first.backends().to_vec();
         let first_batch = first.result_batch();
@@ -738,12 +803,10 @@ mod tests {
             first_batch,
             second_batch,
         ]));
-        let schedulers = backends
-            .iter()
-            .copied()
-            .map(|backend| {
+        let schedulers = (0..2)
+            .map(|_| {
                 FrontendFragmentScheduler::new(
-                    FrontendBackendSnapshot::for_test(vec![backend]).unwrap(),
+                    FrontendBackendSnapshot::for_test(backends.clone()).unwrap(),
                 )
             })
             .collect();
@@ -754,7 +817,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(1).unwrap(),
             Arc::new(()),
-            ready_lifecycle_transport_for_test(),
+            Arc::new(RecordingLifecycleTransport::new(Arc::clone(&dispatcher))),
         );
 
         assert_result_outcome_preserved(coordinator.execute(first_request).unwrap(), 1).unwrap();
@@ -767,7 +830,7 @@ mod tests {
             .iter()
             .map(|(backend_idx, _)| *backend_idx)
             .collect::<Vec<_>>();
-        assert_eq!(submitted_backends, vec![3, 3, 8, 8]);
+        assert_eq!(submitted_backends, vec![8, 8, 8, 8]);
     }
 
     #[test]
@@ -1077,7 +1140,10 @@ mod tests {
             .expect("write cancellation must retain abort recovery data");
         assert_write_abort_reason(outcome, "query cancelled")
             .expect("cancelled write cannot commit");
-        assert_eq!(dispatcher.submissions.lock().unwrap().len(), 1);
+        assert!(
+            !dispatcher.submissions.lock().unwrap().is_empty(),
+            "the cancellation must be observed after at least one StartPreparedQuery release"
+        );
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
     }
 
@@ -1330,6 +1396,7 @@ mod tests {
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
             FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
+        let lifecycle = Arc::new(RecordingLifecycleTransport::new(Arc::clone(&dispatcher)));
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test(
             QueryId::new(41, 73),
             report_endpoint(),
@@ -1337,7 +1404,7 @@ mod tests {
             dispatcher.clone(),
             NonZeroUsize::new(1).unwrap(),
             Arc::new(()),
-            ready_lifecycle_transport_for_test(),
+            lifecycle,
         );
         dispatcher.report_on_submit(2, report, &coordinator);
 
