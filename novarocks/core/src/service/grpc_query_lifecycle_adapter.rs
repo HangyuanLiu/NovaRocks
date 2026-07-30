@@ -161,7 +161,7 @@ pub(crate) fn handle_start_prepared_query(
     }
     if response.outcome().is_running()
         && let Some(scope) =
-            claim_backend_fault(QueryLifecycleFaultKind::StartAckSuppress, execution_id)?
+            observe_backend_fault(QueryLifecycleFaultKind::StartAckSuppress, execution_id)?
     {
         eprintln!(
             "NOVAROCKS_START_ACK_SUPPRESSED execution_id={}:{}:{} backend_index={} token={}",
@@ -416,6 +416,8 @@ async fn run_attached_control_stream(
 
 #[cfg(debug_assertions)]
 use crate::common::query_lifecycle_fault::claim_matching_fault;
+#[cfg(debug_assertions)]
+use crate::common::query_lifecycle_fault::observe_matching_fault;
 use crate::common::query_lifecycle_fault::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
 
 #[cfg(debug_assertions)]
@@ -489,8 +491,46 @@ fn claim_backend_fault(
     .map_err(tonic::Status::failed_precondition)
 }
 
+#[cfg(debug_assertions)]
+fn observe_backend_fault(
+    kind: QueryLifecycleFaultKind,
+    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
+    let Some(root) = crate::common::config::sql_test_query_lifecycle_fault_dir() else {
+        return Ok(None);
+    };
+    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
+        .map_err(|_| tonic::Status::failed_precondition("lifecycle fault backend index is unset"))?
+        .parse::<usize>()
+        .map_err(|error| {
+            tonic::Status::failed_precondition(format!(
+                "invalid lifecycle fault backend index: {error}"
+            ))
+        })?;
+    let backend_id = crate::runtime::backend_id::backend_id()
+        .and_then(|id| u64::try_from(id).ok())
+        .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
+    observe_matching_fault(
+        &root,
+        kind,
+        execution_id,
+        backend_index,
+        backend_id,
+        crate::runtime::start_epoch::start_epoch(),
+    )
+    .map_err(tonic::Status::failed_precondition)
+}
+
 #[cfg(not(debug_assertions))]
 fn claim_backend_fault(
+    _kind: QueryLifecycleFaultKind,
+    _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
+    Ok(None)
+}
+
+#[cfg(not(debug_assertions))]
+fn observe_backend_fault(
     _kind: QueryLifecycleFaultKind,
     _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {

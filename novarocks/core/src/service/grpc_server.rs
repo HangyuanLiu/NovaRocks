@@ -93,23 +93,6 @@ struct RejectingTestNativeFragmentIngress;
 #[cfg(test)]
 struct RejectingTestQueryLifecycleIngress;
 
-#[cfg(test)]
-fn decode_test_native_fragment_request(
-    execution_id: crate::proto::novarocks::QueryExecutionId,
-    fragment: crate::proto::plan::PlanFragment,
-    instance_params: crate::proto::novarocks::InstanceParams,
-) -> Result<
-    crate::service::native_fragment_ingress::NativeFragmentRequest,
-    crate::service::native_fragment_ingress::NativeFragmentIngressError,
-> {
-    crate::service::native_fragment_ingress::NativeFragmentRequest::try_decode_wire(
-        execution_id,
-        fragment,
-        instance_params,
-        Arc::new(crate::connector::ConnectorRegistry::new()),
-    )
-}
-
 #[cfg(all(test, feature = "compat"))]
 struct RejectingTestSyncFragmentExecutor;
 
@@ -179,36 +162,6 @@ impl QueryLifecycleIngress for RejectingTestQueryLifecycleIngress {
 
 #[cfg(test)]
 impl NativeFragmentIngress for RejectingTestNativeFragmentIngress {
-    fn submit_native_payload(
-        &self,
-        execution_id: crate::proto::novarocks::QueryExecutionId,
-        fragment: crate::proto::plan::PlanFragment,
-        instance_params: crate::proto::novarocks::InstanceParams,
-    ) -> Result<
-        crate::service::native_fragment_ingress::NativeFragmentAccepted,
-        crate::service::native_fragment_ingress::NativeFragmentIngressError,
-    > {
-        self.submit(decode_test_native_fragment_request(
-            execution_id,
-            fragment,
-            instance_params,
-        )?)
-    }
-
-    fn submit(
-        &self,
-        _request: crate::service::native_fragment_ingress::NativeFragmentRequest,
-    ) -> Result<
-        crate::service::native_fragment_ingress::NativeFragmentAccepted,
-        crate::service::native_fragment_ingress::NativeFragmentIngressError,
-    > {
-        Err(
-            crate::service::native_fragment_ingress::NativeFragmentIngressError::new(
-                "test native fragment ingress is not configured",
-            ),
-        )
-    }
-
     fn cancel(
         &self,
         _request: NativeFragmentCancelRequest,
@@ -2965,8 +2918,7 @@ mod pr3_tests {
     };
     use crate::service::grpc_server::decode_test_native_fragment_request;
     use crate::service::native_fragment_ingress::{
-        NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
-        NativeFragmentIngressError, NativeFragmentRequest,
+        NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
     };
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -3446,38 +3398,10 @@ mod pr3_tests {
 
     #[derive(Default)]
     struct RecordingNativeFragmentIngress {
-        submissions: Mutex<Vec<(QueryId, UniqueId)>>,
         cancellations: Mutex<Vec<NativeFragmentCancelRequest>>,
     }
 
     impl NativeFragmentIngress for RecordingNativeFragmentIngress {
-        fn submit_native_payload(
-            &self,
-            execution_id: novarocks::QueryExecutionId,
-            fragment: plan::PlanFragment,
-            instance_params: novarocks::InstanceParams,
-        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-            self.submit(decode_test_native_fragment_request(
-                execution_id,
-                fragment,
-                instance_params,
-            )?)
-        }
-
-        fn submit(
-            &self,
-            request: NativeFragmentRequest,
-        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-            self.submissions
-                .lock()
-                .expect("native fragment submissions")
-                .push((request.query_id(), request.fragment_instance_id()));
-            Ok(NativeFragmentAccepted::new(
-                request.query_id(),
-                request.fragment_instance_id(),
-            ))
-        }
-
         fn cancel(
             &self,
             request: NativeFragmentCancelRequest,
@@ -3486,77 +3410,6 @@ mod pr3_tests {
                 .lock()
                 .expect("native fragment cancellations")
                 .push(request);
-            Ok(())
-        }
-    }
-
-    struct GatedNativeFragmentIngress {
-        entered: Notify,
-        accepted: Mutex<bool>,
-        acceptance_gate: Condvar,
-    }
-
-    impl GatedNativeFragmentIngress {
-        fn new() -> Self {
-            Self {
-                entered: Notify::new(),
-                accepted: Mutex::new(false),
-                acceptance_gate: Condvar::new(),
-            }
-        }
-
-        async fn wait_until_entered(&self) {
-            self.entered.notified().await;
-        }
-
-        fn accept(&self) {
-            *self
-                .accepted
-                .lock()
-                .expect("native fragment acceptance gate") = true;
-            self.acceptance_gate.notify_all();
-        }
-    }
-
-    impl NativeFragmentIngress for GatedNativeFragmentIngress {
-        fn submit_native_payload(
-            &self,
-            execution_id: novarocks::QueryExecutionId,
-            fragment: plan::PlanFragment,
-            instance_params: novarocks::InstanceParams,
-        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-            self.submit(decode_test_native_fragment_request(
-                execution_id,
-                fragment,
-                instance_params,
-            )?)
-        }
-
-        fn submit(
-            &self,
-            request: NativeFragmentRequest,
-        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-            self.entered.notify_one();
-            let mut accepted = self
-                .accepted
-                .lock()
-                .expect("native fragment acceptance gate");
-            while !*accepted {
-                accepted = self
-                    .acceptance_gate
-                    .wait(accepted)
-                    .expect("native fragment acceptance gate");
-            }
-            Ok(NativeFragmentAccepted::new(
-                request.query_id(),
-                request.fragment_instance_id(),
-            ))
-        }
-
-        fn cancel(
-            &self,
-            _request: NativeFragmentCancelRequest,
-        ) -> Result<(), NativeFragmentIngressError> {
             Ok(())
         }
     }

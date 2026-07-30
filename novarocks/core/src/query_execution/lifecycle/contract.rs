@@ -112,7 +112,7 @@ pub trait QueryLifecycleTransport: Send + Sync + 'static {
     /// Atomically stage the complete participant-local fragment batch.
     ///
     /// Implementations that have not completed the QLC-3 cutover return an
-    /// explicit unavailable error rather than falling back to SubmitFragment.
+    /// explicit unavailable error rather than falling back to per-fragment startup.
     fn stage_fragments(
         &self,
         _target: QueryLifecycleTarget,

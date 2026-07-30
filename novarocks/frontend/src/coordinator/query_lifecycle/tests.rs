@@ -39,8 +39,7 @@ use novarocks::runtime::query_options::QueryOptions;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 use novarocks::service::grpc_server::GrpcService;
 use novarocks::service::native_fragment_ingress::{
-    NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
-    NativeFragmentIngressError, NativeFragmentRequest,
+    NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
 
 use super::barrier::{
@@ -2056,15 +2055,6 @@ fn live_control_error(
 struct RejectNativeFragments;
 
 impl NativeFragmentIngress for RejectNativeFragments {
-    fn submit(
-        &self,
-        _request: NativeFragmentRequest,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-        Err(NativeFragmentIngressError::new(
-            "live lifecycle test does not submit fragments",
-        ))
-    }
-
     fn cancel(
         &self,
         _request: NativeFragmentCancelRequest,

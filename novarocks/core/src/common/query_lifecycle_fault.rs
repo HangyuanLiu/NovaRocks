@@ -161,6 +161,37 @@ pub fn claim_matching_fault(
     Ok(Some(scope))
 }
 
+/// Reads a matching runner-owned fault without consuming it.
+///
+/// `StartAckSuppress` remains armed for the full execution attempt so both
+/// the first Start RPC and its one idempotent retry have an unknown outcome.
+/// That forces the frontend through the partial-start global Abort path. The
+/// SQL runner owns cleanup of the fault directory after the step.
+pub fn observe_matching_fault(
+    root: &Path,
+    kind: QueryLifecycleFaultKind,
+    execution_id: QueryExecutionId,
+    backend_index: usize,
+    backend_id: u64,
+    start_epoch: u64,
+) -> Result<Option<QueryLifecycleFaultScope>, String> {
+    let trigger = trigger_path(root, backend_index, kind);
+    let contents = match fs::read_to_string(&trigger) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", trigger.display())),
+    };
+    let scope = parse_scope(&contents)?;
+    if scope.execution_id != execution_id
+        || scope.backend_index != backend_index
+        || scope.backend_id != backend_id
+        || scope.start_epoch != start_epoch
+    {
+        return Ok(None);
+    }
+    Ok(Some(scope))
+}
+
 fn serialize_scope(scope: &QueryLifecycleFaultScope) -> String {
     format!(
         "token={}\nexecution_hi={}\nexecution_lo={}\nattempt={}\nbackend_index={}\nbackend_id={}\nstart_epoch={}\n",
@@ -330,6 +361,48 @@ mod tests {
             Some(expected)
         );
         assert!(!trigger_path(&root, 1, QueryLifecycleFaultKind::InitAckDrop).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn observed_fault_remains_armed_for_the_start_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-lifecycle-observe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create scope root");
+        let arm = arm_path(&root, 1, QueryLifecycleFaultKind::StartAckSuppress);
+        fs::write(&arm, "token=retry-ack\nbackend_index=1\n").expect("write arm");
+        let expected = bind_armed_fault(
+            &root,
+            QueryLifecycleFaultKind::StartAckSuppress,
+            execution_id(9),
+            1,
+            17,
+            23,
+        )
+        .expect("bind")
+        .expect("armed");
+
+        for _ in 0..2 {
+            assert_eq!(
+                observe_matching_fault(
+                    &root,
+                    QueryLifecycleFaultKind::StartAckSuppress,
+                    execution_id(9),
+                    1,
+                    17,
+                    23,
+                )
+                .expect("observe"),
+                Some(expected.clone())
+            );
+        }
+        assert!(trigger_path(&root, 1, QueryLifecycleFaultKind::StartAckSuppress).exists());
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
