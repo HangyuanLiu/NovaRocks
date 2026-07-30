@@ -41,8 +41,7 @@ const PRODUCER_AGGREGATE_TOPN_KEY_FIELD: u32 = 4;
 /// producer target oneofs: accepting either would make invalid raw wire appear
 /// to satisfy the current contract after unknown-field or oneof information is
 /// discarded. The decoder therefore inspects only the affected paths in raw
-/// `SubmitFragmentRequest` and `StageFragmentsRequest` bytes before delegating
-/// to Prost. No legacy payload is decoded or carried.
+/// `StageFragmentsRequest` bytes before delegating to Prost.
 #[derive(Debug, Clone)]
 pub(crate) struct NativeProstCodec<T, U> {
     marker: PhantomData<(T, U)>,
@@ -132,22 +131,16 @@ where
     type Error = Status;
 
     fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        let is_submit_fragment =
-            TypeId::of::<U>() == TypeId::of::<crate::proto::novarocks::SubmitFragmentRequest>();
         let is_stage_fragments =
             TypeId::of::<U>() == TypeId::of::<crate::proto::novarocks::StageFragmentsRequest>();
-        if is_submit_fragment || is_stage_fragments {
+        if is_stage_fragments {
             let bytes = source.chunk();
             if bytes.len() != source.remaining() {
                 return Err(Status::internal(
                     "native fragment request protobuf is not contiguous",
                 ));
             }
-            let result = if is_submit_fragment {
-                scan_submit_fragment_request(bytes)
-            } else {
-                scan_stage_fragments_request(bytes)
-            };
+            let result = scan_stage_fragments_request(bytes);
             match result {
                 Ok(()) | Err(WireScanError::Decode(_)) => {}
                 Err(WireScanError::RetiredInstanceParamsField) => {
@@ -166,19 +159,6 @@ where
 
     fn buffer_settings(&self) -> BufferSettings {
         self.buffer_settings
-    }
-}
-
-pub(crate) fn validate_submit_fragment_request_wire(bytes: &[u8]) -> Result<(), Status> {
-    match scan_submit_fragment_request(bytes) {
-        Ok(()) => Ok(()),
-        Err(WireScanError::RetiredInstanceParamsField) => {
-            Err(retired_instance_params_field_status())
-        }
-        Err(WireScanError::AmbiguousProducerBindingTarget) => {
-            Err(ambiguous_producer_binding_target_status())
-        }
-        Err(WireScanError::Decode(error)) => Err(Status::internal(error.to_string())),
     }
 }
 
@@ -205,31 +185,6 @@ fn ambiguous_producer_binding_target_status() -> Status {
     Status::invalid_argument(
         "native runtime-filter producer target carries both join_build_key and aggregate_topn_key",
     )
-}
-
-fn scan_submit_fragment_request(bytes: &[u8]) -> Result<(), WireScanError> {
-    let mut cursor = bytes;
-    let context = DecodeContext::default();
-    while cursor.has_remaining() {
-        let (field, wire_type) = decode_key(&mut cursor)?;
-        if wire_type == WireType::LengthDelimited {
-            match field {
-                PLAN_FIELD => {
-                    let plan = take_length_delimited(&mut cursor)?;
-                    scan_plan_fragment(plan)?;
-                    continue;
-                }
-                INSTANCE_PARAMS_FIELD => {
-                    let instance_params = take_length_delimited(&mut cursor)?;
-                    scan_instance_params(instance_params)?;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        skip_field(wire_type, field, &mut cursor, context.clone())?;
-    }
-    Ok(())
 }
 
 fn scan_stage_fragments_request(bytes: &[u8]) -> Result<(), WireScanError> {
@@ -392,15 +347,9 @@ impl std::fmt::Display for WireScanError {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_stage_fragments_request_wire, validate_submit_fragment_request_wire};
-    use prost::Message;
-
-    fn submit_with_instance(instance: &[u8]) -> Vec<u8> {
-        assert!(instance.len() < 128);
-        let mut request = vec![0x12, instance.len() as u8];
-        request.extend_from_slice(instance);
-        request
-    }
+    use super::{
+        INSTANCE_PARAMS_FIELD, STAGE_FRAGMENTS_FIELD, validate_stage_fragments_request_wire,
+    };
 
     fn length_delimited(field: u32, payload: &[u8]) -> Vec<u8> {
         assert!(field <= 15);
@@ -416,114 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_instance_params_tag_seven_is_rejected_for_every_valid_wire_type() {
-        for wire_type in 0_u8..=5 {
-            let key = ((7_u32 << 3) | u32::from(wire_type)) as u8;
-            let request = submit_with_instance(&[key]);
-            let error = validate_submit_fragment_request_wire(&request)
-                .expect_err("tag 7 must be rejected before its value is decoded");
-            assert_eq!(error.code(), tonic::Code::InvalidArgument);
-            assert!(error.message().contains("tag 7"), "{error}");
-        }
-    }
-
-    #[test]
     fn stage_scanner_rejects_retired_instance_params_tag_in_nested_fragments() {
         let error = validate_stage_fragments_request_wire(&stage_with_instance(&[0x3a, 0]))
             .expect_err("nested retired tag must be rejected before Prost drops it");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().contains("tag 7"), "{error}");
-    }
-
-    #[test]
-    fn scanner_skips_supported_wire_types_without_interpreting_payloads() {
-        let instance = [
-            0x08, 0x96, 0x01, // field 1, varint
-            0x11, 1, 2, 3, 4, 5, 6, 7, 8, // field 2, fixed64
-            0x1a, 0x03, 9, 10, 11, // field 3, length-delimited
-            0x25, 12, 13, 14, 15, // field 4, fixed32
-        ];
-        validate_submit_fragment_request_wire(&submit_with_instance(&instance))
-            .expect("supported fields must delegate to Prost");
-    }
-
-    #[test]
-    fn unknown_group_is_transparent_to_scanner_and_prost() {
-        let request = submit_with_instance(&[
-            0x5b, 0x08, 1, 0x5c, // unknown field 11, group containing field 1
-        ]);
-        validate_submit_fragment_request_wire(&request)
-            .expect("unknown group must be skipped by the guard");
-        crate::proto::novarocks::SubmitFragmentRequest::decode(request.as_slice())
-            .expect("unknown groups must remain transparent to Prost");
-    }
-
-    #[test]
-    fn repeated_instance_params_rejects_if_any_occurrence_contains_legacy_tag() {
-        let mut request = submit_with_instance(&[0x08, 1]);
-        request.extend_from_slice(&submit_with_instance(&[0x3a, 0]));
-        let error = validate_submit_fragment_request_wire(&request)
-            .expect_err("every InstanceParams occurrence must be inspected");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn outer_tag_seven_is_not_confused_with_retired_instance_params_tag() {
-        let mut request = vec![0x3a, 0];
-        request.extend_from_slice(&submit_with_instance(&[0x08, 1]));
-        validate_submit_fragment_request_wire(&request)
-            .expect("only direct InstanceParams tag 7 is retired");
-    }
-
-    #[test]
-    fn producer_binding_target_rejects_ambiguous_raw_oneof_before_prost_collapse() {
-        let mut producer = length_delimited(3, &[]);
-        producer.extend_from_slice(&length_delimited(4, &[]));
-        let binding = length_delimited(8, &producer);
-        let table = length_delimited(2, &binding);
-        let plan = length_delimited(10, &table);
-        let request = length_delimited(1, &plan);
-
-        let decoded = crate::proto::novarocks::SubmitFragmentRequest::decode(request.as_slice())
-            .expect("Prost accepts both oneof target tags");
-        let target = decoded
-            .plan
-            .and_then(|plan| plan.runtime_filter_bindings)
-            .and_then(|table| table.bindings.into_iter().next())
-            .and_then(|binding| binding.role)
-            .and_then(|role| match role {
-                crate::proto::plan::runtime_filter_binding::Role::Producer(role) => role.target,
-                crate::proto::plan::runtime_filter_binding::Role::Consumer(_) => None,
-            });
-        assert!(matches!(
-            target,
-            Some(crate::proto::plan::runtime_filter_producer_role::Target::AggregateTopnKey(_))
-        ));
-
-        let error = validate_submit_fragment_request_wire(&request)
-            .expect_err("raw wire carrying both producer target arms must be rejected");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("join_build_key"), "{error}");
-        assert!(error.message().contains("aggregate_topn_key"), "{error}");
-    }
-
-    #[test]
-    fn malformed_submit_wire_is_bounded_and_never_panics() {
-        let malformed = [
-            vec![0x12, 0x80],
-            vec![0x12, 0x04, 0x08],
-            vec![0x12, 0x01, 0x0c],
-            vec![0x12, 0x02, 0x0b, 0x14],
-            vec![0x00],
-            vec![0x80; 11],
-            vec![0x12, 0x01, 0x0e],
-        ];
-        for bytes in malformed {
-            let outcome =
-                std::panic::catch_unwind(|| validate_submit_fragment_request_wire(&bytes));
-            let result = outcome.expect("wire scanner must not panic");
-            let error = result.expect_err("malformed bytes must retain Prost rejection semantics");
-            assert_eq!(error.code(), tonic::Code::Internal, "bytes={bytes:?}");
-        }
     }
 }

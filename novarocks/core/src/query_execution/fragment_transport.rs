@@ -23,7 +23,6 @@ use std::sync::Arc;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::query_execution::contract::QueryId;
-use crate::query_execution::lifecycle::QueryExecutionId;
 
 /// Opaque data-plane batch returned by a fragment dispatcher.
 ///
@@ -72,19 +71,12 @@ pub enum FetchOutcome {
     Err(String),
 }
 
-/// Fragment dispatcher trait.
+/// Result and cancellation transport for an already-running native query.
 ///
-/// Implementations choose where and how fragments run. The coordinator calls
-/// `submit_fragment` for each fragment, then polls `fetch_result` for the root
-/// fragment instance until `Eof` or `Err`.
+/// Query startup belongs exclusively to the query lifecycle Stage/Start
+/// barrier. This port deliberately exposes only the residual fetch, cancel,
+/// and reporting policy needed after that barrier has entered `Running`.
 pub trait FragmentDispatcher: Send + Sync + 'static {
-    /// Submit a fragment for asynchronous execution to the given backend.
-    fn submit_fragment(
-        &self,
-        backend_idx: usize,
-        submission: NativeFragmentEnvelope,
-    ) -> Result<(), String>;
-
     /// Poll for the next result chunk from the root fragment on the given backend.
     fn fetch_result(
         &self,
@@ -106,132 +98,12 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     }
 }
 
-/// Build the production gRPC fragment dispatcher from one explicit immutable
-/// backend snapshot.
+/// Build the production result/cancellation transport from one explicit
+/// immutable backend snapshot.
 pub fn new_grpc_fragment_dispatcher(
     backends: &[(usize, SocketAddr)],
 ) -> Result<Arc<dyn FragmentDispatcher>, String> {
     Ok(Arc::new(
         crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(backends)?,
     ))
-}
-
-pub struct NativeFragmentEnvelope {
-    execution_id: QueryExecutionId,
-    plan: crate::proto::plan::PlanFragment,
-    instance_params: crate::proto::novarocks::InstanceParams,
-}
-
-impl NativeFragmentEnvelope {
-    pub(crate) fn new(
-        execution_id: QueryExecutionId,
-        plan: crate::proto::plan::PlanFragment,
-        instance_params: crate::proto::novarocks::InstanceParams,
-    ) -> Self {
-        Self {
-            execution_id,
-            plan,
-            instance_params,
-        }
-    }
-
-    pub const fn execution_id(&self) -> QueryExecutionId {
-        self.execution_id
-    }
-
-    #[cfg(test)]
-    pub(crate) fn plan_for_test(&self) -> &crate::proto::plan::PlanFragment {
-        &self.plan
-    }
-
-    #[cfg(test)]
-    pub(crate) fn instance_params_for_test(&self) -> &crate::proto::novarocks::InstanceParams {
-        &self.instance_params
-    }
-
-    pub fn fragment_id(&self) -> u32 {
-        self.plan.fragment_id
-    }
-
-    pub fn query_id(&self) -> Result<UniqueId, String> {
-        let id = self
-            .instance_params
-            .query_id
-            .as_ref()
-            .ok_or_else(|| "fragment submission missing query_id".to_string())?;
-        Ok(UniqueId {
-            hi: id.hi,
-            lo: id.lo,
-        })
-    }
-
-    pub fn fragment_instance_id(&self) -> Result<UniqueId, String> {
-        let id = self
-            .instance_params
-            .fragment_instance_id
-            .as_ref()
-            .ok_or_else(|| "fragment submission missing fragment_instance_id".to_string())?;
-        Ok(UniqueId {
-            hi: id.hi,
-            lo: id.lo,
-        })
-    }
-
-    pub fn has_report_endpoint(&self) -> bool {
-        self.instance_params.report_endpoint.is_some()
-    }
-
-    pub fn uses_typed_result_sink(&self) -> bool {
-        self.instance_params.typed_result_sink
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        crate::proto::plan::PlanFragment,
-        crate::proto::novarocks::InstanceParams,
-    ) {
-        (self.plan, self.instance_params)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::proto::common::UniqueId as ProtoUniqueId;
-    use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-
-    #[test]
-    fn native_fragment_envelope_preserves_native_plan_and_instance_params() {
-        let envelope = NativeFragmentEnvelope::new(
-            QueryExecutionId::new(
-                QueryId::new(7, 9),
-                AttemptId::new(3).expect("nonzero attempt"),
-            )
-            .expect("valid execution id"),
-            crate::proto::plan::PlanFragment {
-                fragment_id: 9,
-                ..Default::default()
-            },
-            crate::proto::novarocks::InstanceParams {
-                query_id: Some(ProtoUniqueId { hi: 7, lo: 9 }),
-                fragment_instance_id: Some(ProtoUniqueId { hi: 7, lo: 11 }),
-                backend_num: 3,
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(envelope.execution_id().attempt_id().get(), 3);
-        assert_eq!(
-            envelope.query_id().expect("native query id"),
-            UniqueId { hi: 7, lo: 9 }
-        );
-        assert_eq!(
-            envelope.fragment_instance_id().expect("native finst id"),
-            UniqueId { hi: 7, lo: 11 }
-        );
-        let (plan, instance_params) = envelope.into_parts();
-        assert_eq!(plan.fragment_id, 9);
-        assert_eq!(instance_params.backend_num, 3);
-    }
 }

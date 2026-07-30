@@ -33,9 +33,7 @@ use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, QueryId, ResolvedQueryOptions,
 };
-use crate::query_execution::fragment_transport::{
-    ExpectedOutputSchemaView, FetchedQueryBatch, NativeFragmentEnvelope,
-};
+use crate::query_execution::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 use crate::query_execution::lifecycle::{
     ExchangeRouteManifest, QueryExecutionId, QueryInitBarrier, QueryInitOptions,
     QueryLaunchBarrier, QueryLifecycleLease, StageBatch, StageFragment, StageParticipantBinding,
@@ -901,7 +899,9 @@ impl NativeSubmissionContext {
 pub struct ValidatedNativeSubmission {
     backend_idx: usize,
     finst_id: UniqueId,
-    envelope: NativeFragmentEnvelope,
+    execution_id: QueryExecutionId,
+    plan: crate::proto::plan::PlanFragment,
+    instance_params: crate::proto::novarocks::InstanceParams,
 }
 
 impl ValidatedNativeSubmission {
@@ -914,16 +914,11 @@ impl ValidatedNativeSubmission {
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
-        self.envelope.execution_id()
-    }
-
-    pub fn into_envelope(self) -> NativeFragmentEnvelope {
-        self.envelope
+        self.execution_id
     }
 
     fn into_stage_fragment(self) -> Result<(usize, StageFragment), DistributedQueryError> {
-        let (plan, instance_params) = self.envelope.into_parts();
-        let fragment = StageFragment::new(plan, instance_params)
+        let fragment = StageFragment::new(self.plan, self.instance_params)
             .map_err(|error| contract_error(error.to_string()))?;
         if fragment.fragment_instance_id() != self.finst_id {
             return Err(contract_error(
@@ -1389,11 +1384,9 @@ fn assemble_native_execution(
                 Ok(ValidatedNativeSubmission {
                     backend_idx: placement.backend_idx,
                     finst_id: placement.finst_id,
-                    envelope: NativeFragmentEnvelope::new(
-                        execution_id,
-                        native_fragment,
-                        instance_params,
-                    ),
+                    execution_id,
+                    plan: native_fragment,
+                    instance_params,
                 })
             })
             .collect::<Result<Vec<_>, DistributedQueryError>>()?;
