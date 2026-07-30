@@ -1470,6 +1470,16 @@ fn plan_native_iceberg_read_with_file_override(
     let declaration = control_binding
         .execution_declaration(&context)
         .map_err(|error| error.to_string())?;
+    // A fixed snapshot can arrive without a materialized file list when it
+    // was loaded through the schema metadata path (notably the synthetic
+    // time-travel table used by an MV full refresh). Keep an explicit list
+    // authoritative when present, but otherwise let the connector resolve
+    // the requested snapshot instead of treating the empty list as an empty
+    // table.
+    let use_explicit_files = matches!(
+        binding,
+        super::scan_model::IcebergDataFileBinding::ExplicitFiles
+    ) && explicit_files.is_some_and(|files| !files.is_empty());
     let table_handle = ConnectorTableHandle::try_new(
         instance_id.clone(),
         encode_payload(
@@ -1480,12 +1490,8 @@ fn plan_native_iceberg_read_with_file_override(
                 metadata_columns: Vec::new(),
                 metadata_table_type: None,
                 prepared_files: Vec::new(),
-                explicit_files: matches!(
-                    binding,
-                    super::scan_model::IcebergDataFileBinding::ExplicitFiles
-                )
-                .then(|| explicit_files.map(ToOwned::to_owned))
-                .flatten(),
+                explicit_files: use_explicit_files
+                    .then(|| explicit_files.expect("non-empty explicit files").to_vec()),
                 logical_type_columns: BTreeMap::new(),
             },
             "table handle",
