@@ -179,6 +179,7 @@ impl StageResourceReservation {
         state.active_builders += 1;
         state.encoded_bytes = next_bytes;
         state.dormant_workers = next_workers;
+        drop(state);
         Ok(Self {
             ledger,
             encoded_bytes,

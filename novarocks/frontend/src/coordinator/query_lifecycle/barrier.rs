@@ -23,8 +23,7 @@ use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::{
     QueryControlAttach, QueryControlEvent, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
-    QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStageOutcome, QueryStartAck,
-    QueryStartOutcome, StageBatch,
+    QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStartAck, StageBatch,
 };
 
 use super::QueryLifecycleTransport;

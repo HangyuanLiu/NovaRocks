@@ -124,6 +124,7 @@ impl FrontendFragmentScheduler {
         self.backends.entries()
     }
 
+    #[cfg(test)]
     pub(crate) fn live_targets(&self) -> Vec<LiveBackendTarget> {
         self.backends.live_targets()
     }
