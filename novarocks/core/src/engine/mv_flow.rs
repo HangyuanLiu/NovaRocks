@@ -22,7 +22,6 @@ use std::sync::Arc;
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, RefreshCtx, RefreshError, RefreshRequest,
 };
-use crate::engine::statement::{AlterIcebergPropertiesStmt, PropertiesOp};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::persistence::definition::{
@@ -607,17 +606,28 @@ pub(crate) fn alter_mv_with_connector_context(
             );
         }
         if let AlterMaterializedViewAction::SetProperties(entries) = &stmt.action {
-            crate::connector::iceberg::catalog::alter_table_properties(
-                state,
-                &AlterIcebergPropertiesStmt {
-                    table: stmt.name.clone(),
-                    op: PropertiesOp::Set {
-                        entries: entries.clone(),
+            let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+                .map_err(|error| error.to_string())?;
+            crate::connector::mutation::execute_catalog_mutation(
+                state.connector_control.as_ref(),
+                &instance_id,
+                novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
+                    table: novarocks_spi::connector::ConnectorTableIdentity {
+                        instance_id: instance_id.clone(),
+                        namespace: Arc::from(target.namespace.as_str()),
+                        table: Arc::from(target.table.as_str()),
                     },
+                    changes: entries
+                        .iter()
+                        .map(|(key, value)| {
+                            novarocks_spi::connector::ConnectorPropertyChange::Set {
+                                key: Arc::from(key.as_str()),
+                                value: Arc::from(value.as_str()),
+                            }
+                        })
+                        .collect(),
                 },
-                Some(current_catalog),
-                db,
-                connector_context,
+                connector_context.clone(),
             )?;
             return Ok(StatementResult::Ok);
         }

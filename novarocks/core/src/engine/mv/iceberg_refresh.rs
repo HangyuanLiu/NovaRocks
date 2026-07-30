@@ -387,16 +387,45 @@ impl MvEngine for StandaloneMvEngine {
         _operation_id: uuid::Uuid,
     ) -> Result<CreatedMvTarget, MvEngineError> {
         let prepared = self.preparation(plan)?;
-        crate::connector::iceberg::catalog::registry::create_table(
-            &prepared.entry,
-            &prepared.target.namespace,
-            &prepared.target.table,
-            &prepared.columns,
-            None,
-            &prepared.partition_fields,
-            &prepared.target_properties,
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
+                .map_err(|error| engine_target_error(error.to_string()))?;
+        let created = crate::connector::mutation::execute_catalog_mutation(
+            self.state.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(prepared.target.namespace.as_str()),
+                    table: Arc::from(prepared.target.table.as_str()),
+                },
+                columns: prepared
+                    .columns
+                    .iter()
+                    .map(crate::engine::statement::connector_column)
+                    .collect::<Result<_, _>>()
+                    .map_err(engine_target_error)?,
+                key: None,
+                partitioning: prepared
+                    .partition_fields
+                    .iter()
+                    .map(crate::engine::statement::connector_partition_transform)
+                    .collect(),
+                properties: prepared
+                    .target_properties
+                    .iter()
+                    .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
+                    .collect(),
+                policy: novarocks_spi::connector::CreatePolicy::FailIfExists,
+            },
+            self.connector_context.clone(),
         )
         .map_err(engine_target_error)?;
+        if created.effect != novarocks_spi::connector::ExternalMutationEffect::Applied {
+            return Err(engine_target_error(
+                "materialized view target create unexpectedly returned NoOp".to_string(),
+            ));
+        }
         prepared
             .entry
             .invalidate_table_cache(&prepared.target.namespace, &prepared.target.table);
@@ -503,10 +532,23 @@ impl MvEngine for StandaloneMvEngine {
 
     fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
         let prepared = self.preparation_for_target(&target.target)?;
-        crate::connector::iceberg::catalog::registry::drop_table(
-            &prepared.entry,
-            &prepared.target.namespace,
-            &prepared.target.table,
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
+                .map_err(|error| engine_target_error(error.to_string()))?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.state.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(prepared.target.namespace.as_str()),
+                    table: Arc::from(prepared.target.table.as_str()),
+                },
+                policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                data_disposition:
+                    novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+            },
+            self.connector_context.clone(),
         )
         .map_err(engine_target_error)?;
         self.preparations
