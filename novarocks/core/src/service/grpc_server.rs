@@ -54,6 +54,8 @@ use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 use crate::query_execution::lifecycle::QueryLifecycleIngress;
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
+#[cfg(all(test, feature = "compat"))]
+use crate::runtime::fragment::io::SyncFragmentExecutor;
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
@@ -90,6 +92,33 @@ struct RejectingTestNativeFragmentIngress;
 
 #[cfg(test)]
 struct RejectingTestQueryLifecycleIngress;
+
+#[cfg(test)]
+fn decode_test_native_fragment_request(
+    execution_id: crate::proto::novarocks::QueryExecutionId,
+    fragment: crate::proto::plan::PlanFragment,
+    instance_params: crate::proto::novarocks::InstanceParams,
+) -> Result<
+    crate::service::native_fragment_ingress::NativeFragmentRequest,
+    crate::service::native_fragment_ingress::NativeFragmentIngressError,
+> {
+    crate::service::native_fragment_ingress::NativeFragmentRequest::try_decode_wire(
+        execution_id,
+        fragment,
+        instance_params,
+        Arc::new(crate::connector::ConnectorRegistry::new()),
+    )
+}
+
+#[cfg(all(test, feature = "compat"))]
+struct RejectingTestSyncFragmentExecutor;
+
+#[cfg(all(test, feature = "compat"))]
+impl SyncFragmentExecutor for RejectingTestSyncFragmentExecutor {
+    fn execute_encoded(&self, _payload: &[u8]) -> Result<crate::common::types::UniqueId, String> {
+        Err("test StarRocks fragment sync ingress is not configured".to_string())
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn rejecting_test_native_fragment_ingress() -> Arc<dyn NativeFragmentIngress> {
@@ -150,6 +179,22 @@ impl QueryLifecycleIngress for RejectingTestQueryLifecycleIngress {
 
 #[cfg(test)]
 impl NativeFragmentIngress for RejectingTestNativeFragmentIngress {
+    fn submit_native_payload(
+        &self,
+        execution_id: crate::proto::novarocks::QueryExecutionId,
+        fragment: crate::proto::plan::PlanFragment,
+        instance_params: crate::proto::novarocks::InstanceParams,
+    ) -> Result<
+        crate::service::native_fragment_ingress::NativeFragmentAccepted,
+        crate::service::native_fragment_ingress::NativeFragmentIngressError,
+    > {
+        self.submit(decode_test_native_fragment_request(
+            execution_id,
+            fragment,
+            instance_params,
+        )?)
+    }
+
     fn submit(
         &self,
         _request: crate::service::native_fragment_ingress::NativeFragmentRequest,
@@ -911,6 +956,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             println!("{}", grpc_submit_accepted_marker(identity));
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
+        if crate::common::config::debug_emit_grpc_fragment_marker()
+            && let Err(error) = &result
+        {
+            println!("NOVAROCKS_GRPC_SUBMIT_REJECTED error={error}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
         match result {
             Ok(()) => Ok(tonic::Response::new(
                 proto::novarocks::SubmitFragmentResponse {
@@ -1117,6 +1168,79 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(
             proto::novarocks::CancelFragmentResponse {
                 status_code: CANCEL_FRAGMENT_OK,
+            },
+        ))
+    }
+
+    async fn install_connector_instance(
+        &self,
+        request: tonic::Request<proto::novarocks::InstallConnectorInstanceRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::InstallConnectorInstanceResponse>, tonic::Status>
+    {
+        self.require_local_execution("InstallConnectorInstance")?;
+        let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
+            tonic::Status::failed_precondition("connector binding ingress is not configured")
+        })?;
+        let request = request.into_inner();
+        let result = tokio::task::spawn_blocking(move || {
+            let declaration = crate::service::connector_binding::decode_install_request(request)
+                .map_err(|error| error.to_string())?;
+            let context = crate::service::connector_binding::install_request_context()
+                .map_err(|error| error.to_string())?;
+            ingress
+                .install_connector_instance(declaration, context)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!(
+                "install_connector_instance handler panicked: {error}"
+            ))
+        })?;
+        let (status_code, message) = match result {
+            Ok(()) => (0, String::new()),
+            Err(error) => (1, error),
+        };
+        Ok(tonic::Response::new(
+            proto::novarocks::InstallConnectorInstanceResponse {
+                status_code,
+                message,
+            },
+        ))
+    }
+
+    async fn retire_connector_instance(
+        &self,
+        request: tonic::Request<proto::novarocks::RetireConnectorInstanceRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::RetireConnectorInstanceResponse>, tonic::Status>
+    {
+        self.require_local_execution("RetireConnectorInstance")?;
+        let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
+            tonic::Status::failed_precondition("connector binding ingress is not configured")
+        })?;
+        let request = request.into_inner();
+        let result = tokio::task::spawn_blocking(move || {
+            let (instance_id, incarnation) =
+                crate::service::connector_binding::decode_retire_request(request)
+                    .map_err(|error| error.to_string())?;
+            ingress
+                .retire_connector_instance(instance_id, incarnation)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!(
+                "retire_connector_instance handler panicked: {error}"
+            ))
+        })?;
+        let (status_code, message) = match result {
+            Ok(()) => (0, String::new()),
+            Err(error) => (1, error),
+        };
+        Ok(tonic::Response::new(
+            proto::novarocks::RetireConnectorInstanceResponse {
+                status_code,
+                message,
             },
         ))
     }
@@ -2876,6 +3000,7 @@ mod pr3_tests {
     use crate::runtime_filter::port::transport::{
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
     };
+    use crate::service::grpc_server::decode_test_native_fragment_request;
     use crate::service::native_fragment_ingress::{
         NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
         NativeFragmentIngressError, NativeFragmentRequest,
@@ -3363,6 +3488,19 @@ mod pr3_tests {
     }
 
     impl NativeFragmentIngress for RecordingNativeFragmentIngress {
+        fn submit_native_payload(
+            &self,
+            execution_id: novarocks::QueryExecutionId,
+            fragment: plan::PlanFragment,
+            instance_params: novarocks::InstanceParams,
+        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+            self.submit(decode_test_native_fragment_request(
+                execution_id,
+                fragment,
+                instance_params,
+            )?)
+        }
+
         fn submit(
             &self,
             request: NativeFragmentRequest,
@@ -3418,6 +3556,19 @@ mod pr3_tests {
     }
 
     impl NativeFragmentIngress for GatedNativeFragmentIngress {
+        fn submit_native_payload(
+            &self,
+            execution_id: novarocks::QueryExecutionId,
+            fragment: plan::PlanFragment,
+            instance_params: novarocks::InstanceParams,
+        ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+            self.submit(decode_test_native_fragment_request(
+                execution_id,
+                fragment,
+                instance_params,
+            )?)
+        }
+
         fn submit(
             &self,
             request: NativeFragmentRequest,

@@ -75,6 +75,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
             .expect("placement endpoint"),
         scan_ranges,
+        connector_splits: BTreeMap::new(),
         destinations: vec![destination],
         per_exch_num_senders,
     };
@@ -193,6 +194,7 @@ fn instance_params_encoder_maps_starrocks_tablet_range() {
                     .expect("StarRocks tablet range"),
             ],
         )]),
+        connector_splits: BTreeMap::new(),
         destinations: Vec::new(),
         per_exch_num_senders: BTreeMap::new(),
     };

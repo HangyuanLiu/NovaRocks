@@ -240,6 +240,21 @@ impl CompatApplicationHost {
             fragment_sync_executor,
         ));
         let compat_routes = load_router(Arc::clone(&load_service), Arc::clone(&tracking));
+        fragment_service
+            .compose_connector_bindings(config.connector.object_store_config().map_err(
+                |error| {
+                    CompatApplicationError::new(
+                        CompatApplicationErrorKind::Configuration,
+                        format!("resolve connector startup object-store binding: {error}"),
+                    )
+                },
+            )?)
+            .map_err(|error| {
+                CompatApplicationError::new(
+                    CompatApplicationErrorKind::Configuration,
+                    format!("compose connector instance bindings: {error}"),
+                )
+            })?;
         let brpc_config = brpc::CompatConfig {
             host: &server.host,
             heartbeat_port: server.heartbeat_port,

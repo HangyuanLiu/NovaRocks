@@ -17,6 +17,7 @@
 #[cfg(feature = "compat")]
 pub mod backend_service;
 pub mod cluster_heartbeat;
+pub(crate) mod connector_binding;
 #[cfg(feature = "compat")]
 pub mod disk_report;
 #[cfg(feature = "compat")]

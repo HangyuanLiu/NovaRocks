@@ -16,7 +16,6 @@
 // under the License.
 pub(crate) mod backend;
 pub(crate) mod file_execution;
-pub mod hdfs;
 pub(crate) mod host;
 pub mod iceberg;
 pub mod jdbc;
@@ -52,12 +51,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorInstance, ConnectorInstanceId, ConnectorProviderId,
+    ConnectorCancellation, ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorInstanceInstaller, ConnectorProviderId,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution,
 };
 
-use self::host::{ConnectorHost, ConnectorHostError, ConnectorInstanceLease};
+use self::host::{ConnectorHost, ConnectorHostError};
 
 struct RequestConnectorCancellation {
     signal: Arc<AtomicBool>,
@@ -243,7 +243,6 @@ pub use crate::connector::file_execution::FileScanRange;
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
-pub use hdfs::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig};
 pub use jdbc::JdbcScanConfig;
 #[cfg(feature = "compat")]
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
@@ -455,45 +454,61 @@ impl ConnectorRegistry {
             .resolve(instance_id)
     }
 
-    pub(crate) fn materialize_transport_connector_instance(
+    pub(crate) fn register_connector_instance_installer(
         &self,
-        provider_id: &ConnectorProviderId,
-        instance_id: ConnectorInstanceId,
-        scan_payload: bytes::Bytes,
-        file_ranges: &[crate::connector::file_execution::FileScanRange],
-        output_schema: crate::exec::chunk::ChunkSchemaRef,
-    ) -> Result<ConnectorInstance, ConnectorHostError> {
+        installer: Arc<dyn ConnectorInstanceInstaller>,
+    ) -> Result<(), ConnectorHostError> {
         self.connector_host
-            .read()
-            .map_err(|_| ConnectorHostError::unavailable("connector host read lock poisoned"))?
-            .materialize_transport_instance(
-                provider_id,
-                instance_id,
-                scan_payload,
-                file_ranges,
-                output_schema,
-            )
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .register_installer(installer)
     }
 
-    /// Register a query-local instance and return a lease that removes it once
-    /// the physical scan no longer retains it.
-    pub(crate) fn register_ephemeral_connector_instance(
+    pub(crate) fn install_connector_instance(
         &self,
-        instance: ConnectorInstance,
-    ) -> Result<(Arc<ConnectorInstance>, Arc<ConnectorInstanceLease>), ConnectorHostError> {
-        let instance_id = instance.descriptor().instance_id.clone();
-        self.register_connector_instance(instance)?;
-        let lease = Arc::new(ConnectorInstanceLease::new(
-            Arc::clone(&self.connector_host),
-            instance_id.clone(),
-        ));
-        match self.connector_instance(&instance_id) {
-            Ok(instance) => Ok((instance, lease)),
-            Err(error) => {
-                drop(lease);
-                Err(error)
-            }
-        }
+        declaration: &ConnectorInstanceDeclaration,
+        context: &ConnectorRequestContext,
+    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
+        self.connector_host
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .install(declaration, context)
+    }
+
+    pub(crate) fn retire_connector_instance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        incarnation: ConnectorInstanceIncarnation,
+    ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {
+        self.connector_host
+            .write()
+            .map_err(|_| ConnectorHostError::unavailable("connector host write lock poisoned"))?
+            .retire(instance_id, incarnation)
+    }
+
+    /// Installs a startup-bound read-only instance received by the native
+    /// control plane. This is the only composition-facing installation API;
+    /// fragment decoding only resolves instances already present in this host.
+    pub fn install_distributed_instance(
+        &self,
+        declaration: &ConnectorInstanceDeclaration,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
+        self.install_connector_instance(declaration, context)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Marks one distributed instance generation as retiring. Existing reader
+    /// Arcs may drain, while subsequent fragment resolution is rejected.
+    pub fn retire_distributed_instance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        incarnation: ConnectorInstanceIncarnation,
+    ) -> Result<(), String> {
+        self.retire_connector_instance(instance_id, incarnation)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn register_catalog_backend(&mut self, backend: Arc<dyn CatalogBackend>) {
@@ -539,6 +554,33 @@ impl ConnectorRegistry {
     }
 }
 
+/// Registers the startup-bound installers that a BE process may use through
+/// the connector binding control plane.  Callers supply the already parsed
+/// local configuration; declarations only select the fixed `default` binding
+/// and cannot replace its credentials or endpoint.
+pub fn compose_backend_connector_installers(
+    registry: &ConnectorRegistry,
+    default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
+) -> Result<(), String> {
+    let file_runtime = crate::runtime::global_async_runtime::data_runtime_handle()?;
+    let binding = iceberg::provider::IcebergReadBinding::new(
+        default_object_store,
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(file_runtime.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(file_runtime)),
+    );
+    registry
+        .register_connector_instance_installer(Arc::new(
+            iceberg::provider::IcebergConnectorInstaller::new(binding.clone()),
+        ))
+        .map_err(|error| error.to_string())?;
+    registry
+        .register_connector_instance(
+            iceberg::provider::compose_compat_read_instance(binding)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
     let iceberg_catalogs = Arc::clone(&state.iceberg_catalogs);
     {
@@ -567,13 +609,7 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
 
 impl Default for ConnectorRegistry {
     fn default() -> Self {
-        let reg = ConnectorRegistry::new();
-        reg.connector_host
-            .write()
-            .expect("connector host write lock poisoned")
-            .register_transport_factory(Arc::new(hdfs::HdfsNativeTransportFactory::new()))
-            .expect("register native HDFS transport factory");
-        reg
+        ConnectorRegistry::new()
     }
 }
 

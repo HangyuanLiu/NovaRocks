@@ -32,7 +32,7 @@ mod projection;
 mod pruning;
 
 pub(crate) use iceberg::build_iceberg_metadata_scan_range_params;
-use iceberg::plan_iceberg_file_ranges;
+use iceberg::{plan_iceberg_connector_read, plan_iceberg_delta_connector_read};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
 
 pub(super) fn prepare_scan_bindings(
@@ -109,12 +109,11 @@ fn prepare_scan_node(
         ScanSource::IcebergDataFiles {
             table,
             files,
-            cloud_properties,
             binding,
+            ..
         } => ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
             table: table.clone(),
             files: files.clone(),
-            cloud_properties: cloud_properties.clone(),
             binding: *binding,
         }),
         ScanSource::IcebergMetadataTable { .. } => {
@@ -167,13 +166,21 @@ fn prepare_scan_node(
     validate_resolved_execution_kind(node_id, &scan.table.source, &execution)?;
     reject_target_equality_deletes(node_id, &scan.table.source, &execution)?;
     let physical_columns = resolve_physical_columns(node_id, scan)?;
-    let (ranges, equality_required) = match &execution {
+    let (ranges, equality_required, connector_read) = match &execution {
         ResolvedScanExecution::IcebergFiles(_) => {
-            plan_iceberg_file_ranges(connectors, context.clone(), scan, &execution)
-                .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?
+            let planned =
+                plan_iceberg_connector_read(connectors, context.clone(), scan, &execution)
+                    .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
+            // The provider reader projects physical equality keys internally
+            // and drops them before delivery. Core therefore never owns a
+            // hidden Iceberg delete column or file range.
+            (Vec::new(), Vec::new(), Some(planned))
         }
         ResolvedScanExecution::IcebergDelta(_) => {
-            (vec![build_iceberg_metadata_scan_range_params()], Vec::new())
+            let planned =
+                plan_iceberg_delta_connector_read(connectors, context.clone(), scan, &execution)
+                    .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
+            (Vec::new(), Vec::new(), Some(planned))
         }
     };
     let required_reads = resolve_effective_required_reads(node_id, scan, &equality_required)?;
@@ -183,6 +190,9 @@ fn prepare_scan_node(
         physical_columns,
         required_reads,
     })?;
+    if let Some(connector_read) = connector_read {
+        bindings.insert_connector_read(fragment_id, node_id, connector_read)?;
+    }
     bindings.insert_scan_ranges(fragment_id, node_id, ranges)
 }
 

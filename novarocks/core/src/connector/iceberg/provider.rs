@@ -26,10 +26,16 @@ use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
+use novarocks_fs::{
+    FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
+    FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+};
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest, ConnectorRead,
+    ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceDistribution, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorInstanceInstaller, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
     ConnectorReadSelector, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
     ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution,
@@ -40,23 +46,455 @@ use super::catalog::IcebergCatalogEntry;
 use super::catalog::registry::{
     IcebergCatalogRegistry, extract_data_files_with_stats_at, list_tables, load_table,
 };
+use super::reader::IcebergBatchReader;
 use super::scan_model::IcebergDataFileInfo;
-use super::scan_range::plan_iceberg_file_ranges;
-use crate::cache::CacheOptions;
-use crate::common::ids::SlotId;
-use crate::connector::HdfsScanConfig;
-use crate::connector::hdfs::HdfsFileBatchReader;
-use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::formats::FileFormatConfig;
-use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
-use novarocks_fs::DataCacheContext;
+
+#[derive(Clone, Deserialize, Serialize)]
+struct IcebergDeltaSplitPayload {
+    source: super::delta::DeltaSourceFile,
+    #[serde(default)]
+    delete_side: Option<super::delta::DeltaScanDeleteSide>,
+}
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
+const ICEBERG_DECLARATION_V1: u16 = 1;
+const DEFAULT_ACCESS_BINDING: &str = "default";
+/// Compat has no NovaRocks catalog instance identity on the wire.  Its
+/// read-only Iceberg binding is therefore composed once per BE process, not
+/// synthesized for each query or inferred from an HDFS path.
+pub(crate) const COMPAT_ICEBERG_INSTANCE_ID: &str = "iceberg.compat.default";
+const COMPAT_ICEBERG_INCARNATION: [u8; 16] = [0; 16];
+
+/// Provider-owned, secret-free declaration used to install an Iceberg read
+/// instance into a BE.  Catalog clients and credentials deliberately do not
+/// cross this boundary: the installer resolves the named binding from process
+/// startup composition.
+#[derive(Deserialize, Serialize)]
+struct IcebergDeclarationV1 {
+    version: u16,
+    access_binding: String,
+}
+
+#[derive(Clone)]
+struct IcebergInstanceDistribution {
+    descriptor: ConnectorInstanceDescriptor,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl ConnectorInstanceDistribution for IcebergInstanceDistribution {
+    fn declaration(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorInstanceDeclaration, ConnectorError> {
+        if context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        let payload = IcebergDeclarationV1 {
+            version: ICEBERG_DECLARATION_V1,
+            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
+        };
+        ConnectorInstanceDeclaration::try_new(
+            self.descriptor.clone(),
+            self.incarnation,
+            encode_payload(
+                &payload,
+                "Iceberg instance declaration",
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            )?,
+        )
+    }
+}
+
+/// Process-startup binding for a read-only Iceberg execution instance.
+///
+/// This type intentionally owns only a locally-composed access binding.  It
+/// has no catalog registry or metadata capability, because BE execution must
+/// consume the fully planned provider split rather than reconnecting a
+/// catalog.
+#[derive(Clone)]
+pub(crate) struct IcebergReadBinding {
+    access_binding: String,
+    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+    access_resolver: FsAccessResolver,
+    file_runtime: Arc<dyn FileIoRuntime>,
+    file_task_spawner: Arc<dyn FileTaskSpawner>,
+}
+
+impl std::fmt::Debug for IcebergReadBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergReadBinding")
+            .field("access_binding", &self.access_binding)
+            .field(
+                "object_store_config",
+                &self.object_store_config.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl IcebergReadBinding {
+    pub(crate) fn default_binding(
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+    ) -> Result<Self, ConnectorError> {
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            static FALLBACK_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+            FALLBACK_RUNTIME
+                .get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Iceberg fallback Tokio runtime must initialize")
+                })
+                .handle()
+                .clone()
+        });
+        Ok(Self::new(
+            object_store_config,
+            Arc::new(TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(TokioFileTaskSpawner::new(handle)),
+        ))
+    }
+
+    pub(crate) fn new(
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+        file_runtime: Arc<dyn FileIoRuntime>,
+        file_task_spawner: Arc<dyn FileTaskSpawner>,
+    ) -> Self {
+        Self {
+            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
+            object_store_config,
+            access_resolver: FsAccessResolver::new(),
+            file_runtime,
+            file_task_spawner,
+        }
+    }
+
+    pub(crate) fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
+        self.access_resolver
+            .resolve_location(location, self.object_store_config.as_ref())
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
+    }
+
+    pub(crate) fn file_read_context(
+        &self,
+        cancellation: novarocks_fs::FileCancellation,
+        deadline: std::time::Instant,
+    ) -> Result<FileReadContext, ConnectorError> {
+        Ok(FileReadContext {
+            cancellation,
+            deadline: Some(deadline),
+            runtime: Arc::clone(&self.file_runtime),
+            task_spawner: Arc::clone(&self.file_task_spawner),
+        })
+    }
+
+    pub(crate) fn file_size(
+        &self,
+        path: &str,
+        access: &FsAccessHandle,
+        context: &FileReadContext,
+    ) -> Result<u64, ConnectorError> {
+        let file = access
+            .bind_location(path, FileIdentity::new(path, 0, None))
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })?;
+        let cancellation = context.cancellation.clone();
+        context
+            .runtime
+            .block_on_u64(Box::pin(async move { file.stat(&cancellation).await }))
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
+                    .with_retryable_before_progress()
+            })
+    }
+}
+
+/// Startup-composed installer for Iceberg read-only instances.  The payload
+/// identifies the binding but cannot override it with cloud properties.
+pub(crate) struct IcebergConnectorInstaller {
+    provider_id: ConnectorProviderId,
+    binding: IcebergReadBinding,
+}
+
+impl IcebergConnectorInstaller {
+    pub(crate) fn new(binding: IcebergReadBinding) -> Self {
+        Self {
+            provider_id: ConnectorProviderId::parse(PROVIDER_ID)
+                .expect("static Iceberg provider ID is valid"),
+            binding,
+        }
+    }
+}
+
+/// Build the stable compat-only Iceberg reader instance from the same startup
+/// access binding used by distributed instance installation.  The identity is
+/// intentionally not query-local and carries no catalog client or credential
+/// in a fragment payload.
+pub(crate) fn compose_compat_read_instance(
+    binding: IcebergReadBinding,
+) -> Result<ConnectorInstance, ConnectorError> {
+    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: ConnectorProviderId::parse(PROVIDER_ID)?,
+        instance_id: instance_id.clone(),
+    };
+    ConnectorInstance::try_new(
+        descriptor,
+        None,
+        Arc::new(IcebergReadOnlyConnectorInstance {
+            instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes(COMPAT_ICEBERG_INCARNATION),
+            binding,
+        }),
+    )
+}
+
+/// Encode compat-normalized data-file facts as provider-owned opaque splits.
+/// The caller cannot alter provider identity, incarnation, or payload layout.
+pub(crate) fn build_compat_read_splits(
+    files: impl IntoIterator<Item = IcebergDataFileInfo>,
+) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+    let owner = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
+    files
+        .into_iter()
+        .enumerate()
+        .map(|(index, data_file)| {
+            let estimated_bytes = u64::try_from(data_file.size).ok();
+            let payload = SplitPayload {
+                version: ICEBERG_SPLIT_V1,
+                owner_instance_id: owner.as_str().to_string(),
+                incarnation: COMPAT_ICEBERG_INCARNATION,
+                namespace: "compat".to_string(),
+                table: "iceberg".to_string(),
+                snapshot_id: None,
+                table_uuid: None,
+                schema_id: None,
+                data_file,
+                projection: Vec::new(),
+                limit: None,
+                delta: None,
+            };
+            ConnectorSplit::try_new(
+                owner.clone(),
+                format!("compat-iceberg-{index}"),
+                encode_payload(
+                    &payload,
+                    "compat Iceberg split",
+                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                )?,
+                estimated_bytes,
+            )
+        })
+        .collect()
+}
+
+/// Encode compat-normalized snapshot-delta facts as ordinary provider-owned
+/// splits.  The stable compat instance owns the startup access binding; the
+/// Thrift plan contributes no object-store configuration or runtime handle.
+pub(crate) fn build_compat_delta_read_splits(
+    sources: impl IntoIterator<Item = super::delta::DeltaSourceFile>,
+    delete_side: Option<super::delta::DeltaScanDeleteSide>,
+) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+    let owner = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
+    sources
+        .into_iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let estimated_bytes = u64::try_from(source.size).ok();
+            let data_file = IcebergDataFileInfo {
+                path: source.path.clone(),
+                size: source.size,
+                row_count: None,
+                column_stats: None,
+                partition_spec_id: source.partition_spec_id,
+                partition_key: source.partition_key.clone(),
+                first_row_id: source.first_row_id,
+                data_sequence_number: source.data_sequence_number,
+                ivm_change_op: None,
+                included_positions: None,
+                delete_files: Vec::new(),
+                manifest_path: None,
+                partition_values: Vec::new(),
+            };
+            let payload = SplitPayload {
+                version: ICEBERG_SPLIT_V1,
+                owner_instance_id: owner.as_str().to_string(),
+                incarnation: COMPAT_ICEBERG_INCARNATION,
+                namespace: "compat".to_string(),
+                table: "iceberg-delta".to_string(),
+                snapshot_id: None,
+                table_uuid: None,
+                schema_id: None,
+                data_file,
+                projection: Vec::new(),
+                limit: None,
+                delta: Some(IcebergDeltaSplitPayload {
+                    source,
+                    delete_side: delete_side.clone(),
+                }),
+            };
+            ConnectorSplit::try_new(
+                owner.clone(),
+                format!("compat-iceberg-delta-{index}"),
+                encode_payload(
+                    &payload,
+                    "compat Iceberg delta split",
+                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                )?,
+                estimated_bytes,
+            )
+        })
+        .collect()
+}
+
+impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
+    fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
+    }
+
+    fn install(
+        &self,
+        declaration: &ConnectorInstanceDeclaration,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorInstance, ConnectorError> {
+        if declaration.descriptor().provider_id != self.provider_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg installer received a declaration for another provider",
+            ));
+        }
+        let payload: IcebergDeclarationV1 =
+            decode_payload(declaration.payload(), "Iceberg instance declaration")?;
+        if payload.version != ICEBERG_DECLARATION_V1 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!(
+                    "unsupported Iceberg instance declaration version {}",
+                    payload.version
+                ),
+            ));
+        }
+        if payload.access_binding != self.binding.access_binding {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg declaration access binding does not match BE startup binding",
+            ));
+        }
+        let reader = Arc::new(IcebergReadOnlyConnectorInstance {
+            instance_id: declaration.descriptor().instance_id.clone(),
+            incarnation: declaration.incarnation(),
+            binding: self.binding.clone(),
+        });
+        ConnectorInstance::try_new(declaration.descriptor().clone(), None, reader)
+    }
+}
+
+/// BE-only instance installed through the binding control plane.  Metadata and
+/// planning are deliberately unsupported; once the provider reader is wired,
+/// `open_reader` will consume the opaque, fully planned Iceberg split.
+struct IcebergReadOnlyConnectorInstance {
+    instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
+    binding: IcebergReadBinding,
+}
+
+impl ConnectorRead for IcebergReadOnlyConnectorInstance {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        _table: &ConnectorTableHandle,
+        _request: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "BE read-only Iceberg instances do not plan scans",
+        ))
+    }
+
+    fn plan_splits(
+        &self,
+        _scan: &ConnectorScanHandle,
+        _request: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "BE read-only Iceberg instances do not plan splits",
+        ))
+    }
+
+    fn open_reader(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        if request.context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= request.context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        ensure_owner(split.owner(), &self.instance_id)?;
+        let payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
+        if payload.version != ICEBERG_SPLIT_V1 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!("unsupported Iceberg split version {}", payload.version),
+            ));
+        }
+        if payload.owner_instance_id != self.instance_id.as_str()
+            || payload.incarnation != self.incarnation.to_bytes()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg split does not belong to this installed instance incarnation",
+            ));
+        }
+        if let Some(delta) = payload.delta {
+            return super::delta_reader::IcebergDeltaBatchReader::try_new(
+                delta.source,
+                delta.delete_side,
+                self.binding.clone(),
+                request,
+            )
+            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
+        }
+        let file_context = self.binding.file_read_context(
+            novarocks_fs::FileCancellation::new(),
+            request.context.deadline(),
+        )?;
+        let access = self.binding.resolve_access(&payload.data_file.path)?;
+        IcebergBatchReader::try_new(&payload.data_file, access, request, file_context)
+            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct IcebergConnectorInstance {
     instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
     snapshot_memberships: Arc<SnapshotMembershipCache>,
 }
@@ -66,20 +504,26 @@ impl IcebergConnectorInstance {
         instance_id: ConnectorInstanceId,
         registry: Arc<RwLock<IcebergCatalogRegistry>>,
     ) -> Result<ConnectorInstance, ConnectorError> {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse(PROVIDER_ID)?,
+            instance_id: instance_id.clone(),
+        };
+        let incarnation = ConnectorInstanceIncarnation::new();
         let provider = Arc::new(Self {
             instance_id: instance_id.clone(),
+            incarnation,
             registry,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
         });
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse(PROVIDER_ID)?,
-                instance_id,
+        ConnectorInstance::try_new(descriptor.clone(), Some(provider.clone()), provider).map(
+            |instance| {
+                instance.with_distribution(Arc::new(IcebergInstanceDistribution {
+                    descriptor,
+                    incarnation,
+                }))
             },
-            Some(provider.clone()),
-            provider,
         )
     }
 
@@ -180,31 +624,6 @@ impl IcebergConnectorInstance {
                 }),
         }?;
         Ok((snapshot_id, metadata.uuid().to_string()))
-    }
-
-    fn chunk_schema_for(&self, schema: &SchemaRef) -> Result<Arc<ChunkSchema>, ConnectorError> {
-        let slots = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let slot_id = u32::try_from(index + 1).map_err(|_| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "Iceberg projection has too many columns",
-                    )
-                })?;
-                Ok(ChunkSlotSchema::new_with_field(
-                    SlotId::new(slot_id),
-                    field.as_ref().clone(),
-                    None,
-                    None,
-                ))
-            })
-            .collect::<Result<Vec<_>, ConnectorError>>()?;
-        ChunkSchema::try_new(slots)
-            .map(Arc::new)
-            .map_err(|error| internal(format!("build Iceberg chunk schema: {error}")))
     }
 
     fn snapshot_membership(
@@ -555,13 +974,18 @@ impl ConnectorRead for IcebergConnectorInstance {
             }
             let estimated_bytes = u64::try_from(file.size).ok();
             let payload = SplitPayload {
+                version: ICEBERG_SPLIT_V1,
+                owner_instance_id: self.instance_id.as_str().to_string(),
+                incarnation: self.incarnation.to_bytes(),
                 namespace: scan.table.namespace.clone(),
                 table: scan.table.table.clone(),
                 snapshot_id: scan.snapshot_id,
                 table_uuid: scan.table_uuid.clone(),
+                schema_id: scan.table.table_info.as_ref().map(|table| table.schema_id),
                 data_file: file,
                 projection: scan.projection.clone(),
                 limit: scan.limit,
+                delta: None,
             };
             push_split_with_budget(
                 &mut splits,
@@ -640,51 +1064,16 @@ impl ConnectorRead for IcebergConnectorInstance {
                 ));
             }
         }
-        let ranges = plan_iceberg_file_ranges(&split.data_file).map_err(map_iceberg_error)?;
-        let chunk_schema = self.chunk_schema_for(&output_schema)?;
-        let columns = output_schema
-            .fields()
-            .iter()
-            .map(|field| field.name().to_string())
-            .collect::<Vec<_>>();
-        let batch_size = request.batch.max_rows.get();
-        let parquet = ParquetScanConfig {
-            columns,
-            chunk_schema: Arc::clone(&chunk_schema),
-            slot_kinds: vec![ParquetSlotKind::Regular; chunk_schema.slots().len()],
-            case_sensitive: true,
-            enable_page_index: false,
-            min_max_predicates: Vec::new(),
-            runtime_min_max_filter_columns: Default::default(),
-            variant_path_predicates: Vec::new(),
-            batch_size: Some(batch_size),
-            datacache: DataCacheContext::external(
-                CacheOptions::from_query_options(None)
-                    .map_err(|error| internal(format!("default cache options: {error}")))?
-                    .to_file_cache_options(),
-            ),
-            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
-            profile_label: Some("spi_iceberg_reader".to_string()),
-            iceberg_output_schema: Some(Arc::clone(&output_schema)),
-            variant_path_columns: Vec::new(),
-            query_global_dicts: Default::default(),
-        };
-        Ok(Box::new(HdfsFileBatchReader::new(
-            HdfsScanConfig {
-                original_range_count: ranges.len(),
-                ranges,
-                has_more: false,
-                limit: split.limit.and_then(|limit| usize::try_from(limit).ok()),
-                profile_label: Some("spi_iceberg_reader".to_string()),
-                format: Some(FileFormatConfig::Parquet(parquet)),
-                object_store_config: loaded.object_store_config,
-                iceberg_table_locations: Default::default(),
-                query_global_dicts: Default::default(),
-                iceberg_runtime_pruning: None,
-            },
-            request.context,
-            request.batch.max_rows.get(),
-            request.batch.max_bytes.get(),
+        let binding = IcebergReadBinding::default_binding(loaded.object_store_config.clone())?;
+        let file_context = binding.file_read_context(
+            novarocks_fs::FileCancellation::new(),
+            request.context.deadline(),
+        )?;
+        Ok(Box::new(IcebergBatchReader::try_new(
+            &split.data_file,
+            binding.resolve_access(&split.data_file.path)?,
+            request,
+            file_context,
         )?))
     }
 }
@@ -785,13 +1174,10 @@ fn build_table_payload(
         .iter()
         .map(|column| column.name.clone())
         .collect();
-    let (table_info, cloud_properties, source_files) = match table_def.source {
-        crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table,
-            files,
-            cloud_properties,
-            ..
-        } => (table, cloud_properties, files),
+    let (table_info, source_files) = match table_def.source {
+        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, files, .. } => {
+            (table, files)
+        }
         _ => {
             return Err(internal(
                 "Iceberg metadata capability produced a non-Iceberg table source".to_string(),
@@ -805,7 +1191,6 @@ fn build_table_payload(
         namespace: namespace.to_string(),
         table: table.to_string(),
         table_info: Some(table_info),
-        cloud_properties,
         metadata_columns,
         metadata_table_type,
         prepared_files,
@@ -818,7 +1203,6 @@ struct TablePayload {
     namespace: String,
     table: String,
     table_info: Option<super::scan_model::IcebergTableInfo>,
-    cloud_properties: BTreeMap<String, String>,
     metadata_columns: Vec<String>,
     metadata_table_type: Option<super::IcebergMetadataTableType>,
     prepared_files: Vec<IcebergDataFileInfo>,
@@ -837,14 +1221,30 @@ struct ScanPayload {
 
 #[derive(Deserialize, Serialize)]
 struct SplitPayload {
+    #[serde(default = "default_iceberg_split_version")]
+    version: u16,
+    #[serde(default)]
+    owner_instance_id: String,
+    #[serde(default)]
+    incarnation: [u8; 16],
     namespace: String,
     table: String,
     snapshot_id: Option<i64>,
     #[serde(default)]
     table_uuid: Option<String>,
+    #[serde(default)]
+    schema_id: Option<i32>,
     data_file: IcebergDataFileInfo,
     projection: Vec<usize>,
     limit: Option<u64>,
+    #[serde(default)]
+    delta: Option<IcebergDeltaSplitPayload>,
+}
+
+const ICEBERG_SPLIT_V1: u16 = 1;
+
+fn default_iceberg_split_version() -> u16 {
+    ICEBERG_SPLIT_V1
 }
 
 pub(crate) fn load_schema_table_def(
@@ -934,7 +1334,7 @@ pub(crate) fn load_table_def_at(
         source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
             table: table_info,
             files,
-            cloud_properties: payload.cloud_properties,
+            cloud_properties: BTreeMap::new(),
             binding,
         },
     };
@@ -999,7 +1399,7 @@ fn table_def_from_metadata(
         source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
             table: table_info,
             files: payload.prepared_files,
-            cloud_properties: payload.cloud_properties,
+            cloud_properties: BTreeMap::new(),
             binding: super::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         },
     })
@@ -1049,6 +1449,38 @@ pub(crate) fn plan_scan_files(
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
+    let planned = plan_native_iceberg_read(
+        connectors,
+        context,
+        table,
+        binding,
+        explicit_files,
+        projection,
+    )?;
+    planned
+        .splits
+        .iter()
+        .map(|split| {
+            decode_payload::<SplitPayload>(split.payload(), "split")
+                .map(|payload| payload.data_file)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+/// Fully plans an Iceberg read through its real connector instance.  The
+/// returned scan handle and splits are provider-owned bytes; callers may only
+/// schedule and carry them.  This is intentionally separate from range
+/// planning so native execution never reconstructs an Iceberg file scan in
+/// core.
+pub(crate) fn plan_native_iceberg_read(
+    connectors: &crate::connector::ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    binding: super::scan_model::IcebergDataFileBinding,
+    explicit_files: &[IcebergDataFileInfo],
+    projection: &[usize],
+) -> Result<PlannedIcebergConnectorRead, String> {
     use std::num::NonZeroUsize;
 
     let instance_id =
@@ -1056,14 +1488,22 @@ pub(crate) fn plan_scan_files(
     let instance = connectors
         .connector_instance(&instance_id)
         .map_err(|error| error.to_string())?;
+    let distribution = instance.distribution().ok_or_else(|| {
+        format!(
+            "Iceberg connector instance {} cannot be distributed to native backends",
+            instance_id.as_str()
+        )
+    })?;
+    let declaration = distribution
+        .declaration(&context)
+        .map_err(|error| error.to_string())?;
     let table_handle = ConnectorTableHandle::try_new(
-        instance_id,
+        instance_id.clone(),
         encode_payload(
             &TablePayload {
                 namespace: table.namespace.clone(),
                 table: table.table.clone(),
                 table_info: Some(table.clone()),
-                cloud_properties: BTreeMap::new(),
                 metadata_columns: Vec::new(),
                 metadata_table_type: None,
                 prepared_files: Vec::new(),
@@ -1118,16 +1558,101 @@ pub(crate) fn plan_scan_files(
             },
         )
         .map_err(|error| error.to_string())?;
-    splits
+    if splits
         .iter()
-        .map(|split| {
-            ensure_owner(split.owner(), &instance.descriptor().instance_id)
-                .map_err(|error| error.to_string())?;
-            decode_payload::<SplitPayload>(split.payload(), "split")
-                .map(|payload| payload.data_file)
-                .map_err(|error| error.to_string())
-        })
-        .collect()
+        .any(|split| split.owner() != &instance.descriptor().instance_id)
+    {
+        return Err("Iceberg connector planned a split for another instance".to_string());
+    }
+    Ok(PlannedIcebergConnectorRead {
+        declaration,
+        scan,
+        splits,
+        batch: novarocks_spi::connector::ConnectorBatchBudget {
+            max_rows: NonZeroUsize::new(4096).expect("batch rows are nonzero"),
+            max_bytes: NonZeroUsize::new(
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            )
+            .expect("batch bytes are nonzero"),
+        },
+    })
+}
+
+/// Plan snapshot-delta physical reads as ordinary opaque Iceberg connector
+/// splits.  Delta retains its logical planner identity; no native carrier or
+/// core scan operator receives a role-specific file/deletion payload.
+pub(crate) fn plan_native_iceberg_delta_read(
+    connectors: &crate::connector::ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    sources: &[super::delta::DeltaSourceFile],
+    delete_side: Option<&super::delta::DeltaScanDeleteSide>,
+) -> Result<PlannedIcebergConnectorRead, String> {
+    let mut planned = plan_native_iceberg_read(
+        connectors,
+        context.clone(),
+        table,
+        super::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        &[],
+        &[],
+    )?;
+    let owner = planned.declaration.descriptor().instance_id.clone();
+    let incarnation = planned.declaration.incarnation().to_bytes();
+    let mut total_payload_bytes = 0usize;
+    let mut splits = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().cloned().enumerate() {
+        let data_file = IcebergDataFileInfo {
+            path: source.path.clone(),
+            size: source.size,
+            row_count: None,
+            column_stats: None,
+            partition_spec_id: source.partition_spec_id,
+            partition_key: source.partition_key.clone(),
+            first_row_id: source.first_row_id,
+            data_sequence_number: source.data_sequence_number,
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: Vec::new(),
+            manifest_path: None,
+            partition_values: Vec::new(),
+        };
+        let payload = SplitPayload {
+            version: ICEBERG_SPLIT_V1,
+            owner_instance_id: owner.as_str().to_string(),
+            incarnation,
+            namespace: table.namespace.clone(),
+            table: table.table.clone(),
+            snapshot_id: table.current_snapshot_id,
+            table_uuid: table.table_uuid.clone(),
+            schema_id: Some(table.schema_id),
+            data_file,
+            projection: Vec::new(),
+            limit: None,
+            delta: Some(IcebergDeltaSplitPayload {
+                source,
+                delete_side: delete_side.cloned(),
+            }),
+        };
+        push_split_with_budget(
+            &mut splits,
+            &mut total_payload_bytes,
+            owner.clone(),
+            format!("delta-{index}"),
+            &payload,
+            u64::try_from(payload.data_file.size).ok(),
+            &context,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    planned.splits = splits;
+    Ok(planned)
+}
+
+pub(crate) struct PlannedIcebergConnectorRead {
+    pub(crate) declaration: ConnectorInstanceDeclaration,
+    pub(crate) scan: ConnectorScan,
+    pub(crate) splits: Vec<ConnectorSplit>,
+    pub(crate) batch: novarocks_spi::connector::ConnectorBatchBudget,
 }
 
 fn ensure_owner(
@@ -1320,17 +1845,20 @@ mod tests {
                 serialized_metadata: Some("x".repeat(256 * 1024)),
                 serialized_metadata_rows: None,
             }),
-            cloud_properties: BTreeMap::new(),
             metadata_columns: Vec::new(),
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
         };
         let payload = SplitPayload {
+            version: ICEBERG_SPLIT_V1,
+            owner_instance_id: "ice".to_string(),
+            incarnation: [0; 16],
             namespace: table.namespace,
             table: table.table,
             snapshot_id: Some(7),
             table_uuid: Some("table-uuid".to_string()),
+            schema_id: Some(1),
             data_file: IcebergDataFileInfo::for_test(
                 "s3://warehouse/db/orders/data-1.parquet",
                 1024,
@@ -1338,6 +1866,7 @@ mod tests {
             ),
             projection: vec![0],
             limit: None,
+            delta: None,
         };
 
         let encoded = serde_json::to_vec(&payload).expect("encode split payload");
@@ -1357,10 +1886,14 @@ mod tests {
     fn aggregate_budget_rejects_candidate_before_split_is_pushed() {
         let owner = ConnectorInstanceId::parse("ice").expect("owner");
         let payload = |suffix: &str| SplitPayload {
+            version: ICEBERG_SPLIT_V1,
+            owner_instance_id: "ice".to_string(),
+            incarnation: [0; 16],
             namespace: "db".to_string(),
             table: "orders".to_string(),
             snapshot_id: Some(7),
             table_uuid: Some("table-uuid".to_string()),
+            schema_id: Some(1),
             data_file: IcebergDataFileInfo::for_test(
                 &format!(
                     "s3://warehouse/db/orders/{}-{suffix}.parquet",
@@ -1371,6 +1904,7 @@ mod tests {
             ),
             projection: vec![0],
             limit: None,
+            delta: None,
         };
         let first = payload("first");
         let second = payload("second");
@@ -1409,6 +1943,54 @@ mod tests {
     }
 
     #[test]
+    fn compat_splits_are_owned_by_the_startup_iceberg_instance() {
+        let instance = compose_compat_read_instance(
+            IcebergReadBinding::default_binding(None).expect("compose compat Iceberg binding"),
+        )
+        .expect("compose compat Iceberg instance");
+        assert_eq!(
+            instance.descriptor().instance_id.as_str(),
+            COMPAT_ICEBERG_INSTANCE_ID
+        );
+        assert_eq!(instance.descriptor().provider_id.as_str(), PROVIDER_ID);
+
+        let splits = build_compat_read_splits(vec![IcebergDataFileInfo::for_test(
+            "file:///tmp/compat.parquet",
+            64,
+            2,
+        )])
+        .expect("encode compat split");
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].owner().as_str(), COMPAT_ICEBERG_INSTANCE_ID);
+        let payload: SplitPayload =
+            decode_payload(splits[0].payload(), "compat split").expect("decode provider split");
+        assert_eq!(payload.incarnation, COMPAT_ICEBERG_INCARNATION);
+        assert_eq!(payload.data_file.path, "file:///tmp/compat.parquet");
+    }
+
+    #[test]
+    fn compat_delta_splits_keep_delete_facts_in_the_provider_payload() {
+        let source = super::super::delta::DeltaSourceFile {
+            path: "file:///tmp/compat-delta.parquet".to_string(),
+            size: 64,
+            role: super::super::delta::DeltaSourceRole::DataFile,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: Some(10),
+            data_sequence_number: Some(20),
+            row_id_allow_list: None,
+        };
+        let splits = build_compat_delta_read_splits(vec![source.clone()], None)
+            .expect("encode compat delta split");
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].owner().as_str(), COMPAT_ICEBERG_INSTANCE_ID);
+        let payload: SplitPayload =
+            decode_payload(splits[0].payload(), "compat delta split").expect("decode split");
+        assert_eq!(payload.incarnation, COMPAT_ICEBERG_INCARNATION);
+        assert_eq!(payload.delta.expect("delta payload").source, source);
+    }
+
+    #[test]
     fn plan_splits_enforces_aggregate_budget_incrementally() {
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let files = ["first", "second"]
@@ -1428,13 +2010,18 @@ mod tests {
             .iter()
             .cloned()
             .map(|data_file| SplitPayload {
+                version: ICEBERG_SPLIT_V1,
+                owner_instance_id: instance_id.as_str().to_string(),
+                incarnation: [0; 16],
                 namespace: "db".to_string(),
                 table: "orders".to_string(),
                 snapshot_id: None,
                 table_uuid: None,
+                schema_id: None,
                 data_file,
                 projection: vec![0],
                 limit: None,
+                delta: None,
             })
             .collect::<Vec<_>>();
         let lengths = split_payloads
@@ -1453,7 +2040,6 @@ mod tests {
                         namespace: "db".to_string(),
                         table: "orders".to_string(),
                         table_info: None,
-                        cloud_properties: BTreeMap::new(),
                         metadata_columns: Vec::new(),
                         metadata_table_type: None,
                         prepared_files: Vec::new(),
@@ -1472,6 +2058,7 @@ mod tests {
         .expect("scan handle");
         let provider = IcebergConnectorInstance {
             instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes([0; 16]),
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
@@ -1586,13 +2173,18 @@ pub(crate) fn register_planned_table_files_fixture(
                         format!("fixture-{index}"),
                         encode_payload(
                             &SplitPayload {
+                                version: ICEBERG_SPLIT_V1,
+                                owner_instance_id: self.instance_id.as_str().to_string(),
+                                incarnation: [0; 16],
                                 namespace: scan.table.namespace.clone(),
                                 table: scan.table.table.clone(),
                                 snapshot_id: None,
                                 table_uuid: None,
+                                schema_id: None,
                                 data_file,
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,
+                                delta: None,
                             },
                             "fixture split",
                             request.context.max_handle_payload_bytes(),
@@ -1621,18 +2213,20 @@ pub(crate) fn register_planned_table_files_fixture(
         files_by_table,
         seen_projections,
     });
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .expect("fixture provider ID"),
+        instance_id,
+    };
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
     registry
         .register_connector_instance(
-            ConnectorInstance::try_new(
-                ConnectorInstanceDescriptor {
-                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                        .expect("fixture provider ID"),
-                    instance_id,
-                },
-                None,
-                read,
-            )
-            .expect("fixture connector instance"),
+            ConnectorInstance::try_new(descriptor.clone(), None, read)
+                .expect("fixture connector instance")
+                .with_distribution(Arc::new(IcebergInstanceDistribution {
+                    descriptor,
+                    incarnation,
+                })),
         )
         .expect("register planned-files fixture");
 }

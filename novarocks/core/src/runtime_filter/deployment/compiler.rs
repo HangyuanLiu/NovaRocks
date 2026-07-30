@@ -327,6 +327,7 @@ mod tests {
             backend_idx,
             endpoint: RuntimeEndpoint::from_socket_addr("127.0.0.1:9060".parse().unwrap()),
             scan_ranges: BTreeMap::new(),
+            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }

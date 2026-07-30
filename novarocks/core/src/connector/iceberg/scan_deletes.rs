@@ -1022,7 +1022,7 @@ pub(crate) fn scan_deletes_with_lineage_lookup_and_path_normalizer<F, R, N>(
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
     F: Fn(&str) -> Option<u64>,
-    R: Fn(&str) -> Option<crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    R: Fn(&str) -> Option<crate::connector::iceberg::delta::BaseDataFileLineage>,
     N: Fn(&str) -> Result<String, ChangeError>,
 {
     use iceberg::spec::DataFileFormat;
@@ -1108,7 +1108,7 @@ fn read_data_file_at_positions_with_v3_lineage_and_path_normalizer<N>(
     data_file_path: &str,
     data_file_size: Option<u64>,
     positions: &RoaringTreemap,
-    lineage: crate::exec::node::iceberg_delta_scan::BaseDataFileLineage,
+    lineage: crate::connector::iceberg::delta::BaseDataFileLineage,
     factory: &novarocks_fs::FsAccessHandle,
     normalize_path: &N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
@@ -1489,7 +1489,7 @@ mod tests {
         let mut prior_positions = RoaringTreemap::new();
         prior_positions.insert(0);
         prior.insert(data_uri.to_string(), prior_positions);
-        let lineage = crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+        let lineage = crate::connector::iceberg::delta::BaseDataFileLineage {
             first_row_id: 1_000,
             data_sequence_number: 17,
         };
@@ -1548,7 +1548,7 @@ mod tests {
                 partition_values: Vec::new(),
             },
         ];
-        let lineage = crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+        let lineage = crate::connector::iceberg::delta::BaseDataFileLineage {
             first_row_id: 5_000,
             data_sequence_number: 3,
         };

@@ -72,6 +72,7 @@ pub struct CompatFragmentService {
     report_service: Arc<CompatReportService>,
     load_registry: Arc<CompatLoadRegistry>,
     load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
+    connectors: Arc<novarocks::connector::ConnectorRegistry>,
 }
 
 impl CompatFragmentService {
@@ -132,7 +133,21 @@ impl CompatFragmentService {
             report_service,
             load_registry,
             load_tracking_sink,
+            connectors: Arc::new(novarocks::connector::ConnectorRegistry::default()),
         }
+    }
+
+    /// Compose process-lifetime connector bindings once during BE startup.
+    /// Fragment preparation receives this same host by injection and never
+    /// creates a registry or access binding for an individual query.
+    pub fn compose_connector_bindings(
+        &self,
+        default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
+    ) -> Result<(), String> {
+        novarocks::connector::compose_backend_connector_installers(
+            self.connectors.as_ref(),
+            default_object_store,
+        )
     }
 
     pub fn submit_exec_batch_plan_fragments(&self, thrift_bytes: &[u8]) -> Result<usize, String> {
@@ -695,6 +710,7 @@ fn prepare_starrocks_draft(
     group_execution_scan_dop: Option<i32>,
     batch_exchange_sender_counts: &HashMap<i32, usize>,
     typed_result_sink: bool,
+    connectors: &novarocks::connector::ConnectorRegistry,
 ) -> Result<StarRocksFragmentDraftEnvelope, String> {
     validate_internal_addresses(params, Some(fragment))?;
     let facts = snapshot_decode_facts(resolve_stream_load_paths(load_registry, params)?)?;
@@ -722,6 +738,7 @@ fn prepare_starrocks_draft(
         batch_exchange_sender_counts,
         typed_result_sink,
         facts: &facts,
+        connectors,
     })
     .map_err(|error| error.to_string())?;
     Ok(StarRocksFragmentDraftEnvelope {
@@ -1823,6 +1840,7 @@ fn submit_exec_batch_plan_fragments_with(
             entry.9,
             &sender_counts,
             entry.10,
+            service.connectors.as_ref(),
         )?);
     }
     token.check(0).map_err(|error| error.to_string())?;
@@ -1912,6 +1930,7 @@ fn submit_exec_plan_fragment_with(
         one.group_execution_scan_dop,
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
+        service.connectors.as_ref(),
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token)?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
@@ -1974,6 +1993,7 @@ fn execute_plan_fragment_sync_with(
         one.group_execution_scan_dop,
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
+        service.connectors.as_ref(),
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token)?;
     let prepared = finish_starrocks_draft(draft, resolved)?;

@@ -16,21 +16,20 @@
 // under the License.
 #[cfg(feature = "compat")]
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
-use crate::common::ids::SlotId;
 use crate::connector::file_execution::FileScanRange;
-use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
-use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
-use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
+use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::profile::RuntimeProfile;
+use novarocks_spi::connector::{ConnectorInstance, ConnectorSplit};
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -40,19 +39,7 @@ pub enum ScanMorsel {
         offset: u64,
         length: u64,
         scan_range_id: i32,
-        first_row_id: Option<i64>,
-        /// Iceberg V3 data sequence number for the manifest entry this range
-        /// belongs to. Used to synthesize `_last_updated_sequence_number`.
-        /// None for non-row-lineage scans.
-        data_sequence_number: Option<i64>,
-        ivm_change_op: Option<i8>,
-        included_positions: Option<Vec<i64>>,
         external_datacache: Option<ExternalDataCacheRangeOptions>,
-        /// Iceberg v2 position-delete files that apply to this data file.
-        /// Empty for append-only tables and for v1 scans.
-        delete_files: Vec<IcebergDeleteFileSpec>,
-        iceberg_file_pruning:
-            Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata>,
     },
     #[cfg(feature = "compat")]
     StarRocksRange {
@@ -68,13 +55,7 @@ pub enum ScanMorsel {
     /// in the core morsel contract.
     ConnectorSplit {
         index: usize,
-    },
-    /// A scheduled SPI split with file metadata retained by core. The opaque
-    /// provider payload is selected by `index`; `range` remains available to
-    /// core row-position, virtual-column, and delete filtering logic.
-    ConnectorFileSplit {
-        index: usize,
-        range: FileScanRange,
+        row_position: Option<ConnectorRowPosition>,
     },
     Schema {
         table_name: String,
@@ -91,27 +72,10 @@ impl ScanMorsel {
                 offset,
                 length,
                 scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions,
                 external_datacache,
-                delete_files,
-                iceberg_file_pruning,
             } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} included_positions={} external_datacache={:?} delete_files={} iceberg_file_pruning={}",
-                path,
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions.as_ref().map(|v| v.len()).unwrap_or(0),
-                external_datacache,
-                delete_files.len(),
-                iceberg_file_pruning.is_some()
+                "path={} file_len={} offset={} length={} scan_range_id={} external_datacache={:?}",
+                path, file_len, offset, length, scan_range_id, external_datacache,
             ),
             #[cfg(feature = "compat")]
             ScanMorsel::StarRocksRange { index, tablet_id } => {
@@ -121,20 +85,23 @@ impl ScanMorsel {
             ScanMorsel::IcebergMetadata { index } => {
                 format!("iceberg_metadata_index={index}")
             }
-            ScanMorsel::ConnectorSplit { index } => {
-                format!("connector_split_index={index}")
-            }
-            ScanMorsel::ConnectorFileSplit { index, range } => format!(
-                "connector_file_split_index={index} path={} offset={} length={}",
-                range.path, range.offset, range.length
+            ScanMorsel::ConnectorSplit {
+                index,
+                row_position,
+            } => format!(
+                "connector_split_index={index} row_position_range={}",
+                row_position
+                    .as_ref()
+                    .map(|position| position.scan_range_id.to_string())
+                    .unwrap_or_else(|| "none".to_string())
             ),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),
         }
     }
 
-    /// Returns the core-owned file metadata for both legacy and SPI-scheduled
-    /// file morsels. It intentionally excludes every provider payload.
+    /// Returns legacy file metadata. Connector splits never expose provider
+    /// file details to core execution.
     pub fn file_range(&self) -> Option<FileScanRange> {
         match self {
             Self::FileRange {
@@ -143,31 +110,39 @@ impl ScanMorsel {
                 offset,
                 length,
                 scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions,
                 external_datacache,
-                delete_files,
-                iceberg_file_pruning,
             } => Some(FileScanRange {
                 path: path.clone(),
                 file_len: *file_len,
                 offset: *offset,
                 length: *length,
                 scan_range_id: *scan_range_id,
-                first_row_id: *first_row_id,
-                data_sequence_number: *data_sequence_number,
-                ivm_change_op: *ivm_change_op,
-                included_positions: included_positions.clone(),
                 external_datacache: external_datacache.clone(),
-                delete_files: delete_files.clone(),
-                iceberg_file_pruning: iceberg_file_pruning.clone(),
             }),
-            Self::ConnectorFileSplit { range, .. } => Some(range.clone()),
             _ => None,
         }
     }
+
+    pub fn connector_row_position(&self) -> Option<&ConnectorRowPosition> {
+        match self {
+            Self::ConnectorSplit { row_position, .. } => row_position.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorRowPosition {
+    pub scan_range_id: i32,
+}
+
+/// Query-local core binding for an engine late-materialization lookup. It is
+/// deliberately provider-neutral: the split remains opaque and the bound
+/// instance owns every table-format read semantic.
+#[derive(Clone)]
+pub(crate) struct ConnectorRowPositionLookup {
+    pub(crate) instance: Arc<ConnectorInstance>,
+    pub(crate) splits: HashMap<i32, ConnectorSplit>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -330,6 +305,12 @@ pub(crate) enum ScanMorselPruneDecision {
 }
 
 pub trait ScanOp: Send + Sync {
+    /// Starts terminal cleanup for readers owned by this scan operation. The
+    /// default keeps non-connector scan operators source-compatible.
+    fn terminate(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn execute_iter(
         &self,
         morsel: ScanMorsel,
@@ -353,41 +334,6 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
-
-    fn flush_morsel_materialization_profile(&self, _profile: &RuntimeProfile) {}
-
-    #[allow(private_interfaces)]
-    fn late_prune_morsel_with_ordered_predicate(
-        &self,
-        _morsel: &ScanMorsel,
-        _slot_id: SlotId,
-        _predicate: &crate::runtime_filter::exec::ordered_range_predicate::
-            NativeOrderedRangePredicate,
-    ) -> Result<ScanMorselPruneDecision, String> {
-        Ok(ScanMorselPruneDecision::Keep)
-    }
-
-    /// Load Iceberg v2 position-delete files attached to `morsel` and collect
-    /// the row positions they retire for the morsel's data file. Returns
-    /// `Ok(None)` when the morsel has no delete files (the common case);
-    /// returns `Ok(Some(set))` otherwise.
-    ///
-    /// Only the HDFS connector knows how to open the delete-file parquet
-    /// (it owns the object-store credentials the FE handed down), so every
-    /// other scan op inherits the default no-op implementation.
-    fn load_iceberg_position_deletes(
-        &self,
-        _morsel: &ScanMorsel,
-    ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        Ok(None)
-    }
-
-    fn load_iceberg_equality_deletes(
-        &self,
-        _morsel: &ScanMorsel,
-    ) -> Result<Option<Vec<EqualityDeleteSet>>, String> {
-        Ok(None)
-    }
 }
 
 /// Instance-decoded, proto-free connector ranges handed to [`ScanSource::bind`].
@@ -443,18 +389,6 @@ pub struct LakeGlmScanInfo {
     pub lake_schema_meta: Option<LakeScanSchemaMeta>,
 }
 
-#[derive(Clone, Debug)]
-pub struct RowPositionScanConfig {
-    pub file_format: HdfsScanFileFormat,
-    pub case_sensitive: bool,
-    pub batch_size: Option<usize>,
-    pub enable_file_metacache: bool,
-    pub enable_file_pagecache: bool,
-    /// OSS credentials for re-scanning the source file during late-materialisation lookups.
-    /// `None` for local / HDFS paths; must be `Some` for `oss://` / `s3://` paths.
-    pub oss_config: Option<novarocks_fs::ObjectStoreConfig>,
-}
-
 #[derive(Clone)]
 pub struct ScanNode {
     source: Arc<dyn ScanSource>,
@@ -469,12 +403,10 @@ pub struct ScanNode {
     limit: Option<usize>,
     accept_empty_scan_ranges: bool,
     row_position: Option<RowPositionSpec>,
-    row_position_scan: Option<RowPositionScanConfig>,
-    row_position_ranges: Option<Vec<FileScanRange>>,
+    connector_row_position_lookup: Option<ConnectorRowPositionLookup>,
     lake_row_position: Option<LakeRowPositionSpec>,
     #[cfg(feature = "compat")]
     lake_glm_info: Option<LakeGlmScanInfo>,
-    iceberg_virtual: Option<IcebergVirtualSpec>,
 }
 
 /// Test-only static source that binds to a fixed, pre-built op regardless of
@@ -502,12 +434,10 @@ impl ScanNode {
             limit: None,
             accept_empty_scan_ranges: false,
             row_position: None,
-            row_position_scan: None,
-            row_position_ranges: None,
+            connector_row_position_lookup: None,
             lake_row_position: None,
             #[cfg(feature = "compat")]
             lake_glm_info: None,
-            iceberg_virtual: None,
         }
     }
 
@@ -555,13 +485,11 @@ impl ScanNode {
         self
     }
 
-    pub fn with_row_position_scan(mut self, cfg: Option<RowPositionScanConfig>) -> Self {
-        self.row_position_scan = cfg;
-        self
-    }
-
-    pub fn with_row_position_ranges(mut self, ranges: Option<Vec<FileScanRange>>) -> Self {
-        self.row_position_ranges = ranges;
+    pub(crate) fn with_connector_row_position_lookup(
+        mut self,
+        lookup: Option<ConnectorRowPositionLookup>,
+    ) -> Self {
+        self.connector_row_position_lookup = lookup;
         self
     }
 
@@ -573,11 +501,6 @@ impl ScanNode {
     #[cfg(feature = "compat")]
     pub fn with_lake_glm_info(mut self, info: Option<LakeGlmScanInfo>) -> Self {
         self.lake_glm_info = info;
-        self
-    }
-
-    pub fn with_iceberg_virtual(mut self, spec: Option<IcebergVirtualSpec>) -> Self {
-        self.iceberg_virtual = spec.filter(|s| !s.is_empty());
         self
     }
 
@@ -631,12 +554,8 @@ impl ScanNode {
         self.row_position.as_ref()
     }
 
-    pub fn row_position_scan(&self) -> Option<&RowPositionScanConfig> {
-        self.row_position_scan.as_ref()
-    }
-
-    pub fn row_position_ranges(&self) -> Option<&[FileScanRange]> {
-        self.row_position_ranges.as_deref()
+    pub(crate) fn connector_row_position_lookup(&self) -> Option<&ConnectorRowPositionLookup> {
+        self.connector_row_position_lookup.as_ref()
     }
 
     pub fn lake_row_position(&self) -> Option<&LakeRowPositionSpec> {
@@ -646,10 +565,6 @@ impl ScanNode {
     #[cfg(feature = "compat")]
     pub fn lake_glm_info(&self) -> Option<&LakeGlmScanInfo> {
         self.lake_glm_info.as_ref()
-    }
-
-    pub fn iceberg_virtual(&self) -> Option<&IcebergVirtualSpec> {
-        self.iceberg_virtual.as_ref()
     }
 }
 
@@ -665,8 +580,7 @@ impl std::fmt::Debug for ScanNode {
 mod tests {
     use std::sync::Arc;
 
-    use super::{RuntimeFilterContext, ScanMorsel};
-    use crate::connector::file_execution::FileScanRange;
+    use super::{ConnectorRowPosition, RuntimeFilterContext, ScanMorsel};
     use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
 
     #[test]
@@ -687,28 +601,15 @@ mod tests {
     }
 
     #[test]
-    fn connector_file_split_preserves_core_file_metadata() {
-        let morsel = ScanMorsel::ConnectorFileSplit {
+    fn connector_split_keeps_only_generic_row_position_metadata() {
+        let morsel = ScanMorsel::ConnectorSplit {
             index: 3,
-            range: FileScanRange {
-                path: "s3://bucket/data.parquet".to_string(),
-                file_len: 99,
-                offset: 7,
-                length: 11,
-                scan_range_id: 5,
-                first_row_id: Some(13),
-                data_sequence_number: Some(17),
-                ivm_change_op: Some(2),
-                included_positions: Some(vec![1, 4]),
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            },
+            row_position: Some(ConnectorRowPosition { scan_range_id: 5 }),
         };
-        let range = morsel.file_range().expect("file metadata");
-        assert_eq!(range.path, "s3://bucket/data.parquet");
-        assert_eq!(range.scan_range_id, 5);
-        assert_eq!(range.first_row_id, Some(13));
-        assert_eq!(range.included_positions, Some(vec![1, 4]));
+        assert_eq!(
+            morsel.connector_row_position(),
+            Some(&ConnectorRowPosition { scan_range_id: 5 })
+        );
+        assert!(morsel.file_range().is_none());
     }
 }

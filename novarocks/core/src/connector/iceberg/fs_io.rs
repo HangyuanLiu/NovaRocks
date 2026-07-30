@@ -742,6 +742,9 @@ mod tests {
         let err = resolve_access_for_location("s3://bucket/table/metadata.json", None)
             .expect_err("missing object-store config should fail");
 
-        assert_eq!(err, "object-store location requires object store config");
+        assert!(
+            err.ends_with("object-store location requires object store config"),
+            "unexpected resolver error: {err}"
+        );
     }
 }

@@ -262,28 +262,19 @@ impl ScanSourceOperator {
             self.row_position_registered = true;
             return Ok(());
         };
-        let Some(ranges) = self.scan.row_position_ranges() else {
-            return Err("row position ranges missing".to_string());
-        };
-        if ranges.is_empty() {
+        if let Some(lookup) = self.scan.connector_row_position_lookup() {
+            let query_id = state
+                .query_id()
+                .ok_or_else(|| "row position requires query_id".to_string())?;
+            crate::runtime::query_context::query_context_manager().register_connector_glm(
+                query_id,
+                spec.row_source_slot,
+                lookup.clone(),
+            )?;
             self.row_position_registered = true;
             return Ok(());
         }
-        let Some(scan_cfg) = self.scan.row_position_scan() else {
-            return Err("row position scan config missing".to_string());
-        };
-        let Some(query_id) = state.query_id() else {
-            return Err("row position requires query_id".to_string());
-        };
-        // Register ranges once so lookup RPCs can re-scan files by scan_range_id/row_id.
-        crate::runtime::query_context::query_context_manager().register_glm_scan_ranges(
-            query_id,
-            spec.row_source_slot,
-            scan_cfg.clone(),
-            ranges.to_vec(),
-        )?;
-        self.row_position_registered = true;
-        Ok(())
+        Err("row position requires a connector read binding".to_string())
     }
 
     fn register_lake_row_position(&mut self, state: &RuntimeState) -> Result<(), String> {
@@ -668,10 +659,17 @@ impl Operator for ScanSourceOperator {
 
     fn cancel(&mut self) {
         self.async_state.cancel();
+        let _ = self.op.terminate();
     }
 
     fn close(&mut self) -> Result<(), String> {
         self.async_state.cancel();
+        // Each driver owns one operator instance, while a connector ScanOp
+        // owns a fragment-wide reader group and a shared morsel queue.  A
+        // normally exhausted driver must not terminate that group: sibling
+        // drivers can still own queued splits.  Cancellation/error reaches
+        // `cancel`, which invokes the terminal hook; normal readers close on
+        // EOF or iterator Drop.
         Ok(())
     }
 
@@ -825,13 +823,7 @@ mod tests {
             offset: 0,
             length: 0,
             scan_range_id: -1,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         }
     }
 
@@ -911,13 +903,7 @@ mod tests {
                     offset: 0,
                     length: 0,
                     scan_range_id: -1,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    ivm_change_op: None,
-                    included_positions: None,
                     external_datacache: None,
-                    delete_files: Vec::new(),
-                    iceberg_file_pruning: None,
                 })
                 .collect();
             Ok(ScanMorsels::new(morsels, false))
@@ -955,13 +941,7 @@ mod tests {
                     offset: 0,
                     length: 0,
                     scan_range_id: -1,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    ivm_change_op: None,
-                    included_positions: None,
                     external_datacache: None,
-                    delete_files: Vec::new(),
-                    iceberg_file_pruning: None,
                 }],
                 false,
             ))

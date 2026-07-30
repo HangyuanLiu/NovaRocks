@@ -27,10 +27,10 @@ use crate::connector::iceberg::changes::{
     previous_snapshot_data_file_lineage_index, scan_deleted_data_file_rows,
     scan_equality_delete_rows_for_table_at,
 };
+use crate::connector::iceberg::delta::BaseDataFileLineage;
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
 use crate::engine::{StandaloneState, execute_query_with_catalog_provider};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
-use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use novarocks_catalog::identifier::TableIdentity;

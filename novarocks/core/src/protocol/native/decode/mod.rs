@@ -42,11 +42,11 @@ pub(in crate::protocol::native) use runtime_filter::{
     decode_runtime_filter_completion, decode_runtime_filter_contribution_kind,
     decode_runtime_filter_logical_domain_and_reduction,
 };
-#[cfg(test)]
-pub(crate) use scan::scan_read_binding_for_test;
 pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_program};
+#[cfg(test)]
 #[allow(unused_imports)]
-pub(crate) use submission::{decode_fragment_submission, decode_query_execution_id};
+pub(crate) use submission::decode_fragment_submission;
+pub(crate) use submission::{decode_fragment_submission_with_connectors, decode_query_execution_id};
 
 #[cfg(test)]
 mod tests {

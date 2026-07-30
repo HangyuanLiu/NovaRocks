@@ -1109,13 +1109,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
             offset: 0,
             length: data_file_len,
             scan_range_id: -1,
-            first_row_id: data_file.first_row_id,
-            data_sequence_number: data_file.data_sequence_number,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         });
         for delete_file in &data_file.delete_files {
             let delete_len_i64 = delete_file.length.unwrap_or(0);
@@ -1128,13 +1122,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
                 offset: 0,
                 length: delete_len,
                 scan_range_id: -1,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
                 external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
             });
         }
 
@@ -1231,13 +1219,7 @@ fn load_delete_visibility_from_data_files(
             offset: 0,
             length: data_file_len,
             scan_range_id: -1,
-            first_row_id: data_file.first_row_id,
-            data_sequence_number: data_file.data_sequence_number,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         });
         for delete_file in &data_file.delete_files {
             let delete_len_i64 = delete_file.length.unwrap_or(0);
@@ -1250,13 +1232,7 @@ fn load_delete_visibility_from_data_files(
                 offset: 0,
                 length: delete_len,
                 scan_range_id: -1,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
                 external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
             });
         }
 

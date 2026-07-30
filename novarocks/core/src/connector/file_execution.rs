@@ -14,15 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Core-private file execution sidecars.
+//! Core-private raw file execution helpers.
 //!
-//! This type is deliberately not part of the connector SPI or `novarocks-fs`.
-//! It carries query-engine and table-format correctness data until the
-//! connector adapter maps the connector-neutral subset into a foundation
-//! `FileReadRequest`.
+//! These types are deliberately not part of the connector SPI or
+//! `novarocks-fs`. They describe only protocol-owned raw file access; table
+//! format correctness belongs to the connector that owns its opaque split.
 
 use crate::cache::ExternalDataCacheRangeOptions;
-use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::RuntimeProfile;
 use bytes::Bytes;
@@ -42,25 +40,7 @@ pub struct FileScanRange {
     pub offset: u64,
     pub length: u64,
     pub scan_range_id: i32,
-    pub first_row_id: Option<i64>,
-    /// Iceberg V3 data sequence number of the manifest entry this range belongs
-    /// to. Used to synthesize `_last_updated_sequence_number` per-row.
-    /// None for non-row-lineage scans.
-    pub data_sequence_number: Option<i64>,
-    pub ivm_change_op: Option<i8>,
-    /// Optional absolute row positions to include from this data-file range.
-    /// Positions use the same `_pos` coordinate as Iceberg position deletes.
-    pub included_positions: Option<Vec<i64>>,
     pub external_datacache: Option<ExternalDataCacheRangeOptions>,
-    /// Iceberg delete files attached to this data-file range. Empty for v1 or
-    /// append-only scans. Populated by HDFS scan lowering and standalone
-    /// write-side visibility planning.
-    pub delete_files: Vec<IcebergDeleteFileSpec>,
-    /// Per-file Iceberg statistics carried across the thrift/HDFS range
-    /// boundary for later file-level pruning. None for non-Iceberg scans or
-    /// files whose manifest stats are unavailable/unsupported.
-    pub iceberg_file_pruning:
-        Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata>,
 }
 
 #[derive(Clone)]
@@ -303,10 +283,6 @@ pub(crate) fn read_foundation_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
-    use crate::connector::iceberg::scan_model::IcebergColumnStats;
     use novarocks_fs::FsScheme;
 
     fn range(path: &str) -> FileScanRange {
@@ -316,29 +292,7 @@ mod tests {
             offset: 0,
             length: 1,
             scan_range_id: 0,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
-        }
-    }
-
-    fn metadata() -> IcebergFilePruningMetadata {
-        IcebergFilePruningMetadata {
-            columns: HashMap::from([(
-                "id".to_string(),
-                IcebergColumnStats {
-                    null_count: None,
-                    value_count: None,
-                    column_size: None,
-                    lower_bound: Some(10_i64.to_le_bytes().to_vec()),
-                    upper_bound: Some(20_i64.to_le_bytes().to_vec()),
-                },
-            )]),
-            null_states: HashMap::new(),
         }
     }
 
@@ -354,26 +308,6 @@ mod tests {
         assert_eq!(ctx.ranges.len(), 1);
         assert_eq!(ctx.ranges[0].path, file.to_string_lossy());
         assert_eq!(ctx.scheme, FsScheme::Local);
-    }
-
-    #[test]
-    fn file_read_sidecar_remains_in_core_scan_envelope() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("a.parquet");
-        std::fs::write(&file, b"data").expect("write fixture");
-        let mut range = range(file.to_string_lossy().as_ref());
-        range.iceberg_file_pruning = Some(metadata());
-
-        let ctx = FileScanContext::build(vec![range], None, None).expect("build scan context");
-
-        let pruning = ctx.ranges[0]
-            .iceberg_file_pruning
-            .as_ref()
-            .expect("iceberg metadata");
-        assert_eq!(
-            pruning.columns["id"].lower_bound,
-            Some(10_i64.to_le_bytes().to_vec())
-        );
     }
 
     #[test]

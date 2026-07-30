@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "connector-conformance")]
-
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;

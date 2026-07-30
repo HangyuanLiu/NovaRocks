@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -278,9 +278,16 @@ impl FsAccessHandle {
                     FileError::new(FileErrorKind::Internal, "local access handle has no root")
                 })?;
                 let path = Path::new(location.path());
-                let relative = if root == "." {
-                    path.to_path_buf()
-                } else {
+                let relative = if path.is_absolute() {
+                    if root == "." {
+                        return Err(FileError::new(
+                            FileErrorKind::Permission,
+                            format!(
+                                "absolute local file {} is outside relative authorized root",
+                                location.original()
+                            ),
+                        ));
+                    }
                     path.strip_prefix(root)
                         .map(Path::to_path_buf)
                         .map_err(|_| {
@@ -292,8 +299,10 @@ impl FsAccessHandle {
                                 ),
                             )
                         })?
+                } else {
+                    path.to_path_buf()
                 };
-                relative.to_string_lossy().to_string()
+                normalize_bound_relative_path(&relative, location.original())?
             }
             FsScheme::ObjectStore => {
                 if location.authority() != self.authority.as_deref() {
@@ -328,6 +337,29 @@ impl FsAccessHandle {
             .map(ResolvedFsPath::operator_relative_path)
             .collect()
     }
+}
+
+fn normalize_bound_relative_path(path: &Path, original: &str) -> FileResult<String> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => normalized.push(component),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(FileError::new(
+                    FileErrorKind::Permission,
+                    format!("local file {original} escapes its authorized root"),
+                ));
+            }
+        }
+    }
+    let normalized = normalized.to_string_lossy().to_string();
+    if normalized.is_empty() {
+        return Err(FileError::invalid(format!(
+            "local file {original} does not name a file beneath its authorized root"
+        )));
+    }
+    Ok(normalized)
 }
 
 pub fn is_object_store_location_parse_only(location: &str) -> FileResult<bool> {

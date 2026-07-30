@@ -734,10 +734,6 @@ fn set_native_scan_specs(
             scan.set_native_runtime_filter_specs(specs);
             Ok(())
         }
-        ExecNodeKind::IcebergDeltaScan(scan) => {
-            scan.set_native_runtime_filter_specs(specs);
-            Ok(())
-        }
         ExecNodeKind::Project(project) if project.is_subordinate => {
             set_native_scan_specs(&mut project.input, specs)
         }

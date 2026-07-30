@@ -24,7 +24,10 @@ use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use novarocks::query_execution::artifact::PreparedNativeExecutionParts;
+use novarocks::query_execution::artifact::{
+    ConnectorBindingDispatcher, DispatchingConnectorBindingBarrier,
+    PreparedNativeExecutionParts, new_grpc_connector_binding_dispatcher,
+};
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{
@@ -80,6 +83,21 @@ struct FixedQueryIdSource(QueryId);
 impl QueryIdSource for FixedQueryIdSource {
     fn next_query_id(&self) -> QueryId {
         self.0
+    }
+}
+
+#[cfg(test)]
+struct TestConnectorBindingDispatcher;
+
+#[cfg(test)]
+impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
+    fn install(
+        &self,
+        _backend_idx: usize,
+        _endpoint: SocketAddr,
+        _declaration: &novarocks_spi::connector::ConnectorInstanceDeclaration,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -179,12 +197,14 @@ enum BackendServicesSource {
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
+        connector_binding_dispatcher: Arc<dyn ConnectorBindingDispatcher>,
     },
     #[cfg(test)]
     Sequence {
         schedulers: Mutex<VecDeque<FrontendFragmentScheduler>>,
         dispatcher: Arc<dyn FragmentDispatcher>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
+        connector_binding_dispatcher: Arc<dyn ConnectorBindingDispatcher>,
     },
 }
 
@@ -193,6 +213,7 @@ struct QueryBackendServices {
     dispatcher: Arc<dyn FragmentDispatcher>,
     lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     live_backends: Vec<LiveBackendTarget>,
+    connector_binding_dispatcher: Arc<dyn ConnectorBindingDispatcher>,
 }
 
 #[cfg(test)]
@@ -374,17 +395,20 @@ impl BackendServicesSource {
                 scheduler,
                 dispatcher,
                 lifecycle_transport,
+                connector_binding_dispatcher,
             } => Ok(QueryBackendServices {
                 scheduler: scheduler.clone(),
                 dispatcher: Arc::clone(dispatcher),
                 lifecycle_transport: Arc::clone(lifecycle_transport),
                 live_backends: topology.to_vec(),
+                connector_binding_dispatcher: Arc::clone(connector_binding_dispatcher),
             }),
             #[cfg(test)]
             Self::Sequence {
                 schedulers,
                 dispatcher,
                 lifecycle_transport,
+                connector_binding_dispatcher,
             } => {
                 let scheduler = schedulers
                     .lock()
@@ -396,6 +420,7 @@ impl BackendServicesSource {
                     dispatcher: Arc::clone(dispatcher),
                     lifecycle_transport: Arc::clone(lifecycle_transport),
                     live_backends: topology.to_vec(),
+                    connector_binding_dispatcher: Arc::clone(connector_binding_dispatcher),
                 })
             }
         }
@@ -415,6 +440,8 @@ fn production_backend_services(
         dispatcher: new_grpc_fragment_dispatcher(&entries).map_err(failed)?,
         lifecycle_transport: new_grpc_query_lifecycle_transport(topology).map_err(failed)?,
         live_backends: topology.to_vec(),
+        connector_binding_dispatcher: new_grpc_connector_binding_dispatcher(&entries)
+            .map_err(failed)?,
     })
 }
 
@@ -491,6 +518,7 @@ impl FrontendDistributedQueryCoordinator {
                 scheduler,
                 dispatcher,
                 lifecycle_transport,
+                connector_binding_dispatcher: Arc::new(TestConnectorBindingDispatcher),
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
@@ -523,6 +551,7 @@ impl FrontendDistributedQueryCoordinator {
                 schedulers: Mutex::new(schedulers.into()),
                 dispatcher,
                 lifecycle_transport,
+                connector_binding_dispatcher: Arc::new(TestConnectorBindingDispatcher),
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
@@ -628,8 +657,11 @@ impl FrontendDistributedQueryCoordinator {
             self.report_endpoint.resolve()?,
             dispatcher.needs_fragment_status_report() || intent == DistributedQueryIntent::Profile,
         )?;
+        let connector_bindings =
+            DispatchingConnectorBindingBarrier::new(backend_services.connector_binding_dispatcher);
         let execution = scheduled
             .initialize_query(init_options, &lifecycle_barrier)?
+            .prepare_connector_bindings(&connector_bindings)?
             .assemble()?;
         let PreparedNativeExecutionParts {
             submissions,
@@ -637,6 +669,7 @@ impl FrontendDistributedQueryCoordinator {
             writer_registrations,
             expected_output,
             query_lifecycle_lease,
+            connector_binding_lease: _connector_binding_lease,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);
         let submitted_instance_ids = submissions

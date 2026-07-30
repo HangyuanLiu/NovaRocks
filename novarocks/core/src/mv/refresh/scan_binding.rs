@@ -19,10 +19,8 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use crate::connector::iceberg::delta::{DeltaDataColumn, DeltaScanDeleteSide};
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
-use crate::exec::node::iceberg_delta_scan::{
-    DeltaScanDeleteSidePayload, IcebergDeltaDataColumnPayload,
-};
 use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
 use crate::query_execution::preparation::scan::{
     IcebergDeltaScanRuntimePlan, ResolvedIcebergDeltaScan, ResolvedIcebergFileScan,
@@ -120,8 +118,8 @@ fn resolve_file_scan(
     let ScanSource::IcebergDataFiles {
         table,
         files,
-        cloud_properties,
         binding,
+        ..
     } = source
     else {
         return Err(format!(
@@ -131,7 +129,6 @@ fn resolve_file_scan(
     Ok(ResolvedIcebergFileScan {
         table,
         files,
-        cloud_properties,
         binding,
     })
 }
@@ -271,7 +268,7 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
                 &loaded,
                 batch.previous_snapshot_id,
             )?;
-        Some(DeltaScanDeleteSidePayload {
+        Some(DeltaScanDeleteSide {
             base_data_file_lineage,
             previous_data_file_lineage,
             previous_delete_visibility_data_files,
@@ -287,7 +284,7 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
         .as_struct()
         .fields()
         .iter()
-        .map(|field| IcebergDeltaDataColumnPayload {
+        .map(|field| DeltaDataColumn {
             name: field.name.clone(),
             field_id: field.id,
         })
@@ -295,7 +292,6 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
     Ok(IcebergDeltaScanRuntimePlan {
         table_location: loaded.metadata().location().to_string(),
         data_columns,
-        cloud_properties: entry.cloud_properties_map(),
         change_files,
         delete_side,
     })
@@ -830,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn real_delta_builder_materializes_changes_delete_visibility_and_cloud_properties() {
+    fn real_delta_builder_materializes_changes_and_delete_visibility() {
         let fixture = delta_overwrite_refresh_fixture("scan_binding_delta");
         let resolved = fixture
             .ctx
@@ -848,7 +844,6 @@ mod tests {
             panic!("expected delta binding");
         };
         assert!(!delta.runtime_plan.change_files.is_empty());
-        assert!(!delta.runtime_plan.cloud_properties.is_empty());
         let delete_side = delta
             .runtime_plan
             .delete_side
@@ -999,11 +994,10 @@ mod tests {
                 assert_eq!((from, to), (10, 20));
                 Ok(IcebergDeltaScanRuntimePlan {
                     table_location: "s3://bucket/base".to_string(),
-                    data_columns: vec![IcebergDeltaDataColumnPayload {
+                    data_columns: vec![DeltaDataColumn {
                         name: "k".to_string(),
                         field_id: 1,
                     }],
-                    cloud_properties: BTreeMap::new(),
                     change_files: Vec::new(),
                     delete_side: None,
                 })

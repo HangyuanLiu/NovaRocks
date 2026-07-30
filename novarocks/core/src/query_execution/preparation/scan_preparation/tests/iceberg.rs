@@ -167,7 +167,7 @@ fn ordinary_iceberg_scan_preserves_min_max_pruning() {
 }
 
 #[test]
-fn delta_scan_uses_resolved_payload_and_sentinel_range() {
+fn delta_scan_uses_opaque_connector_read() {
     let mut root = scan_node(40, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut root,
@@ -178,27 +178,35 @@ fn delta_scan_uses_resolved_payload_and_sentinel_range() {
         },
     );
     let resolver = StaticResolver {
-        execution: resolved_delta(),
+        execution: resolved_data_delta(),
     };
 
-    let bindings = prepare_scan_bindings(&plan(root), &ConnectorRegistry::new(), Some(&resolver))
+    let bindings = prepare_scan_bindings(&plan(root), &registry(Vec::new()), Some(&resolver))
         .expect("prepare delta scan");
 
     assert!(matches!(
         bindings.binding(40).expect("binding").execution,
         ResolvedScanExecution::IcebergDelta(_)
     ));
-    let ranges = bindings.scan_ranges(0, 40).expect("delta ranges");
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected delta sentinel range");
-    };
-    assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
-    assert!(file.use_iceberg_jni_metadata_reader);
+    assert!(
+        bindings
+            .scan_ranges(0, 40)
+            .expect("delta ranges")
+            .is_empty()
+    );
+    let planned = bindings
+        .connector_read(0, 40)
+        .expect("delta connector read");
+    assert_eq!(
+        planned.declaration.descriptor().provider_id.as_str(),
+        "iceberg"
+    );
+    assert_eq!(planned.splits.len(), 1);
+    assert_eq!(planned.splits[0].split_id(), "delta-0");
 }
 
 #[test]
-fn explicit_files_preserve_native_split_ranges() {
+fn explicit_files_plan_opaque_connector_splits() {
     let plan = plan(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
     let bindings = prepare_scan_bindings(
         &plan,
@@ -207,17 +215,19 @@ fn explicit_files_preserve_native_split_ranges() {
     )
     .expect("prepare explicit scan");
     let ranges = bindings.scan_ranges(0, 10).expect("ranges");
-
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected file range");
-    };
+    assert!(ranges.is_empty());
+    let planned = bindings.connector_read(0, 10).expect("connector read");
     assert_eq!(
-        file.full_path.as_deref(),
-        Some("s3://bucket/explicit.parquet")
+        planned.declaration.descriptor().provider_id.as_str(),
+        "iceberg"
     );
-    assert_eq!(file.offset, 0);
-    assert_eq!(file.length, 128);
+    assert_eq!(
+        planned.declaration.descriptor().instance_id.as_str(),
+        "test_catalog"
+    );
+    assert_eq!(planned.splits.len(), 1);
+    assert_eq!(planned.splits[0].split_id(), "fixture-0");
+    assert_eq!(planned.splits[0].owner().as_str(), "test_catalog");
 }
 
 #[test]

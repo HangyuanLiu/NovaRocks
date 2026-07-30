@@ -25,12 +25,11 @@ use std::time::{Duration, Instant};
 use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::connector::file_execution::FileScanRange;
+use crate::exec::node::scan::ConnectorRowPositionLookup;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::IncrementalScanRange;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::LakeGlmScanInfo;
-use crate::exec::node::scan::RowPositionScanConfig;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::ScanOp;
 #[cfg(feature = "compat")]
@@ -38,7 +37,6 @@ use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
-use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
 pub(crate) use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::runtime_filter_observability::{
@@ -211,7 +209,7 @@ pub(crate) struct QueryContext {
     runtime_filter_deployment: Option<RuntimeFilterDeploymentClaim>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
-    pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
+    pub(crate) connector_glm_contexts: HashMap<SlotId, ConnectorRowPositionLookup>,
     #[cfg(feature = "compat")]
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
@@ -411,7 +409,7 @@ impl QueryContext {
             runtime_filter_deployment: None,
             row_pos_descs: HashMap::new(),
             lookup_fetchers: HashMap::new(),
-            glm_contexts: HashMap::new(),
+            connector_glm_contexts: HashMap::new(),
             #[cfg(feature = "compat")]
             lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
@@ -621,33 +619,38 @@ impl QueryContext {
         Ok(())
     }
 
-    pub(crate) fn register_glm_scan_ranges(
+    pub(crate) fn register_connector_glm(
         &mut self,
         row_source_slot: SlotId,
-        scan_cfg: RowPositionScanConfig,
-        ranges: Vec<FileScanRange>,
-    ) {
-        let ctx = self
-            .glm_contexts
-            .entry(row_source_slot)
-            .or_insert_with(|| GlobalLateMaterializationContext::new(row_source_slot, scan_cfg));
-        ctx.register_ranges(ranges);
+        lookup: ConnectorRowPositionLookup,
+    ) -> Result<(), String> {
+        if let Some(existing) = self.connector_glm_contexts.get(&row_source_slot) {
+            if existing.instance.descriptor() != lookup.instance.descriptor()
+                || existing.splits != lookup.splits
+            {
+                return Err(format!(
+                    "conflicting connector late-materialization binding for row source slot {row_source_slot}"
+                ));
+            }
+            return Ok(());
+        }
+        self.connector_glm_contexts.insert(row_source_slot, lookup);
+        Ok(())
     }
 
-    pub(crate) fn glm_scan_range(
+    pub(crate) fn connector_glm_split(
         &self,
         row_source_slot: SlotId,
         scan_range_id: i32,
-    ) -> Option<FileScanRange> {
-        self.glm_contexts
-            .get(&row_source_slot)
-            .and_then(|ctx| ctx.get_scan_range(scan_range_id).cloned())
-    }
-
-    pub(crate) fn glm_scan_config(&self, row_source_slot: SlotId) -> Option<RowPositionScanConfig> {
-        self.glm_contexts
-            .get(&row_source_slot)
-            .map(|ctx| ctx.scan_config.clone())
+    ) -> Option<(
+        Arc<novarocks_spi::connector::ConnectorInstance>,
+        novarocks_spi::connector::ConnectorSplit,
+    )> {
+        let lookup = self.connector_glm_contexts.get(&row_source_slot)?;
+        Some((
+            Arc::clone(&lookup.instance),
+            lookup.splits.get(&scan_range_id)?.clone(),
+        ))
     }
 
     #[cfg(feature = "compat")]
@@ -2486,17 +2489,32 @@ impl QueryContextManager {
         Ok(())
     }
 
-    pub(crate) fn register_glm_scan_ranges(
+    pub(crate) fn register_connector_glm(
         &self,
         query_id: QueryId,
         row_source_slot: SlotId,
-        scan_cfg: RowPositionScanConfig,
-        ranges: Vec<FileScanRange>,
+        lookup: ConnectorRowPositionLookup,
     ) -> Result<(), String> {
         self.with_context_mut(query_id, |ctx| {
-            ctx.register_glm_scan_ranges(row_source_slot, scan_cfg, ranges);
-            Ok(())
+            ctx.register_connector_glm(row_source_slot, lookup)
         })
+    }
+
+    pub(crate) fn connector_glm_split(
+        &self,
+        query_id: QueryId,
+        row_source_slot: SlotId,
+        scan_range_id: i32,
+    ) -> Option<(
+        Arc<novarocks_spi::connector::ConnectorInstance>,
+        novarocks_spi::connector::ConnectorSplit,
+    )> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .and_then(|ctx| ctx.connector_glm_split(row_source_slot, scan_range_id))
     }
 
     pub(crate) fn row_pos_desc(
@@ -2510,33 +2528,6 @@ impl QueryContextManager {
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
             .and_then(|ctx| ctx.row_pos_desc(tuple_id))
-    }
-
-    pub(crate) fn glm_scan_range(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-        scan_range_id: i32,
-    ) -> Option<FileScanRange> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.glm_scan_range(row_source_slot, scan_range_id))
-    }
-
-    pub(crate) fn glm_scan_config(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-    ) -> Option<RowPositionScanConfig> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.glm_scan_config(row_source_slot))
     }
 
     #[cfg(feature = "compat")]

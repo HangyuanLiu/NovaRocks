@@ -193,11 +193,11 @@ impl JdbcConnectorInstance {
 
 /// Build a generic SPI scan source for one decoder-local JDBC/MySQL instance.
 ///
-/// Connection details stay in the provider instance.  The shared host retains
-/// that instance only through the returned source's lease; its scan and split
-/// payloads are provider-owned JSON without credentials.
+/// Connection details stay in the provider instance. The returned source owns
+/// the instance directly; its scan and split payloads are provider-owned JSON
+/// without credentials.
 pub(crate) fn plan_jdbc_read_source(
-    connectors: &ConnectorRegistry,
+    _connectors: &ConnectorRegistry,
     instance_id: ConnectorInstanceId,
     config: JdbcInstanceConfig,
     batch: ConnectorBatchBudget,
@@ -234,11 +234,8 @@ pub(crate) fn plan_jdbc_read_source(
         },
     )?;
     let instance = provider.connector_instance()?;
-    let (instance, lifecycle) = connectors
-        .register_ephemeral_connector_instance(instance)
-        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
-    Ok(Arc::new(ConnectorReadScanSource::new_ephemeral(
-        instance,
+    Ok(Arc::new(ConnectorReadScanSource::new(
+        Arc::new(instance),
         splits,
         ConnectorOpenReaderRequest {
             expected_schema: scan.output_schema,
@@ -246,7 +243,6 @@ pub(crate) fn plan_jdbc_read_source(
             context,
         },
         chunk_schema,
-        lifecycle,
     )))
 }
 

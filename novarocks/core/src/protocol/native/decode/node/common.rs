@@ -41,7 +41,6 @@ pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {
 pub(crate) fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
     match kind {
         ExecNodeKind::Scan(_) => "Scan",
-        ExecNodeKind::IcebergDeltaScan(_) => "IcebergDeltaScan",
         ExecNodeKind::Project(_) => "Project",
         ExecNodeKind::Filter(_) => "Filter",
         ExecNodeKind::Aggregate(_) => "Aggregate",

@@ -15,48 +15,228 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::cache::{CacheOptions, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicate;
-use crate::connector::hdfs::{HdfsInstanceConfig, plan_starrocks_hdfs_read_source};
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
+use crate::connector::iceberg::provider::{COMPAT_ICEBERG_INSTANCE_ID, build_compat_read_splits};
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+};
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
-    IcebergMetadataScanRange, IcebergMetadataTableType,
-    build_projected_output_schema_from_descriptor, plan_compat_iceberg_metadata_read_source,
+    IcebergMetadataScanRange, IcebergMetadataTableType, plan_compat_iceberg_metadata_read_source,
 };
+use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::fragment::program::ScanAssignmentKind;
-use crate::exec::node::scan::{BoundScanRanges, ScanNode};
+use crate::exec::node::scan::{
+    BoundScanRanges, ConnectorRowPosition, ConnectorRowPositionLookup, ScanNode,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::formats::parquet::{
-    ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
-};
-use crate::novarocks_connectors::{
-    ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsIcebergRuntimePruningConfig,
-    HdfsScanConfig, OrcScanConfig, ParquetScanConfig,
-};
+use crate::exec::row_position::RowPositionSpec;
+use crate::formats::parquet::{ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec};
+use crate::novarocks_connectors::ConnectorRegistry;
 use crate::novarocks_logging::{debug, warn};
 use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thrift;
 use crate::protocol::starrocks::decode::layout::{Layout, layout_from_slot_ids};
-use crate::protocol::starrocks::decode::node::decode::{
-    QueryGlobalDictMap, build_scan_query_global_dicts,
-};
+use crate::protocol::starrocks::decode::node::decode::QueryGlobalDictMap;
 use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
 use crate::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
-use crate::runtime::query_options::QueryOptions;
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
 use crate::thrift::{descriptors, exprs, plan_nodes, types};
-use novarocks_fs::DataCacheContext;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
+    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+
+struct CompatIcebergQueryCancellation {
+    query_id: QueryId,
+}
+
+impl ConnectorCancellation for CompatIcebergQueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        query_context_manager().is_query_canceled(self.query_id)
+    }
+}
+
+fn compat_iceberg_file_from_wire(
+    node_id: i32,
+    path: String,
+    file_len: u64,
+    offset: u64,
+    length: u64,
+    first_row_id: Option<i64>,
+    data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
+    included_positions: Option<Vec<i64>>,
+    delete_files: Vec<IcebergDeleteFileSpec>,
+) -> Result<IcebergDataFileInfo, String> {
+    if offset != 0 || (length != 0 && length != file_len) {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={node_id} Iceberg compatibility scan range must cover one complete data file"
+        ));
+    }
+    let delete_files = delete_files
+        .into_iter()
+        .map(|delete| {
+            Ok(IcebergDeleteFileInfo {
+                path: delete.path,
+                file_format: match delete.file_format {
+                    IcebergFileFormat::Parquet => IcebergDeleteFileFormat::Parquet,
+                    IcebergFileFormat::Puffin => IcebergDeleteFileFormat::Puffin,
+                    IcebergFileFormat::Unknown => {
+                        return Err("Iceberg delete file has unknown format".to_string());
+                    }
+                },
+                file_content: match delete.file_content {
+                    IcebergFileContent::PositionDeletes => IcebergDeleteFileContent::Position,
+                    IcebergFileContent::EqualityDeletes => IcebergDeleteFileContent::Equality,
+                    IcebergFileContent::Data => {
+                        return Err("Iceberg delete attachment has data-file content".to_string());
+                    }
+                },
+                length: delete.length.and_then(|value| i64::try_from(value).ok()),
+                content_offset: delete.content_offset,
+                content_size_in_bytes: delete.content_size_in_bytes,
+                sequence_number: None,
+                partition_spec_id: None,
+                partition_key: None,
+                equality_column_names: Vec::new(),
+                equality_field_ids: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IcebergDataFileInfo {
+        path,
+        size: i64::try_from(file_len).map_err(|_| "Iceberg data file length exceeds Int64")?,
+        row_count: None,
+        column_stats: None,
+        partition_spec_id: None,
+        partition_key: None,
+        first_row_id,
+        data_sequence_number,
+        ivm_change_op,
+        included_positions,
+        delete_files,
+        manifest_path: None,
+        partition_values: Vec::new(),
+    })
+}
+
+struct CompatIcebergDataReadPlan {
+    source: Arc<dyn crate::exec::node::scan::ScanSource>,
+    row_position_lookup: Option<ConnectorRowPositionLookup>,
+}
+
+fn provider_schema_for_compat_iceberg(
+    output_schema: &ChunkSchemaRef,
+    row_position: Option<&RowPositionSpec>,
+) -> Result<ChunkSchemaRef, String> {
+    let Some(row_position) = row_position else {
+        return Ok(Arc::clone(output_schema));
+    };
+    let slots = output_schema
+        .slots()
+        .iter()
+        .filter(|slot| {
+            slot.slot_id() != row_position.row_source_slot
+                && slot.slot_id() != row_position.scan_range_slot
+        })
+        .cloned()
+        .collect();
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+}
+
+fn plan_compat_iceberg_data_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: QueryId,
+    output_schema: ChunkSchemaRef,
+    files: Vec<IcebergDataFileInfo>,
+    row_position_ids: Option<Vec<i32>>,
+    row_position: Option<&RowPositionSpec>,
+    query_options: &QueryOptions,
+) -> Result<CompatIcebergDataReadPlan, String> {
+    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)
+        .map_err(|error| error.to_string())?;
+    let instance = connectors
+        .connector_instance(&instance_id)
+        .map_err(|error| format!("compat Iceberg startup instance is unavailable: {error}"))?;
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(CompatIcebergQueryCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let splits = build_compat_read_splits(files).map_err(|error| error.to_string())?;
+    let provider_schema = provider_schema_for_compat_iceberg(&output_schema, row_position)?;
+    let row_position_lookup = match row_position_ids {
+        Some(ids) => {
+            if ids.len() != splits.len() {
+                return Err("compat Iceberg row-position split count mismatch".to_string());
+            }
+            Some(ConnectorRowPositionLookup {
+                instance: Arc::clone(&instance),
+                splits: ids.into_iter().zip(splits.iter().cloned()).collect(),
+            })
+        }
+        None => None,
+    };
+    let scheduled = splits
+        .into_iter()
+        .enumerate()
+        .map(|(index, split)| {
+            match row_position_lookup.as_ref().and_then(|lookup| {
+                lookup.splits.iter().find_map(|(range_id, candidate)| {
+                    (candidate.split_id() == split.split_id()).then_some(*range_id)
+                })
+            }) {
+                Some(scan_range_id) => ConnectorScheduledSplit::with_row_position(
+                    split,
+                    ConnectorRowPosition { scan_range_id },
+                ),
+                None => ConnectorScheduledSplit::plain(split),
+            }
+        })
+        .collect();
+    Ok(CompatIcebergDataReadPlan {
+        source: Arc::new(ConnectorReadScanSource::new_scheduled(
+            instance,
+            scheduled,
+            ConnectorOpenReaderRequest {
+                expected_schema: provider_schema.arrow_schema_ref(),
+                batch: ConnectorBatchBudget {
+                    max_rows: rows,
+                    max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+                        .expect("SPI handle maximum is nonzero"),
+                },
+                context,
+            },
+            provider_schema,
+        )),
+        row_position_lookup,
+    })
+}
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
     let max_slot = visible_slot_ids
@@ -95,82 +275,6 @@ fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
         PARQUET_FIELD_ID_META_KEY.to_string(),
         field_id.to_string(),
     )]))
-}
-
-fn apply_path_rewrite(
-    ranges: &mut [FileScanRange],
-    rewrite: Option<&crate::protocol::starrocks::decode::instance::StarRocksPathRewriteFacts>,
-) -> Result<(), String> {
-    let Some(rewrite) = rewrite else {
-        return Ok(());
-    };
-
-    let from = rewrite.from_prefix().trim();
-    let to = rewrite.to_prefix().trim();
-    if from.is_empty() || to.is_empty() {
-        return Err(
-            "path rewrite enabled but runtime.path_rewrite.from_prefix/to_prefix is empty"
-                .to_string(),
-        );
-    }
-    if !to.starts_with('/') {
-        return Err(format!(
-            "path rewrite to_prefix must be absolute path, got: {}",
-            to
-        ));
-    }
-
-    let from = from.trim_end_matches('/');
-    let to = to.trim_end_matches('/');
-
-    let mut matched = 0usize;
-    let mut rewritten = Vec::with_capacity(ranges.len());
-    for range in ranges.iter() {
-        let original = range.path.trim();
-        if let Some(rest) = original.strip_prefix(from) {
-            let rest = rest.trim_start_matches('/');
-            let new_path = if rest.is_empty() {
-                to.to_string()
-            } else {
-                format!("{}/{}", to, rest)
-            };
-            rewritten.push(Some((original.to_string(), new_path)));
-            matched += 1;
-        } else {
-            rewritten.push(None);
-        }
-    }
-
-    if matched != ranges.len() {
-        let first_unmatched = ranges
-            .iter()
-            .map(|r| r.path.trim())
-            .find(|p| !p.starts_with(from))
-            .unwrap_or("<unknown>");
-        return Err(format!(
-            "path rewrite enabled but not all paths match prefix: prefix={} first_unmatched={}",
-            from, first_unmatched
-        ));
-    }
-
-    for (range, item) in ranges.iter_mut().zip(rewritten.into_iter()) {
-        let Some((original, new_path)) = item else {
-            continue;
-        };
-        debug!("HDFS_SCAN path rewrite: {} -> {}", original, new_path);
-        range.path = new_path;
-    }
-
-    Ok(())
-}
-
-fn scan_ranges_have_position_delete_files(ranges: &[FileScanRange]) -> bool {
-    ranges.iter().any(|range| {
-        range
-            .delete_files
-            .iter()
-            .any(|delete_file| delete_file.file_content == IcebergFileContent::PositionDeletes)
-    })
 }
 
 fn file_cache_flags_from_query_options(query_opts: &QueryOptions) -> (bool, bool) {
@@ -731,6 +835,17 @@ pub(crate) fn lower_hdfs_scan_node(
     let iceberg_table_locations = IcebergTableLocationMap::from_snapshot(&desc_snapshot);
     let is_paimon = desc_snapshot.is_paimon_table_for_tuple(tuple_id);
     let is_iceberg_table = desc_snapshot.is_iceberg_table_for_tuple(tuple_id);
+    if !is_iceberg_table {
+        let table_kind = if is_paimon {
+            "Paimon"
+        } else {
+            "unknown external"
+        };
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={} {} scans are unsupported; compat supports only internal tables and explicit Iceberg descriptors",
+            node.node_id, table_kind
+        ));
+    }
     let hive_column_names = hdfs.hive_column_names.clone();
     let orc_use_column_names = query_opts.orc_use_column_names;
 
@@ -777,16 +892,8 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut row_source_field: Option<arrow::datatypes::Field> = None;
     let mut scan_range_field: Option<arrow::datatypes::Field> = None;
     let mut row_id_field: Option<arrow::datatypes::Field> = None;
-    let mut iceberg_virtual_file_slot: Option<SlotId> = None;
-    let mut iceberg_virtual_pos_slot: Option<SlotId> = None;
-    let mut iceberg_virtual_row_id_slot: Option<SlotId> = None;
-    let mut iceberg_virtual_last_updated_seq_slot: Option<SlotId> = None;
-    let mut iceberg_virtual_change_op_slot: Option<SlotId> = None;
-    let mut iceberg_virtual_file_field: Option<arrow::datatypes::Field> = None;
-    let mut iceberg_virtual_pos_field: Option<arrow::datatypes::Field> = None;
-    let mut iceberg_virtual_row_id_field: Option<arrow::datatypes::Field> = None;
-    let mut iceberg_virtual_last_updated_seq_field: Option<arrow::datatypes::Field> = None;
-    let mut iceberg_virtual_change_op_field: Option<arrow::datatypes::Field> = None;
+    let mut has_iceberg_virtual_row_id = false;
+    let mut has_iceberg_virtual_change_op = false;
 
     for (tuple_id, slot_id) in &out_layout.order {
         let slot_id = SlotId::try_from(*slot_id)?;
@@ -845,9 +952,6 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id, slot_id, logical
                 ));
             }
-            iceberg_virtual_file_slot = Some(slot_id);
-            iceberg_virtual_file_field =
-                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
         if !is_physical_hdfs_column && crate::exec::row_position::is_iceberg_row_pos(&name) {
@@ -857,14 +961,10 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id, slot_id, logical
                 ));
             }
-            iceberg_virtual_pos_slot = Some(slot_id);
-            iceberg_virtual_pos_field =
-                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
 
         // Lowering of `_row_id` / `_last_updated_sequence_number` slots into
-        // IcebergVirtualSpec is exercised end-to-end by the Task 5 integration
         // tests (e.g. `select_row_id_and_last_updated_seq_on_v3_row_lineage_table`).
         // The synthetic-fixture style used elsewhere in this file is not added
         // here because constructing a valid `TPlanNode` for an iceberg scan
@@ -877,9 +977,7 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id, slot_id, logical
                 ));
             }
-            iceberg_virtual_row_id_slot = Some(slot_id);
-            iceberg_virtual_row_id_field =
-                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            has_iceberg_virtual_row_id = true;
             continue;
         }
 
@@ -892,9 +990,6 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id, slot_id, logical
                 ));
             }
-            iceberg_virtual_last_updated_seq_slot = Some(slot_id);
-            iceberg_virtual_last_updated_seq_field =
-                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
         if crate::exec::row_position::is_change_op(&name)
@@ -912,9 +1007,7 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id, slot_id, logical
                 ));
             }
-            iceberg_virtual_change_op_slot = Some(slot_id);
-            iceberg_virtual_change_op_field =
-                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            has_iceberg_virtual_change_op = true;
             continue;
         }
 
@@ -964,9 +1057,8 @@ pub(crate) fn lower_hdfs_scan_node(
             ));
         }
     };
-    let needs_first_row_id = row_position_spec.is_some() || iceberg_virtual_row_id_slot.is_some();
+    let needs_first_row_id = row_position_spec.is_some() || has_iceberg_virtual_row_id;
 
-    let case_sensitive = hdfs.case_sensitive.unwrap_or(true);
     let mut cache_options = CacheOptions::from_query_options(Some(query_opts))?;
     if let Some(node_datacache_options) = hdfs.datacache_options.as_ref() {
         let node_range_options = ExternalDataCacheRangeOptions {
@@ -1016,15 +1108,16 @@ pub(crate) fn lower_hdfs_scan_node(
     // iceberg-rust's `TableMetadata`. The SPI reader rejects flavors the native path does
     // not yet implement (Files / Manifests / LogicalIcebergMetadata).
     let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
-    let mut ranges: Vec<FileScanRange> = Vec::new();
+    let mut iceberg_files: Vec<IcebergDataFileInfo> = Vec::new();
     let mut iceberg_metadata_ranges: Vec<IcebergMetadataScanRange> = Vec::new();
-    let mut has_more = false;
     let mut scan_format: Option<descriptors::THdfsFileFormat> = None;
-    let mut next_scan_range_id: i32 = 0;
     for p in assignment_ranges {
         if p.empty.unwrap_or(false) {
             if p.has_more.unwrap_or(false) {
-                has_more = true;
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} incremental Iceberg scan ranges are unsupported",
+                    node.node_id
+                ));
             }
             continue;
         }
@@ -1184,13 +1277,6 @@ pub(crate) fn lower_hdfs_scan_node(
                 node.node_id
             ));
         }
-        let scan_range_id = if row_position_spec.is_some() {
-            let id = next_scan_range_id;
-            next_scan_range_id = next_scan_range_id.saturating_add(1);
-            id
-        } else {
-            -1
-        };
         let first_row_id = if needs_first_row_id {
             Some(hdfs_range.first_row_id.ok_or_else(|| {
                 format!(
@@ -1201,35 +1287,6 @@ pub(crate) fn lower_hdfs_scan_node(
         } else {
             None
         };
-        let external_datacache = {
-            let range_datacache_options = hdfs_range.datacache_options.as_ref();
-            let candidate_node = hdfs_range
-                .candidate_node
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let options = ExternalDataCacheRangeOptions {
-                modification_time: hdfs_range.modification_time,
-                enable_populate_datacache: range_datacache_options
-                    .and_then(|opts| opts.enable_populate_datacache),
-                datacache_priority: range_datacache_options.and_then(|opts| opts.priority),
-                candidate_node,
-            };
-            if options.modification_time.is_some()
-                || options.enable_populate_datacache.is_some()
-                || options.datacache_priority.is_some()
-                || options.candidate_node.is_some()
-            {
-                // Validate range-level cache options early in lowering.
-                let _ = cache_options.with_external_range_options(Some(&options))?;
-                Some(options)
-            } else {
-                None
-            }
-        };
-        let iceberg_file_pruning = None;
-
         // data_sequence_number is populated from THdfsScanRange field 38
         // when the NovaRocks iceberg codegen path (standalone SQL) fills it in.
         // For FE-sent scan ranges that do not carry field 38, this will be
@@ -1237,29 +1294,15 @@ pub(crate) fn lower_hdfs_scan_node(
         // produces None for FE-driven ranges (see build_incremental_morsels).
         let data_sequence_number = hdfs_range.data_sequence_number;
         let ivm_change_op = hdfs_range.ivm_change_op;
-        if iceberg_virtual_change_op_slot.is_some() && ivm_change_op.is_none() {
+        if has_iceberg_virtual_change_op && ivm_change_op.is_none() {
             return Err(format!(
                 "HDFS_SCAN_NODE node_id={} __change_op virtual slot requires every scan range to carry extended_columns",
                 node.node_id
             ));
         }
 
-        if let Some(fp) = hdfs_range.full_path.as_ref().filter(|s| !s.is_empty()) {
-            ranges.push(FileScanRange {
-                path: fp.clone(),
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions: (!hdfs_range.included_positions.is_empty())
-                    .then(|| hdfs_range.included_positions.clone()),
-                external_datacache: external_datacache.clone(),
-                delete_files: iceberg_delete_files.clone(),
-                iceberg_file_pruning: iceberg_file_pruning.clone(),
-            });
+        let path = if let Some(fp) = hdfs_range.full_path.as_ref().filter(|s| !s.is_empty()) {
+            fp.clone()
         } else if let Some(rp) = hdfs_range.relative_path.as_ref().filter(|s| !s.is_empty()) {
             let table_id = hdfs_range.table_id.ok_or_else(|| {
                 format!(
@@ -1275,22 +1318,26 @@ pub(crate) fn lower_hdfs_scan_node(
             })?;
             let base = loc.trim_end_matches('/');
             let rel = rp.trim_start_matches('/');
-            ranges.push(FileScanRange {
-                path: format!("{base}/{rel}"),
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                first_row_id,
-                data_sequence_number,
-                ivm_change_op,
-                included_positions: (!hdfs_range.included_positions.is_empty())
-                    .then(|| hdfs_range.included_positions.clone()),
-                external_datacache,
-                delete_files: iceberg_delete_files,
-                iceberg_file_pruning,
-            });
-        }
+            format!("{base}/{rel}")
+        } else {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={} Iceberg scan range requires full_path or relative_path",
+                node.node_id
+            ));
+        };
+        iceberg_files.push(compat_iceberg_file_from_wire(
+            node.node_id,
+            path,
+            file_len,
+            offset,
+            length,
+            first_row_id,
+            data_sequence_number,
+            ivm_change_op,
+            (!hdfs_range.included_positions.is_empty())
+                .then(|| hdfs_range.included_positions.clone()),
+            iceberg_delete_files,
+        )?);
     }
     if let Some(metadata_table_type) = iceberg_metadata_table_type {
         let batch_size: usize = query_opts
@@ -1334,291 +1381,44 @@ pub(crate) fn lower_hdfs_scan_node(
             layout: out_layout,
         });
     }
-    let original_range_count = ranges.len();
-    apply_path_rewrite(&mut ranges, decode_facts.path_rewrite())?;
-    let mut enable_page_index = query_opts.enable_parquet_reader_page_index;
-
-    let pruning_predicates = parse_hdfs_scan_pruning_predicates(
-        node.node_id,
-        hdfs.min_max_conjuncts.as_deref(),
-        &out_layout,
-        &variant_path_plan.specs,
-    )?;
-    let mut min_max_predicates = pruning_predicates.physical;
-    let mut variant_path_predicates = pruning_predicates.variant;
-    if let Some(min_max_conjs) = hdfs.min_max_conjuncts.as_ref() {
-        debug!(
-            "[Row Group Pruning] parsing {} min_max_conjuncts",
-            min_max_conjs.len()
-        );
-        for pred in &min_max_predicates {
-            debug!("[Row Group Pruning] parsed predicate: {:?}", pred);
-        }
-        if !min_max_predicates.is_empty() {
-            debug!(
-                "[Row Group Pruning] total {} min_max_predicates ready for row group filtering",
-                min_max_predicates.len()
-            );
-        }
-    }
-    let has_position_delete_files = scan_ranges_have_position_delete_files(&ranges);
-    let mut runtime_min_max_filter_columns = HashMap::new();
-    apply_row_position_pruning_gate(
-        row_position_spec.is_some() || has_position_delete_files,
-        &mut enable_page_index,
-        &mut min_max_predicates,
-        &mut variant_path_predicates,
-        &mut runtime_min_max_filter_columns,
-    );
-
-    debug!(
-        "HDFS_SCAN creating scan with {} ranges, {} columns",
-        ranges.len(),
-        read_columns.columns.len()
-    );
-    debug!("HDFS_SCAN final out_layout.order: {:?}", out_layout.order);
-    debug!("HDFS_SCAN final out_layout.index: {:?}", out_layout.index);
-    let batch_size: Option<usize> = query_opts.batch_size.map(|bs| bs as usize).or(Some(4096));
-
-    debug!("HDFS_SCAN using batch_size: {:?}", batch_size);
-
-    let external_datacache = DataCacheContext::external(cache_options.to_file_cache_options());
-    let (enable_file_metacache, enable_file_pagecache) =
-        file_cache_flags_from_query_options(query_opts);
-    if is_iceberg_table && scan_format == Some(descriptors::THdfsFileFormat::ORC) {
-        return Err(format!(
-            "HDFS_SCAN_NODE node_id={} does not support Iceberg ORC files; NovaRocks currently only supports Parquet for Iceberg schema/partition evolution",
-            node.node_id
-        ));
-    }
-    if !variant_path_plan.specs.is_empty()
-        && scan_format.is_some()
-        && scan_format != Some(descriptors::THdfsFileFormat::PARQUET)
-    {
-        return Err(format!(
-            "HDFS_SCAN_NODE node_id={} variant_path_columns require PARQUET scan ranges, got {:?}",
-            node.node_id, scan_format
-        ));
-    }
-    if is_iceberg_table
-        && (iceberg_virtual_row_id_slot.is_some()
-            || iceberg_virtual_last_updated_seq_slot.is_some())
-    {
-        let mut hidden_slot_bases = slot_ids.clone();
-        hidden_slot_bases.extend(read_columns.slot_ids.iter().copied());
-        let mut hidden_slot_id = next_hidden_slot_id(&hidden_slot_bases)?;
-        if iceberg_virtual_row_id_slot.is_some() {
-            read_columns
-                .columns
-                .push(crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string());
-            read_columns.slot_ids.push(hidden_slot_id);
-            read_columns.slot_kinds.push(ParquetSlotKind::Regular);
-            read_columns.fields.push(iceberg_reserved_field(
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
-                true,
-                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-            ));
-            read_columns
-                .iceberg_projected_columns
-                .push(IcebergArrowColumn {
-                    name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                });
-            hidden_slot_id = advance_hidden_slot_id(hidden_slot_id)?;
-        }
-        if iceberg_virtual_last_updated_seq_slot.is_some() {
-            read_columns
-                .columns
-                .push(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string());
-            read_columns.slot_ids.push(hidden_slot_id);
-            read_columns.slot_kinds.push(ParquetSlotKind::Regular);
-            read_columns.fields.push(iceberg_reserved_field(
-                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-                true,
-                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-            ));
-            read_columns
-                .iceberg_projected_columns
-                .push(IcebergArrowColumn {
-                    name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                });
-        }
-    }
-    // Build the per-slot dict encode map up front. iceberg/HDFS dict columns
-    // are declared Int32 in the chunk/tuple schema but stored as Utf8 strings;
-    // the parquet reader reads them as Utf8 and encodes Utf8 -> Int32 dict ids.
-    // The iceberg schema-evolution alignment (`align_batch_to_iceberg_schema`,
-    // driven by `iceberg_output_schema`) casts every projected column to its
-    // target type, so a dict column MUST carry its Utf8 scan-read type there or
-    // the align would cast Utf8 -> Int32 and null everything out. Rewrite the
-    // dict columns in `iceberg_projected_columns` to their scan-read type before
-    // building `iceberg_output_schema`. `parquet_chunk_schema` below keeps the
-    // Int32 output type on purpose — it is the post-encode output layout that
-    // `encode_batch_with_query_global_dicts` produces.
-    let query_global_dicts =
-        build_scan_query_global_dicts(&read_columns.slot_ids, query_global_dict_map)?;
-    if !query_global_dicts.is_empty() {
-        for (col, slot_id) in read_columns
-            .iceberg_projected_columns
-            .iter_mut()
-            .zip(read_columns.slot_ids.iter())
-        {
-            if query_global_dicts.contains_key(slot_id)
-                && let Some(scan_ty) =
-                    crate::exec::dict_encode::dict_scan_data_type_for_output(&col.data_type)
-            {
-                col.data_type = scan_ty;
-            }
-        }
-    }
-    let iceberg_runtime_pruning = if is_iceberg_table {
-        Some(HdfsIcebergRuntimePruningConfig {
-            slot_to_column: read_columns
-                .slot_ids
+    if is_iceberg_table {
+        let query_id = query_id.ok_or_else(|| {
+            "HDFS_SCAN_NODE requires a query identity for connector cancellation".to_string()
+        })?;
+        let output_chunk_schema = chunk_schema_for_snapshot_layout(&out_layout, &slot_info_map)?;
+        let row_position_ids = row_position_spec.as_ref().map(|_| {
+            iceberg_files
                 .iter()
-                .zip(read_columns.columns.iter())
-                .map(|(slot_id, column)| (*slot_id, column.clone()))
-                .collect(),
-            min_max_filter_columns: runtime_min_max_filter_columns.clone(),
-            discrete_set_max_values: 256,
-        })
-    } else {
-        None
-    };
-    let iceberg_output_schema = if is_iceberg_table {
-        build_projected_output_schema_from_descriptor(
-            desc_snapshot.iceberg_schema_for_tuple(tuple_id),
-            &read_columns.iceberg_projected_columns,
-        )?
-    } else {
-        None
-    };
-    let output_chunk_schema = chunk_schema_for_snapshot_layout(&out_layout, &slot_info_map)?;
-    // Parquet reader only materializes physical data columns (iceberg `_file` /
-    // `_pos` are synthesized by the scan runner afterwards), so its chunk
-    // schema must omit virtual-column slots to keep the column-count check on
-    // the parquet side happy.
-    let parquet_chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-        &Schema::new(read_columns.fields.clone()),
-        &read_columns.slot_ids,
-    )?;
-    let parquet_cfg = ParquetScanConfig {
-        columns: read_columns.columns,
-        chunk_schema: parquet_chunk_schema,
-        slot_kinds: read_columns.slot_kinds,
-        case_sensitive,
-        enable_page_index,
-        min_max_predicates,
-        runtime_min_max_filter_columns,
-        batch_size,
-        datacache: external_datacache,
-        cache_policy: ParquetReadCachePolicy::with_flags(
-            enable_file_metacache,
-            enable_file_pagecache,
-            u32::try_from(cache_options.datacache_evict_probability).ok(),
-        ),
-        profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
-        iceberg_output_schema,
-        variant_path_predicates,
-        variant_path_columns: variant_path_plan.specs,
-        query_global_dicts: Default::default(),
-    };
-    let orc_cfg = OrcScanConfig {
-        columns: parquet_cfg.columns.clone(),
-        chunk_schema: parquet_cfg.chunk_schema.clone(),
-        case_sensitive: parquet_cfg.case_sensitive,
-        orc_use_column_names,
-        hive_column_names,
-        batch_size: parquet_cfg.batch_size,
-        datacache: parquet_cfg.datacache.clone(),
-    };
-    let format = match scan_format {
-        Some(descriptors::THdfsFileFormat::PARQUET) => Some(FileFormatConfig::Parquet(parquet_cfg)),
-        Some(descriptors::THdfsFileFormat::ORC) => Some(FileFormatConfig::Orc(orc_cfg)),
-        Some(other) => {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} unsupported file_format {:?}",
-                node.node_id, other
-            ));
-        }
-        None => None,
-    };
-    let cloud_props = hdfs
-        .cloud_configuration
-        .as_ref()
-        .and_then(|c| c.cloud_properties.as_ref());
-    let object_store_config = resolve_cloud_object_store_config(cloud_props, decode_facts)?;
-    let row_position_ranges = row_position_spec.as_ref().map(|_| ranges.clone());
-    let cfg = HdfsScanConfig {
-        ranges,
-        original_range_count,
-        has_more,
-        limit,
-        profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
-        format,
-        object_store_config: object_store_config.clone(),
-        iceberg_table_locations: iceberg_table_locations.to_hash_map(),
-        query_global_dicts,
-        iceberg_runtime_pruning,
-    };
-    let row_position_scan = row_position_spec.as_ref().and_then(|_| {
-        scan_format.map(
-            |file_format| crate::exec::node::scan::RowPositionScanConfig {
-                file_format: hdfs_scan_file_format_from_thrift(file_format),
-                case_sensitive,
-                batch_size,
-                enable_file_metacache,
-                enable_file_pagecache,
-                oss_config: object_store_config.clone(),
+                .enumerate()
+                .map(|(index, _)| i32::try_from(index).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>()
+        });
+        let planned = plan_compat_iceberg_data_read_source(
+            connectors,
+            query_id,
+            output_chunk_schema.clone(),
+            iceberg_files,
+            row_position_ids,
+            row_position_spec.as_ref(),
+            query_opts,
+        )?;
+        scan_ranges.capture(node.node_id, BoundScanRanges::None);
+        let scan = ScanNode::new(planned.source)
+            .with_node_id(node.node_id)
+            .with_output_chunk_schema(output_chunk_schema)
+            .with_limit(limit)
+            .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
+            .with_accept_empty_scan_ranges(true)
+            .with_row_position(row_position_spec)
+            .with_connector_row_position_lookup(planned.row_position_lookup);
+        return Ok(Lowered {
+            node: ExecNode {
+                kind: ExecNodeKind::Scan(scan),
             },
-        )
-    });
-
-    let query_id = query_id.ok_or_else(|| {
-        "HDFS_SCAN_NODE requires a query identity for connector cancellation".to_string()
-    })?;
-    let source = plan_starrocks_hdfs_read_source(
-        connectors,
-        query_id,
-        node.node_id,
-        HdfsInstanceConfig {
-            scan: cfg,
-            chunk_schema: output_chunk_schema.clone(),
-        },
-        query_opts,
-    )
-    .map_err(|error| error.to_string())?;
-    scan_ranges.capture(node.node_id, BoundScanRanges::None);
-    let scan = ScanNode::new(source)
-        .with_node_id(node.node_id)
-        .with_output_chunk_schema(output_chunk_schema)
-        .with_limit(limit)
-        .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
-        .with_accept_empty_scan_ranges(true)
-        .with_row_position(row_position_spec)
-        .with_row_position_scan(row_position_scan)
-        .with_row_position_ranges(row_position_ranges)
-        .with_iceberg_virtual(Some(crate::exec::row_position::IcebergVirtualSpec {
-            file_path_slot: iceberg_virtual_file_slot,
-            row_pos_slot: iceberg_virtual_pos_slot,
-            row_id_slot: iceberg_virtual_row_id_slot,
-            last_updated_seq_slot: iceberg_virtual_last_updated_seq_slot,
-            change_op_slot: iceberg_virtual_change_op_slot,
-            file_path_field: iceberg_virtual_file_field,
-            row_pos_field: iceberg_virtual_pos_field,
-            row_id_field: iceberg_virtual_row_id_field,
-            last_updated_seq_field: iceberg_virtual_last_updated_seq_field,
-            change_op_field: iceberg_virtual_change_op_field,
-        }));
-    Ok(Lowered {
-        node: ExecNode {
-            kind: ExecNodeKind::Scan(scan),
-        },
-        layout: out_layout,
-    })
+            layout: out_layout,
+        });
+    }
+    unreachable!("non-Iceberg HDFS_SCAN_NODEs are rejected before scan materialization")
 }
 
 fn output_slots_from_layout(
@@ -1642,4 +1442,57 @@ fn output_slots_from_layout(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compat_iceberg_normalization_preserves_delete_and_lineage_facts() {
+        let file = compat_iceberg_file_from_wire(
+            7,
+            "s3://warehouse/data.parquet".to_string(),
+            128,
+            0,
+            128,
+            Some(100),
+            Some(9),
+            None,
+            Some(vec![4, 8]),
+            vec![IcebergDeleteFileSpec::puffin_position_delete(
+                "s3://warehouse/delete.puffin".to_string(),
+                Some(64),
+                12,
+                34,
+            )],
+        )
+        .expect("normalize Iceberg compatibility facts");
+        assert_eq!(file.first_row_id, Some(100));
+        assert_eq!(file.data_sequence_number, Some(9));
+        assert_eq!(file.included_positions, Some(vec![4, 8]));
+        assert_eq!(file.delete_files.len(), 1);
+        assert_eq!(
+            file.delete_files[0].file_format,
+            IcebergDeleteFileFormat::Puffin
+        );
+    }
+
+    #[test]
+    fn compat_iceberg_normalization_rejects_partial_data_file() {
+        let error = compat_iceberg_file_from_wire(
+            8,
+            "file:///tmp/data.parquet".to_string(),
+            128,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect_err("partial compatibility range must not bypass Iceberg coordinates");
+        assert!(error.contains("complete data file"));
+    }
 }

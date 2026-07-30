@@ -39,8 +39,9 @@ use crate::exec::chunk::Chunk;
 use crate::exec::chunk::ChunkSchema;
 use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
-    CancelFragmentRequest, FetchResultRequest, QueryExecutionId as ProtoQueryExecutionId,
-    SubmitFragmentRequest, fetch_result_response::Status as FetchStatus,
+    CancelFragmentRequest, FetchResultRequest, InstallConnectorInstanceRequest,
+    QueryExecutionId as ProtoQueryExecutionId, SubmitFragmentRequest,
+    fetch_result_response::Status as FetchStatus,
 };
 use crate::query_execution::contract::QueryId;
 use crate::query_execution::fragment_transport::{
@@ -55,6 +56,86 @@ use tracing::warn;
 
 static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// gRPC adapter for the connector instance control plane. Declarations are
+/// installed before a fragment carrier exists, so provider selection never
+/// crosses the fragment carrier boundary.
+pub(crate) struct GrpcConnectorBindingControl {
+    clients: BTreeMap<usize, NovaRocksGrpcRemoteClient>,
+    endpoints: BTreeMap<usize, SocketAddr>,
+}
+
+impl GrpcConnectorBindingControl {
+    pub(crate) fn new(backends: &[(usize, SocketAddr)]) -> Result<Self, String> {
+        if backends.is_empty() {
+            return Err("GrpcConnectorBindingControl requires at least one backend".to_string());
+        }
+        let mut clients = BTreeMap::new();
+        let mut endpoints = BTreeMap::new();
+        for (backend_idx, endpoint) in backends {
+            if clients.contains_key(backend_idx) {
+                return Err(format!("duplicate connector binding backend {backend_idx}"));
+            }
+            clients.insert(
+                *backend_idx,
+                NovaRocksGrpcRemoteClient::connect_blocking(*endpoint)?,
+            );
+            endpoints.insert(*backend_idx, *endpoint);
+        }
+        Ok(Self { clients, endpoints })
+    }
+
+    fn client_and_endpoint(
+        &self,
+        backend_idx: usize,
+        endpoint: SocketAddr,
+    ) -> Result<&NovaRocksGrpcRemoteClient, String> {
+        let configured = self.endpoints.get(&backend_idx).ok_or_else(|| {
+            format!("connector binding backend {backend_idx} is absent from configured snapshot")
+        })?;
+        if *configured != endpoint {
+            return Err(format!(
+                "connector binding endpoint mismatch for backend {backend_idx}: configured {configured}, received {endpoint}"
+            ));
+        }
+        self.clients.get(&backend_idx).ok_or_else(|| {
+            format!("connector binding client for backend {backend_idx} is missing")
+        })
+    }
+}
+
+impl crate::query_execution::artifact::ConnectorBindingDispatcher
+    for GrpcConnectorBindingControl
+{
+    fn install(
+        &self,
+        backend_idx: usize,
+        endpoint: SocketAddr,
+        declaration: &novarocks_spi::connector::ConnectorInstanceDeclaration,
+    ) -> Result<(), String> {
+        let client = self.client_and_endpoint(backend_idx, endpoint)?;
+        let request = InstallConnectorInstanceRequest {
+            provider_id: declaration.descriptor().provider_id.as_str().to_string(),
+            instance_id: declaration.descriptor().instance_id.as_str().to_string(),
+            incarnation: declaration.incarnation().to_bytes().to_vec(),
+            declaration_payload: declaration.payload().to_vec(),
+        };
+        let response = client
+            .blocking_install_connector_instance(request)
+            .map_err(|error| {
+                format!(
+                    "connector binding install RPC failed for BE[{backend_idx}] ({endpoint}): {error}"
+                )
+            })?;
+        if response.status_code != 0 {
+            return Err(format!(
+                "connector binding install was rejected by BE[{backend_idx}] ({endpoint}): {}",
+                response.message
+            ));
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RemoteDispatcher
@@ -359,8 +440,10 @@ mod tests {
     use proto::novarocks::{
         BatchReportExecStatusRequest, BatchReportExecStatusResponse, CancelFragmentRequest,
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
-        HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
-        SubmitFragmentRequest, SubmitFragmentResponse,
+        HeartbeatRequest, HeartbeatResponse, InstallConnectorInstanceRequest,
+        InstallConnectorInstanceResponse, ReportExecStatusRequest, ReportExecStatusResponse,
+        RetireConnectorInstanceRequest, RetireConnectorInstanceResponse, SubmitFragmentRequest,
+        SubmitFragmentResponse,
     };
     use tonic::{Request, Response, Status, Streaming};
 
@@ -514,6 +597,20 @@ mod tests {
             &self,
             _request: Request<Streaming<proto::novarocks::QueryControlRequest>>,
         ) -> Result<Response<Self::QueryControlStreamStream>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn install_connector_instance(
+            &self,
+            _request: Request<InstallConnectorInstanceRequest>,
+        ) -> Result<Response<InstallConnectorInstanceResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn retire_connector_instance(
+            &self,
+            _request: Request<RetireConnectorInstanceRequest>,
+        ) -> Result<Response<RetireConnectorInstanceResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 

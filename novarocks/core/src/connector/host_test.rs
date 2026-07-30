@@ -17,11 +17,13 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorInstance,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorProviderId, ConnectorRead, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorInstanceDeclaration, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorInstanceInstaller, ConnectorOpenReaderRequest,
+    ConnectorProviderId, ConnectorRead, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
 };
 
 use super::ConnectorRegistry;
@@ -76,6 +78,47 @@ fn instance(instance_id: &str) -> ConnectorInstance {
     };
     ConnectorInstance::try_new(descriptor, None, Arc::new(TestRead::new(instance_id)))
         .expect("matching read capability")
+}
+
+struct TestInstaller {
+    provider_id: ConnectorProviderId,
+}
+
+impl TestInstaller {
+    fn new() -> Self {
+        Self {
+            provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+        }
+    }
+}
+
+impl ConnectorInstanceInstaller for TestInstaller {
+    fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
+    }
+
+    fn install(
+        &self,
+        declaration: &ConnectorInstanceDeclaration,
+        _context: &ConnectorRequestContext,
+    ) -> Result<ConnectorInstance, ConnectorError> {
+        Ok(instance(declaration.descriptor().instance_id.as_str()))
+    }
+}
+
+fn declaration(
+    incarnation: ConnectorInstanceIncarnation,
+    payload: &'static [u8],
+) -> ConnectorInstanceDeclaration {
+    ConnectorInstanceDeclaration::try_new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+            instance_id: ConnectorInstanceId::parse("lake.catalog").expect("instance ID"),
+        },
+        incarnation,
+        Bytes::from_static(payload),
+    )
+    .expect("bounded declaration")
 }
 
 #[test]
@@ -149,4 +192,81 @@ fn registry_exposes_only_typed_connector_instance_resolution() {
         .connector_instance(&ConnectorInstanceId::parse("lake.catalog").expect("instance ID"))
         .expect("typed instance resolution");
     assert_eq!(resolved.descriptor().provider_id.as_str(), "test");
+}
+
+#[test]
+fn host_installs_a_declared_instance_idempotently() {
+    let mut host = ConnectorHost::default();
+    host.register_installer(Arc::new(TestInstaller::new()))
+        .expect("register installer");
+    let declaration = declaration(
+        ConnectorInstanceIncarnation::from_bytes([1; 16]),
+        b"binding=default",
+    );
+    let context = crate::connector::test_request_context();
+
+    let first = host.install(&declaration, &context).expect("first install");
+    let second = host
+        .install(&declaration, &context)
+        .expect("idempotent install");
+
+    assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn host_rejects_conflicting_declarations_for_one_incarnation() {
+    let mut host = ConnectorHost::default();
+    host.register_installer(Arc::new(TestInstaller::new()))
+        .expect("register installer");
+    let context = crate::connector::test_request_context();
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    host.install(&declaration(incarnation, b"binding=default"), &context)
+        .expect("first install");
+
+    let error = host
+        .install(&declaration(incarnation, b"binding=other"), &context)
+        .err()
+        .expect("same incarnation must not change declaration");
+    assert_eq!(error.kind(), ConnectorHostErrorKind::ConflictingDeclaration);
+}
+
+#[test]
+fn host_replaces_a_newer_incarnation_and_retires_it() {
+    let mut host = ConnectorHost::default();
+    host.register_installer(Arc::new(TestInstaller::new()))
+        .expect("register installer");
+    let context = crate::connector::test_request_context();
+    let first_incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    let second_incarnation = ConnectorInstanceIncarnation::from_bytes([2; 16]);
+    let first = host
+        .install(
+            &declaration(first_incarnation, b"binding=default"),
+            &context,
+        )
+        .expect("first install");
+    let second = host
+        .install(
+            &declaration(second_incarnation, b"binding=default"),
+            &context,
+        )
+        .expect("new incarnation install");
+    assert!(!Arc::ptr_eq(&first, &second));
+
+    let instance_id = ConnectorInstanceId::parse("lake.catalog").expect("instance ID");
+    let error = host
+        .install(
+            &declaration(first_incarnation, b"binding=default"),
+            &context,
+        )
+        .err()
+        .expect("stale incarnation must not replace active instance");
+    assert_eq!(error.kind(), ConnectorHostErrorKind::StaleIncarnation);
+    host.retire(&instance_id, second_incarnation)
+        .expect("retire current incarnation");
+    let error = host
+        .resolve(&instance_id)
+        .err()
+        .expect("retired instance must reject new readers");
+    assert_eq!(error.kind(), ConnectorHostErrorKind::RetiringInstance);
+    assert_eq!(first.descriptor().instance_id, instance_id);
 }

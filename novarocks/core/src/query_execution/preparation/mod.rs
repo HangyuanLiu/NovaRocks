@@ -116,6 +116,7 @@ pub(crate) fn prepare_fragments(
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();
     let mut expected_binding_node_ids = BTreeSet::new();
+    let mut expected_connector_read_keys = BTreeSet::new();
     let mut expected_starrocks_node_ids = BTreeSet::new();
     for fragment in plan.fragments() {
         let mut scan_nodes = Vec::new();
@@ -150,6 +151,12 @@ pub(crate) fn prepare_fragments(
                             "prepared fragment missing scan binding fragment_id={} node_id={node_id}",
                             fragment.fragment_id
                         ));
+                    }
+                    if scan_bindings
+                        .connector_read(fragment.fragment_id, *node_id)
+                        .is_some()
+                    {
+                        expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
                     }
                 }
             }
@@ -230,6 +237,11 @@ pub(crate) fn prepare_fragments(
         "scan bindings",
         &expected_binding_node_ids,
         &scan_bindings.binding_node_ids().collect(),
+    )?;
+    validate_binding_keys(
+        "connector reads",
+        &expected_connector_read_keys,
+        &scan_bindings.connector_read_keys().collect(),
     )?;
     validate_binding_keys(
         "StarRocks descriptors",

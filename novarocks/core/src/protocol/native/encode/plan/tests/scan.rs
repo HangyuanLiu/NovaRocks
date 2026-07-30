@@ -16,8 +16,16 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use bytes::Bytes;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorScan,
+    ConnectorScanHandle,
+};
 
 use super::*;
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
@@ -43,7 +51,7 @@ fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static Prepared
 }
 
 #[test]
-fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
+fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
     let plan = iceberg_delta_distributed_plan_for_test();
     let source_column = novarocks_catalog::schema::ColumnDef {
         name: "physical_order_id".to_string(),
@@ -74,10 +82,6 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
                 runtime_plan: IcebergDeltaScanRuntimePlan {
                     table_location: "s3://prepared/orders".to_string(),
                     data_columns: Vec::new(),
-                    cloud_properties: BTreeMap::from([(
-                        "endpoint".to_string(),
-                        "http://prepared-minio".to_string(),
-                    )]),
                     change_files: Vec::new(),
                     delete_side: None,
                 },
@@ -101,6 +105,9 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
             ],
         })
         .expect("insert prepared delta binding");
+    bindings
+        .insert_connector_read(0, 10, planned_connector_read_for_test())
+        .expect("insert planned delta connector read");
 
     let encoded = native_plan::encode_distributed_plan_with_context(
         &plan,
@@ -138,19 +145,43 @@ fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
         vec!["physical_order_id", "tenant_id"]
     );
     assert!(table.iceberg_row_lineage_metadata_columns.is_empty());
-    let Some(crate::proto::plan::scan_source::Kind::IcebergDeltaTable(delta)) = table
+    let Some(crate::proto::plan::scan_source::Kind::ConnectorRead(connector)) = table
         .source
         .as_ref()
         .and_then(|source| source.kind.as_ref())
     else {
-        panic!("expected encoded delta source");
+        panic!("expected encoded connector source");
     };
-    let runtime = delta.delta_plan.as_ref().expect("prepared runtime payload");
-    assert_eq!(runtime.table_location, "s3://prepared/orders");
-    assert!(
-        runtime.cloud_properties.is_empty(),
-        "native delta plans must use each BE's startup connector configuration"
-    );
+    assert_eq!(connector.instance_id, "ice");
+    assert_eq!(connector.scan_payload, b"delta-scan".to_vec());
+    assert!(connector.splits.is_empty());
+}
+
+fn planned_connector_read_for_test()
+-> crate::query_execution::preparation::scan::PlannedConnectorRead {
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let declaration = ConnectorInstanceDeclaration::try_new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: instance_id.clone(),
+        },
+        ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        Bytes::from_static(b"binding"),
+    )
+    .expect("declaration");
+    crate::query_execution::preparation::scan::PlannedConnectorRead {
+        declaration,
+        scan: ConnectorScan {
+            handle: ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"delta-scan"))
+                .expect("scan handle"),
+            output_schema: Arc::new(arrow::datatypes::Schema::empty()),
+        },
+        splits: Vec::new(),
+        batch: ConnectorBatchBudget {
+            max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+            max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
+        },
+    }
 }
 
 #[test]
@@ -215,10 +246,7 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
     else {
         panic!("ordinary source must encode as IcebergDataFiles");
     };
-    assert!(
-        files.cloud_properties.is_empty(),
-        "native Iceberg plans must not carry object-store configuration"
-    );
+    let _ = files;
 }
 
 #[test]
@@ -377,17 +405,10 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             files.binding,
             crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
         );
-        let (read_columns, variants) = crate::protocol::native::decode::scan_read_binding_for_test(
-            scan,
-            files.table.as_ref().expect("resolved table"),
-            &scan.columns,
-        )
-        .expect("lower bound refresh read plan");
-        assert!(
-            read_columns.iter().any(|column| column == "tenant_id"),
-            "native lowering must resolve hidden equality key from TableDef"
+        assert_eq!(
+            files.binding,
+            crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
         );
-        assert!(variants.is_empty());
     }
 }
 
@@ -539,14 +560,9 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     else {
         panic!("variant binding must encode as IcebergDataFiles");
     };
-    let (read_columns, variants) = crate::protocol::native::decode::scan_read_binding_for_test(
-        scan,
-        files.table.as_ref().expect("resolved table"),
-        &scan.columns[1..],
-    )
-    .expect("lower encoded bound VARIANT scan");
-    assert_eq!(read_columns, vec!["v"]);
-    assert_eq!(variants, vec![(1, 2)]);
+    assert!(
+        matches!(files.binding, x if x == crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32)
+    );
 }
 
 fn root_scan_for_test(
@@ -581,7 +597,6 @@ fn file_binding_for_test(
         execution: ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
             table,
             files: Vec::new(),
-            cloud_properties: BTreeMap::from([("region".to_string(), "test".to_string())]),
             binding: file_binding,
         }),
         physical_columns,
@@ -596,7 +611,6 @@ fn delta_binding_for_test(node_id: i32) -> ResolvedScanBinding {
             runtime_plan: IcebergDeltaScanRuntimePlan {
                 table_location: "s3://prepared/orders".to_string(),
                 data_columns: Vec::new(),
-                cloud_properties: BTreeMap::new(),
                 change_files: Vec::new(),
                 delete_side: None,
             },

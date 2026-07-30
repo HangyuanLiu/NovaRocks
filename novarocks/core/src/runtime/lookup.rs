@@ -16,71 +16,39 @@
 // under the License.
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int32Array, Int64Array, UInt32Array, new_empty_array};
 use arrow::compute::{concat, take};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::connector::file_execution::FileScanRange;
-use crate::connector::hdfs::{HdfsFileBatchReader, HdfsScanConfig};
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::read_starrocks_batches;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::row_position::RowPositionType;
-use crate::formats::{
-    parquet::ParquetReadCachePolicy, parquet::ParquetScanConfig, parquet::ParquetSlotKind,
-};
 #[cfg(feature = "compat")]
 use crate::novarocks_connectors::StarRocksScanConfig;
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
-use crate::runtime::descriptor_snapshot::{
-    is_iceberg_v3_row_position, is_lake_row_position, lookup_file_format_config,
-};
+use crate::runtime::descriptor_snapshot::{is_iceberg_v3_row_position, is_lake_row_position};
 use crate::runtime::query_context::{QueryId, query_context_manager};
-use novarocks_fs::DataCacheManager;
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorCancellation, ConnectorRequestContext,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorCancellation, ConnectorOpenReaderRequest,
+    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
-struct LookupCancellation;
+struct LookupCancellation {
+    query_id: QueryId,
+}
 
 impl ConnectorCancellation for LookupCancellation {
     fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct GlobalLateMaterializationContext {
-    pub row_source_slot: SlotId,
-    pub scan_config: RowPositionScanConfig,
-    scan_ranges: HashMap<i32, FileScanRange>,
-}
-
-impl GlobalLateMaterializationContext {
-    pub fn new(row_source_slot: SlotId, scan_config: RowPositionScanConfig) -> Self {
-        Self {
-            row_source_slot,
-            scan_config,
-            scan_ranges: HashMap::new(),
-        }
-    }
-
-    pub fn register_ranges(&mut self, ranges: Vec<FileScanRange>) {
-        for range in ranges {
-            self.scan_ranges.entry(range.scan_range_id).or_insert(range);
-        }
-    }
-
-    pub fn get_scan_range(&self, scan_range_id: i32) -> Option<&FileScanRange> {
-        self.scan_ranges.get(&scan_range_id)
+        query_context_manager().is_query_canceled(self.query_id)
     }
 }
 
@@ -99,13 +67,6 @@ fn lookup_slot_meta<'a>(
     Ok(map)
 }
 
-fn parquet_slot_kind_from_descriptor_slot(slot: &DescriptorSlot) -> ParquetSlotKind {
-    if slot.logical.is_variant() {
-        ParquetSlotKind::Variant
-    } else {
-        ParquetSlotKind::Regular
-    }
-}
 pub fn encode_column_ipc(array: &ArrayRef) -> Result<Vec<u8>, String> {
     let field = arrow::datatypes::Field::new("col", array.data_type().clone(), true);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
@@ -135,6 +96,155 @@ pub fn decode_column_ipc(data: &[u8]) -> Result<ArrayRef, String> {
     Ok(batch.column(0).clone())
 }
 
+fn execute_connector_lookup_request(
+    query_id: QueryId,
+    row_source_slot: SlotId,
+    lookup_slots: &[SlotId],
+    slot_meta: &HashMap<SlotId, &DescriptorSlot>,
+    mut range_to_positions: HashMap<i32, HashMap<i64, VecDeque<usize>>>,
+    request_len: usize,
+) -> Result<Vec<(SlotId, ArrayRef)>, String> {
+    let lookup_metas = lookup_slots
+        .iter()
+        .map(|slot| {
+            slot_meta
+                .get(slot)
+                .copied()
+                .ok_or_else(|| format!("missing slot meta for slot {slot}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_id_index = lookup_metas
+        .iter()
+        .position(|meta| crate::exec::row_position::is_row_id(&meta.name));
+    let mut provider_fields = lookup_metas
+        .iter()
+        .map(|meta| meta.field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let row_id_index = match row_id_index {
+        Some(index) => index,
+        None => {
+            provider_fields.push(Field::new("_row_id", DataType::Int64, false));
+            provider_fields.len() - 1
+        }
+    };
+    let provider_schema = Arc::new(Schema::new(provider_fields));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(3600),
+        Arc::new(LookupCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let request = ConnectorOpenReaderRequest {
+        expected_schema: Arc::clone(&provider_schema),
+        batch: ConnectorBatchBudget {
+            max_rows: NonZeroUsize::new(4096).expect("constant is nonzero"),
+            max_bytes: NonZeroUsize::new(64 * 1024 * 1024).expect("constant is nonzero"),
+        },
+        context,
+    };
+
+    let mut column_chunks: HashMap<SlotId, Vec<ArrayRef>> = HashMap::new();
+    let mut response_positions = Vec::with_capacity(request_len);
+    for (scan_range_id, mut positions_map) in range_to_positions.drain() {
+        let (instance, split) = query_context_manager()
+            .connector_glm_split(query_id, row_source_slot, scan_range_id)
+            .ok_or_else(|| {
+                format!(
+                    "connector late-materialization split {} is not registered",
+                    scan_range_id
+                )
+            })?;
+        let mut reader = instance
+            .read()
+            .open_reader(&split, request.clone())
+            .map_err(|error| error.to_string())?;
+        let read_result = (|| -> Result<(), String> {
+            while let Some(batch) = reader.next_batch().map_err(|error| error.to_string())? {
+                let row_ids = batch
+                    .column(row_id_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| "connector lookup _row_id must be Int64".to_string())?;
+                for row_idx in 0..batch.num_rows() {
+                    let row_id = row_ids.value(row_idx);
+                    let Some(queue) = positions_map.get_mut(&row_id) else {
+                        continue;
+                    };
+                    while let Some(position) = queue.pop_front() {
+                        for (column_index, slot) in lookup_slots.iter().enumerate() {
+                            let column = batch.column(column_index);
+                            let taken = take(
+                                column.as_ref(),
+                                &UInt32Array::from(vec![row_idx as u32]),
+                                None,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            column_chunks.entry(*slot).or_default().push(taken);
+                        }
+                        response_positions.push(position);
+                    }
+                }
+            }
+            for (row_id, queue) in positions_map {
+                if !queue.is_empty() {
+                    return Err(format!(
+                        "connector lookup failed to materialize row_id {} ({} pending)",
+                        row_id,
+                        queue.len()
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        let close_result = reader.close().map_err(|error| error.to_string());
+        match (read_result, close_result) {
+            (Ok(()), Ok(())) => {}
+            (Ok(()), Err(cleanup)) => return Err(cleanup),
+            (Err(primary), Ok(())) => return Err(primary),
+            (Err(primary), Err(cleanup)) => {
+                return Err(format!("{primary} (cleanup: {cleanup})"));
+            }
+        }
+    }
+    if response_positions.len() != request_len {
+        return Err(format!(
+            "connector lookup response size mismatch: expected {} got {}",
+            request_len,
+            response_positions.len()
+        ));
+    }
+    let mut response_indices = vec![u32::MAX; request_len];
+    for (response_index, request_index) in response_positions.iter().enumerate() {
+        if response_indices[*request_index] != u32::MAX {
+            return Err(format!(
+                "duplicate connector lookup response position {request_index}"
+            ));
+        }
+        response_indices[*request_index] = response_index as u32;
+    }
+    if response_indices.contains(&u32::MAX) {
+        return Err("connector lookup response is missing positions".to_string());
+    }
+    let response_indices = UInt32Array::from(response_indices);
+    lookup_slots
+        .iter()
+        .map(|slot| {
+            let chunks = column_chunks
+                .get(slot)
+                .ok_or_else(|| format!("missing connector lookup column {slot}"))?;
+            let refs = chunks
+                .iter()
+                .map(|chunk| chunk.as_ref())
+                .collect::<Vec<_>>();
+            let full = concat(&refs).map_err(|error| error.to_string())?;
+            take(&full, &response_indices, None)
+                .map(|array| (*slot, array))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
 pub fn execute_lookup_request(
     query_id: QueryId,
     tuple_id: i32,
@@ -153,9 +263,6 @@ pub fn execute_lookup_request(
     let snapshot = mgr
         .descriptor_snapshot(query_id)
         .ok_or_else(|| "descriptor snapshot missing for lookup".to_string())?;
-    let cache_options = mgr
-        .cache_options(query_id)
-        .ok_or_else(|| "cache options missing for lookup".to_string())?;
     let lookup_slots = snapshot.lookup_output_slots(tuple_id, &row_pos_desc);
     let slot_meta = lookup_slot_meta(&snapshot, tuple_id, &lookup_slots)?;
 
@@ -212,180 +319,25 @@ pub fn execute_lookup_request(
             .push_back(idx);
     }
 
-    let scan_cfg = mgr
-        .glm_scan_config(query_id, row_pos_desc.row_source_slot)
-        .ok_or_else(|| "missing glm scan config".to_string())?;
-
-    let mut column_chunks: HashMap<SlotId, Vec<ArrayRef>> = HashMap::new();
-    let mut response_positions: Vec<usize> = Vec::with_capacity(request_len);
-
-    for (scan_range_id, mut positions_map) in range_to_positions {
-        let scan_range = mgr
-            .glm_scan_range(query_id, row_pos_desc.row_source_slot, scan_range_id)
-            .ok_or_else(|| format!("scan_range_id {} not registered", scan_range_id))?;
-        let first_row_id = scan_range.first_row_id.ok_or_else(|| {
-            format!(
-                "scan_range_id {} missing first_row_id for lookup",
+    for scan_range_id in range_to_positions.keys() {
+        if mgr
+            .connector_glm_split(query_id, row_pos_desc.row_source_slot, *scan_range_id)
+            .is_none()
+        {
+            return Err(format!(
+                "Iceberg late-materialization split {} is not bound to a connector instance",
                 scan_range_id
-            )
-        })?;
-
-        let lookup_metas = lookup_slots
-            .iter()
-            .map(|slot| {
-                slot_meta
-                    .get(slot)
-                    .cloned()
-                    .ok_or_else(|| format!("missing slot meta for slot {}", slot))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let columns = lookup_metas.iter().map(|m| m.name.clone()).collect();
-        let slot_kinds = lookup_metas
-            .iter()
-            .map(|meta| parquet_slot_kind_from_descriptor_slot(meta))
-            .collect::<Vec<_>>();
-        let chunk_schema = Arc::new(ChunkSchema::try_new(
-            lookup_slots
-                .iter()
-                .copied()
-                .zip(lookup_metas.iter())
-                .map(|(slot_id, meta)| {
-                    ChunkSlotSchema::new_with_field(
-                        slot_id,
-                        meta.field.clone(),
-                        None,
-                        meta.unique_id,
-                    )
-                })
-                .collect(),
-        )?);
-
-        let parquet_cfg = ParquetScanConfig {
-            columns,
-            chunk_schema: Arc::clone(&chunk_schema),
-            slot_kinds,
-            case_sensitive: scan_cfg.case_sensitive,
-            enable_page_index: false,
-            min_max_predicates: Vec::new(),
-            runtime_min_max_filter_columns: HashMap::new(),
-            variant_path_predicates: Vec::new(),
-            batch_size: scan_cfg.batch_size,
-            datacache: DataCacheManager::instance()
-                .external_context(cache_options.to_file_cache_options()),
-            cache_policy: ParquetReadCachePolicy::with_flags(
-                scan_cfg.enable_file_metacache,
-                scan_cfg.enable_file_pagecache,
-                u32::try_from(cache_options.datacache_evict_probability).ok(),
-            ),
-            profile_label: None,
-            iceberg_output_schema: None,
-            variant_path_columns: Vec::new(),
-            query_global_dicts: Default::default(),
-        };
-        let format = lookup_file_format_config(scan_cfg.file_format, parquet_cfg)?;
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(3600),
-            Arc::new(LookupCancellation),
-            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .map_err(|error| error.to_string())?;
-        let mut reader = HdfsFileBatchReader::new(
-            HdfsScanConfig {
-                ranges: vec![scan_range.clone()],
-                original_range_count: 1,
-                has_more: false,
-                limit: None,
-                profile_label: None,
-                format: Some(format),
-                object_store_config: scan_cfg.oss_config.clone(),
-                iceberg_table_locations: HashMap::new(),
-                query_global_dicts: Default::default(),
-                iceberg_runtime_pruning: None,
-            },
-            context,
-            scan_cfg.batch_size.unwrap_or(4096).max(1),
-            64 * 1024 * 1024,
-        )
-        .map_err(|error| error.to_string())?;
-
-        let mut row_offset = 0i64;
-        while let Some(batch) = reader.next_batch().map_err(|error| error.to_string())? {
-            let row_count = batch.num_rows();
-            if row_count == 0 {
-                continue;
-            }
-            let mut indices = Vec::new();
-            let mut positions = Vec::new();
-            for row_idx in 0..row_count {
-                let row_id = first_row_id + row_offset + row_idx as i64;
-                if let Some(queue) = positions_map.get_mut(&row_id) {
-                    while let Some(pos) = queue.pop_front() {
-                        indices.push(row_idx as u32);
-                        positions.push(pos);
-                    }
-                }
-            }
-            row_offset = row_offset.saturating_add(row_count as i64);
-            if indices.is_empty() {
-                continue;
-            }
-            let indices_array = UInt32Array::from(indices);
-            for slot in lookup_slots.iter() {
-                let slot_index = chunk_schema
-                    .index_of(*slot)
-                    .ok_or_else(|| format!("lookup output missing slot {slot}"))?;
-                let column = batch.column(slot_index);
-                let taken =
-                    take(column.as_ref(), &indices_array, None).map_err(|e| e.to_string())?;
-                column_chunks.entry(*slot).or_default().push(taken);
-            }
-            response_positions.extend(positions);
-        }
-
-        for (row_id, queue) in positions_map {
-            if !queue.is_empty() {
-                return Err(format!(
-                    "lookup failed to materialize row_id {} ({} pending)",
-                    row_id,
-                    queue.len()
-                ));
-            }
+            ));
         }
     }
-
-    if response_positions.len() != request_len {
-        return Err(format!(
-            "lookup response size mismatch: expected {} got {}",
-            request_len,
-            response_positions.len()
-        ));
-    }
-
-    let mut response_indices = vec![u32::MAX; request_len];
-    for (resp_idx, req_pos) in response_positions.iter().enumerate() {
-        if response_indices[*req_pos] != u32::MAX {
-            return Err(format!("duplicate response position {}", req_pos));
-        }
-        response_indices[*req_pos] = resp_idx as u32;
-    }
-    if response_indices.contains(&u32::MAX) {
-        return Err("lookup response missing positions".to_string());
-    }
-    let response_indices_array = UInt32Array::from(response_indices);
-
-    let mut out = Vec::new();
-    for slot in lookup_slots {
-        let chunks = column_chunks
-            .get(&slot)
-            .ok_or_else(|| format!("missing lookup column {}", slot))?;
-        let chunk_refs: Vec<&dyn arrow::array::Array> = chunks.iter().map(|c| c.as_ref()).collect();
-        let full = concat(&chunk_refs).map_err(|e| e.to_string())?;
-        let ordered = take(&full, &response_indices_array, None).map_err(|e| e.to_string())?;
-        out.push((slot, ordered));
-    }
-    Ok(out)
+    execute_connector_lookup_request(
+        query_id,
+        row_pos_desc.row_source_slot,
+        &lookup_slots,
+        &slot_meta,
+        range_to_positions,
+        request_len,
+    )
 }
 
 fn dispatch_position_lookup<T, R, Lake, Iceberg>(

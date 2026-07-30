@@ -451,13 +451,7 @@ impl ScanOp for FileLoadScanOp {
                 offset: r.offset,
                 length: r.length,
                 scan_range_id: r.scan_range_id,
-                first_row_id: r.first_row_id,
-                data_sequence_number: r.data_sequence_number,
-                ivm_change_op: r.ivm_change_op,
-                included_positions: r.included_positions.clone(),
                 external_datacache: r.external_datacache.clone(),
-                delete_files: r.delete_files.clone(),
-                iceberg_file_pruning: None,
             });
         }
         Ok(ScanMorsels::new(morsels, self.cfg.has_more))
@@ -655,13 +649,7 @@ fn lower_file_scan_node_inner(
             offset: range_desc.offset.max(0) as u64,
             length: range_desc.length.max(0) as u64,
             scan_range_id: next_scan_range_id,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         });
         next_scan_range_id = next_scan_range_id.saturating_add(1);
     }
@@ -1095,13 +1083,7 @@ mod tests {
             offset: 0,
             length: 0,
             scan_range_id: 0,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         }
     }
 

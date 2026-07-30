@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_spi::connector::ConnectorSplit;
 
 use crate::exec::chunk::Chunk;
 use crate::novarocks_logging::debug;
@@ -319,6 +320,78 @@ pub(crate) fn validate_scheduling_placements(plan: &SchedulingPlan) -> Result<()
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Applies only placement to an already-encoded provider-neutral connector
+/// source. The traversal deliberately has no provider branch and never
+/// interprets a split payload.
+pub(crate) fn patch_native_connector_read_splits(
+    fragment: &mut crate::proto::plan::PlanFragment,
+    node_id: i32,
+    splits: &[ConnectorSplit],
+) -> Result<(), String> {
+    let root = fragment.root.as_mut().ok_or_else(|| {
+        format!(
+            "native connector split patch requires a root node for fragment {}",
+            fragment.fragment_id
+        )
+    })?;
+    let mut matches = 0usize;
+    patch_connector_splits_in_node(root, node_id, splits, &mut matches)?;
+    match matches {
+        1 => Ok(()),
+        0 => Err(format!(
+            "native connector split patch could not find ConnectorReadSource node {node_id} in fragment {}",
+            fragment.fragment_id
+        )),
+        count => Err(format!(
+            "native connector split patch found ConnectorReadSource node {node_id} {count} times in fragment {}",
+            fragment.fragment_id
+        )),
+    }
+}
+
+fn patch_connector_splits_in_node(
+    node: &mut crate::proto::plan::DistributedNode,
+    node_id: i32,
+    splits: &[ConnectorSplit],
+    matches: &mut usize,
+) -> Result<(), String> {
+    if node.node_id == node_id {
+        let source = node
+            .payload
+            .as_mut()
+            .and_then(|payload| match payload {
+                crate::proto::plan::distributed_node::Payload::Physical(physical) => {
+                    physical.kind.as_mut()
+                }
+                crate::proto::plan::distributed_node::Payload::Exchange(_) => None,
+            })
+            .and_then(|kind| match kind {
+                crate::proto::plan::plan_node::Kind::Scan(scan) => scan.table.as_mut(),
+                _ => None,
+            })
+            .and_then(|table| table.source.as_mut())
+            .and_then(|source| source.kind.as_mut());
+        let Some(crate::proto::plan::scan_source::Kind::ConnectorRead(source)) = source else {
+            return Err(format!(
+                "native connector split patch node {node_id} is not a ConnectorReadSource"
+            ));
+        };
+        source.splits = splits
+            .iter()
+            .map(|split| crate::proto::plan::ConnectorReadSplit {
+                split_id: split.split_id().to_string(),
+                split_payload: split.payload().to_vec(),
+                estimated_bytes: split.estimated_bytes(),
+            })
+            .collect();
+        *matches = matches.saturating_add(1);
+    }
+    for child in &mut node.children {
+        patch_connector_splits_in_node(child, node_id, splits, matches)?;
     }
     Ok(())
 }
@@ -756,6 +829,7 @@ mod tests {
             backend_idx: 0,
             endpoint: RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
+            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }

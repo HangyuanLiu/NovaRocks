@@ -491,6 +491,17 @@ impl PipelineDriver {
         }
     }
 
+    /// Run terminal operator cancellation before an externally cancelled task
+    /// is dropped by the global executor.
+    ///
+    /// The executor can observe a fragment abort while a driver is parked and
+    /// discard that task without another `process` turn.  Cancellation must
+    /// still reach source-owned resources such as connector reader groups.
+    pub(crate) fn cancel_for_fragment_abort(&mut self) {
+        self.cancel_operators();
+        self.state = DriverState::Canceled;
+    }
+
     fn fail_operators(&mut self) {
         for op in self.operators.iter_mut() {
             op.on_driver_failure();

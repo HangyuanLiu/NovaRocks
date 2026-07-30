@@ -59,6 +59,13 @@ pub(crate) fn debug_emit_grpc_fragment_marker() -> bool {
         || sql_test_fragment_failure_harness_enabled()
 }
 
+pub(crate) fn debug_emit_connector_reader_marker() -> bool {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.debug.emit_connector_reader_marker())
+        .unwrap_or(false)
+}
+
 pub(crate) fn sql_test_fragment_failure_harness_enabled() -> bool {
     std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
 }

@@ -16,12 +16,15 @@
 // under the License.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::proto;
-use crate::protocol::native::decode::decode_fragment_submission;
+use crate::protocol::native::decode::{
+    decode_fragment_submission_with_connectors, decode_query_execution_id,
+};
 use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::submission::FragmentSubmission;
@@ -36,13 +39,26 @@ pub struct NativeFragmentRequest {
 }
 
 impl NativeFragmentRequest {
+    pub fn try_decode_wire(
+        execution_id: proto::novarocks::QueryExecutionId,
+        fragment: proto::plan::PlanFragment,
+        instance_params: proto::novarocks::InstanceParams,
+        connectors: Arc<crate::connector::ConnectorRegistry>,
+    ) -> Result<Self, NativeFragmentIngressError> {
+        let execution_id =
+            decode_query_execution_id(&execution_id).map_err(NativeFragmentIngressError::new)?;
+        Self::try_decode(execution_id, fragment, instance_params, connectors)
+    }
+
     pub fn try_decode(
         execution_id: QueryExecutionId,
         fragment: proto::plan::PlanFragment,
         instance_params: proto::novarocks::InstanceParams,
+        connectors: Arc<crate::connector::ConnectorRegistry>,
     ) -> Result<Self, NativeFragmentIngressError> {
-        let decoded = decode_fragment_submission(&fragment, &instance_params)
-            .map_err(NativeFragmentIngressError::new)?;
+        let decoded =
+            decode_fragment_submission_with_connectors(&fragment, &instance_params, connectors)
+                .map_err(NativeFragmentIngressError::new)?;
         let (submission, metadata) = decoded.into_parts();
         if execution_id.query_id().high() != submission.instance().query_id().hi()
             || execution_id.query_id().low() != submission.instance().query_id().lo()
@@ -208,6 +224,37 @@ impl fmt::Display for NativeFragmentIngressError {
 impl std::error::Error for NativeFragmentIngressError {}
 
 pub trait NativeFragmentIngress: Send + Sync + 'static {
+    fn install_connector_instance(
+        &self,
+        _declaration: novarocks_spi::connector::ConnectorInstanceDeclaration,
+        _context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), NativeFragmentIngressError> {
+        Err(NativeFragmentIngressError::new(
+            "connector binding ingress is not configured",
+        ))
+    }
+
+    fn retire_connector_instance(
+        &self,
+        _instance_id: novarocks_spi::connector::ConnectorInstanceId,
+        _incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+    ) -> Result<(), NativeFragmentIngressError> {
+        Err(NativeFragmentIngressError::new(
+            "connector binding ingress is not configured",
+        ))
+    }
+
+    fn submit_native_payload(
+        &self,
+        _execution_id: proto::novarocks::QueryExecutionId,
+        _fragment: proto::plan::PlanFragment,
+        _instance_params: proto::novarocks::InstanceParams,
+    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+        Err(NativeFragmentIngressError::new(
+            "native fragment payload ingress is not configured",
+        ))
+    }
+
     fn submit(
         &self,
         request: NativeFragmentRequest,

@@ -18,17 +18,18 @@
 //! Native decoding for the provider-neutral SPI read carrier.
 
 use std::collections::BTreeSet;
+use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow::ipc::reader::StreamReader;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
+    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
 };
 
-use crate::connector::file_execution::FileScanRange;
 use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::BoundScanRanges;
@@ -64,13 +65,6 @@ pub(super) fn lower_connector_read_scan(
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
             "instance_id",
-            error.to_string(),
-        )
-    })?;
-    let provider_id = ConnectorProviderId::parse(&source.provider_id).map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "provider_id",
             error.to_string(),
         )
     })?;
@@ -148,15 +142,7 @@ pub(super) fn lower_connector_read_scan(
                 .append_index(index));
             }
             total_payload_bytes = total_payload_bytes.saturating_add(split.payload().len());
-            let file_range = wire_split
-                .file_execution
-                .as_ref()
-                .map(|sidecar| decode_file_execution_sidecar(sidecar, index))
-                .transpose()?;
-            Ok(match file_range {
-                Some(file_range) => ConnectorScheduledSplit::file(split, file_range),
-                None => ConnectorScheduledSplit::plain(split),
-            })
+            Ok(ConnectorScheduledSplit::plain(split))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if source.scan_payload.len() > request_context.max_handle_payload_bytes() {
@@ -176,76 +162,41 @@ pub(super) fn lower_connector_read_scan(
 
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
-    let file_ranges = scheduled
-        .iter()
-        .filter_map(|scheduled| scheduled.file_range().cloned())
-        .collect::<Vec<_>>();
+    validate_expected_schema_ipc(
+        &source.expected_schema_ipc,
+        output_schema.arrow_schema_ref().as_ref(),
+        request_context.max_handle_payload_bytes(),
+    )?;
     let connectors = ctx.connectors()?;
-    let (instance, lifecycle) = match connectors.connector_instance(&instance_id) {
-        Ok(instance) => {
-            if instance.descriptor().provider_id != provider_id {
-                return Err(NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InconsistentFields,
-                    "provider_id",
-                    format!(
-                        "ConnectorReadSource provider_id `{}` does not match registered instance provider `{}`",
-                        provider_id.as_str(),
-                        instance.descriptor().provider_id.as_str(),
-                    ),
-                ));
-            }
-            (instance, None)
-        }
-        Err(_) => {
-            let native_instance = connectors
-                .materialize_transport_connector_instance(
-                    &provider_id,
-                    instance_id,
-                    Bytes::copy_from_slice(&source.scan_payload),
-                    &file_ranges,
-                    output_schema.clone(),
-                )
-                .map_err(|error| {
-                    NativeFragmentLeafDecodeError::at_field(
-                        ProtocolErrorKind::InvalidValue,
-                        "provider_id",
-                        error.to_string(),
-                    )
-                })?;
-            let (instance, lifecycle) = connectors
-                .register_ephemeral_connector_instance(native_instance)
-                .map_err(|error| {
-                    NativeFragmentLeafDecodeError::at_field(
-                        ProtocolErrorKind::InvalidValue,
-                        "instance_id",
-                        error.to_string(),
-                    )
-                })?;
-            (instance, Some(lifecycle))
-        }
-    };
+    let instance = connectors
+        .connector_instance(&instance_id)
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "instance_id",
+                error.to_string(),
+            )
+        })?;
+    if crate::common::config::debug_emit_connector_reader_marker() {
+        println!(
+            "NOVAROCKS_CONNECTOR_READ_SOURCE instance={} splits={}",
+            instance_id.as_str(),
+            scheduled.len()
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
     let request = ConnectorOpenReaderRequest {
         expected_schema: output_schema.arrow_schema_ref(),
         batch,
         context: request_context,
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    let source = Arc::new(match lifecycle {
-        Some(lifecycle) => ConnectorReadScanSource::new_scheduled_ephemeral(
-            instance,
-            scheduled,
-            request,
-            output_schema.clone(),
-            lifecycle,
-            None,
-        ),
-        None => ConnectorReadScanSource::new_scheduled(
-            instance,
-            scheduled,
-            request,
-            output_schema.clone(),
-        ),
-    });
+    let source = Arc::new(ConnectorReadScanSource::new_scheduled(
+        instance,
+        scheduled,
+        request,
+        output_schema.clone(),
+    ));
     ctx.capture_scan_ranges(node.node_id, BoundScanRanges::None);
     let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
@@ -262,74 +213,44 @@ pub(super) fn lower_connector_read_scan(
     })
 }
 
-fn decode_file_execution_sidecar(
-    sidecar: &plan::FileExecutionSidecar,
-    split_index: usize,
-) -> Result<FileScanRange, NativeFragmentLeafDecodeError> {
-    let error = |field: &'static str, detail: String| {
-        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "splits", detail)
-            .append_index(split_index)
-            .append_field("file_execution")
-            .append_field(field)
-    };
-    if sidecar.version != 1 {
-        return Err(error(
-            "version",
+fn validate_expected_schema_ipc(
+    encoded: &[u8],
+    expected: &arrow::datatypes::Schema,
+    max_bytes: usize,
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    if encoded.is_empty() {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "expected_schema_ipc",
+            "ConnectorReadSource requires an expected Arrow schema",
+        ));
+    }
+    if encoded.len() > max_bytes {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "expected_schema_ipc",
+            format!("ConnectorReadSource expected Arrow schema exceeds handle budget {max_bytes}"),
+        ));
+    }
+    let reader = StreamReader::try_new(Cursor::new(encoded), None).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "expected_schema_ipc",
+            format!("decode ConnectorReadSource expected Arrow schema: {error}"),
+        )
+    })?;
+    if reader.schema().as_ref() != expected {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "expected_schema_ipc",
             format!(
-                "unsupported core file execution sidecar version {}",
-                sidecar.version
+                "ConnectorReadSource expected Arrow schema does not match scan output columns: \
+                 carrier={:?} decoded={expected:?}",
+                reader.schema()
             ),
         ));
     }
-    if sidecar.path.is_empty() {
-        return Err(error(
-            "path",
-            "file execution sidecar path is empty".to_string(),
-        ));
-    }
-    if !matches!(
-        plan::FileExecutionFormat::try_from(sidecar.file_format),
-        Ok(plan::FileExecutionFormat::Parquet) | Ok(plan::FileExecutionFormat::Orc)
-    ) {
-        return Err(error(
-            "file_format",
-            "unsupported file execution format".to_string(),
-        ));
-    }
-    if !sidecar.delete_files.is_empty()
-        || sidecar.deletion_vector.is_some()
-        || !sidecar.file_pruning_min_max_values.is_empty()
-    {
-        return Err(error(
-            "file_execution",
-            "delete, deletion-vector, and pruning sidecars require an authenticated connector binding".to_string(),
-        ));
-    }
-    if sidecar.offset > sidecar.file_length {
-        return Err(error("offset", "offset exceeds file length".to_string()));
-    }
-    let ivm_change_op = sidecar
-        .change_op
-        .map(|value| {
-            i8::try_from(value).map_err(|_| error("change_op", "change op exceeds i8".to_string()))
-        })
-        .transpose()?;
-    Ok(FileScanRange {
-        path: sidecar.path.clone(),
-        file_len: sidecar.file_length,
-        offset: sidecar.offset,
-        length: sidecar.length,
-        scan_range_id: i32::try_from(split_index)
-            .map_err(|_| error("split_id", "split index exceeds i32".to_string()))?,
-        first_row_id: sidecar.first_row_id,
-        data_sequence_number: sidecar.data_sequence_number,
-        ivm_change_op,
-        included_positions: (!sidecar.included_positions.is_empty())
-            .then(|| sidecar.included_positions.clone()),
-        external_datacache: None,
-        delete_files: Vec::new(),
-        iceberg_file_pruning: None,
-    })
+    Ok(())
 }
 
 fn required_nonzero_usize(

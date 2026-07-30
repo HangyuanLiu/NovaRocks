@@ -28,8 +28,8 @@ use novarocks_spi::connector::{
 };
 
 use super::runtime::{
-    ConnectorBatchReaderIter, ConnectorReadAuxiliary, ConnectorReadScanSource,
-    ConnectorScheduledSplit, ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
+    ConnectorBatchReaderIter, ConnectorReadScanSource, ConnectorScheduledSplit,
+    ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
 use crate::common::ids::SlotId;
 use crate::connector::file_execution::FileScanRange;
@@ -258,12 +258,19 @@ fn read_scan_source_opens_a_typed_split_and_adapts_its_batches() {
     assert!(matches!(
         morsels.morsels.as_slice(),
         [
-            ScanMorsel::ConnectorSplit { index: 0 },
-            ScanMorsel::ConnectorSplit { index: 1 }
+            ScanMorsel::ConnectorSplit { index: 0, .. },
+            ScanMorsel::ConnectorSplit { index: 1, .. }
         ]
     ));
     let chunks = op
-        .execute_iter(ScanMorsel::ConnectorSplit { index: 0 }, None, None)
+        .execute_iter(
+            ScanMorsel::ConnectorSplit {
+                index: 0,
+                row_position: None,
+            },
+            None,
+            None,
+        )
         .expect("execute reader")
         .collect::<Result<Vec<_>, _>>()
         .expect("reader chunks");
@@ -372,89 +379,16 @@ fn incremental_connector_source_appends_only_new_connector_morsels() {
             .expect("initial morsels")
             .morsels
             .as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 0 }]
+        [ScanMorsel::ConnectorSplit { index: 0, .. }]
     ));
     let appended = op
         .build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
         .expect("append connector split");
     assert!(matches!(
         appended.morsels.as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 1 }]
+        [ScanMorsel::ConnectorSplit { index: 1, .. }]
     ));
     assert!(!appended.has_more);
-}
-
-#[test]
-fn incremental_connector_source_preserves_file_range_sidecars() {
-    let instance_id = ConnectorInstanceId::parse("test.incremental.file").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
-    let appended = ConnectorScheduledSplit::file(
-        ConnectorSplit::try_new(
-            instance_id.clone(),
-            "next-file",
-            bytes::Bytes::new(),
-            Some(1),
-        )
-        .expect("file split"),
-        FileScanRange {
-            path: "s3://bucket/path/next.parquet".to_string(),
-            file_len: 32,
-            offset: 0,
-            length: 32,
-            scan_range_id: 9,
-            first_row_id: Some(42),
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
-            external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
-        },
-    );
-    let source = ConnectorReadScanSource::new_with_incremental(
-        instance,
-        vec![
-            ConnectorSplit::try_new(instance_id, "initial", bytes::Bytes::new(), Some(1))
-                .expect("initial split"),
-        ],
-        ConnectorOpenReaderRequest {
-            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            batch: ConnectorBatchBudget {
-                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
-                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
-            },
-            context: request_context(),
-        },
-        chunk_schema(),
-        Arc::new(FakeIncrementalSplitAdapter {
-            append: Mutex::new(Some(ConnectorSplitAppend::Scheduled {
-                scheduled: vec![appended],
-                has_more: false,
-            })),
-        }),
-        true,
-    );
-    let op = source.bind(BoundScanRanges::None).expect("bind source");
-    let appended = op
-        .build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
-        .expect("append file split");
-    assert!(matches!(
-        appended.morsels.as_slice(),
-        [ScanMorsel::ConnectorFileSplit { index: 1, range }]
-            if range.scan_range_id == 9 && range.first_row_id == Some(42)
-    ));
 }
 
 #[test]
@@ -505,7 +439,7 @@ fn incremental_connector_source_rejects_append_after_eos_without_calling_provide
             .expect("morsels after rejected append")
             .morsels
             .as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 0 }]
+        [ScanMorsel::ConnectorSplit { index: 0, .. }]
     ));
 }
 
@@ -565,7 +499,7 @@ fn incremental_connector_source_rejects_duplicate_appended_split_ids_atomically(
             .expect("morsels after rejected append")
             .morsels
             .as_slice(),
-        [ScanMorsel::ConnectorSplit { index: 0 }]
+        [ScanMorsel::ConnectorSplit { index: 0, .. }]
     ));
 }
 
@@ -621,142 +555,4 @@ fn incremental_connector_source_does_not_commit_a_rejected_append() {
     op.build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
         .expect_err("duplicate split IDs must fail");
     assert_eq!(*commit_calls.lock().expect("commit calls"), 0);
-}
-
-#[test]
-fn connector_file_split_opens_opaque_split_and_preserves_range_sidecar() {
-    let instance_id = ConnectorInstanceId::parse("test.file").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
-    let source = ConnectorReadScanSource::new_scheduled(
-        instance,
-        vec![ConnectorScheduledSplit::file(
-            ConnectorSplit::try_new(instance_id, "file-0", bytes::Bytes::new(), Some(1))
-                .expect("split"),
-            FileScanRange {
-                path: "file:///tmp/provider-owned.parquet".to_string(),
-                file_len: 12,
-                offset: 2,
-                length: 8,
-                scan_range_id: 6,
-                first_row_id: Some(10),
-                data_sequence_number: Some(11),
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            },
-        )],
-        ConnectorOpenReaderRequest {
-            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            batch: ConnectorBatchBudget {
-                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
-                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
-            },
-            context: request_context(),
-        },
-        chunk_schema(),
-    );
-    let op = source.bind(BoundScanRanges::None).expect("bind source");
-    let morsels = op.build_morsels().expect("file morsel");
-    assert!(matches!(
-        morsels.morsels.as_slice(),
-        [ScanMorsel::ConnectorFileSplit { index: 0, range }]
-            if range.scan_range_id == 6 && range.first_row_id == Some(10)
-    ));
-    let chunks = op
-        .execute_iter(morsels.morsels[0].clone(), None, None)
-        .expect("open opaque split")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("reader chunks");
-    assert_eq!(chunks.len(), 1);
-}
-
-struct FakeDeleteAuxiliary;
-
-impl ConnectorReadAuxiliary for FakeDeleteAuxiliary {
-    fn load_iceberg_position_deletes(
-        &self,
-        _range: &FileScanRange,
-    ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        let mut positions = roaring::RoaringTreemap::new();
-        positions.insert(4);
-        Ok(Some(positions))
-    }
-
-    fn load_iceberg_equality_deletes(
-        &self,
-        _range: &FileScanRange,
-    ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
-    {
-        Ok(None)
-    }
-}
-
-#[test]
-fn connector_file_split_delegates_delete_opening_without_exposing_payload() {
-    let instance_id = ConnectorInstanceId::parse("test.file.delete").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
-    let source = ConnectorReadScanSource::new_scheduled_with_auxiliary(
-        instance,
-        vec![ConnectorScheduledSplit::file(
-            ConnectorSplit::try_new(instance_id, "file-delete", bytes::Bytes::new(), Some(1))
-                .expect("split"),
-            FileScanRange {
-                path: "file:///tmp/provider-owned.parquet".to_string(),
-                file_len: 12,
-                offset: 0,
-                length: 12,
-                scan_range_id: 0,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            },
-        )],
-        ConnectorOpenReaderRequest {
-            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            batch: ConnectorBatchBudget {
-                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
-                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
-            },
-            context: request_context(),
-        },
-        chunk_schema(),
-        Arc::new(FakeDeleteAuxiliary),
-    );
-    let op = source.bind(BoundScanRanges::None).expect("bind source");
-    let morsel = op.build_morsels().expect("morsel").morsels.remove(0);
-    let deletes = op
-        .load_iceberg_position_deletes(&morsel)
-        .expect("delete loader")
-        .expect("position deletes");
-    assert!(deletes.contains(4));
 }

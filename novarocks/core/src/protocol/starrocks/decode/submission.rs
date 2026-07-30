@@ -76,6 +76,10 @@ pub struct StarRocksDecodeInput<'a> {
     pub batch_exchange_sender_counts: &'a HashMap<i32, usize>,
     pub typed_result_sink: bool,
     pub facts: &'a StarRocksDecodeFacts,
+    /// Process-scoped connector host injected by application composition.
+    /// HDFS_SCAN_NODE is only a wire label and must never cause a decoder to
+    /// construct a query-local connector registry.
+    pub connectors: &'a crate::connector::ConnectorRegistry,
 }
 
 #[derive(Debug)]
@@ -466,7 +470,6 @@ fn replace_values_chunk(
         ExecNodeKind::Values(_)
         | ExecNodeKind::ExchangeSource(_)
         | ExecNodeKind::Scan(_)
-        | ExecNodeKind::IcebergDeltaScan(_)
         | ExecNodeKind::LookUp(_) => false,
     }
 }
@@ -583,7 +586,6 @@ fn decode_draft_parts(
         instance.query_options.clone(),
         input.facts,
     );
-    let connectors = crate::connector::ConnectorRegistry::default();
     let last_query_id = input
         .query_globals
         .and_then(|globals| globals.last_query_id.as_deref());
@@ -596,7 +598,7 @@ fn decode_draft_parts(
         input.fragment.query_global_dict_exprs.as_ref(),
         &plan_context,
         input.db_name,
-        &connectors,
+        input.connectors,
         &layout_hints,
         last_query_id,
         Some(dependencies),
@@ -875,10 +877,7 @@ fn collect_exchange_contracts(
                 }
             }
             ExecNodeKind::NativeRuntimeFilterConsumer(value) => visit(&value.input, contracts)?,
-            ExecNodeKind::Values(_)
-            | ExecNodeKind::Scan(_)
-            | ExecNodeKind::IcebergDeltaScan(_)
-            | ExecNodeKind::LookUp(_) => {}
+            ExecNodeKind::Values(_) | ExecNodeKind::Scan(_) | ExecNodeKind::LookUp(_) => {}
         }
         Ok(())
     }
@@ -981,10 +980,7 @@ fn collect_row_position_descriptors(
         ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
             collect_row_position_descriptors(&value.input, output)?
         }
-        ExecNodeKind::Values(_)
-        | ExecNodeKind::ExchangeSource(_)
-        | ExecNodeKind::Scan(_)
-        | ExecNodeKind::IcebergDeltaScan(_) => {}
+        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::Scan(_) => {}
     }
     Ok(())
 }
@@ -1471,7 +1467,14 @@ mod tests {
             batch_exchange_sender_counts: &EMPTY_BATCH_SENDERS,
             typed_result_sink: false,
             facts: &EMPTY_DECODE_FACTS,
+            connectors: test_connectors(),
         }
+    }
+
+    fn test_connectors() -> &'static crate::connector::ConnectorRegistry {
+        static CONNECTORS: std::sync::OnceLock<crate::connector::ConnectorRegistry> =
+            std::sync::OnceLock::new();
+        CONNECTORS.get_or_init(crate::connector::ConnectorRegistry::default)
     }
 
     #[test]

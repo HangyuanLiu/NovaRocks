@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks::common::app_config::{self, NovaRocksConfig};
+use novarocks::connector::ConnectorRegistry;
 use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::grpc_server;
@@ -154,7 +155,9 @@ impl Drop for QueryLifecycleSweepTask {
     }
 }
 
-fn compose_backend_application_services(config: &NovaRocksConfig) -> BackendApplicationServices {
+fn compose_backend_application_services(
+    config: &NovaRocksConfig,
+) -> Result<BackendApplicationServices, BackendApplicationError> {
     let controls = Arc::new(FragmentControlRegistry::default());
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(Arc::clone(&controls)));
     let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound(
@@ -162,6 +165,23 @@ fn compose_backend_application_services(config: &NovaRocksConfig) -> BackendAppl
         local_runtime,
         QueryLifecycleRegistryConfig::from_runtime_config(&config.runtime),
     );
+    let connector_registry = Arc::new(ConnectorRegistry::new());
+    let default_object_store = config.connector.object_store_config().map_err(|error| {
+        BackendApplicationError::new(
+            BackendApplicationErrorKind::Configuration,
+            format!("resolve connector startup object-store binding: {error}"),
+        )
+    })?;
+    novarocks::connector::compose_backend_connector_installers(
+        connector_registry.as_ref(),
+        default_object_store,
+    )
+    .map_err(|error| {
+        BackendApplicationError::new(
+            BackendApplicationErrorKind::Configuration,
+            format!("compose connector instance installers: {error}"),
+        )
+    })?;
     let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
         grpc_exchange_transmitter(),
         grpc_fragment_lookup_client(),
@@ -169,11 +189,12 @@ fn compose_backend_application_services(config: &NovaRocksConfig) -> BackendAppl
         native_fragment_event_sink(),
         controls,
         Arc::clone(&query_lifecycle_registry),
+        connector_registry,
     ));
-    BackendApplicationServices {
+    Ok(BackendApplicationServices {
         native_fragment_service,
         query_lifecycle_registry,
-    }
+    })
 }
 
 impl BackendApplicationHost {
@@ -251,7 +272,7 @@ impl BackendApplicationHost {
             )?;
         let bind_host = config.server.host.clone();
         let grpc_port = config.server.grpc_port;
-        let services = compose_backend_application_services(&config);
+        let services = compose_backend_application_services(&config)?;
         let native_fragment_service = Arc::clone(&services.native_fragment_service);
         let mut query_lifecycle_sweep = QueryLifecycleSweepTask::start(
             Arc::clone(&services.query_lifecycle_registry),
@@ -536,7 +557,8 @@ mod tests {
     #[test]
     fn application_composition_owns_one_query_lifecycle_registry() {
         let config = NovaRocksConfig::default();
-        let services = compose_backend_application_services(&config);
+        let services = compose_backend_application_services(&config)
+            .expect("compose backend application services");
 
         assert_eq!(
             Arc::strong_count(&services.query_lifecycle_registry),

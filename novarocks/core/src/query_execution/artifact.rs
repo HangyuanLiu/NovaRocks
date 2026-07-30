@@ -54,6 +54,11 @@ use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
 };
 
+pub use crate::query_execution::connector_binding::{
+    ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
+    ConnectorBindingInstallLease, ConnectorBindingInstallPlan, DispatchingConnectorBindingBarrier,
+    new_grpc_connector_binding_dispatcher,
+};
 pub type FragmentId = u32;
 pub type PlanNodeId = i32;
 
@@ -106,8 +111,8 @@ impl PreparedDistributedQuery {
 }
 
 /// A core artifact bound to one validated schedule. This type deliberately has
-/// no `assemble` method: query initialization and the frontend-owned control
-/// readiness barrier must first produce `ControlReadyDistributedQuery`.
+/// no `assemble` method: query initialization/control readiness and the
+/// connector install/ACK barrier must first complete.
 ///
 /// ```compile_fail
 /// use novarocks::query_execution::artifact::ScheduleBoundDistributedQuery;
@@ -161,7 +166,8 @@ impl ScheduleBoundDistributedQuery {
     }
 }
 
-/// The only query-control typestate that can assemble native submissions.
+/// Query lifecycle is ready, but connector instances still require their
+/// independent process-scoped install/ACK barrier.
 pub struct ControlReadyDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
@@ -171,6 +177,48 @@ pub struct ControlReadyDistributedQuery {
 }
 
 impl ControlReadyDistributedQuery {
+    pub fn prepare_connector_bindings(
+        self,
+        barrier: &dyn ConnectorBindingInstallBarrier,
+    ) -> Result<ConnectorBindingReadyDistributedQuery, DistributedQueryError> {
+        let plan = crate::query_execution::connector_binding::compile_install_plan(
+            &self.prepared,
+            &self.schedule.inner,
+        )?;
+        let connector_binding_lease = match barrier.install_all(plan) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let kind = error.kind();
+                let message = self
+                .query_lifecycle_lease
+                    .abort_preserving(error.message().to_string());
+                return Err(DistributedQueryError::new(kind, message));
+            }
+        };
+        Ok(ConnectorBindingReadyDistributedQuery {
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            options: self.options,
+            query_lifecycle_lease: self.query_lifecycle_lease,
+            connector_binding_lease,
+        })
+    }
+}
+
+/// The only typestate that can assemble native submissions.  In particular,
+/// it is impossible to create a submission before every selected BE has ACKed
+/// the connector declarations it will resolve by instance id.
+pub struct ConnectorBindingReadyDistributedQuery {
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    schedule: ValidatedFragmentSchedule,
+    options: QueryInitOptions,
+    query_lifecycle_lease: QueryLifecycleLease,
+    connector_binding_lease: ConnectorBindingInstallLease,
+}
+
+impl ConnectorBindingReadyDistributedQuery {
     pub fn assemble(self) -> Result<PreparedNativeExecution, DistributedQueryError> {
         let context = match self.options.native_submission_context() {
             Ok(context) => context,
@@ -179,6 +227,7 @@ impl ControlReadyDistributedQuery {
                 let message = self
                     .query_lifecycle_lease
                     .abort_preserving(error.message().to_string());
+                let message = self.connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -196,12 +245,14 @@ impl ControlReadyDistributedQuery {
                 writer_registrations: assembled.writer_registrations,
                 expected_output: assembled.expected_output,
                 query_lifecycle_lease: self.query_lifecycle_lease,
+                connector_binding_lease: self.connector_binding_lease,
             }),
             Err(error) => {
                 let kind = error.kind();
                 let message = self
                     .query_lifecycle_lease
                     .abort_preserving(error.message().to_string());
+                let message = self.connector_binding_lease.abort_preserving(message);
                 Err(DistributedQueryError::new(kind, message))
             }
         }
@@ -268,6 +319,16 @@ impl<'a> SchedulingFragmentView<'a> {
         self.view
             .scan_ranges(self.fragment.fragment_id(), node_id)
             .map(<[_]>::len)
+    }
+
+    /// Number of provider-neutral opaque splits available to schedule for a
+    /// connector read.  The frontend uses this only as placement cardinality;
+    /// split payloads remain opaque until artifact assembly patches the
+    /// already-encoded carrier for each BE.
+    pub fn connector_split_count(self, node_id: PlanNodeId) -> Option<usize> {
+        self.view
+            .connector_read(self.fragment.fragment_id(), node_id)
+            .map(|read| read.splits.len())
     }
 
     pub fn is_terminal_write(self) -> bool {
@@ -488,6 +549,7 @@ impl ValidatedFragmentSchedule {
                         backend_idx: placement.backend_idx,
                         endpoint: RuntimeEndpoint::from_socket_addr(placement.endpoint),
                         scan_ranges: BTreeMap::new(),
+                        connector_splits: BTreeMap::new(),
                         destinations: Vec::new(),
                         per_exch_num_senders: BTreeMap::new(),
                     })
@@ -517,16 +579,34 @@ impl ValidatedFragmentSchedule {
                         .or_default()
                         .push(range.clone());
                 }
+                if let Some(connector_read) = view.inner.connector_read(fragment_id, node_id) {
+                    for instance in &mut instances {
+                        instance.connector_splits.entry(node_id).or_default();
+                    }
+                    for (index, split) in connector_read.splits.iter().enumerate() {
+                        instances[index % instance_count]
+                            .connector_splits
+                            .entry(node_id)
+                            .or_default()
+                            .push(split.clone());
+                    }
+                }
             }
             let total_ranges = instances
                 .iter()
                 .flat_map(|instance| instance.scan_ranges.values())
                 .map(Vec::len)
-                .sum::<usize>();
-            if total_ranges > 0
-                && instances
+                .sum::<usize>()
+                + instances
                     .iter()
-                    .any(|instance| instance.scan_ranges.values().all(Vec::is_empty))
+                    .flat_map(|instance| instance.connector_splits.values())
+                    .map(Vec::len)
+                    .sum::<usize>();
+            if total_ranges > 0
+                && instances.iter().any(|instance| {
+                    instance.scan_ranges.values().all(Vec::is_empty)
+                        && instance.connector_splits.values().all(Vec::is_empty)
+                })
             {
                 return Err(contract_error(format!(
                     "frontend schedule fragment {fragment_id} creates an empty scan instance"
@@ -909,6 +989,7 @@ pub struct PreparedNativeExecution {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
+    connector_binding_lease: ConnectorBindingInstallLease,
 }
 
 struct AssembledNativeExecution {
@@ -926,6 +1007,7 @@ impl PreparedNativeExecution {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
+            connector_binding_lease: self.connector_binding_lease,
         }
     }
 }
@@ -938,6 +1020,7 @@ pub struct PreparedNativeExecutionParts {
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
+    pub connector_binding_lease: ConnectorBindingInstallLease,
 }
 
 fn assemble_native_execution(
@@ -1108,6 +1191,14 @@ fn assemble_native_execution(
                     });
                 }
                 let mut native_fragment = template.clone();
+                for (&node_id, splits) in &placement.connector_splits {
+                    crate::query_execution::assembly::patch_native_connector_read_splits(
+                        &mut native_fragment,
+                        node_id,
+                        splits,
+                    )
+                    .map_err(contract_error)?;
+                }
                 if !is_root && !is_writer && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         crate::query_execution::assembly::
@@ -1249,6 +1340,7 @@ mod tests {
             endpoint: RuntimeEndpoint::new("127.0.0.1", 19040 + backend_idx as i32)
                 .expect("valid endpoint"),
             scan_ranges: BTreeMap::new(),
+            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }

@@ -553,7 +553,6 @@ fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::C
         ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
             output_chunk_schema_for_node(&consumer.input)
         }
-        ExecNodeKind::IcebergDeltaScan(scan) => Some(Arc::clone(&scan.output_chunk_schema)),
         #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
         ExecNodeKind::LookUp(lookup) => Some(Arc::clone(&lookup.output_chunk_schema)),
@@ -2015,29 +2014,6 @@ fn build_pipeline_for_node(
                 |shared, id| Box::new(ExceptSourceFactory::new(shared, id)),
             ),
         },
-        ExecNodeKind::IcebergDeltaScan(node) => {
-            validate_native_consumer_specs(node.native_runtime_filter_specs(), ctx)?;
-            let source: Box<dyn OperatorFactory> = Box::new(
-                crate::exec::operators::IcebergDeltaScanFactory::new(node.clone()),
-            );
-            // A1 single-driver: morsel-level parallelism deferred to a later
-            // phase (see plan §"Phase 2 — IcebergDeltaScan Operator").
-            let mut pipeline = new_source_pipeline_with_dop(ctx, source, 1);
-            if !node.native_runtime_filter_specs().is_empty() {
-                pipeline
-                    .factories
-                    .push(Box::new(NativeRuntimeFilterProcessorFactory::new(
-                        node.node_id,
-                        node.native_runtime_filter_specs(),
-                        Arc::clone(&ctx.arena),
-                    )?));
-            }
-            Ok(PipelineBuildResult {
-                pipeline,
-                extra_pipelines: Vec::new(),
-                stream: StreamDesc::any(1),
-            })
-        }
         ExecNodeKind::Values(ValuesNode { chunk, node_id }) => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(ValuesSourceFactory::new(chunk.clone(), *node_id));
@@ -2162,10 +2138,6 @@ mod tests {
         AggFunction, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
     };
     use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
-    use crate::exec::node::iceberg_delta_scan::{
-        ApplyKeySource, BaseTableIdent, IcebergDeltaScanNode, IcebergDeltaTablePayload,
-        IcebergRuntimeHandles,
-    };
     use crate::exec::node::join::{
         JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
     };
@@ -2419,81 +2391,6 @@ mod tests {
         assert_eq!(
             names,
             vec!["ValuesSource (id=1)", "NativeRuntimeFilter (id=2)"]
-        );
-    }
-
-    #[test]
-    fn native_iceberg_delta_scan_builder_preserves_consumer_factory() {
-        let (_manager, runtime_filter_context) = installed_native_consumer_context();
-        let arrow_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let output_chunk_schema = chunk_schema_of(&arrow_schema, &[SlotId::new(1)]);
-        let mut arena = ExprArena::default();
-        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        let spec = NativeRuntimeFilterConsumerSpec {
-            binding_id: 4,
-            channel_id: 1,
-            expr_id,
-            activation:
-                crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                crate::runtime_filter::model::contract::ArtifactCapability::Membership,
-                crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
-            ]),
-            contract: installed_native_membership_contract_for_activation(
-                crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
-            ),
-            reduction: NativeRuntimeFilterReduction::SetUnion,
-        };
-        let table_location = "file:///tmp/novarocks-rfd6b-delta".to_string();
-        let plan = ExecPlan {
-            arena,
-            root: ExecNode {
-                kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
-                    base_table_ident: BaseTableIdent {
-                        catalog: "test".to_string(),
-                        namespace: "db".to_string(),
-                        table: "t".to_string(),
-                    },
-                    table_location: table_location.clone(),
-                    from_snapshot_id: 1,
-                    to_snapshot_id: 2,
-                    output_chunk_schema,
-                    apply_key_source: ApplyKeySource::BaseRowId,
-                    change_files: Vec::new(),
-                    object_store_config: None,
-                    iceberg_runtime: Arc::new(IcebergRuntimeHandles::new(
-                        IcebergDeltaTablePayload {
-                            table_location,
-                            data_columns: Vec::new(),
-                        },
-                        None,
-                    )),
-                    node_id: 73,
-                    native_runtime_filter_specs: vec![spec],
-                }),
-            },
-        };
-
-        let graph = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &plan,
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            2,
-            Some(runtime_filter_context),
-        )
-        .expect("native Iceberg delta pipeline");
-        assert_eq!(graph.pipelines.len(), 1);
-        let names = graph.pipelines[0]
-            .factories
-            .iter()
-            .map(|factory| factory.name())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["IcebergDeltaScan (id=73)", "NativeRuntimeFilter (id=73)"]
         );
     }
 

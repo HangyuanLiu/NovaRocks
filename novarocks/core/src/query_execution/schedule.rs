@@ -30,6 +30,7 @@ use crate::query_execution::lifecycle::{ExchangeRouteManifest, QueryInitPlanHead
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::FragmentId;
+use novarocks_spi::connector::ConnectorSplit;
 
 /// Placement information for one fragment instance.
 #[derive(Clone, Debug)]
@@ -40,6 +41,9 @@ pub(crate) struct FragmentInstancePlacement {
     pub(crate) backend_idx: usize,
     pub(crate) endpoint: RuntimeEndpoint,
     pub(crate) scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
+    /// Opaque provider splits assigned by the frontend scheduler.  They never
+    /// enter `InstanceParams.per_node_scan_ranges`.
+    pub(crate) connector_splits: BTreeMap<i32, Vec<ConnectorSplit>>,
     pub(crate) destinations: Vec<FragmentDestination>,
     pub(crate) per_exch_num_senders: BTreeMap<i32, i32>,
 }

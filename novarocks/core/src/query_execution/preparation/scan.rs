@@ -17,6 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorInstanceDeclaration, ConnectorScan, ConnectorSplit,
+};
+
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
 };
@@ -48,13 +52,23 @@ pub(crate) enum ResolvedScanExecution {
 pub(crate) struct ResolvedIcebergFileScan {
     pub table: IcebergTableInfo,
     pub files: Vec<IcebergDataFileInfo>,
-    pub cloud_properties: BTreeMap<String, String>,
     pub binding: IcebergDataFileBinding,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedIcebergDeltaScan {
     pub runtime_plan: IcebergDeltaScanRuntimePlan,
+}
+
+/// Provider-neutral result of planning an executable connector read.  Its
+/// handles remain opaque to core: preparation owns only declaration delivery,
+/// scheduling hints, and native-carrier assembly.
+#[derive(Clone)]
+pub(crate) struct PlannedConnectorRead {
+    pub(crate) declaration: ConnectorInstanceDeclaration,
+    pub(crate) scan: ConnectorScan,
+    pub(crate) splits: Vec<ConnectorSplit>,
+    pub(crate) batch: ConnectorBatchBudget,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +179,7 @@ impl ResolvedScanBinding {
 pub(crate) struct ScanExecutionBindings {
     by_node_id: BTreeMap<i32, ResolvedScanBinding>,
     scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>>,
+    connector_reads: BTreeMap<(FragmentId, i32), PlannedConnectorRead>,
     starrocks_sources: BTreeMap<i32, StarRocksScanSourceDescriptor>,
 }
 
@@ -222,6 +237,57 @@ impl ScanExecutionBindings {
             .flat_map(|(&fragment_id, per_node)| {
                 per_node.keys().map(move |&node_id| (fragment_id, node_id))
             })
+    }
+
+    pub(crate) fn insert_connector_read(
+        &mut self,
+        fragment_id: FragmentId,
+        node_id: i32,
+        read: PlannedConnectorRead,
+    ) -> Result<(), String> {
+        if self.connector_reads.contains_key(&(fragment_id, node_id)) {
+            return Err(format!(
+                "duplicate connector read fragment_id={fragment_id} node_id={node_id}"
+            ));
+        }
+        if read.scan.handle.owner() != &read.declaration.descriptor().instance_id {
+            return Err(format!(
+                "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"
+            ));
+        }
+        if read
+            .splits
+            .iter()
+            .any(|split| split.owner() != &read.declaration.descriptor().instance_id)
+        {
+            return Err(format!(
+                "connector read fragment_id={fragment_id} node_id={node_id} has a split owned by another instance"
+            ));
+        }
+        self.connector_reads.insert((fragment_id, node_id), read);
+        Ok(())
+    }
+
+    pub(crate) fn connector_read(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&PlannedConnectorRead> {
+        self.connector_reads.get(&(fragment_id, node_id))
+    }
+
+    pub(crate) fn connector_read_for_node(&self, node_id: i32) -> Option<&PlannedConnectorRead> {
+        self.connector_reads
+            .iter()
+            .find_map(|(&(fragment_id, candidate), read)| {
+                (candidate == node_id)
+                    .then_some((fragment_id, read))
+                    .map(|(_, read)| read)
+            })
+    }
+
+    pub(super) fn connector_read_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
+        self.connector_reads.keys().copied()
     }
 
     pub(crate) fn insert_starrocks_source(
@@ -291,7 +357,6 @@ mod tests {
             runtime_plan: IcebergDeltaScanRuntimePlan {
                 table_location: "s3://warehouse/db/table".to_string(),
                 data_columns: Vec::new(),
-                cloud_properties: BTreeMap::new(),
                 change_files: Vec::new(),
                 delete_side: None,
             },

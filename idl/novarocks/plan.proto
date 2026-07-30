@@ -995,13 +995,14 @@ message ScanSource {
   oneof kind {
     IcebergDataFiles iceberg_data_files = 1;              // Iceberg data-file scan.
     IcebergMetadataTable iceberg_metadata_table = 2;      // Iceberg metadata-table scan.
-    IcebergDeltaTable iceberg_delta_table = 3;            // Iceberg delta scan.
     IcebergVersionTable iceberg_version_table = 4;        // pinned Iceberg snapshot scan.
     IcebergMvTargetState iceberg_mv_target_state = 5;     // IMV target-state scan.
     IcebergMvTargetLocator iceberg_mv_target_locator = 6; // IMV target-locator scan.
     StarRocksTableSource starrocks_table = 7;              // StarRocks tablet scan.
     ConnectorReadSource connector_read = 8;                // provider-owned opaque scan and splits.
   }
+  reserved 3;
+  reserved "iceberg_delta_table"; // former core-owned Iceberg delta carrier.
 }
 
 // A provider-neutral, already-planned connector read. The opaque handles are
@@ -1016,7 +1017,9 @@ message ConnectorReadSource {
   uint64 max_batch_bytes = 5;          // required nonzero reader batch budget.
   uint64 max_handle_payload_bytes = 6; // required bounded provider-handle budget.
   uint64 max_total_payload_bytes = 7;  // required bounded request aggregate budget.
-  string provider_id = 8;              // normalized ConnectorProviderId for BE-local host lookup.
+  reserved 8;
+  reserved "provider_id"; // host lookup is keyed only by instance_id.
+  bytes expected_schema_ipc = 9; // bounded Arrow IPC schema expected from the provider.
 }
 
 // One scheduled split in a ConnectorReadSource.
@@ -1024,76 +1027,8 @@ message ConnectorReadSplit {
   string split_id = 1;                 // provider-assigned stable split identity.
   bytes split_payload = 2;             // bounded provider-owned split handle.
   optional uint64 estimated_bytes = 3; // optional scheduler hint.
-  FileExecutionSidecar file_execution = 4; // core-owned file correctness sidecar.
-}
-
-// Core-private, versioned execution data for a file-backed connector split.
-// This sidecar intentionally carries only file-format, range, delete, row
-// lineage, and pruning information. Connector configuration, clients, and
-// credentials remain in a BE-local binding and MUST NOT appear here.
-message FileExecutionSidecar {
-  uint32 version = 1; // currently exactly 1.
-  FileExecutionFormat file_format = 2;
-  string path = 3;
-  uint64 file_length = 4;
-  uint64 offset = 5;
-  uint64 length = 6;
-  repeated FileExecutionDeleteFile delete_files = 7;
-  FileExecutionDeletionVector deletion_vector = 8;
-  optional int64 first_row_id = 9;
-  optional int64 data_sequence_number = 10;
-  repeated int64 included_positions = 11;
-  optional int32 change_op = 12;
-  map<int32, FileExecutionPruningValue> file_pruning_min_max_values = 13;
-}
-
-enum FileExecutionFormat {
-  FILE_EXECUTION_FORMAT_UNSPECIFIED = 0;
-  FILE_EXECUTION_FORMAT_PARQUET = 1;
-  FILE_EXECUTION_FORMAT_ORC = 2;
-}
-
-message FileExecutionDeleteFile {
-  string path = 1;
-  FileExecutionDeleteFileFormat file_format = 2;
-  FileExecutionDeleteFileContent file_content = 3;
-  optional int64 length = 4;
-}
-
-enum FileExecutionDeleteFileFormat {
-  FILE_EXECUTION_DELETE_FILE_FORMAT_UNSPECIFIED = 0;
-  FILE_EXECUTION_DELETE_FILE_FORMAT_PARQUET = 1;
-}
-
-enum FileExecutionDeleteFileContent {
-  FILE_EXECUTION_DELETE_FILE_CONTENT_UNSPECIFIED = 0;
-  FILE_EXECUTION_DELETE_FILE_CONTENT_POSITION = 1;
-  FILE_EXECUTION_DELETE_FILE_CONTENT_EQUALITY = 2;
-}
-
-message FileExecutionDeletionVector {
-  optional string storage_type = 1;
-  optional string path_or_inline_dv = 2;
-  optional int64 offset = 3;
-  optional int64 size_in_bytes = 4;
-  optional int64 cardinality = 5;
-}
-
-message FileExecutionPruningValue {
-  FileExecutionPruningValueKind value_kind = 1;
-  bool has_null = 2;
-  bool all_null = 3;
-  optional int64 min_int_value = 4;
-  optional int64 max_int_value = 5;
-  optional double min_float_value = 6;
-  optional double max_float_value = 7;
-}
-
-enum FileExecutionPruningValueKind {
-  FILE_EXECUTION_PRUNING_VALUE_KIND_UNSPECIFIED = 0;
-  FILE_EXECUTION_PRUNING_BOOL = 1;
-  FILE_EXECUTION_PRUNING_INT = 2;
-  FILE_EXECUTION_PRUNING_FLOAT = 3;
+  reserved 4;
+  reserved "file_execution"; // provider payload owns file semantics.
 }
 
 // Native StarRocks table identity and physical-column metadata.
@@ -1155,8 +1090,9 @@ message StarRocksColumnSchema {
 message IcebergDataFiles {
   IcebergTableInfo table = 1;                      // Iceberg table identity and schema.
   repeated IcebergDataFileInfo files = 2;          // explicit data files, possibly empty.
-  map<string, string> cloud_properties = 3;        // object-store properties.
   IcebergDataFileBinding binding = 4;              // current-snapshot vs explicit-file binding.
+  reserved 3;
+  reserved "cloud_properties"; // credentials never enter a read carrier.
 }
 
 // Iceberg data-file binding provenance.

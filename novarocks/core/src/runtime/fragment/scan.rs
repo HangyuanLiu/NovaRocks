@@ -43,8 +43,6 @@ use crate::runtime::fragment::instance::FragmentInstanceSpec;
 /// correctness is enforced (a wrong `BoundScanRanges` variant fails here,
 /// before any pipeline runs).
 ///
-/// `IcebergDeltaScan` is intentionally not materialized here — it is a known
-/// residual that still carries its own ranges.
 pub(crate) fn materialize_scan_bindings(
     program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
@@ -66,8 +64,6 @@ fn visit(
             }
             Ok(())
         }
-        // Out of scope: IcebergDeltaScan keeps its own range handling.
-        ExecNodeKind::IcebergDeltaScan(_) => Ok(()),
         ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::LookUp(_) => {
             Ok(())
         }
@@ -214,13 +210,7 @@ mod tests {
             offset: 0,
             length: 0,
             scan_range_id: index as i32,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         }
     }
 
@@ -231,13 +221,7 @@ mod tests {
             offset: 0,
             length: 16,
             scan_range_id: index as i32,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
             external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
         }
     }
 

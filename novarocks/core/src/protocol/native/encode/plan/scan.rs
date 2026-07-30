@@ -18,7 +18,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
 use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
@@ -62,6 +63,7 @@ pub(super) fn encode_scan_node(
             &src.table,
             Some(node_id),
             Some(&src.columns),
+            Some(&required_columns),
             binding,
             ctx,
         )?),
@@ -216,6 +218,7 @@ pub(super) fn encode_table_def_with_context(
     src: &table_model::TableDef,
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
+    scan_required_columns: Option<&[String]>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
@@ -239,7 +242,13 @@ pub(super) fn encode_table_def_with_context(
             .iter()
             .map(encode_column_def)
             .collect::<Result<Vec<_>, _>>()?,
-        source: Some(encode_scan_source(&src.source, scan_node_id, binding, ctx)?),
+        source: Some(encode_scan_source(
+            &src.source,
+            scan_node_id,
+            scan_required_columns,
+            binding,
+            ctx,
+        )?),
     })
 }
 
@@ -604,31 +613,42 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
 fn encode_scan_source(
     src: &table_model::ScanSource,
     scan_node_id: Option<i32>,
+    scan_required_columns: Option<&[String]>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
 
-    if let Some(ResolvedScanExecution::IcebergFiles(files)) =
-        binding.map(|binding| &binding.execution)
-    {
+    if let Some(planned) = scan_node_id.and_then(|node_id| {
+        optional_context_ref(ctx.scan_bindings)
+            .and_then(|bindings| bindings.connector_read_for_node(node_id))
+    }) {
         return Ok(plan::ScanSource {
-            kind: Some(Kind::IcebergDataFiles(plan::IcebergDataFiles {
-                table: Some(encode_iceberg_table_info(&files.table)?),
-                files: files
-                    .files
-                    .iter()
-                    .map(encode_iceberg_data_file_info)
-                    .collect::<Result<Vec<_>, _>>()?,
-                cloud_properties: Default::default(),
-                binding: match files.binding {
-                    iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
-                        plan::IcebergDataFileBinding::CurrentSnapshot as i32
-                    }
-                    iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles => {
-                        plan::IcebergDataFileBinding::ExplicitFiles as i32
-                    }
-                },
+            kind: Some(Kind::ConnectorRead(plan::ConnectorReadSource {
+                instance_id: planned
+                    .declaration
+                    .descriptor()
+                    .instance_id
+                    .as_str()
+                    .to_string(),
+                scan_payload: planned.scan.handle.payload().to_vec(),
+                splits: Vec::new(),
+                max_batch_rows: u64::try_from(planned.batch.max_rows.get())
+                    .map_err(|_| "connector batch row budget does not fit u64".to_string())?,
+                max_batch_bytes: u64::try_from(planned.batch.max_bytes.get())
+                    .map_err(|_| "connector batch byte budget does not fit u64".to_string())?,
+                max_handle_payload_bytes: u64::try_from(
+                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                )
+                .map_err(|_| "connector handle payload budget does not fit u64".to_string())?,
+                max_total_payload_bytes: u64::try_from(
+                    novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+                )
+                .map_err(|_| "connector total payload budget does not fit u64".to_string())?,
+                expected_schema_ipc: encode_connector_expected_schema_ipc(
+                    binding,
+                    scan_required_columns.unwrap_or_default().to_vec(),
+                )?,
             })),
         });
     }
@@ -676,7 +696,6 @@ fn encode_scan_source(
                     .iter()
                     .map(encode_iceberg_data_file_info)
                     .collect::<Result<Vec<_>, _>>()?,
-                cloud_properties: Default::default(),
                 binding: match binding {
                     iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
@@ -699,32 +718,13 @@ fn encode_scan_source(
                 cloud_properties: Default::default(),
                 metadata_payload: metadata_payload.clone(),
             }),
-            table_model::ScanSource::IcebergDeltaTable {
-                table,
-                from_snapshot_id,
-                to_snapshot_id,
-            } => {
-                let Some(ResolvedScanExecution::IcebergDelta(delta)) =
-                    binding.map(|binding| &binding.execution)
-                else {
-                    return Err(format!(
-                        "native scan encoder missing prepared IcebergDelta binding for node_id={}",
-                        scan_node_id
-                            .map(|node_id| node_id.to_string())
-                            .unwrap_or_else(|| "<none>".to_string())
-                    ));
-                };
-
-                Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
-                    table: Some(encode_iceberg_table_info(table)?),
-                    from_snapshot_id: *from_snapshot_id,
-                    to_snapshot_id: *to_snapshot_id,
-                    delta_plan: Some(
-                        super::super::iceberg_delta_scan::encode_iceberg_delta_scan_plan_native(
-                            &delta.runtime_plan,
-                        )?,
-                    ),
-                })
+            table_model::ScanSource::IcebergDeltaTable { .. } => {
+                return Err(format!(
+                    "native IcebergDeltaTable node_id={} must be materialized as ConnectorReadSource before encoding",
+                    scan_node_id
+                        .map(|node_id| node_id.to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                ));
             }
             table_model::ScanSource::IcebergVersionTable { table, snapshot_id } => {
                 Kind::IcebergVersionTable(plan::IcebergVersionTable {
@@ -773,6 +773,47 @@ fn encode_scan_source(
             }
         }),
     })
+}
+
+fn encode_connector_expected_schema_ipc(
+    binding: Option<&ResolvedScanBinding>,
+    required_columns: Vec<String>,
+) -> Result<Vec<u8>, String> {
+    let binding = binding.ok_or_else(|| {
+        "ConnectorReadSource requires a resolved scan binding for its expected schema".to_string()
+    })?;
+    let schema = Schema::new(
+        binding
+            .physical_columns
+            .iter()
+            .filter(|column| {
+                required_columns.is_empty()
+                    || required_columns
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&column.source.name))
+            })
+            .map(|column| {
+                Field::new(
+                    column.source.name.clone(),
+                    column.source.data_type.clone(),
+                    column.source.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut writer = StreamWriter::try_new(Vec::new(), &schema)
+        .map_err(|error| format!("encode ConnectorReadSource expected schema: {error}"))?;
+    writer
+        .finish()
+        .map_err(|error| format!("finish ConnectorReadSource expected schema: {error}"))?;
+    let bytes = writer.get_ref().clone();
+    if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES {
+        return Err(format!(
+            "ConnectorReadSource expected schema exceeds {} bytes",
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
+        ));
+    }
+    Ok(bytes)
 }
 
 fn encode_starrocks_tablet_schema(

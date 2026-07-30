@@ -677,7 +677,11 @@ deployment_owner = "fe-1"
         }
     }
 
-    fn wait_for_every_be_output_contains(&mut self, marker: &str, timeout: Duration) {
+    fn wait_for_every_be_output_contains(
+        &mut self,
+        marker: &str,
+        timeout: Duration,
+    ) -> Vec<Vec<String>> {
         let deadline = Instant::now() + timeout;
         let mut stdout = vec![Vec::new(); self.bes.len()];
         let mut observed = vec![false; self.bes.len()];
@@ -696,11 +700,58 @@ deployment_owner = "fe-1"
                 }
             }
             if observed.iter().all(|seen| *seen) {
-                return;
+                return stdout;
             }
             assert!(
                 Instant::now() < deadline,
                 "every BE must emit `{marker}`; observed={observed:?}; stdout={stdout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_connector_readers_to_close(
+        &mut self,
+        mut stdout: Vec<Vec<String>>,
+        timeout: Duration,
+    ) -> Vec<Vec<String>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            for (index, be) in self.bes.iter_mut().enumerate() {
+                if let Some(status) = be.child.try_wait().expect("poll BE child") {
+                    panic!(
+                        "BE {index} exited before connector readers closed with status {status}; stdout={:?}; stderr={}",
+                        stdout[index],
+                        be.read_stderr()
+                    );
+                }
+                while let Ok(line) = be.stdout_rx.try_recv() {
+                    stdout[index].push(line);
+                }
+            }
+            let counts = stdout
+                .iter()
+                .map(|lines| {
+                    let opens = lines
+                        .iter()
+                        .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_OPEN"))
+                        .count();
+                    let closes = lines
+                        .iter()
+                        .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_CLOSE"))
+                        .count();
+                    (opens, closes)
+                })
+                .collect::<Vec<_>>();
+            if counts
+                .iter()
+                .all(|(opens, closes)| *opens > 0 && opens == closes)
+            {
+                return stdout;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "connector reader open/close markers did not balance after terminal cancellation: counts={counts:?}; stdout={stdout:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -725,10 +776,12 @@ fn multi_submit_query_sql() -> &'static str {
 }
 
 fn cancellation_acceptance_query_sql() -> &'static str {
-    "SELECT t.v \
-     FROM qlc_cancel_catalog.qlc_cancel.cancellation_data AS t \
-     CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x) \
-     ORDER BY t.v DESC, x DESC LIMIT 1"
+    "SELECT t.s \
+     FROM ( \
+       SELECT sleep(10) AS s \
+       FROM qlc_cancel_catalog.qlc_cancel.cancellation_data \
+     ) AS t \
+     CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x)"
 }
 
 fn assert_mysql_server_error(error: mysql::Error, expected_code: u16) {
@@ -1422,7 +1475,7 @@ emit_grpc_fragment_marker = true
 }
 
 #[test]
-fn three_be_kill_query_cancels_distributed_execution_from_a_control_connection() {
+fn cross_process_three_be_connector_read_distributes_splits_and_cancels() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
@@ -1443,6 +1496,10 @@ path = "{}"
         r#"
 [debug]
 emit_grpc_fragment_marker = true
+emit_connector_reader_marker = true
+
+[runtime]
+operator_buffer_chunks = 1
 "#,
         &metadata_config,
     );
@@ -1461,7 +1518,12 @@ emit_grpc_fragment_marker = true
     control
         .query_drop("CREATE TABLE qlc_cancel_catalog.qlc_cancel.cancellation_data (v BIGINT)")
         .expect("create cancellation table");
-    for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
+    // Each insert intentionally produces a file larger than the connector's
+    // 4,096-row physical batch.  Together with the one-chunk scan buffer this
+    // keeps every assigned reader live under ordinary output backpressure;
+    // cancellation is then exercised against real data-file I/O rather than
+    // a query that has already reached EOF and is only blocked downstream.
+    for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
         control
             .query_drop(format!(
                 "INSERT INTO qlc_cancel_catalog.qlc_cancel.cancellation_data \
@@ -1490,10 +1552,35 @@ emit_grpc_fragment_marker = true
         .recv_timeout(Duration::from_secs(5))
         .expect("target connection id");
 
-    cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_GRPC_SUBMIT_ACCEPTED",
+    let reader_open_output = cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg",
         Duration::from_secs(10),
     );
+    let pre_kill_reader_counts = reader_open_output
+        .iter()
+        .map(|lines| {
+            let opens = lines
+                .iter()
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_OPEN"))
+                .count();
+            let closes = lines
+                .iter()
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_CLOSE"))
+                .count();
+            (opens, closes)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        pre_kill_reader_counts
+            .iter()
+            .all(|(opens, closes)| *opens > *closes),
+        "every BE must retain an in-flight connector reader until KILL QUERY: counts={pre_kill_reader_counts:?}; stdout={reader_open_output:?}"
+    );
+    if let Ok(result) = target_done_rx.try_recv() {
+        panic!(
+            "target query completed before KILL QUERY established connector-read cancellation: {result:?}"
+        );
+    }
     control
         .query_drop(format!("KILL QUERY {target_connection_id}"))
         .expect("KILL QUERY must acknowledge the active target statement");
@@ -1508,6 +1595,26 @@ emit_grpc_fragment_marker = true
             *port,
             "coordinator_abort",
             Duration::from_secs(10),
+        );
+    }
+    let terminal_reader_output =
+        cluster.wait_for_connector_readers_to_close(reader_open_output, Duration::from_secs(10));
+    assert!(
+        terminal_reader_output
+            .iter()
+            .all(|lines| lines.iter().any(|line| line.contains("NOVAROCKS_CANCEL"))),
+        "each BE must receive the formal cancellation control-plane request: {terminal_reader_output:?}"
+    );
+    for lines in &terminal_reader_output {
+        let cancel_index = lines
+            .iter()
+            .position(|line| line.contains("NOVAROCKS_CANCEL"))
+            .expect("each BE cancellation marker was asserted above");
+        assert!(
+            lines[cancel_index + 1..]
+                .iter()
+                .all(|line| !line.contains("NOVAROCKS_CONNECTOR_READER_OPEN")),
+            "terminal cancellation must reject new connector reader opens: {lines:?}"
         );
     }
 
@@ -1528,6 +1635,95 @@ emit_grpc_fragment_marker = true
         .query(coordinated_query_sql())
         .expect("a later distributed query must succeed after cancellation cleanup");
     assert_eq!(rows, vec![1, 2]);
+}
+
+#[test]
+fn cross_process_three_be_connector_read_applies_deletion_vectors() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _guard = lock_cluster_mvp();
+    let metadata_dir = tempfile::tempdir_in(runtime_dir()).expect("create DV metadata directory");
+    let metadata_config = format!(
+        r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+"#,
+        metadata_dir.path().join("catalog.db").display()
+    );
+    let mut cluster = MultiBeClusterHarness::start_n_be(
+        3,
+        r#"
+[debug]
+emit_connector_reader_marker = true
+"#,
+        &metadata_config,
+    );
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create DV warehouse");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG dv_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create DV catalog");
+    conn.query_drop("CREATE DATABASE dv_catalog.dv_db")
+        .expect("create DV database");
+    conn.query_drop(
+        "CREATE TABLE dv_catalog.dv_db.data (id BIGINT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+    )
+    .expect("create Iceberg v3 DV table");
+    for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
+        conn.query_drop(format!(
+            "INSERT INTO dv_catalog.dv_db.data \
+             SELECT generate_series FROM TABLE(generate_series({range}))"
+        ))
+        .expect("write a distinct Iceberg data-file range");
+    }
+    conn.query_drop("DELETE FROM dv_catalog.dv_db.data WHERE id IN (1, 100001, 200001)")
+        .expect("write Iceberg v3 deletion vectors");
+    for be in &mut cluster.bes {
+        while be.stdout_rx.try_recv().is_ok() {}
+    }
+
+    let rows: Vec<Row> = conn
+        .query(
+            "SELECT count(*), sum(id), min(id), max(id) \
+             FROM dv_catalog.dv_db.data",
+        )
+        .expect("read the v3 table through distributed connector reads");
+    assert_eq!(rows.len(), 1, "aggregate must produce one row");
+    let row = &rows[0];
+    assert_eq!(row.get::<Option<i64>, usize>(0).flatten(), Some(299_997));
+    assert_eq!(
+        row.get::<Option<i64>, usize>(1).flatten(),
+        Some(44_999_849_997)
+    );
+    assert_eq!(row.get::<Option<i64>, usize>(2).flatten(), Some(2));
+    assert_eq!(row.get::<Option<i64>, usize>(3).flatten(), Some(300_000));
+
+    let reader_output = cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg",
+        Duration::from_secs(10),
+    );
+    for lines in &reader_output {
+        let source = lines
+            .iter()
+            .find(|line| line.contains("NOVAROCKS_CONNECTOR_READ_SOURCE"))
+            .expect("each BE must decode an opaque connector read source");
+        let split_count = source
+            .split("splits=")
+            .nth(1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("connector source marker must include a numeric split count");
+        assert!(
+            split_count > 0,
+            "each BE must receive at least one opaque Iceberg split: {source}"
+        );
+    }
 }
 
 #[test]

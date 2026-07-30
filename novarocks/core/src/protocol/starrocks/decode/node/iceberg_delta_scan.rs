@@ -22,24 +22,48 @@
 //! into typed table descriptors, change files, object-store config, and
 //! delete-side descriptors; it does not read connector catalog state or
 //! reconstruct Iceberg table metadata.
-//! Delete-side runtime state is captured into `IcebergRuntimeHandles` so
-//! per-file operator code can borrow it instead of rebuilding it per file.
+//! It normalizes the wire facts into provider-owned opaque splits; the stable
+//! compat Iceberg instance owns all physical reads and delete correctness.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::node::iceberg_delta_scan::{
-    ApplyKeySource, BaseTableIdent, DeletedFileVisibility, DeltaScanDeleteSidePayload,
-    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, IcebergDeltaDataColumnPayload,
-    IcebergDeltaScanNode, IcebergDeltaTablePayload, IcebergRuntimeHandles,
-    PositionDeleteFileFormat, PositionDeleteSourceData,
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+use crate::connector::iceberg::delta::{
+    BaseDataFileLineage, DeletedFileVisibility, DeltaDataColumn, DeltaScanDeleteSide,
+    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
+    PositionDeleteSourceData,
 };
+use crate::connector::iceberg::provider::{
+    COMPAT_ICEBERG_INSTANCE_ID, build_compat_delta_read_splits,
+};
+use crate::connector::runtime::ConnectorReadScanSource;
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
-use crate::protocol::starrocks::decode::node::Lowered;
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::thrift::descriptors;
 use crate::thrift::plan_nodes;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
+    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+
+struct CompatIcebergDeltaCancellation {
+    query_id: QueryId,
+}
+
+impl ConnectorCancellation for CompatIcebergDeltaCancellation {
+    fn is_cancelled(&self) -> bool {
+        query_context_manager().is_query_canceled(self.query_id)
+    }
+}
 
 /// Lower an `ICEBERG_DELTA_SCAN_NODE` into an `ExecNode` of kind
 /// `IcebergDeltaScan`. The node must carry a typed refresh/codegen-time
@@ -48,7 +72,10 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     node: &plan_nodes::TPlanNode,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     out_layout: Layout,
-    decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+    connectors: &crate::novarocks_connectors::ConnectorRegistry,
+    query_id: Option<QueryId>,
+    scan_ranges: Option<ScanRangeCarrier<'_>>,
+    query_options: &QueryOptions,
 ) -> Result<Lowered, String> {
     let payload = node.iceberg_delta_scan_node.as_ref().ok_or_else(|| {
         format!(
@@ -76,14 +103,9 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     }
 
     let plan = &payload.delta_plan;
-    let table_payload = lower_table_payload(plan);
+    let data_columns = lower_data_columns(plan);
     let change_files = lower_delta_source_files(&plan.change_files)?;
     let delete_side_payload = lower_delete_side_payload(plan.delete_side.as_ref())?;
-    let object_store_config = object_store_config_from_cloud_configuration(
-        plan.cloud_configuration.as_ref(),
-        &table_payload.table_location,
-        decode_facts,
-    )?;
 
     let output_chunk_schema: ChunkSchemaRef = if out_layout.order.is_empty() {
         Arc::new(crate::exec::chunk::ChunkSchema::empty())
@@ -97,47 +119,102 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         chunk_schema_for_layout(desc_tbl, &out_layout)?
     };
 
-    let exec_node = IcebergDeltaScanNode {
-        base_table_ident: BaseTableIdent {
-            catalog: payload.catalog.clone(),
-            namespace: payload.iceberg_namespace.clone(),
-            table: payload.table.clone(),
+    let query_id = query_id.ok_or_else(|| {
+        "ICEBERG_DELTA_SCAN_NODE requires a query identity for connector cancellation".to_string()
+    })?;
+    let scan_ranges = scan_ranges.ok_or_else(|| {
+        "ICEBERG_DELTA_SCAN_NODE requires scan-range carrier for connector binding".to_string()
+    })?;
+    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)
+        .map_err(|error| error.to_string())?;
+    let instance = connectors
+        .connector_instance(&instance_id)
+        .map_err(|error| format!("compat Iceberg startup instance is unavailable: {error}"))?;
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(CompatIcebergDeltaCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let provider_schema = provider_schema_for_delta(&output_chunk_schema, &data_columns)?;
+    let splits = build_compat_delta_read_splits(change_files, delete_side_payload)
+        .map_err(|error| error.to_string())?;
+    scan_ranges.capture(node.node_id, BoundScanRanges::None);
+    let scan = crate::exec::node::scan::ScanNode::new(Arc::new(ConnectorReadScanSource::new(
+        instance,
+        splits,
+        ConnectorOpenReaderRequest {
+            expected_schema: provider_schema.arrow_schema_ref(),
+            batch: ConnectorBatchBudget {
+                max_rows: rows,
+                max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+                    .expect("SPI handle maximum is nonzero"),
+            },
+            context,
         },
-        table_location: table_payload.table_location.clone(),
-        from_snapshot_id: payload.from_snapshot_id,
-        to_snapshot_id: payload.to_snapshot_id,
-        output_chunk_schema,
-        apply_key_source: ApplyKeySource::BaseRowId,
-        change_files,
-        object_store_config,
-        iceberg_runtime: Arc::new(IcebergRuntimeHandles::new(
-            table_payload,
-            delete_side_payload,
-        )),
-        node_id: node.node_id,
-        native_runtime_filter_specs: Vec::new(),
-    };
+        provider_schema,
+    )))
+    .with_node_id(node.node_id)
+    .with_output_chunk_schema(output_chunk_schema)
+    .with_accept_empty_scan_ranges(true);
 
     Ok(Lowered {
         node: ExecNode {
-            kind: ExecNodeKind::IcebergDeltaScan(exec_node),
+            kind: ExecNodeKind::Scan(scan),
         },
         layout: out_layout,
     })
 }
 
-fn lower_table_payload(plan: &plan_nodes::TIcebergDeltaScanPlan) -> IcebergDeltaTablePayload {
-    IcebergDeltaTablePayload {
-        table_location: plan.table_location.clone(),
-        data_columns: plan
-            .data_columns
-            .iter()
-            .map(|column| IcebergDeltaDataColumnPayload {
-                name: column.name.clone(),
-                field_id: column.field_id,
-            })
-            .collect(),
-    }
+fn lower_data_columns(plan: &plan_nodes::TIcebergDeltaScanPlan) -> Vec<DeltaDataColumn> {
+    plan.data_columns
+        .iter()
+        .map(|column| DeltaDataColumn {
+            name: column.name.clone(),
+            field_id: column.field_id,
+        })
+        .collect()
+}
+
+fn provider_schema_for_delta(
+    output: &ChunkSchemaRef,
+    data_columns: &[DeltaDataColumn],
+) -> Result<ChunkSchemaRef, String> {
+    let slots = output
+        .slots()
+        .iter()
+        .map(|slot| {
+            let virtual_column = matches!(
+                slot.name().to_ascii_lowercase().as_str(),
+                "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number" | "__change_op"
+            );
+            let Some(column) = data_columns.iter().find(|column| {
+                column.name == slot.name() || column.name.eq_ignore_ascii_case(slot.name())
+            }) else {
+                if virtual_column {
+                    return Ok(slot.clone());
+                }
+                return Err(format!(
+                    "ICEBERG_DELTA_SCAN_NODE output column {} has no Iceberg field-ID descriptor",
+                    slot.name()
+                ));
+            };
+            let mut metadata = slot.field().metadata().clone();
+            metadata.insert(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                column.field_id.to_string(),
+            );
+            slot.with_field(slot.field().clone().with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
 }
 
 fn lower_delta_source_files(
@@ -303,11 +380,11 @@ fn lower_equality_delete_target(
 
 fn lower_delete_side_payload(
     payload: Option<&plan_nodes::TIcebergDeltaDeleteSidePlan>,
-) -> Result<Option<DeltaScanDeleteSidePayload>, String> {
+) -> Result<Option<DeltaScanDeleteSide>, String> {
     let Some(payload) = payload else {
         return Ok(None);
     };
-    Ok(Some(DeltaScanDeleteSidePayload {
+    Ok(Some(DeltaScanDeleteSide {
         base_data_file_lineage: lower_lineage_map(&payload.base_data_file_lineage),
         previous_data_file_lineage: lower_lineage_map(&payload.previous_data_file_lineage),
         previous_delete_visibility_data_files: payload
@@ -339,13 +416,13 @@ fn lower_delete_side_payload(
 
 fn lower_lineage_map(
     input: &BTreeMap<String, plan_nodes::TIcebergDeltaBaseDataFileLineage>,
-) -> HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage> {
+) -> HashMap<String, BaseDataFileLineage> {
     input
         .iter()
         .map(|(path, lineage)| {
             (
                 path.clone(),
-                crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+                BaseDataFileLineage {
                     first_row_id: lineage.first_row_id,
                     data_sequence_number: lineage.data_sequence_number,
                 },
@@ -421,27 +498,54 @@ fn lower_delete_visibility_content(
     }
 }
 
-fn object_store_config_from_cloud_configuration(
-    cloud: Option<&crate::thrift::cloud_configuration::TCloudConfiguration>,
-    _table_location: &str,
-    decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
-) -> Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
-    let Some(cloud) = cloud else {
-        return Ok(None);
-    };
-    let Some(props) = cloud.cloud_properties.as_ref() else {
-        return Ok(None);
-    };
-    let credentials =
-        crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
-            props,
-        )?;
-    let Some(credentials) = credentials else {
-        return Ok(None);
-    };
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-    let mut config = credentials.to_object_store_config();
-    decode_facts.object_store_defaults().apply_to(&mut config);
-    Ok(Some(config))
+    use arrow::datatypes::{DataType, Field};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    use super::provider_schema_for_delta;
+    use crate::common::ids::SlotId;
+    use crate::connector::iceberg::delta::DeltaDataColumn;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+
+    #[test]
+    fn delta_provider_schema_uses_planned_field_ids_and_keeps_virtual_columns() {
+        let output = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(
+                    SlotId::new(1),
+                    &Field::new("renamed", DataType::Int64, false),
+                    None,
+                )
+                .expect("data slot"),
+                ChunkSlotSchema::from_field(
+                    SlotId::new(2),
+                    &Field::new("__change_op", DataType::Int8, false),
+                    None,
+                )
+                .expect("virtual slot"),
+            ])
+            .expect("output schema"),
+        );
+
+        let provider = provider_schema_for_delta(
+            &output,
+            &[DeltaDataColumn {
+                name: "renamed".to_string(),
+                field_id: 17,
+            }],
+        )
+        .expect("provider schema");
+
+        assert_eq!(
+            provider.slots()[0]
+                .field()
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"17".to_string())
+        );
+        assert!(provider.slots()[1].field().metadata().is_empty());
+    }
 }
