@@ -31,6 +31,7 @@ typedef struct NovaRocksCompatConfig {
     uint8_t debug_exec_batch_plan_json;
     uint8_t log_level;          // 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
     const void* fragment_service_context;
+    const void* lake_service_context;
 } NovaRocksCompatConfig;
 
 // Starts brpc server only (heartbeat moved to Rust).
@@ -126,7 +127,8 @@ int32_t novarocks_rs_update_fail_point_status(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_publish_version(const uint8_t* ptr,
+int32_t novarocks_rs_lake_publish_version(const void* lake_service_context,
+                                        const uint8_t* ptr,
                                         size_t len,
                                         NovaRocksRustBuf* out_resp,
                                         NovaRocksRustBuf* out_err);
@@ -136,7 +138,8 @@ int32_t novarocks_rs_lake_publish_version(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_publish_log_version(const uint8_t* ptr,
+int32_t novarocks_rs_lake_publish_log_version(const void* lake_service_context,
+                                              const uint8_t* ptr,
                                               size_t len,
                                               NovaRocksRustBuf* out_resp,
                                               NovaRocksRustBuf* out_err);
@@ -146,7 +149,8 @@ int32_t novarocks_rs_lake_publish_log_version(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_publish_log_version_batch(const uint8_t* ptr,
+int32_t novarocks_rs_lake_publish_log_version_batch(const void* lake_service_context,
+                                                    const uint8_t* ptr,
                                                     size_t len,
                                                     NovaRocksRustBuf* out_resp,
                                                     NovaRocksRustBuf* out_err);
@@ -156,7 +160,8 @@ int32_t novarocks_rs_lake_publish_log_version_batch(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_abort_txn(const uint8_t* ptr,
+int32_t novarocks_rs_lake_abort_txn(const void* lake_service_context,
+                                  const uint8_t* ptr,
                                   size_t len,
                                   NovaRocksRustBuf* out_resp,
                                   NovaRocksRustBuf* out_err);
@@ -166,7 +171,8 @@ int32_t novarocks_rs_lake_abort_txn(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_drop_table(const uint8_t* ptr,
+int32_t novarocks_rs_lake_drop_table(const void* lake_service_context,
+                                   const uint8_t* ptr,
                                    size_t len,
                                    NovaRocksRustBuf* out_resp,
                                    NovaRocksRustBuf* out_err);
@@ -176,7 +182,8 @@ int32_t novarocks_rs_lake_drop_table(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_delete_tablet(const uint8_t* ptr,
+int32_t novarocks_rs_lake_delete_tablet(const void* lake_service_context,
+                                      const uint8_t* ptr,
                                       size_t len,
                                       NovaRocksRustBuf* out_resp,
                                       NovaRocksRustBuf* out_err);
@@ -186,7 +193,8 @@ int32_t novarocks_rs_lake_delete_tablet(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_delete_data(const uint8_t* ptr,
+int32_t novarocks_rs_lake_delete_data(const void* lake_service_context,
+                                     const uint8_t* ptr,
                                      size_t len,
                                      NovaRocksRustBuf* out_resp,
                                      NovaRocksRustBuf* out_err);
@@ -196,7 +204,8 @@ int32_t novarocks_rs_lake_delete_data(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_get_tablet_stats(const uint8_t* ptr,
+int32_t novarocks_rs_lake_get_tablet_stats(const void* lake_service_context,
+                                         const uint8_t* ptr,
                                          size_t len,
                                          NovaRocksRustBuf* out_resp,
                                          NovaRocksRustBuf* out_err);
@@ -206,7 +215,8 @@ int32_t novarocks_rs_lake_get_tablet_stats(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_compact(const uint8_t* ptr,
+int32_t novarocks_rs_lake_compact(const void* lake_service_context,
+                                const uint8_t* ptr,
                                 size_t len,
                                 NovaRocksRustBuf* out_resp,
                                 NovaRocksRustBuf* out_err);
@@ -216,7 +226,8 @@ int32_t novarocks_rs_lake_compact(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_abort_compaction(const uint8_t* ptr,
+int32_t novarocks_rs_lake_abort_compaction(const void* lake_service_context,
+                                         const uint8_t* ptr,
                                          size_t len,
                                          NovaRocksRustBuf* out_resp,
                                          NovaRocksRustBuf* out_err);
@@ -226,7 +237,8 @@ int32_t novarocks_rs_lake_abort_compaction(const uint8_t* ptr,
 // - 0: OK
 // - 1: execution failed (out_err set)
 // - 2: invalid request/decode failure (out_err set)
-int32_t novarocks_rs_lake_vacuum(const uint8_t* ptr,
+int32_t novarocks_rs_lake_vacuum(const void* lake_service_context,
+                               const uint8_t* ptr,
                                size_t len,
                                NovaRocksRustBuf* out_resp,
                                NovaRocksRustBuf* out_err);

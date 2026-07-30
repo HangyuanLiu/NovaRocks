@@ -23,12 +23,10 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-#[cfg(feature = "compat")]
-use axum::routing::{post, put};
-use axum::{Extension, Router};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -36,25 +34,14 @@ use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tonic::service::Routes;
-#[cfg(any(test, feature = "compat"))]
-use tonic::transport::Server;
 
-#[cfg(feature = "compat")]
-use crate::common::config::grpc_port;
+#[cfg(not(feature = "compat"))]
 use crate::common::config::http_port;
-#[cfg(feature = "compat")]
-use crate::common::config::starlet_port;
 use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
-#[cfg(feature = "compat")]
-use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 use crate::query_execution::lifecycle::QueryLifecycleIngress;
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
-#[cfg(all(test, feature = "compat"))]
-use crate::runtime::fragment::io::SyncFragmentExecutor;
-#[cfg(feature = "compat")]
-use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
 use crate::service::grpc_query_lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
@@ -65,8 +52,6 @@ use crate::service::internal_rpc;
 use crate::service::metrics_http;
 use crate::service::native_fragment_ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
-#[cfg(feature = "compat")]
-use prost::Message;
 
 pub(crate) use crate::common::engine_error::{
     REPORT_EXEC_STATUS_OK, REPORT_EXEC_STATUS_QUERY_GONE,
@@ -249,8 +234,10 @@ impl GrpcService {
         )
     }
 
-    #[cfg(feature = "compat")]
-    fn execution_without_native_fragment_ingress(
+    /// Builds the neutral internal-RPC handler used by service hosts that
+    /// execute fragments through an out-of-band ingress (for example BRPC).
+    /// It owns no listener, HTTP router, Starlet adapter, or application state.
+    pub fn internal_execution_without_native_fragment_ingress(
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Self {
         Self::with_handlers(
@@ -519,9 +506,6 @@ impl IndependentGrpcRuntimeFilterNode {
                     proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service)
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                #[cfg(feature = "compat")]
-                let app = build_novarocks_http_app(Routes::new(service), Router::new());
-                #[cfg(not(feature = "compat"))]
                 let app = build_novarocks_http_app(Routes::new(service));
                 let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     while !*shutdown_rx.borrow() {
@@ -1194,70 +1178,6 @@ fn emit_grpc_typed_fetch_marker(status: i32) {
     }
 }
 
-#[cfg(feature = "compat")]
-/// Temporary compat composition port for the Starlet listener.
-///
-/// The core listener retains generated gRPC request handling until RCI-5G,
-/// while compat owns the StarOS protobuf interpretation and StarManager
-/// control-plane state.
-pub trait StarletControl: Send + Sync {
-    fn parse_file_path_s3_profile(
-        &self,
-        encoded_file_path: &[u8],
-    ) -> Result<Option<starlet_shard_registry::S3StoreConfig>, String>;
-
-    fn observe_service(&self, service_id: &str);
-
-    fn observe_heartbeat(
-        &self,
-        leader_addr: &str,
-        service_id: &str,
-        worker_group_id: u64,
-        worker_id: u64,
-    );
-}
-
-#[cfg(feature = "compat")]
-#[derive(Clone)]
-pub struct StarletGrpcService {
-    control: Arc<dyn StarletControl>,
-}
-
-#[cfg(feature = "compat")]
-fn staros_ok_status() -> proto::staros::StarStatus {
-    proto::staros::StarStatus {
-        status_code: proto::staros::StatusCode::Ok as i32,
-        error_msg: String::new(),
-        extra_info: Vec::new(),
-    }
-}
-
-#[cfg(feature = "compat")]
-fn parse_add_shard_s3_config(
-    control: &dyn StarletControl,
-    path_info: &proto::staros::FilePathInfo,
-) -> Result<Option<starlet_shard_registry::S3StoreConfig>, String> {
-    control.parse_file_path_s3_profile(&path_info.encode_to_vec())
-}
-
-#[cfg(feature = "compat")]
-fn summarize_top_counts(counts: &HashMap<String, usize>, top_n: usize) -> String {
-    if counts.is_empty() {
-        return "-".to_string();
-    }
-    let mut entries = counts
-        .iter()
-        .map(|(key, count)| (key.clone(), *count))
-        .collect::<Vec<_>>();
-    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    entries
-        .into_iter()
-        .take(top_n.max(1))
-        .map(|(key, count)| format!("{key}:{count}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 async fn grpc_unimplemented_fallback() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -1303,196 +1223,10 @@ where
     }
 }
 
-#[cfg(feature = "compat")]
-fn build_novarocks_http_app(grpc_routes: Routes, compat_routes: Router) -> Router {
-    grpc_routes
-        .into_axum_router()
-        .merge(compat_routes)
-        .route("/metrics", get(metrics_http::handle_metrics))
-}
-
-#[cfg(not(feature = "compat"))]
 fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
     grpc_routes
         .into_axum_router()
         .route("/metrics", get(metrics_http::handle_metrics))
-}
-
-#[cfg(feature = "compat")]
-#[tonic::async_trait]
-impl proto::staros::starlet_server::Starlet for StarletGrpcService {
-    async fn add_shard(
-        &self,
-        request: tonic::Request<proto::staros::AddShardRequest>,
-    ) -> Result<tonic::Response<proto::staros::AddShardResponse>, tonic::Status> {
-        let req = request.into_inner();
-        self.control.observe_service(&req.service_id);
-        let worker_id = req.worker_id;
-        let shard_count = req.shard_info.len();
-        let shard_infos = req.shard_info;
-        let control = Arc::clone(&self.control);
-
-        // AddShard may carry very large batches. Process in background so
-        // heartbeat RPCs are not blocked by shard registry updates.
-        tokio::task::spawn_blocking(move || {
-            let mut updates = Vec::with_capacity(shard_infos.len());
-            let mut invalid_shard_id = 0usize;
-            let mut missing_full_path = 0usize;
-            let mut invalid_s3_config = 0usize;
-            let mut s3_config_count = 0usize;
-            let mut s3_endpoint_counts: HashMap<String, usize> = HashMap::new();
-            let mut s3_bucket_counts: HashMap<String, usize> = HashMap::new();
-            for shard in &shard_infos {
-                let Ok(shard_id) = i64::try_from(shard.shard_id) else {
-                    invalid_shard_id += 1;
-                    continue;
-                };
-                let Some(path_info) = shard.file_path_info.as_ref() else {
-                    missing_full_path += 1;
-                    continue;
-                };
-                if path_info.full_path.trim().is_empty() {
-                    missing_full_path += 1;
-                    continue;
-                }
-                let s3 = match parse_add_shard_s3_config(control.as_ref(), path_info) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        invalid_s3_config += 1;
-                        warn!(
-                            target: "novarocks::grpc",
-                            shard_id,
-                            error = %err,
-                            "skip invalid AddShard S3 fs_info; only full_path is cached"
-                        );
-                        None
-                    }
-                };
-                if let Some(cfg) = s3.as_ref() {
-                    s3_config_count = s3_config_count.saturating_add(1);
-                    *s3_endpoint_counts
-                        .entry(cfg.endpoint().to_string())
-                        .or_insert(0) += 1;
-                    *s3_bucket_counts
-                        .entry(cfg.bucket().to_string())
-                        .or_insert(0) += 1;
-                }
-                updates.push((
-                    shard_id,
-                    starlet_shard_registry::StarletShardInfo::new(path_info.full_path.clone(), s3),
-                ));
-            }
-            let upserted = starlet_shard_registry::upsert_many_infos(updates);
-            info!(
-                target: "novarocks::grpc",
-                worker_id,
-                shard_count,
-                upserted,
-                invalid_shard_id,
-                missing_full_path,
-                invalid_s3_config,
-                s3_config_count,
-                s3_endpoint_summary = %summarize_top_counts(&s3_endpoint_counts, 3),
-                s3_bucket_summary = %summarize_top_counts(&s3_bucket_counts, 3),
-                "processed starlet AddShard"
-            );
-        });
-
-        info!(
-            target: "novarocks::grpc",
-            worker_id,
-            shard_count,
-            "accepted starlet AddShard"
-        );
-        Ok(tonic::Response::new(proto::staros::AddShardResponse {
-            status: Some(staros_ok_status()),
-        }))
-    }
-
-    async fn remove_shard(
-        &self,
-        request: tonic::Request<proto::staros::RemoveShardRequest>,
-    ) -> Result<tonic::Response<proto::staros::RemoveShardResponse>, tonic::Status> {
-        let req = request.into_inner();
-        self.control.observe_service(&req.service_id);
-        let tablet_ids = req
-            .shard_ids
-            .iter()
-            .filter_map(|id| i64::try_from(*id).ok())
-            .collect::<Vec<_>>();
-        let removed = starlet_shard_registry::remove_many(tablet_ids);
-        info!(
-            target: "novarocks::grpc",
-            worker_id = req.worker_id,
-            service_id = req.service_id,
-            shard_count = req.shard_ids.len(),
-            removed,
-            "received starlet RemoveShard"
-        );
-        Ok(tonic::Response::new(proto::staros::RemoveShardResponse {
-            status: Some(staros_ok_status()),
-        }))
-    }
-
-    async fn starlet_heartbeat(
-        &self,
-        request: tonic::Request<proto::staros::StarletHeartbeatRequest>,
-    ) -> Result<tonic::Response<proto::staros::StarletHeartbeatResponse>, tonic::Status> {
-        let req = request.into_inner();
-        self.control.observe_heartbeat(
-            &req.star_mgr_leader,
-            &req.service_id,
-            req.worker_group_id,
-            req.worker_id,
-        );
-        info!(
-            target: "novarocks::grpc",
-            worker_id = req.worker_id,
-            worker_group_id = req.worker_group_id,
-            service_id = req.service_id,
-            star_mgr_leader = req.star_mgr_leader,
-            "received starlet StarletHeartbeat"
-        );
-        Ok(tonic::Response::new(
-            proto::staros::StarletHeartbeatResponse {
-                status: Some(staros_ok_status()),
-            },
-        ))
-    }
-
-    async fn write_cache(
-        &self,
-        request: tonic::Request<proto::staros::WriteCacheRequest>,
-    ) -> Result<tonic::Response<proto::staros::WriteCacheResponse>, tonic::Status> {
-        let req = request.into_inner();
-        info!(
-            target: "novarocks::grpc",
-            shard_id = req.shard_id,
-            payload_bytes = req.data.len(),
-            "received starlet WriteCache"
-        );
-        Ok(tonic::Response::new(proto::staros::WriteCacheResponse {
-            status: Some(staros_ok_status()),
-        }))
-    }
-}
-
-#[cfg(feature = "compat")]
-pub fn start_grpc_server(
-    host: &str,
-    compat_routes: Router,
-    report_handler: Arc<dyn NativeReportHandler>,
-    starlet_control: Arc<dyn StarletControl>,
-) -> Result<(), String> {
-    start_grpc_server_on_ports(
-        host,
-        http_port(),
-        grpc_port(),
-        starlet_port(),
-        compat_routes,
-        report_handler,
-        starlet_control,
-    )
 }
 
 #[cfg(not(feature = "compat"))]
@@ -1634,218 +1368,6 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic payload".to_string())
 }
 
-#[cfg(feature = "compat")]
-async fn supervise_compat_serve_futures<H, G, S>(
-    http_server: H,
-    grpc_server: G,
-    starlet_server: S,
-    stop_requested: Arc<AtomicBool>,
-    failure_tx: mpsc::Sender<String>,
-) where
-    H: std::future::Future<Output = Result<(), String>>,
-    G: std::future::Future<Output = Result<(), String>>,
-    S: std::future::Future<Output = Result<(), String>>,
-{
-    let (service, result) = tokio::select! {
-        result = http_server => ("http", result),
-        result = grpc_server => ("grpc", result),
-        result = starlet_server => ("starlet", result),
-    };
-    if stop_requested.load(Ordering::Acquire) {
-        return;
-    }
-    let detail = match result {
-        Ok(()) => "serve future ended unexpectedly after readiness".to_string(),
-        Err(error) => format!("serve future failed after readiness: {error}"),
-    };
-    let _ = failure_tx.send(format!("grpc server {service} {detail}"));
-}
-
-#[cfg(feature = "compat")]
-fn start_grpc_server_on_ports(
-    host: &str,
-    http_port: u16,
-    grpc_port: u16,
-    starlet_port: u16,
-    compat_routes: Router,
-    report_handler: Arc<dyn NativeReportHandler>,
-    starlet_control: Arc<dyn StarletControl>,
-) -> Result<(), String> {
-    {
-        let state = grpc_server_state()
-            .lock()
-            .map_err(|_| "lock grpc server state failed".to_string())?;
-        if state.started {
-            return Ok(());
-        }
-    }
-    validate_compat_grpc_ports(http_port, grpc_port, starlet_port)?;
-    let http_listener = bind_tcp_listener(host, http_port, "novarocks http")?;
-    let grpc_listener = bind_tcp_listener(host, grpc_port, "novarocks grpc")?;
-    let starlet_listener = bind_tcp_listener(host, starlet_port, "starlet grpc")?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(8)
-        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .map_err(|error| format!("build compat grpc server runtime failed: {error}"))?;
-    let host = host.to_string();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
-    let (failure_tx, failure_rx) = mpsc::channel();
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let stop_requested_for_thread = Arc::clone(&stop_requested);
-
-    let join_handle = std::thread::Builder::new()
-        .name("compat-grpc-server".to_string())
-        .spawn(move || {
-            runtime.block_on(async move {
-                let http_listener = match TokioTcpListener::from_std(http_listener) {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(format!(
-                            "create novarocks http tokio listener failed: {error}"
-                        )));
-                        return;
-                    }
-                };
-                let grpc_listener = match TokioTcpListener::from_std(grpc_listener) {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(format!(
-                            "create novarocks grpc tokio listener failed: {error}"
-                        )));
-                        return;
-                    }
-                };
-                let starlet_listener = match TokioTcpListener::from_std(starlet_listener) {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(format!(
-                            "create starlet grpc tokio listener failed: {error}"
-                        )));
-                        return;
-                    }
-                };
-                info!(
-                    target: "novarocks::grpc",
-                    host = %host,
-                    http_port,
-                    grpc_port,
-                    starlet_port,
-                    "starting compat http and grpc servers"
-                );
-
-                let http_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                    GrpcService::execution_without_native_fragment_ingress(Arc::clone(
-                        &report_handler,
-                    )),
-                )
-                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                let http_app = build_novarocks_http_app(Routes::new(http_svc), compat_routes);
-                let grpc_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                    GrpcService::execution_without_native_fragment_ingress(report_handler),
-                )
-                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                let starlet_svc =
-                    proto::staros::starlet_server::StarletServer::new(StarletGrpcService {
-                        control: starlet_control,
-                    })
-                    .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-
-                let mut http_shutdown = shutdown_rx.clone();
-                let mut grpc_shutdown = shutdown_rx.clone();
-                let mut starlet_shutdown = shutdown_rx.clone();
-                let http_server =
-                    axum::serve(http_listener, http_app).with_graceful_shutdown(async move {
-                        while !*http_shutdown.borrow() {
-                            if http_shutdown.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                let grpc_server = Server::builder()
-                    .add_service(grpc_svc)
-                    .serve_with_incoming_shutdown(
-                        futures::stream::unfold(grpc_listener, |listener| async move {
-                            let accepted = listener.accept().await.map(|(stream, _)| stream);
-                            Some((accepted, listener))
-                        }),
-                        async move {
-                            while !*grpc_shutdown.borrow() {
-                                if grpc_shutdown.changed().await.is_err() {
-                                    break;
-                                }
-                            }
-                        },
-                    );
-                let starlet_server = Server::builder()
-                    .add_service(starlet_svc)
-                    .serve_with_incoming_shutdown(
-                        futures::stream::unfold(starlet_listener, |listener| async move {
-                            let accepted = listener.accept().await.map(|(stream, _)| stream);
-                            Some((accepted, listener))
-                        }),
-                        async move {
-                            while !*starlet_shutdown.borrow() {
-                                if starlet_shutdown.changed().await.is_err() {
-                                    break;
-                                }
-                            }
-                        },
-                    );
-                if ready_tx.send(Ok(())).is_err() {
-                    return;
-                }
-                let http_server =
-                    async move { http_server.await.map_err(|error| error.to_string()) };
-                let grpc_server =
-                    async move { grpc_server.await.map_err(|error| error.to_string()) };
-                let starlet_server =
-                    async move { starlet_server.await.map_err(|error| error.to_string()) };
-                supervise_compat_serve_futures(
-                    http_server,
-                    grpc_server,
-                    starlet_server,
-                    stop_requested_for_thread,
-                    failure_tx,
-                )
-                .await;
-            });
-        })
-        .map_err(|error| format!("spawn compat grpc server thread failed: {error}"))?;
-
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = join_handle.join();
-            return Err(error);
-        }
-        Err(error) => {
-            let _ = join_handle.join();
-            return Err(format!("compat grpc readiness channel closed: {error}"));
-        }
-    }
-    let mut state = grpc_server_state()
-        .lock()
-        .map_err(|_| "lock grpc server state failed".to_string())?;
-    if state.started {
-        let _ = shutdown_tx.send(true);
-        let _ = join_handle.join();
-        return Ok(());
-    }
-    state.started = true;
-    state.bound_port = Some(grpc_port);
-    state.shutdown_tx = Some(shutdown_tx);
-    state.join_handle = Some(join_handle);
-    state.stop_requested = Some(stop_requested);
-    state.failure_rx = Some(failure_rx);
-    Ok(())
-}
-
 pub fn grpc_server_bound_port() -> Result<u16, String> {
     if let Some(failure) = poll_grpc_server_failure()? {
         return Err(failure);
@@ -1956,53 +1478,12 @@ pub fn stop_grpc_server() -> Result<(), String> {
     Ok(())
 }
 
-fn validate_grpc_ports(http_port: u16, starlet_port: u16) -> Result<(), String> {
-    if http_port == starlet_port {
-        return Err(format!(
-            "invalid config: server.http_port ({http_port}) and server.starlet_port ({starlet_port}) must be different"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "compat")]
-fn validate_compat_grpc_ports(
-    http_port: u16,
-    grpc_port: u16,
-    starlet_port: u16,
-) -> Result<(), String> {
-    validate_grpc_ports(http_port, starlet_port)?;
-    if grpc_port == http_port || grpc_port == starlet_port {
-        return Err(format!(
-            "invalid config: server.grpc_port ({grpc_port}) must differ from server.http_port ({http_port}) and server.starlet_port ({starlet_port})"
-        ));
-    }
-    Ok(())
-}
-
 /// Parse a gRPC bind address from a host string and port.
 ///
 /// Handles bare IPv6 addresses (`::`, `::1`), bracketed IPv6 (`[::]`, `[::1]`),
 /// and IPv4/hostname strings.  Bare and bracketed IPv6 forms are parsed via
 /// `IpAddr` to avoid the `:::PORT` ambiguity that arises from naive
 /// `format!("{host}:{port}")` string concatenation.
-/// Build both gRPC server bind addresses from a single host string and two ports.
-///
-/// Uses [`parse_grpc_bind_addr`] for each port so bare IPv6 addresses like `::` and
-/// `::1` are handled correctly, avoiding the `:::PORT` ambiguity produced by naive
-/// `format!("{host}:{port}")` string concatenation.
-pub(crate) fn grpc_server_bind_addrs(
-    host: &str,
-    http_port: u16,
-    starlet_port: u16,
-) -> Result<(SocketAddr, SocketAddr), String> {
-    let http_addr = parse_grpc_bind_addr(host, http_port)
-        .map_err(|e| format!("parse grpc/http bind addr failed: {e}"))?;
-    let starlet_addr = parse_grpc_bind_addr(host, starlet_port)
-        .map_err(|e| format!("parse starlet bind addr failed: {e}"))?;
-    Ok((http_addr, starlet_addr))
-}
-
 pub(crate) fn parse_grpc_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     // Strip brackets from bracketed IPv6 literals, e.g. `[::1]` -> `::1`.
     let bare = if host.starts_with('[') && host.ends_with(']') {
@@ -2591,17 +2072,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_grpc_ports_accept_distinct_ports() {
-        assert!(validate_grpc_ports(8040, 9070).is_ok());
-    }
-
-    #[test]
-    fn test_validate_grpc_ports_reject_same_port() {
-        let err = validate_grpc_ports(8040, 8040).expect_err("expected same-port validation error");
-        assert!(err.contains("must be different"));
-    }
-
-    #[test]
     fn test_ensure_bindable_fails_for_occupied_port() {
         let occupied = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral test port");
         let occupied_port = occupied.local_addr().expect("get local addr").port();
@@ -2651,38 +2121,6 @@ mod tests {
         let addr = parse_grpc_bind_addr("0.0.0.0", 9070).expect("parse 0.0.0.0");
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(addr.port(), 9070);
-    }
-
-    // --- PR-4 regression: grpc_server_bind_addrs must use safe addr construction ---
-
-    #[test]
-    fn grpc_server_bind_addrs_bare_ipv6_wildcard_two_ports() {
-        let (http, starlet) =
-            super::grpc_server_bind_addrs("::", 8040, 9070).expect("bare :: two ports");
-        assert_eq!(http.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-        assert_eq!(http.port(), 8040);
-        assert_eq!(starlet.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-        assert_eq!(starlet.port(), 9070);
-    }
-
-    #[test]
-    fn grpc_server_bind_addrs_bare_ipv6_loopback_two_ports() {
-        let (http, starlet) =
-            super::grpc_server_bind_addrs("::1", 8040, 9070).expect("bare ::1 two ports");
-        assert_eq!(http.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
-        assert_eq!(http.port(), 8040);
-        assert_eq!(starlet.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
-        assert_eq!(starlet.port(), 9070);
-    }
-
-    #[test]
-    fn grpc_server_bind_addrs_ipv4_two_ports() {
-        let (http, starlet) =
-            super::grpc_server_bind_addrs("127.0.0.1", 8040, 9070).expect("ipv4 two ports");
-        assert_eq!(http.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(http.port(), 8040);
-        assert_eq!(starlet.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(starlet.port(), 9070);
     }
 }
 

@@ -36,6 +36,7 @@ pub(crate) mod replay_policy;
 pub(crate) mod schema;
 pub mod schema_adapter;
 pub mod schema_change;
+pub mod service_domain;
 pub mod storage_domain;
 pub(crate) mod storage_schema_wire;
 #[allow(dead_code)]
@@ -44,10 +45,17 @@ pub(crate) mod transactions;
 pub(crate) mod txn_loader;
 pub(crate) mod txn_log;
 
+pub use compaction::{execute_abort_compaction, execute_compact};
 pub(crate) use context::TabletWriteContext;
-pub(crate) use create_tablet::{
-    create_lake_tablet_from_req, create_lake_tablet_from_req_with_storage_metadata_provider,
-};
+pub(crate) use create_tablet::create_lake_tablet_from_req;
+pub use schema::{LakeCreateTabletTask, execute_lake_create_tablet_task};
 pub use schema_adapter::build_sink_tablet_schema;
-pub(crate) use schema_change::execute_update_tablet_meta_info_task_with_storage_metadata_provider;
+pub use schema_change::{
+    LakeTabletMetadataUpdate, LakeUpdateTabletMetaTask, execute_lake_update_tablet_meta_task,
+};
+pub use transactions::{
+    execute_abort_txn, execute_delete_data, execute_delete_tablet, execute_drop_table,
+    execute_get_tablet_stats, execute_publish_log_version, execute_publish_log_version_batch,
+    execute_publish_version, execute_vacuum,
+};
 pub(crate) use txn_log::append_lake_txn_log_with_chunk_rowset;

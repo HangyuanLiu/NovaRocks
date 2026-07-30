@@ -344,7 +344,8 @@ fn encode_metadata_update(value: &StorageMetadataUpdate) -> Result<MetadataUpdat
     })
 }
 
-fn decode_schema_key(key: TableSchemaKeyPb) -> StorageSchemaKey {
+/// Decode a lake-service schema key at the compat wire boundary.
+pub(crate) fn decode_schema_key(key: TableSchemaKeyPb) -> StorageSchemaKey {
     StorageSchemaKey {
         db_id: key.db_id,
         table_id: key.table_id,
@@ -898,7 +899,8 @@ fn encode_delete_predicate(predicate: &StorageDeletePredicate) -> DeletePredicat
     }
 }
 
-fn decode_delete_predicate(predicate: DeletePredicatePb) -> StorageDeletePredicate {
+/// Decode a lake-service delete predicate at the compat wire boundary.
+pub(crate) fn decode_delete_predicate(predicate: DeletePredicatePb) -> StorageDeletePredicate {
     StorageDeletePredicate {
         version: predicate.version,
         sub_predicates: predicate.sub_predicates,

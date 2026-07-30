@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::common::types::UniqueId;
 use crate::connector::starrocks::lake::storage_domain::{
@@ -161,6 +162,44 @@ pub trait StarletMetadataProvider: Send + Sync {
     ) -> Result<HashMap<i64, StarletShardInfo>, String>;
 
     fn retrieve_s3_config_for_path(&self, path: &str) -> Result<Option<S3StoreConfig>, String>;
+}
+
+/// Explicit dependencies required by lake operations that cross the StarRocks
+/// metadata or storage file boundary.
+///
+/// The execution kernel is usable without either capability in native and
+/// standalone deployments. Compat composition supplies both capabilities for
+/// requests that need remote shard recovery or protobuf storage codecs.
+#[derive(Clone, Default)]
+pub struct LakeStorageDependencies {
+    pub starlet_metadata: Option<Arc<dyn StarletMetadataProvider>>,
+    pub storage_metadata: Option<Arc<dyn StorageMetadataProvider>>,
+}
+
+impl LakeStorageDependencies {
+    pub fn with_providers(
+        starlet_metadata: Arc<dyn StarletMetadataProvider>,
+        storage_metadata: Arc<dyn StorageMetadataProvider>,
+    ) -> Self {
+        Self {
+            starlet_metadata: Some(starlet_metadata),
+            storage_metadata: Some(storage_metadata),
+        }
+    }
+
+    pub fn starlet_metadata(&self) -> Result<&Arc<dyn StarletMetadataProvider>, String> {
+        self.starlet_metadata.as_ref().ok_or_else(|| {
+            "Starlet metadata capability is unavailable because no compat provider is installed"
+                .to_string()
+        })
+    }
+
+    pub fn storage_metadata(&self) -> Result<&Arc<dyn StorageMetadataProvider>, String> {
+        self.storage_metadata.as_ref().ok_or_else(|| {
+            "storage metadata capability is unavailable because no compat provider is installed"
+                .to_string()
+        })
+    }
 }
 
 /// Domain facts returned by the FE automatic-partition operation. These are

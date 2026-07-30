@@ -14,6 +14,7 @@ struct NovaRocksCompatConfig {
     debug_exec_batch_plan_json: u8,
     log_level: u8,
     fragment_service_context: *const c_void,
+    lake_service_context: *const c_void,
 }
 
 unsafe extern "C" {
@@ -33,6 +34,7 @@ pub(crate) struct CompatConfig<'a> {
     pub debug_exec_batch_plan_json: bool,
     pub log_level: u8,
     pub fragment_service_context: *const c_void,
+    pub lake_service_context: *const c_void,
 }
 
 #[derive(Debug)]
@@ -80,6 +82,7 @@ fn start_with(
         debug_exec_batch_plan_json: u8::from(config.debug_exec_batch_plan_json),
         log_level: config.log_level,
         fragment_service_context: config.fragment_service_context,
+        lake_service_context: config.lake_service_context,
     };
     let mut error_buffer = vec![0 as c_char; ERROR_BUFFER_LEN];
     let code = native_start(
@@ -123,6 +126,7 @@ mod tests {
             debug_exec_batch_plan_json: true,
             log_level: 2,
             fragment_service_context: std::ptr::dangling(),
+            lake_service_context: std::ptr::dangling(),
         };
 
         start_with(&config, |native, _, _| {
@@ -139,6 +143,7 @@ mod tests {
                 native.fragment_service_context,
                 config.fragment_service_context
             );
+            assert_eq!(native.lake_service_context, config.lake_service_context);
             0
         })
         .expect("native start");
@@ -167,6 +172,10 @@ mod tests {
             offset_of!(NovaRocksCompatConfig, log_level)
                 < offset_of!(NovaRocksCompatConfig, fragment_service_context)
         );
+        assert!(
+            offset_of!(NovaRocksCompatConfig, fragment_service_context)
+                < offset_of!(NovaRocksCompatConfig, lake_service_context)
+        );
     }
 
     #[test]
@@ -180,6 +189,7 @@ mod tests {
             debug_exec_batch_plan_json: false,
             log_level: 0,
             fragment_service_context: std::ptr::dangling(),
+            lake_service_context: std::ptr::dangling(),
         };
 
         let error = start_with(&config, |_, _, _| {
@@ -203,6 +213,7 @@ mod tests {
             debug_exec_batch_plan_json: false,
             log_level: 0,
             fragment_service_context: std::ptr::dangling(),
+            lake_service_context: std::ptr::dangling(),
         };
 
         let error = start_with(&config, |_, buffer, buffer_len| {

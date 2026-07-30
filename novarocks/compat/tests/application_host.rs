@@ -10,6 +10,7 @@ struct FakePorts {
     fail_stops: HashSet<&'static str>,
     polls: Arc<Mutex<VecDeque<Result<Option<String>, String>>>>,
     brpc_fragment_contexts: Arc<Mutex<Vec<usize>>>,
+    brpc_lake_contexts: Arc<Mutex<Vec<usize>>>,
     native_report_rejection:
         Arc<Mutex<Option<novarocks::query_execution::report::NativeReportHandlerError>>>,
 }
@@ -22,6 +23,7 @@ impl FakePorts {
             fail_stops: HashSet::new(),
             polls: Arc::new(Mutex::new(VecDeque::new())),
             brpc_fragment_contexts: Arc::new(Mutex::new(Vec::new())),
+            brpc_lake_contexts: Arc::new(Mutex::new(Vec::new())),
             native_report_rejection: Arc::new(Mutex::new(None)),
         }
     }
@@ -52,10 +54,10 @@ impl FakePorts {
 impl CompatPorts for FakePorts {
     fn start_grpc(
         &mut self,
-        _host: &str,
+        _config: crate::listeners::CompatListenerConfig,
         _compat_routes: axum::Router,
         report_handler: Arc<dyn novarocks::query_execution::report::NativeReportHandler>,
-        _starlet_control: Arc<dyn novarocks::service::grpc_server::StarletControl>,
+        _starlet_control: Arc<dyn crate::listeners::StarletControl>,
     ) -> Result<(), String> {
         let rejection = report_handler
             .handle_native_report(Default::default())
@@ -66,20 +68,19 @@ impl CompatPorts for FakePorts {
 
     fn start_heartbeat(
         &mut self,
-        _config: novarocks::service::heartbeat_service::HeartbeatConfig,
-        _disk_report_sender: Arc<dyn novarocks::service::disk_report::DiskReportSender>,
+        _config: crate::heartbeat_service::HeartbeatConfig,
+        _control: Arc<crate::control::FrontendControlState>,
+        _disk_report_worker: Arc<crate::disk_report::DiskReportWorker>,
     ) -> Result<(), String> {
         self.start("heartbeat")
     }
 
     fn start_backend(
         &mut self,
-        _config: novarocks::service::backend_service::BackendServiceConfig,
-        _load_channel_finisher: Arc<dyn novarocks::service::backend_service::LoadChannelFinisher>,
-        _finish_task_sender: Arc<dyn novarocks::service::backend_service::FinishTaskSender>,
-        _lake_agent_task_adapter: Arc<
-            dyn novarocks::service::backend_service::LakeAgentTaskAdapter,
-        >,
+        _config: crate::backend_service::BackendServiceConfig,
+        _control: Arc<crate::control::FrontendControlState>,
+        _load_service: Arc<crate::load::CompatLoadService>,
+        _lake_agent_task_adapter: Arc<crate::lake_agent_tasks::CompatLakeAgentTaskAdapter>,
     ) -> Result<(), String> {
         self.start("backend")
     }
@@ -89,7 +90,19 @@ impl CompatPorts for FakePorts {
             .lock()
             .unwrap()
             .push(config.fragment_service_context as usize);
+        self.brpc_lake_contexts
+            .lock()
+            .unwrap()
+            .push(config.lake_service_context as usize);
         self.start("brpc")
+    }
+
+    fn poll_heartbeat_failure(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    fn poll_backend_failure(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
     }
 
     fn poll_grpc_failure(&mut self) -> Result<Option<String>, String> {
@@ -156,6 +169,7 @@ fn starts_ports_in_frozen_order_and_preserves_marker_and_summary() {
     let ports = FakePorts::new();
     let events = ports.events.clone();
     let brpc_fragment_contexts = ports.brpc_fragment_contexts.clone();
+    let brpc_lake_contexts = ports.brpc_lake_contexts.clone();
     let host = CompatApplicationHost::open_with_ports(test_config(), ports)
         .expect("open compat application");
 
@@ -180,6 +194,8 @@ fn starts_ports_in_frozen_order_and_preserves_marker_and_summary() {
         "novarocksd started (bind_host=127.0.0.1, advertise_host=be.example.test, advertise_port=19071, heartbeat_port=19050, be_port=19060, brpc_port=18060, http_port=18040, grpc_port=19080, starlet_port=19070)"
     );
     assert_eq!(brpc_fragment_contexts.lock().unwrap().len(), 1);
+    assert_eq!(brpc_lake_contexts.lock().unwrap().len(), 1);
+    assert_ne!(brpc_lake_contexts.lock().unwrap()[0], 0);
 
     host.shutdown().expect("shutdown compat application");
 }

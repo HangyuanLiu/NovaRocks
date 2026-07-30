@@ -39,6 +39,8 @@ use novarocks::thrift::frontend_service::{FrontendServiceSyncClient, TFrontendSe
 use novarocks::thrift::types;
 use novarocks::thrift::{descriptors, frontend_service, status, status_code};
 
+use crate::control::FrontendControlState;
+
 type FrontendRpcClientInner = FrontendServiceSyncClient<
     TBinaryInputProtocol<TBufferedReadTransport<TReadHalf<TTcpChannel>>>,
     TBinaryOutputProtocol<TBufferedWriteTransport<TWriteHalf<TTcpChannel>>>,
@@ -188,10 +190,12 @@ fn call_latest_control<T, F>(mut call: F) -> Result<T, LoadFrontendRpcError>
 where
     F: FnMut(&mut dyn TFrontendServiceSyncClient) -> Result<T, FrontendRpcError>,
 {
-    let fe_addr = novarocks::service::disk_report::latest_fe_addr()
+    let manager = shared().map_err(|error| LoadFrontendRpcError::Rpc(error.to_string()))?;
+    let fe_addr = manager
+        .control_state()
+        .latest_fe_addr()
         .ok_or(LoadFrontendRpcError::MissingFeAddress)?;
-    shared()
-        .map_err(|error| LoadFrontendRpcError::Rpc(error.to_string()))?
+    manager
         .call(FrontendRpcKind::Control, &fe_addr, |client| call(client))
         .map_err(|error| LoadFrontendRpcError::Rpc(error.to_string()))
 }
@@ -285,6 +289,7 @@ impl Drop for PermitGuard<'_> {
 }
 
 pub(crate) struct FrontendRpcManager {
+    control: Arc<FrontendControlState>,
     settings: FrontendRpcSettings,
     nofile_limit: NoFileLimit,
     host_pools: Mutex<HashMap<String, HostClientPool>>,
@@ -296,10 +301,11 @@ pub(crate) struct FrontendRpcManager {
 }
 
 impl FrontendRpcManager {
-    fn new(settings: FrontendRpcSettings) -> Self {
+    fn new(settings: FrontendRpcSettings, control: Arc<FrontendControlState>) -> Self {
         let nofile_limit = read_nofile_limit();
         log_nofile_limit(nofile_limit);
         Self {
+            control,
             total_permits: PermitPool::new(settings.max_inflight_total),
             schema_meta_permits: PermitPool::new(settings.max_inflight_schema),
             exec_status_permits: PermitPool::new(settings.max_inflight_exec_status),
@@ -311,8 +317,15 @@ impl FrontendRpcManager {
         }
     }
 
-    fn from_current_config() -> Arc<Self> {
-        Arc::new(FrontendRpcManager::new(FrontendRpcSettings::from_config()))
+    fn from_current_config(control: Arc<FrontendControlState>) -> Arc<Self> {
+        Arc::new(FrontendRpcManager::new(
+            FrontendRpcSettings::from_config(),
+            control,
+        ))
+    }
+
+    pub(crate) fn control_state(&self) -> Arc<FrontendControlState> {
+        Arc::clone(&self.control)
     }
 
     pub(crate) fn call<T, F>(
@@ -647,7 +660,14 @@ fn manager_slot() -> &'static ManagerSlot {
 
 /// Creates the sole FE transport manager for a compat application host.
 pub(crate) fn create_manager() -> Arc<FrontendRpcManager> {
-    FrontendRpcManager::from_current_config()
+    create_manager_with_control(Arc::new(FrontendControlState::new()))
+}
+
+/// Creates a manager bound to the caller's compat-host control state.
+pub(crate) fn create_manager_with_control(
+    control: Arc<FrontendControlState>,
+) -> Arc<FrontendRpcManager> {
+    FrontendRpcManager::from_current_config(control)
 }
 
 /// Installs a host-owned manager for the duration of a compat application.
@@ -680,6 +700,14 @@ fn shared() -> Result<Arc<FrontendRpcManager>, FrontendRpcError> {
                 "Frontend RPC capability is unavailable because no compat application host is running",
             )
         })
+}
+
+/// Returns the heartbeat-derived FE address for the active compat host.
+///
+/// Schema adapters use this narrow accessor rather than reaching into a core
+/// process-global heartbeat cache.
+pub(crate) fn latest_fe_addr() -> Option<types::TNetworkAddress> {
+    shared().ok()?.control_state().latest_fe_addr()
 }
 
 /// Narrow StarRocks FE operations used by compat-owned protocol adapters.
@@ -1164,6 +1192,22 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "FE getTableSchema response: status=TStatusCode(6), error=upstream rejected schema request"
+        );
+    }
+
+    #[test]
+    fn manager_reads_control_address_from_its_host_state() {
+        let control = Arc::new(FrontendControlState::new());
+        let manager = create_manager_with_control(Arc::clone(&control));
+        control.observe_heartbeat(
+            &types::TNetworkAddress::new("fe.example".to_string(), 9020),
+            Some(8030),
+            "be.example".to_string(),
+        );
+
+        assert_eq!(
+            manager.control_state().latest_fe_addr(),
+            Some(types::TNetworkAddress::new("fe.example".to_string(), 9020))
         );
     }
 }

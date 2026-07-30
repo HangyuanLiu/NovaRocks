@@ -200,7 +200,7 @@ pub fn build_sink_tablet_schema(
     })
 }
 
-pub(crate) fn build_create_tablet_schema(
+pub fn build_create_tablet_schema(
     request: &crate::thrift::agent_service::TCreateTabletReq,
 ) -> Result<StarRocksTabletSchema, String> {
     let schema = &request.tablet_schema;

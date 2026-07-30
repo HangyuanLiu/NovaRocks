@@ -20,10 +20,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use novarocks::novarocks_logging::{error, info, warn};
 
 use crate::protocol::starrocks::thrift_codec::thrift_binary_deserialize;
+use crate::thrift_debug::thrift_named_json;
 use novarocks::common::app_config;
 use novarocks::common::config::debug_exec_batch_plan_json;
 use novarocks::connector::starrocks::ports::LakeMetaStorageResolver;
-use novarocks::service::thrift_debug::thrift_named_json;
 
 use crate::protocol::starrocks::compat::endpoint::destination_address;
 use crate::protocol::starrocks::compat::request::backfill_per_node_scan_ranges;

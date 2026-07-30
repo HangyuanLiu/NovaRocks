@@ -23,3 +23,9 @@ pub mod plan;
 pub(crate) mod routing;
 
 pub use factory::OlapTableSinkFactory;
+
+/// Drops cached auto-increment allocation facts for a table after an FE agent
+/// task removes that table's allocation map.
+pub fn clear_auto_increment_cache_for_table(table_id: i64) {
+    auto_increment::clear_auto_increment_cache_for_table(table_id);
+}

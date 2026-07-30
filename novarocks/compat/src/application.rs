@@ -8,17 +8,23 @@ use std::time::Duration;
 use axum::Router;
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
+use novarocks::connector::starrocks::ports::LakeStorageDependencies;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::fragment::io::SyncFragmentExecutor;
-use novarocks::service::{backend_service, grpc_server, heartbeat_service};
 use novarocks::thrift::{master_service, types};
 
+use crate::backend_service::{self, BackendServiceHandle};
 use crate::brpc;
+use crate::control::FrontendControlState;
+use crate::disk_report::{DiskReportSender, DiskReportWorker};
 use crate::fragment::{
     CompatFragmentService, brpc_exchange_transmitter, brpc_fragment_lookup_client,
     compat_result_writer, lake_meta_storage_resolver,
 };
 use crate::frontend_rpc;
+use crate::heartbeat_service::{self, HeartbeatServer};
+use crate::lake_storage::CompatLakeStorageService;
+use crate::listeners::{self, CompatListenerConfig, CompatListenerGroup};
 use crate::load::{
     CompatLoadRegistry, CompatLoadService, LoadTrackingStore, router as load_router,
 };
@@ -48,27 +54,9 @@ fn compat_native_report_handler() -> Arc<dyn NativeReportHandler> {
     Arc::new(CompatNativeReportHandler)
 }
 
-struct CompatFinishTaskSender;
-
-impl backend_service::FinishTaskSender for CompatFinishTaskSender {
-    fn send_finish_task(
-        &self,
-        fe_addr: &types::TNetworkAddress,
-        request: &master_service::TFinishTaskRequest,
-    ) -> Result<master_service::TMasterResult, backend_service::FinishTaskSendError> {
-        frontend_rpc::finish_task(fe_addr, request.clone()).map_err(|error| {
-            if frontend_rpc::is_transport_error(&error) {
-                backend_service::FinishTaskSendError::transport(error)
-            } else {
-                backend_service::FinishTaskSendError::failed(error)
-            }
-        })
-    }
-}
-
 struct CompatDiskReportSender;
 
-impl novarocks::service::disk_report::DiskReportSender for CompatDiskReportSender {
+impl DiskReportSender for CompatDiskReportSender {
     fn send_disk_report(
         &self,
         fe_addr: &types::TNetworkAddress,
@@ -134,7 +122,6 @@ struct StartedResources {
     backend: bool,
     brpc: bool,
     report: bool,
-    starlet_metadata: bool,
     frontend_rpc: bool,
 }
 
@@ -144,6 +131,9 @@ pub struct CompatApplicationHost {
     fragment_service: Arc<CompatFragmentService>,
     report_service: Arc<CompatReportService>,
     load_service: Arc<CompatLoadService>,
+    lake_storage_service: Arc<CompatLakeStorageService>,
+    control: Arc<FrontendControlState>,
+    disk_report_worker: Arc<DiskReportWorker>,
     tracking: Arc<LoadTrackingStore>,
     ready_marker: String,
     startup_summary: String,
@@ -172,7 +162,7 @@ impl Drop for CompatApplicationHost {
 
 impl CompatApplicationHost {
     pub fn open(config: CompatServerConfig) -> Result<Self, CompatApplicationError> {
-        Self::open_with_ports(config, LiveCompatPorts)
+        Self::open_with_ports(config, LiveCompatPorts::default())
     }
 
     pub fn ready_marker(&self) -> &str {
@@ -186,19 +176,49 @@ impl CompatApplicationHost {
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<CompatApplicationError>, CompatApplicationError> {
-        self.ports
-            .poll_grpc_failure()
-            .map_err(|error| {
-                CompatApplicationError::new(
-                    CompatApplicationErrorKind::Supervision,
-                    format!("poll compat grpc supervisor failed: {error}"),
-                )
-            })
-            .map(|failure| {
-                failure.map(|error| {
-                    CompatApplicationError::new(CompatApplicationErrorKind::Supervision, error)
-                })
-            })
+        if let Some(error) = self.disk_report_worker.poll_failure() {
+            return Ok(Some(CompatApplicationError::new(
+                CompatApplicationErrorKind::Supervision,
+                format!("disk report worker failed: {error}"),
+            )));
+        }
+        let heartbeat_failure = self.ports.poll_heartbeat_failure().map_err(|error| {
+            CompatApplicationError::new(
+                CompatApplicationErrorKind::Supervision,
+                format!("poll heartbeat supervisor failed: {error}"),
+            )
+        })?;
+        if let Some(error) = heartbeat_failure {
+            return Ok(Some(CompatApplicationError::new(
+                CompatApplicationErrorKind::Supervision,
+                error,
+            )));
+        }
+        let backend_failure = self.ports.poll_backend_failure().map_err(|error| {
+            CompatApplicationError::new(
+                CompatApplicationErrorKind::Supervision,
+                format!("poll backend supervisor failed: {error}"),
+            )
+        })?;
+        if let Some(error) = backend_failure {
+            return Ok(Some(CompatApplicationError::new(
+                CompatApplicationErrorKind::Supervision,
+                error,
+            )));
+        }
+        let grpc_failure = self.ports.poll_grpc_failure().map_err(|error| {
+            CompatApplicationError::new(
+                CompatApplicationErrorKind::Supervision,
+                format!("poll compat grpc supervisor failed: {error}"),
+            )
+        })?;
+        if let Some(error) = grpc_failure {
+            return Ok(Some(CompatApplicationError::new(
+                CompatApplicationErrorKind::Supervision,
+                error,
+            )));
+        }
+        Ok(None)
     }
 
     pub fn shutdown(mut self) -> Result<(), CompatApplicationError> {
@@ -270,12 +290,23 @@ impl CompatApplicationHost {
         let load_registry = Arc::new(CompatLoadRegistry::default());
         let tracking = Arc::new(LoadTrackingStore::default());
         let report_service = new_report_service_with_tracking(Arc::clone(&tracking));
-        let frontend_rpc_manager = frontend_rpc::create_manager();
+        let control = Arc::new(FrontendControlState::new());
+        let frontend_rpc_manager = frontend_rpc::create_manager_with_control(Arc::clone(&control));
+        let disk_report_worker = Arc::new(DiskReportWorker::new(
+            Arc::clone(&control),
+            Arc::new(CompatDiskReportSender),
+        ));
         let starlet_metadata_adapter = crate::starlet_metadata::starlet_metadata_adapter();
         let starlet_metadata_provider: Arc<
             dyn novarocks::connector::starrocks::ports::StarletMetadataProvider,
         > = starlet_metadata_adapter.clone();
         let storage_metadata_provider = crate::storage_wire::storage_metadata_provider();
+        let lake_storage_service = Arc::new(CompatLakeStorageService::new(
+            LakeStorageDependencies::with_providers(
+                Arc::clone(&starlet_metadata_provider),
+                Arc::clone(&storage_metadata_provider),
+            ),
+        ));
         let fragment_service = Arc::new(CompatFragmentService::new_with_connector_dependencies(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             brpc_exchange_transmitter(),
@@ -323,6 +354,7 @@ impl CompatApplicationHost {
             debug_exec_batch_plan_json: config.debug.exec_batch_plan_json,
             log_level,
             fragment_service_context: Arc::as_ptr(&fragment_service).cast(),
+            lake_service_context: Arc::as_ptr(&lake_storage_service).cast(),
         };
 
         let mut host = Self {
@@ -331,17 +363,15 @@ impl CompatApplicationHost {
             fragment_service,
             report_service,
             load_service,
+            lake_storage_service,
+            control: Arc::clone(&control),
+            disk_report_worker: Arc::clone(&disk_report_worker),
             tracking,
             ready_marker,
             startup_summary,
             #[cfg(test)]
             _test_lifecycle_lock: test_lifecycle_lock,
         };
-        if let Err(error) = novarocks::service::starlet_metadata::install(starlet_metadata_provider)
-        {
-            return Err(host.start_failure(CompatApplicationErrorKind::Configuration, error));
-        }
-        host.started.starlet_metadata = true;
         if let Err(error) = frontend_rpc::install(frontend_rpc_manager) {
             return Err(host.start_failure(CompatApplicationErrorKind::Configuration, error));
         }
@@ -354,7 +384,12 @@ impl CompatApplicationHost {
         }
         host.started.report = true;
         if let Err(error) = host.ports.start_grpc(
-            &server.host,
+            CompatListenerConfig {
+                host: server.host.clone(),
+                http_port: server.http_port,
+                grpc_port: server.grpc_port,
+                starlet_port: server.starlet_port,
+            },
             compat_routes,
             compat_native_report_handler(),
             starlet_metadata_adapter,
@@ -365,28 +400,23 @@ impl CompatApplicationHost {
             ));
         }
         host.started.grpc = true;
-        let disk_report_sender: Arc<dyn novarocks::service::disk_report::DiskReportSender> =
-            Arc::new(CompatDiskReportSender);
-        if let Err(error) = host
-            .ports
-            .start_heartbeat(heartbeat_config, disk_report_sender)
-        {
+        if let Err(error) = host.ports.start_heartbeat(
+            heartbeat_config,
+            Arc::clone(&control),
+            Arc::clone(&disk_report_worker),
+        ) {
             return Err(host.start_failure(
                 CompatApplicationErrorKind::HeartbeatStart,
                 format!("start heartbeat listener: {error}"),
             ));
         }
         host.started.heartbeat = true;
-        let load_channel_finisher: Arc<dyn backend_service::LoadChannelFinisher> =
-            host.load_service.clone();
-        let finish_task_sender: Arc<dyn backend_service::FinishTaskSender> =
-            Arc::new(CompatFinishTaskSender);
         let lake_agent_task_adapter =
             crate::lake_agent_tasks::lake_agent_task_adapter(storage_metadata_provider);
         if let Err(error) = host.ports.start_backend(
             backend_config,
-            load_channel_finisher,
-            finish_task_sender,
+            Arc::clone(&control),
+            Arc::clone(&host.load_service),
             lake_agent_task_adapter,
         ) {
             return Err(host.start_failure(
@@ -436,17 +466,14 @@ impl CompatApplicationHost {
             }
             self.started.heartbeat = false;
         }
+        if let Err(error) = self.disk_report_worker.shutdown() {
+            failures.push(format!("stop disk report worker failed: {error}"));
+        }
         if self.started.grpc {
             if let Err(error) = self.ports.stop_grpc() {
                 failures.push(format!("stop grpc server failed: {error}"));
             }
             self.started.grpc = false;
-        }
-        if self.started.starlet_metadata {
-            if let Err(error) = novarocks::service::starlet_metadata::clear() {
-                failures.push(format!("clear Starlet metadata callback failed: {error}"));
-            }
-            self.started.starlet_metadata = false;
         }
         self.load_service.finish_shutdown();
         self.tracking.clear();
@@ -475,7 +502,11 @@ pub fn run_compat_server_until_shutdown<F>(
 where
     F: FnMut() -> bool,
 {
-    run_compat_server_until_shutdown_with_ports(config, shutdown_requested, LiveCompatPorts)
+    run_compat_server_until_shutdown_with_ports(
+        config,
+        shutdown_requested,
+        LiveCompatPorts::default(),
+    )
 }
 
 fn run_compat_server_until_shutdown_with_ports<F>(
@@ -533,24 +564,27 @@ fn compat_log_level(level: &str) -> u8 {
 trait CompatPorts: Send {
     fn start_grpc(
         &mut self,
-        host: &str,
+        config: CompatListenerConfig,
         compat_routes: Router,
         report_handler: Arc<dyn NativeReportHandler>,
-        starlet_control: Arc<dyn grpc_server::StarletControl>,
+        starlet_control: Arc<dyn listeners::StarletControl>,
     ) -> Result<(), String>;
     fn start_heartbeat(
         &mut self,
         config: heartbeat_service::HeartbeatConfig,
-        disk_report_sender: Arc<dyn novarocks::service::disk_report::DiskReportSender>,
+        control: Arc<FrontendControlState>,
+        disk_report_worker: Arc<DiskReportWorker>,
     ) -> Result<(), String>;
     fn start_backend(
         &mut self,
         config: backend_service::BackendServiceConfig,
-        load_channel_finisher: Arc<dyn backend_service::LoadChannelFinisher>,
-        finish_task_sender: Arc<dyn backend_service::FinishTaskSender>,
-        lake_agent_task_adapter: Arc<dyn backend_service::LakeAgentTaskAdapter>,
+        control: Arc<FrontendControlState>,
+        load_service: Arc<CompatLoadService>,
+        lake_agent_task_adapter: Arc<crate::lake_agent_tasks::CompatLakeAgentTaskAdapter>,
     ) -> Result<(), String>;
     fn start_brpc(&mut self, config: &brpc::CompatConfig<'_>) -> Result<(), String>;
+    fn poll_heartbeat_failure(&mut self) -> Result<Option<String>, String>;
+    fn poll_backend_failure(&mut self) -> Result<Option<String>, String>;
     fn poll_grpc_failure(&mut self) -> Result<Option<String>, String>;
     fn stop_brpc(&mut self);
     fn stop_backend(&mut self) -> Result<(), String>;
@@ -558,48 +592,76 @@ trait CompatPorts: Send {
     fn stop_grpc(&mut self) -> Result<(), String>;
 }
 
-struct LiveCompatPorts;
+#[derive(Default)]
+struct LiveCompatPorts {
+    heartbeat: Option<HeartbeatServer>,
+    backend: Option<BackendServiceHandle>,
+    listeners: Option<CompatListenerGroup>,
+}
 
 impl CompatPorts for LiveCompatPorts {
     fn start_grpc(
         &mut self,
-        host: &str,
+        config: CompatListenerConfig,
         compat_routes: Router,
         report_handler: Arc<dyn NativeReportHandler>,
-        starlet_control: Arc<dyn grpc_server::StarletControl>,
+        starlet_control: Arc<dyn listeners::StarletControl>,
     ) -> Result<(), String> {
-        grpc_server::start_grpc_server(host, compat_routes, report_handler, starlet_control)
+        self.listeners = Some(CompatListenerGroup::start(
+            config,
+            compat_routes,
+            report_handler,
+            starlet_control,
+        )?);
+        Ok(())
     }
 
     fn start_heartbeat(
         &mut self,
         config: heartbeat_service::HeartbeatConfig,
-        disk_report_sender: Arc<dyn novarocks::service::disk_report::DiskReportSender>,
+        control: Arc<FrontendControlState>,
+        disk_report_worker: Arc<DiskReportWorker>,
     ) -> Result<(), String> {
-        heartbeat_service::start_heartbeat_server(config, disk_report_sender)
+        self.heartbeat = Some(HeartbeatServer::start(config, control, disk_report_worker)?);
+        Ok(())
     }
 
     fn start_backend(
         &mut self,
         config: backend_service::BackendServiceConfig,
-        load_channel_finisher: Arc<dyn backend_service::LoadChannelFinisher>,
-        finish_task_sender: Arc<dyn backend_service::FinishTaskSender>,
-        lake_agent_task_adapter: Arc<dyn backend_service::LakeAgentTaskAdapter>,
+        control: Arc<FrontendControlState>,
+        load_service: Arc<CompatLoadService>,
+        lake_agent_task_adapter: Arc<crate::lake_agent_tasks::CompatLakeAgentTaskAdapter>,
     ) -> Result<(), String> {
-        backend_service::start_backend_service(
+        self.backend = Some(backend_service::start_backend_service(
             config,
-            load_channel_finisher,
-            finish_task_sender,
+            control,
+            load_service,
             lake_agent_task_adapter,
-        )
+        )?);
+        Ok(())
     }
 
     fn start_brpc(&mut self, config: &brpc::CompatConfig<'_>) -> Result<(), String> {
         brpc::start(config).map_err(|error| error.to_string())
     }
 
+    fn poll_heartbeat_failure(&mut self) -> Result<Option<String>, String> {
+        self.heartbeat
+            .as_mut()
+            .map_or(Ok(None), HeartbeatServer::poll_failure)
+    }
+
+    fn poll_backend_failure(&mut self) -> Result<Option<String>, String> {
+        self.backend
+            .as_ref()
+            .map_or(Ok(None), BackendServiceHandle::poll_failure)
+    }
+
     fn poll_grpc_failure(&mut self) -> Result<Option<String>, String> {
-        grpc_server::poll_grpc_server_failure()
+        self.listeners
+            .as_ref()
+            .map_or(Ok(None), CompatListenerGroup::poll_failure)
     }
 
     fn stop_brpc(&mut self) {
@@ -607,15 +669,19 @@ impl CompatPorts for LiveCompatPorts {
     }
 
     fn stop_backend(&mut self) -> Result<(), String> {
-        backend_service::stop_backend_service()
+        self.backend.take().map_or(Ok(()), |handle| handle.stop())
     }
 
     fn stop_heartbeat(&mut self) -> Result<(), String> {
-        heartbeat_service::stop_heartbeat_server()
+        self.heartbeat
+            .take()
+            .map_or(Ok(()), |mut server| server.stop())
     }
 
     fn stop_grpc(&mut self) -> Result<(), String> {
-        grpc_server::stop_grpc_server()
+        self.listeners
+            .take()
+            .map_or(Ok(()), |listeners| listeners.stop())
     }
 }
 

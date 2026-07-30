@@ -15,55 +15,219 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compat composition for the temporary BackendService lake-agent callback.
+//! StarRocks BackendService lake-agent request adapter.
 
 use std::sync::Arc;
 
-use novarocks::connector::starrocks::lake::schema_adapter::build_tablet_schema_from_thrift;
+use novarocks::connector::starrocks::lake::schema_adapter::{
+    build_create_tablet_schema, build_tablet_schema_from_thrift,
+};
 use novarocks::connector::starrocks::lake::schema_change::{
-    CompiledRollupExpression, LakeAlterTabletMode, LakeAlterTabletTask, RollupExpressionProgram,
-    RollupInputSlot, RollupMaterializedViewParam,
+    CompiledRollupExpression, LakeAlterTabletMode, LakeAlterTabletTask, LakeTabletMetadataUpdate,
+    LakeUpdateTabletMetaTask, RollupExpressionProgram, RollupInputSlot,
+    RollupMaterializedViewParam,
+};
+use novarocks::connector::starrocks::lake::storage_domain::{
+    StorageFlatJsonConfig, StorageMetadataUpdate,
 };
 use novarocks::exec::expr::ExprArena;
 use novarocks::runtime::starlet_shard_registry::StarletShardInfo;
-use novarocks::service::backend_service::{self, LakeAgentTaskAdapter};
+use novarocks::service::grpc_client::proto::starrocks::{
+    CompactionStrategyPb, PersistentIndexTypePb,
+};
 use novarocks::thrift::agent_service::{
-    TAlterJobType, TAlterTabletReqV2, TCreateTabletReq, TTabletType, TUpdateTabletMetaInfoReq,
+    TAlterJobType, TAlterTabletReqV2, TCompactionStrategy, TCreateTabletReq, TPersistentIndexType,
+    TTabletType, TUpdateTabletMetaInfoReq,
 };
 use novarocks::thrift::exprs::TExpr;
 
-struct CompatLakeAgentTaskAdapter {
+pub(crate) struct CompatLakeAgentTaskAdapter {
     storage_metadata_provider:
         Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>,
 }
 
-impl LakeAgentTaskAdapter for CompatLakeAgentTaskAdapter {
-    fn create_tablet(
+impl CompatLakeAgentTaskAdapter {
+    pub(crate) fn create_tablet(
         &self,
         request: &TCreateTabletReq,
         shard_info: &StarletShardInfo,
     ) -> Result<(), String> {
-        backend_service::execute_lake_create_tablet(
-            request,
-            shard_info,
+        novarocks::connector::starrocks::lake::execute_lake_create_tablet_task(
+            adapt_create_tablet_task(request, shard_info)?,
             Arc::clone(&self.storage_metadata_provider),
         )
     }
 
-    fn alter_tablet(&self, request: &TAlterTabletReqV2) -> Result<(), String> {
+    pub(crate) fn alter_tablet(&self, request: &TAlterTabletReqV2) -> Result<(), String> {
         let task = adapt_alter_tablet_task(request)?;
-        backend_service::execute_lake_alter_tablet(
+        novarocks::connector::starrocks::lake::schema_change::execute_lake_alter_tablet_task(
             task,
             Arc::clone(&self.storage_metadata_provider),
         )
     }
 
-    fn update_tablet_meta_info(&self, request: &TUpdateTabletMetaInfoReq) -> Result<(), String> {
-        backend_service::execute_lake_update_tablet_meta_info(
-            request,
+    pub(crate) fn update_tablet_meta_info(
+        &self,
+        request: &TUpdateTabletMetaInfoReq,
+    ) -> Result<(), String> {
+        novarocks::connector::starrocks::lake::execute_lake_update_tablet_meta_task(
+            adapt_update_tablet_meta_task(request)?,
             Arc::clone(&self.storage_metadata_provider),
         )
     }
+}
+
+fn adapt_create_tablet_task(
+    request: &TCreateTabletReq,
+    shard_info: &StarletShardInfo,
+) -> Result<novarocks::connector::starrocks::lake::LakeCreateTabletTask, String> {
+    Ok(
+        novarocks::connector::starrocks::lake::LakeCreateTabletTask {
+            tablet_id: request.tablet_id,
+            table_id: request.table_id.unwrap_or(0),
+            tablet_root_path: shard_info.full_path().to_string(),
+            tablet_schema: build_create_tablet_schema(request)?,
+            s3_config: shard_info.s3().cloned(),
+            enable_persistent_index: request.enable_persistent_index,
+            persistent_index_type: request
+                .persistent_index_type
+                .map(map_create_tablet_persistent_index_type)
+                .transpose()?,
+            gtid: request.gtid.unwrap_or(0),
+            compaction_strategy: request
+                .compaction_strategy
+                .map(map_create_tablet_compaction_strategy)
+                .transpose()?
+                .or(Some(CompactionStrategyPb::Default as i32)),
+            flat_json_config: request
+                .flat_json_config
+                .as_ref()
+                .map(|cfg| StorageFlatJsonConfig {
+                    enabled: cfg.flat_json_enable,
+                    null_factor: cfg.flat_json_null_factor.map(|value| value.0),
+                    sparsity_factor: cfg.flat_json_sparsity_factor.map(|value| value.0),
+                    max_column_max: cfg.flat_json_column_max,
+                }),
+            enable_tablet_creation_optimization: request
+                .enable_tablet_creation_optimization
+                .unwrap_or(false),
+        },
+    )
+}
+
+fn map_create_tablet_persistent_index_type(
+    persistent_index_type: TPersistentIndexType,
+) -> Result<i32, String> {
+    if persistent_index_type == TPersistentIndexType::LOCAL {
+        return Ok(PersistentIndexTypePb::Local as i32);
+    }
+    if persistent_index_type == TPersistentIndexType::CLOUD_NATIVE {
+        return Ok(PersistentIndexTypePb::CloudNative as i32);
+    }
+    Err(format!(
+        "unsupported create_tablet persistent_index_type={persistent_index_type:?}"
+    ))
+}
+
+fn map_create_tablet_compaction_strategy(
+    compaction_strategy: TCompactionStrategy,
+) -> Result<i32, String> {
+    if compaction_strategy == TCompactionStrategy::DEFAULT {
+        return Ok(CompactionStrategyPb::Default as i32);
+    }
+    if compaction_strategy == TCompactionStrategy::REAL_TIME {
+        return Ok(CompactionStrategyPb::RealTime as i32);
+    }
+    Err(format!(
+        "unsupported create_tablet compaction_strategy={compaction_strategy:?}"
+    ))
+}
+
+fn adapt_update_tablet_meta_task(
+    request: &TUpdateTabletMetaInfoReq,
+) -> Result<LakeUpdateTabletMetaTask, String> {
+    let tablet_type = request.tablet_type.unwrap_or(TTabletType::TABLET_TYPE_DISK);
+    if tablet_type != TTabletType::TABLET_TYPE_LAKE {
+        return Err(format!(
+            "update_tablet_meta_info unsupported tablet_type={tablet_type:?} (only TABLET_TYPE_LAKE is supported)"
+        ));
+    }
+    let txn_id = request
+        .txn_id
+        .ok_or_else(|| "update_tablet_meta_info missing txn_id".to_string())?;
+    if txn_id <= 0 {
+        return Err(format!(
+            "update_tablet_meta_info has invalid txn_id={txn_id}"
+        ));
+    }
+    let tablet_meta_infos = request
+        .tablet_meta_infos
+        .as_ref()
+        .ok_or_else(|| "update_tablet_meta_info missing tablet_meta_infos".to_string())?;
+    let updates = tablet_meta_infos
+        .iter()
+        .map(|tablet_meta_info| {
+            Ok(LakeTabletMetadataUpdate {
+                tablet_id: tablet_meta_info.tablet_id.ok_or_else(|| {
+                    "update_tablet_meta_info tablet_meta_info missing tablet_id".to_string()
+                })?,
+                metadata_update: StorageMetadataUpdate {
+                    enable_persistent_index: tablet_meta_info.enable_persistent_index,
+                    persistent_index_type: tablet_meta_info
+                        .persistent_index_type
+                        .map(map_update_tablet_meta_persistent_index_type)
+                        .transpose()?,
+                    bundle_tablet_metadata: tablet_meta_info.bundle_tablet_metadata,
+                    compaction_strategy: tablet_meta_info
+                        .compaction_strategy
+                        .map(map_update_tablet_meta_compaction_strategy)
+                        .transpose()?,
+                    flat_json_config: tablet_meta_info.flat_json_config.as_ref().map(|cfg| {
+                        StorageFlatJsonConfig {
+                            enabled: cfg.flat_json_enable,
+                            null_factor: cfg.flat_json_null_factor.map(|value| value.0),
+                            sparsity_factor: cfg.flat_json_sparsity_factor.map(|value| value.0),
+                            max_column_max: cfg.flat_json_column_max,
+                        }
+                    }),
+                    tablet_schema: tablet_meta_info
+                        .tablet_schema
+                        .as_ref()
+                        .map(build_tablet_schema_from_thrift)
+                        .transpose()?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(LakeUpdateTabletMetaTask { txn_id, updates })
+}
+
+fn map_update_tablet_meta_persistent_index_type(
+    persistent_index_type: TPersistentIndexType,
+) -> Result<i32, String> {
+    if persistent_index_type == TPersistentIndexType::LOCAL {
+        return Ok(PersistentIndexTypePb::Local as i32);
+    }
+    if persistent_index_type == TPersistentIndexType::CLOUD_NATIVE {
+        return Ok(PersistentIndexTypePb::CloudNative as i32);
+    }
+    Err(format!(
+        "update_tablet_meta_info unsupported persistent_index_type={persistent_index_type:?}"
+    ))
+}
+
+fn map_update_tablet_meta_compaction_strategy(
+    compaction_strategy: TCompactionStrategy,
+) -> Result<i32, String> {
+    if compaction_strategy == TCompactionStrategy::DEFAULT {
+        return Ok(CompactionStrategyPb::Default as i32);
+    }
+    if compaction_strategy == TCompactionStrategy::REAL_TIME {
+        return Ok(CompactionStrategyPb::RealTime as i32);
+    }
+    Err(format!(
+        "update_tablet_meta_info unsupported compaction_strategy={compaction_strategy:?}"
+    ))
 }
 
 fn adapt_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<LakeAlterTabletTask, String> {
@@ -253,7 +417,7 @@ pub(crate) fn lake_agent_task_adapter(
     storage_metadata_provider: Arc<
         dyn novarocks::connector::starrocks::ports::StorageMetadataProvider,
     >,
-) -> Arc<dyn LakeAgentTaskAdapter> {
+) -> Arc<CompatLakeAgentTaskAdapter> {
     Arc::new(CompatLakeAgentTaskAdapter {
         storage_metadata_provider,
     })
