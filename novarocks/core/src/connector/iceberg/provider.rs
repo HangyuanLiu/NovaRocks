@@ -1381,11 +1381,34 @@ fn lower_ref_action(
                 },
             }
         }
-        ConnectorRefAction::FastForwardBranch { .. } => {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "Iceberg branch fast-forward mutation is not implemented",
-            ));
+        ConnectorRefAction::FastForwardBranch {
+            source_branch,
+            target_branch,
+            source_snapshot_id,
+            expected_target_snapshot_id,
+        } => {
+            if source_branch.eq_ignore_ascii_case("main") {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg fast-forward source must be a named branch",
+                ));
+            }
+            if !matches!(
+                metadata.refs().get(source_branch.as_ref()),
+                Some(reference) if reference.is_branch()
+                    && reference.snapshot_id == source_snapshot_id
+            ) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg fast-forward source branch does not match its expected snapshot",
+                ));
+            }
+            super::commit::RefAction::FastForwardBranch {
+                source_branch: source_branch.to_string(),
+                target_branch: target_branch.to_string(),
+                source_snapshot_id,
+                expected_target_snapshot_id,
+            }
         }
     };
     Ok(super::commit::RefActionPlan {

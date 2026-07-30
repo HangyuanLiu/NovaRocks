@@ -56,6 +56,13 @@ pub enum RefAction {
         name: String,
         if_exists: bool,
     },
+    /// Internal MV publication primitive. SQL never constructs this action.
+    FastForwardBranch {
+        source_branch: String,
+        target_branch: String,
+        source_snapshot_id: i64,
+        expected_target_snapshot_id: Option<i64>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -163,6 +170,74 @@ pub async fn execute_ref_action(
                 }],
             ),
         },
+        RefAction::FastForwardBranch {
+            source_branch,
+            target_branch,
+            source_snapshot_id,
+            expected_target_snapshot_id,
+        } => {
+            let source = metadata.refs().get(source_branch).ok_or_else(|| {
+                format!("iceberg ref: source branch '{source_branch}' does not exist")
+            })?;
+            if !source.is_branch() {
+                return Err(format!(
+                    "iceberg ref: source '{source_branch}' is not a branch"
+                ));
+            }
+            if source.snapshot_id != *source_snapshot_id {
+                return Err(format!(
+                    "iceberg ref: source branch '{source_branch}' points to {}, expected {source_snapshot_id}",
+                    source.snapshot_id
+                ));
+            }
+            if metadata.snapshot_by_id(*source_snapshot_id).is_none() {
+                return Err(format!(
+                    "iceberg ref: source snapshot {source_snapshot_id} does not exist"
+                ));
+            }
+            let current_target_snapshot_id = if target_branch == "main" {
+                metadata.current_snapshot_id()
+            } else {
+                let target = metadata.refs().get(target_branch).ok_or_else(|| {
+                    format!("iceberg ref: target branch '{target_branch}' does not exist")
+                })?;
+                if !target.is_branch() {
+                    return Err(format!(
+                        "iceberg ref: target '{target_branch}' is not a branch"
+                    ));
+                }
+                Some(target.snapshot_id)
+            };
+            if current_target_snapshot_id != *expected_target_snapshot_id {
+                return Err(format!(
+                    "iceberg ref: target branch '{target_branch}' points to {:?}, expected {:?}",
+                    current_target_snapshot_id, expected_target_snapshot_id
+                ));
+            }
+            (
+                vec![TableUpdate::SetSnapshotRef {
+                    ref_name: target_branch.clone(),
+                    reference: SnapshotReference {
+                        snapshot_id: *source_snapshot_id,
+                        retention: SnapshotRetention::Branch {
+                            min_snapshots_to_keep: None,
+                            max_snapshot_age_ms: None,
+                            max_ref_age_ms: None,
+                        },
+                    },
+                }],
+                vec![
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: source_branch.clone(),
+                        snapshot_id: Some(*source_snapshot_id),
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: target_branch.clone(),
+                        snapshot_id: *expected_target_snapshot_id,
+                    },
+                ],
+            )
+        }
     };
 
     let commit = TableCommit::builder()
