@@ -2240,8 +2240,8 @@ use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, Tr
 use iceberg::{TableRequirement, TableUpdate};
 
 use crate::connector::iceberg::catalog::registry::{
-    TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key, logical_type_property_key,
-    logical_type_property_value,
+    IcebergCatalogEntry, TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key,
+    logical_type_property_key, logical_type_property_value,
 };
 use crate::connector::iceberg::commit::retry::commit_with_retry;
 use crate::connector::iceberg::variant_write::{
@@ -4046,6 +4046,106 @@ fn validate_variant_shredding_property_set(
     }
     parse_variant_shredding_properties(&props, schema)?;
     Ok(())
+}
+
+/// Provider-owned table property mutation. The caller must already have
+/// selected the catalog instance and normalized the SPI property DTO.
+pub(crate) fn alter_table_properties_on_entry(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+    op: &PropertiesOp,
+) -> Result<(), String> {
+    let denied = collect_property_denylist_hits(op);
+    if !denied.is_empty() {
+        let mut messages = denied
+            .into_iter()
+            .map(|(key, reason)| format!("`{key}`: {reason}"))
+            .collect::<Vec<_>>();
+        messages.sort();
+        return Err(format!(
+            "ALTER TABLE TBLPROPERTIES rejected reserved key(s): {}",
+            messages.join("; ")
+        ));
+    }
+
+    entry.invalidate_table_cache(namespace, table);
+    let entry_for_retry = entry.clone();
+    let namespace_for_retry = namespace.to_string();
+    let table_for_retry = table.to_string();
+    let op_for_retry = op.clone();
+    let commit_result =
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            commit_with_retry(|_attempt| {
+                let entry_inner = entry_for_retry.clone();
+                let namespace_inner = namespace_for_retry.clone();
+                let table_inner = table_for_retry.clone();
+                let op_inner = op_for_retry.clone();
+                async move {
+                    entry_inner.invalidate_table_cache(&namespace_inner, &table_inner);
+                    let catalog =
+                        crate::connector::iceberg::catalog::registry::build_iceberg_catalog(
+                            &entry_inner,
+                        )
+                        .map_err(|error| {
+                            iceberg::Error::new(
+                                iceberg::ErrorKind::Unexpected,
+                                format!("build catalog for retry: {error}"),
+                            )
+                        })?;
+                    let loaded = crate::connector::iceberg::catalog::registry::load_table(
+                        &entry_inner,
+                        &namespace_inner,
+                        &table_inner,
+                    )
+                    .map_err(|error| {
+                        iceberg::Error::new(
+                            iceberg::ErrorKind::Unexpected,
+                            format!("reload table for retry: {error}"),
+                        )
+                    })?;
+                    let existing = loaded.table.metadata().properties().clone();
+                    validate_variant_shredding_property_set(
+                        &op_inner,
+                        loaded.table.metadata().current_schema(),
+                    )
+                    .map_err(|error| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error))?;
+                    validate_unset_keys_present(&op_inner, &existing).map_err(|error| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error)
+                    })?;
+                    if let PropertiesOp::Unset {
+                        if_exists: true, ..
+                    } = &op_inner
+                    {
+                        if compute_remove_keys(&op_inner, &existing).is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    let tx = Transaction::new(&loaded.table);
+                    let mut action = tx.update_table_properties();
+                    match &op_inner {
+                        PropertiesOp::Set { entries } => {
+                            for (key, value) in entries {
+                                action = action.set(key.clone(), value.clone());
+                            }
+                        }
+                        PropertiesOp::Unset { .. } => {
+                            for key in compute_remove_keys(&op_inner, &existing) {
+                                action = action.remove(key);
+                            }
+                        }
+                    }
+                    let tx = action.apply(tx).map_err(|error| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error.to_string())
+                    })?;
+                    tx.commit(catalog.as_ref()).await.map(|_| ())
+                }
+            })
+            .await
+        })
+        .map_err(|error| format!("alter table properties runtime failed: {error}"))?;
+    entry.invalidate_table_cache(namespace, table);
+    commit_result
 }
 
 /// Execute SET TBLPROPERTIES or UNSET TBLPROPERTIES on an Iceberg table.

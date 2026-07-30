@@ -1024,6 +1024,27 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 })
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
             }
+            ConnectorCatalogMutationOperation::AlterProperties { table, changes } => {
+                if table.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "property mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                let operation = lower_property_changes(&changes)?;
+                super::catalog::schema_update::alter_table_properties_on_entry(
+                    &entry,
+                    &table.namespace,
+                    &table.table,
+                    &operation,
+                )
+                .map(|()| ExternalMutationEffect::Applied)
+                .map_err(map_iceberg_error)
+            }
             _ => Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 format!("Iceberg catalog mutation `{operation_kind}` is not implemented"),
@@ -1346,6 +1367,59 @@ fn lower_ref_action(
         table: table.to_string(),
         action,
     })
+}
+
+fn lower_property_changes(
+    changes: &[novarocks_spi::connector::ConnectorPropertyChange],
+) -> Result<crate::engine::statement::PropertiesOp, ConnectorError> {
+    use novarocks_spi::connector::ConnectorPropertyChange;
+
+    let Some(first) = changes.first() else {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "property mutation must contain at least one change",
+        ));
+    };
+    match first {
+        ConnectorPropertyChange::Set { .. } => {
+            let entries = changes
+                .iter()
+                .map(|change| match change {
+                    ConnectorPropertyChange::Set { key, value } => {
+                        Ok((key.to_string(), value.to_string()))
+                    }
+                    ConnectorPropertyChange::Unset { .. } => Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "mixed property set/unset mutations are not supported",
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(crate::engine::statement::PropertiesOp::Set { entries })
+        }
+        ConnectorPropertyChange::Unset { if_exists, .. } => {
+            let keys = changes
+                .iter()
+                .map(|change| match change {
+                    ConnectorPropertyChange::Unset {
+                        key,
+                        if_exists: change_if_exists,
+                    } if change_if_exists == if_exists => Ok(key.to_string()),
+                    ConnectorPropertyChange::Unset { .. } => Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "property unset mutations must share one existence policy",
+                    )),
+                    ConnectorPropertyChange::Set { .. } => Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "mixed property set/unset mutations are not supported",
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(crate::engine::statement::PropertiesOp::Unset {
+                keys,
+                if_exists: *if_exists,
+            })
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
