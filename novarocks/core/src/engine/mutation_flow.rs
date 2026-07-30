@@ -1539,9 +1539,8 @@ fn build_cow_update_distributed_write(
     let base_snapshot_id =
         base_snapshot_id.ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
     let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
-            &registry,
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,
@@ -2603,9 +2602,8 @@ pub(crate) fn execute_merge_statement(
                 insert_columns,
             )?;
             let resolved = {
-                let registry = state.connectors.read().expect("connector registry read");
                 crate::connector::metadata_load_table(
-                    &registry,
+                    state.connector_control.as_ref(),
                     connector_context.clone(),
                     &target.catalog,
                     &target.namespace,

@@ -13564,11 +13564,6 @@ fn execute_imv_change_stream_writer(
         .read()
         .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?
         .get(&target.catalog)?;
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let connector_context = refresh_plan
         .mv_refresh_ctx
         .and_then(|ctx| ctx.connector_context.as_ref())
@@ -13577,7 +13572,7 @@ fn execute_imv_change_stream_writer(
         })?;
     crate::connector::validate_request_context(connector_context)?;
     let resolved = crate::connector::metadata_load_table(
-        &connectors_snapshot,
+        state.connector_control.as_ref(),
         connector_context.clone(),
         &target.catalog,
         &target.namespace,
@@ -19210,9 +19205,8 @@ mod tests {
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
 
-        let connectors = env.state.connectors.read().expect("connector registry");
         let resolved = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",
@@ -19224,7 +19218,7 @@ mod tests {
         assert_eq!(resolved.table, "mv_orders");
 
         let (schema_table, schema_id) = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",
@@ -19237,7 +19231,7 @@ mod tests {
 
         let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
         let missing_schema_err = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",
@@ -19251,7 +19245,7 @@ mod tests {
         );
 
         let missing_target_err = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",

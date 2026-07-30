@@ -79,21 +79,20 @@ pub(crate) fn run_insert(
     };
 
     let target = resolve_existing_table_target(state, name, current_catalog, current_database)?;
-    let (resolved, sink) = {
-        let reg = state.connectors.read().expect("connector registry read");
-        (
-            crate::connector::metadata_load_table(
-                &reg,
-                connector_context.clone(),
-                &target.catalog,
-                &target.namespace,
-                &target.table,
-                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-            )?
-            .0,
-            reg.table_sink(target.backend_name)?,
-        )
-    };
+    let resolved = crate::connector::metadata_load_table(
+        state.connector_control.as_ref(),
+        connector_context.clone(),
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?
+    .0;
+    let sink = state
+        .connectors
+        .read()
+        .expect("connector registry read")
+        .table_sink(target.backend_name)?;
     crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
         state,
         &target,

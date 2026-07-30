@@ -2348,13 +2348,8 @@ impl StandaloneSession {
             current_catalog,
             current_database,
         )?;
-        let connectors = self
-            .inner
-            .connectors
-            .read()
-            .expect("connector registry read");
         let source_table = crate::connector::metadata_load_table(
-            &connectors,
+            self.inner.connector_control.as_ref(),
             connector_context.clone(),
             &source_target.catalog,
             &source_target.namespace,

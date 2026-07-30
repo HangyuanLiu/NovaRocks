@@ -392,12 +392,8 @@ fn resolve_maintenance_table_name(
     table: &str,
 ) -> Result<String, String> {
     let (resolved, _) = {
-        let connectors = state
-            .connectors
-            .read()
-            .expect("connector registry read lock");
         crate::connector::metadata_load_table(
-            &connectors,
+            state.connector_control.as_ref(),
             crate::connector::connector_request_context(
                 None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

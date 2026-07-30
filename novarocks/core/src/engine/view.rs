@@ -170,7 +170,7 @@ impl ViewEngine for StandaloneState {
 
     fn table_exists(&self, target: &ViewTarget) -> Result<bool, String> {
         crate::connector::metadata_table_exists(
-            &self.connectors.read().expect("connector registry read"),
+            self.connector_control.as_ref(),
             crate::connector::connector_request_context(
                 None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

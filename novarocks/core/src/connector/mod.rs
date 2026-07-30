@@ -131,27 +131,27 @@ pub(crate) fn test_request_context() -> ConnectorRequestContext {
         .expect("test connector request context")
 }
 
-fn metadata_instance(
-    connectors: &ConnectorRegistry,
+fn metadata_binding(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     catalog: &str,
-) -> Result<Arc<ConnectorInstance>, String> {
+) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    connectors
-        .connector_instance(&instance_id)
+    controls
+        .acquire_current(&instance_id)
         .map_err(|error| error.to_string())
 }
 
 pub(crate) fn metadata_namespace_exists(
-    connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
 ) -> Result<bool, String> {
-    let instance = metadata_instance(connectors, catalog)?;
-    let instance_id = instance.descriptor().instance_id.clone();
-    instance
+    let binding = metadata_binding(controls, catalog)?;
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
         .metadata()
-        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
         .namespace_exists(novarocks_spi::connector::ConnectorNamespaceRequest {
             namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
                 instance_id,
@@ -163,17 +163,17 @@ pub(crate) fn metadata_namespace_exists(
 }
 
 pub(crate) fn metadata_table_exists(
-    connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> Result<bool, String> {
-    let instance = metadata_instance(connectors, catalog)?;
-    let instance_id = instance.descriptor().instance_id.clone();
-    instance
+    let binding = metadata_binding(controls, catalog)?;
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
         .metadata()
-        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
         .table_exists(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
@@ -187,18 +187,18 @@ pub(crate) fn metadata_table_exists(
 }
 
 pub(crate) fn metadata_load_table(
-    connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
     resolution: ConnectorTableResolution,
 ) -> Result<(backend::ResolvedTable, Option<i32>), String> {
-    let instance = metadata_instance(connectors, catalog)?;
-    let instance_id = instance.descriptor().instance_id.clone();
-    let metadata = instance
+    let binding = metadata_binding(controls, catalog)?;
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let metadata = binding
+        .binding()
         .metadata()
-        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
