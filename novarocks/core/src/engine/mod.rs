@@ -3000,7 +3000,7 @@ fn register_iceberg_control_binding(
 ) -> Result<(), String> {
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let binding = crate::connector::iceberg::provider::IcebergConnectorInstance::new_control(
+    let binding = crate::connector::iceberg::provider::IcebergControlProvider::new_control(
         instance_id,
         Arc::clone(&state.iceberg_catalogs),
     )

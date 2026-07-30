@@ -29,7 +29,7 @@ use novarocks_spi::connector::{
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
 use super::iceberg::catalog::{IcebergCatalogRegistry, create_namespace};
 use super::iceberg::provider::{
-    IcebergConnectorInstaller, IcebergConnectorInstance, IcebergReadBinding,
+    IcebergConnectorInstaller, IcebergControlProvider, IcebergReadBinding,
 };
 use crate::sql::{Literal, TableColumnDef};
 use novarocks_catalog::schema::SqlType;
@@ -117,7 +117,7 @@ fn install_execution(
 fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let control = IcebergConnectorInstance::new_control(instance_id, registry)
+    let control = IcebergControlProvider::new_control(instance_id, registry)
         .expect("planning Iceberg control binding");
 
     let declaration = control
@@ -139,7 +139,7 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
 fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let planning = IcebergConnectorInstance::new_control(instance_id.clone(), registry)
+    let planning = IcebergControlProvider::new_control(instance_id.clone(), registry)
         .expect("planning Iceberg control binding");
     let resolved = planning
         .metadata()
@@ -288,7 +288,7 @@ fn force_current_snapshot_id(
 fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     let (registry, warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let instance = IcebergConnectorInstance::new_control(instance_id.clone(), registry)
+    let instance = IcebergControlProvider::new_control(instance_id.clone(), registry)
         .expect("Iceberg control binding");
     let metadata = instance.metadata();
     let namespace = ConnectorNamespaceIdentity {
@@ -416,9 +416,8 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         .get("ice")
         .expect("catalog entry");
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let instance =
-        IcebergConnectorInstance::new_control(instance_id.clone(), Arc::clone(&registry))
-            .expect("Iceberg control binding");
+    let instance = IcebergControlProvider::new_control(instance_id.clone(), Arc::clone(&registry))
+        .expect("Iceberg control binding");
     let table_identity = ConnectorTableIdentity {
         instance_id: instance_id.clone(),
         namespace: Arc::from("db"),

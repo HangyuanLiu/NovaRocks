@@ -481,14 +481,14 @@ impl ConnectorReadExecution for IcebergReadOnlyConnectorInstance {
 }
 
 #[derive(Clone)]
-pub(crate) struct IcebergConnectorInstance {
+pub(crate) struct IcebergControlProvider {
     instance_id: ConnectorInstanceId,
     incarnation: ConnectorInstanceIncarnation,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
     snapshot_memberships: Arc<SnapshotMembershipCache>,
 }
 
-impl IcebergConnectorInstance {
+impl IcebergControlProvider {
     /// Creates the FE-only control binding for a logical Iceberg catalog. The
     /// implementation remains in core until SPI-5, but its runtime capability
     /// aggregate no longer needs to cross into a BE process.
@@ -790,7 +790,7 @@ impl SnapshotMembershipCache {
     }
 }
 
-impl ConnectorMetadata for IcebergConnectorInstance {
+impl ConnectorMetadata for IcebergControlProvider {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.instance_id
     }
@@ -877,7 +877,7 @@ impl ConnectorMetadata for IcebergConnectorInstance {
     }
 }
 
-impl ConnectorScanPlanning for IcebergConnectorInstance {
+impl ConnectorScanPlanning for IcebergControlProvider {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.instance_id
     }
@@ -2035,7 +2035,7 @@ mod tests {
             .expect("scan payload"),
         )
         .expect("scan handle");
-        let provider = IcebergConnectorInstance {
+        let provider = IcebergControlProvider {
             instance_id,
             incarnation: ConnectorInstanceIncarnation::from_bytes([0; 16]),
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
