@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use prost::Message;
 
@@ -215,8 +215,8 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
         query_id: Some(id(1, 2)),
         fragment_instance_id: Some(id(3, 4)),
         backend_num: 1,
-        per_node_scan_ranges: HashMap::new(),
-        per_exch_num_senders: HashMap::new(),
+        per_node_scan_ranges: BTreeMap::new(),
+        per_exch_num_senders: BTreeMap::new(),
         destinations: vec![destination()],
         query_options: Some(query_options()),
         report_endpoint: Some("10.0.0.10:9070".to_string()),
@@ -247,13 +247,13 @@ fn instance_params_survives_proto_roundtrip() {
         query_id: Some(id(1, 2)),
         fragment_instance_id: Some(id(3, 4)),
         backend_num: 9,
-        per_node_scan_ranges: HashMap::from([(
+        per_node_scan_ranges: BTreeMap::from([(
             10,
             novarocks::ScanRangeList {
                 ranges: vec![file_scan_range()],
             },
         )]),
-        per_exch_num_senders: HashMap::from([(20, 3)]),
+        per_exch_num_senders: BTreeMap::from([(20, 3)]),
         destinations: vec![destination()],
         query_options: Some(query_options()),
         report_endpoint: Some("10.0.0.10:9070".to_string()),
@@ -265,34 +265,35 @@ fn instance_params_survives_proto_roundtrip() {
 }
 
 #[test]
-fn submit_fragment_request_carries_native_fields_only() {
-    let request = novarocks::SubmitFragmentRequest {
-        plan: Some(plan::PlanFragment::default()),
-        instance_params: Some(novarocks::InstanceParams {
-            query_id: Some(id(1, 2)),
-            fragment_instance_id: Some(id(3, 4)),
-            backend_num: 1,
-            per_node_scan_ranges: HashMap::new(),
-            per_exch_num_senders: HashMap::new(),
-            destinations: vec![destination()],
-            query_options: Some(query_options()),
-            report_endpoint: Some("10.0.0.10:9070".to_string()),
-            typed_result_sink: true,
-        }),
+fn stage_fragment_request_carries_native_fields_only() {
+    let request = novarocks::StageFragmentsRequest {
         execution_id: Some(novarocks::QueryExecutionId {
             query_id: Some(id(1, 2)),
             attempt_id: 1,
         }),
+        init_digest: vec![1; 32],
+        stage_digest_version: 1,
+        stage_digest: vec![2; 32],
+        fragments: vec![novarocks::StageFragment {
+            plan: Some(plan::PlanFragment::default()),
+            instance_params: Some(novarocks::InstanceParams {
+            query_id: Some(id(1, 2)),
+            fragment_instance_id: Some(id(3, 4)),
+            backend_num: 1,
+            per_node_scan_ranges: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+            destinations: vec![destination()],
+            query_options: Some(query_options()),
+            report_endpoint: Some("10.0.0.10:9070".to_string()),
+            typed_result_sink: true,
+            }),
+        }],
     };
     let fields = encoded_field_numbers(&request);
 
-    assert!(fields.contains(&1), "plan must use reset tag 1");
-    assert!(fields.contains(&2), "instance_params must use reset tag 2");
-    assert!(
-        fields.contains(&3),
-        "execution_id must use SubmitFragmentRequest tag 3"
-    );
+    assert!(fields.contains(&1), "execution_id must use StageFragmentsRequest tag 1");
+    assert!(fields.contains(&5), "fragments must use StageFragmentsRequest tag 5");
 
-    let decoded: novarocks::SubmitFragmentRequest = roundtrip_message(&request);
+    let decoded: novarocks::StageFragmentsRequest = roundtrip_message(&request);
     assert_eq!(request, decoded);
 }

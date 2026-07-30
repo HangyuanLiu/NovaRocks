@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use prost::Message;
 
@@ -328,29 +328,34 @@ fn release_plan_fragment() -> plan::PlanFragment {
     }
 }
 
-fn release_submit_fragment_request() -> novarocks::SubmitFragmentRequest {
-    novarocks::SubmitFragmentRequest {
-        plan: Some(release_plan_fragment()),
-        instance_params: Some(novarocks::InstanceParams {
+fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
+    novarocks::StageFragmentsRequest {
+        execution_id: Some(novarocks::QueryExecutionId {
+            query_id: Some(id(1, 2)),
+            attempt_id: 1,
+        }),
+        init_digest: vec![0x11; 32],
+        stage_digest_version: 1,
+        stage_digest: vec![0x22; 32],
+        fragments: vec![novarocks::StageFragment {
+            plan: Some(release_plan_fragment()),
+            instance_params: Some(novarocks::InstanceParams {
             query_id: Some(id(1, 2)),
             fragment_instance_id: Some(id(3, 4)),
             backend_num: 9,
-            per_node_scan_ranges: HashMap::from([(
+            per_node_scan_ranges: BTreeMap::from([(
                 11,
                 novarocks::ScanRangeList {
                     ranges: vec![release_scan_range()],
                 },
             )]),
-            per_exch_num_senders: HashMap::from([(12, 3)]),
+            per_exch_num_senders: BTreeMap::from([(12, 3)]),
             destinations: vec![release_destination()],
             query_options: Some(release_query_options()),
             report_endpoint: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,
-        }),
-        execution_id: Some(novarocks::QueryExecutionId {
-            query_id: Some(id(1, 2)),
-            attempt_id: 1,
-        }),
+            }),
+        }],
     }
 }
 
@@ -503,8 +508,8 @@ fn print_fixture<M: Message>(name: &str, message: &M) {
 #[ignore = "manual release fixture recorder; paste output into checked-in constants"]
 fn print_release_fixture_hex() {
     print_fixture(
-        "SUBMIT_FRAGMENT_REQUEST",
-        &release_submit_fragment_request(),
+        "STAGE_FRAGMENTS_REQUEST",
+        &release_stage_fragments_request(),
     );
     print_fixture("FETCH_RESULT_RESPONSE", &release_fetch_result_response());
     print_fixture(
@@ -522,92 +527,88 @@ fn print_release_fixture_hex() {
 }
 
 #[test]
-fn legacy_release_submit_fragment_request_fixture_is_rejected_at_native_wire_boundary() {
-    let bytes = decode_hex(
-        "legacy SubmitFragmentRequest",
-        SUBMIT_FRAGMENT_REQUEST_FIXTURE_HEX,
-    );
-    let error = crate::protocol::native::codec::validate_submit_fragment_request_wire(&bytes)
-        .expect_err("legacy InstanceParams tag 7 must fail before Prost drops it");
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    assert!(error.message().contains("tag 7"), "{error}");
-
-    // This proves why the raw-wire guard is required: plain Prost still silently
-    // drops the reserved field and decodes the remaining legacy fixture.
-    let request = novarocks::SubmitFragmentRequest::decode(bytes.as_slice())
-        .expect("plain Prost preserves its unknown-field behavior");
-    let plan = request
+fn release_stage_fragments_request_fixture_decodes() {
+    let request = release_stage_fragments_request();
+    let bytes = request.encode_to_vec();
+    crate::protocol::native::codec::validate_stage_fragments_request_wire(&bytes)
+        .expect("StageFragmentsRequest fixture must satisfy the native wire boundary");
+    let request = novarocks::StageFragmentsRequest::decode(bytes.as_slice())
+        .expect("StageFragmentsRequest fixture decodes");
+    assert_eq!(request.stage_digest_version, 1);
+    assert_eq!(request.fragments.len(), 1);
+    let fragment = request.fragments.first().expect("StageFragmentsRequest fixture fragment");
+    let plan = fragment
         .plan
         .as_ref()
-        .expect("SubmitFragmentRequest fixture plan");
-    assert_eq!(plan.fragment_id, 1, "SubmitFragmentRequest fixture plan id");
+        .expect("StageFragmentsRequest fixture plan");
+    assert_eq!(plan.fragment_id, 1, "StageFragmentsRequest fixture plan id");
 
-    let params = request
+    let params = fragment
         .instance_params
         .as_ref()
-        .expect("SubmitFragmentRequest fixture instance_params");
+        .expect("StageFragmentsRequest fixture instance_params");
     assert_eq!(
         params.backend_num, 9,
-        "SubmitFragmentRequest fixture backend_num"
+        "StageFragmentsRequest fixture backend_num"
     );
     let scan_ranges = params
         .per_node_scan_ranges
         .get(&11)
-        .expect("SubmitFragmentRequest fixture per_node_scan_ranges[11]");
+        .expect("StageFragmentsRequest fixture per_node_scan_ranges[11]");
     assert_eq!(
         scan_ranges.ranges.len(),
         1,
-        "SubmitFragmentRequest fixture per_node_scan_ranges[11].ranges.len"
+        "StageFragmentsRequest fixture per_node_scan_ranges[11].ranges.len"
     );
     let scan_range = scan_ranges
         .ranges
         .first()
         .and_then(|params| params.range.as_ref())
-        .expect("SubmitFragmentRequest fixture per_node_scan_ranges[11].ranges[0].range");
+        .expect("StageFragmentsRequest fixture per_node_scan_ranges[11].ranges[0].range");
     let file_range = match scan_range.kind.as_ref() {
         Some(novarocks::scan_range::Kind::File(file)) => file,
         other => panic!(
-            "SubmitFragmentRequest fixture per_node_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
+            "StageFragmentsRequest fixture per_node_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
         ),
     };
     assert_eq!(
         file_range.file_format, "PARQUET",
-        "SubmitFragmentRequest fixture FileScanRange.file_format"
+        "StageFragmentsRequest fixture FileScanRange.file_format"
     );
     assert_eq!(
         file_range.full_path.as_deref(),
         Some("s3://bucket/data.parquet"),
-        "SubmitFragmentRequest fixture FileScanRange.full_path"
+        "StageFragmentsRequest fixture FileScanRange.full_path"
     );
     assert_eq!(
         file_range.delete_files.len(),
         1,
-        "SubmitFragmentRequest fixture FileScanRange.delete_files.len"
+        "StageFragmentsRequest fixture FileScanRange.delete_files.len"
     );
     let delete_file = &file_range.delete_files[0];
     assert_eq!(
         delete_file.full_path.as_deref(),
         Some("s3://bucket/delete.parquet"),
-        "SubmitFragmentRequest fixture FileScanRange.delete_files[0].full_path"
+        "StageFragmentsRequest fixture FileScanRange.delete_files[0].full_path"
     );
     assert_eq!(
         delete_file.file_content, "POSITION_DELETES",
-        "SubmitFragmentRequest fixture FileScanRange.delete_files[0].file_content"
+        "StageFragmentsRequest fixture FileScanRange.delete_files[0].file_content"
     );
     assert_eq!(
         delete_file.length,
         Some(64),
-        "SubmitFragmentRequest fixture FileScanRange.delete_files[0].length"
+        "StageFragmentsRequest fixture FileScanRange.delete_files[0].length"
     );
     assert_eq!(
         file_range.first_row_id,
         Some(1_000),
-        "SubmitFragmentRequest fixture FileScanRange.first_row_id"
+        "StageFragmentsRequest fixture FileScanRange.first_row_id"
     );
     assert_eq!(
         file_range.data_sequence_number,
         Some(44),
-        "SubmitFragmentRequest fixture FileScanRange.data_sequence_number"
+        "StageFragmentsRequest fixture FileScanRange.data_sequence_number"
     );
     assert_eq!(
         file_range
@@ -615,52 +616,52 @@ fn legacy_release_submit_fragment_request_fixture_is_rejected_at_native_wire_bou
             .as_ref()
             .and_then(|options| options.priority),
         Some(3),
-        "SubmitFragmentRequest fixture FileScanRange.datacache_options.priority"
+        "StageFragmentsRequest fixture FileScanRange.datacache_options.priority"
     );
     assert_eq!(
         file_range.included_positions,
         vec![3, 5, 8],
-        "SubmitFragmentRequest fixture FileScanRange.included_positions"
+        "StageFragmentsRequest fixture FileScanRange.included_positions"
     );
     assert_eq!(
         file_range.serialized_split.as_deref(),
         Some("{\"split\":1}"),
-        "SubmitFragmentRequest fixture FileScanRange.serialized_split"
+        "StageFragmentsRequest fixture FileScanRange.serialized_split"
     );
     assert_eq!(
         file_range.change_op,
         Some(-1),
-        "SubmitFragmentRequest fixture FileScanRange.change_op"
+        "StageFragmentsRequest fixture FileScanRange.change_op"
     );
     let pruning = file_range
         .file_pruning_min_max_values
         .get(&1)
-        .expect("SubmitFragmentRequest fixture FileScanRange.file_pruning_min_max_values[1]");
+        .expect("StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1]");
     assert_eq!(
         pruning.min_int_value,
         Some(10),
-        "SubmitFragmentRequest fixture FileScanRange.file_pruning_min_max_values[1].min_int_value"
+        "StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1].min_int_value"
     );
     assert_eq!(
         pruning.max_int_value,
         Some(20),
-        "SubmitFragmentRequest fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
+        "StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
     );
 
     let query_options = decode_query_options(
         params
             .query_options
             .as_ref()
-            .expect("SubmitFragmentRequest fixture query_options"),
+            .expect("StageFragmentsRequest fixture query_options"),
     )
-    .expect("SubmitFragmentRequest fixture query_options boundary");
+    .expect("StageFragmentsRequest fixture query_options boundary");
     assert_eq!(query_options.exec_mem_limit, Some(512 << 20));
     assert_eq!(query_options.pipeline_dop, Some(8));
     assert_eq!(query_options.runtime_filter_scan_wait_time_ms, Some(1500));
     assert_eq!(query_options.runtime_filter_wait_timeout_ms, Some(3000));
 
     let destinations = decode_destinations(&params.destinations)
-        .expect("SubmitFragmentRequest fixture destinations boundary");
+        .expect("StageFragmentsRequest fixture destinations boundary");
     assert_eq!(destinations.len(), 1);
     assert_eq!(destinations[0].endpoint().as_host_port(), "10.0.0.8:8060");
 
@@ -668,9 +669,9 @@ fn legacy_release_submit_fragment_request_fixture_is_rejected_at_native_wire_bou
         params.per_node_scan_ranges[&11]
             .ranges
             .first()
-            .expect("SubmitFragmentRequest fixture per_node_scan_ranges[11].ranges[0]"),
+            .expect("StageFragmentsRequest fixture per_node_scan_ranges[11].ranges[0]"),
     )
-    .expect("SubmitFragmentRequest fixture scan range boundary");
+    .expect("StageFragmentsRequest fixture scan range boundary");
     assert!(matches!(
         decoded_scan_range.range,
         crate::runtime::scan_range::ScanRange::File(_)
