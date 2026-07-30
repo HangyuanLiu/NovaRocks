@@ -724,7 +724,7 @@ fn lower_node_with_children_typed(
                     node,
                     desc_tbl,
                     out_layout,
-                    connectors,
+                    context.compat_iceberg_execution.cloned(),
                     context.query_id,
                     context.scan_ranges,
                     &context.query_options,
