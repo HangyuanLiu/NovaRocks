@@ -736,7 +736,7 @@ impl ConnectorReadScanSource {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_scheduled_execution_with_incremental(
+    pub(crate) fn new_scheduled_execution_with_incremental(
         binding: Arc<ConnectorExecutionBinding>,
         scheduled: Vec<ConnectorScheduledSplit>,
         request: ConnectorOpenReaderRequest,
