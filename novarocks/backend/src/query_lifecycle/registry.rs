@@ -1054,6 +1054,7 @@ impl QueryLifecycleRegistry {
 
         let mut state = entry.state.lock().expect("query lifecycle entry lock");
         let mut released_stage_resources = None;
+        let mut local_drained_event = None;
         let (outcome, detail) = match state.phase {
             QueryLifecyclePhase::Staged => {
                 if state.stage_digest != Some(stage_digest) {
@@ -1064,6 +1065,12 @@ impl QueryLifecycleRegistry {
                 } else if let Some(gate) = state.start_gate.clone() {
                     state.phase = QueryLifecyclePhase::Running;
                     state.pre_start_deadline = None;
+                    if entry.manifest.expected_fragment_instance_ids().is_empty()
+                        && !state.local_drained_emitted
+                    {
+                        state.local_drained_emitted = true;
+                        local_drained_event = state.events.clone();
+                    }
                     let released = gate.release();
                     debug_assert!(released, "a staged start gate must be pending");
                     released_stage_resources = state.stage_resources.take();
@@ -1101,6 +1108,9 @@ impl QueryLifecycleRegistry {
             ),
         };
         drop(state);
+        if let Some(events) = local_drained_event {
+            let _ = events.try_send(QueryControlEvent::LocalDrained);
+        }
         // The gate has been released under the entry lock.  Once Running is
         // visible there can be no dormant workers or retained stage payload,
         // so return the Stage reservation outside lifecycle locks.
@@ -1445,9 +1455,6 @@ impl QueryLifecycleRegistry {
         let Some(execution_id) = committed_execution_id else {
             return;
         };
-        if matches!(outcome, FragmentOutcome::Succeeded) {
-            return;
-        }
         let entry = self
             .state
             .lock()
@@ -1458,6 +1465,24 @@ impl QueryLifecycleRegistry {
         let Some(entry) = entry else {
             return;
         };
+        let local_drained = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            state.completed_fragments.insert(fragment_instance_id);
+            let expected = entry.manifest.expected_fragment_instance_ids();
+            let complete = expected.iter().all(|id| state.completed_fragments.contains(id));
+            if complete && matches!(outcome, FragmentOutcome::Succeeded) && !state.local_drained_emitted {
+                state.local_drained_emitted = true;
+                state.events.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(events) = local_drained {
+            let _ = events.try_send(QueryControlEvent::LocalDrained);
+        }
+        if matches!(outcome, FragmentOutcome::Succeeded) {
+            return;
+        }
         let (code, detail) = match outcome {
             FragmentOutcome::Failed(error) => {
                 ("FRAGMENT_EXECUTION_FAILED".to_string(), error.to_string())

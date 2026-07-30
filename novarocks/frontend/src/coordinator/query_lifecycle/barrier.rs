@@ -327,7 +327,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             execution_id.attempt_id().get(),
             self.config,
             self.metrics.as_ref(),
-            control.as_ref(),
+            &control,
         );
         if let Some(primary) = attach_errors.into_iter().next() {
             let message = control.abort_before_ready(primary);
@@ -336,12 +336,6 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(control.abort_before_ready(reason)));
         }
-        if !control.is_active() {
-            return Err(failed(control.abort_before_ready(
-                "query lifecycle attempt was cancelled during control attach".to_string(),
-            )));
-        }
-
         Ok(pre_ready_guard.into_lease())
     }
 }
@@ -781,7 +775,7 @@ fn attach_all(
     frontend_owner_epoch: u64,
     config: FrontendQueryLifecycleConfig,
     metrics: &FrontendLifecycleMetrics,
-    control: &AttemptControl,
+    control: &Arc<AttemptControl>,
 ) -> Vec<String> {
     let outcomes = std::thread::scope(|scope| {
         let handles = participants

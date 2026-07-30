@@ -325,6 +325,9 @@ impl novarocks::query_execution::lifecycle::QueryControlSession for ReadyLifecyc
             QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
                 reason: QueryTerminationReason::CoordinatorFinalize,
             },
+            QueryControlCommand::TerminalAck { .. } => {
+                return Ok(());
+            }
         };
         self.events
             .lock()

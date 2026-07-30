@@ -127,7 +127,9 @@ impl QueryControlSession for RecordingSession {
         let terminal = match &command {
             QueryControlCommand::Abort { .. } => Some(QueryTerminationReason::CoordinatorAbort),
             QueryControlCommand::Finalize => Some(QueryTerminationReason::CoordinatorFinalize),
-            QueryControlCommand::Heartbeat { .. } => None,
+            QueryControlCommand::Heartbeat { .. } | QueryControlCommand::TerminalAck { .. } => {
+                None
+            }
         };
         state.commands.push(command);
         if let Some(reason) = terminal {
@@ -568,6 +570,7 @@ impl QueryControlSession for HeartbeatGateSession {
                         reason: QueryTerminationReason::CoordinatorFinalize,
                     });
             }
+            QueryControlCommand::TerminalAck { .. } => {}
         }
         state.commands.push(command);
         Ok(())

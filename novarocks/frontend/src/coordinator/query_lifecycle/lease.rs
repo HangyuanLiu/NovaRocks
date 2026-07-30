@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
@@ -25,7 +25,8 @@ use novarocks::query_execution::contract::{DistributedQueryError, DistributedQue
 use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
     ParticipantManifestDigest, QueryAbortRequest, QueryControlCommand, QueryControlEvent,
-    QueryExecutionId, QueryLifecycleLease, QueryLifecycleLeaseGuard, QueryTerminationReason,
+    QueryExecutionId, QueryLifecycleLease, QueryLifecycleLeaseGuard, QueryTerminalSet,
+    QueryTerminalSnapshot, QueryTerminationReason,
 };
 
 use super::barrier::FrontendQueryLifecycleConfig;
@@ -89,6 +90,25 @@ pub(super) struct ActiveSession {
     pub digest: ParticipantManifestDigest,
     pub session: Arc<dyn QueryControlSession>,
     recv_gate: Arc<Mutex<()>>,
+}
+
+#[derive(Default)]
+struct TerminalState {
+    heartbeat_acks: BTreeMap<usize, u64>,
+    locally_drained: BTreeSet<usize>,
+    termination_accepted: BTreeMap<usize, QueryTerminationReason>,
+    snapshots: BTreeMap<usize, QueryTerminalSnapshot>,
+    reader_failure: Option<String>,
+    stop_readers: bool,
+}
+
+/// The result of storing a participant terminal snapshot.  The distinction is
+/// intentionally preserved: both cases must be acknowledged, while only the
+/// first one contributes to the terminal set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalSnapshotStoreOutcome {
+    Accepted,
+    AlreadyAccepted,
 }
 
 impl ActiveSession {
@@ -212,6 +232,8 @@ pub(super) struct AttemptControl {
     state: AtomicU8,
     primary_error: Mutex<Option<String>>,
     stop: (Mutex<bool>, Condvar),
+    terminal: (Mutex<TerminalState>, Condvar),
+    readers: Mutex<Vec<JoinHandle<()>>>,
     metrics: Arc<FrontendLifecycleMetrics>,
 }
 
@@ -234,6 +256,8 @@ impl AttemptControl {
             state: AtomicU8::new(ACTIVE),
             primary_error: Mutex::new(None),
             stop: (Mutex::new(false), Condvar::new()),
+            terminal: (Mutex::new(TerminalState::default()), Condvar::new()),
+            readers: Mutex::new(Vec::new()),
             metrics,
         })
     }
@@ -256,11 +280,27 @@ impl AttemptControl {
         );
     }
 
-    pub fn add_session(&self, session: ActiveSession) {
+    pub fn add_session(self: &Arc<Self>, session: ActiveSession) {
+        let reader_session = session.clone();
         self.sessions
             .lock()
             .expect("active query control sessions")
             .insert(session.target.backend_idx(), session);
+        let weak = Arc::downgrade(self);
+        let reader = std::thread::Builder::new()
+            .name(format!(
+                "query-control-reader-{}/{}-{}-{}",
+                self.execution_id.query_id().high(),
+                self.execution_id.query_id().low(),
+                self.execution_id.attempt_id().get(),
+                reader_session.target.backend_idx(),
+            ))
+            .spawn(move || control_event_reader(weak, reader_session))
+            .expect("spawn query control event reader");
+        self.readers
+            .lock()
+            .expect("query control event readers")
+            .push(reader);
     }
 
     pub fn sessions(&self) -> Vec<ActiveSession> {
@@ -270,6 +310,77 @@ impl AttemptControl {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Stores a terminal snapshot through the same path used by the stream
+    /// reader and the unary fallback ingress.  It validates the immutable
+    /// snapshot before changing any FE state, then makes same-digest retries
+    /// idempotent and rejects conflicting payloads for the participant.
+    pub(crate) fn store_terminal_snapshot(
+        &self,
+        snapshot: QueryTerminalSnapshot,
+    ) -> Result<TerminalSnapshotStoreOutcome, DistributedQueryError> {
+        snapshot.validate().map_err(|error| failed(error.to_string()))?;
+        if snapshot.execution_id() != self.execution_id {
+            return Err(contract_violation(
+                "query terminal snapshot execution id differs from active lifecycle attempt",
+            ));
+        }
+        let (backend_idx, participant) = self
+            .attempted
+            .lock()
+            .expect("attempted participant set")
+            .iter()
+            .find(|(_, participant)| {
+                participant.digest == snapshot.init_digest()
+                    && participant.request.manifest().backend() == snapshot.backend()
+            })
+            .map(|(backend_idx, participant)| (*backend_idx, participant.clone()))
+            .ok_or_else(|| {
+                contract_violation(
+                    "query terminal snapshot is not owned by an attempted lifecycle participant",
+                )
+            })?;
+        if participant.request.manifest().execution_id() != self.execution_id {
+            return Err(contract_violation(
+                "attempted participant manifest execution id differs from active lifecycle attempt",
+            ));
+        }
+
+        let mut terminal = self.terminal.0.lock().expect("query terminal store");
+        let outcome = match terminal.snapshots.get(&backend_idx) {
+            Some(existing) if existing.digest() == snapshot.digest() => {
+                TerminalSnapshotStoreOutcome::AlreadyAccepted
+            }
+            Some(_) => {
+                return Err(contract_violation(
+                    "query terminal snapshot conflicts with an already stored participant snapshot",
+                ));
+            }
+            None => {
+                terminal.snapshots.insert(backend_idx, snapshot);
+                TerminalSnapshotStoreOutcome::Accepted
+            }
+        };
+        self.terminal.1.notify_all();
+        Ok(outcome)
+    }
+
+    pub(crate) fn terminal_set(&self) -> Result<QueryTerminalSet, DistributedQueryError> {
+        let expected = self
+            .attempted
+            .lock()
+            .expect("attempted participant set")
+            .len();
+        let terminal = self.terminal.0.lock().expect("query terminal store");
+        if terminal.snapshots.len() != expected {
+            return Err(failed(format!(
+                "query lifecycle terminal snapshots are incomplete: received {}, expected {expected}",
+                terminal.snapshots.len()
+            )));
+        }
+        QueryTerminalSet::new(terminal.snapshots.values().cloned().collect())
+            .map_err(|error| failed(error.to_string()))
     }
 
     pub fn abort_before_ready(&self, primary_error: String) -> String {
@@ -403,13 +514,11 @@ impl AttemptControl {
                         reason: reason.to_string(),
                     })
                     .map_err(|error| (error.kind(), error.to_string()))?;
-                match session
-                    .recv(self.config.attach_timeout())
-                    .map_err(|error| (error.kind(), error.to_string()))?
-                {
-                    QueryControlEvent::TerminationAccepted {
-                        reason: accepted_reason,
-                    } => {
+                match self.wait_for_termination(
+                    participant.target.backend_idx(),
+                    self.config.attach_timeout(),
+                ) {
+                    Ok(accepted_reason) => {
                         tracing::info!(
                             query_id_high = self.execution_id.query_id().high(),
                             query_id_low = self.execution_id.query_id().low(),
@@ -422,13 +531,7 @@ impl AttemptControl {
                         );
                         Ok(())
                     }
-                    event => Err((
-                        QueryLifecycleTransportErrorKind::InvalidResponse,
-                        format!(
-                            "backend {} returned {event:?} after stream abort",
-                            participant.target.backend_idx()
-                        ),
-                    )),
+                    Err(error) => Err((QueryLifecycleTransportErrorKind::InvalidResponse, error)),
                 }
             })();
             if stream_result.is_ok() {
@@ -479,6 +582,104 @@ impl AttemptControl {
             "frontend query lifecycle unary abort accepted"
         );
         Ok(())
+    }
+
+    fn wait_for_heartbeat(
+        &self,
+        backend_idx: usize,
+        sequence: u64,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.wait_terminal_event(timeout, |terminal| {
+            if let Some(error) = &terminal.reader_failure {
+                return Some(Err(error.clone()));
+            }
+            terminal
+                .heartbeat_acks
+                .get(&backend_idx)
+                .is_some_and(|ack| *ack >= sequence)
+                .then_some(Ok(()))
+        })
+        .ok_or_else(|| format!("query lifecycle heartbeat timeout on backend {backend_idx}"))?
+    }
+
+    fn wait_for_termination(
+        &self,
+        backend_idx: usize,
+        timeout: Duration,
+    ) -> Result<QueryTerminationReason, String> {
+        self.wait_terminal_event(timeout, |terminal| {
+            if let Some(error) = &terminal.reader_failure {
+                return Some(Err(error.clone()));
+            }
+            terminal.termination_accepted.get(&backend_idx).copied().map(Ok)
+        })
+        .ok_or_else(|| {
+            format!("query lifecycle abort acknowledgement timed out on backend {backend_idx}")
+        })?
+    }
+
+    fn wait_for_all_drained(&self, timeout: Duration) -> Result<(), String> {
+        let expected = self
+            .attempted
+            .lock()
+            .expect("attempted participant set")
+            .len();
+        self.wait_terminal_event(timeout, |terminal| {
+            if let Some(error) = &terminal.reader_failure {
+                return Some(Err(error.clone()));
+            }
+            (terminal.locally_drained.len() == expected).then_some(Ok(()))
+        })
+        .ok_or_else(|| "query lifecycle timed out waiting for all participants to drain".to_string())?
+    }
+
+    fn wait_for_all_snapshots(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
+        let expected = self
+            .attempted
+            .lock()
+            .expect("attempted participant set")
+            .len();
+        self.wait_terminal_event(timeout, |terminal| {
+            if let Some(error) = &terminal.reader_failure {
+                return Some(Err(error.clone()));
+            }
+            if terminal.snapshots.len() != expected {
+                return None;
+            }
+            Some(
+                QueryTerminalSet::new(terminal.snapshots.values().cloned().collect())
+                    .map_err(|error| error.to_string()),
+            )
+        })
+        .ok_or_else(|| "query lifecycle timed out waiting for all terminal snapshots".to_string())?
+    }
+
+    fn wait_terminal_event<T>(
+        &self,
+        timeout: Duration,
+        condition: impl Fn(&TerminalState) -> Option<Result<T, String>>,
+    ) -> Option<Result<T, String>> {
+        let deadline = Instant::now().checked_add(timeout)?;
+        let mut terminal = self.terminal.0.lock().expect("query terminal state");
+        loop {
+            if let Some(result) = condition(&terminal) {
+                return Some(result);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next, wait) = self
+                .terminal
+                .1
+                .wait_timeout(terminal, deadline.saturating_duration_since(now))
+                .expect("query terminal state wait");
+            terminal = next;
+            if wait.timed_out() {
+                return condition(&terminal);
+            }
+        }
     }
 
     pub fn stop_supervisor(&self) {
@@ -538,17 +739,16 @@ impl AttemptControl {
                             .session
                             .send(QueryControlCommand::Finalize)
                             .map_err(|error| error.to_string())?;
-                        match session
-                            .recv(self.config.attach_timeout())
-                            .map_err(|error| error.to_string())?
-                        {
-                            QueryControlEvent::TerminationAccepted {
-                                reason: QueryTerminationReason::CoordinatorFinalize,
-                            } => Ok(()),
-                            event => Err(format!(
-                                "backend {} returned {event:?} after finalize",
+                        match self.wait_for_termination(
+                            session.target.backend_idx(),
+                            self.config.attach_timeout(),
+                        ) {
+                            Ok(QueryTerminationReason::CoordinatorFinalize) => Ok(()),
+                            Ok(reason) => Err(format!(
+                                "backend {} accepted finalize with unexpected reason {reason:?}",
                                 session.target.backend_idx()
                             )),
+                            Err(error) => Err(error),
                         }
                     })
                 })
@@ -597,6 +797,143 @@ impl AttemptControl {
     }
 }
 
+fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
+    loop {
+        let Some(control) = control.upgrade() else {
+            return;
+        };
+        {
+            let terminal = control.terminal.0.lock().expect("query terminal state");
+            if terminal.stop_readers {
+                return;
+            }
+        }
+        let event = match session.recv(control.config.heartbeat_timeout()) {
+            Ok(event) => event,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    QueryLifecycleTransportErrorKind::DeadlineExceeded
+                ) => continue,
+            Err(error) => {
+                control.record_reader_failure(format!(
+                    "query lifecycle control stream lost on backend {} digest {}: {error}",
+                    session.target.backend_idx(),
+                    hex::encode(session.digest.as_bytes())
+                ));
+                return;
+            }
+        };
+        if let QueryControlEvent::LocalFailure { code, detail } = event {
+            control.supervisor_failed(
+                format!(
+                    "query lifecycle local failure on backend {} ({code}): {detail}",
+                    session.target.backend_idx()
+                ),
+                SupervisorFailureKind::LocalFailure,
+            );
+            return;
+        }
+        if let Err(error) = control.handle_control_event(&session, event) {
+            control.record_reader_failure(error);
+            return;
+        }
+    }
+}
+
+impl AttemptControl {
+    fn handle_control_event(
+        &self,
+        session: &ActiveSession,
+        event: QueryControlEvent,
+    ) -> Result<(), String> {
+        match event {
+            QueryControlEvent::HeartbeatAck { sequence } => {
+                let mut terminal = self.terminal.0.lock().expect("query terminal state");
+                let prior = terminal
+                    .heartbeat_acks
+                    .entry(session.target.backend_idx())
+                    .or_insert(0);
+                *prior = (*prior).max(sequence);
+                self.terminal.1.notify_all();
+                Ok(())
+            }
+            QueryControlEvent::LocalDrained => {
+                self.terminal
+                    .0
+                    .lock()
+                    .expect("query terminal state")
+                    .locally_drained
+                    .insert(session.target.backend_idx());
+                self.terminal.1.notify_all();
+                Ok(())
+            }
+            QueryControlEvent::TerminationAccepted { reason } => {
+                self.terminal
+                    .0
+                    .lock()
+                    .expect("query terminal state")
+                    .termination_accepted
+                    .insert(session.target.backend_idx(), reason);
+                self.terminal.1.notify_all();
+                Ok(())
+            }
+            QueryControlEvent::TerminalSnapshot { snapshot } => {
+                self.store_terminal_snapshot(snapshot.clone())
+                    .map_err(|error| error.to_string())?;
+                session
+                    .session
+                    .send(QueryControlCommand::TerminalAck {
+                        ack: novarocks::query_execution::lifecycle::QueryTerminalAck::from_snapshot(
+                            &snapshot,
+                        ),
+                    })
+                    .map_err(|error| {
+                        format!(
+                            "query lifecycle terminal ACK failed for backend {}: {error}",
+                            session.target.backend_idx()
+                        )
+                    })
+            }
+            QueryControlEvent::LocalFailure { code, detail } => Err(format!(
+                "query lifecycle local failure on backend {} ({code}): {detail}",
+                session.target.backend_idx()
+            )),
+            QueryControlEvent::ControlReady => Err(format!(
+                "backend {} emitted duplicate ControlReady after attachment",
+                session.target.backend_idx()
+            )),
+        }
+    }
+
+    fn record_reader_failure(&self, reason: String) {
+        let mut terminal = self.terminal.0.lock().expect("query terminal state");
+        if terminal.reader_failure.is_none() {
+            terminal.reader_failure = Some(reason);
+        }
+        self.terminal.1.notify_all();
+    }
+
+    fn stop_readers(&self) {
+        self.terminal
+            .0
+            .lock()
+            .expect("query terminal state")
+            .stop_readers = true;
+        self.terminal.1.notify_all();
+    }
+
+    fn join_readers(&self) {
+        self.stop_readers();
+        let readers = std::mem::take(
+            &mut *self.readers.lock().expect("query control event readers"),
+        );
+        for reader in readers {
+            let _ = reader.join();
+        }
+    }
+}
+
 impl ActiveQueryAttemptControl for AttemptControl {
     fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
@@ -607,6 +944,14 @@ impl ActiveQueryAttemptControl for AttemptControl {
         if let Some(registry) = self.registry.upgrade() {
             let _ = registry.preserve_failure_context(self.execution_id.query_id(), enriched);
         }
+    }
+
+    fn report_terminal_snapshot(
+        &self,
+        snapshot: QueryTerminalSnapshot,
+    ) -> Result<bool, DistributedQueryError> {
+        self.store_terminal_snapshot(snapshot)
+            .map(|outcome| outcome == TerminalSnapshotStoreOutcome::Accepted)
     }
 }
 
@@ -658,35 +1003,14 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
             }
         }
         for session in &sessions {
-            match session.recv(control.config.heartbeat_timeout()) {
-                Ok(QueryControlEvent::HeartbeatAck {
-                    sequence: ack_sequence,
-                }) if ack_sequence == sequence => {}
-                Ok(QueryControlEvent::LocalFailure { code, detail }) => {
-                    control.supervisor_failed(
-                        format!(
-                            "query lifecycle local failure on backend {} ({code}): {detail}",
-                            session.target.backend_idx()
-                        ),
-                        SupervisorFailureKind::LocalFailure,
-                    );
-                    return;
-                }
-                Ok(event) => {
-                    control.supervisor_failed(
-                        format!(
-                            "query lifecycle invalid heartbeat event from backend {}: {event:?}",
-                            session.target.backend_idx()
-                        ),
-                        SupervisorFailureKind::CoordinatorLost,
-                    );
-                    return;
-                }
+            match control.wait_for_heartbeat(
+                session.target.backend_idx(),
+                sequence,
+                control.config.heartbeat_timeout(),
+            ) {
+                Ok(()) => {}
                 Err(error) => {
-                    let timeout = matches!(
-                        error.kind(),
-                        super::QueryLifecycleTransportErrorKind::DeadlineExceeded
-                    );
+                    let timeout = error.contains("heartbeat timeout");
                     let failure = if timeout {
                         format!(
                             "query lifecycle heartbeat timeout on backend {} digest {}",
@@ -695,7 +1019,7 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                         )
                     } else {
                         format!(
-                            "query lifecycle control stream lost on backend {} digest {}: {error}",
+                            "query lifecycle control event reader failed on backend {} digest {}: {error}",
                             session.target.backend_idx(),
                             hex::encode(session.digest.as_bytes())
                         )
@@ -786,4 +1110,8 @@ impl Drop for FrontendQueryLifecycleLeaseGuard {
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+}
+
+fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
+    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }

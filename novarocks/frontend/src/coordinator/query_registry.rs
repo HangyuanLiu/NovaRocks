@@ -24,7 +24,7 @@ use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent, QueryId,
 };
 use novarocks::query_execution::fragment_transport::FragmentDispatcher;
-use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryTerminalSnapshot};
 use novarocks::query_execution::write::NativeExecutionReport;
 
 type QueryKey = (i64, i64);
@@ -33,6 +33,15 @@ pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     fn execution_id(&self) -> QueryExecutionId;
 
     fn request_abort(&self, reason: String);
+
+    /// The terminal ingress is deliberately routed through the active attempt
+    /// rather than the legacy execution-report registry.  This keeps the
+    /// store-before-ACK identity check in one place for stream and unary
+    /// delivery.
+    fn report_terminal_snapshot(
+        &self,
+        snapshot: QueryTerminalSnapshot,
+    ) -> Result<bool, DistributedQueryError>;
 }
 
 struct ActiveQuery {
@@ -250,6 +259,33 @@ impl FrontendQueryRegistry {
             })?;
         control.request_abort(reason);
         Ok(())
+    }
+
+    pub(crate) fn report_query_terminal(
+        &self,
+        snapshot: QueryTerminalSnapshot,
+    ) -> Result<bool, DistributedQueryError> {
+        let query_id = snapshot.execution_id().query_id();
+        let control = self
+            .active
+            .lock()
+            .expect("frontend query registry lock")
+            .get(&query_key(query_id))
+            .ok_or_else(|| inactive_query(query_id))?
+            .active_attempt
+            .clone()
+            .ok_or_else(|| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::Rejected,
+                    "frontend query has no active lifecycle attempt for terminal snapshot",
+                )
+            })?;
+        if control.execution_id() != snapshot.execution_id() {
+            return Err(contract_violation(
+                "query terminal snapshot execution id is stale or belongs to a replaced attempt",
+            ));
+        }
+        control.report_terminal_snapshot(snapshot)
     }
 
     #[cfg(test)]

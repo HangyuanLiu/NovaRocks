@@ -362,6 +362,7 @@ mod tests {
                 QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
                     reason: QueryTerminationReason::CoordinatorFinalize,
                 },
+                QueryControlCommand::TerminalAck { .. } => return Ok(()),
             };
             self.events.lock().unwrap().push_back(event);
             Ok(())
@@ -495,6 +496,7 @@ mod tests {
                 QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
                     reason: QueryTerminationReason::CoordinatorFinalize,
                 },
+                QueryControlCommand::TerminalAck { .. } => return Ok(()),
             };
             self.events
                 .lock()

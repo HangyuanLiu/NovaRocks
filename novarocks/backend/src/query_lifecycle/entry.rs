@@ -58,6 +58,11 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) terminated_at: Option<Instant>,
     pub(crate) in_flight_fragments: BTreeSet<UniqueId>,
     pub(crate) accepted_fragments: BTreeSet<UniqueId>,
+    /// Immutable fragment terminal facts are admitted exactly once per staged
+    /// instance.  QLC-4 uses this set to publish LocalDrained before Finalize;
+    /// it is intentionally separate from routing removal.
+    pub(crate) completed_fragments: BTreeSet<UniqueId>,
+    pub(crate) local_drained_emitted: bool,
     pub(crate) pre_start_deadline: Option<Instant>,
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
@@ -91,6 +96,8 @@ impl QueryLifecycleEntry {
                 terminated_at: None,
                 in_flight_fragments: BTreeSet::new(),
                 accepted_fragments: BTreeSet::new(),
+                completed_fragments: BTreeSet::new(),
+                local_drained_emitted: false,
                 pre_start_deadline: None,
                 last_heartbeat: None,
                 frontend_owner_epoch: None,
