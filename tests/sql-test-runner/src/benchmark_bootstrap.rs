@@ -16,9 +16,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 use crate::types::RunnerConfig;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

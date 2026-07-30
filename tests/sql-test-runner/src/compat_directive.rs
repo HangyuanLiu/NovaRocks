@@ -239,7 +239,10 @@ fn lifecycle_log_deltas(
             let log = server_handle.be_log_contents(index)?;
             let before = snapshot.log_lengths.get(index).copied().unwrap_or(0);
             if log.len() < before {
-                bail!("BE[{index}] lifecycle log length decreased from {before} to {}", log.len());
+                bail!(
+                    "BE[{index}] lifecycle log length decreased from {before} to {}",
+                    log.len()
+                );
             }
             Ok(log[before..].to_string())
         })
@@ -302,11 +305,17 @@ fn lifecycle_evidence(
                     .get("expected_fragments")
                     .context("ControlReady missing expected_fragments")?
                     .parse::<usize>()?;
-                by_execution.entry(execution).or_default().push((index, expected));
+                by_execution
+                    .entry(execution)
+                    .or_default()
+                    .push((index, expected));
             }
         }
         for (execution, participants) in by_execution {
-            let participant_bes = participants.iter().map(|(be, _)| *be).collect::<HashSet<_>>();
+            let participant_bes = participants
+                .iter()
+                .map(|(be, _)| *be)
+                .collect::<HashSet<_>>();
             if participant_bes.len() != 3 {
                 continue;
             }
@@ -319,10 +328,7 @@ fn lifecycle_evidence(
                 "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
                 &execution,
             )?;
-            if services.len() == 1
-                && executors.len() == limit
-                && services.is_disjoint(&executors)
-            {
+            if services.len() == 1 && executors.len() == limit && services.is_disjoint(&executors) {
                 return Ok(Some(LogEvidenceCheck::Satisfied(vec![format!(
                     "    query_lifecycle_evidence PASS kind=service-only execution_id={execution} participants=3 executors={limit} service_backend={}",
                     services.iter().next().unwrap()
@@ -368,37 +374,32 @@ fn lifecycle_evidence(
                 "token-scoped InitAck drop marker missing".to_string(),
             )));
         };
-        let applied = distinct_backends_for_execution(&logs, "NOVAROCKS_QUERY_INIT_APPLIED", &execution)?;
-        let idempotent = distinct_backends_for_execution(
-            &logs,
-            "NOVAROCKS_QUERY_INIT_IDEMPOTENT",
-            &execution,
-        )?;
+        let applied =
+            distinct_backends_for_execution(&logs, "NOVAROCKS_QUERY_INIT_APPLIED", &execution)?;
+        let idempotent =
+            distinct_backends_for_execution(&logs, "NOVAROCKS_QUERY_INIT_IDEMPOTENT", &execution)?;
         let target_index = snapshot
             .lifecycle_token
             .as_ref()
             .map(|(index, _, _)| *index)
             .context("InitAck loss evidence has no target backend")?;
-        return Ok(Some(if applied.len() == 3 && idempotent.contains(&target_index) {
-            LogEvidenceCheck::Satisfied(vec![format!(
-                "    query_lifecycle_evidence PASS kind=init-ack-loss execution_id={execution} applied_backends=3 idempotent_backends={}",
-                idempotent.len()
-            )])
-        } else {
-            LogEvidenceCheck::Pending(format!(
-                "InitAck execution {execution} applied_backends={} idempotent_backends={}",
-                applied.len(),
-                idempotent.len()
-            ))
-        }));
+        return Ok(Some(
+            if applied.len() == 3 && idempotent.contains(&target_index) {
+                LogEvidenceCheck::Satisfied(vec![format!(
+                    "    query_lifecycle_evidence PASS kind=init-ack-loss execution_id={execution} applied_backends=3 idempotent_backends={}",
+                    idempotent.len()
+                )])
+            } else {
+                LogEvidenceCheck::Pending(format!(
+                    "InitAck execution {execution} applied_backends={} idempotent_backends={}",
+                    applied.len(),
+                    idempotent.len()
+                ))
+            },
+        ));
     }
 
-    let (
-        anchor_marker,
-        required_anchor_backends,
-        required_reason,
-        required_reason_backends,
-    ) =
+    let (anchor_marker, required_anchor_backends, required_reason, required_reason_backends) =
         if step.meta.stop_query_control_heartbeat_be_index.is_some() {
             (
                 "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED",
@@ -598,11 +599,7 @@ fn exact_fragment_cancellation_evidence(
     let anchors = failure_markers
         .into_iter()
         .enumerate()
-        .flat_map(|(be_index, markers)| {
-            markers
-                .into_iter()
-                .map(move |marker| (be_index, marker))
-        })
+        .flat_map(|(be_index, markers)| markers.into_iter().map(move |marker| (be_index, marker)))
         .filter_map(|(be_index, (marker_token, identity))| {
             (marker_token == token).then_some((be_index, identity))
         })
@@ -657,9 +654,7 @@ fn exact_fragment_cancellation_evidence(
         .filter(|identity| **identity == anchor)
         .count();
     if acknowledgements_on_failure_be != 1 {
-        bail!(
-            "injected fragment {anchor:?} ACK is not on failure BE[{anchor_be_index}]"
-        );
+        bail!("injected fragment {anchor:?} ACK is not on failure BE[{anchor_be_index}]");
     }
 
     let mut total = 0usize;
@@ -802,9 +797,7 @@ fn evaluate_log_evidence(
         }
     }
 
-    if let Some(check) =
-        lifecycle_evidence(step, server_handle, snapshot, endpoint_count)?
-    {
+    if let Some(check) = lifecycle_evidence(step, server_handle, snapshot, endpoint_count)? {
         match check {
             LogEvidenceCheck::Satisfied(lifecycle_successes) => {
                 successes.extend(lifecycle_successes)
@@ -1247,10 +1240,7 @@ mod tests {
             "the injected identity and its ACK must be proven on the BE that consumed the token",
         );
 
-        assert!(
-            error.to_string().contains("injected fragment"),
-            "{error:#}"
-        );
+        assert!(error.to_string().contains("injected fragment"), "{error:#}");
     }
 
     #[test]

@@ -735,21 +735,19 @@ fn run_imv_equivalence_check(
         0 => {
             return Err(format!(
                 "@imv_equivalence_check: MV `{mv}` not found in SHOW MATERIALIZED VIEWS output"
-            ))
+            ));
         }
         1 => matched[0]
             .get(select_text_col)
             .ok_or_else(|| {
-                format!(
-                    "@imv_equivalence_check: MV `{mv}` row has no SelectText value"
-                )
+                format!("@imv_equivalence_check: MV `{mv}` row has no SelectText value")
             })?
             .clone(),
         n => {
             return Err(format!(
                 "@imv_equivalence_check: MV `{mv}` is ambiguous in SHOW MATERIALIZED VIEWS \
                  (qualify with a unique db); matched {n} rows"
-            ))
+            ));
         }
     };
 
@@ -1917,25 +1915,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                let expected_error_compat_ok = if matched_expected_error
-                    && ctx.record_from == RecordFrom::Target
-                {
-                    match run_compat_directives_for_successful_step(
-                        step,
-                        &ctx.server_handle,
-                        &compat_snapshot,
-                        &mut log,
-                    ) {
-                        Ok(()) => true,
-                        Err(reason) => {
-                            case_failed = true;
-                            last_failure = reason;
-                            false
+                let expected_error_compat_ok =
+                    if matched_expected_error && ctx.record_from == RecordFrom::Target {
+                        match run_compat_directives_for_successful_step(
+                            step,
+                            &ctx.server_handle,
+                            &compat_snapshot,
+                            &mut log,
+                        ) {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                case_failed = true;
+                                last_failure = reason;
+                                false
+                            }
                         }
-                    }
-                } else {
-                    true
-                };
+                    } else {
+                        true
+                    };
 
                 if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
                     if matched_expected_error && expected_error_compat_ok {
@@ -1988,24 +1985,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         // @explain_*: validate during record too.
                         let explain_ok = compat_ok
                             && if !step.meta.explain_contains.is_empty()
-                            || !step.meta.explain_not_contains.is_empty()
-                        {
-                            match run_explain_directive_checks(
-                                step,
-                                &mut target_session,
-                                ctx.query_timeout,
-                                &mut log,
-                            ) {
-                                Ok(()) => true,
-                                Err(msg) => {
-                                    case_failed = true;
-                                    let _ = writeln!(log, "    ❌ {}", msg);
-                                    false
+                                || !step.meta.explain_not_contains.is_empty()
+                            {
+                                match run_explain_directive_checks(
+                                    step,
+                                    &mut target_session,
+                                    ctx.query_timeout,
+                                    &mut log,
+                                ) {
+                                    Ok(()) => true,
+                                    Err(msg) => {
+                                        case_failed = true;
+                                        let _ = writeln!(log, "    ❌ {}", msg);
+                                        false
+                                    }
                                 }
-                            }
-                        } else {
-                            true
-                        };
+                            } else {
+                                true
+                            };
                         if explain_ok {
                             if step_requires_recorded_result(step) {
                                 let record_rows = if step.meta.normalize_explain_timing {
@@ -2586,6 +2583,14 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "kill_fe_after_control_ready_count",
         "restart_be_after_init_ack_index",
         "kill_query_after_control_ready_count",
+        "fail_stage_prepare_ordinal",
+        "drop_next_stage_ack_be_index",
+        "drop_next_start_ack_be_index",
+        "suppress_start_ack_be_index",
+        "kill_query_at_lifecycle_phase",
+        "kill_fe_at_lifecycle_phase",
+        "stop_query_control_heartbeat_after_stage_be_index",
+        "hold_start_until_early_ingress",
         "query_control_fragment_backend_limit",
     ];
     sql.lines().any(|line| {
@@ -2606,9 +2611,7 @@ fn validate_selected_suite_cluster(
         .any(|suite| suite == "distributed-resilience")
         && (mode != ClusterMode::CrossProcess || cluster_size != 3)
     {
-        bail!(
-            "distributed-resilience requires --cluster-mode cross-process --cluster-size 3"
-        );
+        bail!("distributed-resilience requires --cluster-mode cross-process --cluster-size 3");
     }
     Ok(())
 }
@@ -2623,8 +2626,8 @@ fn selected_cases_require_query_lifecycle_faults(
         let suite = suite_configs
             .get(suite_name)
             .with_context(|| format!("selected suite {suite_name} is missing"))?;
-        let sql_dir = resolve_path(cli.sql_dir.as_deref(), base_dir)
-            .unwrap_or_else(|| suite.sql_dir.clone());
+        let sql_dir =
+            resolve_path(cli.sql_dir.as_deref(), base_dir).unwrap_or_else(|| suite.sql_dir.clone());
         let sql_glob = cli
             .sql_glob
             .clone()
@@ -2817,568 +2820,575 @@ fn run() -> Result<i32> {
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
     let server_handle = Arc::new(Mutex::new(server_handle));
     let primary_result = (|| -> Result<i32> {
+        // Resolve global connection params
+        let reference_required = cli.mode == Mode::Diff
+            || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
+        let target_port = resolve_effective_target_port(
+            launched_target_port,
+            cli.port.as_deref(),
+            &runner_config,
+        )?;
+        let reference_port =
+            resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
 
-    // Resolve global connection params
-    let reference_required = cli.mode == Mode::Diff
-        || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
-    let target_port = resolve_effective_target_port(
-        launched_target_port,
-        cli.port.as_deref(),
-        &runner_config,
-    )?;
-    let reference_port =
-        resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
+        let target_host = launched_target_host
+            .or_else(|| cli.host.clone())
+            .or_else(|| env_optional("STARUST_TEST_HOST"))
+            .or_else(|| runner_config.cluster.get("host").cloned())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let target_user = cli
+            .user
+            .clone()
+            .or_else(|| env_optional("STARUST_TEST_USER"))
+            .or_else(|| runner_config.cluster.get("user").cloned())
+            .unwrap_or_else(|| "root".to_string());
+        let target_password = cli
+            .password
+            .clone()
+            .or_else(|| env_optional("STARUST_TEST_PASSWORD"))
+            .or_else(|| runner_config.cluster.get("password").cloned());
+        let target_mysql_bin = cli
+            .mysql
+            .clone()
+            .unwrap_or_else(|| env_or_default("STARUST_TEST_MYSQL", "mysql"));
 
-    let target_host = launched_target_host
-        .or_else(|| cli.host.clone())
-        .or_else(|| env_optional("STARUST_TEST_HOST"))
-        .or_else(|| runner_config.cluster.get("host").cloned())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let target_user = cli
-        .user
-        .clone()
-        .or_else(|| env_optional("STARUST_TEST_USER"))
-        .or_else(|| runner_config.cluster.get("user").cloned())
-        .unwrap_or_else(|| "root".to_string());
-    let target_password = cli
-        .password
-        .clone()
-        .or_else(|| env_optional("STARUST_TEST_PASSWORD"))
-        .or_else(|| runner_config.cluster.get("password").cloned());
-    let target_mysql_bin = cli
-        .mysql
-        .clone()
-        .unwrap_or_else(|| env_or_default("STARUST_TEST_MYSQL", "mysql"));
+        let ref_host = cli
+            .ref_host
+            .clone()
+            .or_else(|| env_optional("STARUST_REF_HOST"))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let ref_user = cli
+            .ref_user
+            .clone()
+            .or_else(|| env_optional("STARUST_REF_USER"))
+            .unwrap_or_else(|| "root".to_string());
+        let ref_password = cli
+            .ref_password
+            .clone()
+            .or_else(|| env_optional("STARUST_REF_PASSWORD"));
+        let ref_mysql_bin = cli
+            .ref_mysql
+            .clone()
+            .unwrap_or_else(|| env_or_default("STARUST_REF_MYSQL", "mysql"));
 
-    let ref_host = cli
-        .ref_host
-        .clone()
-        .or_else(|| env_optional("STARUST_REF_HOST"))
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let ref_user = cli
-        .ref_user
-        .clone()
-        .or_else(|| env_optional("STARUST_REF_USER"))
-        .unwrap_or_else(|| "root".to_string());
-    let ref_password = cli
-        .ref_password
-        .clone()
-        .or_else(|| env_optional("STARUST_REF_PASSWORD"));
-    let ref_mysql_bin = cli
-        .ref_mysql
-        .clone()
-        .unwrap_or_else(|| env_or_default("STARUST_REF_MYSQL", "mysql"));
+        let verify_enabled_override = verify_override(&cli);
+        let actual_artifact_dir = resolve_path(cli.write_actual_dir.as_deref(), &base_dir);
+        let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$")?;
 
-    let verify_enabled_override = verify_override(&cli);
-    let actual_artifact_dir = resolve_path(cli.write_actual_dir.as_deref(), &base_dir);
-    let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
-    let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$")?;
-
-    // Configure thread pool
-    let jobs = if cli.jobs == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    } else {
-        cli.jobs
-    };
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .build()
-        .context("failed to build rayon thread pool")?;
-
-    // Prepare all suites
-    let mut prepared_suites: Vec<PreparedSuite> = Vec::new();
-
-    for suite_name in &suite_names {
-        let suite = suite_configs
-            .get(suite_name)
-            .expect("suite already validated");
-
-        let sql_dir = if !multi_suite {
-            resolve_path(cli.sql_dir.as_deref(), &base_dir).unwrap_or_else(|| suite.sql_dir.clone())
+        // Configure thread pool
+        let jobs = if cli.jobs == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
         } else {
-            suite.sql_dir.clone()
+            cli.jobs
         };
-        let result_dir = if !multi_suite {
-            resolve_path(cli.result_dir.as_deref(), &base_dir).or_else(|| suite.result_dir.clone())
-        } else {
-            suite.result_dir.clone()
-        };
-        let sql_glob = if !multi_suite {
-            cli.sql_glob
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .context("failed to build rayon thread pool")?;
+
+        // Prepare all suites
+        let mut prepared_suites: Vec<PreparedSuite> = Vec::new();
+
+        for suite_name in &suite_names {
+            let suite = suite_configs
+                .get(suite_name)
+                .expect("suite already validated");
+
+            let sql_dir = if !multi_suite {
+                resolve_path(cli.sql_dir.as_deref(), &base_dir)
+                    .unwrap_or_else(|| suite.sql_dir.clone())
+            } else {
+                suite.sql_dir.clone()
+            };
+            let result_dir = if !multi_suite {
+                resolve_path(cli.result_dir.as_deref(), &base_dir)
+                    .or_else(|| suite.result_dir.clone())
+            } else {
+                suite.result_dir.clone()
+            };
+            let sql_glob = if !multi_suite {
+                cli.sql_glob
+                    .clone()
+                    .unwrap_or_else(|| suite.sql_glob.clone())
+            } else {
+                suite.sql_glob.clone()
+            };
+
+            let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
+            let suite_init_hook =
+                load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
+                    .with_context(|| {
+                        format!("failed to load suite init hook for {}", suite.name)
+                    })?;
+            let suite_cleanup_hook =
+                load_suite_hook(suite.cleanup_sql.as_deref(), &meta_re, &placeholder_vars)
+                    .with_context(|| {
+                        format!("failed to load suite cleanup hook for {}", suite.name)
+                    })?;
+
+            let suite_catalog_override = suite_init_hook
+                .as_ref()
+                .and_then(|hook| hook.catalog.clone());
+            let suite_db_override = suite_init_hook.as_ref().and_then(|hook| hook.db.clone());
+
+            let target_db_default = suite_db_override
                 .clone()
-                .unwrap_or_else(|| suite.sql_glob.clone())
-        } else {
-            suite.sql_glob.clone()
-        };
+                .unwrap_or_else(|| suite.default_db.clone());
+            let ref_db_default = suite_db_override
+                .clone()
+                .unwrap_or_else(|| suite.default_db.clone());
 
-        let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
-        let suite_init_hook =
-            load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
-                .with_context(|| format!("failed to load suite init hook for {}", suite.name))?;
-        let suite_cleanup_hook =
-            load_suite_hook(suite.cleanup_sql.as_deref(), &meta_re, &placeholder_vars)
-                .with_context(|| format!("failed to load suite cleanup hook for {}", suite.name))?;
+            let verify_enabled = verify_enabled_override.unwrap_or(suite.verify_default);
+            let query_timeout = cli.query_timeout.unwrap_or_else(|| {
+                env_optional("STARUST_TEST_TIMEOUT")
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or_else(|| suite_default_query_timeout(&suite.name))
+            });
 
-        let suite_catalog_override = suite_init_hook
-            .as_ref()
-            .and_then(|hook| hook.catalog.clone());
-        let suite_db_override = suite_init_hook.as_ref().and_then(|hook| hook.db.clone());
+            let target_catalog_name = suite_catalog_override
+                .clone()
+                .unwrap_or_else(|| suite.default_catalog.clone());
+            let reference_catalog_name = suite_catalog_override
+                .clone()
+                .unwrap_or_else(|| suite.default_catalog.clone());
 
-        let target_db_default = suite_db_override
-            .clone()
-            .unwrap_or_else(|| suite.default_db.clone());
-        let ref_db_default = suite_db_override
-            .clone()
-            .unwrap_or_else(|| suite.default_db.clone());
+            let target_conn_base = ConnectionConfig {
+                mysql: target_mysql_bin.clone(),
+                host: target_host.clone(),
+                port: target_port.clone(),
+                user: target_user.clone(),
+                password: target_password.clone(),
+                catalog: Some(target_catalog_name.clone()),
+                db: if target_db_default.is_empty() {
+                    None
+                } else {
+                    Some(target_db_default)
+                },
+            };
 
-        let verify_enabled = verify_enabled_override.unwrap_or(suite.verify_default);
-        let query_timeout = cli.query_timeout.unwrap_or_else(|| {
-            env_optional("STARUST_TEST_TIMEOUT")
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or_else(|| suite_default_query_timeout(&suite.name))
-        });
+            let reference_conn_base = ConnectionConfig {
+                mysql: ref_mysql_bin.clone(),
+                host: ref_host.clone(),
+                port: reference_port.clone(),
+                user: ref_user.clone(),
+                password: ref_password.clone(),
+                catalog: Some(reference_catalog_name),
+                db: if ref_db_default.is_empty() {
+                    None
+                } else {
+                    Some(ref_db_default)
+                },
+            };
 
-        let target_catalog_name = suite_catalog_override
-            .clone()
-            .unwrap_or_else(|| suite.default_catalog.clone());
-        let reference_catalog_name = suite_catalog_override
-            .clone()
-            .unwrap_or_else(|| suite.default_catalog.clone());
+            let target_admin_conn = ConnectionConfig {
+                catalog: None,
+                db: None,
+                ..target_conn_base.clone()
+            };
+            let reference_admin_conn = ConnectionConfig {
+                catalog: None,
+                db: None,
+                ..reference_conn_base.clone()
+            };
 
-        let target_conn_base = ConnectionConfig {
-            mysql: target_mysql_bin.clone(),
-            host: target_host.clone(),
-            port: target_port.clone(),
-            user: target_user.clone(),
-            password: target_password.clone(),
-            catalog: Some(target_catalog_name.clone()),
-            db: if target_db_default.is_empty() {
-                None
-            } else {
-                Some(target_db_default)
-            },
-        };
-
-        let reference_conn_base = ConnectionConfig {
-            mysql: ref_mysql_bin.clone(),
-            host: ref_host.clone(),
-            port: reference_port.clone(),
-            user: ref_user.clone(),
-            password: ref_password.clone(),
-            catalog: Some(reference_catalog_name),
-            db: if ref_db_default.is_empty() {
-                None
-            } else {
-                Some(ref_db_default)
-            },
-        };
-
-        let target_admin_conn = ConnectionConfig {
-            catalog: None,
-            db: None,
-            ..target_conn_base.clone()
-        };
-        let reference_admin_conn = ConnectionConfig {
-            catalog: None,
-            db: None,
-            ..reference_conn_base.clone()
-        };
-
-        // Load and filter cases
-        if !sql_dir.exists() {
-            println!(
-                "❌ ERROR: SQL directory not found for suite {}: {}",
-                suite.name,
-                sql_dir.display()
-            );
-            return Ok(1);
-        }
-
-        let sql_files = list_sql_files(&sql_dir, &sql_glob)?;
-        if sql_files.is_empty() {
-            println!(
-                "❌ ERROR: no SQL files found in {} with pattern {} (suite {})",
-                sql_dir.display(),
-                sql_glob,
-                suite.name,
-            );
-            return Ok(1);
-        }
-
-        let mut cases: Vec<SqlCase> = Vec::new();
-        for sql_file in sql_files {
-            match parser::load_sql_case_from_file(
-                &sql_file,
-                &meta_re,
-                &marker_re,
-                &placeholder_vars,
-            ) {
-                Ok(Some(case)) => cases.push(case),
-                Ok(None) => {
-                    println!(
-                        "Warning: skipping SQL file without executable steps: {}",
-                        sql_file.display()
-                    );
-                }
-                Err(exc) => {
-                    println!("❌ ERROR: {}", exc);
-                    return Ok(1);
-                }
-            }
-        }
-
-        let available_case_ids: HashSet<String> = cases.iter().map(|c| c.case_id.clone()).collect();
-        let only_set = parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
-        let skip_set = parse_selector_list(cli.skip.as_deref(), &available_case_ids, "--skip")?;
-
-        cases.retain(|case| {
-            if !only_set.is_empty() && !only_set.contains(&case.case_id) {
-                return false;
-            }
-            !skip_set.contains(&case.case_id)
-        });
-
-        if let Some(limit) = cli.limit {
-            if cases.len() > limit {
-                cases.truncate(limit);
-            }
-        }
-
-        if cases.is_empty() {
-            println!("⚠️ WARNING: no queries selected for suite {}", suite.name);
-            continue;
-        }
-
-        for case in &cases {
-            for step in &case.steps {
-                if let Err(error) = compat_directive::validate_record_source(
-                    &step.meta,
-                    cli.mode,
-                    cli.record_from,
-                ) {
-                    println!(
-                        "❌ ERROR: suite {} case {} step {}: {error}",
-                        suite.name, case.case_id, step.query_number
-                    );
-                    return Ok(1);
-                }
-                if let Err(error) =
-                    compat_directive::validate_execution_mode(&step.meta, cli.mode)
-                {
-                    println!(
-                        "❌ ERROR: suite {} case {} step {}: {error}",
-                        suite.name, case.case_id, step.query_number
-                    );
-                    return Ok(1);
-                }
-                if let Err(error) = compat_directive::validate_mode(&step.meta, selected_cluster_mode)
-                {
-                    println!(
-                        "❌ ERROR: suite {} case {} step {}: {error}",
-                        suite.name, case.case_id, step.query_number
-                    );
-                    return Ok(1);
-                }
-            }
-        }
-
-        if let Err(exc) = validate_fault_injection_jobs(&cases, jobs) {
-            println!("❌ ERROR: {}", exc);
-            return Ok(1);
-        }
-
-        if matches!(cli.mode, Mode::Verify | Mode::Record) && result_dir.is_none() {
-            println!(
-                "❌ ERROR: result_dir is required for verify/record mode (suite {})",
-                suite.name
-            );
-            return Ok(1);
-        }
-
-        if cli.mode == Mode::Verify
-            && verify_enabled
-            && result_dir.is_some()
-            && !result_dir.as_ref().is_some_and(|p| p.exists())
-        {
-            println!(
-                "❌ ERROR: result_dir not found for suite {}: {}",
-                suite.name,
-                result_dir
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            );
-            return Ok(1);
-        }
-
-        if cli.mode == Mode::Record {
-            if let Some(dir) = &result_dir {
-                fs::create_dir_all(dir)
-                    .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
-            }
-        }
-
-        if !cli.dry_run {
-            ensure_benchmark_data(
-                &benchmark_bootstrap_options,
-                &runner_config,
-                &base_dir,
-                &suite.name,
-                &target_catalog_name,
-                &target_host,
-                &target_port,
-                &target_user,
-                target_password.as_deref(),
-            )
-            .with_context(|| format!("failed to prepare benchmark data for {}", suite.name))?;
-        }
-
-        // Print suite header
-        println!("{}", "=".repeat(72));
-        println!(
-            "📋 {} correctness runner (jobs={})",
-            suite.name.to_uppercase(),
-            jobs
-        );
-        println!("{}", "=".repeat(72));
-        println!("mode={}", mode_name(cli.mode));
-        println!(
-            "cluster_mode={}",
-            match selected_cluster_mode {
-                ClusterMode::AllInOne => "all-in-one",
-                ClusterMode::CrossProcess => "cross-process",
-                ClusterMode::StarRocksCompat => "starrocks-compat",
-            }
-        );
-        println!("sql_dir={}", sql_dir.display());
-        println!("sql_glob={}", sql_glob);
-        if let Some(path) = runner_config.path.as_deref() {
-            println!("config={}", path.display());
-        }
-        if let Some(dir) = &result_dir {
-            println!("result_dir={}", dir.display());
-        }
-        println!("query_timeout={}s", query_timeout);
-        println!("{}", summarize_connection("target", &target_conn_base));
-        if cli.mode == Mode::Diff
-            || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
-        {
-            println!(
-                "{}",
-                summarize_connection("reference", &reference_conn_base)
-            );
-        }
-        if cli.mode == Mode::Verify {
-            println!("verify_enabled={}", verify_enabled);
-        }
-        if let Some(hook) = suite_init_hook.as_ref() {
-            println!("suite_init={}", hook.path.display());
-            if let Some(catalog) = hook.catalog.as_deref() {
-                println!("suite_env.catalog={}", catalog);
-            }
-            if let Some(db) = hook.db.as_deref() {
-                println!("suite_env.db={}", db);
-            }
-        }
-        if let Some(hook) = suite_cleanup_hook.as_ref() {
-            println!("suite_cleanup={}", hook.path.display());
-        }
-        let seq_count = cases.iter().filter(|c| c.sequential).count();
-        if seq_count > 0 {
-            println!(
-                "cases={} (parallel={}, sequential={})",
-                cases.len(),
-                cases.len() - seq_count,
-                seq_count
-            );
-        } else {
-            println!("cases={}", cases.len());
-        }
-        println!("{}", "=".repeat(72));
-
-        if cli.dry_run {
-            println!("selected cases for suite {}:", suite.name);
-            for case in &cases {
-                let file_name = case
-                    .source_file
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default();
-                let seq_tag = if case.sequential { " [sequential]" } else { "" };
+            // Load and filter cases
+            if !sql_dir.exists() {
                 println!(
-                    "  {} ({}, steps={}{})",
-                    case.case_id,
-                    file_name,
-                    case.steps.len(),
-                    seq_tag,
+                    "❌ ERROR: SQL directory not found for suite {}: {}",
+                    suite.name,
+                    sql_dir.display()
+                );
+                return Ok(1);
+            }
+
+            let sql_files = list_sql_files(&sql_dir, &sql_glob)?;
+            if sql_files.is_empty() {
+                println!(
+                    "❌ ERROR: no SQL files found in {} with pattern {} (suite {})",
+                    sql_dir.display(),
+                    sql_glob,
+                    suite.name,
+                );
+                return Ok(1);
+            }
+
+            let mut cases: Vec<SqlCase> = Vec::new();
+            for sql_file in sql_files {
+                match parser::load_sql_case_from_file(
+                    &sql_file,
+                    &meta_re,
+                    &marker_re,
+                    &placeholder_vars,
+                ) {
+                    Ok(Some(case)) => cases.push(case),
+                    Ok(None) => {
+                        println!(
+                            "Warning: skipping SQL file without executable steps: {}",
+                            sql_file.display()
+                        );
+                    }
+                    Err(exc) => {
+                        println!("❌ ERROR: {}", exc);
+                        return Ok(1);
+                    }
+                }
+            }
+
+            let available_case_ids: HashSet<String> =
+                cases.iter().map(|c| c.case_id.clone()).collect();
+            let only_set = parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
+            let skip_set = parse_selector_list(cli.skip.as_deref(), &available_case_ids, "--skip")?;
+
+            cases.retain(|case| {
+                if !only_set.is_empty() && !only_set.contains(&case.case_id) {
+                    return false;
+                }
+                !skip_set.contains(&case.case_id)
+            });
+
+            if let Some(limit) = cli.limit {
+                if cases.len() > limit {
+                    cases.truncate(limit);
+                }
+            }
+
+            if cases.is_empty() {
+                println!("⚠️ WARNING: no queries selected for suite {}", suite.name);
+                continue;
+            }
+
+            for case in &cases {
+                for step in &case.steps {
+                    if let Err(error) = compat_directive::validate_record_source(
+                        &step.meta,
+                        cli.mode,
+                        cli.record_from,
+                    ) {
+                        println!(
+                            "❌ ERROR: suite {} case {} step {}: {error}",
+                            suite.name, case.case_id, step.query_number
+                        );
+                        return Ok(1);
+                    }
+                    if let Err(error) =
+                        compat_directive::validate_execution_mode(&step.meta, cli.mode)
+                    {
+                        println!(
+                            "❌ ERROR: suite {} case {} step {}: {error}",
+                            suite.name, case.case_id, step.query_number
+                        );
+                        return Ok(1);
+                    }
+                    if let Err(error) =
+                        compat_directive::validate_mode(&step.meta, selected_cluster_mode)
+                    {
+                        println!(
+                            "❌ ERROR: suite {} case {} step {}: {error}",
+                            suite.name, case.case_id, step.query_number
+                        );
+                        return Ok(1);
+                    }
+                }
+            }
+
+            if let Err(exc) = validate_fault_injection_jobs(&cases, jobs) {
+                println!("❌ ERROR: {}", exc);
+                return Ok(1);
+            }
+
+            if matches!(cli.mode, Mode::Verify | Mode::Record) && result_dir.is_none() {
+                println!(
+                    "❌ ERROR: result_dir is required for verify/record mode (suite {})",
+                    suite.name
+                );
+                return Ok(1);
+            }
+
+            if cli.mode == Mode::Verify
+                && verify_enabled
+                && result_dir.is_some()
+                && !result_dir.as_ref().is_some_and(|p| p.exists())
+            {
+                println!(
+                    "❌ ERROR: result_dir not found for suite {}: {}",
+                    suite.name,
+                    result_dir
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+                return Ok(1);
+            }
+
+            if cli.mode == Mode::Record {
+                if let Some(dir) = &result_dir {
+                    fs::create_dir_all(dir)
+                        .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
+                }
+            }
+
+            if !cli.dry_run {
+                ensure_benchmark_data(
+                    &benchmark_bootstrap_options,
+                    &runner_config,
+                    &base_dir,
+                    &suite.name,
+                    &target_catalog_name,
+                    &target_host,
+                    &target_port,
+                    &target_user,
+                    target_password.as_deref(),
+                )
+                .with_context(|| format!("failed to prepare benchmark data for {}", suite.name))?;
+            }
+
+            // Print suite header
+            println!("{}", "=".repeat(72));
+            println!(
+                "📋 {} correctness runner (jobs={})",
+                suite.name.to_uppercase(),
+                jobs
+            );
+            println!("{}", "=".repeat(72));
+            println!("mode={}", mode_name(cli.mode));
+            println!(
+                "cluster_mode={}",
+                match selected_cluster_mode {
+                    ClusterMode::AllInOne => "all-in-one",
+                    ClusterMode::CrossProcess => "cross-process",
+                    ClusterMode::StarRocksCompat => "starrocks-compat",
+                }
+            );
+            println!("sql_dir={}", sql_dir.display());
+            println!("sql_glob={}", sql_glob);
+            if let Some(path) = runner_config.path.as_deref() {
+                println!("config={}", path.display());
+            }
+            if let Some(dir) = &result_dir {
+                println!("result_dir={}", dir.display());
+            }
+            println!("query_timeout={}s", query_timeout);
+            println!("{}", summarize_connection("target", &target_conn_base));
+            if cli.mode == Mode::Diff
+                || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
+            {
+                println!(
+                    "{}",
+                    summarize_connection("reference", &reference_conn_base)
                 );
             }
-            continue;
-        }
-
-        let ctx = SuiteRunContext {
-            suite_name: suite.name.clone(),
-            mode: cli.mode,
-            record_from: cli.record_from,
-            target_conn_base,
-            reference_conn_base,
-            target_admin_conn,
-            reference_admin_conn,
-            result_dir,
-            actual_artifact_dir: actual_artifact_dir.clone(),
-            verify_enabled,
-            query_timeout,
-            reference_required,
-            auto_case_db: suite.auto_case_db,
-            order_sensitive_default: cli.order_sensitive_default,
-            float_epsilon: cli.float_epsilon,
-            preview_lines: cli.preview_lines,
-            update_expected: cli.update_expected,
-            target_session_sql: cli.target_session_sql.clone(),
-            marker_re: marker_re.clone(),
-            fail_fast: cli.fail_fast,
-            server_handle: Arc::clone(&server_handle),
-        };
-
-        prepared_suites.push(PreparedSuite {
-            ctx,
-            cases,
-            init_hook: suite_init_hook,
-            cleanup_hook: suite_cleanup_hook,
-        });
-    }
-
-    if cli.dry_run {
-        return Ok(0);
-    }
-
-    if prepared_suites.is_empty() {
-        println!("❌ ERROR: no suites to run");
-        return Ok(1);
-    }
-
-    // Global abort flag for fail-fast
-    let abort = AtomicBool::new(false);
-    let stdout_lock = Mutex::new(());
-
-    // Run suites (parallel via rayon thread pool)
-    let suite_outcomes: Vec<SuiteOutcome> = pool.install(|| {
-        prepared_suites
-            .par_iter()
-            .map(|ps| run_suite(ps, &abort, &stdout_lock))
-            .collect()
-    });
-
-    // Aggregate results
-    let mut grand_total = 0usize;
-    let mut grand_passed = 0usize;
-    let mut grand_failed = 0usize;
-    let mut grand_skipped = 0usize;
-    let mut all_case_timings: Vec<CaseTiming> = Vec::new();
-    let mut all_failed_cases: Vec<(String, String)> = Vec::new();
-    let mut all_cleanup_errors: Vec<String> = Vec::new();
-
-    for so in &suite_outcomes {
-        grand_total += so.total;
-        for co in &so.outcomes {
-            match co.status {
-                CaseStatus::Pass => grand_passed += 1,
-                CaseStatus::Fail => {
-                    grand_failed += 1;
-                    all_failed_cases.push((so.suite_name.clone(), co.case_id.clone()));
-                }
-                CaseStatus::Skipped => grand_skipped += 1,
+            if cli.mode == Mode::Verify {
+                println!("verify_enabled={}", verify_enabled);
             }
-            all_case_timings.push(CaseTiming {
-                suite_name: so.suite_name.clone(),
-                case_id: co.case_id.clone(),
-                status: co.status,
-                elapsed: co.elapsed,
+            if let Some(hook) = suite_init_hook.as_ref() {
+                println!("suite_init={}", hook.path.display());
+                if let Some(catalog) = hook.catalog.as_deref() {
+                    println!("suite_env.catalog={}", catalog);
+                }
+                if let Some(db) = hook.db.as_deref() {
+                    println!("suite_env.db={}", db);
+                }
+            }
+            if let Some(hook) = suite_cleanup_hook.as_ref() {
+                println!("suite_cleanup={}", hook.path.display());
+            }
+            let seq_count = cases.iter().filter(|c| c.sequential).count();
+            if seq_count > 0 {
+                println!(
+                    "cases={} (parallel={}, sequential={})",
+                    cases.len(),
+                    cases.len() - seq_count,
+                    seq_count
+                );
+            } else {
+                println!("cases={}", cases.len());
+            }
+            println!("{}", "=".repeat(72));
+
+            if cli.dry_run {
+                println!("selected cases for suite {}:", suite.name);
+                for case in &cases {
+                    let file_name = case
+                        .source_file
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default();
+                    let seq_tag = if case.sequential { " [sequential]" } else { "" };
+                    println!(
+                        "  {} ({}, steps={}{})",
+                        case.case_id,
+                        file_name,
+                        case.steps.len(),
+                        seq_tag,
+                    );
+                }
+                continue;
+            }
+
+            let ctx = SuiteRunContext {
+                suite_name: suite.name.clone(),
+                mode: cli.mode,
+                record_from: cli.record_from,
+                target_conn_base,
+                reference_conn_base,
+                target_admin_conn,
+                reference_admin_conn,
+                result_dir,
+                actual_artifact_dir: actual_artifact_dir.clone(),
+                verify_enabled,
+                query_timeout,
+                reference_required,
+                auto_case_db: suite.auto_case_db,
+                order_sensitive_default: cli.order_sensitive_default,
+                float_epsilon: cli.float_epsilon,
+                preview_lines: cli.preview_lines,
+                update_expected: cli.update_expected,
+                target_session_sql: cli.target_session_sql.clone(),
+                marker_re: marker_re.clone(),
+                fail_fast: cli.fail_fast,
+                server_handle: Arc::clone(&server_handle),
+            };
+
+            prepared_suites.push(PreparedSuite {
+                ctx,
+                cases,
+                init_hook: suite_init_hook,
+                cleanup_hook: suite_cleanup_hook,
             });
         }
-        all_cleanup_errors.extend(so.cleanup_errors.iter().cloned());
-    }
 
-    let total_cpu_time: Duration = all_case_timings.iter().map(|timing| timing.elapsed).sum();
-
-    // Print summary
-    println!("\n{}", "=".repeat(72));
-    if suite_outcomes.len() == 1 {
-        println!(
-            "summary ({}, mode={})",
-            suite_outcomes[0].suite_name,
-            mode_name(cli.mode)
-        );
-    } else {
-        let names: Vec<&str> = suite_outcomes
-            .iter()
-            .map(|s| s.suite_name.as_str())
-            .collect();
-        println!(
-            "summary ({} suites: {}, mode={})",
-            names.len(),
-            names.join(", "),
-            mode_name(cli.mode)
-        );
-    }
-    println!("{}", "=".repeat(72));
-    println!("total={}", grand_total);
-    println!("pass={}", grand_passed);
-    println!("fail={}", grand_failed);
-    if grand_skipped > 0 {
-        println!("skipped={}", grand_skipped);
-    }
-    println!("cpu_time={:.2}s", total_cpu_time.as_secs_f64());
-    for so in &suite_outcomes {
-        println!(
-            "  suite {} wall_time={:.2}s",
-            so.suite_name,
-            so.wall_time.as_secs_f64()
-        );
-    }
-
-    let mut slowest_case_timings = all_case_timings.clone();
-    slowest_case_timings.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
-    println!("\nslowest cases (top 5):");
-    for timing in slowest_case_timings.iter().take(5) {
-        println!(
-            "  [{}] {}: {:.2}s",
-            timing.suite_name,
-            timing.case_id,
-            timing.elapsed.as_secs_f64()
-        );
-    }
-
-    all_case_timings.sort_by(|a, b| {
-        a.suite_name
-            .cmp(&b.suite_name)
-            .then_with(|| b.elapsed.cmp(&a.elapsed))
-            .then_with(|| a.case_id.cmp(&b.case_id))
-    });
-    print!("{}", format_case_timings(&all_case_timings));
-
-    if !all_failed_cases.is_empty() {
-        println!("\nfailed cases:");
-        for (suite, case_id) in &all_failed_cases {
-            println!("  [{}] {}", suite, case_id);
+        if cli.dry_run {
+            return Ok(0);
         }
-    }
-    if !all_cleanup_errors.is_empty() {
-        println!("\ncleanup errors:");
-        for err in &all_cleanup_errors {
-            println!("  {}", err);
+
+        if prepared_suites.is_empty() {
+            println!("❌ ERROR: no suites to run");
+            return Ok(1);
         }
-    }
-    println!("{}", "=".repeat(72));
 
-    if grand_failed > 0 || !all_cleanup_errors.is_empty() {
-        return Ok(1);
-    }
+        // Global abort flag for fail-fast
+        let abort = AtomicBool::new(false);
+        let stdout_lock = Mutex::new(());
 
-    Ok(0)
+        // Run suites (parallel via rayon thread pool)
+        let suite_outcomes: Vec<SuiteOutcome> = pool.install(|| {
+            prepared_suites
+                .par_iter()
+                .map(|ps| run_suite(ps, &abort, &stdout_lock))
+                .collect()
+        });
+
+        // Aggregate results
+        let mut grand_total = 0usize;
+        let mut grand_passed = 0usize;
+        let mut grand_failed = 0usize;
+        let mut grand_skipped = 0usize;
+        let mut all_case_timings: Vec<CaseTiming> = Vec::new();
+        let mut all_failed_cases: Vec<(String, String)> = Vec::new();
+        let mut all_cleanup_errors: Vec<String> = Vec::new();
+
+        for so in &suite_outcomes {
+            grand_total += so.total;
+            for co in &so.outcomes {
+                match co.status {
+                    CaseStatus::Pass => grand_passed += 1,
+                    CaseStatus::Fail => {
+                        grand_failed += 1;
+                        all_failed_cases.push((so.suite_name.clone(), co.case_id.clone()));
+                    }
+                    CaseStatus::Skipped => grand_skipped += 1,
+                }
+                all_case_timings.push(CaseTiming {
+                    suite_name: so.suite_name.clone(),
+                    case_id: co.case_id.clone(),
+                    status: co.status,
+                    elapsed: co.elapsed,
+                });
+            }
+            all_cleanup_errors.extend(so.cleanup_errors.iter().cloned());
+        }
+
+        let total_cpu_time: Duration = all_case_timings.iter().map(|timing| timing.elapsed).sum();
+
+        // Print summary
+        println!("\n{}", "=".repeat(72));
+        if suite_outcomes.len() == 1 {
+            println!(
+                "summary ({}, mode={})",
+                suite_outcomes[0].suite_name,
+                mode_name(cli.mode)
+            );
+        } else {
+            let names: Vec<&str> = suite_outcomes
+                .iter()
+                .map(|s| s.suite_name.as_str())
+                .collect();
+            println!(
+                "summary ({} suites: {}, mode={})",
+                names.len(),
+                names.join(", "),
+                mode_name(cli.mode)
+            );
+        }
+        println!("{}", "=".repeat(72));
+        println!("total={}", grand_total);
+        println!("pass={}", grand_passed);
+        println!("fail={}", grand_failed);
+        if grand_skipped > 0 {
+            println!("skipped={}", grand_skipped);
+        }
+        println!("cpu_time={:.2}s", total_cpu_time.as_secs_f64());
+        for so in &suite_outcomes {
+            println!(
+                "  suite {} wall_time={:.2}s",
+                so.suite_name,
+                so.wall_time.as_secs_f64()
+            );
+        }
+
+        let mut slowest_case_timings = all_case_timings.clone();
+        slowest_case_timings.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
+        println!("\nslowest cases (top 5):");
+        for timing in slowest_case_timings.iter().take(5) {
+            println!(
+                "  [{}] {}: {:.2}s",
+                timing.suite_name,
+                timing.case_id,
+                timing.elapsed.as_secs_f64()
+            );
+        }
+
+        all_case_timings.sort_by(|a, b| {
+            a.suite_name
+                .cmp(&b.suite_name)
+                .then_with(|| b.elapsed.cmp(&a.elapsed))
+                .then_with(|| a.case_id.cmp(&b.case_id))
+        });
+        print!("{}", format_case_timings(&all_case_timings));
+
+        if !all_failed_cases.is_empty() {
+            println!("\nfailed cases:");
+            for (suite, case_id) in &all_failed_cases {
+                println!("  [{}] {}", suite, case_id);
+            }
+        }
+        if !all_cleanup_errors.is_empty() {
+            println!("\ncleanup errors:");
+            for err in &all_cleanup_errors {
+                println!("  {}", err);
+            }
+        }
+        println!("{}", "=".repeat(72));
+
+        if grand_failed > 0 || !all_cleanup_errors.is_empty() {
+            return Ok(1);
+        }
+
+        Ok(0)
     })();
     finish_run_with_server_cleanup(server_handle, primary_result)
 }
@@ -3396,11 +3406,11 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
-        Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
-        bounded_fault_query_timeout, execute_target_session_sql_with,
-        expected_engine_error_code_diff_result,
-        expected_engine_error_code_result, finish_expected_error_step, validate_fault_injection_jobs,
-        sql_text_has_query_lifecycle_fault_directive, validate_selected_suite_cluster,
+        Cli, annotate_failure_with_engine_error_code, bounded_fault_query_timeout,
+        evaluate_expected_error_branch, execute_target_session_sql_with,
+        expected_engine_error_code_diff_result, expected_engine_error_code_result,
+        finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
+        validate_fault_injection_jobs, validate_selected_suite_cluster,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3487,6 +3497,12 @@ mod tests {
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @kill_query_after_control_ready_count=3\nSELECT 1;"
         ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @drop_next_stage_ack_be_index=1\nSELECT 1;"
+        ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @hold_start_until_early_ingress=true\nSELECT 1;"
+        ));
         assert!(!sql_text_has_query_lifecycle_fault_directive(
             "-- query-control-heartbeat-loss is only a case name\nSELECT 1;"
         ));
@@ -3505,9 +3521,9 @@ mod tests {
             let error = validate_selected_suite_cluster(&suites, mode, size)
                 .expect_err("distributed-resilience must reject noncanonical topology");
             assert!(
-                error
-                    .to_string()
-                    .contains("distributed-resilience requires --cluster-mode cross-process --cluster-size 3"),
+                error.to_string().contains(
+                    "distributed-resilience requires --cluster-mode cross-process --cluster-size 3"
+                ),
                 "unexpected error: {error}"
             );
         }
@@ -3707,8 +3723,8 @@ mod tests {
                 ..QueryMeta::default()
             },
         };
-        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> = Arc::new(
-            Mutex::new(Box::new(MissingCompatEvidenceServer {
+        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(MissingCompatEvidenceServer {
                 endpoints: vec![crate::types::CompatBeEndpoint {
                     host: "127.0.0.1".to_string(),
                     heartbeat_port: 19050,
@@ -3718,8 +3734,7 @@ mod tests {
                     grpc_port: 18070,
                     starlet_port: 19070,
                 }],
-            })),
-        );
+            })));
         let mut log = String::new();
 
         let passed = finish_expected_error_step(
@@ -3767,8 +3782,8 @@ mod tests {
                 ..QueryMeta::default()
             },
         };
-        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> = Arc::new(
-            Mutex::new(Box::new(PresentCompatEvidenceServer(
+        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(PresentCompatEvidenceServer(
                 MissingCompatEvidenceServer {
                     endpoints: vec![crate::types::CompatBeEndpoint {
                         host: "127.0.0.1".to_string(),
@@ -3780,8 +3795,7 @@ mod tests {
                         starlet_port: 19070,
                     }],
                 },
-            ))),
-        );
+            ))));
         let mut log = String::new();
 
         assert!(finish_expected_error_step(
@@ -3870,26 +3884,25 @@ mod tests {
         ];
         let mut events = Vec::new();
 
-        let setup = execute_target_session_sql_with(
-            &mut events,
-            &statements,
-            |events, statement| {
+        let setup =
+            execute_target_session_sql_with(&mut events, &statements, |events, statement| {
                 events.push(statement.to_string());
                 if statement.contains("rejected") {
                     Err("session override rejected".to_string())
                 } else {
                     Ok(())
                 }
-            },
-        );
+            });
         if setup.is_ok() {
             events.push("CASE STEP".to_string());
         }
 
         assert_eq!(
             setup,
-            Err("target session SQL failed for \"SET rejected = true\": session override rejected"
-                .to_string())
+            Err(
+                "target session SQL failed for \"SET rejected = true\": session override rejected"
+                    .to_string()
+            )
         );
         assert_eq!(events, ["SET first = true", "SET rejected = true"]);
         assert!(!events.iter().any(|event| event == "CASE STEP"));
@@ -3901,14 +3914,10 @@ mod tests {
         let mut target_events = Vec::new();
         let reference_events: Vec<String> = Vec::new();
 
-        execute_target_session_sql_with(
-            &mut target_events,
-            &statements,
-            |events, statement| {
-                events.push(statement.to_string());
-                Ok(())
-            },
-        )
+        execute_target_session_sql_with(&mut target_events, &statements, |events, statement| {
+            events.push(statement.to_string());
+            Ok(())
+        })
         .expect("target session SQL should pass");
 
         assert_eq!(target_events, ["SET target_only = true"]);
@@ -4017,9 +4026,8 @@ mod tests {
 
     #[test]
     fn post_launch_cleanup_reports_primary_shutdown_and_residual_failures() {
-        let server: std::sync::Arc<
-            std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer)));
+        let server: std::sync::Arc<std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer)));
         let error = super::finish_run_with_server_cleanup(
             server,
             Err(anyhow::anyhow!("injected execution failure")),
@@ -4056,20 +4064,10 @@ access_key_id = "admin"
 enable_path_style_access = true
 "#;
 
-        let fe = render_cross_process_config(
-            base,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-        )
-        .expect("render fe config");
-        let be = render_cross_process_config(
-            base,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-        )
-        .expect("render be config");
+        let fe = render_cross_process_config(base, ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config(base, ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
