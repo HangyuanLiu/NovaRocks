@@ -187,13 +187,17 @@ fn plan_jobs(
             for (path, value) in &side.previous_data_file_lineage {
                 lineage.entry(path.clone()).or_insert(*value);
             }
-            let specs = deletes
-                .iter()
-                .map(position_delete_spec)
-                .collect::<Result<Vec<_>, _>>()?;
             let mut jobs = Vec::new();
             for (path, file_lineage) in lineage {
                 if side.deleted_data_file_paths.contains(&path) {
+                    continue;
+                }
+                let specs = deletes
+                    .iter()
+                    .filter(|delete| position_delete_applies_to_data_file(delete, &path))
+                    .map(position_delete_spec)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if specs.is_empty() {
                     continue;
                 }
                 let access = binding.resolve_access(&path)?;
@@ -376,6 +380,25 @@ fn position_delete_spec(
     }
 }
 
+fn position_delete_applies_to_data_file(
+    delete: &super::delta::PositionDeleteSourceData,
+    data_file_path: &str,
+) -> bool {
+    match delete.file_format {
+        // Parquet position-delete files carry one target path per row, so the
+        // reader must retain them and perform the row-level path filter.
+        PositionDeleteFileFormat::Parquet => true,
+        // A Puffin deletion vector has no per-row file-path column. Its
+        // manifest-level referenced_data_file is therefore the only target
+        // identity; applying it to every live file aliases positions across
+        // files and corrupts v3 row lineage.
+        PositionDeleteFileFormat::Puffin => delete
+            .referenced_data_file
+            .as_deref()
+            .is_some_and(|referenced| referenced == data_file_path),
+    }
+}
+
 fn delete_visibility_specs(
     file: &super::changes::DeleteVisibilityDataFileDescriptor,
 ) -> Result<Vec<IcebergDeleteFileInfo>, ConnectorError> {
@@ -456,4 +479,49 @@ fn filter_allowed_row_ids(
     let filtered = filter_record_batch(&batch, &mask)
         .map_err(|error| corrupt(format!("filter Iceberg delta row_id_allow_list: {error}")))?;
     Ok(filtered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn puffin_delete(
+        referenced_data_file: Option<&str>,
+    ) -> super::super::delta::PositionDeleteSourceData {
+        super::super::delta::PositionDeleteSourceData {
+            delete_file_path: "s3://bucket/table/delete.puffin".to_string(),
+            delete_file_size: 1,
+            referenced_data_file: referenced_data_file.map(str::to_string),
+            file_format: PositionDeleteFileFormat::Puffin,
+            content_offset: Some(0),
+            content_size_in_bytes: Some(1),
+        }
+    }
+
+    #[test]
+    fn puffin_deletion_vector_only_applies_to_its_referenced_data_file() {
+        let delete = puffin_delete(Some("s3://bucket/table/data-new.parquet"));
+
+        assert!(position_delete_applies_to_data_file(
+            &delete,
+            "s3://bucket/table/data-new.parquet"
+        ));
+        assert!(!position_delete_applies_to_data_file(
+            &delete,
+            "s3://bucket/table/data-old.parquet"
+        ));
+    }
+
+    #[test]
+    fn parquet_position_delete_remains_row_filtered() {
+        let mut delete = puffin_delete(None);
+        delete.file_format = PositionDeleteFileFormat::Parquet;
+        delete.content_offset = None;
+        delete.content_size_in_bytes = None;
+
+        assert!(position_delete_applies_to_data_file(
+            &delete,
+            "s3://bucket/table/any-data-file.parquet"
+        ));
+    }
 }

@@ -1858,6 +1858,7 @@ mod tests {
             prepared_files: Vec::new(),
             explicit_files: None,
             logical_type_columns: BTreeMap::new(),
+            hidden_columns: Vec::new(),
         };
         let payload = SplitPayload {
             version: ICEBERG_SPLIT_V1,
@@ -2054,6 +2055,7 @@ mod tests {
                         prepared_files: Vec::new(),
                         explicit_files: Some(files),
                         logical_type_columns: BTreeMap::new(),
+                        hidden_columns: Vec::new(),
                     },
                     snapshot_id: None,
                     table_uuid: None,
