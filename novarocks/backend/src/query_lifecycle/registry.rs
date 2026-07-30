@@ -28,10 +28,11 @@ use novarocks::query_execution::lifecycle::{
     ImmutableQueryTerminalRecord, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
     QueryControlAttach, QueryControlAttachment, QueryControlEvent, QueryExecutionId, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
-    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminalSnapshot,
-    QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
-    StageDigestVersion,
+    QueryLifecycleIngress, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
+    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
+    QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
+    QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason,
+    RuntimeFilterContribution, StageDigest, StageDigestVersion,
 };
 use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
@@ -107,6 +108,11 @@ pub(crate) struct QueryLifecycleRegistryConfig {
     pub(crate) stage_max_inflight_encoded_bytes: usize,
     pub(crate) stage_max_dormant_workers: usize,
     pub(crate) terminal_max_encoded_bytes: usize,
+    pub(crate) terminal_ack_timeout: Duration,
+    pub(crate) terminal_fallback_rpc_timeout: Duration,
+    pub(crate) terminal_fallback_max_attempts: usize,
+    pub(crate) terminal_fallback_initial_backoff: Duration,
+    pub(crate) terminal_fallback_max_backoff: Duration,
 }
 
 impl QueryLifecycleRegistryConfig {
@@ -128,6 +134,19 @@ impl QueryLifecycleRegistryConfig {
                 .query_control_stage_max_inflight_encoded_bytes,
             stage_max_dormant_workers: runtime.query_control_stage_max_dormant_workers,
             terminal_max_encoded_bytes: runtime.query_control_terminal_max_encoded_bytes,
+            terminal_ack_timeout: Duration::from_millis(
+                runtime.query_control_terminal_ack_timeout_ms,
+            ),
+            terminal_fallback_rpc_timeout: Duration::from_millis(
+                runtime.query_control_terminal_fallback_rpc_timeout_ms,
+            ),
+            terminal_fallback_max_attempts: runtime.query_control_terminal_fallback_max_attempts,
+            terminal_fallback_initial_backoff: Duration::from_millis(
+                runtime.query_control_terminal_fallback_initial_backoff_ms,
+            ),
+            terminal_fallback_max_backoff: Duration::from_millis(
+                runtime.query_control_terminal_fallback_max_backoff_ms,
+            ),
         }
     }
 }
@@ -229,7 +248,64 @@ pub(crate) struct QueryLifecycleRegistry {
     clock: Arc<dyn MonotonicClock>,
     metrics: Arc<dyn QueryLifecycleMetricsSink>,
     stage_resources: Arc<Mutex<StageResourceLedger>>,
+    terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
     self_weak: Weak<QueryLifecycleRegistry>,
+}
+
+struct GrpcQueryTerminalFallbackTransport;
+
+impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
+    fn report_query_terminal(
+        &self,
+        endpoint: &novarocks::query_execution::lifecycle::QueryControlEndpoint,
+        snapshot: QueryTerminalSnapshot,
+        timeout: Duration,
+    ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError> {
+        let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new_host_port(
+            endpoint.host().to_string(),
+            endpoint.port(),
+        )
+        .map_err(|error| {
+            QueryLifecycleTransportError::new(QueryLifecycleTransportErrorKind::Unavailable, error)
+        })?;
+        let response = client
+            .blocking_report_query_terminal_with_timeout(
+                novarocks::proto::novarocks::ReportQueryTerminalRequest {
+                    snapshot: Some(
+                        novarocks::query_execution::lifecycle::encode_query_terminal_snapshot(
+                            &snapshot,
+                        ),
+                    ),
+                },
+                timeout,
+            )
+            .map_err(|error| {
+                QueryLifecycleTransportError::new(
+                    QueryLifecycleTransportErrorKind::Unavailable,
+                    error,
+                )
+            })?;
+        let outcome = match novarocks::proto::novarocks::ReportQueryTerminalOutcome::try_from(
+            response.outcome,
+        ) {
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::Accepted) => {
+                QueryTerminalReportOutcome::Accepted
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::AlreadyAccepted) => {
+                QueryTerminalReportOutcome::AlreadyAccepted
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::RejectedConflict) => {
+                QueryTerminalReportOutcome::RejectedConflict
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::RejectedGone) | Err(_) => {
+                QueryTerminalReportOutcome::RejectedGone
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::Unspecified) => {
+                QueryTerminalReportOutcome::RejectedGone
+            }
+        };
+        Ok(QueryTerminalReportAck::new(outcome, response.detail))
+    }
 }
 
 struct QueryLifecycleRegistryState {
@@ -450,6 +526,9 @@ impl QueryLifecycleRegistry {
         assert!(config.stage_max_encoded_bytes > 0);
         assert!(config.stage_max_inflight_encoded_bytes >= config.stage_max_encoded_bytes);
         assert!(config.stage_max_dormant_workers >= config.stage_max_fragments);
+        assert!(!config.terminal_ack_timeout.is_zero());
+        assert!(!config.terminal_fallback_rpc_timeout.is_zero());
+        assert!(config.terminal_fallback_max_attempts > 0);
         Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
@@ -459,6 +538,7 @@ impl QueryLifecycleRegistry {
             clock,
             metrics,
             stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
+            terminal_fallback: Arc::new(GrpcQueryTerminalFallbackTransport),
             self_weak: self_weak.clone(),
         })
     }
@@ -1648,7 +1728,79 @@ impl QueryLifecycleRegistry {
                 reason: QueryTerminationReason::CoordinatorFinalize,
             });
         }
+        self.schedule_terminal_fallback(entry, record.snapshot().clone());
         Ok(())
+    }
+
+    fn schedule_terminal_fallback(
+        &self,
+        entry: Arc<QueryLifecycleEntry>,
+        snapshot: QueryTerminalSnapshot,
+    ) {
+        let endpoint = entry.manifest.report_endpoint().clone();
+        let weak = self.self_weak.clone();
+        let transport = Arc::clone(&self.terminal_fallback);
+        let config = self.config;
+        std::thread::Builder::new()
+            .name("query-terminal-fallback".to_string())
+            .spawn(move || {
+                std::thread::sleep(config.terminal_ack_timeout);
+                let mut backoff = config.terminal_fallback_initial_backoff;
+                for attempt in 0..config.terminal_fallback_max_attempts {
+                    let Some(registry) = weak.upgrade() else {
+                        return;
+                    };
+                    let retained = entry
+                        .state
+                        .lock()
+                        .expect("query lifecycle entry lock")
+                        .terminal_record
+                        .as_ref()
+                        .is_some_and(|record| record.snapshot().digest() == snapshot.digest());
+                    if !retained {
+                        return;
+                    }
+                    match transport.report_query_terminal(
+                        &endpoint,
+                        snapshot.clone(),
+                        config.terminal_fallback_rpc_timeout,
+                    ) {
+                        Ok(ack)
+                            if matches!(
+                                ack.outcome(),
+                                QueryTerminalReportOutcome::Accepted
+                                    | QueryTerminalReportOutcome::AlreadyAccepted
+                            ) =>
+                        {
+                            let _ = registry.terminal_ack_from_control(
+                                QueryTerminalAck::from_snapshot(&snapshot),
+                            );
+                            return;
+                        }
+                        Ok(ack) => warn!(
+                            target: "novarocks::query_lifecycle",
+                            attempt,
+                            outcome = ?ack.outcome(),
+                            detail = %ack.detail(),
+                            "query terminal fallback was rejected"
+                        ),
+                        Err(error) => warn!(
+                            target: "novarocks::query_lifecycle",
+                            attempt,
+                            error = %error,
+                            "query terminal fallback delivery failed"
+                        ),
+                    }
+                    if attempt + 1 < config.terminal_fallback_max_attempts {
+                        std::thread::sleep(backoff);
+                        backoff = backoff
+                            .checked_mul(2)
+                            .unwrap_or(config.terminal_fallback_max_backoff)
+                            .min(config.terminal_fallback_max_backoff);
+                    }
+                }
+            })
+            .expect("spawn query terminal fallback delivery");
     }
 
     fn terminal_ack_from_control(&self, ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {

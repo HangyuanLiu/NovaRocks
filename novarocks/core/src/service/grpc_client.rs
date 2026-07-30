@@ -67,7 +67,7 @@ impl NovaRocksGrpcRemoteClient {
         Self::new_host_port(endpoint.host().to_string(), port)
     }
 
-    fn new_host_port(host: String, port: u16) -> Result<Self, String> {
+    pub fn new_host_port(host: String, port: u16) -> Result<Self, String> {
         // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
         channel_endpoint(&host, port)
             .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;

@@ -257,6 +257,11 @@ fn registry_config(max_active_entries: usize) -> QueryLifecycleRegistryConfig {
         stage_max_inflight_encoded_bytes: 256 * 1024 * 1024,
         stage_max_dormant_workers: 512,
         terminal_max_encoded_bytes: 48 * 1024 * 1024,
+        terminal_ack_timeout: Duration::from_millis(5_000),
+        terminal_fallback_rpc_timeout: Duration::from_millis(5_000),
+        terminal_fallback_max_attempts: 5,
+        terminal_fallback_initial_backoff: Duration::from_millis(100),
+        terminal_fallback_max_backoff: Duration::from_millis(1_000),
     }
 }
 

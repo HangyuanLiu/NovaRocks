@@ -187,7 +187,7 @@ pub trait QueryTerminalIngress: Send + Sync + 'static {
 pub trait QueryTerminalFallbackTransport: Send + Sync + 'static {
     fn report_query_terminal(
         &self,
-        target: QueryLifecycleTarget,
+        endpoint: &QueryControlEndpoint,
         snapshot: QueryTerminalSnapshot,
         timeout: Duration,
     ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError>;
