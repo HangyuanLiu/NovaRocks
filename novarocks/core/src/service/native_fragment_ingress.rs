@@ -289,22 +289,6 @@ pub trait NativeFragmentIngress: Send + Sync + 'static {
         ))
     }
 
-    fn submit_native_payload(
-        &self,
-        _execution_id: proto::novarocks::QueryExecutionId,
-        _fragment: proto::plan::PlanFragment,
-        _instance_params: proto::novarocks::InstanceParams,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-        Err(NativeFragmentIngressError::new(
-            "native fragment payload ingress is not configured",
-        ))
-    }
-
-    fn submit(
-        &self,
-        request: NativeFragmentRequest,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError>;
-
     fn cancel(
         &self,
         request: NativeFragmentCancelRequest,
