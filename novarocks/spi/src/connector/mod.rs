@@ -29,7 +29,10 @@ mod read;
 pub mod conformance;
 
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
-pub use control::{ConnectorControlBinding, ConnectorExecutionDistribution, ConnectorScanPlanning};
+pub use control::{
+    ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlResolver,
+    ConnectorExecutionDistribution, ConnectorScanPlanning,
+};
 pub use distribution::{
     ConnectorExecutionDeclaration, ConnectorInstanceDeclaration, ConnectorInstanceDistribution,
     ConnectorInstanceIncarnation, ConnectorInstanceInstaller,

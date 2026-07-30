@@ -269,7 +269,10 @@ mod tests {
 
         let debug = format!("{declaration:?}");
         assert!(!debug.contains("must-not-appear"));
-        assert_eq!(declaration.binding_key().instance_id.as_str(), "catalog.analytics");
+        assert_eq!(
+            declaration.binding_key().instance_id.as_str(),
+            "catalog.analytics"
+        );
         assert_eq!(declaration.binding_key().incarnation.to_bytes(), [9; 16]);
     }
 }

@@ -123,3 +123,45 @@ impl ConnectorControlBinding {
         Ok(declaration)
     }
 }
+
+/// Narrow consumer port used by core planning code. Its implementation belongs
+/// to the frontend process; core neither owns the control registry nor creates
+/// a control binding.
+pub trait ConnectorControlResolver: Send + Sync {
+    fn acquire_current(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorControlPlanningLease, ConnectorError>;
+}
+
+/// Keeps one control generation live from metadata/planning until the caller
+/// completes the execution-binding barrier. The opaque release action is
+/// frontend-owned and is never part of a wire contract.
+pub struct ConnectorControlPlanningLease {
+    binding: Arc<ConnectorControlBinding>,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl ConnectorControlPlanningLease {
+    pub fn new(
+        binding: Arc<ConnectorControlBinding>,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            binding,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    pub fn binding(&self) -> &Arc<ConnectorControlBinding> {
+        &self.binding
+    }
+}
+
+impl Drop for ConnectorControlPlanningLease {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
