@@ -27,7 +27,7 @@ use crate::exec::operators::DataStreamPartitionType;
 use crate::sql::common::ChangeStreamBranchKind;
 
 #[derive(Clone, Debug)]
-pub(crate) enum FragmentSinkProgram {
+pub enum FragmentSinkProgram {
     Result,
     Noop,
     DataStream(DataStreamSinkProgram),
@@ -57,7 +57,7 @@ impl FragmentSinkProgram {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DataStreamSinkProgram {
+pub struct DataStreamSinkProgram {
     dest_node_id: i32,
     output_exprs: Vec<ExprId>,
     output_partition_type: DataStreamPartitionType,
@@ -69,7 +69,7 @@ pub(crate) struct DataStreamSinkProgram {
 
 impl DataStreamSinkProgram {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new(
+    pub fn try_new(
         dest_node_id: i32,
         output_exprs: Vec<ExprId>,
         output_partition_type: DataStreamPartitionType,
@@ -121,7 +121,7 @@ impl DataStreamSinkProgram {
         self.output_partition_type
     }
 
-    pub(crate) fn output_partition_exprs(&self) -> &[ExprId] {
+    pub fn output_partition_exprs(&self) -> &[ExprId] {
         &self.output_partition_exprs
     }
 
@@ -129,17 +129,17 @@ impl DataStreamSinkProgram {
         &self.output_columns
     }
 
-    pub(crate) const fn partition_arena(&self) -> &ExprArena {
+    pub const fn partition_arena(&self) -> &ExprArena {
         &self.partition_arena
     }
 
-    pub(crate) fn partition_arena_mut(&mut self) -> &mut ExprArena {
+    pub fn partition_arena_mut(&mut self) -> &mut ExprArena {
         &mut self.partition_arena
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DataStreamSinkBranchProgram {
+pub struct DataStreamSinkBranchProgram {
     dest_node_id: i32,
     output_exprs: Vec<ExprId>,
     output_partition_type: DataStreamPartitionType,
@@ -149,7 +149,7 @@ pub(crate) struct DataStreamSinkBranchProgram {
 }
 
 impl DataStreamSinkBranchProgram {
-    pub(crate) fn try_new(
+    pub fn try_new(
         dest_node_id: i32,
         output_exprs: Vec<ExprId>,
         output_partition_type: DataStreamPartitionType,
@@ -172,7 +172,7 @@ impl DataStreamSinkBranchProgram {
         Ok(program)
     }
 
-    pub(crate) fn into_program(
+    pub fn into_program(
         self,
         partition_arena: ExprArena,
     ) -> Result<DataStreamSinkProgram, ExecPlanBuildError> {
@@ -197,39 +197,39 @@ impl DataStreamSinkBranchProgram {
         )
     }
 
-    pub(crate) const fn dest_node_id(&self) -> i32 {
+    pub const fn dest_node_id(&self) -> i32 {
         self.dest_node_id
     }
 
-    pub(crate) fn output_exprs(&self) -> &[ExprId] {
+    pub fn output_exprs(&self) -> &[ExprId] {
         &self.output_exprs
     }
 
-    pub(crate) const fn output_partition_type(&self) -> DataStreamPartitionType {
+    pub const fn output_partition_type(&self) -> DataStreamPartitionType {
         self.output_partition_type
     }
 
-    pub(crate) fn output_partition_exprs(&self) -> &[ExprId] {
+    pub fn output_partition_exprs(&self) -> &[ExprId] {
         &self.output_partition_exprs
     }
 
-    pub(crate) fn output_columns(&self) -> &[SlotId] {
+    pub fn output_columns(&self) -> &[SlotId] {
         &self.output_columns
     }
 
-    pub(crate) const fn limit(&self) -> Option<i64> {
+    pub const fn limit(&self) -> Option<i64> {
         self.limit
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MultiCastDataStreamSinkProgram {
+pub struct MultiCastDataStreamSinkProgram {
     sinks: Vec<DataStreamSinkBranchProgram>,
     partition_arena: ExprArena,
 }
 
 impl MultiCastDataStreamSinkProgram {
-    pub(crate) fn try_new(
+    pub fn try_new(
         sinks: Vec<DataStreamSinkBranchProgram>,
         partition_arena: ExprArena,
     ) -> Result<Self, ExecPlanBuildError> {
@@ -254,28 +254,28 @@ impl MultiCastDataStreamSinkProgram {
         Ok(())
     }
 
-    pub(crate) fn sinks(&self) -> &[DataStreamSinkBranchProgram] {
+    pub fn sinks(&self) -> &[DataStreamSinkBranchProgram] {
         &self.sinks
     }
 
-    pub(crate) const fn partition_arena(&self) -> &ExprArena {
+    pub const fn partition_arena(&self) -> &ExprArena {
         &self.partition_arena
     }
 
-    pub(crate) fn partition_arena_mut(&mut self) -> &mut ExprArena {
+    pub fn partition_arena_mut(&mut self) -> &mut ExprArena {
         &mut self.partition_arena
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SplitDataStreamSinkProgram {
+pub struct SplitDataStreamSinkProgram {
     sinks: Vec<DataStreamSinkBranchProgram>,
     split_exprs: Vec<ExprId>,
     arena: ExprArena,
 }
 
 impl SplitDataStreamSinkProgram {
-    pub(crate) fn try_new(
+    pub fn try_new(
         sinks: Vec<DataStreamSinkBranchProgram>,
         split_exprs: Vec<ExprId>,
         arena: ExprArena,
@@ -317,25 +317,25 @@ impl SplitDataStreamSinkProgram {
         Ok(())
     }
 
-    pub(crate) fn sinks(&self) -> &[DataStreamSinkBranchProgram] {
+    pub fn sinks(&self) -> &[DataStreamSinkBranchProgram] {
         &self.sinks
     }
 
-    pub(crate) fn split_exprs(&self) -> &[ExprId] {
+    pub fn split_exprs(&self) -> &[ExprId] {
         &self.split_exprs
     }
 
-    pub(crate) const fn arena(&self) -> &ExprArena {
+    pub const fn arena(&self) -> &ExprArena {
         &self.arena
     }
 
-    pub(crate) fn arena_mut(&mut self) -> &mut ExprArena {
+    pub fn arena_mut(&mut self) -> &mut ExprArena {
         &mut self.arena
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct IcebergTableSinkProgram {
+pub struct IcebergTableSinkProgram {
     name: String,
     arena: ExprArena,
     plan: IcebergSinkPlan,
@@ -351,7 +351,7 @@ impl std::fmt::Debug for IcebergTableSinkProgram {
 }
 
 impl IcebergTableSinkProgram {
-    pub(crate) fn try_from_factory_input(
+    pub fn try_from_factory_input(
         input: IcebergSinkFactoryInput,
     ) -> Result<Self, ExecPlanBuildError> {
         let program = Self {
@@ -376,20 +376,20 @@ impl IcebergTableSinkProgram {
         }
     }
 
-    pub(crate) fn arena_mut(&mut self) -> &mut ExprArena {
+    pub fn arena_mut(&mut self) -> &mut ExprArena {
         &mut self.arena
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamRouterBranchProgram {
+pub struct IcebergChangeStreamRouterBranchProgram {
     branch_id: i32,
     branch_kind: ChangeStreamBranchKind,
     stream_sink: DataStreamSinkBranchProgram,
 }
 
 impl IcebergChangeStreamRouterBranchProgram {
-    pub(crate) fn new(
+    pub fn new(
         branch_id: i32,
         branch_kind: ChangeStreamBranchKind,
         stream_sink: DataStreamSinkBranchProgram,
@@ -401,21 +401,21 @@ impl IcebergChangeStreamRouterBranchProgram {
         }
     }
 
-    pub(crate) const fn branch_id(&self) -> i32 {
+    pub const fn branch_id(&self) -> i32 {
         self.branch_id
     }
 
-    pub(crate) const fn branch_kind(&self) -> ChangeStreamBranchKind {
+    pub const fn branch_kind(&self) -> ChangeStreamBranchKind {
         self.branch_kind
     }
 
-    pub(crate) const fn stream_sink(&self) -> &DataStreamSinkBranchProgram {
+    pub const fn stream_sink(&self) -> &DataStreamSinkBranchProgram {
         &self.stream_sink
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamRouterProgram {
+pub struct IcebergChangeStreamRouterProgram {
     change_op_slot_id: SlotId,
     data_route_slot_id: Option<SlotId>,
     branches: Vec<IcebergChangeStreamRouterBranchProgram>,
@@ -423,7 +423,7 @@ pub(crate) struct IcebergChangeStreamRouterProgram {
 }
 
 impl IcebergChangeStreamRouterProgram {
-    pub(crate) fn try_new(
+    pub fn try_new(
         change_op_slot_id: SlotId,
         data_route_slot_id: Option<SlotId>,
         branches: Vec<IcebergChangeStreamRouterBranchProgram>,
@@ -454,23 +454,23 @@ impl IcebergChangeStreamRouterProgram {
         Ok(())
     }
 
-    pub(crate) const fn change_op_slot_id(&self) -> SlotId {
+    pub const fn change_op_slot_id(&self) -> SlotId {
         self.change_op_slot_id
     }
 
-    pub(crate) const fn data_route_slot_id(&self) -> Option<SlotId> {
+    pub const fn data_route_slot_id(&self) -> Option<SlotId> {
         self.data_route_slot_id
     }
 
-    pub(crate) fn branches(&self) -> &[IcebergChangeStreamRouterBranchProgram] {
+    pub fn branches(&self) -> &[IcebergChangeStreamRouterBranchProgram] {
         &self.branches
     }
 
-    pub(crate) const fn partition_arena(&self) -> &ExprArena {
+    pub const fn partition_arena(&self) -> &ExprArena {
         &self.partition_arena
     }
 
-    pub(crate) fn partition_arena_mut(&mut self) -> &mut ExprArena {
+    pub fn partition_arena_mut(&mut self) -> &mut ExprArena {
         &mut self.partition_arena
     }
 }

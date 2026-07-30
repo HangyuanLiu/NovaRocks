@@ -29,8 +29,8 @@ use crate::connector::starrocks::lake::storage_domain::{
     StorageBundleFile, StorageBundleMetadata, StorageCombinedTransactionLog, StorageTabletMetadata,
     StorageTransactionLog,
 };
+use crate::connector::starrocks::lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest};
 use crate::connector::starrocks::schema::LakeScanTableSchema;
-use crate::protocol::starrocks::decode::{LakeMetaStorageFacts, LakeMetaStorageRequest};
 use crate::runtime::starlet_shard_registry::{S3StoreConfig, StarletShardInfo};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

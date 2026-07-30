@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub(crate) mod provider;
+pub use provider::{JdbcInstanceConfig, plan_starrocks_jdbc_read_source};
 
 use crate::exec::chunk::ChunkSchemaRef;
 use arrow::array::{

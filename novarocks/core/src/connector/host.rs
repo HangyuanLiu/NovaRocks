@@ -37,7 +37,7 @@ pub(crate) enum ConnectorHostErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConnectorHostError {
+pub struct ConnectorHostError {
     kind: ConnectorHostErrorKind,
     message: String,
 }

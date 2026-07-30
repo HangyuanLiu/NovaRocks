@@ -1016,7 +1016,7 @@ pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DataStreamPartitionType {
+pub enum DataStreamPartitionType {
     Unpartitioned,
     Random,
     HashPartitioned,
@@ -1033,7 +1033,7 @@ impl DataStreamPartitionType {
         }
     }
 
-    pub(crate) fn requires_exprs(self) -> bool {
+    pub fn requires_exprs(self) -> bool {
         matches!(
             self,
             Self::HashPartitioned | Self::BucketShuffleHashPartitioned
@@ -1042,17 +1042,17 @@ impl DataStreamPartitionType {
 }
 
 #[derive(Clone)]
-pub(crate) struct DataStreamSinkFactoryInput {
-    pub(crate) dest_node_id: i32,
-    pub(crate) output_exprs: Vec<ExprId>,
-    pub(crate) output_partition_type: DataStreamPartitionType,
-    pub(crate) output_partition_exprs: Vec<ExprId>,
-    pub(crate) output_columns: Vec<SlotId>,
-    pub(crate) destinations: Vec<FragmentDestination>,
+pub struct DataStreamSinkFactoryInput {
+    pub dest_node_id: i32,
+    pub output_exprs: Vec<ExprId>,
+    pub output_partition_type: DataStreamPartitionType,
+    pub output_partition_exprs: Vec<ExprId>,
+    pub output_columns: Vec<SlotId>,
+    pub destinations: Vec<FragmentDestination>,
 }
 
 impl DataStreamSinkFactoryInput {
-    pub(crate) fn try_from_static_program(
+    pub fn try_from_static_program(
         dest_node_id: i32,
         output_partition_type: DataStreamPartitionType,
         output_exprs: Vec<ExprId>,
@@ -1085,7 +1085,7 @@ impl DataStreamSinkFactoryInput {
         })
     }
 
-    pub(crate) fn try_new(
+    pub fn try_new(
         dest_node_id: i32,
         output_partition_type: DataStreamPartitionType,
         output_exprs: Vec<ExprId>,

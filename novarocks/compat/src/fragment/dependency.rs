@@ -18,12 +18,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks::connector::starrocks::ports::{
-    LakeMetaStorageResolver, StarletMetadataProvider, StorageMetadataProvider,
+use crate::protocol::starrocks::decode::{
+    StarRocksExternalDependency, StarRocksResolvedDependencies, StarRocksResolvedDependencyValue,
 };
-use novarocks::protocol::starrocks::decode::{
-    LakeMetaStorageFacts, LakeMetaStorageRequest, StarRocksExternalDependency,
-    StarRocksResolvedDependencies, StarRocksResolvedDependencyValue,
+use novarocks::connector::starrocks::{
+    lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest},
+    ports::{LakeMetaStorageResolver, StarletMetadataProvider, StorageMetadataProvider},
 };
 use novarocks::thrift::types::TNetworkAddress;
 
@@ -180,11 +180,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::protocol::starrocks::decode::{
+        StarRocksExternalDependency, StarRocksResolvedDependencyValue,
+    };
     use novarocks::common::types::UniqueId;
-    use novarocks::connector::starrocks::ports::LakeMetaStorageResolver;
-    use novarocks::protocol::starrocks::decode::{
-        LakeMetaStorageFacts, LakeMetaStorageRequest, StarRocksExternalDependency,
-        StarRocksResolvedDependencyValue,
+    use novarocks::connector::starrocks::{
+        lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest},
+        ports::LakeMetaStorageResolver,
     };
     use novarocks::runtime::endpoint::RuntimeEndpoint;
     use novarocks::runtime::query_context::QueryId;

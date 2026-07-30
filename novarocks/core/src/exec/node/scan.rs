@@ -140,9 +140,19 @@ pub struct ConnectorRowPosition {
 /// deliberately provider-neutral: the split remains opaque and the bound
 /// instance owns every table-format read semantic.
 #[derive(Clone)]
-pub(crate) struct ConnectorRowPositionLookup {
+pub struct ConnectorRowPositionLookup {
     pub(crate) instance: Arc<ConnectorInstance>,
     pub(crate) splits: HashMap<i32, ConnectorSplit>,
+}
+
+impl ConnectorRowPositionLookup {
+    pub fn new(instance: Arc<ConnectorInstance>, splits: HashMap<i32, ConnectorSplit>) -> Self {
+        Self { instance, splits }
+    }
+
+    pub fn splits(&self) -> impl Iterator<Item = (&i32, &ConnectorSplit)> {
+        self.splits.iter()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -491,7 +501,7 @@ impl ScanNode {
         self
     }
 
-    pub(crate) fn with_connector_row_position_lookup(
+    pub fn with_connector_row_position_lookup(
         mut self,
         lookup: Option<ConnectorRowPositionLookup>,
     ) -> Self {

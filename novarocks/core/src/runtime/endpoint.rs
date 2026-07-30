@@ -76,21 +76,21 @@ impl RuntimeEndpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentDestination {
+pub struct FragmentDestination {
     finst_id: UniqueId,
     endpoint: RuntimeEndpoint,
 }
 
 impl FragmentDestination {
-    pub(crate) fn new(finst_id: UniqueId, endpoint: RuntimeEndpoint) -> Self {
+    pub fn new(finst_id: UniqueId, endpoint: RuntimeEndpoint) -> Self {
         Self { finst_id, endpoint }
     }
 
-    pub(crate) fn finst_id(&self) -> &UniqueId {
+    pub fn finst_id(&self) -> &UniqueId {
         &self.finst_id
     }
 
-    pub(crate) fn endpoint(&self) -> &RuntimeEndpoint {
+    pub fn endpoint(&self) -> &RuntimeEndpoint {
         &self.endpoint
     }
 }

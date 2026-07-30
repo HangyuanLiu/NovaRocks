@@ -80,8 +80,21 @@ pub(crate) struct NativeAggregateTopNProducerSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AggregateRuntimeFilterSpec {
+pub struct AggregateRuntimeFilterSpec {
     pub(crate) topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+}
+
+impl AggregateRuntimeFilterSpec {
+    /// Compat fragments do not carry native runtime-filter producers.
+    pub const fn empty() -> Self {
+        Self {
+            topn_producers: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.topn_producers.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +116,6 @@ pub struct AggregateNode {
     /// Mixed merge/update aggregates are supported via per-function flags.
     pub input_is_intermediate: bool,
     pub output_chunk_schema: ChunkSchemaRef,
-    pub(crate) runtime_filter_spec: AggregateRuntimeFilterSpec,
+    pub runtime_filter_spec: AggregateRuntimeFilterSpec,
     pub streaming_preaggregation_mode: Option<StreamingPreaggregationMode>,
 }

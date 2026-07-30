@@ -70,11 +70,10 @@ pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
 pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
+pub(crate) use data_stream_sink::DataStreamSinkFactory;
 #[cfg(test)]
 pub(crate) use data_stream_sink::take_eos_be_number_for_test;
-pub(crate) use data_stream_sink::{
-    DataStreamPartitionType, DataStreamSinkFactory, DataStreamSinkFactoryInput,
-};
+pub use data_stream_sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 pub use exchange_source::ExchangeSourceFactory;
 #[cfg(feature = "compat")]
 pub use fetch_processor::FetchProcessorFactory;
@@ -84,10 +83,10 @@ pub use hashjoin::{
     BroadcastJoinProbeProcessorFactory, HashJoinBuildSinkFactory,
     PartitionedJoinProbeProcessorFactory,
 };
+pub(crate) use iceberg_change_stream_router_sink::IcebergChangeStreamRouterSinkFactory;
 #[allow(unused_imports)]
-pub(crate) use iceberg_change_stream_router_sink::{
-    IcebergChangeStreamRouterBranchFactoryInput, IcebergChangeStreamRouterSinkFactory,
-    IcebergChangeStreamRouterSinkFactoryInput,
+pub use iceberg_change_stream_router_sink::{
+    IcebergChangeStreamRouterBranchFactoryInput, IcebergChangeStreamRouterSinkFactoryInput,
 };
 pub use limit_processor::LimitProcessorFactory;
 pub use local_exchange_sink::LocalExchangeSinkFactory;

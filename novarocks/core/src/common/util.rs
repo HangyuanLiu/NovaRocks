@@ -35,14 +35,14 @@ use novarocks_types::largeint;
 use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FieldRenderSchema {
+pub struct FieldRenderSchema {
     primitive: Option<PrimitiveType>,
     json_value: bool,
     children: Vec<FieldRenderSchema>,
 }
 
 impl FieldRenderSchema {
-    pub(crate) fn scalar(primitive: Option<PrimitiveType>) -> Self {
+    pub fn scalar(primitive: Option<PrimitiveType>) -> Self {
         Self {
             primitive,
             json_value: primitive.is_some_and(PrimitiveType::is_json),
@@ -50,7 +50,7 @@ impl FieldRenderSchema {
         }
     }
 
-    pub(crate) fn complex(children: Vec<FieldRenderSchema>) -> Self {
+    pub fn complex(children: Vec<FieldRenderSchema>) -> Self {
         Self {
             primitive: None,
             json_value: false,
@@ -58,7 +58,7 @@ impl FieldRenderSchema {
         }
     }
 
-    pub(crate) fn from_field(field: &Field) -> Self {
+    pub fn from_field(field: &Field) -> Self {
         let children = match field.data_type() {
             DataType::Struct(fields) => fields
                 .iter()

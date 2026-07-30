@@ -18,8 +18,8 @@
 pub(crate) mod auto_increment;
 mod factory;
 pub(crate) mod operator;
-pub(crate) mod partition_key;
-pub(crate) mod plan;
+pub mod partition_key;
+pub mod plan;
 pub(crate) mod routing;
 
 pub use factory::OlapTableSinkFactory;

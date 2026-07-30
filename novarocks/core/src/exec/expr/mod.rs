@@ -28,7 +28,7 @@ mod in_pred;
 mod literal;
 mod slot;
 mod struct_expr;
-pub(crate) use cast::cast_with_special_rules;
+pub use cast::cast_with_special_rules;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
@@ -160,11 +160,7 @@ impl ExprArena {
         self.nodes.get(id.0)
     }
 
-    pub(crate) fn replace_literal(
-        &mut self,
-        id: ExprId,
-        value: LiteralValue,
-    ) -> Result<(), String> {
+    pub fn replace_literal(&mut self, id: ExprId, value: LiteralValue) -> Result<(), String> {
         let node = self
             .nodes
             .get_mut(id.0)
@@ -411,10 +407,7 @@ impl ExprArena {
     }
 }
 
-pub(crate) fn cast_array_to_target(
-    array: &ArrayRef,
-    target_type: &DataType,
-) -> Result<ArrayRef, String> {
+pub fn cast_array_to_target(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef, String> {
     cast::cast_with_special_rules(array, target_type)
 }
 

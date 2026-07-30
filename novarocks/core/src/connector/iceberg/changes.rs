@@ -263,19 +263,19 @@ pub(crate) struct PositionDeleteRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) enum DeleteVisibilityDeleteFileFormat {
+pub enum DeleteVisibilityDeleteFileFormat {
     Parquet,
     Puffin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) enum DeleteVisibilityDeleteFileContent {
+pub enum DeleteVisibilityDeleteFileContent {
     Position,
     Equality,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct DeleteVisibilityDeleteFileDescriptor {
+pub struct DeleteVisibilityDeleteFileDescriptor {
     pub path: String,
     pub file_format: DeleteVisibilityDeleteFileFormat,
     pub file_content: DeleteVisibilityDeleteFileContent,
@@ -285,7 +285,7 @@ pub(crate) struct DeleteVisibilityDeleteFileDescriptor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct DeleteVisibilityDataFileDescriptor {
+pub struct DeleteVisibilityDataFileDescriptor {
     pub path: String,
     pub size: i64,
     pub first_row_id: Option<i64>,

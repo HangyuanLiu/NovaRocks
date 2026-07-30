@@ -26,7 +26,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use prost::Message;
 
-use crate::common::ids::SlotId;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, get_tablet_runtime, register_tablet_runtime,
     update_tablet_runtime_schema, with_txn_log_append_lock,
@@ -41,6 +40,7 @@ use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+use crate::exec::expr::{ExprArena, ExprId};
 use crate::formats::starrocks::metadata::{
     collect_delete_predicates, lake_rowset_visibility_version,
 };
@@ -63,12 +63,12 @@ use crate::service::grpc_client::proto::starrocks::{
     txn_log_pb,
 };
 use crate::thrift::agent_service::{
-    TAlterJobType, TAlterMaterializedViewParam, TAlterTabletReqV2, TCompactionStrategy,
-    TPersistentIndexType, TTabletMetaInfo, TTabletType, TUpdateTabletMetaInfoReq,
+    TCompactionStrategy, TPersistentIndexType, TTabletMetaInfo, TTabletType,
+    TUpdateTabletMetaInfoReq,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AlterMode {
+pub enum LakeAlterTabletMode {
     SchemaChange,
     Rollup,
 }
@@ -77,9 +77,46 @@ const ALTER_METADATA_LOAD_MAX_ATTEMPTS: usize = 30;
 const ALTER_METADATA_LOAD_RETRY_INTERVAL_MS: u64 = 100;
 
 #[derive(Clone, Debug)]
-pub(super) struct RollupExprLayout {
-    pub(super) order: Vec<(i32, i32)>,
-    pub(super) index: HashMap<(i32, i32), usize>,
+pub struct RollupInputSlot {
+    pub tuple_id: i32,
+    pub slot_id: i32,
+    pub name: String,
+    pub nullable: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledRollupExpression {
+    pub arena: ExprArena,
+    pub root: ExprId,
+}
+
+#[derive(Clone, Debug)]
+pub struct RollupMaterializedViewParam {
+    pub column_name: String,
+    pub origin_column_name: Option<String>,
+    pub expression: Option<CompiledRollupExpression>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RollupExpressionProgram {
+    pub input_slots: Vec<RollupInputSlot>,
+    pub where_expression: Option<CompiledRollupExpression>,
+    pub materialized_view_params: Vec<RollupMaterializedViewParam>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LakeAlterTabletTask {
+    pub base_tablet_id: i64,
+    pub new_tablet_id: i64,
+    pub base_schema_hash: i32,
+    pub new_schema_hash: i32,
+    pub alter_version: i64,
+    pub txn_id: i64,
+    pub mode: LakeAlterTabletMode,
+    pub base_tablet_read_schema: Option<StarRocksTabletSchema>,
+    pub rollup: Option<RollupExpressionProgram>,
+    pub columns_len: usize,
+    pub base_table_column_names_len: usize,
 }
 
 fn normalize_slot_name(name: &str) -> String {
@@ -100,58 +137,56 @@ fn normalize_slot_name(name: &str) -> String {
 /// composition root.  Compat must pass this explicitly: a tablet may not be
 /// registered yet when the agent task arrives, so consulting the runtime
 /// registry here would make the protobuf fallback observable on cold paths.
-pub(crate) fn execute_alter_tablet_task_with_storage_metadata_provider(
-    request: &TAlterTabletReqV2,
+pub fn execute_lake_alter_tablet_task(
+    task: LakeAlterTabletTask,
     storage_metadata_provider: Arc<dyn StorageMetadataProvider>,
 ) -> Result<(), String> {
-    let alter_mode = validate_schema_change_request(request)?;
+    validate_schema_change_task(&task)?;
 
-    let base_tablet_id = request.base_tablet_id;
-    let new_tablet_id = request.new_tablet_id;
-    let alter_version = request
-        .alter_version
-        .ok_or_else(|| "alter task missing alter_version".to_string())?;
+    let alter_mode = task.mode;
+    let base_tablet_id = task.base_tablet_id;
+    let new_tablet_id = task.new_tablet_id;
+    let alter_version = task.alter_version;
     if alter_version <= 0 {
         return Err(format!(
             "alter task has invalid alter_version={alter_version}"
         ));
     }
-    let txn_id = request
-        .txn_id
-        .ok_or_else(|| "alter task missing txn_id".to_string())?;
+    let txn_id = task.txn_id;
     if txn_id <= 0 {
         return Err(format!("alter task has invalid txn_id={txn_id}"));
     }
 
-    let materialized_view_param_summary = request
-        .materialized_view_params
+    let materialized_view_param_summary = task
+        .rollup
         .as_ref()
-        .map(|params| {
-            params
+        .map(|program| {
+            program
+                .materialized_view_params
                 .iter()
                 .map(|param| {
                     format!(
                         "{}=>origin={:?},mv_expr={}",
                         param.column_name,
                         param.origin_column_name.as_deref(),
-                        param.mv_expr.is_some()
+                        param.expression.is_some()
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("; ")
         })
         .unwrap_or_default();
-    let slot_desc_summary = request
-        .desc_tbl
+    let slot_desc_summary = task
+        .rollup
         .as_ref()
-        .and_then(|tbl| tbl.slot_descriptors.as_ref())
-        .map(|slots| {
-            slots
+        .map(|program| {
+            program
+                .input_slots
                 .iter()
                 .map(|slot| {
                     format!(
-                        "slot_id={:?},col={:?},physical={:?},parent={:?}",
-                        slot.id, slot.col_name, slot.col_physical_name, slot.parent
+                        "slot_id={},col={},physical=None,parent={}",
+                        slot.slot_id, slot.name, slot.tuple_id
                     )
                 })
                 .collect::<Vec<_>>()
@@ -163,21 +198,13 @@ pub(crate) fn execute_alter_tablet_task_with_storage_metadata_provider(
         alter_mode = ?alter_mode,
         base_tablet_id,
         new_tablet_id,
-        base_schema_hash = request.base_schema_hash,
-        new_schema_hash = request.new_schema_hash,
+        base_schema_hash = task.base_schema_hash,
+        new_schema_hash = task.new_schema_hash,
         alter_version,
         txn_id,
-        columns_len = request.columns.as_ref().map(|v| v.len()).unwrap_or(0),
-        base_table_column_names_len = request
-            .base_table_column_names
-            .as_ref()
-            .map(|v| v.len())
-            .unwrap_or(0),
-        materialized_view_param_count = request
-            .materialized_view_params
-            .as_ref()
-            .map(|v| v.len())
-            .unwrap_or(0),
+        columns_len = task.columns_len,
+        base_table_column_names_len = task.base_table_column_names_len,
+        materialized_view_param_count = task.rollup.as_ref().map(|program| program.materialized_view_params.len()).unwrap_or(0),
         materialized_view_param_summary,
         slot_desc_summary,
         "schema_change alter task received"
@@ -200,8 +227,8 @@ pub(crate) fn execute_alter_tablet_task_with_storage_metadata_provider(
         true,
     )?;
 
-    let base_read_schema = if let Some(read_schema) = request.base_tablet_read_schema.as_ref() {
-        build_tablet_schema_from_thrift(read_schema)?
+    let base_read_schema = if let Some(read_schema) = task.base_tablet_read_schema.as_ref() {
+        read_schema.clone()
     } else {
         resolve_tablet_schema_from_metadata_or_runtime(
             "alter_base_tablet",
@@ -224,7 +251,7 @@ pub(crate) fn execute_alter_tablet_task_with_storage_metadata_provider(
         "schema_change resolved base/new metadata schemas"
     );
     let new_schema = resolve_target_schema(
-        request,
+        &task,
         &base_read_schema,
         &new_metadata_schema,
         new_tablet_id,
@@ -234,7 +261,7 @@ pub(crate) fn execute_alter_tablet_task_with_storage_metadata_provider(
         "schema_change resolved target schema"
     );
 
-    if alter_mode == AlterMode::SchemaChange {
+    if alter_mode == LakeAlterTabletMode::SchemaChange {
         ensure_schema_change_base_supported(
             &base_read_schema,
             &base_metadata,
@@ -342,7 +369,7 @@ pub(crate) fn execute_alter_tablet_task_with_storage_metadata_provider(
             &source_batch,
             &base_read_schema,
             &new_schema,
-            request,
+            &task,
             alter_mode,
             rowset_idx,
         )?;
@@ -681,72 +708,36 @@ fn resolve_tablet_schema_from_metadata_or_runtime(
     Ok(runtime.schema)
 }
 
-fn validate_schema_change_request(request: &TAlterTabletReqV2) -> Result<AlterMode, String> {
-    if request.base_tablet_id <= 0 {
+fn validate_schema_change_task(task: &LakeAlterTabletTask) -> Result<(), String> {
+    if task.base_tablet_id <= 0 {
         return Err(format!(
             "alter task has non-positive base_tablet_id={}",
-            request.base_tablet_id
+            task.base_tablet_id
         ));
     }
-    if request.new_tablet_id <= 0 {
+    if task.new_tablet_id <= 0 {
         return Err(format!(
             "alter task has non-positive new_tablet_id={}",
-            request.new_tablet_id
+            task.new_tablet_id
         ));
     }
-
-    let tablet_type = request.tablet_type.unwrap_or(TTabletType::TABLET_TYPE_DISK);
-    if tablet_type != TTabletType::TABLET_TYPE_LAKE {
+    if task.alter_version <= 0 {
         return Err(format!(
-            "alter task unsupported tablet_type={tablet_type:?} (only TABLET_TYPE_LAKE is supported)"
+            "alter task has invalid alter_version={}",
+            task.alter_version
         ));
     }
-
-    let alter_job_type = request
-        .alter_job_type
-        .unwrap_or(TAlterJobType::SCHEMA_CHANGE);
-    match alter_job_type {
-        TAlterJobType::SCHEMA_CHANGE => {
-            if request
-                .materialized_view_params
-                .as_ref()
-                .is_some_and(|v| !v.is_empty())
-            {
-                return Err(
-                    "alter task does not support materialized_view_params in SCHEMA_CHANGE V1"
-                        .to_string(),
-                );
-            }
-            if request.materialized_column_req.is_some() {
-                return Err(
-                    "alter task does not support materialized_column_req in SCHEMA_CHANGE V1"
-                        .to_string(),
-                );
-            }
-            if request.where_expr.is_some() {
-                return Err(
-                    "alter task does not support where_expr in SCHEMA_CHANGE V1".to_string()
-                );
-            }
-            Ok(AlterMode::SchemaChange)
+    if task.txn_id <= 0 {
+        return Err(format!("alter task has invalid txn_id={}", task.txn_id));
+    }
+    match task.mode {
+        LakeAlterTabletMode::SchemaChange if task.rollup.is_some() => Err(
+            "alter task does not support materialized_view_params in SCHEMA_CHANGE V1".to_string(),
+        ),
+        LakeAlterTabletMode::Rollup if task.rollup.is_none() => {
+            Err("alter task missing desc_tbl for ROLLUP".to_string())
         }
-        TAlterJobType::ROLLUP => {
-            if request.materialized_column_req.is_some() {
-                return Err(
-                    "alter task does not support materialized_column_req in ROLLUP V1".to_string(),
-                );
-            }
-            if request.query_options.is_none() || request.query_globals.is_none() {
-                return Err("alter task missing query_options/query_globals for ROLLUP".to_string());
-            }
-            if request.desc_tbl.is_none() {
-                return Err("alter task missing desc_tbl for ROLLUP".to_string());
-            }
-            Ok(AlterMode::Rollup)
-        }
-        _ => Err(format!(
-            "alter task unsupported alter_job_type={alter_job_type:?} (supported: SCHEMA_CHANGE, ROLLUP)"
-        )),
+        _ => Ok(()),
     }
 }
 
@@ -797,7 +788,7 @@ fn ensure_schema_change_base_supported(
 }
 
 fn resolve_target_schema(
-    request: &TAlterTabletReqV2,
+    task: &LakeAlterTabletTask,
     base_read_schema: &StarRocksTabletSchema,
     new_metadata_schema: &StarRocksTabletSchema,
     new_tablet_id: i64,
@@ -813,12 +804,12 @@ fn resolve_target_schema(
         }
         return Ok(runtime.schema);
     }
-    if request.new_schema_hash != request.base_schema_hash
+    if task.new_schema_hash != task.base_schema_hash
         && schemas_equivalent(base_read_schema, new_metadata_schema)
     {
         return Err(format!(
             "alter task target schema unresolved: new_schema_hash={} base_schema_hash={} but new tablet metadata schema is equivalent to base schema and runtime schema is unavailable",
-            request.new_schema_hash, request.base_schema_hash
+            task.new_schema_hash, task.base_schema_hash
         ));
     }
     Ok(new_metadata_schema.clone())
@@ -885,22 +876,24 @@ fn transform_rowset_batch(
     source_batch: &RecordBatch,
     source_schema: &StarRocksTabletSchema,
     target_schema: &StarRocksTabletSchema,
-    request: &TAlterTabletReqV2,
-    alter_mode: AlterMode,
+    task: &LakeAlterTabletTask,
+    alter_mode: LakeAlterTabletMode,
     rowset_idx: usize,
 ) -> Result<RecordBatch, String> {
     match alter_mode {
-        AlterMode::SchemaChange => transform_rowset_batch_schema_change(
+        LakeAlterTabletMode::SchemaChange => transform_rowset_batch_schema_change(
             source_batch,
             source_schema,
             target_schema,
             rowset_idx,
         ),
-        AlterMode::Rollup => transform_rowset_batch_rollup(
+        LakeAlterTabletMode::Rollup => transform_rowset_batch_rollup(
             source_batch,
             source_schema,
             target_schema,
-            request,
+            task.rollup
+                .as_ref()
+                .expect("validated rollup task has program"),
             rowset_idx,
         ),
     }
@@ -1003,7 +996,7 @@ fn transform_rowset_batch_rollup(
     source_batch: &RecordBatch,
     source_schema: &StarRocksTabletSchema,
     target_schema: &StarRocksTabletSchema,
-    request: &TAlterTabletReqV2,
+    program: &RollupExpressionProgram,
     rowset_idx: usize,
 ) -> Result<RecordBatch, String> {
     let target_output_schema = build_tablet_output_schema(target_schema)?;
@@ -1011,9 +1004,9 @@ fn transform_rowset_batch_rollup(
         return Ok(RecordBatch::new_empty(target_output_schema));
     }
 
-    let materialized_param_map = build_rollup_materialized_param_map(request)?;
+    let materialized_param_map = build_rollup_materialized_param_map(program)?;
     let filtered_source_batch =
-        apply_rollup_where_expr(source_batch, source_schema, request, rowset_idx)?;
+        apply_rollup_where_expr(source_batch, source_schema, program, rowset_idx)?;
     if filtered_source_batch.num_rows() == 0 {
         return Ok(RecordBatch::new_empty(target_output_schema));
     }
@@ -1022,10 +1015,10 @@ fn transform_rowset_batch_rollup(
     let source_name_to_index = build_source_name_index_map(source_schema, "rollup source schema")?;
     let need_mv_expr_eval = materialized_param_map
         .values()
-        .any(|param| param.mv_expr.is_some());
+        .any(|param| param.expression.is_some());
     let eval_input = if need_mv_expr_eval {
         Some(build_rollup_expr_input(
-            request,
+            program,
             &filtered_source_batch,
             source_schema,
             rowset_idx,
@@ -1051,7 +1044,7 @@ fn transform_rowset_batch_rollup(
         let output_array = if let Some(mv_param) =
             materialized_param_map.get(&target_name_key).copied()
         {
-            if let Some(mv_expr) = mv_param.mv_expr.as_ref() {
+            if let Some(mv_expr) = mv_param.expression.as_ref() {
                 let eval_input = eval_input.as_ref().ok_or_else(|| {
                     format!(
                         "rollup mv_expr evaluation context is missing: rowset_idx={} target_index={} target_name={}",
@@ -1208,11 +1201,10 @@ fn resolve_source_column_index_by_name(
 }
 
 fn build_rollup_materialized_param_map(
-    request: &TAlterTabletReqV2,
-) -> Result<HashMap<String, &TAlterMaterializedViewParam>, String> {
+    program: &RollupExpressionProgram,
+) -> Result<HashMap<String, &RollupMaterializedViewParam>, String> {
     let mut out = HashMap::new();
-    let params = request.materialized_view_params.as_deref().unwrap_or(&[]);
-    for (idx, param) in params.iter().enumerate() {
+    for (idx, param) in program.materialized_view_params.iter().enumerate() {
         let name = param.column_name.trim();
         if name.is_empty() {
             return Err(format!(
@@ -1231,64 +1223,39 @@ fn build_rollup_materialized_param_map(
     Ok(out)
 }
 
-pub(super) struct RollupExprInput {
-    pub(super) chunk: Chunk,
-    pub(super) layout: RollupExprLayout,
+struct RollupExprInput {
+    chunk: Chunk,
 }
 
 fn build_rollup_expr_input(
-    request: &TAlterTabletReqV2,
+    program: &RollupExpressionProgram,
     source_batch: &RecordBatch,
     source_schema: &StarRocksTabletSchema,
     rowset_idx: usize,
 ) -> Result<RollupExprInput, String> {
-    let desc_tbl = request
-        .desc_tbl
-        .as_ref()
-        .ok_or_else(|| "rollup expression evaluation requires desc_tbl".to_string())?;
-    let slot_descs = desc_tbl.slot_descriptors.as_ref().ok_or_else(|| {
-        "rollup expression evaluation requires desc_tbl.slot_descriptors".to_string()
-    })?;
     let source_name_to_index = build_source_name_index_map(source_schema, "rollup source schema")?;
 
     let mut fields = Vec::new();
     let mut slot_schemas = Vec::new();
     let mut arrays = Vec::new();
-    let mut order = Vec::new();
     let mut seen_slots = HashSet::new();
 
-    for slot_desc in slot_descs {
-        let (Some(tuple_id), Some(raw_slot_id)) = (slot_desc.parent, slot_desc.id) else {
-            continue;
-        };
-        let Some(slot_name) = slot_desc
-            .col_name
-            .as_ref()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| {
-                slot_desc
-                    .col_physical_name
-                    .as_ref()
-                    .filter(|v| !v.trim().is_empty())
-            })
-        else {
-            continue;
-        };
+    for slot in &program.input_slots {
         let Some(source_idx) =
-            resolve_source_column_index_by_name(&source_name_to_index, slot_name)
+            resolve_source_column_index_by_name(&source_name_to_index, &slot.name)
         else {
             continue;
         };
-        let slot_id = SlotId::try_from(raw_slot_id).map_err(|e| {
+        let slot_id = crate::common::ids::SlotId::try_from(slot.slot_id).map_err(|e| {
             format!(
                 "rollup descriptor slot id conversion failed: rowset_idx={} slot_id={} error={}",
-                rowset_idx, raw_slot_id, e
+                rowset_idx, slot.slot_id, e
             )
         })?;
         if !seen_slots.insert(slot_id) {
             return Err(format!(
                 "rollup descriptor contains duplicate slot id: rowset_idx={} slot_id={}",
-                rowset_idx, raw_slot_id
+                rowset_idx, slot.slot_id
             ));
         }
         let source_batch_schema = source_batch.schema();
@@ -1304,9 +1271,9 @@ fn build_rollup_expr_input(
                 )
             })?;
         let field = Field::new(
-            slot_name,
+            &slot.name,
             source_field.data_type().clone(),
-            slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
+            slot.nullable.unwrap_or(source_field.is_nullable()),
         );
         slot_schemas.push(ChunkSlotSchema::from_field(slot_id, &field, None)?);
         fields.push(field);
@@ -1324,7 +1291,6 @@ fn build_rollup_expr_input(
                     )
                 })?,
         );
-        order.push((tuple_id, raw_slot_id));
     }
 
     if fields.is_empty() {
@@ -1349,57 +1315,35 @@ fn build_rollup_expr_input(
                     rowset_idx, e
                 )
             })?;
-    let index = order.iter().enumerate().map(|(i, key)| (*key, i)).collect();
-    Ok(RollupExprInput {
-        chunk,
-        layout: RollupExprLayout { order, index },
-    })
+    Ok(RollupExprInput { chunk })
 }
 
-#[cfg(feature = "compat")]
 fn eval_rollup_expr(
-    expr: &crate::thrift::exprs::TExpr,
+    expr: &CompiledRollupExpression,
     eval_input: &RollupExprInput,
     expr_context: &str,
     rowset_idx: usize,
     target_idx: usize,
     target_name: &str,
 ) -> Result<ArrayRef, String> {
-    super::schema_change_compat::eval_rollup_expr(
-        expr,
-        eval_input,
-        expr_context,
-        rowset_idx,
-        target_idx,
-        target_name,
-    )
-}
-
-#[cfg(not(feature = "compat"))]
-fn eval_rollup_expr(
-    _expr: &crate::thrift::exprs::TExpr,
-    _eval_input: &RollupExprInput,
-    expr_context: &str,
-    rowset_idx: usize,
-    target_idx: usize,
-    target_name: &str,
-) -> Result<ArrayRef, String> {
-    Err(format!(
-        "rollup expression evaluation requires compat feature: rowset_idx={} target_index={} target_name={} context={}",
-        rowset_idx, target_idx, target_name, expr_context
-    ))
+    expr.arena.eval(expr.root, &eval_input.chunk).map_err(|e| {
+        format!(
+            "rollup evaluate expression failed: rowset_idx={} target_index={} target_name={} context={} error={}",
+            rowset_idx, target_idx, target_name, expr_context, e
+        )
+    })
 }
 
 fn apply_rollup_where_expr(
     source_batch: &RecordBatch,
     source_schema: &StarRocksTabletSchema,
-    request: &TAlterTabletReqV2,
+    program: &RollupExpressionProgram,
     rowset_idx: usize,
 ) -> Result<RecordBatch, String> {
-    let Some(where_expr) = request.where_expr.as_ref() else {
+    let Some(where_expr) = program.where_expression.as_ref() else {
         return Ok(source_batch.clone());
     };
-    let eval_input = build_rollup_expr_input(request, source_batch, source_schema, rowset_idx)?;
+    let eval_input = build_rollup_expr_input(program, source_batch, source_schema, rowset_idx)?;
     let predicate = eval_rollup_expr(
         where_expr,
         &eval_input,
@@ -1749,6 +1693,32 @@ fn write_schema_change_txn_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_change_domain_task_rejects_rollup_program() {
+        let task = LakeAlterTabletTask {
+            base_tablet_id: 1,
+            new_tablet_id: 2,
+            base_schema_hash: 1,
+            new_schema_hash: 2,
+            alter_version: 1,
+            txn_id: 1,
+            mode: LakeAlterTabletMode::SchemaChange,
+            base_tablet_read_schema: None,
+            rollup: Some(RollupExpressionProgram {
+                input_slots: vec![],
+                where_expression: None,
+                materialized_view_params: vec![],
+            }),
+            columns_len: 0,
+            base_table_column_names_len: 0,
+        };
+
+        assert_eq!(
+            validate_schema_change_task(&task).expect_err("schema-change must reject rollup"),
+            "alter task does not support materialized_view_params in SCHEMA_CHANGE V1"
+        );
+    }
 
     #[test]
     fn metadata_update_domain_facts_preserve_optional_task_values() {

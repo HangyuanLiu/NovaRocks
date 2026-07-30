@@ -24,11 +24,7 @@ pub struct ResultProjection {
 }
 
 impl ResultProjection {
-    pub(crate) fn new(
-        slot_id: SlotId,
-        primitive: PrimitiveType,
-        field_schema: FieldRenderSchema,
-    ) -> Self {
+    pub fn new(slot_id: SlotId, primitive: PrimitiveType, field_schema: FieldRenderSchema) -> Self {
         Self {
             slot_id,
             primitive,
@@ -44,7 +40,7 @@ impl ResultProjection {
         self.primitive
     }
 
-    pub(crate) fn field_schema(&self) -> &FieldRenderSchema {
+    pub fn field_schema(&self) -> &FieldRenderSchema {
         &self.field_schema
     }
 }
@@ -58,7 +54,7 @@ pub struct ResultWriteSpec {
 }
 
 impl ResultWriteSpec {
-    pub(crate) fn new(
+    pub fn new(
         fragment_instance_id: UniqueId,
         presentation: ResultPresentation,
         projections: Option<Vec<ResultProjection>>,

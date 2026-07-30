@@ -65,6 +65,16 @@ pub struct NativeRuntimeFilterConsumerNode {
     pub(crate) bindings: Vec<NativeRuntimeFilterConsumerSpec>,
 }
 
+impl NativeRuntimeFilterConsumerNode {
+    pub fn input(&self) -> &ExecNode {
+        &self.input
+    }
+
+    pub fn input_mut(&mut self) -> &mut ExecNode {
+        &mut self.input
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

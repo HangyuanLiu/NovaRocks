@@ -28,47 +28,47 @@ pub(crate) const ICEBERG_POSITION_DELETE_POS_COLUMN: &str = "pos";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) struct PositionDeleteDescriptorBinding {
-    pub(crate) output_schema: SchemaRef,
-    pub(crate) output_column_names: Vec<String>,
-    pub(crate) partition_source_column_names: Vec<String>,
-    pub(crate) partition_column_names: Vec<String>,
+pub struct PositionDeleteDescriptorBinding {
+    pub output_schema: SchemaRef,
+    pub output_column_names: Vec<String>,
+    pub partition_source_column_names: Vec<String>,
+    pub partition_column_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PositionDeleteOutputField {
-    pub(crate) output_expr_index: usize,
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) field_id: i32,
+pub struct PositionDeleteOutputField {
+    pub output_expr_index: usize,
+    pub name: String,
+    pub data_type: DataType,
+    pub field_id: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PositionDeletePartitionSourceField {
-    pub(crate) output_expr_index: usize,
-    pub(crate) source_column_name: String,
-    pub(crate) partition_field_name: String,
-    pub(crate) transform_expr: String,
-    pub(crate) source_field_id: i32,
-    pub(crate) data_type: DataType,
+pub struct PositionDeletePartitionSourceField {
+    pub output_expr_index: usize,
+    pub source_column_name: String,
+    pub partition_field_name: String,
+    pub transform_expr: String,
+    pub source_field_id: i32,
+    pub data_type: DataType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PositionDeleteDescriptorInput {
-    pub(crate) file_path: PositionDeleteOutputField,
-    pub(crate) pos: PositionDeleteOutputField,
-    pub(crate) partition_source_fields: Vec<PositionDeletePartitionSourceField>,
-    pub(crate) target_partition_spec_id: i32,
+pub struct PositionDeleteDescriptorInput {
+    pub file_path: PositionDeleteOutputField,
+    pub pos: PositionDeleteOutputField,
+    pub partition_source_fields: Vec<PositionDeletePartitionSourceField>,
+    pub target_partition_spec_id: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PositionDeleteExpectedBinding {
-    pub(crate) target_partition_spec_id: i32,
-    pub(crate) partition_source_column_names: Vec<String>,
-    pub(crate) partition_column_names: Vec<String>,
-    pub(crate) partition_transform_exprs: Vec<String>,
-    pub(crate) partition_source_field_ids: Vec<i32>,
-    pub(crate) output_expr_count: usize,
+pub struct PositionDeleteExpectedBinding {
+    pub target_partition_spec_id: i32,
+    pub partition_source_column_names: Vec<String>,
+    pub partition_column_names: Vec<String>,
+    pub partition_transform_exprs: Vec<String>,
+    pub partition_source_field_ids: Vec<i32>,
+    pub output_expr_count: usize,
 }
 
 fn descriptor_error(message: impl Into<String>) -> crate::common::engine_error::EngineError {
@@ -168,7 +168,7 @@ pub(crate) fn output_schema_from_descriptor(
 }
 
 #[allow(dead_code)]
-pub(crate) fn bind_position_delete_descriptor(
+pub fn bind_position_delete_descriptor(
     desc: &PositionDeleteDescriptorInput,
     expected: &PositionDeleteExpectedBinding,
 ) -> Result<PositionDeleteDescriptorBinding, crate::common::engine_error::EngineError> {

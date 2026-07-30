@@ -41,7 +41,7 @@ pub struct FragmentSubmission {
 }
 
 impl FragmentSubmission {
-    pub(crate) fn try_new(
+    pub fn try_new(
         program: Arc<FragmentProgram>,
         instance: FragmentInstanceSpec,
     ) -> Result<Self, FragmentBindingError> {
@@ -67,11 +67,11 @@ impl FragmentSubmission {
         Ok(Self { program, instance })
     }
 
-    pub(crate) fn program(&self) -> &Arc<FragmentProgram> {
+    pub fn program(&self) -> &Arc<FragmentProgram> {
         &self.program
     }
 
-    pub(crate) const fn instance(&self) -> &FragmentInstanceSpec {
+    pub const fn instance(&self) -> &FragmentInstanceSpec {
         &self.instance
     }
 

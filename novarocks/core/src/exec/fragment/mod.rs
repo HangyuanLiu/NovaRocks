@@ -15,6 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod error;
-pub(crate) mod program;
-pub(crate) mod sink;
+pub mod error;
+pub mod program;
+pub mod sink;

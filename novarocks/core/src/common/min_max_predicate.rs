@@ -79,7 +79,7 @@ pub enum MinMaxPredicateOp {
 }
 
 impl MinMaxPredicate {
-    pub(crate) fn column(&self) -> &str {
+    pub fn column(&self) -> &str {
         match self {
             MinMaxPredicate::Le { column, .. }
             | MinMaxPredicate::Ge { column, .. }
@@ -109,7 +109,7 @@ impl MinMaxPredicate {
         }
     }
 
-    pub(crate) fn with_column(&self, column: String) -> Self {
+    pub fn with_column(&self, column: String) -> Self {
         match self {
             MinMaxPredicate::Le { value, .. } => MinMaxPredicate::Le {
                 column,

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) const CHANGE_OP_DELETE: i32 = -1;
-pub(crate) const CHANGE_OP_INSERT: i32 = 1;
-pub(crate) const DATA_ROUTE_REUSE: i32 = 1;
-pub(crate) const DATA_ROUTE_FRESH: i32 = 2;
+pub const CHANGE_OP_DELETE: i32 = -1;
+pub const CHANGE_OP_INSERT: i32 = 1;
+pub const DATA_ROUTE_REUSE: i32 = 1;
+pub const DATA_ROUTE_FRESH: i32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChangeStreamBranchKind {
@@ -28,7 +28,7 @@ pub enum ChangeStreamBranchKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ChangeStreamRouteKey {
+pub struct ChangeStreamRouteKey {
     pub(crate) change_op: i32,
     pub(crate) data_route: Option<i32>,
 }

@@ -46,3 +46,4 @@ pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
 #[cfg(feature = "compat")]
 pub mod starlet_metadata;
+pub mod thrift_debug;

@@ -39,7 +39,7 @@ pub mod result_buffer;
 pub mod runtime_filter_observability;
 pub mod runtime_state;
 pub mod scan_executor;
-pub(crate) mod scan_range;
+pub mod scan_range;
 pub mod sink_commit;
 pub mod starlet_shard_registry;
 #[cfg(feature = "compat")]

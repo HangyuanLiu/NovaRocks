@@ -22,6 +22,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::build_native_object_store_profile_from_properties;
+use crate::connector::starrocks::lake_meta::{
+    LakeMetaColumnKind, LakeMetaStorageFacts, LakeMetaStorageRequest,
+};
 use crate::connector::starrocks::ports::StorageMetadataProvider;
 use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::formats::starrocks::metadata::{
@@ -30,9 +33,6 @@ use crate::formats::starrocks::metadata::{
 };
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
-use crate::protocol::starrocks::decode::{
-    LakeMetaColumnKind, LakeMetaStorageFacts, LakeMetaStorageRequest,
-};
 
 struct LoadedTabletSnapshot {
     tablet_root_path: String,

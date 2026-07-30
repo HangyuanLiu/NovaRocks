@@ -35,42 +35,42 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
 #[derive(Clone)]
-pub(crate) enum PartitionKeySource {
+pub enum PartitionKeySource {
     None,
     SlotRefs(Vec<PartitionSlotRef>),
     Expr(Arc<PartitionExprPlan>),
 }
 
 #[derive(Clone)]
-pub(crate) struct PartitionSlotRef {
-    pub(crate) slot_id: SlotId,
-    pub(crate) column_name: String,
+pub struct PartitionSlotRef {
+    pub slot_id: SlotId,
+    pub column_name: String,
 }
 
 #[derive(Clone)]
-pub(crate) struct PartitionExprPlan {
-    pub(crate) arena: ExprArena,
-    pub(crate) expr_ids: Vec<ExprId>,
+pub struct PartitionExprPlan {
+    pub arena: ExprArena,
+    pub expr_ids: Vec<ExprId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PartitionMode {
+pub enum PartitionMode {
     Unpartitioned,
     Range,
     List,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PartitionRoutingEntry {
-    pub(crate) partition_id: i64,
-    pub(crate) tablet_ids: Vec<i64>,
-    pub(crate) start_key: Option<Vec<PartitionKeyValue>>,
-    pub(crate) end_key: Option<Vec<PartitionKeyValue>>,
-    pub(crate) in_keys: Vec<Vec<PartitionKeyValue>>,
+pub struct PartitionRoutingEntry {
+    pub partition_id: i64,
+    pub tablet_ids: Vec<i64>,
+    pub start_key: Option<Vec<PartitionKeyValue>>,
+    pub end_key: Option<Vec<PartitionKeyValue>>,
+    pub in_keys: Vec<Vec<PartitionKeyValue>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PartitionKeyValue {
+pub enum PartitionKeyValue {
     Null,
     Bool(bool),
     Int(i128),
@@ -81,7 +81,7 @@ pub(crate) enum PartitionKeyValue {
     Binary(Vec<u8>),
 }
 
-pub(crate) fn partition_key_source_len(source: &PartitionKeySource) -> usize {
+pub fn partition_key_source_len(source: &PartitionKeySource) -> usize {
     match source {
         PartitionKeySource::None => 0,
         PartitionKeySource::SlotRefs(slot_refs) => slot_refs.len(),
@@ -89,7 +89,7 @@ pub(crate) fn partition_key_source_len(source: &PartitionKeySource) -> usize {
     }
 }
 
-pub(crate) fn build_slot_name_map(
+pub fn build_slot_name_map(
     slot_descs: &[SinkSlotDescriptor],
 ) -> Result<HashMap<String, SlotId>, String> {
     let mut slot_by_name = HashMap::new();
@@ -120,7 +120,7 @@ pub(crate) fn build_slot_name_map(
     Ok(slot_by_name)
 }
 
-pub(crate) fn resolve_slot_ids_by_names(
+pub fn resolve_slot_ids_by_names(
     slot_descs: &[SinkSlotDescriptor],
     names: &[String],
     label: &str,
@@ -143,7 +143,7 @@ pub(crate) fn resolve_slot_ids_by_names(
     Ok(out)
 }
 
-pub(crate) fn build_partition_key_source(
+pub fn build_partition_key_source(
     partition: &SinkPartitionDescriptor,
     schema: &SinkSchemaDescriptor,
     slot_name_overrides: Option<&HashMap<String, SlotId>>,
@@ -174,7 +174,7 @@ pub(crate) fn build_partition_key_source(
     Ok(PartitionKeySource::SlotRefs(slot_refs))
 }
 
-pub(crate) fn validate_partition_key_length(
+pub fn validate_partition_key_length(
     partition_id: i64,
     expected_len: usize,
     start_key: Option<&[PartitionKeyValue]>,
@@ -225,7 +225,7 @@ pub(crate) fn validate_partition_key_length(
     Ok(())
 }
 
-pub(crate) fn build_partition_key_arrays(
+pub fn build_partition_key_arrays(
     partition_key_source: &PartitionKeySource,
     chunk: &Chunk,
 ) -> Result<Vec<ArrayRef>, String> {
@@ -275,7 +275,7 @@ fn find_chunk_column_by_name(chunk: &Chunk, column_name: &str) -> Option<ArrayRe
     chunk.batch.columns().get(idx).cloned()
 }
 
-pub(crate) fn build_row_partition_key(
+pub fn build_row_partition_key(
     partition_key_arrays: &[ArrayRef],
     row: usize,
 ) -> Result<Vec<PartitionKeyValue>, String> {
@@ -438,7 +438,7 @@ fn read_partition_key_value(array: &dyn Array, row: usize) -> Result<PartitionKe
     }
 }
 
-pub(crate) fn compare_partition_key_vectors(
+pub fn compare_partition_key_vectors(
     left: &[PartitionKeyValue],
     right: &[PartitionKeyValue],
 ) -> Result<Ordering, String> {

@@ -50,8 +50,8 @@ const PROVIDER_ID: &str = "jdbc";
 const PAYLOAD_VERSION: u8 = 1;
 
 #[derive(Clone)]
-pub(crate) struct JdbcInstanceConfig {
-    pub(crate) scan: JdbcScanConfig,
+pub struct JdbcInstanceConfig {
+    pub scan: JdbcScanConfig,
 }
 
 pub(crate) struct JdbcConnectorInstance {
@@ -259,7 +259,7 @@ impl ConnectorCancellation for QueryCancellation {
 /// Construct the bounded read request used by the StarRocks JDBC and MySQL
 /// decoders. The cancellation probe is local to the BE and never enters a
 /// handle payload.
-pub(crate) fn plan_starrocks_jdbc_read_source(
+pub fn plan_starrocks_jdbc_read_source(
     connectors: &ConnectorRegistry,
     query_id: QueryId,
     node_id: i32,

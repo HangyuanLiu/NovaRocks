@@ -27,63 +27,63 @@ use crate::exec::fragment::sink::FragmentSinkProgram;
 use crate::exec::node::{ExecNodeKind, ExecPlan};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FragmentContractVersion(u16);
+pub struct FragmentContractVersion(u16);
 
 impl FragmentContractVersion {
-    pub(crate) const CURRENT: Self = Self(1);
+    pub const CURRENT: Self = Self(1);
 
-    pub(crate) const fn new(value: u16) -> Self {
+    pub const fn new(value: u16) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> u16 {
+    pub const fn get(self) -> u16 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FragmentNodeId(i32);
+pub struct FragmentNodeId(i32);
 
 impl FragmentNodeId {
-    pub(crate) const fn new(value: i32) -> Self {
+    pub const fn new(value: i32) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> i32 {
+    pub const fn get(self) -> i32 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct RuntimeFilterId(i32);
+pub struct RuntimeFilterId(i32);
 
 impl RuntimeFilterId {
-    pub(crate) const fn new(value: i32) -> Self {
+    pub const fn new(value: i32) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> i32 {
+    pub const fn get(self) -> i32 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentProgramOptions {
+pub struct FragmentProgramOptions {
     contract_version: FragmentContractVersion,
 }
 
 impl FragmentProgramOptions {
-    pub(crate) const fn new(contract_version: FragmentContractVersion) -> Self {
+    pub const fn new(contract_version: FragmentContractVersion) -> Self {
         Self { contract_version }
     }
 
-    pub(crate) const fn contract_version(&self) -> FragmentContractVersion {
+    pub const fn contract_version(&self) -> FragmentContractVersion {
         self.contract_version
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScanAssignmentKind {
+pub enum ScanAssignmentKind {
     File,
     #[cfg(feature = "compat")]
     BrokerFile,
@@ -93,43 +93,43 @@ pub(crate) enum ScanAssignmentKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ScanSourceContract {
+pub struct ScanSourceContract {
     assignment_kind: ScanAssignmentKind,
 }
 
 impl ScanSourceContract {
-    pub(crate) const fn new(assignment_kind: ScanAssignmentKind) -> Self {
+    pub const fn new(assignment_kind: ScanAssignmentKind) -> Self {
         Self { assignment_kind }
     }
 
-    pub(crate) const fn assignment_kind(&self) -> ScanAssignmentKind {
+    pub const fn assignment_kind(&self) -> ScanAssignmentKind {
         self.assignment_kind
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExchangeInputContract {
+pub struct ExchangeInputContract {
     expected_schema: ChunkSchemaRef,
 }
 
 impl ExchangeInputContract {
-    pub(crate) fn new(expected_schema: ChunkSchemaRef) -> Self {
+    pub fn new(expected_schema: ChunkSchemaRef) -> Self {
         Self { expected_schema }
     }
 
-    pub(crate) fn expected_schema(&self) -> &ChunkSchemaRef {
+    pub fn expected_schema(&self) -> &ChunkSchemaRef {
         &self.expected_schema
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterContract {
+pub struct RuntimeFilterContract {
     build_filters: BTreeSet<RuntimeFilterId>,
     probe_filters: BTreeSet<RuntimeFilterId>,
 }
 
 impl RuntimeFilterContract {
-    pub(crate) fn new(
+    pub fn new(
         build_filters: BTreeSet<RuntimeFilterId>,
         probe_filters: BTreeSet<RuntimeFilterId>,
     ) -> Self {
@@ -139,21 +139,21 @@ impl RuntimeFilterContract {
         }
     }
 
-    pub(crate) fn build_filters(&self) -> &BTreeSet<RuntimeFilterId> {
+    pub fn build_filters(&self) -> &BTreeSet<RuntimeFilterId> {
         &self.build_filters
     }
 
-    pub(crate) fn probe_filters(&self) -> &BTreeSet<RuntimeFilterId> {
+    pub fn probe_filters(&self) -> &BTreeSet<RuntimeFilterId> {
         &self.probe_filters
     }
 
-    pub(crate) fn has_bindings(&self) -> bool {
+    pub fn has_bindings(&self) -> bool {
         !self.build_filters.is_empty() || !self.probe_filters.is_empty()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentSinkKind {
+pub enum FragmentSinkKind {
     Result,
     Noop,
     DataStream,
@@ -165,27 +165,27 @@ pub(crate) enum FragmentSinkKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentSinkAssignmentKind {
+pub enum FragmentSinkAssignmentKind {
     StreamDestinations,
     DestinationGroups(NonZeroUsize),
     StarRocksTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentSinkAssignmentRequirement {
+pub enum FragmentSinkAssignmentRequirement {
     None,
     Required(FragmentSinkAssignmentKind),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FragmentSinkSpec {
+pub struct FragmentSinkSpec {
     program: FragmentSinkProgram,
     kind: FragmentSinkKind,
     assignment_requirement: FragmentSinkAssignmentRequirement,
 }
 
 impl FragmentSinkSpec {
-    pub(crate) fn try_new(program: FragmentSinkProgram) -> Result<Self, FragmentBindingError> {
+    pub fn try_new(program: FragmentSinkProgram) -> Result<Self, FragmentBindingError> {
         use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
         use FragmentSinkAssignmentRequirement::{None, Required};
 
@@ -238,19 +238,19 @@ impl FragmentSinkSpec {
         })
     }
 
-    pub(crate) const fn program(&self) -> &FragmentSinkProgram {
+    pub const fn program(&self) -> &FragmentSinkProgram {
         &self.program
     }
 
-    pub(crate) fn program_mut(&mut self) -> &mut FragmentSinkProgram {
+    pub fn program_mut(&mut self) -> &mut FragmentSinkProgram {
         &mut self.program
     }
 
-    pub(crate) const fn kind(&self) -> FragmentSinkKind {
+    pub const fn kind(&self) -> FragmentSinkKind {
         self.kind
     }
 
-    pub(crate) const fn assignment_requirement(&self) -> FragmentSinkAssignmentRequirement {
+    pub const fn assignment_requirement(&self) -> FragmentSinkAssignmentRequirement {
         self.assignment_requirement
     }
 }
@@ -277,7 +277,7 @@ fn non_empty_group_count(
 }
 
 #[derive(Debug)]
-pub(crate) struct FragmentProgram {
+pub struct FragmentProgram {
     root_plan_node_id: FragmentNodeId,
     plan: ExecPlan,
     sink: FragmentSinkSpec,
@@ -288,7 +288,7 @@ pub(crate) struct FragmentProgram {
 }
 
 impl FragmentProgram {
-    pub(crate) fn new(
+    pub fn new(
         plan: ExecPlan,
         sink: FragmentSinkSpec,
         program_options: FragmentProgramOptions,
@@ -308,39 +308,39 @@ impl FragmentProgram {
         }
     }
 
-    pub(crate) const fn root_plan_node_id(&self) -> FragmentNodeId {
+    pub const fn root_plan_node_id(&self) -> FragmentNodeId {
         self.root_plan_node_id
     }
 
-    pub(crate) fn plan(&self) -> &ExecPlan {
+    pub fn plan(&self) -> &ExecPlan {
         &self.plan
     }
 
-    pub(crate) fn plan_mut(&mut self) -> &mut ExecPlan {
+    pub fn plan_mut(&mut self) -> &mut ExecPlan {
         &mut self.plan
     }
 
-    pub(crate) const fn sink(&self) -> &FragmentSinkSpec {
+    pub const fn sink(&self) -> &FragmentSinkSpec {
         &self.sink
     }
 
-    pub(crate) fn sink_mut(&mut self) -> &mut FragmentSinkSpec {
+    pub fn sink_mut(&mut self) -> &mut FragmentSinkSpec {
         &mut self.sink
     }
 
-    pub(crate) const fn program_options(&self) -> &FragmentProgramOptions {
+    pub const fn program_options(&self) -> &FragmentProgramOptions {
         &self.program_options
     }
 
-    pub(crate) fn scan_sources(&self) -> &BTreeMap<FragmentNodeId, ScanSourceContract> {
+    pub fn scan_sources(&self) -> &BTreeMap<FragmentNodeId, ScanSourceContract> {
         &self.scan_sources
     }
 
-    pub(crate) fn exchange_inputs(&self) -> &BTreeMap<FragmentNodeId, ExchangeInputContract> {
+    pub fn exchange_inputs(&self) -> &BTreeMap<FragmentNodeId, ExchangeInputContract> {
         &self.exchange_inputs
     }
 
-    pub(crate) const fn runtime_filters(&self) -> &RuntimeFilterContract {
+    pub const fn runtime_filters(&self) -> &RuntimeFilterContract {
         &self.runtime_filters
     }
 }

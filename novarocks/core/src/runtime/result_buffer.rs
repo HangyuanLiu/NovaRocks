@@ -133,16 +133,16 @@ impl ResultBufferWriteHandle {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum FetchErrorKind {
+pub enum FetchErrorKind {
     NotFound,
     Cancelled,
     Failed,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FetchError {
-    pub(crate) kind: FetchErrorKind,
-    pub(crate) message: String,
+pub struct FetchError {
+    pub kind: FetchErrorKind,
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -510,7 +510,7 @@ pub(crate) fn set_eos_template(finst_id: UniqueId, template: ResultBatch) {
 }
 
 #[derive(Debug)]
-pub(crate) enum TryFetchResult {
+pub enum TryFetchResult {
     Ready(FetchResult),
     NotReady,
     Error(FetchError),
@@ -635,7 +635,7 @@ fn try_fetch_typed_inner(
     TryFetchTypedResult::NotReady
 }
 
-pub(crate) fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
+pub fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
     try_fetch_inner(&mut guard, finst_id)

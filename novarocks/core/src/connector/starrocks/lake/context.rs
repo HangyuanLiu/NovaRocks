@@ -78,7 +78,7 @@ pub(crate) fn with_txn_log_append_lock<T>(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum PartialUpdateWriteMode {
+pub enum PartialUpdateWriteMode {
     Unknown,
     Row,
     ColumnUpsert,

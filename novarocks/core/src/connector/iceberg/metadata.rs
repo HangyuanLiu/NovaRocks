@@ -419,7 +419,7 @@ pub(crate) fn plan_native_iceberg_metadata_read_source(
     )
 }
 
-pub(crate) fn plan_compat_iceberg_metadata_read_source(
+pub fn plan_compat_iceberg_metadata_read_source(
     connectors: &ConnectorRegistry,
     query_id: Option<QueryId>,
     node_id: i32,

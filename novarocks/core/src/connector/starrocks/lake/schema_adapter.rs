@@ -40,7 +40,7 @@ const PERSISTENT_INDEX_CLOUD_NATIVE: i32 = 1;
 const COMPACTION_STRATEGY_DEFAULT: i32 = 0;
 const COMPACTION_STRATEGY_REAL_TIME: i32 = 1;
 
-pub(crate) fn build_sink_tablet_schema(
+pub fn build_sink_tablet_schema(
     schema: &crate::thrift::descriptors::TOlapTableSchemaParam,
     schema_id: i64,
     keys_type: StarRocksKeysType,
@@ -367,7 +367,7 @@ pub(crate) fn build_create_tablet_schema(
     })
 }
 
-pub(crate) fn build_tablet_schema_from_thrift(
+pub fn build_tablet_schema_from_thrift(
     schema: &crate::thrift::agent_service::TTabletSchema,
 ) -> Result<StarRocksTabletSchema, String> {
     if schema.columns.is_empty() {

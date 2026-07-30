@@ -127,7 +127,7 @@ impl std::fmt::Debug for LakeScanSchemaMeta {
 }
 
 #[derive(Clone)]
-pub(crate) struct DeferredLakeScanResolution {
+pub struct DeferredLakeScanResolution {
     pub(crate) query_id: Option<crate::runtime::query_context::QueryId>,
     pub(crate) table: LakeTableIdentity,
     pub(crate) tablets: Vec<LakeScanTabletRef>,
@@ -211,7 +211,7 @@ pub struct StarRocksScanConfig {
     pub profile_label: Option<String>,
     pub min_max_predicates: Vec<MinMaxPredicate>,
     pub lake_schema_meta: Option<LakeScanSchemaMeta>,
-    pub(crate) deferred_lake_resolution: Option<DeferredLakeScanResolution>,
+    pub deferred_lake_resolution: Option<DeferredLakeScanResolution>,
     /// Maps TopN runtime filter_id → scan column name.
     /// Populated during lowering so that execute_iter() can convert
     /// `RuntimeMinMaxFilter` instances into `MinMaxPredicate` values
@@ -473,7 +473,7 @@ fn starrocks_read_budget_and_context(
     Ok((batch, context))
 }
 
-pub(crate) fn plan_compat_starrocks_read_source(
+pub fn plan_compat_starrocks_read_source(
     connectors: &ConnectorRegistry,
     query_id: QueryId,
     node_id: i32,

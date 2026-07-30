@@ -771,7 +771,7 @@ struct QueryContextManagerInner {
     incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
 }
 
-pub(crate) struct QueryContextManager {
+pub struct QueryContextManager {
     inner: Mutex<QueryContextManagerInner>,
     stopped: AtomicBool,
 }
@@ -2558,7 +2558,8 @@ impl QueryContextManager {
             .cloned()
     }
 
-    pub(crate) fn query_mem_tracker(&self, query_id: QueryId) -> Option<Arc<MemTracker>> {
+    /// Returns the query tracker for lifecycle verification and neutral runtime observers.
+    pub fn query_mem_tracker(&self, query_id: QueryId) -> Option<Arc<MemTracker>> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
             .active
@@ -2747,7 +2748,8 @@ impl QueryContextManager {
         }
     }
 
-    pub(crate) fn query_id_by_finst(&self, finst_id: UniqueId) -> Option<QueryId> {
+    /// Returns the owning query for a fragment instance when it is still registered.
+    pub fn query_id_by_finst(&self, finst_id: UniqueId) -> Option<QueryId> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
             .finst_to_query
@@ -2902,7 +2904,8 @@ impl QueryContextManager {
             .map(|ctx| ctx.query_expire)
     }
 
-    pub(crate) fn is_query_canceled(&self, query_id: QueryId) -> bool {
+    /// Read-only cancellation capability for protocol adapters that own scan planning.
+    pub fn is_query_canceled(&self, query_id: QueryId) -> bool {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
             .runtime_filter_query_cancellations
@@ -3625,7 +3628,7 @@ mod lookup_lifecycle_tests {
 
 static QUERY_CONTEXT_MANAGER: OnceLock<Arc<QueryContextManager>> = OnceLock::new();
 
-pub(crate) fn query_context_manager() -> Arc<QueryContextManager> {
+pub fn query_context_manager() -> Arc<QueryContextManager> {
     QUERY_CONTEXT_MANAGER
         .get_or_init(QueryContextManager::new)
         .clone()

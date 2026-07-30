@@ -20,9 +20,8 @@ mod reader;
 
 pub(crate) use op::DeferredLakeScanResolution;
 pub(crate) use op::build_native_object_store_profile_from_properties;
+pub use op::plan_compat_starrocks_read_source;
 pub use op::{
     LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange, StarRocksSchemaColumnHint,
 };
-pub(crate) use op::{
-    plan_compat_starrocks_read_source, plan_native_starrocks_read_source, read_starrocks_batches,
-};
+pub(crate) use op::{plan_native_starrocks_read_source, read_starrocks_batches};

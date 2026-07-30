@@ -16,6 +16,16 @@
 // under the License.
 use crate::runtime::query_options::QueryOptions;
 
+/// Returns whether the process currently has a data-cache block store.
+///
+/// Protocol adapters may snapshot this capability while decoding a request, but
+/// must not retain or access the cache manager itself.
+pub fn datacache_block_cache_available() -> bool {
+    novarocks_fs::DataCacheManager::instance()
+        .block_cache()
+        .is_some()
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExternalDataCacheRangeOptions {
     pub modification_time: Option<i64>,

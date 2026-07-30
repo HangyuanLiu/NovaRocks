@@ -26,10 +26,10 @@ use crate::exec::row_position::RowPositionType;
 use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct IcebergTableLocationMap(HashMap<i64, String>);
+pub struct IcebergTableLocationMap(HashMap<i64, String>);
 
 impl IcebergTableLocationMap {
-    pub(crate) fn from_snapshot(snapshot: &DescriptorSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: &DescriptorSnapshot) -> Self {
         Self(
             snapshot
                 .iceberg_table_locations()
@@ -38,31 +38,31 @@ impl IcebergTableLocationMap {
         )
     }
 
-    pub(crate) fn get(&self, table_id: i64) -> Option<&str> {
+    pub fn get(&self, table_id: i64) -> Option<&str> {
         self.0.get(&table_id).map(String::as_str)
     }
 
-    pub(crate) fn to_hash_map(&self) -> HashMap<i64, String> {
+    pub fn to_hash_map(&self) -> HashMap<i64, String> {
         self.0.clone()
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LookupNodeInfo {
-    pub(crate) id: i64,
-    pub(crate) option: i64,
-    pub(crate) host: String,
-    pub(crate) async_internal_port: u16,
+    pub id: i64,
+    pub option: i64,
+    pub host: String,
+    pub async_internal_port: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LookupNodesInfo {
-    pub(crate) version: i64,
-    pub(crate) nodes: Vec<LookupNodeInfo>,
+    pub version: i64,
+    pub nodes: Vec<LookupNodeInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DescriptorLogicalType {
+pub enum DescriptorLogicalType {
     Null,
     Boolean,
     Int8,
@@ -90,62 +90,62 @@ pub(crate) enum DescriptorLogicalType {
 
 impl DescriptorLogicalType {
     #[allow(dead_code)]
-    pub(crate) fn is_int32(&self) -> bool {
+    pub fn is_int32(&self) -> bool {
         matches!(self, Self::Int32)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn is_int64(&self) -> bool {
+    pub fn is_int64(&self) -> bool {
         matches!(self, Self::Int64)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn is_int8(&self) -> bool {
+    pub fn is_int8(&self) -> bool {
         matches!(self, Self::Int8)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn is_variant(&self) -> bool {
+    pub fn is_variant(&self) -> bool {
         matches!(self, Self::Variant)
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DescriptorSlot {
-    pub(crate) tuple_id: i32,
-    pub(crate) slot_id: SlotId,
-    pub(crate) name: String,
-    pub(crate) field: Field,
-    pub(crate) logical: DescriptorLogicalType,
-    pub(crate) unique_id: Option<i32>,
+pub struct DescriptorSlot {
+    pub tuple_id: i32,
+    pub slot_id: SlotId,
+    pub name: String,
+    pub field: Field,
+    pub logical: DescriptorLogicalType,
+    pub unique_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DescriptorIcebergSchemaField {
-    pub(crate) field_id: Option<i32>,
-    pub(crate) name: Option<String>,
-    pub(crate) initial_default_json: Option<String>,
-    pub(crate) children: Option<Vec<DescriptorIcebergSchemaField>>,
+pub struct DescriptorIcebergSchemaField {
+    pub field_id: Option<i32>,
+    pub name: Option<String>,
+    pub initial_default_json: Option<String>,
+    pub children: Option<Vec<DescriptorIcebergSchemaField>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DescriptorIcebergSchema {
-    pub(crate) fields: Option<Vec<DescriptorIcebergSchemaField>>,
+pub struct DescriptorIcebergSchema {
+    pub fields: Option<Vec<DescriptorIcebergSchemaField>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DescriptorTableKind {
+pub enum DescriptorTableKind {
     Iceberg,
     Paimon,
     Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DescriptorTable {
-    pub(crate) id: i64,
-    pub(crate) kind: DescriptorTableKind,
-    pub(crate) location: Option<String>,
-    pub(crate) iceberg_schema: Option<DescriptorIcebergSchema>,
+pub struct DescriptorTable {
+    pub id: i64,
+    pub kind: DescriptorTableKind,
+    pub location: Option<String>,
+    pub iceberg_schema: Option<DescriptorIcebergSchema>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -157,14 +157,14 @@ pub struct DescriptorSnapshot {
 }
 
 impl DescriptorSnapshot {
-    pub(crate) fn new(
+    pub fn new(
         slots: Vec<DescriptorSlot>,
         tuple_to_table: HashMap<i32, i64>,
     ) -> Result<Self, String> {
         Self::new_with_tables(slots, tuple_to_table, Vec::new())
     }
 
-    pub(crate) fn new_with_tables(
+    pub fn new_with_tables(
         slots: Vec<DescriptorSlot>,
         tuple_to_table: HashMap<i32, i64>,
         tables: Vec<DescriptorTable>,
@@ -203,35 +203,32 @@ impl DescriptorSnapshot {
         })
     }
 
-    pub(crate) fn slot(&self, tuple_id: i32, slot_id: SlotId) -> Option<&DescriptorSlot> {
+    pub fn slot(&self, tuple_id: i32, slot_id: SlotId) -> Option<&DescriptorSlot> {
         self.slots_by_tuple_slot.get(&(tuple_id, slot_id))
     }
 
-    pub(crate) fn tuple_slots(&self, tuple_id: i32) -> &[SlotId] {
+    pub fn tuple_slots(&self, tuple_id: i32) -> &[SlotId] {
         self.slots_by_tuple
             .get(&tuple_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
-    pub(crate) fn table_id_for_tuple(&self, tuple_id: i32) -> Option<i64> {
+    pub fn table_id_for_tuple(&self, tuple_id: i32) -> Option<i64> {
         self.tuple_to_table.get(&tuple_id).copied()
     }
 
-    pub(crate) fn table_for_tuple(&self, tuple_id: i32) -> Option<&DescriptorTable> {
+    pub fn table_for_tuple(&self, tuple_id: i32) -> Option<&DescriptorTable> {
         let table_id = self.table_id_for_tuple(tuple_id)?;
         self.tables_by_id.get(&table_id)
     }
 
-    pub(crate) fn is_paimon_table_for_tuple(&self, tuple_id: i32) -> bool {
+    pub fn is_paimon_table_for_tuple(&self, tuple_id: i32) -> bool {
         self.table_for_tuple(tuple_id)
             .is_some_and(|table| matches!(table.kind, DescriptorTableKind::Paimon))
     }
 
-    pub(crate) fn iceberg_schema_for_tuple(
-        &self,
-        tuple_id: i32,
-    ) -> Option<&DescriptorIcebergSchema> {
+    pub fn iceberg_schema_for_tuple(&self, tuple_id: i32) -> Option<&DescriptorIcebergSchema> {
         let table = self.table_for_tuple(tuple_id)?;
         match table.kind {
             DescriptorTableKind::Iceberg => table.iceberg_schema.as_ref(),
@@ -239,12 +236,12 @@ impl DescriptorSnapshot {
         }
     }
 
-    pub(crate) fn is_iceberg_table_for_tuple(&self, tuple_id: i32) -> bool {
+    pub fn is_iceberg_table_for_tuple(&self, tuple_id: i32) -> bool {
         self.table_for_tuple(tuple_id)
             .is_some_and(|table| matches!(table.kind, DescriptorTableKind::Iceberg))
     }
 
-    pub(crate) fn iceberg_table_locations(&self) -> impl Iterator<Item = (i64, &str)> {
+    pub fn iceberg_table_locations(&self) -> impl Iterator<Item = (i64, &str)> {
         self.tables_by_id.values().filter_map(|table| {
             if !matches!(table.kind, DescriptorTableKind::Iceberg) {
                 return None;
