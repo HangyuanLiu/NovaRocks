@@ -3518,7 +3518,8 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
     );
-    execute_query_with_catalog_provider(
+    let execution = capture_maintenance_execution(state)?;
+    execute_query_with_catalog_provider_with_execution(
         query,
         &analyzer_provider,
         &catalog_snapshot,
@@ -3529,6 +3530,7 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
         &state.query_execution,
         connector_context,
         Some(state),
+        &execution,
     )
 }
 

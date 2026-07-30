@@ -31,12 +31,6 @@ pub fn debug_exec_batch_plan_json() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn debug_fault_inject_submit_fail_after() -> Option<usize> {
-    novarocks_app_config()
-        .ok()
-        .and_then(|c| c.debug.fault_inject_submit_fail_after())
-}
-
 pub(crate) fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
     novarocks_app_config()
         .ok()

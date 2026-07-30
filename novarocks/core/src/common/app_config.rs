@@ -1738,8 +1738,6 @@ pub struct DebugConfig {
     /// This is config-only (no env var fallback).
     pub exec_batch_plan_json: bool,
     #[cfg(debug_assertions)]
-    pub fault_inject_submit_fail_after: Option<usize>,
-    #[cfg(debug_assertions)]
     pub fault_inject_fetch_not_ready_count: Option<usize>,
     #[cfg(debug_assertions)]
     pub emit_cancel_marker: bool,
@@ -1757,7 +1755,6 @@ pub struct DebugConfig {
 struct DebugConfigToml {
     exec_node_output: bool,
     exec_batch_plan_json: bool,
-    fault_inject_submit_fail_after: Option<usize>,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: bool,
     emit_grpc_fragment_marker: bool,
@@ -1771,7 +1768,6 @@ struct DebugConfigToml {
 struct DebugConfigToml {
     exec_node_output: bool,
     exec_batch_plan_json: bool,
-    fault_inject_submit_fail_after: Option<usize>,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: Option<bool>,
     emit_grpc_fragment_marker: Option<bool>,
@@ -1790,7 +1786,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
             Ok(Self {
                 exec_node_output: raw.exec_node_output,
                 exec_batch_plan_json: raw.exec_batch_plan_json,
-                fault_inject_submit_fail_after: raw.fault_inject_submit_fail_after,
                 fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
                 emit_cancel_marker: raw.emit_cancel_marker,
                 emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
@@ -1800,11 +1795,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
         }
         #[cfg(not(debug_assertions))]
         {
-            if raw.fault_inject_submit_fail_after.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.fault_inject_submit_fail_after is only available in debug builds",
-                ));
-            }
             if raw.fault_inject_fetch_not_ready_count.is_some() {
                 return Err(serde::de::Error::custom(
                     "debug.fault_inject_fetch_not_ready_count is only available in debug builds",
@@ -1839,16 +1829,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
 }
 
 impl DebugConfig {
-    #[cfg(debug_assertions)]
-    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
-        self.fault_inject_submit_fail_after
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
-        None
-    }
-
     #[cfg(debug_assertions)]
     pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
         self.fault_inject_fetch_not_ready_count
@@ -2353,7 +2333,6 @@ enable_path_style_access = true
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
 [debug]
-fault_inject_submit_fail_after = 1
 fault_inject_fetch_not_ready_count = 2
 emit_cancel_marker = true
 emit_grpc_fragment_marker = true
@@ -2362,7 +2341,6 @@ emit_connector_reader_marker = true
 "#,
         )
         .expect("parse config");
-        assert_eq!(cfg.debug.fault_inject_submit_fail_after, Some(1));
         assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
         assert!(cfg.debug.emit_cancel_marker);
         assert!(cfg.debug.emit_grpc_fragment_marker);
@@ -2378,21 +2356,6 @@ emit_connector_reader_marker = true
     #[test]
     #[cfg(not(debug_assertions))]
     fn test_debug_fault_injection_knobs_are_rejected_in_release_builds() {
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-fault_inject_submit_fail_after = 1
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject fault injection knobs"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("fault_inject_submit_fail_after"),
-            "unexpected parse error: {err}"
-        );
-
         let err = match toml::from_str::<NovaRocksConfig>(
             r#"
 [debug]
