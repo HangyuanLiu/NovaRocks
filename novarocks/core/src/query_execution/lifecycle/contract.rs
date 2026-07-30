@@ -26,6 +26,10 @@ use super::manifest::{
     ParticipantManifestDigest, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
     RuntimeFilterContribution,
 };
+use super::stage::{
+    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
+    QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
+};
 use crate::common::types::UniqueId;
 use crate::proto::{common, filter, novarocks};
 
@@ -105,6 +109,35 @@ pub trait QueryLifecycleTransport: Send + Sync + 'static {
         timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError>;
 
+    /// Atomically stage the complete participant-local fragment batch.
+    ///
+    /// Implementations that have not completed the QLC-3 cutover return an
+    /// explicit unavailable error rather than falling back to per-fragment startup.
+    fn stage_fragments(
+        &self,
+        _target: QueryLifecycleTarget,
+        _request: &QueryStageRequest,
+        _timeout: Duration,
+    ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+        Err(QueryLifecycleTransportError::new(
+            QueryLifecycleTransportErrorKind::Unavailable,
+            "StageFragments is not supported by this lifecycle transport",
+        ))
+    }
+
+    /// Releases the already prepared participant-local start gate.
+    fn start_prepared_query(
+        &self,
+        _target: QueryLifecycleTarget,
+        _request: &QueryStartRequest,
+        _timeout: Duration,
+    ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
+        Err(QueryLifecycleTransportError::new(
+            QueryLifecycleTransportErrorKind::Unavailable,
+            "StartPreparedQuery is not supported by this lifecycle transport",
+        ))
+    }
+
     fn abort_query(
         &self,
         target: QueryLifecycleTarget,
@@ -183,6 +216,14 @@ impl QueryLifecycleTransportError {
     }
 
     pub const fn is_unknown_init_outcome(&self) -> bool {
+        matches!(
+            self.kind,
+            QueryLifecycleTransportErrorKind::DeadlineExceeded
+                | QueryLifecycleTransportErrorKind::StreamClosed
+        )
+    }
+
+    pub const fn is_unknown_stage_or_start_outcome(&self) -> bool {
         matches!(
             self.kind,
             QueryLifecycleTransportErrorKind::DeadlineExceeded
@@ -419,6 +460,31 @@ pub trait QueryLifecycleIngress: Send + Sync + 'static {
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
 
+    /// Atomically records the participant-local stage contract.  Fragment
+    /// materialization remains a backend concern; this contract boundary only
+    /// returns a typed outcome so an ambiguous RPC retry can be idempotent.
+    fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
+        QueryStageAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            QueryStageOutcome::RejectedInvalidState,
+            "StageFragments is not supported by this lifecycle ingress",
+        )
+    }
+
+    /// Releases one previously staged query bundle.  A duplicate request with
+    /// the same digest must not cause a second release.
+    fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
+        QueryStartAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            QueryStartOutcome::RejectedNotStaged,
+            "StartPreparedQuery is not supported by this lifecycle ingress",
+        )
+    }
+
     fn abort_query(
         &self,
         request: QueryAbortRequest,
@@ -466,6 +532,125 @@ pub fn decode_query_init_response(
         decode_required_execution_id(response.execution_id.as_ref())?,
         ParticipantManifestDigest::try_from_slice(&response.init_digest)?,
         decode_init_outcome(response.outcome)?,
+    ))
+}
+
+pub fn encode_query_stage_request(request: &QueryStageRequest) -> novarocks::StageFragmentsRequest {
+    novarocks::StageFragmentsRequest {
+        execution_id: Some(encode_execution_id(request.execution_id())),
+        init_digest: request.init_digest().as_bytes().to_vec(),
+        stage_digest_version: request.digest_version().get(),
+        stage_digest: request.digest().as_bytes().to_vec(),
+        fragments: request
+            .fragments()
+            .iter()
+            .map(|fragment| novarocks::StageFragment {
+                plan: Some(fragment.plan().clone()),
+                instance_params: Some(fragment.instance_params().clone()),
+            })
+            .collect(),
+    }
+}
+
+pub fn decode_query_stage_request(
+    request: &novarocks::StageFragmentsRequest,
+) -> Result<QueryStageRequest, QueryLifecycleError> {
+    let fragments = request
+        .fragments
+        .iter()
+        .map(|fragment| {
+            let plan = fragment.plan.clone().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest("stage fragment plan is required")
+            })?;
+            let instance_params = fragment.instance_params.clone().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest("stage fragment instance params are required")
+            })?;
+            StageFragment::new(plan, instance_params)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let decoded = QueryStageRequest::new(
+        decode_required_execution_id(request.execution_id.as_ref())?,
+        ParticipantManifestDigest::try_from_slice(&request.init_digest)?,
+        StageDigestVersion::try_from_wire(request.stage_digest_version)?,
+        StageDigest::try_from_slice(&request.stage_digest)?,
+        fragments,
+    )?;
+    let recomputed = StageDigest::compute_v1(
+        decoded.execution_id(),
+        decoded.init_digest(),
+        decoded.fragments(),
+    )?;
+    if recomputed != decoded.digest() {
+        return Err(QueryLifecycleError::invalid_manifest(
+            "stage digest does not match decoded stage fragment batch",
+        ));
+    }
+    Ok(decoded)
+}
+
+pub fn encode_query_stage_response(response: &QueryStageAck) -> novarocks::StageFragmentsResponse {
+    novarocks::StageFragmentsResponse {
+        execution_id: Some(encode_execution_id(response.execution_id())),
+        stage_digest_version: response.digest_version().get(),
+        stage_digest: response.digest().as_bytes().to_vec(),
+        outcome: encode_stage_outcome(response.outcome()),
+        detail: response.detail().to_string(),
+    }
+}
+
+pub fn decode_query_stage_response(
+    response: &novarocks::StageFragmentsResponse,
+) -> Result<QueryStageAck, QueryLifecycleError> {
+    Ok(QueryStageAck::new(
+        decode_required_execution_id(response.execution_id.as_ref())?,
+        StageDigestVersion::try_from_wire(response.stage_digest_version)?,
+        StageDigest::try_from_slice(&response.stage_digest)?,
+        decode_stage_outcome(response.outcome)?,
+        response.detail.clone(),
+    ))
+}
+
+pub fn encode_query_start_request(
+    request: &QueryStartRequest,
+) -> novarocks::StartPreparedQueryRequest {
+    novarocks::StartPreparedQueryRequest {
+        execution_id: Some(encode_execution_id(request.execution_id())),
+        stage_digest_version: request.digest_version().get(),
+        stage_digest: request.digest().as_bytes().to_vec(),
+    }
+}
+
+pub fn decode_query_start_request(
+    request: &novarocks::StartPreparedQueryRequest,
+) -> Result<QueryStartRequest, QueryLifecycleError> {
+    Ok(QueryStartRequest::new(
+        decode_required_execution_id(request.execution_id.as_ref())?,
+        StageDigestVersion::try_from_wire(request.stage_digest_version)?,
+        StageDigest::try_from_slice(&request.stage_digest)?,
+    ))
+}
+
+pub fn encode_query_start_response(
+    response: &QueryStartAck,
+) -> novarocks::StartPreparedQueryResponse {
+    novarocks::StartPreparedQueryResponse {
+        execution_id: Some(encode_execution_id(response.execution_id())),
+        stage_digest_version: response.digest_version().get(),
+        stage_digest: response.digest().as_bytes().to_vec(),
+        outcome: encode_start_outcome(response.outcome()),
+        detail: response.detail().to_string(),
+    }
+}
+
+pub fn decode_query_start_response(
+    response: &novarocks::StartPreparedQueryResponse,
+) -> Result<QueryStartAck, QueryLifecycleError> {
+    Ok(QueryStartAck::new(
+        decode_required_execution_id(response.execution_id.as_ref())?,
+        StageDigestVersion::try_from_wire(response.stage_digest_version)?,
+        StageDigest::try_from_slice(&response.stage_digest)?,
+        decode_start_outcome(response.outcome)?,
+        response.detail.clone(),
     ))
 }
 
@@ -981,6 +1166,58 @@ fn decode_init_outcome(outcome: i32) -> Result<QueryInitOutcome, QueryLifecycleE
     }
 }
 
+fn encode_stage_outcome(outcome: QueryStageOutcome) -> i32 {
+    match outcome {
+        QueryStageOutcome::Applied => 1,
+        QueryStageOutcome::AlreadyApplied => 2,
+        QueryStageOutcome::RejectedConflict => 3,
+        QueryStageOutcome::RejectedInvalidState => 4,
+        QueryStageOutcome::RejectedInvalidBatch => 5,
+        QueryStageOutcome::RejectedCapacity => 6,
+        QueryStageOutcome::RejectedTerminated => 7,
+        QueryStageOutcome::RejectedLocalFailure => 8,
+    }
+}
+
+fn decode_stage_outcome(outcome: i32) -> Result<QueryStageOutcome, QueryLifecycleError> {
+    match outcome {
+        1 => Ok(QueryStageOutcome::Applied),
+        2 => Ok(QueryStageOutcome::AlreadyApplied),
+        3 => Ok(QueryStageOutcome::RejectedConflict),
+        4 => Ok(QueryStageOutcome::RejectedInvalidState),
+        5 => Ok(QueryStageOutcome::RejectedInvalidBatch),
+        6 => Ok(QueryStageOutcome::RejectedCapacity),
+        7 => Ok(QueryStageOutcome::RejectedTerminated),
+        8 => Ok(QueryStageOutcome::RejectedLocalFailure),
+        value => Err(QueryLifecycleError::invalid_manifest(format!(
+            "unknown stage fragments outcome {value}"
+        ))),
+    }
+}
+
+fn encode_start_outcome(outcome: QueryStartOutcome) -> i32 {
+    match outcome {
+        QueryStartOutcome::Applied => 1,
+        QueryStartOutcome::AlreadyStarted => 2,
+        QueryStartOutcome::RejectedNotStaged => 3,
+        QueryStartOutcome::RejectedConflict => 4,
+        QueryStartOutcome::RejectedTerminated => 5,
+    }
+}
+
+fn decode_start_outcome(outcome: i32) -> Result<QueryStartOutcome, QueryLifecycleError> {
+    match outcome {
+        1 => Ok(QueryStartOutcome::Applied),
+        2 => Ok(QueryStartOutcome::AlreadyStarted),
+        3 => Ok(QueryStartOutcome::RejectedNotStaged),
+        4 => Ok(QueryStartOutcome::RejectedConflict),
+        5 => Ok(QueryStartOutcome::RejectedTerminated),
+        value => Err(QueryLifecycleError::invalid_manifest(format!(
+            "unknown start prepared query outcome {value}"
+        ))),
+    }
+}
+
 fn encode_termination_reason(reason: QueryTerminationReason) -> i32 {
     match reason {
         QueryTerminationReason::CoordinatorAbort => 1,
@@ -1011,13 +1248,22 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use super::{QueryInitRequest, decode_query_init_request, encode_query_init_request};
+    use super::{
+        QueryInitRequest, decode_query_init_request, decode_query_stage_request,
+        decode_query_stage_response, decode_query_start_request, decode_query_start_response,
+        encode_query_init_request, encode_query_stage_request, encode_query_stage_response,
+        encode_query_start_request, encode_query_start_response,
+    };
     use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::identity::{AttemptId, QueryExecutionId};
     use crate::query_execution::lifecycle::manifest::{
         ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions, ParticipantRole,
         QueryControlEndpoint, RuntimeFilterContribution,
+    };
+    use crate::query_execution::lifecycle::{
+        QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
+        QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
     };
     use crate::runtime::query_options::{QueryCacheOptions, QueryOptions};
     use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
@@ -1198,5 +1444,104 @@ mod tests {
             .attempt_id = 0;
 
         assert!(decode_query_init_request(&wire).is_err());
+    }
+
+    fn stage_fragment(lo: i64) -> StageFragment {
+        StageFragment::new(
+            crate::proto::plan::PlanFragment::default(),
+            crate::proto::novarocks::InstanceParams {
+                fragment_instance_id: Some(crate::proto::common::UniqueId { hi: 17, lo }),
+                ..Default::default()
+            },
+        )
+        .expect("valid stage fragment")
+    }
+
+    #[test]
+    fn proto_stage_and_start_round_trip_typed_contracts() {
+        let fragments = vec![stage_fragment(9), stage_fragment(2)];
+        let digest = StageDigest::compute_v1(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
+            &fragments,
+        )
+        .expect("stage digest");
+        let stage = QueryStageRequest::new(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
+            StageDigestVersion::V1,
+            digest,
+            fragments,
+        )
+        .expect("valid stage request");
+        let decoded_stage = decode_query_stage_request(&encode_query_stage_request(&stage))
+            .expect("stage request round trips");
+        assert_eq!(decoded_stage, stage);
+
+        let stage_ack = QueryStageAck::new(
+            execution_id(),
+            StageDigestVersion::V1,
+            StageDigest::new([5; 32]),
+            QueryStageOutcome::AlreadyApplied,
+            "replayed",
+        );
+        assert_eq!(
+            decode_query_stage_response(&encode_query_stage_response(&stage_ack))
+                .expect("stage ack round trips"),
+            stage_ack
+        );
+
+        let start = QueryStartRequest::new(
+            execution_id(),
+            StageDigestVersion::V1,
+            StageDigest::new([5; 32]),
+        );
+        assert_eq!(
+            decode_query_start_request(&encode_query_start_request(&start))
+                .expect("start request round trips"),
+            start
+        );
+        let start_ack = QueryStartAck::new(
+            execution_id(),
+            StageDigestVersion::V1,
+            StageDigest::new([5; 32]),
+            QueryStartOutcome::AlreadyStarted,
+            "replayed",
+        );
+        assert_eq!(
+            decode_query_start_response(&encode_query_start_response(&start_ack))
+                .expect("start ack round trips"),
+            start_ack
+        );
+    }
+
+    #[test]
+    fn proto_stage_rejects_unknown_version_and_incomplete_fragment() {
+        let fragments = vec![stage_fragment(2)];
+        let digest = StageDigest::compute_v1(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
+            &fragments,
+        )
+        .expect("stage digest");
+        let request = QueryStageRequest::new(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
+            StageDigestVersion::V1,
+            digest,
+            fragments,
+        )
+        .expect("valid stage request");
+        let mut wire = encode_query_stage_request(&request);
+        wire.stage_digest_version = 99;
+        assert!(decode_query_stage_request(&wire).is_err());
+
+        let mut wire = encode_query_stage_request(&request);
+        wire.fragments[0].plan = None;
+        assert!(decode_query_stage_request(&wire).is_err());
+
+        let mut wire = encode_query_stage_request(&request);
+        wire.stage_digest[0] ^= 0xff;
+        assert!(decode_query_stage_request(&wire).is_err());
     }
 }

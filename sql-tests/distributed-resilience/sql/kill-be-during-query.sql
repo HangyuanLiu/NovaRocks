@@ -24,9 +24,14 @@ CREATE TABLE ${case_db}.resilience_series (
 )
 TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.resilience_series
-SELECT generate_series FROM TABLE(generate_series(1, 1000000));
+SELECT generate_series FROM TABLE(generate_series(1, 333333));
+INSERT INTO ${case_db}.resilience_series
+SELECT generate_series FROM TABLE(generate_series(333334, 666666));
+INSERT INTO ${case_db}.resilience_series
+SELECT generate_series FROM TABLE(generate_series(666667, 1000000));
 
 -- query 2
+-- @query_control_fragment_backend_limit=2
 -- @kill_be_after_fragment_start=1
 -- @expect_error=backend 1 lost after heartbeat timeout
 SELECT COUNT(*) FROM ${case_db}.resilience_series;

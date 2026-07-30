@@ -108,6 +108,16 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.restart_be_after_init_ack_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
+        || meta.fail_stage_prepare_ordinal.is_some()
+        || meta.drop_next_stage_ack_be_index.is_some()
+        || meta.drop_next_start_ack_be_index.is_some()
+        || meta.suppress_start_ack_be_index.is_some()
+        || meta.kill_query_at_lifecycle_phase.is_some()
+        || meta.kill_fe_at_lifecycle_phase.is_some()
+        || meta
+            .stop_query_control_heartbeat_after_stage_be_index
+            .is_some()
+        || meta.hold_start_until_early_ingress
         || meta.query_control_fragment_backend_limit.is_some();
     QueryLifecycleFaultStepGuard {
         server: armed.then_some(server),
@@ -141,6 +151,16 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.restart_be_after_init_ack_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
+        || meta.fail_stage_prepare_ordinal.is_some()
+        || meta.drop_next_stage_ack_be_index.is_some()
+        || meta.drop_next_start_ack_be_index.is_some()
+        || meta.suppress_start_ack_be_index.is_some()
+        || meta.kill_query_at_lifecycle_phase.is_some()
+        || meta.kill_fe_at_lifecycle_phase.is_some()
+        || meta
+            .stop_query_control_heartbeat_after_stage_be_index
+            .is_some()
+        || meta.hold_start_until_early_ingress
         || meta.query_control_fragment_backend_limit.is_some()
 }
 
@@ -165,13 +185,21 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.kill_fe_after_control_ready_count.is_some(),
         meta.restart_be_after_init_ack_index.is_some(),
         meta.kill_query_after_control_ready_count.is_some(),
+        meta.fail_stage_prepare_ordinal.is_some(),
+        meta.drop_next_stage_ack_be_index.is_some(),
+        meta.drop_next_start_ack_be_index.is_some(),
+        meta.suppress_start_ack_be_index.is_some(),
+        meta.kill_query_at_lifecycle_phase.is_some(),
+        meta.kill_fe_at_lifecycle_phase.is_some(),
+        meta.stop_query_control_heartbeat_after_stage_be_index
+            .is_some(),
     ]
     .into_iter()
     .filter(|configured| *configured)
     .count();
     if lifecycle_fault_count > 1 {
         bail!(
-            "a SQL step may configure at most one query lifecycle fault directive: drop_next_init_ack_be_index, stop_query_control_heartbeat_be_index, kill_fe_after_control_ready_count, restart_be_after_init_ack_index, or kill_query_after_control_ready_count"
+            "a SQL step may configure at most one query lifecycle fault directive; hold_start_until_early_ingress is schedule-shaping and may be combined"
         );
     }
 
@@ -205,6 +233,22 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
             "restart_be_after_init_ack_index",
             meta.restart_be_after_init_ack_index,
         ),
+        (
+            "drop_next_stage_ack_be_index",
+            meta.drop_next_stage_ack_be_index,
+        ),
+        (
+            "drop_next_start_ack_be_index",
+            meta.drop_next_start_ack_be_index,
+        ),
+        (
+            "suppress_start_ack_be_index",
+            meta.suppress_start_ack_be_index,
+        ),
+        (
+            "stop_query_control_heartbeat_after_stage_be_index",
+            meta.stop_query_control_heartbeat_after_stage_be_index,
+        ),
     ] {
         if let Some(index) = index
             && index >= be_count
@@ -221,6 +265,11 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         && !(1..=be_count).contains(&count)
     {
         bail!("kill_query_after_control_ready_count must be between 1 and {be_count}, got {count}");
+    }
+    if let Some(ordinal) = meta.fail_stage_prepare_ordinal
+        && ordinal == 0
+    {
+        bail!("fail_stage_prepare_ordinal must be at least 1, got {ordinal}");
     }
     if let Some(limit) = meta.query_control_fragment_backend_limit
         && !(1..=be_count).contains(&limit)
@@ -239,6 +288,30 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     if let Some(index) = meta.restart_be_after_init_ack_index {
         server.arm_be_restart_after_init_ack(index)?;
+    }
+    if let Some(ordinal) = meta.fail_stage_prepare_ordinal {
+        server.arm_stage_prepare_failure(ordinal)?;
+    }
+    if let Some(index) = meta.drop_next_stage_ack_be_index {
+        server.arm_stage_ack_drop(index)?;
+    }
+    if let Some(index) = meta.drop_next_start_ack_be_index {
+        server.arm_start_ack_drop(index)?;
+    }
+    if let Some(index) = meta.suppress_start_ack_be_index {
+        server.arm_start_ack_suppress(index)?;
+    }
+    if let Some(phase) = meta.kill_query_at_lifecycle_phase {
+        server.arm_kill_query_at_lifecycle_phase(phase)?;
+    }
+    if let Some(phase) = meta.kill_fe_at_lifecycle_phase {
+        server.arm_fe_crash_at_lifecycle_phase(phase)?;
+    }
+    if let Some(index) = meta.stop_query_control_heartbeat_after_stage_be_index {
+        server.arm_query_control_heartbeat_stop_after_stage(index)?;
+    }
+    if meta.hold_start_until_early_ingress {
+        server.arm_hold_start_until_early_ingress()?;
     }
     if let Some(limit) = meta.query_control_fragment_backend_limit {
         server.arm_query_control_fragment_backend_limit(limit)?;
@@ -283,10 +356,18 @@ where
             ready_count: usize,
             connection_id: u32,
         },
+        KillQueryAtLifecyclePhase {
+            phase: crate::types::QueryLifecyclePhase,
+            connection_id: u32,
+        },
+        KillFrontendAtLifecyclePhase(crate::types::QueryLifecyclePhase),
     }
 
     enum FaultBaseline {
         ScheduledFragments(Vec<(usize, u64)>),
+        FrontendStage {
+            marker_count: u64,
+        },
         FrontendReady {
             ready_count: u64,
             coordinator_lost: Vec<u64>,
@@ -295,6 +376,11 @@ where
             index: usize,
             token: String,
             start_epoch: u64,
+        },
+        FrontendPhase {
+            phase: crate::types::QueryLifecyclePhase,
+            fe_crash: bool,
+            marker_count: u64,
         },
     }
 
@@ -321,6 +407,20 @@ where
                     })
             })
             .transpose()?,
+        meta.kill_query_at_lifecycle_phase
+            .map(|phase| {
+                query_connection_id
+                    .map(|connection_id| PostQueryFault::KillQueryAtLifecyclePhase {
+                        phase,
+                        connection_id,
+                    })
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "kill_query_at_lifecycle_phase requires the target query connection id"
+                    ))
+            })
+            .transpose()?,
+        meta.kill_fe_at_lifecycle_phase
+            .map(PostQueryFault::KillFrontendAtLifecyclePhase),
     ]
     .into_iter()
     .flatten()
@@ -359,11 +459,9 @@ where
                         server.be_count()
                     );
                 }
-                FaultBaseline::ScheduledFragments(
-                    (0..server.be_count())
-                        .map(|backend| Ok((backend, server.scheduled_fragment_count(backend)?)))
-                        .collect::<Result<Vec<_>>>()?,
-                )
+                FaultBaseline::FrontendStage {
+                    marker_count: server.fe_log_count("NOVAROCKS_QUERY_STAGE_BARRIER")? as u64,
+                }
             }
             PostQueryFault::KillFrontendAfterControlReady(_) => FaultBaseline::FrontendReady {
                 ready_count: server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")? as u64,
@@ -395,13 +493,24 @@ where
                     start_epoch: server.backend_start_epoch(index)?,
                 }
             }
+            PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
+            | PostQueryFault::KillFrontendAtLifecyclePhase(phase) => FaultBaseline::FrontendPhase {
+                phase,
+                fe_crash: matches!(fault, PostQueryFault::KillFrontendAtLifecyclePhase(_)),
+                marker_count: lifecycle_phase_marker_count(
+                    &server.fe_log_contents()?,
+                    phase,
+                    matches!(fault, PostQueryFault::KillFrontendAtLifecyclePhase(_)),
+                )? as u64,
+            },
         }
     };
     let fault_state = Arc::new(ActiveQueryFaultState::new());
     let worker_server = Arc::clone(server);
     let worker_fault_state = Arc::clone(&fault_state);
     let worker = thread::spawn(move || -> Result<()> {
-        let deadline = shared_deadline.unwrap_or_else(|| Instant::now() + POST_FRAGMENT_START_TIMEOUT);
+        let deadline =
+            shared_deadline.unwrap_or_else(|| Instant::now() + POST_FRAGMENT_START_TIMEOUT);
         let mut deadline_cancel_sent = false;
         loop {
             if Instant::now() >= deadline {
@@ -443,6 +552,10 @@ where
                         }
                         all_fresh
                     }
+                    FaultBaseline::FrontendStage { marker_count } => {
+                        server.fe_log_count("NOVAROCKS_QUERY_STAGE_BARRIER")?
+                            > *marker_count as usize
+                    }
                     FaultBaseline::FrontendReady { ready_count, .. } => {
                         let target = match fault {
                             PostQueryFault::KillFrontendAfterControlReady(target) => target,
@@ -456,14 +569,20 @@ where
                         server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")?
                             >= (*ready_count as usize).saturating_add(target)
                     }
-                    FaultBaseline::BackendInit {
-                        index,
-                        token,
-                        ..
-                    } => server.be_log_contents(*index)?.lines().any(|line| {
-                        line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
-                            && line.contains(&format!("token={token}"))
-                    }),
+                    FaultBaseline::BackendInit { index, token, .. } => {
+                        server.be_log_contents(*index)?.lines().any(|line| {
+                            line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
+                                && line.contains(&format!("token={token}"))
+                        })
+                    }
+                    FaultBaseline::FrontendPhase {
+                        phase,
+                        fe_crash,
+                        marker_count,
+                    } => {
+                        lifecycle_phase_marker_count(&server.fe_log_contents()?, *phase, *fe_crash)?
+                            > *marker_count as usize
+                    }
                 }
             };
             if ready {
@@ -484,118 +603,141 @@ where
                         &server.fe_log_contents()?,
                         *ready_count as usize,
                     )?,
+                    (
+                        FaultBaseline::FrontendPhase {
+                            phase,
+                            fe_crash,
+                            marker_count,
+                        },
+                        PostQueryFault::KillQueryAtLifecyclePhase { .. }
+                        | PostQueryFault::KillFrontendAtLifecyclePhase(_),
+                    ) => fresh_lifecycle_phase_execution(
+                        &server.fe_log_contents()?,
+                        *marker_count as usize,
+                        *phase,
+                        *fe_crash,
+                    )?,
                     _ => None,
                 };
                 let action_result = (|| -> Result<()> {
                     match fault {
-                    PostQueryFault::KillBackend(index) => server.kill_be(index)?,
-                    PostQueryFault::ReleaseFragmentFailure(index) => {
-                        server.release_fragment_executor_failure(index)?
-                    }
-                    PostQueryFault::RestartBackendAfterInitAck(index) => {
-                        let FaultBaseline::BackendInit {
-                            token,
-                            start_epoch,
-                            ..
-                        } = &baseline
-                        else {
-                            unreachable!("BE restart fault has BackendInit baseline")
-                        };
-                        let old_log = server.be_log_contents(index)?;
-                        let old_execution = old_log
-                            .lines()
-                            .rev()
-                            .find(|line| {
-                                line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
-                                    && line.contains(&format!("token={token}"))
-                            })
-                            .and_then(|line| marker_field(line, "execution_id"))
-                            .context("restart marker is missing execution_id")?;
-                        let backend_id = old_log
-                            .lines()
-                            .rev()
-                            .find(|line| {
-                                line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
-                                    && line.contains(&format!("token={token}"))
-                            })
-                            .and_then(|line| marker_field(line, "backend_id"))
-                            .context("restart marker is missing backend_id")?
-                            .parse::<u64>()
-                            .context("restart marker has invalid backend_id")?;
-                        server.restart_be_until(index, deadline)?;
-                        let new_epoch = server.backend_start_epoch(index)?;
-                        if new_epoch == *start_epoch {
-                            bail!(
-                                "BE[{index}] restart did not change start epoch: old={start_epoch} new={new_epoch}"
-                            );
+                        PostQueryFault::KillBackend(index) => server.kill_be(index)?,
+                        PostQueryFault::ReleaseFragmentFailure(index) => {
+                            server.release_fragment_executor_failure(index)?
                         }
-                        let new_log = server.be_current_log_contents(index)?;
-                        validate_restart_nonrestore_status(
-                            &new_log,
-                            &old_execution,
-                            backend_id,
-                            new_epoch,
-                        )?;
-                        evidence_execution = Some(old_execution.clone());
-                        println!(
-                            "query lifecycle BE restart proof PASS: backend_index={index} backend_id={backend_id} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false"
-                        );
-                    }
-                    PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
-                        server.kill_query_until(connection_id, deadline)?
-                    }
-                        PostQueryFault::KillFrontendAfterControlReady(_) => {
-                        server.kill_fe()?;
-                        let FaultBaseline::FrontendReady {
-                            coordinator_lost, ..
-                        } = &baseline
-                        else {
-                            unreachable!("FE crash fault has frontend baseline");
-                        };
-                        loop {
-                            if Instant::now() >= deadline {
-                                let fe = server.fe_log_contents().unwrap_or_default();
-                                let bes = (0..server.be_count())
-                                    .map(|index| {
-                                        server.be_log_contents(index).unwrap_or_default()
-                                    })
-                                    .collect::<Vec<_>>();
+                        PostQueryFault::RestartBackendAfterInitAck(index) => {
+                            let FaultBaseline::BackendInit {
+                                token, start_epoch, ..
+                            } = &baseline
+                            else {
+                                unreachable!("BE restart fault has BackendInit baseline")
+                            };
+                            let old_log = server.be_log_contents(index)?;
+                            let old_execution = old_log
+                                .lines()
+                                .rev()
+                                .find(|line| {
+                                    line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
+                                        && line.contains(&format!("token={token}"))
+                                })
+                                .and_then(|line| marker_field(line, "execution_id"))
+                                .context("restart marker is missing execution_id")?;
+                            let backend_id = old_log
+                                .lines()
+                                .rev()
+                                .find(|line| {
+                                    line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
+                                        && line.contains(&format!("token={token}"))
+                                })
+                                .and_then(|line| marker_field(line, "backend_id"))
+                                .context("restart marker is missing backend_id")?
+                                .parse::<u64>()
+                                .context("restart marker has invalid backend_id")?;
+                            server.restart_be_until(index, deadline)?;
+                            let new_epoch = server.backend_start_epoch(index)?;
+                            if new_epoch == *start_epoch {
                                 bail!(
-                                    "timed out waiting for coordinator-lost marker on every BE after FE crash; fe_tail={:?}; be_tails={:?}",
-                                    log_tail(&fe),
-                                    bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
+                                    "BE[{index}] restart did not change start epoch: old={start_epoch} new={new_epoch}"
                                 );
                             }
-                            let lost_executions = coordinator_lost
-                                .iter()
-                                .enumerate()
-                                .map(|(index, baseline)| {
-                                    let log = server.be_log_contents(index)?;
-                                    let execution = log
-                                        .lines()
-                                        .filter(|line| {
-                                            line.contains(
-                                                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST",
-                                            )
-                                        })
-                                        .skip(*baseline as usize)
-                                        .find_map(|line| marker_field(line, "execution_id"));
-                                    Ok(execution)
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            let all_lost = lost_executions.iter().all(Option::is_some);
-                            let same_execution = all_lost
-                                && lost_executions
-                                    .iter()
-                                    .flatten()
-                                    .all(|execution| Some(execution) == evidence_execution.as_ref());
-                            if same_execution {
-                                break;
-                            }
-                            sleep(POST_FRAGMENT_START_POLL_INTERVAL);
+                            let new_log = server.be_current_log_contents(index)?;
+                            validate_restart_nonrestore_status(
+                                &new_log,
+                                &old_execution,
+                                backend_id,
+                                new_epoch,
+                            )?;
+                            evidence_execution = Some(old_execution.clone());
+                            println!(
+                                "query lifecycle BE restart proof PASS: backend_index={index} backend_id={backend_id} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false"
+                            );
                         }
-                        server.clear_query_lifecycle_faults()?;
-                        server.restart_fe_until(deadline)?;
+                        PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
+                            server.kill_query_until(connection_id, deadline)?
+                        }
+                        PostQueryFault::KillQueryAtLifecyclePhase {
+                            phase,
+                            connection_id,
+                        } => {
+                            server.kill_query_until(connection_id, deadline)?;
+                            server.release_query_lifecycle_phase_fault(phase, false)?;
+                        }
+                        PostQueryFault::KillFrontendAtLifecyclePhase(phase) => {
+                            server.kill_fe()?;
+                            server.release_query_lifecycle_phase_fault(phase, true)?;
+                            server.restart_fe_until(deadline)?;
+                        }
+                        PostQueryFault::KillFrontendAfterControlReady(_) => {
+                            server.kill_fe()?;
+                            let FaultBaseline::FrontendReady {
+                                coordinator_lost, ..
+                            } = &baseline
+                            else {
+                                unreachable!("FE crash fault has frontend baseline");
+                            };
+                            loop {
+                                if Instant::now() >= deadline {
+                                    let fe = server.fe_log_contents().unwrap_or_default();
+                                    let bes = (0..server.be_count())
+                                        .map(|index| {
+                                            server.be_log_contents(index).unwrap_or_default()
+                                        })
+                                        .collect::<Vec<_>>();
+                                    bail!(
+                                        "timed out waiting for coordinator-lost marker on every BE after FE crash; fe_tail={:?}; be_tails={:?}",
+                                        log_tail(&fe),
+                                        bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
+                                    );
+                                }
+                                let lost_executions = coordinator_lost
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, baseline)| {
+                                        let log = server.be_log_contents(index)?;
+                                        let execution = log
+                                            .lines()
+                                            .filter(|line| {
+                                                line.contains(
+                                                    "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST",
+                                                )
+                                            })
+                                            .skip(*baseline as usize)
+                                            .find_map(|line| marker_field(line, "execution_id"));
+                                        Ok(execution)
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                let all_lost = lost_executions.iter().all(Option::is_some);
+                                let same_execution = all_lost
+                                    && lost_executions.iter().flatten().all(|execution| {
+                                        Some(execution) == evidence_execution.as_ref()
+                                    });
+                                if same_execution {
+                                    break;
+                                }
+                                sleep(POST_FRAGMENT_START_POLL_INTERVAL);
+                            }
+                            server.clear_query_lifecycle_faults()?;
+                            server.restart_fe_until(deadline)?;
                         }
                     }
                     Ok(())
@@ -749,10 +891,56 @@ fn fresh_fe_control_ready_execution(log: &str, baseline: usize) -> Result<Option
     Ok(Some(first.clone()))
 }
 
-fn terminal_cleanup_on_all_backends(
-    server: &dyn ServerHandle,
-    execution_id: &str,
-) -> Result<bool> {
+fn lifecycle_phase_marker_count(
+    log: &str,
+    phase: crate::types::QueryLifecyclePhase,
+    fe_crash: bool,
+) -> Result<usize> {
+    let action = if fe_crash { "kill_fe" } else { "kill_query" };
+    let markers = log
+        .lines()
+        .filter(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_PHASE"))
+        .filter(|line| {
+            marker_field(line, "phase").as_deref() == Some(phase.as_str())
+                && marker_field(line, "action").as_deref() == Some(action)
+        })
+        .collect::<Vec<_>>();
+    if markers
+        .iter()
+        .any(|line| marker_field(line, "token").is_none())
+    {
+        bail!("lifecycle phase marker has no token: {markers:?}");
+    }
+    Ok(markers.len())
+}
+
+fn fresh_lifecycle_phase_execution(
+    log: &str,
+    baseline: usize,
+    phase: crate::types::QueryLifecyclePhase,
+    fe_crash: bool,
+) -> Result<Option<String>> {
+    let action = if fe_crash { "kill_fe" } else { "kill_query" };
+    let executions = log
+        .lines()
+        .filter(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_PHASE"))
+        .filter(|line| {
+            marker_field(line, "phase").as_deref() == Some(phase.as_str())
+                && marker_field(line, "action").as_deref() == Some(action)
+        })
+        .skip(baseline)
+        .filter_map(|line| marker_field(line, "execution_id"))
+        .collect::<Vec<_>>();
+    let Some(first) = executions.first() else {
+        return Ok(None);
+    };
+    if executions.iter().any(|execution| execution != first) {
+        bail!("fresh lifecycle phase markers span multiple executions: {executions:?}");
+    }
+    Ok(Some(first.clone()))
+}
+
+fn terminal_cleanup_on_all_backends(server: &dyn ServerHandle, execution_id: &str) -> Result<bool> {
     if server.be_count() != 3 {
         bail!(
             "post-query lifecycle terminal cleanup evidence requires exactly 3 BEs, found {}",
@@ -919,6 +1107,57 @@ mod tests {
             Ok(())
         }
 
+        fn arm_stage_prepare_failure(&mut self, ordinal: usize) -> Result<()> {
+            self.events
+                .push(format!("arm-stage-prepare-failure:{ordinal}"));
+            Ok(())
+        }
+
+        fn arm_stage_ack_drop(&mut self, index: usize) -> Result<()> {
+            self.events.push(format!("arm-stage-ack-drop:{index}"));
+            Ok(())
+        }
+
+        fn arm_start_ack_drop(&mut self, index: usize) -> Result<()> {
+            self.events.push(format!("arm-start-ack-drop:{index}"));
+            Ok(())
+        }
+
+        fn arm_start_ack_suppress(&mut self, index: usize) -> Result<()> {
+            self.events.push(format!("arm-start-ack-suppress:{index}"));
+            Ok(())
+        }
+
+        fn arm_kill_query_at_lifecycle_phase(
+            &mut self,
+            phase: crate::types::QueryLifecyclePhase,
+        ) -> Result<()> {
+            self.events
+                .push(format!("arm-kill-query-phase:{}", phase.as_str()));
+            Ok(())
+        }
+
+        fn arm_fe_crash_at_lifecycle_phase(
+            &mut self,
+            phase: crate::types::QueryLifecyclePhase,
+        ) -> Result<()> {
+            self.events
+                .push(format!("arm-fe-crash-phase:{}", phase.as_str()));
+            Ok(())
+        }
+
+        fn arm_query_control_heartbeat_stop_after_stage(&mut self, index: usize) -> Result<()> {
+            self.events
+                .push(format!("arm-heartbeat-stop-after-stage:{index}"));
+            Ok(())
+        }
+
+        fn arm_hold_start_until_early_ingress(&mut self) -> Result<()> {
+            self.events
+                .push("arm-hold-start-until-early-ingress".to_string());
+            Ok(())
+        }
+
         fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
             self.events.push(format!("arm-fragment-limit:{limit}"));
             Ok(())
@@ -1020,6 +1259,38 @@ mod tests {
                 query_control_fragment_backend_limit: Some(1),
                 ..QueryMeta::default()
             },
+            QueryMeta {
+                fail_stage_prepare_ordinal: Some(1),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                drop_next_stage_ack_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                drop_next_start_ack_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                suppress_start_ack_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                kill_query_at_lifecycle_phase: Some(crate::types::QueryLifecyclePhase::Staged),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                kill_fe_at_lifecycle_phase: Some(crate::types::QueryLifecyclePhase::Staged),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                stop_query_control_heartbeat_after_stage_be_index: Some(0),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                hold_start_until_early_ingress: true,
+                ..QueryMeta::default()
+            },
         ] {
             let mut server = UnsupportedServerHandle;
             let error = apply_pre_query(&meta, &mut server)
@@ -1052,6 +1323,26 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(server.events.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_start_hold_may_combine_with_one_primary_fault() {
+        let mut server = RecordingServerHandle::default();
+        let meta = QueryMeta {
+            drop_next_start_ack_be_index: Some(1),
+            hold_start_until_early_ingress: true,
+            ..QueryMeta::default()
+        };
+
+        apply_pre_query(&meta, &mut server).expect("schedule-shaping hold may compose");
+
+        assert_eq!(
+            server.events,
+            vec![
+                "arm-start-ack-drop:1".to_string(),
+                "arm-hold-start-until-early-ingress".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1126,6 +1417,41 @@ mod tests {
                 },
                 "query_control_fragment_backend_limit must be between 1 and 3",
             ),
+            (
+                QueryMeta {
+                    fail_stage_prepare_ordinal: Some(0),
+                    ..QueryMeta::default()
+                },
+                "fail_stage_prepare_ordinal must be at least 1",
+            ),
+            (
+                QueryMeta {
+                    drop_next_stage_ack_be_index: Some(3),
+                    ..QueryMeta::default()
+                },
+                "drop_next_stage_ack_be_index 3 is out of bounds for 3 BE(s)",
+            ),
+            (
+                QueryMeta {
+                    drop_next_start_ack_be_index: Some(3),
+                    ..QueryMeta::default()
+                },
+                "drop_next_start_ack_be_index 3 is out of bounds for 3 BE(s)",
+            ),
+            (
+                QueryMeta {
+                    suppress_start_ack_be_index: Some(3),
+                    ..QueryMeta::default()
+                },
+                "suppress_start_ack_be_index 3 is out of bounds for 3 BE(s)",
+            ),
+            (
+                QueryMeta {
+                    stop_query_control_heartbeat_after_stage_be_index: Some(3),
+                    ..QueryMeta::default()
+                },
+                "stop_query_control_heartbeat_after_stage_be_index 3 is out of bounds for 3 BE(s)",
+            ),
         ] {
             let mut server = ThreeBackendServer;
             let error = apply_pre_query(&meta, &mut server)
@@ -1174,6 +1500,64 @@ mod tests {
                     ..QueryMeta::default()
                 },
                 "arm-fragment-limit:2",
+            ),
+            (
+                QueryMeta {
+                    fail_stage_prepare_ordinal: Some(2),
+                    ..QueryMeta::default()
+                },
+                "arm-stage-prepare-failure:2",
+            ),
+            (
+                QueryMeta {
+                    drop_next_stage_ack_be_index: Some(1),
+                    ..QueryMeta::default()
+                },
+                "arm-stage-ack-drop:1",
+            ),
+            (
+                QueryMeta {
+                    drop_next_start_ack_be_index: Some(1),
+                    ..QueryMeta::default()
+                },
+                "arm-start-ack-drop:1",
+            ),
+            (
+                QueryMeta {
+                    suppress_start_ack_be_index: Some(1),
+                    ..QueryMeta::default()
+                },
+                "arm-start-ack-suppress:1",
+            ),
+            (
+                QueryMeta {
+                    kill_query_at_lifecycle_phase: Some(
+                        crate::types::QueryLifecyclePhase::Starting,
+                    ),
+                    ..QueryMeta::default()
+                },
+                "arm-kill-query-phase:starting",
+            ),
+            (
+                QueryMeta {
+                    kill_fe_at_lifecycle_phase: Some(crate::types::QueryLifecyclePhase::Staged),
+                    ..QueryMeta::default()
+                },
+                "arm-fe-crash-phase:staged",
+            ),
+            (
+                QueryMeta {
+                    stop_query_control_heartbeat_after_stage_be_index: Some(1),
+                    ..QueryMeta::default()
+                },
+                "arm-heartbeat-stop-after-stage:1",
+            ),
+            (
+                QueryMeta {
+                    hold_start_until_early_ingress: true,
+                    ..QueryMeta::default()
+                },
+                "arm-hold-start-until-early-ingress",
             ),
         ] {
             let mut server = RecordingServerHandle::default();
@@ -1375,19 +1759,20 @@ mod tests {
             ..QueryMeta::default()
         };
 
-        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
-            let (lock, wake) = state.as_ref();
-            let mut query = lock.lock().expect("active query state");
-            query.events.push("query:start");
-            query.fragment_started = true;
-            wake.notify_all();
-            query = wake
-                .wait_while(query, |state| !state.killed)
-                .expect("wait for runner kill");
-            query.events.push("query:end");
-            42
-        })
-        .expect("active-query fault execution");
+        let result =
+            execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
+                let (lock, wake) = state.as_ref();
+                let mut query = lock.lock().expect("active query state");
+                query.events.push("query:start");
+                query.fragment_started = true;
+                wake.notify_all();
+                query = wake
+                    .wait_while(query, |state| !state.killed)
+                    .expect("wait for runner kill");
+                query.events.push("query:end");
+                42
+            })
+            .expect("active-query fault execution");
 
         assert_eq!(result, 42);
         assert_eq!(
@@ -1444,6 +1829,13 @@ mod tests {
             }
         }
 
+        fn fe_log_count(&self, marker: &str) -> Result<usize> {
+            assert_eq!(marker, "NOVAROCKS_QUERY_STAGE_BARRIER");
+            let (lock, _) = self.state.as_ref();
+            let state = lock.lock().expect("all-backend release state");
+            Ok(usize::from(state.query_started))
+        }
+
         fn release_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
             let (lock, wake) = self.state.as_ref();
             let mut state = lock.lock().expect("all-backend release state");
@@ -1455,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn fragment_failure_release_waits_for_fresh_counts_on_every_backend() {
+    fn fragment_failure_release_waits_for_the_stage_barrier() {
         let state = Arc::new((
             Mutex::new(AllBackendsReleaseState::default()),
             Condvar::new(),
@@ -1469,30 +1861,25 @@ mod tests {
             ..QueryMeta::default()
         };
 
-        let result = execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
-            let (lock, wake) = state.as_ref();
-            let mut query = lock.lock().expect("all-backend release state");
-            query.events.push("query:start");
-            query.query_started = true;
-            wake.notify_all();
-            query = wake
-                .wait_while(query, |state| state.released_index.is_none())
-                .expect("wait for runner release");
-            query.events.push("query:end");
-            42
-        })
-        .expect("active-query fragment failure release");
+        let result =
+            execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
+                let (lock, wake) = state.as_ref();
+                let mut query = lock.lock().expect("all-backend release state");
+                query.events.push("query:start");
+                query.query_started = true;
+                wake.notify_all();
+                query = wake
+                    .wait_while(query, |state| state.released_index.is_none())
+                    .expect("wait for runner release");
+                query.events.push("query:end");
+                42
+            })
+            .expect("active-query fragment failure release");
 
         assert_eq!(result, 42);
         let state = state.0.lock().expect("all-backend release state");
-        assert_eq!(state.baseline_reads, vec![0, 1, 2]);
-        assert!(
-            [0, 1, 2]
-                .into_iter()
-                .all(|index| state.fresh_reads.contains(&index)),
-            "release must observe a fresh ScheduledFragments count on every BE: {:?}",
-            state.fresh_reads
-        );
+        assert!(state.baseline_reads.is_empty());
+        assert!(state.fresh_reads.is_empty());
         assert_eq!(state.released_index, Some(1));
         assert_eq!(state.events, vec!["query:start", "release", "query:end"]);
     }
@@ -1510,10 +1897,15 @@ mod tests {
         };
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ =
-                execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || -> () {
+            let _ = execute_with_post_fragment_start_fault(
+                &meta,
+                &server_handle,
+                None,
+                None,
+                || -> () {
                     panic!("simulated query panic");
-                });
+                },
+            );
         }));
 
         assert!(panic.is_err());
@@ -1574,9 +1966,7 @@ mod tests {
                 .expect("kill-query state")
                 .control_ready_count;
             Ok((0..count)
-                .map(|_| {
-                    "NOVAROCKS_QUERY_CONTROL_READY execution_id=10:20:1 backend_id=1\n"
-                })
+                .map(|_| "NOVAROCKS_QUERY_CONTROL_READY execution_id=10:20:1 backend_id=1\n")
                 .collect())
         }
 

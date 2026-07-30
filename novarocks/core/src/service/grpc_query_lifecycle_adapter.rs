@@ -15,15 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(debug_assertions)]
+use std::collections::BTreeMap;
 use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proto::novarocks;
 use crate::query_execution::lifecycle::contract::{
     decode_abort_query_request, decode_query_control_attach, decode_query_control_command,
-    decode_query_init_request, encode_abort_query_response, encode_query_control_event,
-    encode_query_init_response,
+    decode_query_init_request, decode_query_stage_request, decode_query_start_request,
+    encode_abort_query_response, encode_query_control_event, encode_query_init_response,
+    encode_query_stage_response, encode_query_start_response,
 };
 use crate::query_execution::lifecycle::{
     BackendQueryControl, QueryControlCommand, QueryControlEvent, QueryInitOutcome,
@@ -97,6 +102,82 @@ fn emit_query_lifecycle_abort_marker() {
     }
 }
 
+pub(crate) fn handle_stage_fragments(
+    ingress: &dyn QueryLifecycleIngress,
+    request: novarocks::StageFragmentsRequest,
+) -> Result<novarocks::StageFragmentsResponse, tonic::Status> {
+    let request = decode_query_stage_request(&request).map_err(status_from_lifecycle_error)?;
+    let execution_id = request.execution_id();
+    let response = ingress.stage_fragments(request);
+    if response.outcome().is_staged() {
+        if let Some(scope) = claim_backend_fault(
+            QueryLifecycleFaultKind::HeartbeatStopAfterStage,
+            execution_id,
+        )? {
+            register_staged_heartbeat_stop(scope);
+        }
+    }
+    if response.outcome().is_staged()
+        && let Some(scope) =
+            claim_backend_fault(QueryLifecycleFaultKind::StageAckDrop, execution_id)?
+    {
+        eprintln!(
+            "NOVAROCKS_STAGE_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            scope.backend_index,
+            scope.token
+        );
+        return Err(tonic::Status::deadline_exceeded(
+            "runner-owned StageAck response dropped after staging",
+        ));
+    }
+    Ok(encode_query_stage_response(&response))
+}
+
+pub(crate) fn handle_start_prepared_query(
+    ingress: &dyn QueryLifecycleIngress,
+    request: novarocks::StartPreparedQueryRequest,
+) -> Result<novarocks::StartPreparedQueryResponse, tonic::Status> {
+    let request = decode_query_start_request(&request).map_err(status_from_lifecycle_error)?;
+    let execution_id = request.execution_id();
+    let response = ingress.start_prepared_query(request);
+    if response.outcome().is_running()
+        && let Some(scope) =
+            claim_backend_fault(QueryLifecycleFaultKind::StartAckDrop, execution_id)?
+    {
+        eprintln!(
+            "NOVAROCKS_START_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            scope.backend_index,
+            scope.token
+        );
+        return Err(tonic::Status::deadline_exceeded(
+            "runner-owned StartAck response dropped after release",
+        ));
+    }
+    if response.outcome().is_running()
+        && let Some(scope) =
+            observe_backend_fault(QueryLifecycleFaultKind::StartAckSuppress, execution_id)?
+    {
+        eprintln!(
+            "NOVAROCKS_START_ACK_SUPPRESSED execution_id={}:{}:{} backend_index={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            scope.backend_index,
+            scope.token
+        );
+        return Err(tonic::Status::deadline_exceeded(
+            "runner-owned StartAck response suppressed after release",
+        ));
+    }
+    Ok(encode_query_start_response(&response))
+}
+
 pub(crate) async fn handle_query_control_stream(
     ingress: Arc<dyn QueryLifecycleIngress>,
     mut inbound: tonic::Streaming<novarocks::QueryControlRequest>,
@@ -120,10 +201,8 @@ pub(crate) async fn handle_query_control_stream(
         ));
     }
     let attach = decode_query_control_attach(&first).map_err(status_from_lifecycle_error)?;
-    let heartbeat_stop = claim_backend_fault(
-        QueryLifecycleFaultKind::HeartbeatStop,
-        attach.execution_id(),
-    )?;
+    let execution_id = attach.execution_id();
+    let heartbeat_stop = claim_backend_fault(QueryLifecycleFaultKind::HeartbeatStop, execution_id)?;
     let attachment = ingress
         .attach_control(attach)
         .map_err(status_from_lifecycle_error)?;
@@ -136,6 +215,7 @@ pub(crate) async fn handle_query_control_stream(
         outbound_tx,
         shutdown,
         heartbeat_stop,
+        execution_id,
     ));
     Ok(ReceiverStream::new(outbound_rx))
 }
@@ -147,6 +227,7 @@ async fn run_attached_control_stream(
     outbound: tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
+    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
 ) {
     let first_event = tokio::select! {
         biased;
@@ -263,7 +344,11 @@ async fn run_attached_control_stream(
                 };
                 let result = match command {
                     QueryControlCommand::Heartbeat { sequence, .. } => {
-                        if let Some(scope) = heartbeat_stop.as_ref() {
+                        if let Some(scope) = heartbeat_stop
+                            .as_ref()
+                            .cloned()
+                            .or_else(|| staged_heartbeat_stop(execution_id))
+                        {
                             if !heartbeat_stop_logged {
                                 eprintln!(
                                     "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
@@ -331,7 +416,50 @@ async fn run_attached_control_stream(
 
 #[cfg(debug_assertions)]
 use crate::common::query_lifecycle_fault::claim_matching_fault;
+#[cfg(debug_assertions)]
+use crate::common::query_lifecycle_fault::observe_matching_fault;
 use crate::common::query_lifecycle_fault::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
+
+#[cfg(debug_assertions)]
+fn staged_heartbeat_stops() -> &'static Mutex<
+    BTreeMap<crate::query_execution::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
+> {
+    static STOPS: OnceLock<
+        Mutex<
+            BTreeMap<crate::query_execution::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
+        >,
+    > = OnceLock::new();
+    STOPS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(debug_assertions)]
+fn register_staged_heartbeat_stop(scope: QueryLifecycleFaultScope) {
+    let mut stops = staged_heartbeat_stops()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    stops.insert(scope.execution_id, scope);
+}
+
+#[cfg(not(debug_assertions))]
+fn register_staged_heartbeat_stop(_scope: QueryLifecycleFaultScope) {}
+
+#[cfg(debug_assertions)]
+fn staged_heartbeat_stop(
+    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+) -> Option<QueryLifecycleFaultScope> {
+    staged_heartbeat_stops()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&execution_id)
+        .cloned()
+}
+
+#[cfg(not(debug_assertions))]
+fn staged_heartbeat_stop(
+    _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+) -> Option<QueryLifecycleFaultScope> {
+    None
+}
 
 #[cfg(debug_assertions)]
 fn claim_backend_fault(
@@ -363,8 +491,46 @@ fn claim_backend_fault(
     .map_err(tonic::Status::failed_precondition)
 }
 
+#[cfg(debug_assertions)]
+fn observe_backend_fault(
+    kind: QueryLifecycleFaultKind,
+    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
+    let Some(root) = crate::common::config::sql_test_query_lifecycle_fault_dir() else {
+        return Ok(None);
+    };
+    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
+        .map_err(|_| tonic::Status::failed_precondition("lifecycle fault backend index is unset"))?
+        .parse::<usize>()
+        .map_err(|error| {
+            tonic::Status::failed_precondition(format!(
+                "invalid lifecycle fault backend index: {error}"
+            ))
+        })?;
+    let backend_id = crate::runtime::backend_id::backend_id()
+        .and_then(|id| u64::try_from(id).ok())
+        .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
+    observe_matching_fault(
+        &root,
+        kind,
+        execution_id,
+        backend_index,
+        backend_id,
+        crate::runtime::start_epoch::start_epoch(),
+    )
+    .map_err(tonic::Status::failed_precondition)
+}
+
 #[cfg(not(debug_assertions))]
 fn claim_backend_fault(
+    _kind: QueryLifecycleFaultKind,
+    _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
+    Ok(None)
+}
+
+#[cfg(not(debug_assertions))]
+fn observe_backend_fault(
     _kind: QueryLifecycleFaultKind,
     _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {

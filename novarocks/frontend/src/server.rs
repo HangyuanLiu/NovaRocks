@@ -569,20 +569,6 @@ mod tests {
     impl novarocks::service::native_fragment_ingress::NativeFragmentIngress
         for RejectingNativeFragmentIngress
     {
-        fn submit(
-            &self,
-            _request: novarocks::service::native_fragment_ingress::NativeFragmentRequest,
-        ) -> Result<
-            novarocks::service::native_fragment_ingress::NativeFragmentAccepted,
-            novarocks::service::native_fragment_ingress::NativeFragmentIngressError,
-        > {
-            Err(
-                novarocks::service::native_fragment_ingress::NativeFragmentIngressError::new(
-                    "test native fragment ingress rejects submissions",
-                ),
-            )
-        }
-
         fn cancel(
             &self,
             _request: novarocks::service::native_fragment_ingress::NativeFragmentCancelRequest,
@@ -756,10 +742,7 @@ mod tests {
             Ok(_) => panic!("contract fixture must reach backend ingress over loopback gRPC"),
             Err(error) => error,
         };
-        assert!(
-            error.message().contains("remote submit_fragment failed"),
-            "{error}"
-        );
+        assert!(error.message().contains("StageFragments"), "{error}");
 
         drop(engine);
         novarocks::service::grpc_server::stop_grpc_server()

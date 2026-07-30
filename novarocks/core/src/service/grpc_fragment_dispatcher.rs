@@ -41,11 +41,11 @@ use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
     CancelFragmentRequest, EnsureConnectorExecutionBindingRequest, FetchResultRequest,
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
-    SubmitFragmentRequest, fetch_result_response::Status as FetchStatus,
+    fetch_result_response::Status as FetchStatus,
 };
 use crate::query_execution::contract::QueryId;
 use crate::query_execution::fragment_transport::{
-    FetchOutcome, FetchedQueryBatch, FragmentDispatcher, NativeFragmentEnvelope,
+    FetchOutcome, FetchedQueryBatch, FragmentDispatcher,
 };
 use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
@@ -55,7 +55,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tracing::warn;
 
-static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// gRPC adapter for the connector instance control plane. Declarations are
@@ -269,53 +268,6 @@ impl RemoteDispatcher {
 }
 
 impl FragmentDispatcher for RemoteDispatcher {
-    fn submit_fragment(
-        &self,
-        backend_idx: usize,
-        submission: NativeFragmentEnvelope,
-    ) -> Result<(), String> {
-        let (client, addr) = self.client_and_addr(backend_idx)?;
-        // Counter increments only after a successful check_idx, so only valid-index
-        // calls are counted — matches the fault-injection test assumptions.
-        let call_index = REMOTE_SUBMIT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
-        if crate::common::config::debug_fault_inject_submit_fail_after()
-            .is_some_and(|successes| call_index > successes)
-        {
-            println!("NOVAROCKS_SUBMIT_FAIL call={call_index}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            return Err(format!("debug submit fault injected on call {call_index}"));
-        }
-        let execution_id = submission.execution_id();
-        let (plan, instance_params) = submission.into_parts();
-        let request = SubmitFragmentRequest {
-            plan: Some(plan),
-            instance_params: Some(instance_params),
-            execution_id: Some(ProtoQueryExecutionId {
-                query_id: Some(ProtoUniqueId {
-                    hi: execution_id.query_id().high(),
-                    lo: execution_id.query_id().low(),
-                }),
-                attempt_id: execution_id.attempt_id().get(),
-            }),
-        };
-        #[cfg(test)]
-        let resp = if let Some(timeout) = self.rpc_timeout {
-            client.blocking_submit_fragment_with_timeout(request, timeout)
-        } else {
-            client.blocking_submit_fragment(request)
-        };
-        #[cfg(not(test))]
-        let resp = client.blocking_submit_fragment(request);
-        let resp = resp.map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
-        if resp.status_code != 0 {
-            return Err(format!(
-                "remote submit_fragment failed on {}: {}",
-                addr, resp.message
-            ));
-        }
-        Ok(())
-    }
-
     fn fetch_result(
         &self,
         backend_idx: usize,
@@ -471,7 +423,6 @@ mod tests {
 
     use crate::proto;
     use crate::query_execution::contract::QueryId;
-    use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
     use arrow::array::Int32Array;
     use proto::filter::{LookupRequest, LookupResponse};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
@@ -482,7 +433,6 @@ mod tests {
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
         HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
         RetireConnectorExecutionBindingRequest, RetireConnectorExecutionBindingResponse,
-        SubmitFragmentRequest, SubmitFragmentResponse,
     };
     use tonic::{Request, Response, Status, Streaming};
 
@@ -490,27 +440,10 @@ mod tests {
         UniqueId { hi, lo }
     }
 
-    fn make_submission(hi: i64, lo: i64) -> NativeFragmentEnvelope {
-        NativeFragmentEnvelope::new(
-            QueryExecutionId::new(
-                QueryId::new(hi, 99),
-                AttemptId::new(1).expect("nonzero attempt"),
-            )
-            .expect("valid execution id"),
-            crate::proto::plan::PlanFragment::default(),
-            crate::proto::novarocks::InstanceParams {
-                query_id: Some(ProtoUniqueId { hi, lo: 99 }),
-                fragment_instance_id: Some(ProtoUniqueId { hi, lo }),
-                ..Default::default()
-            },
-        )
-    }
-
     #[derive(Clone)]
     struct MockGrpc(Arc<MockState>);
 
     struct MockState {
-        submit_code: AtomicI32,
         fetch_status: AtomicI32,
         fetch_eos: AtomicBool,
         fetch_arrow: Mutex<Vec<u8>>,
@@ -524,7 +457,6 @@ mod tests {
     impl Default for MockState {
         fn default() -> Self {
             Self {
-                submit_code: AtomicI32::new(0),
                 fetch_status: AtomicI32::new(FetchStatus::Eof as i32),
                 fetch_eos: AtomicBool::new(false),
                 fetch_arrow: Mutex::new(Vec::new()),
@@ -579,16 +511,6 @@ mod tests {
             Err(Status::unimplemented("mock"))
         }
 
-        async fn submit_fragment(
-            &self,
-            _request: Request<SubmitFragmentRequest>,
-        ) -> Result<Response<SubmitFragmentResponse>, Status> {
-            Ok(Response::new(SubmitFragmentResponse {
-                status_code: self.0.submit_code.load(Ordering::SeqCst),
-                message: "submit failed".to_string(),
-            }))
-        }
-
         async fn fetch_result(
             &self,
             _request: Request<FetchResultRequest>,
@@ -622,6 +544,20 @@ mod tests {
             &self,
             _request: Request<proto::novarocks::InitQueryRequest>,
         ) -> Result<Response<proto::novarocks::InitQueryResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn stage_fragments(
+            &self,
+            _request: Request<proto::novarocks::StageFragmentsRequest>,
+        ) -> Result<Response<proto::novarocks::StageFragmentsResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn start_prepared_query(
+            &self,
+            _request: Request<proto::novarocks::StartPreparedQueryRequest>,
+        ) -> Result<Response<proto::novarocks::StartPreparedQueryResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
@@ -734,21 +670,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         addr
-    }
-
-    #[test]
-    fn remote_dispatcher_submit_nonzero_status_returns_err() {
-        let state = Arc::new(MockState::default());
-        state.submit_code.store(1, Ordering::SeqCst);
-        let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
-        let submission = make_submission(1, 2);
-
-        let err = dispatcher
-            .submit_fragment(0, submission)
-            .expect_err("nonzero submit status should error");
-
-        assert!(err.contains("submit failed"));
     }
 
     #[test]
@@ -919,15 +840,5 @@ mod tests {
         assert_eq!(d.backend_count(), 1);
         assert_eq!(d.addr_of(2), Some(a));
         assert_eq!(d.addr_of(0), None);
-    }
-
-    #[test]
-    fn remote_dispatcher_returns_err_on_out_of_range_idx() {
-        let a = spawn_mock_server(Arc::new(MockState::default()));
-        let d = RemoteDispatcher::new(&[a]).expect("construct");
-        let err = d
-            .submit_fragment(5, make_submission(1, 2))
-            .expect_err("oob idx");
-        assert!(err.contains("backend_idx") && err.contains('5'));
     }
 }

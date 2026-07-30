@@ -210,29 +210,6 @@ impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionRe
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeFragmentAccepted {
-    query_id: QueryId,
-    fragment_instance_id: UniqueId,
-}
-
-impl NativeFragmentAccepted {
-    pub const fn new(query_id: QueryId, fragment_instance_id: UniqueId) -> Self {
-        Self {
-            query_id,
-            fragment_instance_id,
-        }
-    }
-
-    pub const fn query_id(self) -> QueryId {
-        self.query_id
-    }
-
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeFragmentCancelRequest {
     query_id: QueryId,
@@ -311,22 +288,6 @@ pub trait NativeFragmentIngress: Send + Sync + 'static {
             "connector binding ingress is not configured",
         ))
     }
-
-    fn submit_native_payload(
-        &self,
-        _execution_id: proto::novarocks::QueryExecutionId,
-        _fragment: proto::plan::PlanFragment,
-        _instance_params: proto::novarocks::InstanceParams,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-        Err(NativeFragmentIngressError::new(
-            "native fragment payload ingress is not configured",
-        ))
-    }
-
-    fn submit(
-        &self,
-        request: NativeFragmentRequest,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError>;
 
     fn cancel(
         &self,

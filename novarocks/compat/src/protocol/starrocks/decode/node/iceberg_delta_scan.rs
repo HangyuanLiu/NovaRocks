@@ -34,12 +34,12 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
+use novarocks::connector::iceberg::build_compat_delta_read_splits;
 use novarocks::connector::iceberg::delta::{
     BaseDataFileLineage, DeletedFileVisibility, DeltaDataColumn, DeltaScanDeleteSide,
     DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
     PositionDeleteSourceData,
 };
-use novarocks::connector::iceberg::build_compat_delta_read_splits;
 use novarocks::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks::exec::node::scan::BoundScanRanges;

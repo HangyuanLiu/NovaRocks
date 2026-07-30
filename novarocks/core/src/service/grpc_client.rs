@@ -175,6 +175,64 @@ impl NovaRocksGrpcRemoteClient {
             .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
     }
 
+    pub(crate) async fn stage_fragments_async(
+        &self,
+        request: proto::novarocks::StageFragmentsRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::StageFragmentsResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("stage_fragments", deadline_at)
+            .await
+            .map_err(QueryLifecycleRpcError::PreSubmission)?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::PreSubmission(
+                "stage_fragments deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.stage_fragments(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(
+                    "stage_fragments deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
+    }
+
+    pub(crate) async fn start_prepared_query_async(
+        &self,
+        request: proto::novarocks::StartPreparedQueryRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::StartPreparedQueryResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("start_prepared_query", deadline_at)
+            .await
+            .map_err(QueryLifecycleRpcError::PreSubmission)?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::PreSubmission(
+                "start_prepared_query deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.start_prepared_query(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(
+                    "start_prepared_query deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
+    }
+
     pub(crate) async fn abort_query_async(
         &self,
         request: proto::novarocks::AbortQueryRequest,
@@ -235,19 +293,6 @@ impl NovaRocksGrpcRemoteClient {
         .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
     }
 
-    pub fn blocking_submit_fragment(
-        &self,
-        req: proto::novarocks::SubmitFragmentRequest,
-    ) -> Result<proto::novarocks::SubmitFragmentResponse, String> {
-        let mut cli = self.make_client()?;
-        data_block_on(async move {
-            cli.submit_fragment(req)
-                .await
-                .map(|r| r.into_inner())
-                .map_err(|e| format!("submit_fragment rpc failed: {e}"))
-        })?
-    }
-
     pub fn blocking_ensure_connector_execution_binding(
         &self,
         req: proto::novarocks::EnsureConnectorExecutionBindingRequest,
@@ -271,27 +316,6 @@ impl NovaRocksGrpcRemoteClient {
                 .await
                 .map(|response| response.into_inner())
                 .map_err(|error| format!("retire_connector_execution_binding rpc failed: {error}"))
-        })?
-    }
-
-    #[cfg(test)]
-    pub(crate) fn blocking_submit_fragment_with_timeout(
-        &self,
-        req: proto::novarocks::SubmitFragmentRequest,
-        timeout: Duration,
-    ) -> Result<proto::novarocks::SubmitFragmentResponse, String> {
-        data_block_on(async {
-            let deadline_at = tokio::time::Instant::now() + timeout;
-            let mut client = self
-                .make_deadline_async_client("submit_fragment", deadline_at)
-                .await?;
-            let mut request = Request::new(req);
-            request.set_timeout(timeout);
-            tokio::time::timeout_at(deadline_at, client.submit_fragment(request))
-                .await
-                .map_err(|_| "submit_fragment deadline exceeded".to_string())?
-                .map(|response| response.into_inner())
-                .map_err(|error| format!("submit_fragment rpc failed: {error}"))
         })?
     }
 
@@ -825,16 +849,6 @@ mod pr3_tests {
             .expect("loopback report RPC");
         assert_eq!(report_response.status_code, 0, "{report_response:?}");
         assert_eq!(report_calls.load(Ordering::SeqCst), 1);
-
-        let submit_response = client
-            .blocking_submit_fragment(proto::novarocks::SubmitFragmentRequest::default())
-            .expect("loopback fragment RPC");
-        assert_ne!(submit_response.status_code, 0);
-        assert!(
-            submit_response
-                .message
-                .contains("requires native plan and instance_params")
-        );
     }
 
     #[test]

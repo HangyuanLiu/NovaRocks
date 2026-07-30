@@ -32,6 +32,7 @@ iceberg-dml
 iceberg-ivm
 iceberg-mv-apply
 iceberg-rest
+distributed-resilience
 
 # The suites below are not part of default daily mode yet.
 # materialized-view

@@ -18,11 +18,16 @@
 use std::collections::BTreeSet;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use novarocks::common::app_config;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::novarocks_logging::{error, info, warn};
+#[cfg(test)]
+use novarocks::novarocks_logging::warn;
+use novarocks::novarocks_logging::{error, info};
+use novarocks::query_execution::lifecycle::StageFragment;
 use novarocks::query_execution::native_fragment_report;
 use novarocks::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
@@ -33,17 +38,21 @@ use novarocks::runtime::fragment::{
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::profile::Profiler;
 use novarocks::service::native_fragment_ingress::{
-    NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
-    NativeFragmentIngressError, NativeFragmentRequest,
+    NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
+    NativeFragmentRequest,
 };
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
 };
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
+#[cfg(test)]
 use super::failure_injection::start_with_configured_fragment_failure_trigger;
+use super::failure_injection::{
+    FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
+};
 use crate::ConnectorExecutionHost;
-use crate::query_lifecycle::QueryLifecycleRegistry;
+use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NativeFragmentLifecycleEvent {
@@ -55,6 +64,33 @@ pub(super) enum NativeFragmentLifecycleEvent {
 }
 
 type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>;
+
+#[cfg(debug_assertions)]
+fn runner_stage_prepare_failure(
+    available_fragments: usize,
+) -> Result<
+    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
+    NativeFragmentIngressError,
+> {
+    let Some(root) = app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(None);
+    };
+    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(root, available_fragments)
+        .map_err(NativeFragmentIngressError::new)
+}
+
+#[cfg(not(debug_assertions))]
+fn runner_stage_prepare_failure(
+    _available_fragments: usize,
+) -> Result<
+    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
+    NativeFragmentIngressError,
+> {
+    Ok(None)
+}
 
 pub struct NativeFragmentService {
     pub(super) controls: Arc<FragmentControlRegistry>,
@@ -180,54 +216,194 @@ impl NativeFragmentService {
             observer(event);
         }
     }
-}
 
-impl NativeFragmentIngress for NativeFragmentService {
-    fn ensure_connector_execution_binding(
+    /// Materializes a complete fragment bundle without starting its drivers.
+    /// Every spawned worker waits on the query-owned gate; gate abort is a
+    /// pure cleanup path and never calls `DormantFragmentHandle::start`.
+    pub(crate) fn stage_fragments(
         &self,
         execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
-        declaration: ConnectorExecutionDeclaration,
-        context: ConnectorRequestContext,
+        fragments: &[StageFragment],
+        gate: Arc<StartGate>,
     ) -> Result<(), NativeFragmentIngressError> {
-        self.execution_host
-            .ensure(execution_id, &declaration, &context)
-            .map_err(NativeFragmentIngressError::new)
-    }
-
-    fn retire_connector_execution_binding(
-        &self,
-        key: ConnectorExecutionBindingKey,
-    ) -> Result<(), NativeFragmentIngressError> {
-        self.execution_host
-            .retire(&key)
-            .map_err(NativeFragmentIngressError::new)
-    }
-
-    fn submit_native_payload(
-        &self,
-        execution_id: novarocks::proto::novarocks::QueryExecutionId,
-        fragment: novarocks::proto::plan::PlanFragment,
-        instance_params: novarocks::proto::novarocks::InstanceParams,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-        let execution_key =
-            novarocks::service::native_fragment_ingress::decode_native_query_execution_id(
-                &execution_id,
-            )?;
-        self.submit(
-            NativeFragmentRequest::try_decode_wire_with_execution_resolver(
+        let injected_failure = runner_stage_prepare_failure(fragments.len())?;
+        for (index, fragment) in fragments.iter().enumerate() {
+            if injected_failure
+                .as_ref()
+                .is_some_and(|failure| failure.ordinal == index.saturating_add(1))
+            {
+                let failure = injected_failure.expect("checked injected Stage failure");
+                eprintln!(
+                    "NOVAROCKS_STAGE_PREPARE_FAILED execution_id={}:{}:{} ordinal={} token={}",
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    failure.ordinal,
+                    failure.token
+                );
+                return Err(NativeFragmentIngressError::new(format!(
+                    "runner-owned Stage prepare failure at ordinal {}",
+                    failure.ordinal
+                )));
+            }
+            let request = NativeFragmentRequest::try_decode_with_execution_resolver(
                 execution_id,
-                fragment,
-                instance_params,
+                fragment.plan().clone(),
+                fragment.instance_params().clone(),
                 Arc::clone(&self.connector_registry),
-                Arc::new(self.execution_host.resolver_for(execution_key)),
-            )?,
-        )
+                Arc::new(self.execution_host.resolver_for(execution_id)),
+            )?;
+            self.stage_one(request, Arc::clone(&gate))?;
+        }
+        Ok(())
     }
 
-    fn submit(
+    fn stage_one(
         &self,
         request: NativeFragmentRequest,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+        gate: Arc<StartGate>,
+    ) -> Result<(), NativeFragmentIngressError> {
+        let query_id = request.query_id();
+        let execution_id = request.execution_id();
+        let fragment_instance_id = request.fragment_instance_id();
+        let lifecycle_permit = self
+            .lifecycle
+            .admit_fragment(execution_id, fragment_instance_id)
+            .map_err(NativeFragmentIngressError::new)?;
+        let backend_num = request.backend_num();
+        let report_endpoint = request.report_endpoint().cloned();
+        let enable_profile = request.enable_profile();
+        let report_interval_ns = profile_report_interval_ns(
+            enable_profile,
+            request.runtime_profile_report_interval_seconds(),
+        );
+        let (delivery_expire, query_expire) = request.query_expire_durations();
+        let cache_options = request.cache_options()?;
+        let profiler =
+            enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
+        let admission = self
+            .queries
+            .prepare_admission(
+                query_id,
+                fragment_instance_id,
+                delivery_expire,
+                query_expire,
+                cache_options,
+                request.has_runtime_filter_bindings(),
+            )
+            .map_err(NativeFragmentIngressError::new)?;
+        let query_mem_tracker = admission.query_mem_tracker();
+        let fragment_mem_tracker = admission.fragment_mem_tracker();
+        let failure_injection_eligible = !request.uses_result_sink();
+        let dormant = prepare_fragment(
+            request.into_submission(),
+            admission.into_prepare_context(
+                profiler.clone(),
+                Arc::clone(&self.exchange_transmitter),
+                Arc::clone(&self.lookup_client),
+                Arc::clone(&self.result_writer),
+                Arc::clone(&self.event_sink),
+            ),
+        )
+        .map_err(NativeFragmentIngressError::new)?;
+        self.observe(NativeFragmentLifecycleEvent::Prepared);
+        let reservation = self
+            .controls
+            .reserve(fragment_instance_id)
+            .map_err(NativeFragmentIngressError::new)?;
+        let registration = self
+            .queries
+            .register_fragment(
+                query_id,
+                fragment_instance_id,
+                delivery_expire,
+                query_expire,
+            )
+            .map_err(NativeFragmentIngressError::new)?;
+        let pending_control =
+            Arc::new(PendingFragmentControl::new(self.lifecycle_observer.clone()));
+        let control_handle: Arc<dyn FragmentControlHandle> = pending_control.clone();
+        let token = reservation.publish(control_handle);
+        let queries = self.queries.clone();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let observer = self.lifecycle_observer.clone();
+        std::thread::Builder::new()
+            .name(format!(
+                "native-fragment-{:x}-{:x}",
+                fragment_instance_id.hi, fragment_instance_id.lo
+            ))
+            .spawn(move || {
+                if gate.wait() != crate::query_lifecycle::stage::StartGateState::Released {
+                    queries.unregister_fragment(fragment_instance_id);
+                    token.complete();
+                    return;
+                }
+                // The pre-start lease keeps the query route rollback-capable
+                // while this worker is dormant. Only the Start gate winner may
+                // make it live and install the report registration.
+                registration.into_running();
+                if let Some(report_endpoint) = report_endpoint {
+                    native_fragment_report::register(
+                        novarocks::runtime::fragment::io::FragmentReportRegistration::new(
+                            fragment_instance_id,
+                            query_id,
+                            backend_num,
+                            enable_profile,
+                            profiler,
+                            Some(fragment_mem_tracker),
+                            Some(query_mem_tracker),
+                            report_interval_ns,
+                        ),
+                        report_endpoint,
+                    );
+                }
+                let staged_failure = claim_configured_fragment_failure_trigger(
+                    failure_injection_eligible,
+                );
+                let (running, staged_failure_token) = match staged_failure {
+                    Ok(Some(release)) => match release.wait() {
+                        Ok(token) => (
+                            dormant.start_failed(FRAGMENT_EXECUTOR_FAILURE_MESSAGE),
+                            Some(token),
+                        ),
+                        Err(error) => (dormant.start_failed(error), None),
+                    },
+                    Ok(None) => (dormant.start(), None),
+                    Err(error) => (dormant.start_failed(error), None),
+                };
+                pending_control.attach(running.clone());
+                if let Some(observer) = observer.as_ref() {
+                    observer(NativeFragmentLifecycleEvent::Started);
+                }
+                if let Some(token) = staged_failure_token {
+                    eprintln!(
+                        "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token={} query_hi={} query_lo={} finst_hi={} finst_lo={}",
+                        token,
+                        query_id.hi(),
+                        query_id.lo(),
+                        fragment_instance_id.hi,
+                        fragment_instance_id.lo
+                    );
+                }
+                consume_terminal_fact(running, token, queries, lifecycle, execution_id);
+            })
+            .map_err(|error| {
+                NativeFragmentIngressError::new(format!(
+                    "spawn staged native fragment worker failed: {error}"
+                ))
+            })?;
+        self.observe(NativeFragmentLifecycleEvent::Registered);
+        lifecycle_permit
+            .commit()
+            .map_err(NativeFragmentIngressError::new)?;
+        self.observe(NativeFragmentLifecycleEvent::Accepted);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl NativeFragmentService {
+    fn submit(&self, request: NativeFragmentRequest) -> Result<(), NativeFragmentIngressError> {
         let query_id = request.query_id();
         let execution_id = request.execution_id();
         let fragment_instance_id = request.fragment_instance_id();
@@ -399,7 +575,29 @@ impl NativeFragmentIngress for NativeFragmentService {
                 "native fragment adapter worker terminated before start",
             )
         })?;
-        Ok(NativeFragmentAccepted::new(query_id, fragment_instance_id))
+        Ok(())
+    }
+}
+
+impl NativeFragmentIngress for NativeFragmentService {
+    fn ensure_connector_execution_binding(
+        &self,
+        execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+        declaration: ConnectorExecutionDeclaration,
+        context: ConnectorRequestContext,
+    ) -> Result<(), NativeFragmentIngressError> {
+        self.execution_host
+            .ensure(execution_id, &declaration, &context)
+            .map_err(NativeFragmentIngressError::new)
+    }
+
+    fn retire_connector_execution_binding(
+        &self,
+        key: ConnectorExecutionBindingKey,
+    ) -> Result<(), NativeFragmentIngressError> {
+        self.execution_host
+            .retire(&key)
+            .map_err(NativeFragmentIngressError::new)
     }
 
     fn cancel(
@@ -493,7 +691,6 @@ fn consume_terminal_fact(
     let fact = running.join();
     let query_id = fact.query_id();
     let fragment_instance_id = fact.fragment_instance_id();
-    lifecycle.record_fragment_terminal(execution_id, fragment_instance_id, fact.outcome());
     let report_error = match fact.outcome() {
         FragmentOutcome::Succeeded => {
             if let Some(profile) = fact.profile() {
@@ -528,6 +725,10 @@ fn consume_terminal_fact(
     );
     queries.unregister_fragment(fragment_instance_id);
     queries.cleanup_after_fragment_report(query_id, report_decision);
+    // Publish the terminal report before this fact can fail-close the local
+    // lifecycle. Otherwise a sibling cancelled by the first terminal fact may
+    // win the report slot and hide the fragment that actually failed.
+    lifecycle.record_fragment_terminal(execution_id, fragment_instance_id, fact.outcome());
     token.complete();
 }
 
@@ -558,11 +759,13 @@ fn profile_report_interval_ns(
 
 #[cfg(test)]
 fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryLifecycleRegistry> {
-    let execution_host = Arc::new(ConnectorExecutionHost::new());
     let registry = QueryLifecycleRegistry::new_unbound(
         1,
         Arc::new(
-            crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(controls, execution_host),
+            crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
+                controls,
+                Arc::new(ConnectorExecutionHost::new()),
+            ),
         ),
         crate::query_lifecycle::QueryLifecycleRegistryConfig::from_runtime_config(
             &novarocks::common::app_config::RuntimeConfig::default(),

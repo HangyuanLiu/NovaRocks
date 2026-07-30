@@ -613,9 +613,7 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
     ) -> Result<Self> {
-        Self::spawn_impl(
-            label, command, marker, timeout, log_path, None, false, None,
-        )
+        Self::spawn_impl(label, command, marker, timeout, log_path, None, false, None)
     }
 
     #[cfg(test)]
@@ -661,8 +659,8 @@ impl ManagedProcess {
         one_shot_deadline: Option<Instant>,
     ) -> Result<Self> {
         let started = Instant::now();
-        let deadline = one_shot_deadline
-            .unwrap_or_else(|| started.checked_add(timeout).unwrap_or(started));
+        let deadline =
+            one_shot_deadline.unwrap_or_else(|| started.checked_add(timeout).unwrap_or(started));
         let one_shot = one_shot_deadline.is_some();
         let readiness_baseline = ReadinessBaseline::capture(&marker)?;
         let log_file: Box<dyn Write + Send> = match log_writer {
@@ -741,16 +739,14 @@ impl ManagedProcess {
             stderr_thread: Mutex::new(Some(stderr_thread)),
             stopped: false,
         };
-        if let Err(error) =
-            process.wait_for_ready(
-                &marker,
-                &readiness_baseline,
-                &ready_rx,
-                deadline,
-                timeout,
-                one_shot,
-            )
-        {
+        if let Err(error) = process.wait_for_ready(
+            &marker,
+            &readiness_baseline,
+            &ready_rx,
+            deadline,
+            timeout,
+            one_shot,
+        ) {
             let cleanup = process.kill_now();
             return match cleanup {
                 Ok(()) => Err(error),
@@ -1232,16 +1228,15 @@ impl ManagedProcess {
     ) -> Result<bool> {
         match marker {
             ReadyMarker::StdoutContains(needle) => Ok(self.stdout_tail().contains(needle)),
-            ReadyMarker::FileContains { path, needle } => {
-                match FileReadinessSnapshot::read(path) {
-                    Ok(Some(snapshot)) => {
-                        Ok(readiness_baseline.file_contains_fresh_marker(&snapshot, needle))
-                    }
-                    Ok(None) => Ok(false),
-                    Err(error) => Err(error)
-                        .with_context(|| format!("read readiness file {}", path.display())),
+            ReadyMarker::FileContains { path, needle } => match FileReadinessSnapshot::read(path) {
+                Ok(Some(snapshot)) => {
+                    Ok(readiness_baseline.file_contains_fresh_marker(&snapshot, needle))
                 }
-            }
+                Ok(None) => Ok(false),
+                Err(error) => {
+                    Err(error).with_context(|| format!("read readiness file {}", path.display()))
+                }
+            },
         }
     }
 
@@ -3116,7 +3111,9 @@ mod tests {
             .expect("parse one-shot pid");
         assert!(format!("{error:#}").contains("status"), "{error:#}");
         assert!(format!("{error:#}").contains('7'), "{error:#}");
-        assert!(wait_until(Duration::from_secs(1), || !pid_exists(child_pid)));
+        assert!(wait_until(Duration::from_secs(1), || !pid_exists(
+            child_pid
+        )));
     }
 
     #[test]
@@ -3142,7 +3139,9 @@ mod tests {
             .parse::<u32>()
             .expect("parse timed out one-shot pid");
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
-        assert!(wait_until(Duration::from_secs(1), || !pid_exists(child_pid)));
+        assert!(wait_until(Duration::from_secs(1), || !pid_exists(
+            child_pid
+        )));
     }
 
     #[test]
@@ -3198,7 +3197,9 @@ mod tests {
             )
             .expect_err("a natural exit observed after the absolute deadline must be rejected");
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
-        assert!(wait_until(Duration::from_secs(1), || !pid_exists(child_pid)));
+        assert!(wait_until(Duration::from_secs(1), || !pid_exists(
+            child_pid
+        )));
     }
 
     #[test]

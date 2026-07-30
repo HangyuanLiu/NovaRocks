@@ -26,7 +26,11 @@ use crate::query_execution::lifecycle::QueryExecutionId;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryLifecycleFaultKind {
     InitAckDrop,
+    StageAckDrop,
+    StartAckDrop,
+    StartAckSuppress,
     HeartbeatStop,
+    HeartbeatStopAfterStage,
     RestartAfterInitAck,
 }
 
@@ -34,7 +38,11 @@ impl QueryLifecycleFaultKind {
     pub const fn file_stem(self) -> &'static str {
         match self {
             Self::InitAckDrop => "init-ack-drop",
+            Self::StageAckDrop => "stage-ack-drop",
+            Self::StartAckDrop => "start-ack-drop",
+            Self::StartAckSuppress => "start-ack-suppress",
             Self::HeartbeatStop => "heartbeat-stop",
+            Self::HeartbeatStopAfterStage => "heartbeat-stop-after-stage",
             Self::RestartAfterInitAck => "restart-after-init-ack",
         }
     }
@@ -49,12 +57,49 @@ pub struct QueryLifecycleFaultScope {
     pub start_epoch: u64,
 }
 
+/// Runner-owned one-shot failure for a local Stage build. Unlike ACK faults,
+/// the runner does not preselect a backend: the first non-empty batch that
+/// contains the requested local ordinal claims it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagePrepareFailure {
+    pub token: String,
+    pub ordinal: usize,
+}
+
 pub fn arm_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind) -> PathBuf {
     root.join(format!("be-{backend_index}.{}.arm", kind.file_stem()))
 }
 
 pub fn trigger_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind) -> PathBuf {
     root.join(format!("be-{backend_index}.{}.trigger", kind.file_stem()))
+}
+
+pub fn claim_stage_prepare_failure(
+    root: &Path,
+    available_fragments: usize,
+) -> Result<Option<StagePrepareFailure>, String> {
+    let path = root.join("stage-prepare-fail.trigger");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let fields = parse_fields(&contents)?;
+    let failure = StagePrepareFailure {
+        token: required_token(&fields)?,
+        ordinal: required_usize(&fields, "ordinal")?,
+    };
+    if failure.ordinal == 0 {
+        return Err("stage prepare fault ordinal must be at least one".to_string());
+    }
+    if failure.ordinal > available_fragments {
+        return Ok(None);
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(Some(failure)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("consume {}: {error}", path.display())),
+    }
 }
 
 pub fn bind_armed_fault(
@@ -118,6 +163,37 @@ pub fn claim_matching_fault(
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("consume {}: {error}", trigger.display())),
+    }
+    Ok(Some(scope))
+}
+
+/// Reads a matching runner-owned fault without consuming it.
+///
+/// `StartAckSuppress` remains armed for the full execution attempt so both
+/// the first Start RPC and its one idempotent retry have an unknown outcome.
+/// That forces the frontend through the partial-start global Abort path. The
+/// SQL runner owns cleanup of the fault directory after the step.
+pub fn observe_matching_fault(
+    root: &Path,
+    kind: QueryLifecycleFaultKind,
+    execution_id: QueryExecutionId,
+    backend_index: usize,
+    backend_id: u64,
+    start_epoch: u64,
+) -> Result<Option<QueryLifecycleFaultScope>, String> {
+    let trigger = trigger_path(root, backend_index, kind);
+    let contents = match fs::read_to_string(&trigger) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", trigger.display())),
+    };
+    let scope = parse_scope(&contents)?;
+    if scope.execution_id != execution_id
+        || scope.backend_index != backend_index
+        || scope.backend_id != backend_id
+        || scope.start_epoch != start_epoch
+    {
+        return Ok(None);
     }
     Ok(Some(scope))
 }
@@ -291,6 +367,85 @@ mod tests {
             Some(expected)
         );
         assert!(!trigger_path(&root, 1, QueryLifecycleFaultKind::InitAckDrop).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn observed_fault_remains_armed_for_the_start_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-lifecycle-observe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create scope root");
+        let arm = arm_path(&root, 1, QueryLifecycleFaultKind::StartAckSuppress);
+        fs::write(&arm, "token=retry-ack\nbackend_index=1\n").expect("write arm");
+        let expected = bind_armed_fault(
+            &root,
+            QueryLifecycleFaultKind::StartAckSuppress,
+            execution_id(9),
+            1,
+            17,
+            23,
+        )
+        .expect("bind")
+        .expect("armed");
+
+        for _ in 0..2 {
+            assert_eq!(
+                observe_matching_fault(
+                    &root,
+                    QueryLifecycleFaultKind::StartAckSuppress,
+                    execution_id(9),
+                    1,
+                    17,
+                    23,
+                )
+                .expect("observe"),
+                Some(expected.clone())
+            );
+        }
+        assert!(trigger_path(&root, 1, QueryLifecycleFaultKind::StartAckSuppress).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_prepare_fault_waits_for_a_batch_with_the_requested_ordinal() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-stage-prepare-fault-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create scope root");
+        let trigger = root.join("stage-prepare-fail.trigger");
+        fs::write(&trigger, "token=stage-ordinal\nordinal=2\n").expect("write trigger");
+
+        assert!(
+            claim_stage_prepare_failure(&root, 0)
+                .expect("empty batch check")
+                .is_none()
+        );
+        assert!(trigger.exists());
+        assert!(
+            claim_stage_prepare_failure(&root, 1)
+                .expect("short batch check")
+                .is_none()
+        );
+        assert!(trigger.exists());
+        assert_eq!(
+            claim_stage_prepare_failure(&root, 2)
+                .expect("eligible batch check")
+                .expect("eligible batch claims fault")
+                .ordinal,
+            2
+        );
+        assert!(!trigger.exists());
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -27,14 +27,15 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::lifecycle::contract::{
     decode_abort_query_response, decode_query_control_event, decode_query_init_response,
-    encode_abort_query_request, encode_query_control_attach, encode_query_control_command,
-    encode_query_init_request,
+    decode_query_stage_response, decode_query_start_response, encode_abort_query_request,
+    encode_query_control_attach, encode_query_control_command, encode_query_init_request,
+    encode_query_stage_request, encode_query_start_request,
 };
 use crate::query_execution::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent,
     QueryControlSession, QueryInitAck, QueryInitRequest, QueryLifecycleTarget,
     QueryLifecycleTransport, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
-    QueryTerminationAck,
+    QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use crate::service::grpc_client::{NovaRocksGrpcRemoteClient, QueryLifecycleRpcError};
@@ -179,6 +180,62 @@ impl QueryLifecycleTransport for GrpcQueryLifecycleTransport {
             events: Mutex::new(event_rx),
             bridge: Mutex::new(Some(bridge)),
         }))
+    }
+
+    fn stage_fragments(
+        &self,
+        target: QueryLifecycleTarget,
+        request: &QueryStageRequest,
+        timeout: Duration,
+    ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+        let backend = self.backend(target)?;
+        let execution_id = request.execution_id();
+        let digest_version = request.digest_version();
+        let digest = request.digest();
+        let wire = encode_query_stage_request(request);
+        let response = data_block_on(backend.client.stage_fragments_async(wire, timeout))
+            .map_err(|error| unavailable("drive StageFragments", error))?
+            .map_err(|error| init_rpc_error("StageFragments", error))?;
+        let ack = decode_query_stage_response(&response)
+            .map_err(|error| invalid_response("decode StageFragments response", error))?;
+        if ack.execution_id() != execution_id
+            || ack.digest_version() != digest_version
+            || ack.digest() != digest
+        {
+            return Err(transport_error(
+                QueryLifecycleTransportErrorKind::InvalidResponse,
+                "StageFragments acknowledgement identity or digest mismatch",
+            ));
+        }
+        Ok(ack)
+    }
+
+    fn start_prepared_query(
+        &self,
+        target: QueryLifecycleTarget,
+        request: &QueryStartRequest,
+        timeout: Duration,
+    ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
+        let backend = self.backend(target)?;
+        let execution_id = request.execution_id();
+        let digest_version = request.digest_version();
+        let digest = request.digest();
+        let wire = encode_query_start_request(request);
+        let response = data_block_on(backend.client.start_prepared_query_async(wire, timeout))
+            .map_err(|error| unavailable("drive StartPreparedQuery", error))?
+            .map_err(|error| init_rpc_error("StartPreparedQuery", error))?;
+        let ack = decode_query_start_response(&response)
+            .map_err(|error| invalid_response("decode StartPreparedQuery response", error))?;
+        if ack.execution_id() != execution_id
+            || ack.digest_version() != digest_version
+            || ack.digest() != digest
+        {
+            return Err(transport_error(
+                QueryLifecycleTransportErrorKind::InvalidResponse,
+                "StartPreparedQuery acknowledgement identity or digest mismatch",
+            ));
+        }
+        Ok(ack)
     }
 
     fn abort_query(

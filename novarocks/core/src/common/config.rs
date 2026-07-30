@@ -31,12 +31,6 @@ pub fn debug_exec_batch_plan_json() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn debug_fault_inject_submit_fail_after() -> Option<usize> {
-    novarocks_app_config()
-        .ok()
-        .and_then(|c| c.debug.fault_inject_submit_fail_after())
-}
-
 pub(crate) fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
     novarocks_app_config()
         .ok()
@@ -131,6 +125,20 @@ pub(crate) fn query_control_attach_timeout_ms() -> u64 {
         .ok()
         .map(|config| config.runtime.query_control_attach_timeout_ms)
         .unwrap_or(5_000)
+}
+
+pub(crate) fn query_control_stage_rpc_timeout_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_stage_rpc_timeout_ms)
+        .unwrap_or(5_000)
+}
+
+pub(crate) fn query_control_start_rpc_timeout_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_start_rpc_timeout_ms)
+        .unwrap_or(2_000)
 }
 
 pub(crate) fn query_control_pre_start_timeout_ms() -> u64 {

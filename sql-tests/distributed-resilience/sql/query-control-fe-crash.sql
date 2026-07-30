@@ -38,7 +38,7 @@ INSERT INTO ${case_db}.fe_crash VALUES (2, 10);
 INSERT INTO ${case_db}.fe_crash VALUES (3, 10);
 
 -- query 5
--- @kill_fe_after_control_ready_count=2
+-- @kill_fe_at_lifecycle_phase=staged
 -- @expect_error=server disconnected
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST,3
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3

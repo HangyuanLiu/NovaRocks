@@ -33,12 +33,10 @@ use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, QueryId, ResolvedQueryOptions,
 };
-use crate::query_execution::fragment_transport::{
-    ExpectedOutputSchemaView, FetchedQueryBatch, NativeFragmentEnvelope,
-};
+use crate::query_execution::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 use crate::query_execution::lifecycle::{
     ExchangeRouteManifest, QueryExecutionId, QueryInitBarrier, QueryInitOptions,
-    QueryLifecycleLease,
+    QueryLaunchBarrier, QueryLifecycleLease, StageBatch, StageFragment, StageParticipantBinding,
 };
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
@@ -156,6 +154,10 @@ impl ScheduleBoundDistributedQuery {
             runtime_filters,
             &options,
         )?;
+        // Freeze every Stage target and exact fragment set from the same
+        // manifest that InitQuery consumes.  No later lifecycle phase may
+        // consult live topology again.
+        let stage_bindings = plan.stage_participant_bindings()?;
         let query_lifecycle_lease = barrier.initialize_all(plan)?;
         Ok(ControlReadyDistributedQuery {
             prepared: self.prepared,
@@ -163,18 +165,21 @@ impl ScheduleBoundDistributedQuery {
             schedule: self.schedule,
             options,
             query_lifecycle_lease,
+            stage_bindings,
         })
     }
 }
 
 /// Query lifecycle is ready, but connector instances still require their
-/// independent process-scoped install/ACK barrier.
+/// independent process-scoped install/ACK barrier before preparing native
+/// Stage batches.
 pub struct ControlReadyDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: ValidatedFragmentSchedule,
     options: QueryInitOptions,
     query_lifecycle_lease: QueryLifecycleLease,
+    stage_bindings: Vec<StageParticipantBinding>,
 }
 
 impl ControlReadyDistributedQuery {
@@ -203,11 +208,12 @@ impl ControlReadyDistributedQuery {
             options: self.options,
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease,
+            stage_bindings: self.stage_bindings,
         })
     }
 }
 
-/// The only typestate that can assemble native submissions.  In particular,
+/// The only typestate that can prepare native Stage batches. In particular,
 /// it is impossible to create a submission before every selected BE has ACKed
 /// the connector declarations it will resolve by instance id.
 pub struct ConnectorBindingReadyDistributedQuery {
@@ -217,10 +223,11 @@ pub struct ConnectorBindingReadyDistributedQuery {
     options: QueryInitOptions,
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
+    stage_bindings: Vec<StageParticipantBinding>,
 }
 
 impl ConnectorBindingReadyDistributedQuery {
-    pub fn assemble(self) -> Result<PreparedNativeExecution, DistributedQueryError> {
+    pub fn prepare_stage(self) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
         let context = match self.options.native_submission_context() {
             Ok(context) => context,
             Err(error) => {
@@ -240,14 +247,46 @@ impl ConnectorBindingReadyDistributedQuery {
             context,
         );
         match assembled {
-            Ok(assembled) => Ok(PreparedNativeExecution {
-                submissions: assembled.submissions,
-                root_fetch: assembled.root_fetch,
-                writer_registrations: assembled.writer_registrations,
-                expected_output: assembled.expected_output,
-                query_lifecycle_lease: self.query_lifecycle_lease,
-                connector_binding_lease: self.connector_binding_lease,
-            }),
+            Ok(assembled) => {
+                let mut fragments_by_backend = BTreeMap::<usize, Vec<StageFragment>>::new();
+                for submission in assembled.submissions {
+                    let (backend_idx, fragment) = submission.into_stage_fragment()?;
+                    fragments_by_backend
+                        .entry(backend_idx)
+                        .or_default()
+                        .push(fragment);
+                }
+                let mut batches = Vec::with_capacity(self.stage_bindings.len());
+                for binding in self.stage_bindings {
+                    let fragments = fragments_by_backend
+                        .remove(&binding.target().backend_idx())
+                        .unwrap_or_default();
+                    batches.push(
+                        StageBatch::new(self.schedule.execution_id, binding, fragments)
+                            .map_err(|error| contract_error(error.to_string()))?,
+                    );
+                }
+                if !fragments_by_backend.is_empty() {
+                    let error = contract_error(format!(
+                        "native stage assembly produced fragments for unknown participants: {:?}",
+                        fragments_by_backend.keys().collect::<Vec<_>>()
+                    ));
+                    let kind = error.kind();
+                    let message = self
+                        .query_lifecycle_lease
+                        .abort_preserving(error.message().to_string());
+                    let message = self.connector_binding_lease.abort_preserving(message);
+                    return Err(DistributedQueryError::new(kind, message));
+                }
+                Ok(StagePreparedDistributedQuery {
+                    batches,
+                    root_fetch: assembled.root_fetch,
+                    writer_registrations: assembled.writer_registrations,
+                    expected_output: assembled.expected_output,
+                    query_lifecycle_lease: self.query_lifecycle_lease,
+                    connector_binding_lease: self.connector_binding_lease,
+                })
+            }
             Err(error) => {
                 let kind = error.kind();
                 let message = self
@@ -860,7 +899,9 @@ impl NativeSubmissionContext {
 pub struct ValidatedNativeSubmission {
     backend_idx: usize,
     finst_id: UniqueId,
-    envelope: NativeFragmentEnvelope,
+    execution_id: QueryExecutionId,
+    plan: crate::proto::plan::PlanFragment,
+    instance_params: crate::proto::novarocks::InstanceParams,
 }
 
 impl ValidatedNativeSubmission {
@@ -873,11 +914,18 @@ impl ValidatedNativeSubmission {
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
-        self.envelope.execution_id()
+        self.execution_id
     }
 
-    pub fn into_envelope(self) -> NativeFragmentEnvelope {
-        self.envelope
+    fn into_stage_fragment(self) -> Result<(usize, StageFragment), DistributedQueryError> {
+        let fragment = StageFragment::new(self.plan, self.instance_params)
+            .map_err(|error| contract_error(error.to_string()))?;
+        if fragment.fragment_instance_id() != self.finst_id {
+            return Err(contract_error(
+                "native stage fragment instance identity differs from sealed submission",
+            ));
+        }
+        Ok((self.backend_idx, fragment))
     }
 }
 
@@ -984,8 +1032,8 @@ impl ExpectedOutputSchema {
     }
 }
 
-pub struct PreparedNativeExecution {
-    submissions: Vec<ValidatedNativeSubmission>,
+pub struct StagePreparedDistributedQuery {
+    batches: Vec<StageBatch>,
     root_fetch: RootFetchMetadata,
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
@@ -1000,10 +1048,118 @@ struct AssembledNativeExecution {
     expected_output: ExpectedOutputSchema,
 }
 
-impl PreparedNativeExecution {
-    pub fn into_parts(self) -> PreparedNativeExecutionParts {
-        PreparedNativeExecutionParts {
-            submissions: self.submissions,
+impl StagePreparedDistributedQuery {
+    pub fn batches(&self) -> &[StageBatch] {
+        &self.batches
+    }
+
+    pub fn execution_registration_view(&self) -> ExecutionRegistrationView {
+        ExecutionRegistrationView {
+            attempted_instances: self
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    batch.request().fragments().iter().map(move |fragment| {
+                        (
+                            batch.binding().target().backend_idx(),
+                            fragment.fragment_instance_id(),
+                        )
+                    })
+                })
+                .collect(),
+            writer_identities: self.writer_registrations.writer_identities(),
+        }
+    }
+
+    pub fn stage(
+        self,
+        barrier: &dyn QueryLaunchBarrier,
+    ) -> Result<StagedDistributedQuery, DistributedQueryError> {
+        if let Err(error) = barrier.stage_all(&self.batches) {
+            let kind = error.kind();
+            let message = self
+                .query_lifecycle_lease
+                .abort_preserving(error.message().to_string());
+            let message = self.connector_binding_lease.abort_preserving(message);
+            return Err(DistributedQueryError::new(kind, message));
+        }
+        Ok(StagedDistributedQuery {
+            batches: self.batches,
+            root_fetch: self.root_fetch,
+            writer_registrations: self.writer_registrations,
+            expected_output: self.expected_output,
+            query_lifecycle_lease: self.query_lifecycle_lease,
+            connector_binding_lease: self.connector_binding_lease,
+        })
+    }
+}
+
+/// Read-only pre-Start registration data.  It is intentionally separate from
+/// result/fetch ownership, which remains unavailable until Running.
+pub struct ExecutionRegistrationView {
+    attempted_instances: Vec<(usize, UniqueId)>,
+    writer_identities: Vec<(UniqueId, i32)>,
+}
+
+impl ExecutionRegistrationView {
+    pub fn attempted_instances(&self) -> &[(usize, UniqueId)] {
+        &self.attempted_instances
+    }
+
+    pub fn writer_identities(&self) -> &[(UniqueId, i32)] {
+        &self.writer_identities
+    }
+}
+
+pub struct StagedDistributedQuery {
+    batches: Vec<StageBatch>,
+    root_fetch: RootFetchMetadata,
+    writer_registrations: WriterRegistrationSet,
+    expected_output: ExpectedOutputSchema,
+    query_lifecycle_lease: QueryLifecycleLease,
+    connector_binding_lease: ConnectorBindingInstallLease,
+}
+
+impl StagedDistributedQuery {
+    pub fn batches(&self) -> &[StageBatch] {
+        &self.batches
+    }
+
+    pub fn start(
+        self,
+        barrier: &dyn QueryLaunchBarrier,
+    ) -> Result<RunningDistributedQuery, DistributedQueryError> {
+        if let Err(error) = barrier.start_all(&self.batches) {
+            let kind = error.kind();
+            let message = self
+                .query_lifecycle_lease
+                .abort_preserving(error.message().to_string());
+            let message = self.connector_binding_lease.abort_preserving(message);
+            return Err(DistributedQueryError::new(kind, message));
+        }
+        Ok(RunningDistributedQuery {
+            root_fetch: self.root_fetch,
+            writer_registrations: self.writer_registrations,
+            expected_output: self.expected_output,
+            query_lifecycle_lease: self.query_lifecycle_lease,
+            connector_binding_lease: self.connector_binding_lease,
+        })
+    }
+}
+
+/// Running-only execution ownership. No public constructor or inverse
+/// recombination API exists.
+pub struct RunningDistributedQuery {
+    root_fetch: RootFetchMetadata,
+    writer_registrations: WriterRegistrationSet,
+    expected_output: ExpectedOutputSchema,
+    query_lifecycle_lease: QueryLifecycleLease,
+    connector_binding_lease: ConnectorBindingInstallLease,
+}
+
+impl RunningDistributedQuery {
+    pub fn into_parts(self) -> RunningNativeExecutionParts {
+        RunningNativeExecutionParts {
             root_fetch: self.root_fetch,
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
@@ -1013,10 +1169,7 @@ impl PreparedNativeExecution {
     }
 }
 
-/// Consuming assembly output. No public constructor or inverse recombination
-/// API exists.
-pub struct PreparedNativeExecutionParts {
-    pub submissions: Vec<ValidatedNativeSubmission>,
+pub struct RunningNativeExecutionParts {
     pub root_fetch: RootFetchMetadata,
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
@@ -1235,11 +1388,9 @@ fn assemble_native_execution(
                 Ok(ValidatedNativeSubmission {
                     backend_idx: placement.backend_idx,
                     finst_id: placement.finst_id,
-                    envelope: NativeFragmentEnvelope::new(
-                        execution_id,
-                        native_fragment,
-                        instance_params,
-                    ),
+                    execution_id,
+                    plan: native_fragment,
+                    instance_params,
                 })
             })
             .collect::<Result<Vec<_>, DistributedQueryError>>()?;

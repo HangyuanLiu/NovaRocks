@@ -769,6 +769,10 @@ pub struct RuntimeConfig {
     pub query_control_init_rpc_timeout_ms: u64,
     #[serde(default = "default_query_control_attach_timeout_ms")]
     pub query_control_attach_timeout_ms: u64,
+    #[serde(default = "default_query_control_stage_rpc_timeout_ms")]
+    pub query_control_stage_rpc_timeout_ms: u64,
+    #[serde(default = "default_query_control_start_rpc_timeout_ms")]
+    pub query_control_start_rpc_timeout_ms: u64,
     #[serde(default = "default_query_control_pre_start_timeout_ms")]
     pub query_control_pre_start_timeout_ms: u64,
     #[serde(default = "default_query_control_tombstone_retention_ms")]
@@ -777,6 +781,16 @@ pub struct RuntimeConfig {
     pub query_control_tombstone_capacity: usize,
     #[serde(default = "default_query_control_max_active_entries")]
     pub query_control_max_active_entries: usize,
+    #[serde(default = "default_query_control_stage_max_encoded_bytes")]
+    pub query_control_stage_max_encoded_bytes: usize,
+    #[serde(default = "default_query_control_stage_max_fragments")]
+    pub query_control_stage_max_fragments: usize,
+    #[serde(default = "default_query_control_max_active_staging")]
+    pub query_control_max_active_staging: usize,
+    #[serde(default = "default_query_control_stage_max_inflight_encoded_bytes")]
+    pub query_control_stage_max_inflight_encoded_bytes: usize,
+    #[serde(default = "default_query_control_stage_max_dormant_workers")]
+    pub query_control_stage_max_dormant_workers: usize,
     #[serde(default = "default_mem_limit")]
     pub mem_limit: String,
     #[serde(default = "default_be_mem_limit_bytes")]
@@ -1019,6 +1033,14 @@ fn default_query_control_attach_timeout_ms() -> u64 {
     5_000
 }
 
+fn default_query_control_stage_rpc_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_start_rpc_timeout_ms() -> u64 {
+    2_000
+}
+
 fn default_query_control_pre_start_timeout_ms() -> u64 {
     30_000
 }
@@ -1033,6 +1055,26 @@ fn default_query_control_tombstone_capacity() -> usize {
 
 fn default_query_control_max_active_entries() -> usize {
     4_096
+}
+
+fn default_query_control_stage_max_encoded_bytes() -> usize {
+    48 * 1024 * 1024
+}
+
+fn default_query_control_stage_max_fragments() -> usize {
+    256
+}
+
+fn default_query_control_max_active_staging() -> usize {
+    32
+}
+
+fn default_query_control_stage_max_inflight_encoded_bytes() -> usize {
+    256 * 1024 * 1024
+}
+
+fn default_query_control_stage_max_dormant_workers() -> usize {
+    512
 }
 
 fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
@@ -1054,6 +1096,14 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
             runtime.query_control_attach_timeout_ms,
         ),
         (
+            "runtime.query_control_stage_rpc_timeout_ms",
+            runtime.query_control_stage_rpc_timeout_ms,
+        ),
+        (
+            "runtime.query_control_start_rpc_timeout_ms",
+            runtime.query_control_start_rpc_timeout_ms,
+        ),
+        (
             "runtime.query_control_pre_start_timeout_ms",
             runtime.query_control_pre_start_timeout_ms,
         ),
@@ -1072,6 +1122,51 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     }
     if runtime.query_control_max_active_entries == 0 {
         bail!("runtime.query_control_max_active_entries must be greater than 0");
+    }
+    let nonzero_limits = [
+        (
+            "runtime.query_control_stage_max_encoded_bytes",
+            runtime.query_control_stage_max_encoded_bytes,
+        ),
+        (
+            "runtime.query_control_stage_max_fragments",
+            runtime.query_control_stage_max_fragments,
+        ),
+        (
+            "runtime.query_control_max_active_staging",
+            runtime.query_control_max_active_staging,
+        ),
+        (
+            "runtime.query_control_stage_max_inflight_encoded_bytes",
+            runtime.query_control_stage_max_inflight_encoded_bytes,
+        ),
+        (
+            "runtime.query_control_stage_max_dormant_workers",
+            runtime.query_control_stage_max_dormant_workers,
+        ),
+    ];
+    for (field, value) in nonzero_limits {
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
+    }
+    const TONIC_MAX_STAGE_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+    if runtime.query_control_stage_max_encoded_bytes >= TONIC_MAX_STAGE_REQUEST_BYTES {
+        bail!(
+            "runtime.query_control_stage_max_encoded_bytes must be smaller than the 64MiB gRPC limit"
+        );
+    }
+    if runtime.query_control_stage_max_inflight_encoded_bytes
+        < runtime.query_control_stage_max_encoded_bytes
+    {
+        bail!(
+            "runtime.query_control_stage_max_inflight_encoded_bytes must be at least runtime.query_control_stage_max_encoded_bytes"
+        );
+    }
+    if runtime.query_control_stage_max_dormant_workers < runtime.query_control_stage_max_fragments {
+        bail!(
+            "runtime.query_control_stage_max_dormant_workers must be at least runtime.query_control_stage_max_fragments"
+        );
     }
     let minimum_timeout = runtime
         .query_control_heartbeat_interval_ms
@@ -1282,10 +1377,19 @@ impl Default for RuntimeConfig {
             query_control_heartbeat_timeout_ms: default_query_control_heartbeat_timeout_ms(),
             query_control_init_rpc_timeout_ms: default_query_control_init_rpc_timeout_ms(),
             query_control_attach_timeout_ms: default_query_control_attach_timeout_ms(),
+            query_control_stage_rpc_timeout_ms: default_query_control_stage_rpc_timeout_ms(),
+            query_control_start_rpc_timeout_ms: default_query_control_start_rpc_timeout_ms(),
             query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),
             query_control_tombstone_retention_ms: default_query_control_tombstone_retention_ms(),
             query_control_tombstone_capacity: default_query_control_tombstone_capacity(),
             query_control_max_active_entries: default_query_control_max_active_entries(),
+            query_control_stage_max_encoded_bytes: default_query_control_stage_max_encoded_bytes(),
+            query_control_stage_max_fragments: default_query_control_stage_max_fragments(),
+            query_control_max_active_staging: default_query_control_max_active_staging(),
+            query_control_stage_max_inflight_encoded_bytes:
+                default_query_control_stage_max_inflight_encoded_bytes(),
+            query_control_stage_max_dormant_workers:
+                default_query_control_stage_max_dormant_workers(),
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
@@ -1634,8 +1738,6 @@ pub struct DebugConfig {
     /// This is config-only (no env var fallback).
     pub exec_batch_plan_json: bool,
     #[cfg(debug_assertions)]
-    pub fault_inject_submit_fail_after: Option<usize>,
-    #[cfg(debug_assertions)]
     pub fault_inject_fetch_not_ready_count: Option<usize>,
     #[cfg(debug_assertions)]
     pub emit_cancel_marker: bool,
@@ -1653,7 +1755,6 @@ pub struct DebugConfig {
 struct DebugConfigToml {
     exec_node_output: bool,
     exec_batch_plan_json: bool,
-    fault_inject_submit_fail_after: Option<usize>,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: bool,
     emit_grpc_fragment_marker: bool,
@@ -1667,7 +1768,6 @@ struct DebugConfigToml {
 struct DebugConfigToml {
     exec_node_output: bool,
     exec_batch_plan_json: bool,
-    fault_inject_submit_fail_after: Option<usize>,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: Option<bool>,
     emit_grpc_fragment_marker: Option<bool>,
@@ -1686,7 +1786,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
             Ok(Self {
                 exec_node_output: raw.exec_node_output,
                 exec_batch_plan_json: raw.exec_batch_plan_json,
-                fault_inject_submit_fail_after: raw.fault_inject_submit_fail_after,
                 fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
                 emit_cancel_marker: raw.emit_cancel_marker,
                 emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
@@ -1696,11 +1795,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
         }
         #[cfg(not(debug_assertions))]
         {
-            if raw.fault_inject_submit_fail_after.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.fault_inject_submit_fail_after is only available in debug builds",
-                ));
-            }
             if raw.fault_inject_fetch_not_ready_count.is_some() {
                 return Err(serde::de::Error::custom(
                     "debug.fault_inject_fetch_not_ready_count is only available in debug builds",
@@ -1735,16 +1829,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
 }
 
 impl DebugConfig {
-    #[cfg(debug_assertions)]
-    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
-        self.fault_inject_submit_fail_after
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
-        None
-    }
-
     #[cfg(debug_assertions)]
     pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
         self.fault_inject_fetch_not_ready_count
@@ -1838,10 +1922,23 @@ mod tests {
         assert_eq!(runtime.query_control_heartbeat_timeout_ms, 5_000);
         assert_eq!(runtime.query_control_init_rpc_timeout_ms, 5_000);
         assert_eq!(runtime.query_control_attach_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_stage_rpc_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_start_rpc_timeout_ms, 2_000);
         assert_eq!(runtime.query_control_pre_start_timeout_ms, 30_000);
         assert_eq!(runtime.query_control_tombstone_retention_ms, 120_000);
         assert_eq!(runtime.query_control_tombstone_capacity, 16_384);
         assert_eq!(runtime.query_control_max_active_entries, 4_096);
+        assert_eq!(
+            runtime.query_control_stage_max_encoded_bytes,
+            48 * 1024 * 1024
+        );
+        assert_eq!(runtime.query_control_stage_max_fragments, 256);
+        assert_eq!(runtime.query_control_max_active_staging, 32);
+        assert_eq!(
+            runtime.query_control_stage_max_inflight_encoded_bytes,
+            256 * 1024 * 1024
+        );
+        assert_eq!(runtime.query_control_stage_max_dormant_workers, 512);
     }
 
     #[test]
@@ -2236,7 +2333,6 @@ enable_path_style_access = true
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
 [debug]
-fault_inject_submit_fail_after = 1
 fault_inject_fetch_not_ready_count = 2
 emit_cancel_marker = true
 emit_grpc_fragment_marker = true
@@ -2245,7 +2341,6 @@ emit_connector_reader_marker = true
 "#,
         )
         .expect("parse config");
-        assert_eq!(cfg.debug.fault_inject_submit_fail_after, Some(1));
         assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
         assert!(cfg.debug.emit_cancel_marker);
         assert!(cfg.debug.emit_grpc_fragment_marker);
@@ -2261,21 +2356,6 @@ emit_connector_reader_marker = true
     #[test]
     #[cfg(not(debug_assertions))]
     fn test_debug_fault_injection_knobs_are_rejected_in_release_builds() {
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-fault_inject_submit_fail_after = 1
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject fault injection knobs"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("fault_inject_submit_fail_after"),
-            "unexpected parse error: {err}"
-        );
-
         let err = match toml::from_str::<NovaRocksConfig>(
             r#"
 [debug]

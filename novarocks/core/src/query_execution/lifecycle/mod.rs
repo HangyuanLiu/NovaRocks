@@ -21,6 +21,7 @@ pub mod identity;
 pub mod init_plan;
 pub mod manifest;
 pub mod metrics;
+pub mod stage;
 
 pub use contract::{
     BackendQueryControl, QueryAbortRequest, QueryControlAttach, QueryControlAttachment,
@@ -39,4 +40,9 @@ pub use manifest::{
     ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantManifestDigest, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
     RuntimeFilterContribution,
+};
+pub use stage::{
+    QueryLaunchBarrier, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
+    QueryStartOutcome, QueryStartRequest, StageBatch, StageDigest, StageDigestVersion,
+    StageFragment, StageParticipantBinding,
 };

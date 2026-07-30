@@ -1114,11 +1114,14 @@ pub(crate) fn scan_one_added_data_file_with_factory(
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
-    let normalized =
-        normalize_delete_projection_path(path, object_store_config, expected_object_store_bucket)
-            .map_err(|e| format!("normalize added data file `{path}`: {e}"))?;
+    // Validate the file against the configured storage domain, but preserve
+    // its logical URI for `FsAccessHandle::bind_location`. The normalized
+    // object-store path is operator-relative and would otherwise parse as a
+    // local filesystem path at the binding boundary.
+    normalize_delete_projection_path(path, object_store_config, expected_object_store_bucket)
+        .map_err(|e| format!("normalize added data file `{path}`: {e}"))?;
     let len = u64::try_from(size).ok();
-    read_full_data_file(&normalized, len, factory)
+    read_full_data_file(path, len, factory)
 }
 
 /// Helper for `IcebergDeltaScanOperator`: scan one deleted data file

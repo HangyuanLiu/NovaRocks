@@ -27,9 +27,12 @@ use novarocks::query_execution::lifecycle::{
     BackendQueryControl, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
     QueryControlAttach, QueryControlAttachment, QueryControlEvent, QueryExecutionId, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
+    QueryLifecycleIngress, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
+    QueryStartOutcome, QueryStartRequest, QueryTerminationAck, QueryTerminationReason,
+    RuntimeFilterContribution, StageDigest, StageDigestVersion,
 };
 use novarocks::runtime::fragment::FragmentOutcome;
+use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 
@@ -95,6 +98,11 @@ pub(crate) struct QueryLifecycleRegistryConfig {
     pub(crate) tombstone_retention: Duration,
     pub(crate) heartbeat_timeout: Duration,
     pub(crate) pre_start_timeout: Duration,
+    pub(crate) stage_max_fragments: usize,
+    pub(crate) max_active_staging: usize,
+    pub(crate) stage_max_encoded_bytes: usize,
+    pub(crate) stage_max_inflight_encoded_bytes: usize,
+    pub(crate) stage_max_dormant_workers: usize,
 }
 
 impl QueryLifecycleRegistryConfig {
@@ -109,7 +117,101 @@ impl QueryLifecycleRegistryConfig {
             ),
             heartbeat_timeout: Duration::from_millis(runtime.query_control_heartbeat_timeout_ms),
             pre_start_timeout: Duration::from_millis(runtime.query_control_pre_start_timeout_ms),
+            stage_max_fragments: runtime.query_control_stage_max_fragments,
+            max_active_staging: runtime.query_control_max_active_staging,
+            stage_max_encoded_bytes: runtime.query_control_stage_max_encoded_bytes,
+            stage_max_inflight_encoded_bytes: runtime
+                .query_control_stage_max_inflight_encoded_bytes,
+            stage_max_dormant_workers: runtime.query_control_stage_max_dormant_workers,
         }
+    }
+}
+
+/// Global, backend-local accounting for QLC-3 work which exists before a
+/// query is allowed to run.  The counters deliberately cover the full
+/// pre-start lifetime, not only the RPC handler: a completed Stage still owns
+/// decoded plans and dormant workers until Start or Abort wins the lifecycle
+/// race.
+#[derive(Default)]
+struct StageResourceLedger {
+    active_builders: usize,
+    encoded_bytes: usize,
+    dormant_workers: usize,
+}
+
+/// RAII reservation for one participant-local Stage bundle.  It first owns a
+/// builder slot, then transfers the encoded-byte and dormant-worker portions
+/// to the lifecycle entry after a successful commit.  Drop is intentionally
+/// sufficient for every failure path, including panics while materializing a
+/// fragment bundle.
+pub(crate) struct StageResourceReservation {
+    ledger: Arc<Mutex<StageResourceLedger>>,
+    encoded_bytes: usize,
+    dormant_workers: usize,
+    builder_active: bool,
+}
+
+impl StageResourceReservation {
+    fn try_acquire(
+        ledger: Arc<Mutex<StageResourceLedger>>,
+        config: QueryLifecycleRegistryConfig,
+        encoded_bytes: usize,
+        dormant_workers: usize,
+    ) -> Result<Self, &'static str> {
+        let mut state = ledger
+            .lock()
+            .expect("query lifecycle Stage resource ledger lock");
+        if state.active_builders >= config.max_active_staging {
+            return Err("backend has reached its active Stage builder limit");
+        }
+        let Some(next_bytes) = state.encoded_bytes.checked_add(encoded_bytes) else {
+            return Err("backend Stage encoded-byte accounting overflowed");
+        };
+        if next_bytes > config.stage_max_inflight_encoded_bytes {
+            return Err("backend has reached its Stage encoded-byte budget");
+        }
+        let Some(next_workers) = state.dormant_workers.checked_add(dormant_workers) else {
+            return Err("backend Stage dormant-worker accounting overflowed");
+        };
+        if next_workers > config.stage_max_dormant_workers {
+            return Err("backend has reached its dormant worker limit");
+        }
+        state.active_builders += 1;
+        state.encoded_bytes = next_bytes;
+        state.dormant_workers = next_workers;
+        drop(state);
+        Ok(Self {
+            ledger,
+            encoded_bytes,
+            dormant_workers,
+            builder_active: true,
+        })
+    }
+
+    fn release_builder(&mut self) {
+        if !self.builder_active {
+            return;
+        }
+        let mut state = self
+            .ledger
+            .lock()
+            .expect("query lifecycle Stage resource ledger lock");
+        state.active_builders = state.active_builders.saturating_sub(1);
+        self.builder_active = false;
+    }
+}
+
+impl Drop for StageResourceReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .ledger
+            .lock()
+            .expect("query lifecycle Stage resource ledger lock");
+        if self.builder_active {
+            state.active_builders = state.active_builders.saturating_sub(1);
+        }
+        state.encoded_bytes = state.encoded_bytes.saturating_sub(self.encoded_bytes);
+        state.dormant_workers = state.dormant_workers.saturating_sub(self.dormant_workers);
     }
 }
 
@@ -121,6 +223,7 @@ pub(crate) struct QueryLifecycleRegistry {
     local_start_epoch: u64,
     clock: Arc<dyn MonotonicClock>,
     metrics: Arc<dyn QueryLifecycleMetricsSink>,
+    stage_resources: Arc<Mutex<StageResourceLedger>>,
     self_weak: Weak<QueryLifecycleRegistry>,
 }
 
@@ -178,6 +281,24 @@ struct InitWorkspace {
     entry: Arc<QueryLifecycleEntry>,
     execution_id: QueryExecutionId,
     digest: ParticipantManifestDigest,
+}
+
+/// Owns the single in-flight Stage build.  Dropping an uncommitted build
+/// fail-closes the lifecycle entry and wakes every dormant worker through its
+/// shared gate.
+pub(crate) struct StageBuildPermit {
+    registry: Arc<QueryLifecycleRegistry>,
+    entry: Arc<QueryLifecycleEntry>,
+    execution_id: QueryExecutionId,
+    digest: StageDigest,
+    gate: Arc<super::stage::StartGate>,
+    resources: Option<StageResourceReservation>,
+    committed: bool,
+}
+
+pub(crate) enum StageBuildDecision {
+    Build(StageBuildPermit),
+    Complete(QueryStageAck),
 }
 
 pub(crate) struct FragmentAdmissionPermit {
@@ -295,6 +416,11 @@ impl QueryLifecycleRegistry {
         assert!(!config.tombstone_retention.is_zero());
         assert!(!config.heartbeat_timeout.is_zero());
         assert!(!config.pre_start_timeout.is_zero());
+        assert!(config.stage_max_fragments > 0);
+        assert!(config.max_active_staging > 0);
+        assert!(config.stage_max_encoded_bytes > 0);
+        assert!(config.stage_max_inflight_encoded_bytes >= config.stage_max_encoded_bytes);
+        assert!(config.stage_max_dormant_workers >= config.stage_max_fragments);
         Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
@@ -303,6 +429,7 @@ impl QueryLifecycleRegistry {
             local_start_epoch,
             clock,
             metrics,
+            stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
             self_weak: self_weak.clone(),
         })
     }
@@ -498,9 +625,14 @@ impl QueryLifecycleRegistry {
         }
         let outcome = match (state.phase, state.init_outcome) {
             (_, Some(outcome)) if outcome != QueryInitOutcome::Applied => outcome,
-            (QueryLifecyclePhase::Initialized | QueryLifecyclePhase::ControlAttached, _) => {
-                QueryInitOutcome::AlreadyApplied
-            }
+            (
+                QueryLifecyclePhase::Initialized
+                | QueryLifecyclePhase::ControlAttached
+                | QueryLifecyclePhase::Staging
+                | QueryLifecyclePhase::Staged
+                | QueryLifecyclePhase::Running,
+                _,
+            ) => QueryInitOutcome::AlreadyApplied,
             (QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone, _) => {
                 QueryInitOutcome::RejectedTerminated
             }
@@ -631,7 +763,11 @@ impl QueryLifecycleRegistry {
                         phase,
                     ));
                 }
-                QueryLifecyclePhase::Initializing | QueryLifecyclePhase::ControlAttached => {
+                QueryLifecyclePhase::Initializing
+                | QueryLifecyclePhase::ControlAttached
+                | QueryLifecyclePhase::Staging
+                | QueryLifecyclePhase::Staged
+                | QueryLifecyclePhase::Running => {
                     let phase = phase_name(state.phase);
                     drop(state);
                     return Err(self.attach_error(
@@ -682,6 +818,294 @@ impl QueryLifecycleRegistry {
             }),
             events: events_rx,
         })
+    }
+
+    pub(crate) fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
+        match self.begin_stage(request) {
+            StageBuildDecision::Build(permit) => permit.commit(),
+            StageBuildDecision::Complete(ack) => ack,
+        }
+    }
+
+    /// Reserves the entry for one complete local Stage build. The caller owns
+    /// materialization outside registry locks and must either commit or drop
+    /// the returned permit.
+    pub(crate) fn begin_stage(&self, request: QueryStageRequest) -> StageBuildDecision {
+        let execution_id = request.execution_id();
+        let digest_version = request.digest_version();
+        let stage_digest = request.digest();
+        let fragment_count = request.fragments().len();
+        if fragment_count > self.config.stage_max_fragments {
+            return StageBuildDecision::Complete(QueryStageAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                QueryStageOutcome::RejectedCapacity,
+                "stage fragment count exceeds the backend Stage limit",
+            ));
+        }
+        let stage_encoded_bytes =
+            novarocks::query_execution::lifecycle::contract::encode_query_stage_request(&request)
+                .encoded_len();
+        if stage_encoded_bytes > self.config.stage_max_encoded_bytes {
+            return StageBuildDecision::Complete(QueryStageAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                QueryStageOutcome::RejectedCapacity,
+                "stage request encoded bytes exceed the backend Stage limit",
+            ));
+        }
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return StageBuildDecision::Complete(QueryStageAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                QueryStageOutcome::RejectedTerminated,
+                "query lifecycle entry is not active",
+            ));
+        };
+        if entry.digest != request.init_digest() {
+            return StageBuildDecision::Complete(QueryStageAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                QueryStageOutcome::RejectedConflict,
+                "stage init digest conflicts with initialized manifest",
+            ));
+        }
+
+        let requested_instances = request
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.fragment_instance_id())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_instances = entry
+            .manifest
+            .expected_fragment_instance_ids()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut state = entry.state.lock().expect("query lifecycle entry lock");
+        let (outcome, detail, build) = match state.phase {
+            QueryLifecyclePhase::ControlAttached => {
+                if requested_instances != expected_instances {
+                    (
+                        QueryStageOutcome::RejectedInvalidBatch,
+                        "stage fragment set differs from participant manifest",
+                        None,
+                    )
+                } else {
+                    state.phase = QueryLifecyclePhase::Staging;
+                    state.stage_digest = Some(stage_digest);
+                    let gate = Arc::new(super::stage::StartGate::new());
+                    state.start_gate = Some(Arc::clone(&gate));
+                    (
+                        QueryStageOutcome::Applied,
+                        "query participant staging",
+                        Some(gate),
+                    )
+                }
+            }
+            QueryLifecyclePhase::Staging if state.stage_digest == Some(stage_digest) => {
+                while state.phase == QueryLifecyclePhase::Staging
+                    && state.termination_reason.is_none()
+                {
+                    state = entry
+                        .stage_completed
+                        .wait(state)
+                        .expect("query lifecycle entry lock");
+                }
+                match state.phase {
+                    QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running
+                        if state.stage_digest == Some(stage_digest) =>
+                    {
+                        (
+                            QueryStageOutcome::AlreadyApplied,
+                            "query participant was already staged",
+                            None,
+                        )
+                    }
+                    QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+                        QueryStageOutcome::RejectedTerminated,
+                        "query lifecycle entry has terminated",
+                        None,
+                    ),
+                    _ => (
+                        QueryStageOutcome::RejectedInvalidState,
+                        "query participant stage did not complete",
+                        None,
+                    ),
+                }
+            }
+            QueryLifecyclePhase::Staging => (
+                QueryStageOutcome::RejectedConflict,
+                "stage digest conflicts with in-flight participant staging",
+                None,
+            ),
+            QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running => {
+                if state.stage_digest == Some(stage_digest) {
+                    (
+                        QueryStageOutcome::AlreadyApplied,
+                        "query participant was already staged",
+                        None,
+                    )
+                } else {
+                    (
+                        QueryStageOutcome::RejectedConflict,
+                        "stage digest conflicts with existing staged participant",
+                        None,
+                    )
+                }
+            }
+            QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+                QueryStageOutcome::RejectedTerminated,
+                "query lifecycle entry has terminated",
+                None,
+            ),
+            QueryLifecyclePhase::Initializing | QueryLifecyclePhase::Initialized => (
+                QueryStageOutcome::RejectedInvalidState,
+                "query control must attach before staging",
+                None,
+            ),
+        };
+        drop(state);
+        match build {
+            Some(gate) => {
+                let resources = match StageResourceReservation::try_acquire(
+                    Arc::clone(&self.stage_resources),
+                    self.config,
+                    stage_encoded_bytes,
+                    fragment_count,
+                ) {
+                    Ok(resources) => resources,
+                    Err(detail) => {
+                        let mut state = entry.state.lock().expect("query lifecycle entry lock");
+                        if state.phase == QueryLifecyclePhase::Staging
+                            && state.stage_digest == Some(stage_digest)
+                        {
+                            state.phase = QueryLifecyclePhase::ControlAttached;
+                            state.stage_digest = None;
+                            state.start_gate = None;
+                            entry.stage_completed.notify_all();
+                        }
+                        return StageBuildDecision::Complete(QueryStageAck::new(
+                            execution_id,
+                            digest_version,
+                            stage_digest,
+                            QueryStageOutcome::RejectedCapacity,
+                            detail,
+                        ));
+                    }
+                };
+                StageBuildDecision::Build(StageBuildPermit {
+                    registry: self
+                        .self_weak
+                        .upgrade()
+                        .expect("query lifecycle registry owns active entry"),
+                    entry,
+                    execution_id,
+                    digest: stage_digest,
+                    gate,
+                    resources: Some(resources),
+                    committed: false,
+                })
+            }
+            None => StageBuildDecision::Complete(QueryStageAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                outcome,
+                detail,
+            )),
+        }
+    }
+
+    /// Commits the single query-owned start decision.  Releasing the gate
+    /// while holding the entry lock makes `Staged -> Running` and visibility to
+    /// staged workers one atomic lifecycle event.
+    pub(crate) fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
+        let execution_id = request.execution_id();
+        let digest_version = request.digest_version();
+        let stage_digest = request.digest();
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return QueryStartAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                QueryStartOutcome::RejectedTerminated,
+                "query lifecycle entry is not active",
+            );
+        };
+
+        let mut state = entry.state.lock().expect("query lifecycle entry lock");
+        let mut released_stage_resources = None;
+        let (outcome, detail) = match state.phase {
+            QueryLifecyclePhase::Staged => {
+                if state.stage_digest != Some(stage_digest) {
+                    (
+                        QueryStartOutcome::RejectedConflict,
+                        "start digest conflicts with staged participant",
+                    )
+                } else if let Some(gate) = state.start_gate.clone() {
+                    state.phase = QueryLifecyclePhase::Running;
+                    state.pre_start_deadline = None;
+                    let released = gate.release();
+                    debug_assert!(released, "a staged start gate must be pending");
+                    released_stage_resources = state.stage_resources.take();
+                    (QueryStartOutcome::Applied, "query participant started")
+                } else {
+                    (
+                        QueryStartOutcome::RejectedNotStaged,
+                        "staged participant has no start gate",
+                    )
+                }
+            }
+            QueryLifecyclePhase::Running => {
+                if state.stage_digest == Some(stage_digest) {
+                    (
+                        QueryStartOutcome::AlreadyStarted,
+                        "query participant was already started",
+                    )
+                } else {
+                    (
+                        QueryStartOutcome::RejectedConflict,
+                        "start digest conflicts with running participant",
+                    )
+                }
+            }
+            QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+                QueryStartOutcome::RejectedTerminated,
+                "query lifecycle entry has terminated",
+            ),
+            QueryLifecyclePhase::Initializing
+            | QueryLifecyclePhase::Initialized
+            | QueryLifecyclePhase::ControlAttached
+            | QueryLifecyclePhase::Staging => (
+                QueryStartOutcome::RejectedNotStaged,
+                "query participant has not finished staging",
+            ),
+        };
+        drop(state);
+        // The gate has been released under the entry lock.  Once Running is
+        // visible there can be no dormant workers or retained stage payload,
+        // so return the Stage reservation outside lifecycle locks.
+        drop(released_stage_resources);
+        QueryStartAck::new(execution_id, digest_version, stage_digest, outcome, detail)
     }
 
     fn attach_error(
@@ -739,7 +1163,10 @@ impl QueryLifecycleRegistry {
                 "query lifecycle has terminated",
             ));
         }
-        if state.phase != QueryLifecyclePhase::ControlAttached {
+        if !matches!(
+            state.phase,
+            QueryLifecyclePhase::ControlAttached | QueryLifecyclePhase::Staging
+        ) {
             drop(state);
             return Err(self.admission_error(
                 execution_id,
@@ -839,11 +1266,15 @@ impl QueryLifecycleRegistry {
                     .is_some_and(|deadline| now >= deadline)
                 {
                     (None, Some(QueryTerminationReason::PreStartTimeout))
-                } else if state.phase == QueryLifecyclePhase::ControlAttached
-                    && state.last_heartbeat.is_some_and(|heartbeat| {
-                        now.saturating_duration_since(heartbeat) >= self.config.heartbeat_timeout
-                    })
-                {
+                } else if matches!(
+                    state.phase,
+                    QueryLifecyclePhase::ControlAttached
+                        | QueryLifecyclePhase::Staging
+                        | QueryLifecyclePhase::Staged
+                        | QueryLifecyclePhase::Running
+                ) && state.last_heartbeat.is_some_and(|heartbeat| {
+                    now.saturating_duration_since(heartbeat) >= self.config.heartbeat_timeout
+                }) {
                     (
                         None,
                         Some(QueryTerminationReason::CoordinatorHeartbeatTimeout),
@@ -898,7 +1329,14 @@ impl QueryLifecycleRegistry {
         terminal_event: Option<QueryControlEvent>,
         detail: String,
     ) -> QueryTerminationReason {
-        let (execution_id, expected_instances, initializing, terminal_event_permit) = {
+        let (
+            execution_id,
+            expected_instances,
+            initializing,
+            terminal_event_permit,
+            start_gate,
+            stage_resources,
+        ) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if let Some(reason) = state.termination_reason {
                 return reason;
@@ -906,6 +1344,7 @@ impl QueryLifecycleRegistry {
             state.termination_reason = Some(requested_reason);
             let initializing = state.phase == QueryLifecyclePhase::Initializing;
             state.phase = QueryLifecyclePhase::Terminating;
+            entry.stage_completed.notify_all();
             if state.runtime_filter_installed {
                 state.runtime_filter_cleanup_required = true;
             }
@@ -919,9 +1358,19 @@ impl QueryLifecycleRegistry {
                     .collect::<Vec<_>>(),
                 initializing,
                 state.terminal_event_permit.take(),
+                state.start_gate.clone(),
+                state.stage_resources.take(),
             )
         };
 
+        if let Some(gate) = start_gate {
+            // A gate released before termination stays released; otherwise
+            // wake every dormant worker without allowing it to start.
+            gate.abort();
+        }
+        // Abort is terminal for a pre-start bundle.  Free the associated
+        // ledger reservation only after its gate has been fail-closed.
+        drop(stage_resources);
         if let Some(permit) = terminal_event_permit {
             drop(permit.send(
                 terminal_event.unwrap_or(QueryControlEvent::TerminationAccepted {
@@ -1195,8 +1644,13 @@ impl QueryLifecycleRegistry {
         let entry = self.active_entry(execution_id)?;
         let events = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
-            if state.phase != QueryLifecyclePhase::ControlAttached
-                || state.termination_reason.is_some()
+            if !matches!(
+                state.phase,
+                QueryLifecyclePhase::ControlAttached
+                    | QueryLifecyclePhase::Staging
+                    | QueryLifecyclePhase::Staged
+                    | QueryLifecyclePhase::Running
+            ) || state.termination_reason.is_some()
             {
                 return Err(QueryLifecycleError::new(
                     QueryLifecycleErrorCode::Terminated,
@@ -1344,6 +1798,7 @@ impl QueryLifecycleRegistry {
             || state.pre_init_tombstones.contains_key(&execution_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn metrics_snapshot(&self) -> BackendQueryLifecycleMetricsSnapshot {
         let state = self.state.lock().expect("query lifecycle registry lock");
         fold_metrics_locked(&state).0
@@ -1494,6 +1949,66 @@ impl InitWorkspace {
     }
 }
 
+impl StageBuildPermit {
+    pub(crate) fn gate(&self) -> Arc<super::stage::StartGate> {
+        Arc::clone(&self.gate)
+    }
+
+    pub(crate) fn commit(mut self) -> QueryStageAck {
+        let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
+        let (outcome, detail) = if state.termination_reason.is_some()
+            || matches!(
+                state.phase,
+                QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone
+            ) {
+            (
+                QueryStageOutcome::RejectedTerminated,
+                "query lifecycle terminated during staging",
+            )
+        } else if state.phase == QueryLifecyclePhase::Staging
+            && state.stage_digest == Some(self.digest)
+        {
+            let mut resources = self
+                .resources
+                .take()
+                .expect("Stage build permit owns its resource reservation");
+            resources.release_builder();
+            debug_assert!(state.stage_resources.is_none());
+            state.stage_resources = Some(resources);
+            state.phase = QueryLifecyclePhase::Staged;
+            (QueryStageOutcome::Applied, "query participant staged")
+        } else {
+            (
+                QueryStageOutcome::RejectedInvalidState,
+                "query lifecycle stage ownership was lost",
+            )
+        };
+        self.entry.stage_completed.notify_all();
+        drop(state);
+        self.committed = true;
+        QueryStageAck::new(
+            self.execution_id,
+            StageDigestVersion::V1,
+            self.digest,
+            outcome,
+            detail,
+        )
+    }
+}
+
+impl Drop for StageBuildPermit {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.entry.stage_completed.notify_all();
+        self.registry.request_termination(
+            Arc::clone(&self.entry),
+            QueryTerminationReason::LocalFailure,
+        );
+    }
+}
+
 impl FragmentAdmissionPermit {
     #[cfg(test)]
     pub(crate) fn entry_for_test(&self) -> Arc<QueryLifecycleEntry> {
@@ -1542,7 +2057,10 @@ impl FragmentAdmissionPermit {
                 "query lifecycle terminated before fragment admission commit",
             ));
         }
-        if state.phase != QueryLifecyclePhase::ControlAttached {
+        if !matches!(
+            state.phase,
+            QueryLifecyclePhase::ControlAttached | QueryLifecyclePhase::Staging
+        ) {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Conflict,
                 "query control is not ready for fragment admission commit",
@@ -1572,7 +2090,11 @@ impl FragmentAdmissionPermit {
             .insert(self.fragment_instance_id, self.execution_id);
         state.in_flight_fragments.remove(&self.fragment_instance_id);
         state.accepted_fragments.insert(self.fragment_instance_id);
-        state.pre_start_deadline = None;
+        // A staged worker is still pre-start. Only the StartPreparedQuery
+        // transition clears this deadline after releasing the shared gate.
+        if state.phase == QueryLifecyclePhase::ControlAttached {
+            state.pre_start_deadline = None;
+        }
         drop(state);
         drop(registry_state);
         self.committed = true;
@@ -1680,6 +2202,14 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
         QueryLifecycleRegistry::init_query(self, request)
     }
 
+    fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
+        QueryLifecycleRegistry::stage_fragments(self, request)
+    }
+
+    fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
+        QueryLifecycleRegistry::start_prepared_query(self, request)
+    }
+
     fn abort_query(
         &self,
         request: QueryAbortRequest,
@@ -1715,7 +2245,10 @@ fn fold_metrics_locked(
         {
             QueryLifecyclePhase::Initializing => snapshot.initializing += 1,
             QueryLifecyclePhase::Initialized => snapshot.initialized += 1,
-            QueryLifecyclePhase::ControlAttached => snapshot.control_attached += 1,
+            QueryLifecyclePhase::ControlAttached
+            | QueryLifecyclePhase::Staging
+            | QueryLifecyclePhase::Staged
+            | QueryLifecyclePhase::Running => snapshot.control_attached += 1,
             QueryLifecyclePhase::Terminating => snapshot.terminating += 1,
             QueryLifecyclePhase::Tombstone => {}
         }
@@ -1732,6 +2265,9 @@ const fn phase_name(phase: QueryLifecyclePhase) -> &'static str {
         QueryLifecyclePhase::Initializing => "initializing",
         QueryLifecyclePhase::Initialized => "initialized",
         QueryLifecyclePhase::ControlAttached => "control_attached",
+        QueryLifecyclePhase::Staging => "staging",
+        QueryLifecyclePhase::Staged => "staged",
+        QueryLifecyclePhase::Running => "running",
         QueryLifecyclePhase::Terminating => "terminating",
         QueryLifecyclePhase::Tombstone => "tombstone",
     }

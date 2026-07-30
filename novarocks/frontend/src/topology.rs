@@ -1265,7 +1265,7 @@ impl BackendTopologyPort for ClusterBackendService {
         )
     }
 
-    fn record_successful_fragment_submission(&self, backend_idx: usize) {
+    fn record_successful_stage(&self, backend_idx: usize, fragment_count: usize) {
         if let Some(entry) = self
             .state
             .lock()
@@ -1273,7 +1273,9 @@ impl BackendTopologyPort for ClusterBackendService {
             .entries
             .get_mut(&backend_idx)
         {
-            entry.scheduled_fragments = entry.scheduled_fragments.saturating_add(1);
+            entry.scheduled_fragments = entry
+                .scheduled_fragments
+                .saturating_add(fragment_count as u64);
         }
     }
 
@@ -1553,6 +1555,31 @@ mod tests {
         );
         service.drop_backend(endpoint, true).unwrap();
         assert!(service.live_backends().is_empty());
+    }
+
+    #[test]
+    fn show_backends_includes_the_runtime_start_epoch() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        service.add_backend(endpoint).unwrap();
+        service.record_heartbeat_success(0, 17, "test", 2, 100);
+
+        let result = service.show_backends().unwrap();
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "BackendId",
+                "Host",
+                "GrpcPort",
+                "State",
+                "ScheduledFragments",
+                "StartEpoch",
+            ]
+        );
     }
 
     #[test]

@@ -65,7 +65,15 @@ fn fixture_execution_with_deadline(
             0,
             backends
                 .iter()
-                .map(|(backend_idx, endpoint)| LiveBackendTarget::new(*backend_idx, *endpoint, 0))
+                .map(|(backend_idx, endpoint)| {
+                    LiveBackendTarget::new(
+                        *backend_idx,
+                        *endpoint,
+                        u64::try_from(*backend_idx)
+                            .expect("test backend index fits u64")
+                            .saturating_add(1),
+                    )
+                })
                 .collect(),
         )
         .expect("contract fixture topology"),
@@ -160,7 +168,15 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
         0,
         backends
             .iter()
-            .map(|(backend_idx, endpoint)| LiveBackendTarget::new(*backend_idx, *endpoint, 0))
+            .map(|(backend_idx, endpoint)| {
+                LiveBackendTarget::new(
+                    *backend_idx,
+                    *endpoint,
+                    u64::try_from(*backend_idx)
+                        .expect("test backend index fits u64")
+                        .saturating_add(1),
+                )
+            })
             .collect(),
     )
     .expect("contract fixture topology");

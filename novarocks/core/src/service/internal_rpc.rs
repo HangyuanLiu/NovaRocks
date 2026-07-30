@@ -27,9 +27,6 @@ use crate::runtime::lookup::{
 use crate::runtime::query_context::QueryId;
 #[cfg(feature = "compat")]
 use crate::runtime::query_context::query_context_manager;
-use crate::service::native_fragment_ingress::{
-    NativeFragmentAccepted, NativeFragmentIngress, NativeFragmentIngressError,
-};
 
 #[cfg(feature = "compat")]
 type CompatTransmitChunkRequest = proto::starrocks::PTransmitChunkParams; // cfg(feature = "compat")
@@ -301,15 +298,6 @@ pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter:
         }
     }
     response
-}
-
-pub(crate) fn handle_submit_fragment(
-    ingress: &dyn NativeFragmentIngress,
-    execution_id: proto::novarocks::QueryExecutionId,
-    fragment: proto::plan::PlanFragment,
-    instance_params: proto::novarocks::InstanceParams,
-) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-    ingress.submit_native_payload(execution_id, fragment, instance_params)
 }
 
 #[cfg(feature = "compat")]

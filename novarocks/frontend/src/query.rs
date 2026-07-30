@@ -463,11 +463,20 @@ impl QuerySession for FrontendQuerySession {
 
     async fn execute_batch(&self, sql: &str) -> Result<StatementResult, QueryServiceError> {
         let statements = split_sql_statements(sql)?;
-        let mut result = StatementResult::Ok;
+        // Match the standalone MySQL session contract: a batch returns its
+        // most recent result set even when subsequent DDL/session statements
+        // complete successfully. In particular, all-in-one routes through
+        // this frontend session before reaching the Stage/Start lifecycle.
+        let mut last_query_result = None;
         for statement in statements {
-            result = self.execute_statement(&statement).await?;
+            match self.execute_statement(&statement).await? {
+                StatementResult::Query(result) => last_query_result = Some(result),
+                StatementResult::Ok => {}
+            }
         }
-        Ok(result)
+        Ok(last_query_result
+            .map(StatementResult::Query)
+            .unwrap_or(StatementResult::Ok))
     }
 
     fn cancel_current(&self, reason: QueryCancellationReason) {

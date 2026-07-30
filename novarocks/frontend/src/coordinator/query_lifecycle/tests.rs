@@ -24,7 +24,7 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
 use novarocks::query_execution::contract::{DistributedQueryIntent, QueryId};
 use novarocks::query_execution::fragment_transport::{
-    ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope,
+    ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
 use novarocks::query_execution::lifecycle::{
     AttemptId, BackendQueryControl, ParticipantBackendIdentity, ParticipantManifest,
@@ -39,8 +39,7 @@ use novarocks::runtime::query_options::QueryOptions;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 use novarocks::service::grpc_server::GrpcService;
 use novarocks::service::native_fragment_ingress::{
-    NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
-    NativeFragmentIngressError, NativeFragmentRequest,
+    NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
 
 use super::barrier::{
@@ -57,14 +56,6 @@ use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQuer
 struct NoopFragmentDispatcher;
 
 impl FragmentDispatcher for NoopFragmentDispatcher {
-    fn submit_fragment(
-        &self,
-        _backend_idx: usize,
-        _submission: NativeFragmentEnvelope,
-    ) -> Result<(), String> {
-        unreachable!("query lifecycle unit tests do not submit fragments")
-    }
-
     fn fetch_result(
         &self,
         _backend_idx: usize,
@@ -1380,14 +1371,6 @@ struct RecordingLegacyCancellationDispatcher {
 }
 
 impl FragmentDispatcher for RecordingLegacyCancellationDispatcher {
-    fn submit_fragment(
-        &self,
-        _backend_idx: usize,
-        _submission: NativeFragmentEnvelope,
-    ) -> Result<(), String> {
-        unreachable!("cancellation test does not submit fragments")
-    }
-
     fn fetch_result(
         &self,
         _backend_idx: usize,
@@ -2072,15 +2055,6 @@ fn live_control_error(
 struct RejectNativeFragments;
 
 impl NativeFragmentIngress for RejectNativeFragments {
-    fn submit(
-        &self,
-        _request: NativeFragmentRequest,
-    ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
-        Err(NativeFragmentIngressError::new(
-            "live lifecycle test does not submit fragments",
-        ))
-    }
-
     fn cancel(
         &self,
         _request: NativeFragmentCancelRequest,

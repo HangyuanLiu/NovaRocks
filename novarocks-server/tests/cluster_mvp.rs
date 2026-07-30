@@ -300,35 +300,6 @@ role = "all-in-one"
     (process, mysql_port)
 }
 
-fn assert_fe_report_only_endpoint_rejects_local_submit(port: u16) {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .expect("parse fe report endpoint addr");
-    let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new(addr)
-        .expect("create grpc client for fe report endpoint");
-    let err = client
-        .blocking_submit_fragment(
-            novarocks::service::grpc_client::proto::novarocks::SubmitFragmentRequest {
-                plan: None,
-                instance_params: None,
-                execution_id: Some(
-                    novarocks::service::grpc_client::proto::novarocks::QueryExecutionId {
-                        query_id: Some(novarocks::service::grpc_client::proto::common::UniqueId {
-                            hi: 1,
-                            lo: 2,
-                        }),
-                        attempt_id: 1,
-                    },
-                ),
-            },
-        )
-        .expect_err("role=fe report-only endpoint must reject local fragment submission");
-    assert!(
-        err.contains("FailedPrecondition") && err.contains("report-only"),
-        "role=fe endpoint must reject local execution RPCs as report-only: {err}"
-    );
-}
-
 struct ClusterHarness {
     be: ProcessGuard,
     _fe: ProcessGuard,
@@ -671,53 +642,6 @@ deployment_owner = "fe-1"
         let mut fe = ProcessGuard::spawn(self.fe_config.path());
         fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
         self.fe = Some(fe);
-    }
-
-    fn wait_for_be_submit_termination_coverage(
-        &mut self,
-        expected_submit_count: usize,
-        termination_reasons: &[&str],
-        timeout: Duration,
-    ) {
-        let deadline = Instant::now() + timeout;
-        let mut stdout = vec![Vec::new(); self.bes.len()];
-        let mut submitted = vec![0usize; self.bes.len()];
-        loop {
-            for (index, be) in self.bes.iter_mut().enumerate() {
-                if let Some(status) = be.child.try_wait().expect("poll BE child") {
-                    panic!(
-                        "BE {index} exited before submit/termination pairing completed with status {status}; stdout={:?}; stderr={}",
-                        stdout[index],
-                        be.read_stderr()
-                    );
-                }
-                while let Ok(line) = be.stdout_rx.try_recv() {
-                    if line.starts_with("NOVAROCKS_GRPC_SUBMIT call=") {
-                        submitted[index] += 1;
-                    }
-                    stdout[index].push(line);
-                }
-            }
-            let submitted_total = submitted.iter().sum::<usize>();
-            let submitted_backends_terminated =
-                submitted.iter().enumerate().all(|(index, submitted)| {
-                    *submitted == 0
-                        || termination_reasons.iter().any(|reason| {
-                            backend_query_lifecycle_termination_count(
-                                self.be_grpc_ports[index],
-                                reason,
-                            ) >= 1
-                        })
-                });
-            if submitted_total == expected_submit_count && submitted_backends_terminated {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "expected {expected_submit_count} submitted instances covered by lifecycle termination reasons={termination_reasons:?}; submitted={submitted:?} stdout={stdout:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 
     fn wait_for_every_be_output_contains(
@@ -1100,33 +1024,7 @@ fn wait_for_backend_query_lifecycle_termination_any(
 }
 
 #[test]
-fn all_in_one_select_uses_loopback_submit() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let (_srv, mysql_port) = start_all_in_one(
-        r#"
-[debug]
-fault_inject_submit_fail_after = 0
-"#,
-    );
-
-    let mut conn = connect_mysql(mysql_port);
-    let err = conn
-        .query::<i64, _>("SELECT 1")
-        .expect_err("SELECT 1 should hit RemoteDispatcher submit fault");
-    let err = err.to_string();
-    assert!(
-        err.contains("debug submit fault injected"),
-        "expected loopback submit fault, got: {err}"
-    );
-}
-
-#[test]
-fn all_in_one_loopback_select_succeeds() {
+fn all_in_one_loopback_stage_start_select_succeeds() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
@@ -1142,7 +1040,6 @@ emit_grpc_fragment_marker = true
     let mut conn = connect_mysql(mysql_port);
     let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
     assert_eq!(rows, vec![1]);
-    srv.wait_for_output_contains("NOVAROCKS_GRPC_SUBMIT call=", Duration::from_secs(3));
     srv.wait_for_output_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3));
 }
 
@@ -1219,10 +1116,6 @@ deployment_owner = "fe-1"
     let _ = fe_grpc.release();
     let mut fe = ProcessGuard::spawn(fe_config.path());
     fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
-
-    // IW-4: role=fe exposes a report-capable NovaRocksGrpc endpoint, but it
-    // must remain report-only. Local fragments still run on BE, not FE.
-    assert_fe_report_only_endpoint_rejects_local_submit(fe_grpc_port);
 
     let mut conn = connect_mysql(fe_mysql_port);
 
@@ -1403,42 +1296,6 @@ deployment_owner = "fe-1"
 }
 
 #[test]
-fn submit_half_failure_cancels_attempted_submissions() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let cluster = ClusterHarness::start(
-        "",
-        r#"
-[debug]
-fault_inject_submit_fail_after = 1
-"#,
-    );
-
-    let mut conn = connect_mysql(cluster.fe_mysql);
-    let err = conn
-        .query::<String, _>(multi_submit_query_sql())
-        .expect_err("second fragment submit should fail");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("submit_fragment") || err_str.contains("submit"),
-        "expected submit failure, got: {err_str}"
-    );
-    assert!(
-        err_str.contains("debug submit fault injected"),
-        "expected injected submit failure, got: {err_str}"
-    );
-    wait_for_backend_query_lifecycle_termination(
-        cluster.be_grpc,
-        "coordinator_abort",
-        Duration::from_secs(3),
-    );
-}
-
-#[test]
 fn mysql_disconnect_triggers_cancel() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
@@ -1457,7 +1314,7 @@ emit_grpc_fragment_marker = true
     let stream = send_mysql_query(cluster.fe_mysql, disconnect_blocking_query_sql());
     cluster
         .be
-        .wait_for_output_contains("NOVAROCKS_GRPC_SUBMIT call=", Duration::from_secs(3));
+        .wait_for_output_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3));
     stream
         .shutdown(Shutdown::Both)
         .expect("shutdown raw mysql client");
@@ -1493,43 +1350,6 @@ fn query_timeout_triggers_cancel() {
 
     wait_for_backend_query_lifecycle_termination_any(
         cluster.be_grpc,
-        &["coordinator_abort", "local_failure"],
-        Duration::from_secs(5),
-    );
-}
-
-#[test]
-fn three_be_query_timeout_cancels_remote_fragments() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let mut cluster = MultiBeClusterHarness::start_n_be(
-        3,
-        r#"
-[debug]
-emit_grpc_fragment_marker = true
-"#,
-        "",
-    );
-
-    let mut conn = connect_mysql(cluster.fe_mysql_port());
-    assert_exact_live_backends(&mut conn, 3);
-    conn.query_drop("SET query_timeout = 1")
-        .expect("set query timeout");
-    let err = conn
-        .query::<String, _>(coordinated_sleep_query_sql())
-        .expect_err("query should time out while the 3-BE cluster is executing");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("timed out") || err_str.contains("timeout"),
-        "expected timeout error, got: {err_str}"
-    );
-
-    cluster.wait_for_be_submit_termination_coverage(
-        2,
         &["coordinator_abort", "local_failure"],
         Duration::from_secs(5),
     );
@@ -1947,48 +1767,6 @@ operator_buffer_chunks = 1
     target
         .join()
         .expect("old-generation target thread must join");
-}
-
-#[test]
-fn three_be_partial_submit_failure_cancels_attempted_fragments() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let mut cluster = MultiBeClusterHarness::start_n_be(
-        3,
-        r#"
-[debug]
-emit_grpc_fragment_marker = true
-"#,
-        r#"
-[debug]
-fault_inject_submit_fail_after = 2
-"#,
-    );
-
-    let mut conn = connect_mysql(cluster.fe_mysql_port());
-    assert_exact_live_backends(&mut conn, 3);
-    let err = conn
-        .query::<String, _>(multi_submit_query_sql())
-        .expect_err("a later fragment submit should hit the injected fault");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("submit_fragment") || err_str.contains("submit"),
-        "expected submit failure, got: {err_str}"
-    );
-    assert!(
-        err_str.contains("debug submit fault injected"),
-        "expected injected submit failure, got: {err_str}"
-    );
-
-    cluster.wait_for_be_submit_termination_coverage(
-        2,
-        &["coordinator_abort"],
-        Duration::from_secs(5),
-    );
 }
 
 #[test]

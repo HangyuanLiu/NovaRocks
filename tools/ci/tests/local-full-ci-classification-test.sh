@@ -144,6 +144,10 @@ if [ "$(ci_suite_cluster_size distributed-resilience)" != "3" ]; then
   echo "distributed-resilience must run with 3 BEs" >&2
   exit 1
 fi
+if ! grep -qx 'distributed-resilience' "$REPO_ROOT/tools/ci/suites/stable-sql-suites.txt"; then
+  echo "distributed-resilience must be part of the stable SQL suite set" >&2
+  exit 1
+fi
 if ci_native_cross_process_enabled; then
   echo "the duplicate native cross-process matrix must be disabled by default" >&2
   exit 1

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use novarocks::runtime::fragment::{DormantFragmentHandle, RunningFragmentHandle};
 
 pub(super) const FRAGMENT_EXECUTOR_FAILURE_MESSAGE: &str =
@@ -26,6 +27,7 @@ pub(super) const FRAGMENT_EXECUTOR_FAILURE_MESSAGE: &str =
 const FRAGMENT_FAILURE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAGMENT_FAILURE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+#[cfg(test)]
 pub(super) fn start_with_configured_fragment_failure_trigger(
     dormant: DormantFragmentHandle,
     failure_injection_eligible: bool,
@@ -34,6 +36,20 @@ pub(super) fn start_with_configured_fragment_failure_trigger(
     start_with_fragment_failure_trigger(dormant, trigger.as_deref(), failure_injection_eligible)
 }
 
+/// Claims the runner-owned failure rendezvous without making the fragment
+/// terminal. Stage workers use this form so the SQL runner can first observe
+/// the successful Stage batch and explicitly release the post-Start failure.
+pub(super) fn claim_configured_fragment_failure_trigger(
+    failure_injection_eligible: bool,
+) -> Result<Option<FragmentFailureRelease>, String> {
+    if !failure_injection_eligible {
+        return Ok(None);
+    }
+    let trigger = configured_fragment_failure_trigger();
+    consume_fragment_failure_trigger(trigger.as_deref())
+}
+
+#[cfg(test)]
 pub(super) fn start_with_fragment_failure_trigger(
     dormant: DormantFragmentHandle,
     failure_trigger: Option<&Path>,

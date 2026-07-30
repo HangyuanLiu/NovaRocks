@@ -261,6 +261,61 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 })?;
                 meta.kill_query_after_control_ready_count = Some(value);
             }
+            "fail_stage_prepare_ordinal" => {
+                let value = raw_value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid fail_stage_prepare_ordinal: {raw_value}"))?;
+                meta.fail_stage_prepare_ordinal = Some(value);
+            }
+            "drop_next_stage_ack_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid drop_next_stage_ack_be_index: {raw_value}")
+                })?;
+                meta.drop_next_stage_ack_be_index = Some(value);
+            }
+            "drop_next_start_ack_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid drop_next_start_ack_be_index: {raw_value}")
+                })?;
+                meta.drop_next_start_ack_be_index = Some(value);
+            }
+            "suppress_start_ack_be_index" => {
+                let value = raw_value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid suppress_start_ack_be_index: {raw_value}"))?;
+                meta.suppress_start_ack_be_index = Some(value);
+            }
+            "kill_query_at_lifecycle_phase" => {
+                meta.kill_query_at_lifecycle_phase = QueryLifecyclePhase::parse(&raw_value)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid kill_query_at_lifecycle_phase: {raw_value}; expected staging, staged, starting, or running"
+                        )
+                    })
+                    .map(Some)?;
+            }
+            "kill_fe_at_lifecycle_phase" => {
+                let phase = QueryLifecyclePhase::parse(&raw_value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged"
+                    )
+                })?;
+                if phase != QueryLifecyclePhase::Staged {
+                    bail!("invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged");
+                }
+                meta.kill_fe_at_lifecycle_phase = Some(phase);
+            }
+            "stop_query_control_heartbeat_after_stage_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!(
+                        "invalid stop_query_control_heartbeat_after_stage_be_index: {raw_value}"
+                    )
+                })?;
+                meta.stop_query_control_heartbeat_after_stage_be_index = Some(value);
+            }
+            "hold_start_until_early_ingress" => {
+                meta.hold_start_until_early_ingress = parse_bool(&raw_value)?;
+            }
             "query_control_fragment_backend_limit" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
                     format!("invalid query_control_fragment_backend_limit: {raw_value}")
@@ -419,6 +474,29 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),
+        fail_stage_prepare_ordinal: override_meta
+            .fail_stage_prepare_ordinal
+            .or(base.fail_stage_prepare_ordinal),
+        drop_next_stage_ack_be_index: override_meta
+            .drop_next_stage_ack_be_index
+            .or(base.drop_next_stage_ack_be_index),
+        drop_next_start_ack_be_index: override_meta
+            .drop_next_start_ack_be_index
+            .or(base.drop_next_start_ack_be_index),
+        suppress_start_ack_be_index: override_meta
+            .suppress_start_ack_be_index
+            .or(base.suppress_start_ack_be_index),
+        kill_query_at_lifecycle_phase: override_meta
+            .kill_query_at_lifecycle_phase
+            .or(base.kill_query_at_lifecycle_phase),
+        kill_fe_at_lifecycle_phase: override_meta
+            .kill_fe_at_lifecycle_phase
+            .or(base.kill_fe_at_lifecycle_phase),
+        stop_query_control_heartbeat_after_stage_be_index: override_meta
+            .stop_query_control_heartbeat_after_stage_be_index
+            .or(base.stop_query_control_heartbeat_after_stage_be_index),
+        hold_start_until_early_ingress: override_meta.hold_start_until_early_ingress
+            || base.hold_start_until_early_ingress,
         query_control_fragment_backend_limit: override_meta
             .query_control_fragment_backend_limit
             .or(base.query_control_fragment_backend_limit),
@@ -862,6 +940,14 @@ mod opt5_directive_tests {
             "-- @kill_fe_after_control_ready_count=3".to_string(),
             "-- @restart_be_after_init_ack_index=0".to_string(),
             "-- @kill_query_after_control_ready_count=2".to_string(),
+            "-- @fail_stage_prepare_ordinal=2".to_string(),
+            "-- @drop_next_stage_ack_be_index=1".to_string(),
+            "-- @drop_next_start_ack_be_index=2".to_string(),
+            "-- @suppress_start_ack_be_index=0".to_string(),
+            "-- @kill_query_at_lifecycle_phase=starting".to_string(),
+            "-- @kill_fe_at_lifecycle_phase=staged".to_string(),
+            "-- @stop_query_control_heartbeat_after_stage_be_index=1".to_string(),
+            "-- @hold_start_until_early_ingress=true".to_string(),
             "-- @query_control_fragment_backend_limit=2".to_string(),
         ];
 
@@ -872,6 +958,23 @@ mod opt5_directive_tests {
         assert_eq!(meta.kill_fe_after_control_ready_count, Some(3));
         assert_eq!(meta.restart_be_after_init_ack_index, Some(0));
         assert_eq!(meta.kill_query_after_control_ready_count, Some(2));
+        assert_eq!(meta.fail_stage_prepare_ordinal, Some(2));
+        assert_eq!(meta.drop_next_stage_ack_be_index, Some(1));
+        assert_eq!(meta.drop_next_start_ack_be_index, Some(2));
+        assert_eq!(meta.suppress_start_ack_be_index, Some(0));
+        assert_eq!(
+            meta.kill_query_at_lifecycle_phase,
+            Some(QueryLifecyclePhase::Starting)
+        );
+        assert_eq!(
+            meta.kill_fe_at_lifecycle_phase,
+            Some(QueryLifecyclePhase::Staged)
+        );
+        assert_eq!(
+            meta.stop_query_control_heartbeat_after_stage_be_index,
+            Some(1)
+        );
+        assert!(meta.hold_start_until_early_ingress);
         assert_eq!(meta.query_control_fragment_backend_limit, Some(2));
     }
 
@@ -903,12 +1006,39 @@ mod opt5_directive_tests {
                 "query_control_fragment_backend_limit=two",
                 "invalid query_control_fragment_backend_limit: two",
             ),
+            (
+                "fail_stage_prepare_ordinal=second",
+                "invalid fail_stage_prepare_ordinal: second",
+            ),
+            (
+                "drop_next_stage_ack_be_index=first",
+                "invalid drop_next_stage_ack_be_index: first",
+            ),
+            (
+                "drop_next_start_ack_be_index=first",
+                "invalid drop_next_start_ack_be_index: first",
+            ),
+            (
+                "suppress_start_ack_be_index=first",
+                "invalid suppress_start_ack_be_index: first",
+            ),
         ] {
             let error = parse_meta(&[format!("-- @{directive}")], &re)
                 .expect_err("invalid lifecycle directive must fail");
             assert!(
                 format!("{error:#}").contains(expected),
                 "unexpected error for {directive}: {error:#}"
+            );
+        }
+
+        for directive in [
+            "kill_query_at_lifecycle_phase=after-start",
+            "kill_fe_at_lifecycle_phase=running",
+            "hold_start_until_early_ingress=maybe",
+        ] {
+            assert!(
+                parse_meta(&[format!("-- @{directive}")], &re).is_err(),
+                "invalid lifecycle directive must fail: {directive}"
             );
         }
     }
@@ -1073,6 +1203,14 @@ mod opt5_directive_tests {
             kill_fe_after_control_ready_count: Some(2),
             restart_be_after_init_ack_index: Some(0),
             kill_query_after_control_ready_count: Some(1),
+            fail_stage_prepare_ordinal: Some(2),
+            drop_next_stage_ack_be_index: Some(0),
+            drop_next_start_ack_be_index: Some(1),
+            suppress_start_ack_be_index: Some(2),
+            kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Staging),
+            kill_fe_at_lifecycle_phase: Some(QueryLifecyclePhase::Staged),
+            stop_query_control_heartbeat_after_stage_be_index: Some(1),
+            hold_start_until_early_ingress: true,
             query_control_fragment_backend_limit: Some(2),
             ..QueryMeta::default()
         };
@@ -1082,6 +1220,23 @@ mod opt5_directive_tests {
         assert_eq!(inherited.kill_fe_after_control_ready_count, Some(2));
         assert_eq!(inherited.restart_be_after_init_ack_index, Some(0));
         assert_eq!(inherited.kill_query_after_control_ready_count, Some(1));
+        assert_eq!(inherited.fail_stage_prepare_ordinal, Some(2));
+        assert_eq!(inherited.drop_next_stage_ack_be_index, Some(0));
+        assert_eq!(inherited.drop_next_start_ack_be_index, Some(1));
+        assert_eq!(inherited.suppress_start_ack_be_index, Some(2));
+        assert_eq!(
+            inherited.kill_query_at_lifecycle_phase,
+            Some(QueryLifecyclePhase::Staging)
+        );
+        assert_eq!(
+            inherited.kill_fe_at_lifecycle_phase,
+            Some(QueryLifecyclePhase::Staged)
+        );
+        assert_eq!(
+            inherited.stop_query_control_heartbeat_after_stage_be_index,
+            Some(1)
+        );
+        assert!(inherited.hold_start_until_early_ingress);
         assert_eq!(inherited.query_control_fragment_backend_limit, Some(2));
 
         let override_meta = QueryMeta {
@@ -1090,6 +1245,12 @@ mod opt5_directive_tests {
             kill_fe_after_control_ready_count: Some(3),
             restart_be_after_init_ack_index: Some(2),
             kill_query_after_control_ready_count: Some(3),
+            fail_stage_prepare_ordinal: Some(4),
+            drop_next_stage_ack_be_index: Some(2),
+            drop_next_start_ack_be_index: Some(0),
+            suppress_start_ack_be_index: Some(1),
+            kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Running),
+            stop_query_control_heartbeat_after_stage_be_index: Some(2),
             query_control_fragment_backend_limit: Some(1),
             ..QueryMeta::default()
         };
@@ -1099,6 +1260,23 @@ mod opt5_directive_tests {
         assert_eq!(overridden.kill_fe_after_control_ready_count, Some(3));
         assert_eq!(overridden.restart_be_after_init_ack_index, Some(2));
         assert_eq!(overridden.kill_query_after_control_ready_count, Some(3));
+        assert_eq!(overridden.fail_stage_prepare_ordinal, Some(4));
+        assert_eq!(overridden.drop_next_stage_ack_be_index, Some(2));
+        assert_eq!(overridden.drop_next_start_ack_be_index, Some(0));
+        assert_eq!(overridden.suppress_start_ack_be_index, Some(1));
+        assert_eq!(
+            overridden.kill_query_at_lifecycle_phase,
+            Some(QueryLifecyclePhase::Running)
+        );
+        assert_eq!(
+            overridden.kill_fe_at_lifecycle_phase,
+            Some(QueryLifecyclePhase::Staged)
+        );
+        assert_eq!(
+            overridden.stop_query_control_heartbeat_after_stage_be_index,
+            Some(2)
+        );
+        assert!(overridden.hold_start_until_early_ingress);
         assert_eq!(overridden.query_control_fragment_backend_limit, Some(1));
     }
 

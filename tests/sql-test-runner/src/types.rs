@@ -97,6 +97,15 @@ pub struct QueryMeta {
     pub restart_be_after_init_ack_index: Option<usize>,
     /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
     pub kill_query_after_control_ready_count: Option<usize>,
+    /// Fail the local StageFragments build at this one-based fragment ordinal.
+    pub fail_stage_prepare_ordinal: Option<usize>,
+    pub drop_next_stage_ack_be_index: Option<usize>,
+    pub drop_next_start_ack_be_index: Option<usize>,
+    pub suppress_start_ack_be_index: Option<usize>,
+    pub kill_query_at_lifecycle_phase: Option<QueryLifecyclePhase>,
+    pub kill_fe_at_lifecycle_phase: Option<QueryLifecyclePhase>,
+    pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,
+    pub hold_start_until_early_ingress: bool,
     pub query_control_fragment_backend_limit: Option<usize>,
     /// After the step SQL executes, poll `SHOW ALTER TABLE COLUMN` until FINISHED.
     /// Value is the table name.
@@ -131,6 +140,38 @@ pub struct QueryMeta {
     pub be_log_exact_fragment_cancellation: Option<usize>,
     /// Run a fresh external BRPC negative compatibility fixture after the SQL step.
     pub compat_probes: Vec<String>,
+}
+
+/// Runner-visible QLC-3 startup boundaries. The backend and frontend consume
+/// the matching runner-owned fault files; the runner keeps this enum typed so
+/// malformed SQL directives fail during parsing instead of at execution time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLifecyclePhase {
+    Staging,
+    Staged,
+    Starting,
+    Running,
+}
+
+impl QueryLifecyclePhase {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "staging" => Some(Self::Staging),
+            "staged" => Some(Self::Staged),
+            "starting" => Some(Self::Starting),
+            "running" => Some(Self::Running),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Staged => "staged",
+            Self::Starting => "starting",
+            Self::Running => "running",
+        }
+    }
 }
 
 impl QueryMeta {

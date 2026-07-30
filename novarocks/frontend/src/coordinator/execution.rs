@@ -19,13 +19,14 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
-    DispatchingConnectorBindingBarrier, PreparedNativeExecutionParts,
+    DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
     new_grpc_connector_binding_dispatcher,
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
@@ -394,6 +395,42 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         }))
     }
 
+    fn stage_fragments(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        request: &novarocks::query_execution::lifecycle::QueryStageRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryStageAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(novarocks::query_execution::lifecycle::QueryStageAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            novarocks::query_execution::lifecycle::QueryStageOutcome::Applied,
+            "test participant staged",
+        ))
+    }
+
+    fn start_prepared_query(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        request: &novarocks::query_execution::lifecycle::QueryStartRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryStartAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(novarocks::query_execution::lifecycle::QueryStartAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            novarocks::query_execution::lifecycle::QueryStartOutcome::Applied,
+            "test participant started",
+        ))
+    }
+
     fn abort_query(
         &self,
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
@@ -566,6 +603,9 @@ impl FrontendDistributedQueryCoordinator {
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     ) -> Self {
+        let topology = crate::topology::ClusterBackendService::from_captured_targets_for_test(
+            &scheduler.live_targets(),
+        );
         Self::new_for_test_with_topology(
             query_id,
             report_endpoint,
@@ -574,7 +614,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             _test_fixture,
             lifecycle_transport,
-            Arc::new(crate::topology::FrontendTopologyController::new(1)),
+            Arc::new(topology),
         )
     }
 
@@ -760,6 +800,10 @@ impl FrontendDistributedQueryCoordinator {
             Duration::from_millis(runtime.query_control_heartbeat_timeout_ms),
             Duration::from_millis(runtime.query_control_init_rpc_timeout_ms),
             Duration::from_millis(runtime.query_control_attach_timeout_ms),
+        )?
+        .with_stage_start_timeouts(
+            Duration::from_millis(runtime.query_control_stage_rpc_timeout_ms),
+            Duration::from_millis(runtime.query_control_start_rpc_timeout_ms),
         )?;
         let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
             Arc::clone(&backend_services.lifecycle_transport),
@@ -786,13 +830,34 @@ impl FrontendDistributedQueryCoordinator {
                 control: Arc::clone(&self.connector_control),
             }),
         );
-        let execution = scheduled
+        let stage_prepared = scheduled
             .initialize_query(init_options, &lifecycle_barrier)?
             .prepare_connector_bindings(&connector_bindings)?
-            .assemble()?;
+            .prepare_stage()?;
         self.dispatch_ready_connector_retires(connector_binding_dispatcher.as_ref());
-        let PreparedNativeExecutionParts {
-            submissions,
+        let registration = stage_prepared.execution_registration_view();
+        let submitted_instance_ids = registration
+            .attempted_instances()
+            .iter()
+            .map(|(_, finst_id)| *finst_id)
+            .collect::<Vec<_>>();
+        let writer_identities = registration.writer_identities().to_vec();
+        if let Err(error) = self.registry.set_execution_instances(
+            query_id,
+            registration.attempted_instances(),
+            &writer_identities,
+        ) {
+            return Err(error);
+        }
+        let staged = stage_prepared.stage(&lifecycle_barrier)?;
+        for batch in staged.batches() {
+            self.backend_topology.record_successful_stage(
+                batch.binding().target().backend_idx(),
+                batch.request().fragments().len(),
+            );
+        }
+        let execution = staged.start(&lifecycle_barrier)?;
+        let RunningNativeExecutionParts {
             root_fetch,
             writer_registrations,
             expected_output,
@@ -800,118 +865,7 @@ impl FrontendDistributedQueryCoordinator {
             connector_binding_lease: _connector_binding_lease,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);
-        let submitted_instance_ids = submissions
-            .iter()
-            .map(|submission| submission.fragment_instance_id())
-            .collect::<Vec<_>>();
         let writer_instance_ids = writer_registrations.fragment_instance_ids();
-        let writer_identities = writer_registrations.writer_identities();
-        if let Err(error) = self
-            .registry
-            .set_writer_instances(query_id, &writer_identities)
-        {
-            let kind = error.kind();
-            let message =
-                abort_query_lifecycle(&mut query_lifecycle_lease, error.message().to_string());
-            return Err(DistributedQueryError::new(kind, message));
-        }
-
-        let submission_count = submissions.len();
-        let mut submitted = 0usize;
-        for submission in submissions {
-            if parts.cancellation.is_cancelled() {
-                let error = self.fail_cancel_then_abort_query_lifecycle(
-                    query_id,
-                    &mut query_lifecycle_lease,
-                    "query cancelled before fragment submission",
-                );
-                if intent == DistributedQueryIntent::Write {
-                    break;
-                }
-                return Err(error);
-            }
-            let backend_idx = submission.backend_idx();
-            let finst_id = submission.fragment_instance_id();
-            if let Err(error) = self
-                .registry
-                .record_attempt(query_id, backend_idx, finst_id)
-            {
-                let message = abort_query_lifecycle(&mut query_lifecycle_lease, error.to_string());
-                let _ = self
-                    .registry
-                    .preserve_failure_context(query_id, message.clone());
-                if intent == DistributedQueryIntent::Write {
-                    break;
-                }
-                return Err(failed(message));
-            }
-            let submit_result = dispatcher.submit_fragment(backend_idx, submission.into_envelope());
-            if let Err(error) = self.registry.finish_attempt(query_id) {
-                let message = abort_query_lifecycle(&mut query_lifecycle_lease, error.to_string());
-                let _ = self
-                    .registry
-                    .preserve_failure_context(query_id, message.clone());
-                if intent == DistributedQueryIntent::Write {
-                    break;
-                }
-                return Err(failed(message));
-            }
-            if let Err(error) = submit_result {
-                let error = self.fail_cancel_then_abort_query_lifecycle(
-                    query_id,
-                    &mut query_lifecycle_lease,
-                    error,
-                );
-                if intent == DistributedQueryIntent::Write {
-                    break;
-                }
-                return Err(error);
-            }
-            self.backend_topology
-                .record_successful_fragment_submission(backend_idx);
-            submitted += 1;
-            if let Some(message) = self.registry.first_failure(query_id) {
-                if intent != DistributedQueryIntent::Write {
-                    let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
-                    return Err(failed(message));
-                }
-                break;
-            }
-        }
-        let submission_failure = self.registry.first_failure(query_id);
-        if submitted != submission_count
-            || submission_failure.is_some()
-            || parts.cancellation.is_cancelled()
-        {
-            let message = submission_failure.unwrap_or_else(|| {
-                if parts.cancellation.is_cancelled() {
-                    "query cancelled during fragment submission".to_string()
-                } else {
-                    "fragment submission stopped before completion".to_string()
-                }
-            });
-            if self.registry.first_failure(query_id).is_some() {
-                let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
-                let _ = self.registry.preserve_failure_context(query_id, message);
-            } else {
-                let _ = self.fail_cancel_then_abort_query_lifecycle(
-                    query_id,
-                    &mut query_lifecycle_lease,
-                    message,
-                );
-            }
-        }
-
-        if parts.cancellation.is_cancelled() {
-            let error = self.fail_cancel_then_abort_query_lifecycle(
-                query_id,
-                &mut query_lifecycle_lease,
-                "query cancelled after fragment submission",
-            );
-            if intent != DistributedQueryIntent::Write {
-                return Err(error);
-            }
-        }
         if let Some(message) = self.registry.first_failure(query_id)
             && intent != DistributedQueryIntent::Write
         {
@@ -1186,11 +1140,8 @@ fn abort_query_lifecycle(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackendServicesSource, FrontendLiveBackendTopology, FrontendReportEndpointBinding,
-    };
-    use novarocks::query_execution::backend::{CoordinatorReportEndpointSink, LiveBackendTarget};
-    use std::sync::Arc;
+    use super::FrontendReportEndpointBinding;
+    use novarocks::query_execution::backend::CoordinatorReportEndpointSink;
 
     #[test]
     fn ephemeral_report_endpoint_is_unavailable_until_the_bound_port_is_published() {
@@ -1207,63 +1158,5 @@ mod tests {
         binding
             .resolve()
             .expect("bound port publication makes the DNS endpoint available");
-    }
-
-    #[test]
-    fn live_backend_source_resolves_each_query_from_the_latest_injected_snapshot() {
-        let topology = Arc::new(FrontendLiveBackendTopology::new());
-        let source = BackendServicesSource::Live(Arc::clone(&topology));
-        let first: std::net::SocketAddr = "127.0.0.1:19071".parse().unwrap();
-        let second: std::net::SocketAddr = "127.0.0.1:19072".parse().unwrap();
-
-        assert!(
-            source.resolve().is_err(),
-            "an empty injected topology must not fall back to core globals or config"
-        );
-
-        topology.replace(1, vec![LiveBackendTarget::new(7, first, 11)]);
-        assert_eq!(
-            source
-                .resolve()
-                .expect("first injected topology")
-                .scheduler
-                .backend_entries(),
-            &[(7, first)]
-        );
-
-        topology.replace(2, vec![LiveBackendTarget::new(8, second, 12)]);
-        assert_eq!(
-            source
-                .resolve()
-                .expect("replacement injected topology")
-                .scheduler
-                .backend_entries(),
-            &[(8, second)]
-        );
-
-        topology.replace(1, vec![LiveBackendTarget::new(7, first, 11)]);
-        assert_eq!(
-            source
-                .resolve()
-                .expect("stale topology publication is ignored")
-                .scheduler
-                .backend_entries(),
-            &[(8, second)]
-        );
-    }
-
-    #[test]
-    fn frontend_query_lifecycle_live_transport_is_built_with_the_scheduler_snapshot() {
-        let topology = Arc::new(FrontendLiveBackendTopology::new());
-        let source = BackendServicesSource::Live(Arc::clone(&topology));
-        let endpoint = "127.0.0.1:19073".parse().expect("valid endpoint");
-        topology.replace(1, vec![LiveBackendTarget::new(7, endpoint, 21)]);
-
-        let services = source
-            .resolve()
-            .expect("one immutable snapshot builds every backend service");
-
-        assert_eq!(services.scheduler.backend_entries(), &[(7, endpoint)]);
-        assert_eq!(Arc::strong_count(&services.lifecycle_transport), 1);
     }
 }

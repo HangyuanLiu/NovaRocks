@@ -287,11 +287,7 @@ fn parse_probe_manifest(path: &Path) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for (index, line) in contents.lines().enumerate() {
         let (key, value) = line.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid compat probe manifest line {}: {}",
-                index + 1,
-                line
-            )
+            anyhow::anyhow!("invalid compat probe manifest line {}: {}", index + 1, line)
         })?;
         if !PROBE_MANIFEST_KEYS.contains(&key) {
             bail!("unknown probe manifest key: {key}");
@@ -316,11 +312,7 @@ fn require_value(values: &BTreeMap<String, String>, key: &str, expected: &str) -
     Ok(())
 }
 
-fn require_probe_value(
-    values: &BTreeMap<String, String>,
-    key: &str,
-    expected: &str,
-) -> Result<()> {
+fn require_probe_value(values: &BTreeMap<String, String>, key: &str, expected: &str) -> Result<()> {
     let actual = values.get(key).expect("required key checked");
     if actual != expected {
         bail!("invalid probe manifest {key}: expected {expected}, got {actual}");
@@ -386,7 +378,9 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     struct EnvGuard {
@@ -762,7 +756,7 @@ mod tests {
             &hook,
             r##"#!/usr/bin/env bash
 set -euo pipefail
-test "$*" = "cargo build --profile dev-opt -p novarocks-server -p novarocks --features compat --bin novarocks --bin starrocks-compat-probe"
+test "$*" = "cargo build --profile dev-opt -p novarocks-server -p novarocks-compat --features compat --bin novarocks --bin starrocks-compat-probe"
 mkdir -p "$CARGO_TARGET_DIR/dev-opt"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/dev-opt/novarocks"
 chmod +x "$CARGO_TARGET_DIR/dev-opt/novarocks"

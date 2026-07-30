@@ -47,7 +47,6 @@ struct ActiveQuery {
     profile_report_instances: BTreeSet<UniqueId>,
     has_failed_final_report: bool,
     first_failure: Option<String>,
-    submissions_inflight: usize,
     cancellation_requested: bool,
     cancellation_dispatched: bool,
     active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
@@ -111,7 +110,6 @@ impl FrontendQueryRegistry {
                     profile_report_instances: BTreeSet::new(),
                     has_failed_final_report: false,
                     first_failure: None,
-                    submissions_inflight: 0,
                     cancellation_requested: false,
                     cancellation_dispatched: false,
                     active_attempt: None,
@@ -254,6 +252,7 @@ impl FrontendQueryRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn record_attempt(
         &self,
         query_id: QueryId,
@@ -275,7 +274,41 @@ impl FrontendQueryRegistry {
             .entry(backend_idx)
             .or_default()
             .push(finst_id);
-        query.submissions_inflight += 1;
+        Ok(())
+    }
+
+    /// Registers every execution identity before Stage begins.  This closes
+    /// the race where a just-released worker can report before the frontend
+    /// has recorded its identity.
+    pub(crate) fn set_execution_instances(
+        &self,
+        query_id: QueryId,
+        instances: &[(usize, UniqueId)],
+        writer_identities: &[(UniqueId, i32)],
+    ) -> Result<(), DistributedQueryError> {
+        let mut active = self.active.lock().expect("frontend query registry lock");
+        let query = active
+            .get_mut(&query_key(query_id))
+            .ok_or_else(|| inactive_query(query_id))?;
+        if !query.attempted.is_empty() || !query.writer_instances.is_empty() {
+            return Err(contract_violation(
+                "frontend query execution identities are already registered",
+            ));
+        }
+        for &(backend_idx, finst_id) in instances {
+            query
+                .attempted
+                .entry(backend_idx)
+                .or_default()
+                .push(finst_id);
+        }
+        for &(finst_id, sink_id) in writer_identities {
+            if query.writer_instances.insert(finst_id, sink_id).is_some() {
+                return Err(contract_violation(
+                    "frontend query writer registration contains duplicate fragment instance",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -390,16 +423,17 @@ impl FrontendQueryRegistry {
         self.set_scheduled_backend_ownership(query_id, &ownership)
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_attempt(&self, query_id: QueryId) -> Result<(), DistributedQueryError> {
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
-        query.submissions_inflight = query
-            .submissions_inflight
-            .checked_sub(1)
-            .ok_or_else(|| contract_violation("frontend query submission accounting underflow"))?;
-        Ok(())
+        if self
+            .active
+            .lock()
+            .expect("frontend query registry lock")
+            .contains_key(&query_key(query_id))
+        {
+            return Ok(());
+        }
+        Err(inactive_query(query_id))
     }
 
     pub(crate) fn record_report(
@@ -507,6 +541,7 @@ impl FrontendQueryRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_writer_instances(
         &self,
         query_id: QueryId,

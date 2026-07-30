@@ -19,23 +19,27 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
+use novarocks::proto::{common, novarocks as proto_novarocks, plan};
 use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
     AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
     ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
     QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryTerminationReason, RuntimeFilterContribution,
+    QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
+    QueryStartRequest, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
+    StageDigestVersion, StageFragment,
 };
 use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
 use novarocks::runtime::query_options::QueryOptions;
+use prost::Message;
 
 use super::entry::QueryLifecyclePhase;
 use super::registry::{
     MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
-    QueryLifecycleRegistryConfig,
+    QueryLifecycleRegistryConfig, StageBuildDecision,
 };
 
 const LOCAL_BACKEND_ID: u64 = 7;
@@ -247,6 +251,11 @@ fn registry_config(max_active_entries: usize) -> QueryLifecycleRegistryConfig {
         tombstone_retention: Duration::from_millis(120_000),
         heartbeat_timeout: Duration::from_millis(5_000),
         pre_start_timeout: Duration::from_millis(30_000),
+        stage_max_fragments: 256,
+        max_active_staging: 32,
+        stage_max_encoded_bytes: 48 * 1024 * 1024,
+        stage_max_inflight_encoded_bytes: 256 * 1024 * 1024,
+        stage_max_dormant_workers: 512,
     }
 }
 
@@ -257,6 +266,19 @@ fn registry_with(
     registry_with_clock(
         runtime,
         max_active_entries,
+        Arc::new(ManualClock::default()),
+    )
+}
+
+fn registry_with_config(
+    runtime: RecordingLocalRuntime,
+    config: QueryLifecycleRegistryConfig,
+) -> Arc<QueryLifecycleRegistry> {
+    QueryLifecycleRegistry::new_with_clock(
+        LOCAL_BACKEND_ID,
+        LOCAL_START_EPOCH,
+        Arc::new(runtime),
+        config,
         Arc::new(ManualClock::default()),
     )
 }
@@ -449,6 +471,247 @@ fn attach_control(
                 .expect("valid control attach"),
         )
         .expect("control attaches")
+}
+
+fn stage_fragment(instance_id: UniqueId) -> StageFragment {
+    StageFragment::new(
+        plan::PlanFragment::default(),
+        proto_novarocks::InstanceParams {
+            fragment_instance_id: Some(common::UniqueId {
+                hi: instance_id.hi,
+                lo: instance_id.lo,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("valid stage fragment")
+}
+
+fn stage_request(
+    request: &QueryInitRequest,
+    digest_byte: u8,
+    instances: &[UniqueId],
+) -> QueryStageRequest {
+    QueryStageRequest::new(
+        request.manifest().execution_id(),
+        request.digest(),
+        StageDigestVersion::V1,
+        StageDigest::new([digest_byte; 32]),
+        instances.iter().copied().map(stage_fragment).collect(),
+    )
+    .expect("valid stage request")
+}
+
+#[test]
+fn stage_and_start_are_idempotent_after_control_ready() {
+    let expected = [UniqueId { hi: 8, lo: 1 }, UniqueId { hi: 8, lo: 2 }];
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = fragment_init_request_fixture(1_801, &expected);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _attachment = attach_control(&registry, &request);
+    let stage = stage_request(&request, 4, &[expected[1], expected[0]]);
+
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::Applied
+    );
+    assert_eq!(
+        registry.phase(request.manifest().execution_id()),
+        Some(QueryLifecyclePhase::Staged)
+    );
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::AlreadyApplied
+    );
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 5, &expected))
+            .outcome(),
+        QueryStageOutcome::RejectedConflict
+    );
+
+    let start = QueryStartRequest::new(
+        request.manifest().execution_id(),
+        StageDigestVersion::V1,
+        stage.digest(),
+    );
+    assert_eq!(
+        registry.start_prepared_query(start).outcome(),
+        QueryStartOutcome::Applied
+    );
+    assert_eq!(
+        registry.phase(request.manifest().execution_id()),
+        Some(QueryLifecyclePhase::Running)
+    );
+    assert_eq!(
+        registry.start_prepared_query(start).outcome(),
+        QueryStartOutcome::AlreadyStarted
+    );
+}
+
+#[test]
+fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
+    let expected = [UniqueId { hi: 9, lo: 1 }];
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = fragment_init_request_fixture(1_802, &expected);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 1, &expected))
+            .outcome(),
+        QueryStageOutcome::RejectedInvalidState
+    );
+    let _attachment = attach_control(&registry, &request);
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 1, &[]))
+            .outcome(),
+        QueryStageOutcome::RejectedInvalidBatch
+    );
+
+    let mismatched_digest = QueryStageRequest::new(
+        request.manifest().execution_id(),
+        novarocks::query_execution::lifecycle::ParticipantManifestDigest::new([7; 32]),
+        StageDigestVersion::V1,
+        StageDigest::new([1; 32]),
+        expected.iter().copied().map(stage_fragment).collect(),
+    )
+    .expect("well formed mismatched stage request");
+    assert_eq!(
+        registry.stage_fragments(mismatched_digest).outcome(),
+        QueryStageOutcome::RejectedConflict
+    );
+}
+
+#[test]
+fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = init_request_fixture(1_803, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _attachment = attach_control(&registry, &request);
+    let stage = stage_request(&request, 6, &[]);
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::Applied
+    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                request.manifest().execution_id(),
+                request.digest(),
+                "abort staged service participant",
+            )
+            .expect("valid abort"),
+        )
+        .expect("abort accepted");
+    assert_eq!(
+        registry
+            .start_prepared_query(QueryStartRequest::new(
+                request.manifest().execution_id(),
+                StageDigestVersion::V1,
+                stage.digest(),
+            ))
+            .outcome(),
+        QueryStartOutcome::RejectedTerminated
+    );
+}
+
+#[test]
+fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
+    let expected = [UniqueId { hi: 13, lo: 1 }];
+    let first = fragment_init_request_fixture(1_804, &expected);
+    let second = fragment_init_request_fixture(1_805, &expected);
+    let first_stage = stage_request(&first, 13, &expected);
+    let encoded_bytes =
+        novarocks::query_execution::lifecycle::contract::encode_query_stage_request(&first_stage)
+            .encoded_len();
+    let mut config = registry_config(8);
+    config.stage_max_fragments = 1;
+    config.stage_max_encoded_bytes = encoded_bytes;
+    config.stage_max_inflight_encoded_bytes = encoded_bytes;
+    config.stage_max_dormant_workers = 1;
+    let registry = registry_with_config(RecordingLocalRuntime::default(), config);
+
+    for request in [&first, &second] {
+        assert_eq!(
+            registry.init_query(request.clone()).outcome(),
+            QueryInitOutcome::Applied
+        );
+        let _attachment = attach_control(&registry, request);
+    }
+
+    assert_eq!(
+        registry.stage_fragments(first_stage.clone()).outcome(),
+        QueryStageOutcome::Applied
+    );
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&second, 14, &expected))
+            .outcome(),
+        QueryStageOutcome::RejectedCapacity
+    );
+
+    assert_eq!(
+        registry
+            .start_prepared_query(QueryStartRequest::new(
+                first.manifest().execution_id(),
+                StageDigestVersion::V1,
+                first_stage.digest(),
+            ))
+            .outcome(),
+        QueryStartOutcome::Applied
+    );
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&second, 14, &expected))
+            .outcome(),
+        QueryStageOutcome::Applied
+    );
+}
+
+#[test]
+fn stage_builder_limit_is_held_until_commit_or_drop() {
+    let expected = [UniqueId { hi: 14, lo: 1 }];
+    let first = fragment_init_request_fixture(1_806, &expected);
+    let second = fragment_init_request_fixture(1_807, &expected);
+    let mut config = registry_config(8);
+    config.max_active_staging = 1;
+    let registry = registry_with_config(RecordingLocalRuntime::default(), config);
+
+    for request in [&first, &second] {
+        assert_eq!(
+            registry.init_query(request.clone()).outcome(),
+            QueryInitOutcome::Applied
+        );
+        let _attachment = attach_control(&registry, request);
+    }
+
+    let permit = match registry.begin_stage(stage_request(&first, 15, &expected)) {
+        StageBuildDecision::Build(permit) => permit,
+        StageBuildDecision::Complete(ack) => panic!("first Stage must reserve a builder: {ack:?}"),
+    };
+    assert_eq!(
+        match registry.begin_stage(stage_request(&second, 16, &expected)) {
+            StageBuildDecision::Build(_) => QueryStageOutcome::Applied,
+            StageBuildDecision::Complete(ack) => ack.outcome(),
+        },
+        QueryStageOutcome::RejectedCapacity
+    );
+    drop(permit);
+    assert!(matches!(
+        registry.begin_stage(stage_request(&second, 16, &expected)),
+        StageBuildDecision::Build(_)
+    ));
 }
 
 #[test]

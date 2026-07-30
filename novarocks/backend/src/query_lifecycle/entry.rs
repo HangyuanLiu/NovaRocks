@@ -16,20 +16,25 @@
 // under the License.
 
 use std::collections::BTreeSet;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use novarocks::UniqueId;
 use novarocks::query_execution::lifecycle::{
     ParticipantManifest, ParticipantManifestDigest, QueryControlEvent, QueryInitOutcome,
-    QueryTerminationReason,
+    QueryTerminationReason, StageDigest,
 };
+
+use super::stage::StartGate;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueryLifecyclePhase {
     Initializing,
     Initialized,
     ControlAttached,
+    Staging,
+    Staged,
+    Running,
     Terminating,
     Tombstone,
 }
@@ -39,6 +44,7 @@ pub(crate) struct QueryLifecycleEntry {
     pub(crate) manifest: ParticipantManifest,
     pub(crate) state: Mutex<QueryLifecycleEntryState>,
     pub(crate) init_completed: Condvar,
+    pub(crate) stage_completed: Condvar,
 }
 
 pub(crate) struct QueryLifecycleEntryState {
@@ -57,6 +63,13 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) frontend_owner_epoch: Option<u64>,
     pub(crate) events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
     pub(crate) terminal_event_permit: Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
+    /// The opaque QLC-3 batch identity.  The state-only slice owns no fragment
+    /// workspace yet, but it still has to make Stage and Start idempotent.
+    pub(crate) stage_digest: Option<StageDigest>,
+    pub(crate) start_gate: Option<Arc<StartGate>>,
+    /// Backend-global accounting retained for a successfully staged bundle.
+    /// It is released exactly when Start or terminal cleanup wins.
+    pub(crate) stage_resources: Option<super::registry::StageResourceReservation>,
 }
 
 impl QueryLifecycleEntry {
@@ -83,8 +96,12 @@ impl QueryLifecycleEntry {
                 frontend_owner_epoch: None,
                 events: None,
                 terminal_event_permit: None,
+                stage_digest: None,
+                start_gate: None,
+                stage_resources: None,
             }),
             init_completed: Condvar::new(),
+            stage_completed: Condvar::new(),
         }
     }
 }
