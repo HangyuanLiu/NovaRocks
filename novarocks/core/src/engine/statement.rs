@@ -37,9 +37,9 @@ use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
-    ConnectorDataType, ConnectorDefaultValue, ConnectorInstanceId, ConnectorNamespaceIdentity,
-    ConnectorPartitionTransform, ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind,
-    CreatePolicy,
+    ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition,
+    ConnectorInstanceId, ConnectorNamespaceIdentity, ConnectorPartitionTransform,
+    ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind, CreatePolicy, DropPolicy,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
@@ -1171,11 +1171,6 @@ pub(crate) fn execute_drop_database_statement(
 ) -> Result<StatementResult, String> {
     let target =
         crate::engine::backend_resolver::resolve_namespace_target(state, name, current_catalog)?;
-    let backend = state
-        .connectors
-        .read()
-        .expect("connector registry read")
-        .catalog_backend(target.backend_name)?;
     if target.backend_name == "iceberg"
         && !crate::connector::metadata_namespace_exists(
             state.connector_control.as_ref(),
@@ -1202,14 +1197,36 @@ pub(crate) fn execute_drop_database_statement(
             Some(&target.namespace),
         )?;
     }
-    match backend.drop_namespace(&target.catalog, &target.namespace, force) {
-        Ok(()) => Ok(StatementResult::Ok),
-        Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
-        Err(err) if if_exists && target.backend_name == "iceberg" && err.contains("namespace") => {
-            Ok(StatementResult::Ok)
-        }
-        Err(err) => Err(err),
+    if force {
+        // FORCE is still decomposed by the legacy route until the view-aware
+        // application-level sequence is migrated as one unit.
+        let backend = state
+            .connectors
+            .read()
+            .expect("connector registry read")
+            .catalog_backend(target.backend_name)?;
+        return backend
+            .drop_namespace(&target.catalog, &target.namespace, true)
+            .map(|()| StatementResult::Ok);
     }
+    let instance_id = mutation_instance_id(&target.catalog)?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        ConnectorCatalogMutationOperation::DropNamespace {
+            namespace: ConnectorNamespaceIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace),
+            },
+            policy: if if_exists {
+                DropPolicy::NoOpIfMissing
+            } else {
+                DropPolicy::FailIfMissing
+            },
+        },
+        connector_context.clone(),
+    )?;
+    Ok(StatementResult::Ok)
 }
 
 pub(crate) fn execute_drop_table_statement(
@@ -1219,6 +1236,7 @@ pub(crate) fn execute_drop_table_statement(
     current_database: &str,
     if_exists: bool,
     _force: bool,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target = match crate::engine::backend_resolver::resolve_existing_table_target(
         state,
@@ -1235,22 +1253,15 @@ pub(crate) fn execute_drop_table_statement(
         }
         Err(err) => return Err(err),
     };
-    let backend = state
-        .connectors
-        .read()
-        .expect("connector registry read")
-        .catalog_backend(target.backend_name)?;
-    if target.backend_name != "iceberg" {
-        return Err(format!(
-            "standalone table backend `{}` is unavailable",
-            target.backend_name
-        ));
-    }
-    let dependency_ref = crate::mv::dependency::model::iceberg_table_object_ref(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    );
+    let dependency_ref = if target.backend_name == "iceberg" {
+        crate::mv::dependency::model::iceberg_table_object_ref(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )
+    } else {
+        crate::mv::dependency::model::starrocks_table_object_ref(&target.namespace, &target.table)
+    };
     match crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
         state,
         &target,
@@ -1268,8 +1279,26 @@ pub(crate) fn execute_drop_table_statement(
         Err(err) => return Err(err),
     }
     crate::engine::mv::dependency::ensure_no_downstream_dependencies(state, &dependency_ref)?;
-    match backend.drop_table(&target.catalog, &target.namespace, &target.table, if_exists) {
-        Ok(()) => {
+    let instance_id = mutation_instance_id(&target.catalog)?;
+    match crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        ConnectorCatalogMutationOperation::DropTable {
+            table: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            policy: if if_exists {
+                DropPolicy::NoOpIfMissing
+            } else {
+                DropPolicy::FailIfMissing
+            },
+            data_disposition: ConnectorDropTableDataDisposition::Purge,
+        },
+        connector_context.clone(),
+    ) {
+        Ok(_) => {
             if target.backend_name == "iceberg" {
                 state.catalog_service.invalidate_table(
                     &target.catalog,
@@ -1284,7 +1313,7 @@ pub(crate) fn execute_drop_table_statement(
             }
             Ok(StatementResult::Ok)
         }
-        Err(err) if if_exists && err.contains("table") => {
+        Err(err) if if_exists && err.contains("NotFound") => {
             if target.backend_name == "iceberg" {
                 cleanup_iceberg_drop_table_registration_if_exists(state, &target)?;
             }

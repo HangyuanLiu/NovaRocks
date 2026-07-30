@@ -2227,6 +2227,7 @@ impl StandaloneSession {
                     current_database,
                     stmt.if_exists,
                     stmt.force,
+                    connector_context,
                 )?;
                 match stmt.name.parts.as_slice() {
                     [table] => self
