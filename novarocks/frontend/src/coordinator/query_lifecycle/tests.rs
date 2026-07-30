@@ -1686,6 +1686,12 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     session
         .send(QueryControlCommand::Finalize)
         .expect("send finalize");
+    assert!(matches!(
+        session
+            .recv_timeout(Duration::from_secs(2))
+            .expect("TerminalSnapshot"),
+        QueryControlEvent::TerminalSnapshot { .. }
+    ));
     assert_eq!(
         session
             .recv_timeout(Duration::from_secs(2))
@@ -2124,6 +2130,19 @@ impl BackendQueryControl for LiveBackendControl {
         if self.manual_terminal_acks {
             return Ok(());
         }
+        self.events
+            .try_send(QueryControlEvent::TerminalSnapshot {
+                snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                    self.execution_id,
+                    self.backend.clone(),
+                    self.digest,
+                    Vec::new(),
+                )
+                .map_err(|error| {
+                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+                })?,
+            })
+            .map_err(live_control_error)?;
         self.events
             .try_send(QueryControlEvent::TerminationAccepted {
                 reason: QueryTerminationReason::CoordinatorFinalize,

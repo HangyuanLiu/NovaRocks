@@ -805,14 +805,14 @@ impl AttemptControl {
         });
         self.metrics.attempt_terminated();
         if errors.is_empty() {
-            let terminal_set = match self.wait_for_all_snapshots(self.config.terminal_ack_timeout())
-            {
-                Ok(terminal_set) => terminal_set,
-                Err(error) => {
-                    self.metrics.terminal_finalize_failure();
-                    return Err(failed(error));
-                }
-            };
+            let terminal_set =
+                match self.wait_for_all_snapshots(self.config.terminal_snapshot_timeout()) {
+                    Ok(terminal_set) => terminal_set,
+                    Err(error) => {
+                        self.metrics.terminal_finalize_failure();
+                        return Err(failed(error));
+                    }
+                };
             self.state.store(FINALIZED, Ordering::Release);
             tracing::info!(
                 query_id_high = self.execution_id.query_id().high(),
@@ -875,6 +875,20 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 // The stream's terminal send side may close immediately after
                 // accepting the ACK.  Once every immutable snapshot is stored,
                 // transport closure cannot revoke that completed terminal set.
+                return;
+            }
+            Err(error)
+                if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed)
+                    && control.state.load(Ordering::Acquire) == FINALIZING =>
+            {
+                // A Finalize command has already fenced normal execution. A
+                // stream can disappear before the snapshot frame; retain the
+                // participant slot and let its unary fallback complete it.
+                tracing::info!(
+                    backend_idx = session.target.backend_idx(),
+                    error = %error,
+                    "query lifecycle terminal stream closed; waiting for unary snapshot fallback"
+                );
                 return;
             }
             Err(error) => {

@@ -311,6 +311,9 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     if let Some(index) = meta.drop_next_terminal_ack_be_index {
         server.arm_terminal_ack_drop(index)?;
     }
+    if let Some(index) = meta.drop_terminal_snapshot_stream_be_index {
+        server.arm_terminal_snapshot_stream_drop(index)?;
+    }
     if let Some(phase) = meta.kill_query_at_lifecycle_phase {
         server.arm_kill_query_at_lifecycle_phase(phase)?;
     }

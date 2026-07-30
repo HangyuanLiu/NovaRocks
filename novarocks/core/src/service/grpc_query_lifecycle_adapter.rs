@@ -203,6 +203,10 @@ pub(crate) async fn handle_query_control_stream(
     let attach = decode_query_control_attach(&first).map_err(status_from_lifecycle_error)?;
     let execution_id = attach.execution_id();
     let heartbeat_stop = claim_backend_fault(QueryLifecycleFaultKind::HeartbeatStop, execution_id)?;
+    let terminal_snapshot_stream_drop = claim_backend_fault(
+        QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
+        execution_id,
+    )?;
     let attachment = ingress
         .attach_control(attach)
         .map_err(status_from_lifecycle_error)?;
@@ -215,6 +219,7 @@ pub(crate) async fn handle_query_control_stream(
         outbound_tx,
         shutdown,
         heartbeat_stop,
+        terminal_snapshot_stream_drop,
         execution_id,
     ));
     Ok(ReceiverStream::new(outbound_rx))
@@ -227,6 +232,7 @@ async fn run_attached_control_stream(
     outbound: tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
+    terminal_snapshot_stream_drop: Option<QueryLifecycleFaultScope>,
     execution_id: crate::query_execution::lifecycle::QueryExecutionId,
 ) {
     let first_event = tokio::select! {
@@ -364,6 +370,21 @@ async fn run_attached_control_stream(
                 let Some(event) = event else {
                     break;
                 };
+                if matches!(event, QueryControlEvent::TerminalSnapshot { .. })
+                    && let Some(scope) = terminal_snapshot_stream_drop.as_ref()
+                {
+                    eprintln!(
+                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                        scope.execution_id.query_id().high(),
+                        scope.execution_id.query_id().low(),
+                        scope.execution_id.attempt_id().get(),
+                        scope.backend_index,
+                        scope.backend_id,
+                        scope.start_epoch,
+                        scope.token,
+                    );
+                    break;
+                }
                 if !send_control_response(
                     &outbound,
                     Ok(encode_query_control_event(&event)),

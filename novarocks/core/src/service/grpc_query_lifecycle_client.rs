@@ -882,6 +882,10 @@ mod tests {
             QueryTerminationReason::CoordinatorAbort
         );
 
+        // QLC-4 keeps this stream writable after terminal control events so a
+        // retained snapshot can still be acknowledged. Drop the client-side
+        // session before awaiting graceful server shutdown.
+        drop(session);
         let _ = shutdown.send(());
         server.await.expect("join loopback server");
     }

@@ -145,6 +145,14 @@ impl FrontendQueryLifecycleConfig {
     pub(super) const fn terminal_ack_timeout(self) -> Duration {
         self.terminal_ack_timeout
     }
+
+    /// A stream-loss fallback starts only after the normal ACK window. The
+    /// first unary RPC is allowed the same bounded window, so Finalize must
+    /// not fail exactly when the fallback becomes eligible.
+    pub(super) fn terminal_snapshot_timeout(self) -> Duration {
+        self.terminal_ack_timeout
+            .saturating_add(self.terminal_ack_timeout)
+    }
 }
 
 pub(crate) struct FrontendQueryLifecycleBarrier {

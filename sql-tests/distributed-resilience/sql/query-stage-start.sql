@@ -115,3 +115,22 @@ SELECT SUM(left_side.payload) AS total
 FROM ${case_db}.stage_start left_side
 JOIN ${case_db}.stage_start right_side
   ON left_side.id = right_side.id;
+
+-- query 11
+-- Drop one participant's control stream before its TerminalSnapshot reaches
+-- FE. The immutable snapshot must arrive through unary fallback, and the
+-- finalized query must still consume the complete terminal set.
+-- @drop_terminal_snapshot_stream_be_index=0
+-- @query_control_fragment_backend_limit=2
+-- @result_contains=60
+-- @be_log_contains=NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED
+-- @be_log_contains=NOVAROCKS_QUERY_TERMINAL_FALLBACK_ACCEPTED
+SELECT SUM(left_side.payload) AS total
+FROM ${case_db}.stage_start left_side
+JOIN ${case_db}.stage_start right_side
+  ON left_side.id = right_side.id;
+
+-- query 12
+-- Health query after stream-loss fallback.
+-- @result_contains=3
+SELECT COUNT(*) FROM ${case_db}.stage_start;

@@ -2641,6 +2641,10 @@ mod pr3_tests {
         );
         assert_eq!(ingress.coordinator_lost.load(Ordering::SeqCst), 0);
 
+        // Terminal control streams remain open for QLC-4 snapshot delivery.
+        // Explicitly release both halves before waiting for server shutdown.
+        drop(events);
+        drop(tx);
         let _ = shutdown.send(());
         server.await.expect("join query lifecycle server");
     }

@@ -269,6 +269,16 @@ fn registry_config(max_active_entries: usize) -> QueryLifecycleRegistryConfig {
     }
 }
 
+fn wait_for_failed_terminal_freeze(registry: &QueryLifecycleRegistry) {
+    for _ in 0..100 {
+        if registry.metrics_snapshot().terminal_records_frozen > 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("failed terminal snapshot was not frozen within 100ms");
+}
+
 fn registry_with(
     runtime: RecordingLocalRuntime,
     max_active_entries: usize,
@@ -1394,12 +1404,15 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
     let runtime = RecordingLocalRuntime::default();
     let mut config = registry_config(8);
     config.tombstone_capacity = 1;
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    config.terminal_retention = Duration::from_millis(1);
+    let clock = Arc::new(ManualClock::default());
     let registry = QueryLifecycleRegistry::new_with_clock(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
         Arc::new(runtime.clone()),
         config,
-        Arc::new(ManualClock::default()),
+        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
     let fragment_instance_id = UniqueId { hi: 811, lo: 1 };
     let first = fragment_init_request_fixture(811, &[fragment_instance_id]);
@@ -1420,6 +1433,9 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
                 .expect("valid abort"),
         )
         .expect("first abort is accepted");
+    wait_for_failed_terminal_freeze(&registry);
+    clock.advance(Duration::from_millis(2));
+    registry.sweep_expired(clock.now());
 
     let second = init_request_fixture(812, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let second_execution = second.manifest().execution_id();
@@ -1472,12 +1488,15 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     let runtime = RecordingLocalRuntime::default();
     let mut config = registry_config(8);
     config.tombstone_capacity = 1;
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    config.terminal_retention = Duration::from_millis(1);
+    let clock = Arc::new(ManualClock::default());
     let registry = QueryLifecycleRegistry::new_with_clock(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
         Arc::new(runtime),
         config,
-        Arc::new(ManualClock::default()),
+        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
     let fragment_instance_id = UniqueId { hi: 814, lo: 1 };
     let first = fragment_init_request_fixture(814, &[fragment_instance_id]);
@@ -1498,6 +1517,9 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
                 .expect("valid abort"),
         )
         .expect("first abort is accepted");
+    wait_for_failed_terminal_freeze(&registry);
+    clock.advance(Duration::from_millis(2));
+    registry.sweep_expired(clock.now());
 
     let eviction = init_request_fixture(815, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let eviction_execution = eviction.manifest().execution_id();
@@ -1634,6 +1656,8 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
     let clock = Arc::new(ManualClock::default());
     let mut config = registry_config(8);
     config.tombstone_retention = Duration::from_millis(10);
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    config.terminal_retention = Duration::from_millis(1);
     let registry = QueryLifecycleRegistry::new_with_clock(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
@@ -1660,7 +1684,13 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
                 .expect("valid abort"),
         )
         .expect("abort is accepted");
+    wait_for_failed_terminal_freeze(&registry);
 
+    clock.advance(Duration::from_millis(11));
+    registry.sweep_expired(clock.now());
+    // The first sweep converts the expired retained record into a tombstone
+    // and starts the independently configured tombstone TTL at that moment.
+    // Advance it before the next incremental sweep reclaims the mapping.
     clock.advance(Duration::from_millis(11));
     registry.sweep_expired(clock.now());
     assert!(!registry.contains(first_execution));

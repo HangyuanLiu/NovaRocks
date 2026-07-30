@@ -35,6 +35,9 @@ pub enum QueryLifecycleFaultKind {
     /// The frontend stores the snapshot but deliberately withholds its stream
     /// acknowledgement, forcing the BE's unary terminal fallback.
     TerminalAckDrop,
+    /// Closes the query-control stream immediately before its terminal
+    /// snapshot would be sent, forcing unary delivery without stream ingress.
+    TerminalSnapshotStreamDrop,
 }
 
 impl QueryLifecycleFaultKind {
@@ -48,6 +51,7 @@ impl QueryLifecycleFaultKind {
             Self::HeartbeatStopAfterStage => "heartbeat-stop-after-stage",
             Self::RestartAfterInitAck => "restart-after-init-ack",
             Self::TerminalAckDrop => "terminal-ack-drop",
+            Self::TerminalSnapshotStreamDrop => "terminal-snapshot-stream-drop",
         }
     }
 }

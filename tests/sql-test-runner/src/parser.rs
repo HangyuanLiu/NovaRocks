@@ -291,6 +291,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 })?;
                 meta.drop_next_terminal_ack_be_index = Some(value);
             }
+            "drop_terminal_snapshot_stream_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid drop_terminal_snapshot_stream_be_index: {raw_value}")
+                })?;
+                meta.drop_terminal_snapshot_stream_be_index = Some(value);
+            }
             "kill_query_at_lifecycle_phase" => {
                 meta.kill_query_at_lifecycle_phase = QueryLifecyclePhase::parse(&raw_value)
                     .ok_or_else(|| {
@@ -495,6 +501,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         drop_next_terminal_ack_be_index: override_meta
             .drop_next_terminal_ack_be_index
             .or(base.drop_next_terminal_ack_be_index),
+        drop_terminal_snapshot_stream_be_index: override_meta
+            .drop_terminal_snapshot_stream_be_index
+            .or(base.drop_terminal_snapshot_stream_be_index),
         kill_query_at_lifecycle_phase: override_meta
             .kill_query_at_lifecycle_phase
             .or(base.kill_query_at_lifecycle_phase),

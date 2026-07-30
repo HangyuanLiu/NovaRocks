@@ -368,6 +368,9 @@ pub(crate) trait ServerHandle: Send {
     fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
         bail!("TerminalAck drop is unsupported by this server mode (index={index})")
     }
+    fn arm_terminal_snapshot_stream_drop(&mut self, index: usize) -> Result<()> {
+        bail!("TerminalSnapshot stream drop is unsupported by this server mode (index={index})")
+    }
     fn arm_kill_query_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
             "KILL QUERY lifecycle phase fault is unsupported by this server mode (phase={})",
@@ -828,6 +831,10 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, "terminal-ack-drop")
     }
 
+    fn terminal_snapshot_stream_drop_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "terminal-snapshot-stream-drop")
+    }
+
     fn heartbeat_stop_after_stage_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, "heartbeat-stop-after-stage")
     }
@@ -884,6 +891,10 @@ impl QueryLifecycleFaultFiles {
 
     fn publish_terminal_ack_drop(&self, index: usize) -> Result<String> {
         self.publish(self.terminal_ack_drop_path(index)?, index, None)
+    }
+
+    fn publish_terminal_snapshot_stream_drop(&self, index: usize) -> Result<String> {
+        self.publish(self.terminal_snapshot_stream_drop_path(index)?, index, None)
     }
 
     fn publish_heartbeat_stop_after_stage(&self, index: usize) -> Result<String> {
@@ -1425,6 +1436,22 @@ impl ServerHandle for CrossProcessServerHandle {
             "armed TerminalAck drop for cross-process BE[{index}] token={token} trigger={}",
             self.query_lifecycle_fault_files
                 .terminal_ack_drop_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_terminal_snapshot_stream_drop(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_terminal_snapshot_stream_drop(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "terminal-snapshot-stream-drop"), token.clone());
+        println!(
+            "armed TerminalSnapshot stream drop for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .terminal_snapshot_stream_drop_path(index)?
                 .display()
         );
         Ok(())
