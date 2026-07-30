@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_loss_cancels_all_attempted_instances_for_only_affected_queries_once() {
+    fn backend_loss_latches_only_affected_queries_once() {
         let registry = Arc::new(FrontendQueryRegistry::default());
         let affected_dispatcher = Arc::new(RecordingDispatcher::default());
         let unaffected_dispatcher = Arc::new(RecordingDispatcher::default());
@@ -225,13 +225,13 @@ mod tests {
             Some("backend 7 lost")
         );
         assert_eq!(registry.first_failure(unaffected_query), None);
-        assert_eq!(
-            *affected_dispatcher.cancellations.lock().unwrap(),
-            vec![(7, vec![finst_id(11)]), (8, vec![finst_id(12)])]
-        );
-        assert_eq!(
-            *affected_dispatcher.cancellation_query_ids.lock().unwrap(),
-            vec![affected_query, affected_query]
+        assert!(affected_dispatcher.cancellations.lock().unwrap().is_empty());
+        assert!(
+            affected_dispatcher
+                .cancellation_query_ids
+                .lock()
+                .unwrap()
+                .is_empty()
         );
         assert!(
             unaffected_dispatcher
@@ -240,16 +240,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            *second_affected_dispatcher.cancellations.lock().unwrap(),
-            vec![(7, vec![finst_id(31)]), (10, vec![finst_id(32)])]
+        assert!(
+            second_affected_dispatcher
+                .cancellations
+                .lock()
+                .unwrap()
+                .is_empty()
         );
-        assert_eq!(
-            *second_affected_dispatcher
+        assert!(
+            second_affected_dispatcher
                 .cancellation_query_ids
                 .lock()
-                .unwrap(),
-            vec![second_affected_query, second_affected_query]
+                .unwrap()
+                .is_empty()
         );
 
         assert!(activity.backend_lost(7).is_empty());
@@ -257,14 +260,13 @@ mod tests {
             registry.first_failure(affected_query).as_deref(),
             Some("backend 7 lost")
         );
-        assert_eq!(affected_dispatcher.cancellations.lock().unwrap().len(), 2);
-        assert_eq!(
+        assert!(affected_dispatcher.cancellations.lock().unwrap().is_empty());
+        assert!(
             second_affected_dispatcher
                 .cancellations
                 .lock()
                 .unwrap()
-                .len(),
-            2
+                .is_empty()
         );
     }
 
@@ -296,10 +298,7 @@ mod tests {
 
         let activity = backend_activity(Arc::clone(&registry));
         assert_eq!(activity.backend_lost(7), vec![query_id]);
-        assert_eq!(
-            *original_dispatcher.cancellations.lock().unwrap(),
-            vec![(7, vec![finst_id(41)])]
-        );
+        assert!(original_dispatcher.cancellations.lock().unwrap().is_empty());
         assert!(
             duplicate_dispatcher
                 .cancellations
@@ -310,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn production_event_sink_maps_backend_restart_to_exact_frontend_cancellation() {
+    fn production_event_sink_maps_backend_restart_to_frontend_failure() {
         let registry = Arc::new(FrontendQueryRegistry::default());
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let query_id = query_id(5);
@@ -329,14 +328,11 @@ mod tests {
             new_epoch: 8,
         });
 
-        assert_eq!(
-            dispatcher.cancellations.lock().unwrap().as_slice(),
-            [(12, vec![finst_id(51)])]
-        );
+        assert!(dispatcher.cancellations.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn backend_restart_only_cancels_queries_scheduled_on_the_old_generation() {
+    fn backend_restart_only_fails_queries_scheduled_on_the_old_generation() {
         let registry = Arc::new(FrontendQueryRegistry::default());
         let old_dispatcher = Arc::new(RecordingDispatcher::default());
         let new_dispatcher = Arc::new(RecordingDispatcher::default());
@@ -380,10 +376,7 @@ mod tests {
             Some("backend 12 restarted (epoch 7 -> 8)")
         );
         assert_eq!(registry.first_failure(new_query), None);
-        assert_eq!(
-            old_dispatcher.cancellations.lock().unwrap().as_slice(),
-            [(12, vec![finst_id(61)])]
-        );
+        assert!(old_dispatcher.cancellations.lock().unwrap().is_empty());
         assert!(
             new_dispatcher.cancellations.lock().unwrap().is_empty(),
             "a query scheduled from the already-published new topology must survive the old-generation restart event"
@@ -442,10 +435,9 @@ mod tests {
         );
         registry.finish_attempt(query_id).unwrap();
 
-        assert_eq!(
-            dispatcher.cancellations.lock().unwrap().as_slice(),
-            [(7, vec![finst_id(61)])],
-            "only attempted or unknown-outcome instances are cancelled"
+        assert!(
+            dispatcher.cancellations.lock().unwrap().is_empty(),
+            "backend failure must not bypass the lifecycle control stream"
         );
         assert!(
             registry.record_attempt(query_id, 8, finst_id(62)).is_err(),

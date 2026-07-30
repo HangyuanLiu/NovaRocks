@@ -231,6 +231,42 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     .with_context(|| format!("invalid restart_be_delay_ms: {}", raw_value))?;
                 meta.restart_be_delay_ms = Some(value);
             }
+            "drop_next_init_ack_be_index" => {
+                let value = raw_value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid drop_next_init_ack_be_index: {raw_value}"))?;
+                meta.drop_next_init_ack_be_index = Some(value);
+            }
+            "stop_query_control_heartbeat_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid stop_query_control_heartbeat_be_index: {raw_value}")
+                })?;
+                meta.stop_query_control_heartbeat_be_index = Some(value);
+            }
+            "kill_fe_after_control_ready_count" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid kill_fe_after_control_ready_count: {raw_value}")
+                })?;
+                meta.kill_fe_after_control_ready_count = Some(value);
+            }
+            "restart_be_after_init_ack_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid restart_be_after_init_ack_index: {raw_value}")
+                })?;
+                meta.restart_be_after_init_ack_index = Some(value);
+            }
+            "kill_query_after_control_ready_count" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid kill_query_after_control_ready_count: {raw_value}")
+                })?;
+                meta.kill_query_after_control_ready_count = Some(value);
+            }
+            "query_control_fragment_backend_limit" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid query_control_fragment_backend_limit: {raw_value}")
+                })?;
+                meta.query_control_fragment_backend_limit = Some(value);
+            }
             "wait_alter_column" => {
                 meta.wait_alter_column = Some(raw_value);
             }
@@ -368,6 +404,24 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         restart_be_delay_ms: override_meta
             .restart_be_delay_ms
             .or(base.restart_be_delay_ms),
+        drop_next_init_ack_be_index: override_meta
+            .drop_next_init_ack_be_index
+            .or(base.drop_next_init_ack_be_index),
+        stop_query_control_heartbeat_be_index: override_meta
+            .stop_query_control_heartbeat_be_index
+            .or(base.stop_query_control_heartbeat_be_index),
+        kill_fe_after_control_ready_count: override_meta
+            .kill_fe_after_control_ready_count
+            .or(base.kill_fe_after_control_ready_count),
+        restart_be_after_init_ack_index: override_meta
+            .restart_be_after_init_ack_index
+            .or(base.restart_be_after_init_ack_index),
+        kill_query_after_control_ready_count: override_meta
+            .kill_query_after_control_ready_count
+            .or(base.kill_query_after_control_ready_count),
+        query_control_fragment_backend_limit: override_meta
+            .query_control_fragment_backend_limit
+            .or(base.query_control_fragment_backend_limit),
         wait_alter_column: override_meta
             .wait_alter_column
             .clone()
@@ -800,6 +854,66 @@ mod opt5_directive_tests {
     }
 
     #[test]
+    fn parse_meta_parses_query_lifecycle_fault_directives() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @drop_next_init_ack_be_index=1".to_string(),
+            "-- @stop_query_control_heartbeat_be_index=2".to_string(),
+            "-- @kill_fe_after_control_ready_count=3".to_string(),
+            "-- @restart_be_after_init_ack_index=0".to_string(),
+            "-- @kill_query_after_control_ready_count=2".to_string(),
+            "-- @query_control_fragment_backend_limit=2".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse query lifecycle fault directives");
+
+        assert_eq!(meta.drop_next_init_ack_be_index, Some(1));
+        assert_eq!(meta.stop_query_control_heartbeat_be_index, Some(2));
+        assert_eq!(meta.kill_fe_after_control_ready_count, Some(3));
+        assert_eq!(meta.restart_be_after_init_ack_index, Some(0));
+        assert_eq!(meta.kill_query_after_control_ready_count, Some(2));
+        assert_eq!(meta.query_control_fragment_backend_limit, Some(2));
+    }
+
+    #[test]
+    fn parse_meta_rejects_invalid_query_lifecycle_fault_number_with_context() {
+        let re = meta_re();
+        for (directive, expected) in [
+            (
+                "drop_next_init_ack_be_index=first",
+                "invalid drop_next_init_ack_be_index: first",
+            ),
+            (
+                "stop_query_control_heartbeat_be_index=last",
+                "invalid stop_query_control_heartbeat_be_index: last",
+            ),
+            (
+                "kill_fe_after_control_ready_count=all",
+                "invalid kill_fe_after_control_ready_count: all",
+            ),
+            (
+                "restart_be_after_init_ack_index=middle",
+                "invalid restart_be_after_init_ack_index: middle",
+            ),
+            (
+                "kill_query_after_control_ready_count=some",
+                "invalid kill_query_after_control_ready_count: some",
+            ),
+            (
+                "query_control_fragment_backend_limit=two",
+                "invalid query_control_fragment_backend_limit: two",
+            ),
+        ] {
+            let error = parse_meta(&[format!("-- @{directive}")], &re)
+                .expect_err("invalid lifecycle directive must fail");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected error for {directive}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_expect_error_code_meta() {
         let re = meta_re();
         let lines = vec!["-- @expect_error_code=IcebergWriteDescriptorMismatch".to_string()];
@@ -949,6 +1063,43 @@ mod opt5_directive_tests {
         assert_eq!(merged.network_partition_be, Some(4));
         assert_eq!(merged.heartbeat_delay_ms, Some(750));
         assert_eq!(merged.restart_be_delay_ms, Some(1000));
+    }
+
+    #[test]
+    fn merge_meta_inherits_and_overrides_query_lifecycle_fault_directives() {
+        let base = QueryMeta {
+            drop_next_init_ack_be_index: Some(0),
+            stop_query_control_heartbeat_be_index: Some(1),
+            kill_fe_after_control_ready_count: Some(2),
+            restart_be_after_init_ack_index: Some(0),
+            kill_query_after_control_ready_count: Some(1),
+            query_control_fragment_backend_limit: Some(2),
+            ..QueryMeta::default()
+        };
+        let inherited = merge_meta(&base, &QueryMeta::default());
+        assert_eq!(inherited.drop_next_init_ack_be_index, Some(0));
+        assert_eq!(inherited.stop_query_control_heartbeat_be_index, Some(1));
+        assert_eq!(inherited.kill_fe_after_control_ready_count, Some(2));
+        assert_eq!(inherited.restart_be_after_init_ack_index, Some(0));
+        assert_eq!(inherited.kill_query_after_control_ready_count, Some(1));
+        assert_eq!(inherited.query_control_fragment_backend_limit, Some(2));
+
+        let override_meta = QueryMeta {
+            drop_next_init_ack_be_index: Some(2),
+            stop_query_control_heartbeat_be_index: Some(0),
+            kill_fe_after_control_ready_count: Some(3),
+            restart_be_after_init_ack_index: Some(2),
+            kill_query_after_control_ready_count: Some(3),
+            query_control_fragment_backend_limit: Some(1),
+            ..QueryMeta::default()
+        };
+        let overridden = merge_meta(&base, &override_meta);
+        assert_eq!(overridden.drop_next_init_ack_be_index, Some(2));
+        assert_eq!(overridden.stop_query_control_heartbeat_be_index, Some(0));
+        assert_eq!(overridden.kill_fe_after_control_ready_count, Some(3));
+        assert_eq!(overridden.restart_be_after_init_ack_index, Some(2));
+        assert_eq!(overridden.kill_query_after_control_ready_count, Some(3));
+        assert_eq!(overridden.query_control_fragment_backend_limit, Some(1));
     }
 
     #[test]

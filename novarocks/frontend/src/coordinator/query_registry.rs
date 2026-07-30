@@ -24,14 +24,19 @@ use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent, QueryId,
 };
 use novarocks::query_execution::fragment_transport::FragmentDispatcher;
+use novarocks::query_execution::lifecycle::QueryExecutionId;
 use novarocks::query_execution::write::NativeExecutionReport;
 
 type QueryKey = (i64, i64);
 
+pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
+    fn execution_id(&self) -> QueryExecutionId;
+
+    fn request_abort(&self, reason: String);
+}
+
 struct ActiveQuery {
-    query_id: QueryId,
     intent: DistributedQueryIntent,
-    dispatcher: Arc<dyn FragmentDispatcher>,
     scheduled_backends: BTreeMap<usize, u64>,
     attempted: BTreeMap<usize, Vec<UniqueId>>,
     writer_instances: BTreeMap<UniqueId, i32>,
@@ -45,6 +50,7 @@ struct ActiveQuery {
     submissions_inflight: usize,
     cancellation_requested: bool,
     cancellation_dispatched: bool,
+    active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
 }
 
 #[derive(Default)]
@@ -60,21 +66,41 @@ pub(crate) struct FrontendQueryRegistry {
     backend_topology: Mutex<BackendTopologyState>,
 }
 
+pub(crate) struct AttemptBackendOwnershipError {
+    error: DistributedQueryError,
+    backend_epoch_mismatch: bool,
+}
+
+impl AttemptBackendOwnershipError {
+    fn new(error: DistributedQueryError, backend_epoch_mismatch: bool) -> Self {
+        Self {
+            error,
+            backend_epoch_mismatch,
+        }
+    }
+
+    pub(crate) const fn is_backend_epoch_mismatch(&self) -> bool {
+        self.backend_epoch_mismatch
+    }
+
+    pub(crate) fn into_error(self) -> DistributedQueryError {
+        self.error
+    }
+}
+
 impl FrontendQueryRegistry {
     pub(crate) fn register(
         self: &Arc<Self>,
         query_id: QueryId,
         intent: DistributedQueryIntent,
-        dispatcher: Arc<dyn FragmentDispatcher>,
+        _dispatcher: Arc<dyn FragmentDispatcher>,
     ) -> Result<ActiveQueryGuard, DistributedQueryError> {
         let key = query_key(query_id);
         let mut active = self.active.lock().expect("frontend query registry lock");
         match active.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(ActiveQuery {
-                    query_id,
                     intent,
-                    dispatcher,
                     scheduled_backends: BTreeMap::new(),
                     attempted: BTreeMap::new(),
                     writer_instances: BTreeMap::new(),
@@ -88,6 +114,7 @@ impl FrontendQueryRegistry {
                     submissions_inflight: 0,
                     cancellation_requested: false,
                     cancellation_dispatched: false,
+                    active_attempt: None,
                 });
             }
             Entry::Occupied(_) => {
@@ -102,6 +129,129 @@ impl FrontendQueryRegistry {
             registry: Arc::clone(self),
             key,
         })
+    }
+
+    pub(crate) fn bind_active_attempt(
+        self: &Arc<Self>,
+        execution_id: QueryExecutionId,
+        control: Arc<dyn ActiveQueryAttemptControl>,
+    ) -> Result<ActiveQueryAttemptBinding, DistributedQueryError> {
+        if control.execution_id() != execution_id {
+            return Err(contract_violation(
+                "frontend active attempt control execution id differs from binding",
+            ));
+        }
+        let query_id = execution_id.query_id();
+        let mut active = self.active.lock().expect("frontend query registry lock");
+        let query = active
+            .get_mut(&query_key(query_id))
+            .ok_or_else(|| inactive_query(query_id))?;
+        if let Some(message) = &query.first_failure {
+            return Err(failed(message.clone()));
+        }
+        if query.cancellation_requested {
+            return Err(failed(
+                "frontend query cancellation was requested before lifecycle initialization",
+            ));
+        }
+        if query.active_attempt.is_some() {
+            return Err(contract_violation(
+                "frontend query already has an active attempt control binding",
+            ));
+        }
+        query.active_attempt = Some(control);
+        Ok(ActiveQueryAttemptBinding {
+            registry: Arc::downgrade(self),
+            key: query_key(query_id),
+            execution_id,
+        })
+    }
+
+    pub(crate) fn extend_attempt_backend_ownership(
+        &self,
+        query_id: QueryId,
+        backend_ownership: &[(usize, u64)],
+    ) -> Result<(), AttemptBackendOwnershipError> {
+        let topology = self
+            .backend_topology
+            .lock()
+            .expect("frontend backend topology gate lock");
+        if topology.initialized {
+            for &(backend_idx, start_epoch) in backend_ownership {
+                match topology.live_generations.get(&backend_idx) {
+                    Some(current_epoch) if *current_epoch == start_epoch => {}
+                    Some(current_epoch) => {
+                        return Err(AttemptBackendOwnershipError::new(
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::Rejected,
+                                format!(
+                                    "query lifecycle backend {backend_idx} generation {start_epoch} is stale; current generation is {current_epoch}"
+                                ),
+                            ),
+                            true,
+                        ));
+                    }
+                    None => {
+                        return Err(AttemptBackendOwnershipError::new(
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::Rejected,
+                                format!(
+                                    "query lifecycle backend {backend_idx} is no longer live in the current frontend topology"
+                                ),
+                            ),
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
+        drop(topology);
+
+        let mut active = self.active.lock().expect("frontend query registry lock");
+        let query = active
+            .get_mut(&query_key(query_id))
+            .ok_or_else(|| AttemptBackendOwnershipError::new(inactive_query(query_id), false))?;
+        for &(backend_idx, start_epoch) in backend_ownership {
+            match query.scheduled_backends.entry(backend_idx) {
+                Entry::Vacant(entry) => {
+                    entry.insert(start_epoch);
+                }
+                Entry::Occupied(entry) if *entry.get() == start_epoch => {}
+                Entry::Occupied(_) => {
+                    return Err(AttemptBackendOwnershipError::new(
+                        contract_violation(format!(
+                            "frontend query lifecycle backend {backend_idx} generation conflicts with scheduled ownership"
+                        )),
+                        false,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_active_attempt_abort(
+        &self,
+        query_id: QueryId,
+        reason: String,
+    ) -> Result<(), DistributedQueryError> {
+        let control = self
+            .active
+            .lock()
+            .expect("frontend query registry lock")
+            .get(&query_key(query_id))
+            .ok_or_else(|| inactive_query(query_id))?
+            .active_attempt
+            .clone()
+            .ok_or_else(|| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::Rejected,
+                    "frontend query has no active attempt control binding",
+                )
+            })?;
+        control.request_abort(reason);
+        Ok(())
     }
 
     pub(crate) fn record_attempt(
@@ -218,7 +368,7 @@ impl FrontendQueryRegistry {
                             "backend topology revision changed from {previous_revision} to {revision}"
                         )
                     });
-                    request_cancellation(query)
+                    Some(request_cancellation(query))
                 })
                 .collect::<Vec<_>>()
         };
@@ -241,18 +391,14 @@ impl FrontendQueryRegistry {
     }
 
     pub(crate) fn finish_attempt(&self, query_id: QueryId) -> Result<(), DistributedQueryError> {
-        let cancellation = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            let query = active
-                .get_mut(&query_key(query_id))
-                .ok_or_else(|| inactive_query(query_id))?;
-            query.submissions_inflight =
-                query.submissions_inflight.checked_sub(1).ok_or_else(|| {
-                    contract_violation("frontend query submission accounting underflow")
-                })?;
-            cancellation_if_ready(query)
-        };
-        dispatch_cancellation(cancellation);
+        let mut active = self.active.lock().expect("frontend query registry lock");
+        let query = active
+            .get_mut(&query_key(query_id))
+            .ok_or_else(|| inactive_query(query_id))?;
+        query.submissions_inflight = query
+            .submissions_inflight
+            .checked_sub(1)
+            .ok_or_else(|| contract_violation("frontend query submission accounting underflow"))?;
         Ok(())
     }
 
@@ -350,8 +496,7 @@ impl FrontendQueryRegistry {
                 query
                     .first_failure
                     .is_some()
-                    .then(|| request_cancellation(query))
-                    .flatten(),
+                    .then(|| request_cancellation(query)),
                 unexpected_writer_error.or(conflicting_writer_error),
             )
         };
@@ -431,7 +576,7 @@ impl FrontendQueryRegistry {
                 .clone();
             (message, request_cancellation(query))
         };
-        dispatch_cancellation(cancellation);
+        dispatch_cancellation(Some(cancellation));
         Ok(message)
     }
 
@@ -495,17 +640,13 @@ impl FrontendQueryRegistry {
                     query.first_failure = Some(message.clone());
                     affected.push(QueryId::new(high, low));
                 }
-                if let Some(cancellation) = request_cancellation(query) {
-                    cancellations.push(cancellation);
-                }
+                cancellations.push(request_cancellation(query));
             }
             (affected, cancellations)
         };
 
-        for (dispatcher, query_id, attempted) in cancellations {
-            for (backend_idx, finst_ids) in attempted {
-                dispatcher.cancel_fragments(backend_idx, query_id, &finst_ids);
-            }
+        for cancellation in cancellations {
+            dispatch_cancellation(Some(cancellation));
         }
         affected
     }
@@ -530,17 +671,13 @@ impl FrontendQueryRegistry {
                     query.first_failure = Some(message.clone());
                     affected.push(QueryId::new(high, low));
                 }
-                if let Some(cancellation) = request_cancellation(query) {
-                    cancellations.push(cancellation);
-                }
+                cancellations.push(request_cancellation(query));
             }
             (affected, cancellations)
         };
 
-        for (dispatcher, query_id, attempted) in cancellations {
-            for (backend_idx, finst_ids) in attempted {
-                dispatcher.cancel_fragments(backend_idx, query_id, &finst_ids);
-            }
+        for cancellation in cancellations {
+            dispatch_cancellation(Some(cancellation));
         }
         affected
     }
@@ -561,11 +698,37 @@ impl FrontendQueryRegistry {
             .expect("frontend query registry lock")
             .remove(&key);
     }
+
+    fn clear_active_attempt(&self, key: QueryKey, execution_id: QueryExecutionId) {
+        let mut active = self.active.lock().expect("frontend query registry lock");
+        if let Some(query) = active.get_mut(&key)
+            && query
+                .active_attempt
+                .as_ref()
+                .is_some_and(|control| control.execution_id() == execution_id)
+        {
+            query.active_attempt = None;
+        }
+    }
 }
 
 pub(crate) struct ActiveQueryGuard {
     registry: Arc<FrontendQueryRegistry>,
     key: QueryKey,
+}
+
+pub(crate) struct ActiveQueryAttemptBinding {
+    registry: std::sync::Weak<FrontendQueryRegistry>,
+    key: QueryKey,
+    execution_id: QueryExecutionId,
+}
+
+impl Drop for ActiveQueryAttemptBinding {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.clear_active_attempt(self.key, self.execution_id);
+        }
+    }
 }
 
 impl Drop for ActiveQueryGuard {
@@ -574,40 +737,35 @@ impl Drop for ActiveQueryGuard {
     }
 }
 
-type DispatcherCancellation = (
-    Arc<dyn FragmentDispatcher>,
-    QueryId,
-    Vec<(usize, Vec<UniqueId>)>,
-);
+struct CancellationDispatch {
+    active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
+    reason: String,
+}
 
-fn request_cancellation(query: &mut ActiveQuery) -> Option<DispatcherCancellation> {
+fn request_cancellation(query: &mut ActiveQuery) -> CancellationDispatch {
     query.cancellation_requested = true;
-    cancellation_if_ready(query)
-}
-
-fn cancellation_if_ready(query: &mut ActiveQuery) -> Option<DispatcherCancellation> {
-    if !query.cancellation_requested
-        || query.cancellation_dispatched
-        || query.submissions_inflight != 0
-    {
-        return None;
+    let active_attempt = if query.cancellation_dispatched {
+        None
+    } else {
+        let control = query.active_attempt.clone();
+        if control.is_some() {
+            query.cancellation_dispatched = true;
+        }
+        control
+    };
+    CancellationDispatch {
+        active_attempt,
+        reason: query
+            .first_failure
+            .clone()
+            .unwrap_or_else(|| "frontend query cancellation requested".to_string()),
     }
-    query.cancellation_dispatched = true;
-    Some((
-        Arc::clone(&query.dispatcher),
-        query.query_id,
-        query
-            .attempted
-            .iter()
-            .map(|(&backend_idx, finst_ids)| (backend_idx, finst_ids.clone()))
-            .collect(),
-    ))
 }
 
-fn dispatch_cancellation(cancellation: Option<DispatcherCancellation>) {
-    if let Some((dispatcher, query_id, attempted)) = cancellation {
-        for (backend_idx, finst_ids) in attempted {
-            dispatcher.cancel_fragments(backend_idx, query_id, &finst_ids);
+fn dispatch_cancellation(cancellation: Option<CancellationDispatch>) {
+    if let Some(cancellation) = cancellation {
+        if let Some(control) = cancellation.active_attempt {
+            control.request_abort(cancellation.reason);
         }
     }
 }

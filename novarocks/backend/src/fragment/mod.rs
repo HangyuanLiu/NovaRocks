@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod control;
+pub(crate) mod control;
 mod event_io;
 mod failure_injection;
 mod io;

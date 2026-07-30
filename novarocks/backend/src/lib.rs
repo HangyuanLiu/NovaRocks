@@ -1,5 +1,6 @@
 mod application;
 mod fragment;
+mod query_lifecycle;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,

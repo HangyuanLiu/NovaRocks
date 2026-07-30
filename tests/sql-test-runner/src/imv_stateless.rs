@@ -156,7 +156,7 @@ pub(crate) fn run_imv_stateless_l2_case(
     // Phase A: cluster A owns the lake, creates the MV, and refreshes it.
     // -----------------------------------------------------------------
     let cluster_a =
-        CrossProcessServerHandle::launch(case.cluster_size, repo_root, runner_config)
+        CrossProcessServerHandle::launch(case.cluster_size, repo_root, runner_config, false)
             .context("launch cluster A for L2 statelessness case")?;
     let conn = connection_config(&cluster_a)?;
     let mut session =

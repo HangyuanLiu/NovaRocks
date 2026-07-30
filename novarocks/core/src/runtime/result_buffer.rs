@@ -111,11 +111,10 @@ impl ResultBufferWriteHandle {
             ResultAbort::PrepareRollback | ResultAbort::NeverStarted => {
                 discard(self.fragment_instance_id)
             }
-            ResultAbort::Failed => close_error(
-                self.fragment_instance_id,
-                "fragment result session aborted after execution failure".to_string(),
-            ),
-            ResultAbort::Cancelled => cancel(self.fragment_instance_id),
+            ResultAbort::Failed(error) => close_error(self.fragment_instance_id, error),
+            ResultAbort::Cancelled(reason) => {
+                cancel_with_message(self.fragment_instance_id, reason)
+            }
         }
         *state = ResultBufferWriteState::Aborted;
     }
@@ -415,6 +414,10 @@ pub(crate) fn close_error(finst_id: UniqueId, message: String) {
 }
 
 pub(crate) fn cancel(finst_id: UniqueId) {
+    cancel_with_message(finst_id, "Cancelled".to_string());
+}
+
+fn cancel_with_message(finst_id: UniqueId, message: String) {
     let c = ctx();
     {
         let mut guard = c.mu.lock().expect("ctx lock");
@@ -423,7 +426,7 @@ pub(crate) fn cancel(finst_id: UniqueId) {
             .or_insert_with(BufferControlBlock::new);
         block.cancelled = true;
         if block.cancel_message.is_none() {
-            block.cancel_message = Some("Cancelled".to_string());
+            block.cancel_message = Some(message);
         }
         block.queue.clear();
         block.typed_queue.clear();
@@ -791,8 +794,8 @@ mod tests {
         let finst_id = UniqueId { hi: 9903, lo: 9904 };
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
 
-        handle.abort(ResultAbort::Cancelled);
-        handle.abort(ResultAbort::Failed);
+        handle.abort(ResultAbort::Cancelled("Cancelled".to_string()));
+        handle.abort(ResultAbort::Failed("late failure".to_string()));
         assert!(
             handle
                 .write_legacy(FetchResult {
@@ -809,6 +812,24 @@ mod tests {
     }
 
     #[test]
+    fn fragment_result_session_failure_preserves_execution_error() {
+        let finst_id = UniqueId { hi: 9907, lo: 9908 };
+        let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
+
+        handle.abort(ResultAbort::Failed(
+            "assert_num_rows failed: actual=2 row(s), expected = 1 row(s)".to_string(),
+        ));
+
+        let TryFetchResult::Error(error) = try_fetch(finst_id) else {
+            panic!("expected failed result");
+        };
+        assert_eq!(
+            error.message,
+            "assert_num_rows failed: actual=2 row(s), expected = 1 row(s)"
+        );
+    }
+
+    #[test]
     fn fragment_result_session_late_abort_preserves_finished_result() {
         let finst_id = UniqueId { hi: 9905, lo: 9906 };
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
@@ -820,7 +841,7 @@ mod tests {
             })
             .expect("write result");
         handle.finish().expect("finish result");
-        handle.abort(ResultAbort::Cancelled);
+        handle.abort(ResultAbort::Cancelled("Cancelled".to_string()));
 
         let TryFetchResult::Ready(result) = try_fetch(finst_id) else {
             panic!("late abort must not discard a finished result");

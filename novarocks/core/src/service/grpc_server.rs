@@ -24,10 +24,12 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
+#[cfg(feature = "compat")]
+use axum::routing::{post, put};
+use axum::{Extension, Router};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -50,14 +52,16 @@ use crate::connector::starrocks::starmgr;
 #[cfg(feature = "compat")]
 use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
+use crate::query_execution::lifecycle::QueryLifecycleIngress;
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
-use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
-use crate::service::grpc_runtime_filter_install_adapter::{
-    RuntimeFilterDeploymentIngress, query_scoped_runtime_filter_deployment_ingress,
+use crate::service::grpc_query_lifecycle_adapter::{
+    QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
+    status_from_lifecycle_error,
 };
+use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
 use crate::service::internal_rpc;
 use crate::service::metrics_http;
 use crate::service::native_fragment_ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
@@ -85,8 +89,63 @@ static STANDALONE_GRPC_STARTUP_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
 struct RejectingTestNativeFragmentIngress;
 
 #[cfg(test)]
+struct RejectingTestQueryLifecycleIngress;
+
+#[cfg(test)]
 pub(crate) fn rejecting_test_native_fragment_ingress() -> Arc<dyn NativeFragmentIngress> {
     Arc::new(RejectingTestNativeFragmentIngress)
+}
+
+#[cfg(test)]
+pub(crate) fn rejecting_test_query_lifecycle_ingress() -> Arc<dyn QueryLifecycleIngress> {
+    Arc::new(RejectingTestQueryLifecycleIngress)
+}
+
+#[cfg(test)]
+impl QueryLifecycleIngress for RejectingTestQueryLifecycleIngress {
+    fn bind_backend_identity(
+        &self,
+        _backend_id: u64,
+    ) -> Result<(), crate::query_execution::lifecycle::QueryLifecycleError> {
+        Ok(())
+    }
+
+    fn init_query(
+        &self,
+        request: crate::query_execution::lifecycle::QueryInitRequest,
+    ) -> crate::query_execution::lifecycle::QueryInitAck {
+        crate::query_execution::lifecycle::QueryInitAck::new(
+            request.manifest().execution_id(),
+            request.digest(),
+            crate::query_execution::lifecycle::QueryInitOutcome::RejectedInvalidManifest,
+        )
+    }
+
+    fn abort_query(
+        &self,
+        request: crate::query_execution::lifecycle::QueryAbortRequest,
+    ) -> Result<
+        crate::query_execution::lifecycle::QueryTerminationAck,
+        crate::query_execution::lifecycle::QueryLifecycleError,
+    > {
+        Ok(crate::query_execution::lifecycle::QueryTerminationAck::new(
+            request.execution_id(),
+            crate::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
+        ))
+    }
+
+    fn attach_control(
+        &self,
+        _attach: crate::query_execution::lifecycle::QueryControlAttach,
+    ) -> Result<
+        crate::query_execution::lifecycle::QueryControlAttachment,
+        crate::query_execution::lifecycle::QueryLifecycleError,
+    > {
+        Err(crate::query_execution::lifecycle::QueryLifecycleError::new(
+            crate::query_execution::lifecycle::QueryLifecycleErrorCode::Terminated,
+            "test query lifecycle ingress rejects attach",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -192,9 +251,10 @@ fn pause_standalone_grpc_startup_after_reservation() {
 pub struct GrpcService {
     allow_local_execution: bool,
     native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
+    query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
+    query_control_shutdown: Option<watch::Receiver<bool>>,
     report_handler: Arc<dyn NativeReportHandler>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
-    runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
     #[cfg(test)]
     execution_owned_finsts: Option<Arc<Mutex<BTreeSet<crate::common::types::UniqueId>>>>,
     #[cfg(test)]
@@ -225,14 +285,15 @@ impl NativeReportHandler for AcceptingTestNativeReportHandler {
 impl GrpcService {
     pub fn with_fragment_execution(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+        query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Self {
         Self::with_handlers(
             true,
             Some(native_fragment_ingress),
+            Some(query_lifecycle_ingress),
             report_handler,
             query_scoped_runtime_filter_envelope_ingress(),
-            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
@@ -243,9 +304,9 @@ impl GrpcService {
         Self::with_handlers(
             true,
             None,
+            None,
             report_handler,
             query_scoped_runtime_filter_envelope_ingress(),
-            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
@@ -253,25 +314,26 @@ impl GrpcService {
         Self::with_handlers(
             false,
             None,
+            None,
             report_handler,
             query_scoped_runtime_filter_envelope_ingress(),
-            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
     fn with_handlers(
         allow_local_execution: bool,
         native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
+        query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
         report_handler: Arc<dyn NativeReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
-        runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
     ) -> Self {
         Self {
             allow_local_execution,
             native_fragment_ingress,
+            query_lifecycle_ingress,
+            query_control_shutdown: None,
             report_handler,
             runtime_filter_envelope_ingress,
-            runtime_filter_deployment_ingress,
             #[cfg(test)]
             execution_owned_finsts: None,
             #[cfg(test)]
@@ -287,9 +349,9 @@ impl GrpcService {
         Self::with_handlers(
             true,
             Some(Arc::new(RejectingTestNativeFragmentIngress)),
+            None,
             report_handler,
             runtime_filter_envelope_ingress,
-            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
@@ -301,9 +363,9 @@ impl GrpcService {
         Self::with_handlers(
             false,
             None,
+            None,
             report_handler,
             runtime_filter_envelope_ingress,
-            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
@@ -315,11 +377,9 @@ impl GrpcService {
         let mut service = Self::with_handlers(
             true,
             Some(Arc::new(RejectingTestNativeFragmentIngress)),
+            None,
             report_handler,
             crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager(
-                manager.clone(),
-            ),
-            crate::service::grpc_runtime_filter_install_adapter::query_scoped_runtime_filter_deployment_ingress_with_manager(
                 manager.clone(),
             ),
         );
@@ -341,6 +401,21 @@ impl GrpcService {
                 "report-only NovaRocksGrpc endpoint rejects local execution RPC: {rpc_name}"
             )))
         }
+    }
+
+    fn require_query_lifecycle(
+        &self,
+        rpc_name: &str,
+    ) -> Result<Arc<dyn QueryLifecycleIngress>, tonic::Status> {
+        self.require_local_execution(rpc_name)?;
+        self.query_lifecycle_ingress.clone().ok_or_else(|| {
+            tonic::Status::failed_precondition("query lifecycle ingress is not configured")
+        })
+    }
+
+    fn with_query_control_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.query_control_shutdown = Some(shutdown);
+        self
     }
 }
 
@@ -632,6 +707,14 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 + 'static,
         >,
     >;
+    type QueryControlStreamStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<proto::novarocks::QueryControlResponse, tonic::Status>,
+                > + Send
+                + 'static,
+        >,
+    >;
 
     async fn exchange(
         &self,
@@ -749,42 +832,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(response))
     }
 
-    async fn install_runtime_filter_deployment(
-        &self,
-        request: tonic::Request<proto::filter::InstallRuntimeFilterDeploymentRequest>,
-    ) -> Result<tonic::Response<proto::filter::InstallRuntimeFilterDeploymentResponse>, tonic::Status>
-    {
-        self.require_local_execution("InstallRuntimeFilterDeployment")?;
-        let ingress = self.runtime_filter_deployment_ingress.clone();
-        let request = request.into_inner();
-        let response = tokio::task::spawn_blocking(move || ingress.install(request))
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!(
-                    "install_runtime_filter_deployment handler panicked: {error}"
-                ))
-            })?;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn abort_runtime_filter_deployment(
-        &self,
-        request: tonic::Request<proto::filter::AbortRuntimeFilterDeploymentRequest>,
-    ) -> Result<tonic::Response<proto::filter::AbortRuntimeFilterDeploymentResponse>, tonic::Status>
-    {
-        self.require_local_execution("AbortRuntimeFilterDeployment")?;
-        let ingress = self.runtime_filter_deployment_ingress.clone();
-        let request = request.into_inner();
-        let response = tokio::task::spawn_blocking(move || ingress.abort(request))
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!(
-                    "abort_runtime_filter_deployment handler panicked: {error}"
-                ))
-            })?;
-        Ok(tonic::Response::new(response))
-    }
-
     async fn lookup(
         &self,
         request: tonic::Request<proto::filter::LookupRequest>,
@@ -819,17 +866,23 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         let proto::novarocks::SubmitFragmentRequest {
             plan,
             instance_params,
+            execution_id,
         } = request.into_inner();
         let submission_identity = fragment_execution_identity(instance_params.as_ref());
         #[cfg(test)]
         let owned_finst = submission_identity.map(|identity| identity.finst_id);
-        let result = match (plan, instance_params) {
-            (Some(plan), Some(instance_params)) => {
+        let result = match (plan, instance_params, execution_id) {
+            (Some(plan), Some(instance_params), Some(execution_id)) => {
                 let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
                     tonic::Status::failed_precondition("native fragment ingress is not configured")
                 })?;
                 tokio::task::spawn_blocking(move || {
-                    internal_rpc::handle_submit_fragment(ingress.as_ref(), plan, instance_params)
+                    internal_rpc::handle_submit_fragment(
+                        ingress.as_ref(),
+                        execution_id,
+                        plan,
+                        instance_params,
+                    )
                 })
                 .await
                 .map_err(|e| {
@@ -838,6 +891,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
             }
+            (_, _, None) => Err("SubmitFragmentRequest requires execution_id".to_string()),
             _ => Err("SubmitFragmentRequest requires native plan and instance_params".to_string()),
         };
         let accepted_identity = accepted_fragment_execution_identity(&result, submission_identity);
@@ -1071,7 +1125,13 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::HeartbeatRequest>,
     ) -> Result<tonic::Response<proto::novarocks::HeartbeatResponse>, tonic::Status> {
-        let _req = request.into_inner();
+        let req = request.into_inner();
+        if let Some(ingress) = self.query_lifecycle_ingress.as_ref() {
+            ingress
+                .bind_backend_identity(u64::from(req.assigned_be_id))
+                .map_err(status_from_lifecycle_error)?;
+            crate::runtime::backend_id::set_backend_id(i64::from(req.assigned_be_id));
+        }
         let num_cores = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1);
@@ -1081,6 +1141,50 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             num_cores,
             status_code: 0,
         }))
+    }
+
+    async fn init_query(
+        &self,
+        request: tonic::Request<proto::novarocks::InitQueryRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::InitQueryResponse>, tonic::Status> {
+        let ingress = self.require_query_lifecycle("InitQuery")?;
+        let request = request.into_inner();
+        let response =
+            tokio::task::spawn_blocking(move || handle_init_query(ingress.as_ref(), request))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("init_query handler panicked: {error}"))
+                })??;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn abort_query(
+        &self,
+        request: tonic::Request<proto::novarocks::AbortQueryRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::AbortQueryResponse>, tonic::Status> {
+        let ingress = self.require_query_lifecycle("AbortQuery")?;
+        let request = request.into_inner();
+        let response =
+            tokio::task::spawn_blocking(move || handle_abort_query(ingress.as_ref(), request))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("abort_query handler panicked: {error}"))
+                })??;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn query_control_stream(
+        &self,
+        request: tonic::Request<tonic::Streaming<proto::novarocks::QueryControlRequest>>,
+    ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
+        let ingress = self.require_query_lifecycle("QueryControlStream")?;
+        let stream: QueryControlResponseStream = handle_query_control_stream(
+            ingress,
+            request.into_inner(),
+            self.query_control_shutdown.clone(),
+        )
+        .await?;
+        Ok(tonic::Response::new(Box::pin(stream)))
     }
 
     async fn report_exec_status(
@@ -1447,9 +1551,16 @@ pub fn start_grpc_server(
 pub fn start_grpc_server_with_native_fragment_ingress(
     host: &str,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
-    start_grpc_http_server(host, http_port(), native_fragment_ingress, report_handler)
+    start_grpc_http_server(
+        host,
+        http_port(),
+        native_fragment_ingress,
+        query_lifecycle_ingress,
+        report_handler,
+    )
 }
 
 #[cfg(not(feature = "compat"))]
@@ -1457,6 +1568,7 @@ fn start_grpc_http_server(
     host: &str,
     grpc_http_port: u16,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     {
@@ -1494,9 +1606,14 @@ fn start_grpc_http_server(
                 let listener = TokioTcpListener::from_std(std_listener)
                     .map_err(|error| format!("create grpc/http tokio listener failed: {error}"))?;
                 let mut http_shutdown = shutdown_rx.clone();
+                let query_control_shutdown = shutdown_rx.clone();
 
-                let svc =
-                    GrpcService::with_fragment_execution(native_fragment_ingress, report_handler);
+                let svc = GrpcService::with_fragment_execution(
+                    native_fragment_ingress,
+                    query_lifecycle_ingress,
+                    report_handler,
+                )
+                .with_query_control_shutdown(query_control_shutdown);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -1977,14 +2094,17 @@ fn bind_tcp_listener(host: &str, port: u16, role: &str) -> Result<TcpListener, S
 
 #[derive(Clone)]
 enum StandaloneGrpcMode {
-    FullExecution(Arc<dyn NativeFragmentIngress>),
+    FullExecution(
+        Arc<dyn NativeFragmentIngress>,
+        Arc<dyn QueryLifecycleIngress>,
+    ),
     ReportOnly,
 }
 
 impl std::fmt::Debug for StandaloneGrpcMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FullExecution(_) => formatter.write_str("FullExecution"),
+            Self::FullExecution(_, _) => formatter.write_str("FullExecution"),
             Self::ReportOnly => formatter.write_str("ReportOnly"),
         }
     }
@@ -1993,8 +2113,12 @@ impl std::fmt::Debug for StandaloneGrpcMode {
 impl StandaloneGrpcMode {
     fn service(self, report_handler: Arc<dyn NativeReportHandler>) -> GrpcService {
         match self {
-            StandaloneGrpcMode::FullExecution(ingress) => {
-                GrpcService::with_fragment_execution(ingress, report_handler)
+            StandaloneGrpcMode::FullExecution(ingress, query_lifecycle_ingress) => {
+                GrpcService::with_fragment_execution(
+                    ingress,
+                    query_lifecycle_ingress,
+                    report_handler,
+                )
             }
             StandaloneGrpcMode::ReportOnly => GrpcService::report_ingress_only(report_handler),
         }
@@ -2002,7 +2126,7 @@ impl StandaloneGrpcMode {
 
     fn label(&self) -> &'static str {
         match self {
-            StandaloneGrpcMode::FullExecution(_) => "standalone grpc report/exchange",
+            StandaloneGrpcMode::FullExecution(_, _) => "standalone grpc report/exchange",
             StandaloneGrpcMode::ReportOnly => "standalone grpc report-only",
         }
     }
@@ -2016,12 +2140,13 @@ pub fn start_grpc_exchange_server(
     host: &str,
     port: u16,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     start_standalone_grpc_server(
         host,
         port,
-        StandaloneGrpcMode::FullExecution(native_fragment_ingress),
+        StandaloneGrpcMode::FullExecution(native_fragment_ingress, query_lifecycle_ingress),
         report_handler,
     )
 }
@@ -2097,8 +2222,11 @@ fn start_standalone_grpc_server(
                     format!("create standalone grpc/http tokio listener failed: {error}")
                 })?;
                 let mut shutdown = shutdown_rx.clone();
+                let query_control_shutdown = shutdown_rx.clone();
 
-                let svc = mode.service(report_handler);
+                let svc = mode
+                    .service(report_handler)
+                    .with_query_control_shutdown(query_control_shutdown);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -2554,6 +2682,7 @@ mod tests {
                 "127.0.0.1",
                 first_port,
                 super::rejecting_test_native_fragment_ingress(),
+                super::rejecting_test_query_lifecycle_ingress(),
                 Arc::new(super::AcceptingTestNativeReportHandler),
             )
         });
@@ -2571,6 +2700,7 @@ mod tests {
                 "127.0.0.1",
                 second_port,
                 super::rejecting_test_native_fragment_ingress(),
+                super::rejecting_test_query_lifecycle_ingress(),
                 Arc::new(super::AcceptingTestNativeReportHandler),
             )
         });
@@ -2719,17 +2849,26 @@ mod pr3_tests {
     use super::proto::novarocks::{
         BatchReportExecStatusRequest, CancelFragmentRequest, ExchangeRequest, ExecStatusReport,
         FetchResultRequest, HeartbeatRequest, IcebergCommitInfo, IcebergDataFile,
-        IcebergFileContent, ReportExecStatusRequest, SubmitFragmentRequest,
+        IcebergFileContent, InitQueryRequest, ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use super::proto::{novarocks, plan};
     use super::{
         AcceptingTestNativeReportHandler, GrpcService, rejecting_test_native_fragment_ingress,
+        rejecting_test_query_lifecycle_ingress,
     };
     use crate::common::engine_error::EngineError;
     use crate::common::types::UniqueId;
-    use crate::protocol::native::{
-        RuntimeFilterQueryLifecycleOptions, encode_abort_runtime_filter_deployment,
-        encode_participant_install,
+    use crate::query_execution::lifecycle::contract::{
+        decode_query_control_event, encode_query_control_attach, encode_query_control_command,
+        encode_query_init_request,
+    };
+    use crate::query_execution::lifecycle::{
+        AttemptId, BackendQueryControl, ParticipantBackendIdentity, ParticipantManifest,
+        ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
+        QueryControlAttachment, QueryControlCommand, QueryControlEndpoint, QueryControlEvent,
+        QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
+        QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminationAck,
+        QueryTerminationReason,
     };
     use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
     use crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install;
@@ -2741,10 +2880,11 @@ mod pr3_tests {
         NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
         NativeFragmentIngressError, NativeFragmentRequest,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
     use tokio::sync::Notify;
+    use tokio_stream::wrappers::ReceiverStream;
     use tonic::Request;
 
     struct CapturingReportHandler {
@@ -2791,8 +2931,404 @@ mod pr3_tests {
     fn fragment_execution_service(report_handler: Arc<dyn NativeReportHandler>) -> GrpcService {
         GrpcService::with_fragment_execution(
             rejecting_test_native_fragment_ingress(),
+            rejecting_test_query_lifecycle_ingress(),
             report_handler,
         )
+    }
+
+    #[derive(Default)]
+    struct RecordingQueryLifecycleIngress {
+        backend_id: AtomicU64,
+        initialized: Mutex<
+            Option<(
+                QueryExecutionId,
+                crate::query_execution::lifecycle::ParticipantManifestDigest,
+            )>,
+        >,
+        attached: AtomicBool,
+        coordinator_lost: Arc<AtomicUsize>,
+    }
+
+    impl QueryLifecycleIngress for RecordingQueryLifecycleIngress {
+        fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
+            self.backend_id.store(backend_id, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
+            let execution_id = request.manifest().execution_id();
+            let digest = request.digest();
+            *self.initialized.lock().expect("recording initialized") = Some((execution_id, digest));
+            QueryInitAck::new(execution_id, digest, QueryInitOutcome::Applied)
+        }
+
+        fn abort_query(
+            &self,
+            request: QueryAbortRequest,
+        ) -> Result<QueryTerminationAck, QueryLifecycleError> {
+            Ok(QueryTerminationAck::new(
+                request.execution_id(),
+                QueryTerminationReason::CoordinatorAbort,
+            ))
+        }
+
+        fn attach_control(
+            &self,
+            attach: QueryControlAttach,
+        ) -> Result<QueryControlAttachment, QueryLifecycleError> {
+            let initialized = *self.initialized.lock().expect("recording initialized");
+            if initialized != Some((attach.execution_id(), attach.digest())) {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Conflict,
+                    "attach identity or digest does not match InitQuery",
+                ));
+            }
+            if self.attached.swap(true, Ordering::SeqCst) {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Conflict,
+                    "query control is already attached",
+                ));
+            }
+            let (events, receiver) = tokio::sync::mpsc::channel(16);
+            events
+                .try_send(QueryControlEvent::ControlReady)
+                .expect("recording ControlReady");
+            Ok(QueryControlAttachment {
+                control: Arc::new(RecordingBackendQueryControl {
+                    events,
+                    coordinator_lost: Arc::clone(&self.coordinator_lost),
+                }),
+                events: receiver,
+            })
+        }
+    }
+
+    struct RecordingBackendQueryControl {
+        events: tokio::sync::mpsc::Sender<QueryControlEvent>,
+        coordinator_lost: Arc<AtomicUsize>,
+    }
+
+    impl BackendQueryControl for RecordingBackendQueryControl {
+        fn heartbeat(&self, sequence: u64) -> Result<(), QueryLifecycleError> {
+            self.events
+                .try_send(QueryControlEvent::HeartbeatAck { sequence })
+                .map_err(|error| {
+                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+                })
+        }
+
+        fn abort(&self, _reason: String) -> Result<(), QueryLifecycleError> {
+            self.events
+                .try_send(QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorAbort,
+                })
+                .map_err(|error| {
+                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+                })
+        }
+
+        fn finalize(&self) -> Result<(), QueryLifecycleError> {
+            self.events
+                .try_send(QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorFinalize,
+                })
+                .map_err(|error| {
+                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+                })
+        }
+
+        fn coordinator_lost(
+            &self,
+            _reason: QueryTerminationReason,
+        ) -> Result<(), QueryLifecycleError> {
+            self.coordinator_lost.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_query_lifecycle_report_only_rejects_init_before_wire_decode() {
+        let error = GrpcService::report_ingress_only(Arc::new(AcceptingTestNativeReportHandler))
+            .init_query(Request::new(InitQueryRequest::default()))
+            .await
+            .expect_err("report-only endpoint must reject InitQuery");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    fn query_lifecycle_init_fixture(start_epoch: u64, query_low: i64) -> QueryInitRequest {
+        let execution_id = QueryExecutionId::new(
+            crate::query_execution::contract::QueryId::new(0x514c_4302, query_low),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid query execution id");
+        QueryInitRequest::from_manifest(
+            ParticipantManifest::new(
+                execution_id,
+                ParticipantBackendIdentity::new(
+                    7,
+                    QueryControlEndpoint::new("127.0.0.1", 9030)
+                        .expect("valid backend endpoint"),
+                    start_epoch,
+                )
+                .expect("valid backend identity"),
+                [ParticipantRole::FragmentExecutor],
+                [UniqueId {
+                    hi: query_low,
+                    lo: 1,
+                }],
+                ParticipantQueryOptions::new(
+                    crate::runtime::query_options::QueryOptions::default(),
+                ),
+                10_000,
+                [],
+                None,
+                Duration::from_secs(30),
+                QueryControlEndpoint::new("127.0.0.1", 9031)
+                    .expect("valid report endpoint"),
+            )
+            .expect("valid participant manifest"),
+        )
+    }
+
+    async fn spawn_query_lifecycle_loopback(
+        service: GrpcService,
+    ) -> (
+        proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<tonic::transport::Channel>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind query lifecycle loopback");
+        let address = listener.local_addr().expect("loopback address");
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            let item = listener.accept().await.map(|(stream, _)| stream);
+            Some((item, listener))
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service),
+                )
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve query lifecycle loopback");
+        });
+        let client = proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::connect(
+            format!("http://{address}"),
+        )
+        .await
+        .expect("connect query lifecycle loopback");
+        (client, shutdown_tx, server)
+    }
+
+    #[tokio::test]
+    async fn grpc_query_lifecycle_report_only_rejects_abort_and_stream_before_wire_decode() {
+        let (mut client, shutdown, server) = spawn_query_lifecycle_loopback(
+            GrpcService::report_ingress_only(Arc::new(AcceptingTestNativeReportHandler)),
+        )
+        .await;
+
+        let abort = client
+            .abort_query(proto::novarocks::AbortQueryRequest::default())
+            .await
+            .expect_err("report-only endpoint rejects AbortQuery");
+        assert_eq!(abort.code(), tonic::Code::FailedPrecondition);
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let stream = client
+            .query_control_stream(ReceiverStream::new(rx))
+            .await
+            .expect_err("report-only endpoint rejects QueryControlStream");
+        assert_eq!(stream.code(), tonic::Code::FailedPrecondition);
+
+        let _ = shutdown.send(());
+        server.await.expect("join query lifecycle server");
+    }
+
+    #[tokio::test]
+    async fn grpc_query_lifecycle_rejects_heartbeat_as_first_frame() {
+        let ingress = Arc::new(RecordingQueryLifecycleIngress::default());
+        let (mut client, shutdown, server) =
+            spawn_query_lifecycle_loopback(GrpcService::with_fragment_execution(
+                rejecting_test_native_fragment_ingress(),
+                ingress,
+                Arc::new(AcceptingTestNativeReportHandler),
+            ))
+            .await;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(encode_query_control_command(
+            &QueryControlCommand::Heartbeat {
+                sequence: 1,
+                sent_mono_ns: 2,
+            },
+        ))
+        .await
+        .expect("send heartbeat first frame");
+
+        let error = client
+            .query_control_stream(ReceiverStream::new(rx))
+            .await
+            .expect_err("first frame must be Attach");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let _ = shutdown.send(());
+        server.await.expect("join query lifecycle server");
+    }
+
+    #[tokio::test]
+    async fn grpc_query_lifecycle_live_init_attach_heartbeat_abort_round_trip() {
+        let ingress = Arc::new(RecordingQueryLifecycleIngress::default());
+        let (mut client, shutdown, server) =
+            spawn_query_lifecycle_loopback(GrpcService::with_fragment_execution(
+                rejecting_test_native_fragment_ingress(),
+                ingress.clone(),
+                Arc::new(AcceptingTestNativeReportHandler),
+            ))
+            .await;
+        let heartbeat = client
+            .heartbeat(HeartbeatRequest {
+                assigned_be_id: 7,
+                fe_epoch: 1,
+            })
+            .await
+            .expect("bind FE-assigned backend identity")
+            .into_inner();
+        assert_eq!(ingress.backend_id.load(Ordering::SeqCst), 7);
+        let init = query_lifecycle_init_fixture(heartbeat.start_epoch, 801);
+        let init_response = client
+            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .await
+            .expect("InitQuery transport succeeds")
+            .into_inner();
+        assert_eq!(
+            init_response.outcome,
+            proto::novarocks::QueryInitOutcome::QueryInitApplied as i32
+        );
+
+        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
+            .expect("valid attach");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(encode_query_control_attach(&attach))
+            .await
+            .expect("send Attach");
+        let mut events = client
+            .query_control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("attach control stream")
+            .into_inner();
+        assert_eq!(
+            decode_query_control_event(
+                &events
+                    .message()
+                    .await
+                    .expect("read ControlReady")
+                    .expect("ControlReady event")
+            )
+            .expect("decode ControlReady"),
+            QueryControlEvent::ControlReady
+        );
+
+        tx.send(encode_query_control_command(
+            &QueryControlCommand::Heartbeat {
+                sequence: 41,
+                sent_mono_ns: 123,
+            },
+        ))
+        .await
+        .expect("send heartbeat");
+        assert_eq!(
+            decode_query_control_event(
+                &events
+                    .message()
+                    .await
+                    .expect("read HeartbeatAck")
+                    .expect("HeartbeatAck event")
+            )
+            .expect("decode HeartbeatAck"),
+            QueryControlEvent::HeartbeatAck { sequence: 41 }
+        );
+
+        tx.send(encode_query_control_command(&QueryControlCommand::Abort {
+            reason: "client cancelled".to_string(),
+        }))
+        .await
+        .expect("send Abort");
+        assert_eq!(
+            decode_query_control_event(
+                &events
+                    .message()
+                    .await
+                    .expect("read TerminationAccepted")
+                    .expect("TerminationAccepted event")
+            )
+            .expect("decode TerminationAccepted"),
+            QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorAbort
+            }
+        );
+        assert_eq!(ingress.coordinator_lost.load(Ordering::SeqCst), 0);
+
+        let _ = shutdown.send(());
+        server.await.expect("join query lifecycle server");
+    }
+
+    #[tokio::test]
+    async fn grpc_query_lifecycle_disconnect_fails_closed_once_and_rejects_takeover() {
+        let ingress = Arc::new(RecordingQueryLifecycleIngress::default());
+        let (mut client, shutdown, server) =
+            spawn_query_lifecycle_loopback(GrpcService::with_fragment_execution(
+                rejecting_test_native_fragment_ingress(),
+                ingress.clone(),
+                Arc::new(AcceptingTestNativeReportHandler),
+            ))
+            .await;
+        let init = query_lifecycle_init_fixture(crate::runtime::start_epoch::start_epoch(), 802);
+        client
+            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .await
+            .expect("InitQuery transport succeeds");
+        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
+            .expect("valid attach");
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(encode_query_control_attach(&attach))
+            .await
+            .expect("send first Attach");
+        let mut events = client
+            .query_control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("first attach succeeds")
+            .into_inner();
+        let _ = events.message().await.expect("read ControlReady");
+
+        let (takeover_tx, takeover_rx) = tokio::sync::mpsc::channel(1);
+        takeover_tx
+            .send(encode_query_control_attach(&attach))
+            .await
+            .expect("send takeover Attach");
+        let takeover = client
+            .query_control_stream(ReceiverStream::new(takeover_rx))
+            .await
+            .expect_err("second active stream is rejected");
+        assert_eq!(takeover.code(), tonic::Code::AlreadyExists);
+
+        drop(tx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while ingress.coordinator_lost.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "disconnect did not fail-close"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(ingress.coordinator_lost.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown.send(());
+        server.await.expect("join query lifecycle server");
     }
 
     struct RecordingEnvelopeIngress {
@@ -3110,61 +3646,6 @@ mod pr3_tests {
     }
 
     #[tokio::test]
-    async fn deployment_handlers_publish_installed_and_aborted_on_independent_manager() {
-        let manager = QueryContextManager::new_for_test();
-        let svc = GrpcService::full_execution_with_runtime_filter_manager(
-            Arc::new(CapturingReportHandler::accepting()),
-            manager.clone(),
-        );
-        let query = QueryId {
-            hi: 92_201,
-            lo: 92_202,
-        };
-        let install = participant_install();
-        let lifecycle = RuntimeFilterQueryLifecycleOptions {
-            delivery_expire: std::time::Duration::from_secs(11),
-            query_expire: std::time::Duration::from_secs(29),
-            transport_retry_interval: std::time::Duration::from_millis(200),
-            transport_max_attempts: 3,
-            transport_deadline: std::time::Duration::from_secs(5),
-            transport_max_pending_entries: 128,
-            transport_max_pending_bytes: 1024 * 1024,
-        };
-        let wire_query = UniqueId {
-            hi: query.hi,
-            lo: query.lo,
-        };
-
-        let install_response = svc
-            .install_runtime_filter_deployment(Request::new(
-                encode_participant_install(wire_query, lifecycle, &install)
-                    .expect("encode install"),
-            ))
-            .await
-            .expect("install handler")
-            .into_inner();
-        assert_eq!(
-            install_response.status,
-            proto::filter::RuntimeFilterDeploymentResponseStatus::Applied as i32
-        );
-        assert!(manager.runtime_filter_deployment_is_installed_for_test(query));
-
-        let abort_response = svc
-            .abort_runtime_filter_deployment(Request::new(
-                encode_abort_runtime_filter_deployment(wire_query, install.epoch())
-                    .expect("encode abort"),
-            ))
-            .await
-            .expect("abort handler")
-            .into_inner();
-        assert_eq!(
-            abort_response.status,
-            proto::filter::RuntimeFilterDeploymentResponseStatus::Applied as i32
-        );
-        assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
-    }
-
-    #[tokio::test]
     async fn runtime_filter_envelope_malformed_request_never_reaches_ingress() {
         let ingress = Arc::new(RecordingEnvelopeIngress::accepting());
         let svc = GrpcService::full_execution_with_handlers(
@@ -3216,6 +3697,10 @@ mod pr3_tests {
         let req = Request::new(SubmitFragmentRequest {
             plan: None,
             instance_params: None,
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(ProtoUniqueId { hi: 1, lo: 2 }),
+                attempt_id: 1,
+            }),
         });
         let resp = svc.submit_fragment(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -3229,11 +3714,63 @@ mod pr3_tests {
     }
 
     #[tokio::test]
+    async fn submit_fragment_execution_id_is_required_before_native_decode() {
+        let ingress = Arc::new(RecordingNativeFragmentIngress::default());
+        let svc = GrpcService::with_fragment_execution(
+            ingress.clone(),
+            rejecting_test_query_lifecycle_ingress(),
+            Arc::new(AcceptingTestNativeReportHandler),
+        );
+        let req = Request::new(SubmitFragmentRequest {
+            plan: Some(empty_values_result_fragment(7, 41)),
+            instance_params: Some(novarocks::InstanceParams {
+                query_id: Some(ProtoUniqueId {
+                    hi: 7_401,
+                    lo: 7_402,
+                }),
+                fragment_instance_id: Some(ProtoUniqueId {
+                    hi: 7_403,
+                    lo: 7_404,
+                }),
+                backend_num: 3,
+                query_options: Some(novarocks::QueryOptions {
+                    batch_size: 1024,
+                    pipeline_dop: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            execution_id: None,
+        });
+
+        let response = svc.submit_fragment(req).await.expect("RPC-level success");
+
+        assert_ne!(response.get_ref().status_code, 0);
+        assert!(
+            response.get_ref().message.contains("execution_id"),
+            "{}",
+            response.get_ref().message
+        );
+        assert!(
+            ingress
+                .submissions
+                .lock()
+                .expect("native fragment submissions")
+                .is_empty(),
+            "missing execution id must be rejected before native decode and ingress"
+        );
+    }
+
+    #[tokio::test]
     async fn submit_fragment_native_payload_validates_instance_params() {
         let svc = fragment_execution_service(Arc::new(AcceptingTestNativeReportHandler));
         let req = Request::new(SubmitFragmentRequest {
             plan: Some(plan::PlanFragment::default()),
             instance_params: Some(novarocks::InstanceParams::default()),
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(ProtoUniqueId { hi: 1, lo: 2 }),
+                attempt_id: 1,
+            }),
         });
         let resp = svc.submit_fragment(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -3251,6 +3788,10 @@ mod pr3_tests {
         let req = Request::new(SubmitFragmentRequest {
             plan: Some(plan::PlanFragment::default()),
             instance_params: None,
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(ProtoUniqueId { hi: 1, lo: 2 }),
+                attempt_id: 1,
+            }),
         });
         let resp = svc.submit_fragment(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -3268,6 +3809,7 @@ mod pr3_tests {
         let ingress = Arc::new(GatedNativeFragmentIngress::new());
         let svc = GrpcService::with_fragment_execution(
             ingress.clone(),
+            rejecting_test_query_lifecycle_ingress(),
             Arc::new(AcceptingTestNativeReportHandler),
         );
         let query_id = QueryId {
@@ -3298,6 +3840,13 @@ mod pr3_tests {
                         ..Default::default()
                     }),
                     ..Default::default()
+                }),
+                execution_id: Some(novarocks::QueryExecutionId {
+                    query_id: Some(ProtoUniqueId {
+                        hi: query_id.hi,
+                        lo: query_id.lo,
+                    }),
+                    attempt_id: 1,
                 }),
             }))
             .await
@@ -3336,6 +3885,7 @@ mod pr3_tests {
         let req = Request::new(SubmitFragmentRequest {
             plan: None,
             instance_params: None,
+            execution_id: None,
         });
         let err = svc
             .submit_fragment(req)
@@ -3350,6 +3900,7 @@ mod pr3_tests {
         let ingress = Arc::new(RecordingNativeFragmentIngress::default());
         let svc = GrpcService::with_fragment_execution(
             ingress.clone(),
+            rejecting_test_query_lifecycle_ingress(),
             Arc::new(AcceptingTestNativeReportHandler),
         );
         let req = Request::new(CancelFragmentRequest {
@@ -3413,7 +3964,7 @@ mod pr3_tests {
         use super::super::{
             AcceptingTestNativeReportHandler, CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService,
         };
-        use super::RecordingNativeFragmentIngress;
+        use super::{RecordingNativeFragmentIngress, rejecting_test_query_lifecycle_ingress};
         use crate::common::types::UniqueId;
         use crate::runtime::exchange::{
             self, ExchangeKey, set_expected_senders, snapshot_receiver_state,
@@ -3434,6 +3985,7 @@ mod pr3_tests {
             let ingress = Arc::new(RecordingNativeFragmentIngress::default());
             let svc = GrpcService::with_fragment_execution(
                 ingress.clone(),
+                rejecting_test_query_lifecycle_ingress(),
                 Arc::new(AcceptingTestNativeReportHandler),
             );
             let finst = ProtoUniqueId { hi: 6201, lo: 6202 };

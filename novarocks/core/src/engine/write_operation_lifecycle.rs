@@ -211,6 +211,7 @@ pub(crate) mod test_support {
     fn staging_writer_commit_input(writer_key: WriterKey) -> WriterCommitInput {
         WriterCommitInput {
             writer_id: 0,
+            fragment_id: 0,
             writer_key,
             iceberg_commits: vec![novarocks::IcebergCommitInfo {
                 iceberg_data_file: Some(novarocks::IcebergDataFile {
@@ -293,6 +294,7 @@ mod tests {
     fn writer_output(writer_id: usize, writer_key: WriterKey, path: &str) -> WriterCommitInput {
         WriterCommitInput {
             writer_id,
+            fragment_id: 0,
             writer_key,
             iceberg_commits: vec![novarocks::IcebergCommitInfo {
                 iceberg_data_file: Some(novarocks::IcebergDataFile {

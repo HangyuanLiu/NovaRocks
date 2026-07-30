@@ -1304,26 +1304,6 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
-        "AbortRuntimeFilterDeploymentResponse": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "status",
-              "type_name": "RuntimeFilterDeploymentResponseStatus",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "rejection",
-              "type_name": "RuntimeFilterDeploymentRejection",
-              "label": "optional",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
         "Column": {
           "fields": {
             "1": {
@@ -1386,26 +1366,6 @@
               "name": "install",
               "type_name": "RuntimeFilterParticipantInstall",
               "label": "singular",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
-        "InstallRuntimeFilterDeploymentResponse": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "status",
-              "type_name": "RuntimeFilterDeploymentResponseStatus",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "rejection",
-              "type_name": "RuntimeFilterDeploymentRejection",
-              "label": "optional",
               "oneof": null
             }
           },
@@ -1806,26 +1766,6 @@
               "number": 2,
               "name": "sequence",
               "type_name": "uint64",
-              "label": "singular",
-              "oneof": null
-            }
-          },
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
-        "RuntimeFilterDeploymentRejection": {
-          "fields": {
-            "1": {
-              "number": 1,
-              "name": "code",
-              "type_name": "RuntimeFilterDeploymentRejectionCode",
-              "label": "singular",
-              "oneof": null
-            },
-            "2": {
-              "number": 2,
-              "name": "reason",
-              "type_name": "string",
               "label": "singular",
               "oneof": null
             }
@@ -2431,62 +2371,6 @@
             {
               "number": 5,
               "name": "RUNTIME_FILTER_ARTIFACT_KIND_EMPTY_DOMAIN"
-            }
-          ],
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
-        "RuntimeFilterDeploymentRejectionCode": {
-          "values": [
-            {
-              "number": 0,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_UNSPECIFIED"
-            },
-            {
-              "number": 1,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INVALID_REQUEST"
-            },
-            {
-              "number": 2,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_STALE_EPOCH"
-            },
-            {
-              "number": 3,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_CONFLICTING_DEPLOYMENT"
-            },
-            {
-              "number": 4,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_QUERY_ABORTED"
-            },
-            {
-              "number": 5,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_ACTIVE_FRAGMENTS"
-            },
-            {
-              "number": 6,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INTERNAL"
-            }
-          ],
-          "reserved_numbers": [],
-          "reserved_names": []
-        },
-        "RuntimeFilterDeploymentResponseStatus": {
-          "values": [
-            {
-              "number": 0,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_UNSPECIFIED"
-            },
-            {
-              "number": 1,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_APPLIED"
-            },
-            {
-              "number": 2,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_IDEMPOTENT"
-            },
-            {
-              "number": 3,
-              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_REJECTED"
             }
           ],
           "reserved_numbers": [],
@@ -3137,20 +3021,6 @@
               "label": "singular",
               "oneof": null
             },
-            "6": {
-              "number": 6,
-              "name": "build_runtime_filters",
-              "type_name": "RuntimeFilterBuild",
-              "label": "repeated",
-              "oneof": null
-            },
-            "7": {
-              "number": 7,
-              "name": "probe_runtime_filters",
-              "type_name": "RuntimeFilterProbe",
-              "label": "repeated",
-              "oneof": null
-            },
             "8": {
               "number": 8,
               "name": "children",
@@ -3564,13 +3434,6 @@
               "name": "execution_mode",
               "type_name": "JoinExecutionMode",
               "label": "optional",
-              "oneof": null
-            },
-            "6": {
-              "number": 6,
-              "name": "build_runtime_filters",
-              "type_name": "RuntimeFilterBuildIntent",
-              "label": "repeated",
               "oneof": null
             }
           },
@@ -5747,6 +5610,26 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterAggregateTopNKey": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "group_key_ordinal",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "limit",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterBinding": {
           "fields": {
             "1": {
@@ -6006,6 +5889,19 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterJoinBuildKey": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "ordinal",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterMembershipContract": {
           "fields": {
             "1": {
@@ -6123,16 +6019,27 @@
               "label": "singular",
               "oneof": null
             },
-            "3": {
-              "number": 3,
-              "name": "join_key_ordinal",
-              "type_name": "uint32",
-              "label": "optional",
-              "oneof": null
+            "4": {
+              "number": 4,
+              "name": "join_build_key",
+              "type_name": "RuntimeFilterJoinBuildKey",
+              "label": "singular",
+              "oneof": "target"
+            },
+            "5": {
+              "number": 5,
+              "name": "aggregate_topn_key",
+              "type_name": "RuntimeFilterAggregateTopNKey",
+              "label": "singular",
+              "oneof": "target"
             }
           },
-          "reserved_numbers": [],
-          "reserved_names": []
+          "reserved_numbers": [
+            3
+          ],
+          "reserved_names": [
+            "join_key_ordinal"
+          ]
         },
         "RuntimeFilterReductionContract": {
           "fields": {
@@ -7791,6 +7698,53 @@
     "idl/novarocks/service.proto": {
       "package": "novarocks",
       "messages": {
+        "AbortQueryRequest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "init_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "reason",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "AbortQueryResponse": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "accepted_reason",
+              "type_name": "QueryTerminationReason",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "BatchReportExecStatusRequest": {
           "fields": {
             "1": {
@@ -7851,6 +7805,13 @@
               "number": 3,
               "name": "start_epoch",
               "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "query_id",
+              "type_name": "novarocks.common.UniqueId",
               "label": "singular",
               "oneof": null
             }
@@ -8075,6 +8036,47 @@
               "number": 2,
               "name": "status",
               "type_name": "novarocks.common.Status",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "ExchangeRouteManifest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "source_fragment_instance_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "destination_fragment_instance_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "destination_node_id",
+              "type_name": "int32",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "sender_ordinal",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "sender_count",
+              "type_name": "uint32",
               "label": "singular",
               "oneof": null
             }
@@ -8734,6 +8736,53 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "InitQueryRequest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "manifest",
+              "type_name": "ParticipantManifest",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "init_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "InitQueryResponse": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "init_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "outcome",
+              "type_name": "QueryInitOutcome",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "InstanceParams": {
           "fields": {
             "1": {
@@ -8778,13 +8827,6 @@
               "label": "repeated",
               "oneof": null
             },
-            "7": {
-              "number": 7,
-              "name": "runtime_filter_params",
-              "type_name": "RuntimeFilterParams",
-              "label": "singular",
-              "oneof": null
-            },
             "8": {
               "number": 8,
               "name": "query_options",
@@ -8807,8 +8849,12 @@
               "oneof": null
             }
           },
-          "reserved_numbers": [],
-          "reserved_names": []
+          "reserved_numbers": [
+            7
+          ],
+          "reserved_names": [
+            "runtime_filter_params"
+          ]
         },
         "Int32List": {
           "fields": {
@@ -8830,6 +8876,109 @@
               "name": "values",
               "type_name": "int64",
               "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "ParticipantBackendIdentity": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "backend_id",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "endpoint",
+              "type_name": "QueryControlEndpoint",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "start_epoch",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "ParticipantManifest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "backend",
+              "type_name": "ParticipantBackendIdentity",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "participant_roles",
+              "type_name": "QueryParticipantRole",
+              "label": "repeated",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "expected_fragment_instance_ids",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "repeated",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "query_options",
+              "type_name": "QueryOptions",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "query_deadline_unix_ms",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "exchange_routes",
+              "type_name": "ExchangeRouteManifest",
+              "label": "repeated",
+              "oneof": null
+            },
+            "8": {
+              "number": 8,
+              "name": "runtime_filter",
+              "type_name": "RuntimeFilterContribution",
+              "label": "singular",
+              "oneof": null
+            },
+            "9": {
+              "number": 9,
+              "name": "pre_start_timeout_ms",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "10": {
+              "number": 10,
+              "name": "report_endpoint",
+              "type_name": "QueryControlEndpoint",
+              "label": "singular",
               "oneof": null
             }
           },
@@ -8871,6 +9020,230 @@
               "name": "children",
               "type_name": "ProfileNode",
               "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlAbort": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "reason",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlAttach": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "init_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "frontend_owner_epoch",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlEndpoint": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "host",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "port",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlFinalize": {
+          "fields": {},
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlHeartbeat": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "sequence",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "sent_mono_ns",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlHeartbeatAck": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "sequence",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlLocalFailure": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "code",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "detail",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlReady": {
+          "fields": {},
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlRequest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "attach",
+              "type_name": "QueryControlAttach",
+              "label": "singular",
+              "oneof": "command"
+            },
+            "2": {
+              "number": 2,
+              "name": "heartbeat",
+              "type_name": "QueryControlHeartbeat",
+              "label": "singular",
+              "oneof": "command"
+            },
+            "3": {
+              "number": 3,
+              "name": "abort",
+              "type_name": "QueryControlAbort",
+              "label": "singular",
+              "oneof": "command"
+            },
+            "4": {
+              "number": 4,
+              "name": "finalize",
+              "type_name": "QueryControlFinalize",
+              "label": "singular",
+              "oneof": "command"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlResponse": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "control_ready",
+              "type_name": "QueryControlReady",
+              "label": "singular",
+              "oneof": "event"
+            },
+            "2": {
+              "number": 2,
+              "name": "heartbeat_ack",
+              "type_name": "QueryControlHeartbeatAck",
+              "label": "singular",
+              "oneof": "event"
+            },
+            "3": {
+              "number": 3,
+              "name": "local_failure",
+              "type_name": "QueryControlLocalFailure",
+              "label": "singular",
+              "oneof": "event"
+            },
+            "4": {
+              "number": 4,
+              "name": "termination_accepted",
+              "type_name": "QueryControlTerminationAccepted",
+              "label": "singular",
+              "oneof": "event"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryControlTerminationAccepted": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "reason",
+              "type_name": "QueryTerminationReason",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryExecutionId": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "query_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "attempt_id",
+              "type_name": "uint64",
+              "label": "singular",
               "oneof": null
             }
           },
@@ -9053,6 +9426,34 @@
               "type_name": "int64",
               "label": "singular",
               "oneof": null
+            },
+            "26": {
+              "number": 26,
+              "name": "orc_use_column_names",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "27": {
+              "number": 27,
+              "name": "enable_file_metacache",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "28": {
+              "number": 28,
+              "name": "enable_file_pagecache",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "29": {
+              "number": 29,
+              "name": "enable_parquet_reader_page_index",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
             }
           },
           "reserved_numbers": [],
@@ -9091,6 +9492,40 @@
               "number": 3,
               "name": "error_code",
               "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterContribution": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "participant_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "lifecycle",
+              "type_name": "novarocks.filter.RuntimeFilterQueryLifecycleOptions",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "install",
+              "type_name": "novarocks.filter.RuntimeFilterParticipantInstall",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "contribution_digest",
+              "type_name": "bytes",
               "label": "singular",
               "oneof": null
             }
@@ -9289,6 +9724,13 @@
               "type_name": "InstanceParams",
               "label": "singular",
               "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "execution_id",
+              "type_name": "QueryExecutionId",
+              "label": "singular",
+              "oneof": null
             }
           },
           "reserved_numbers": [],
@@ -9423,14 +9865,104 @@
           ],
           "reserved_numbers": [],
           "reserved_names": []
+        },
+        "QueryInitOutcome": {
+          "values": [
+            {
+              "number": 0,
+              "name": "QUERY_INIT_OUTCOME_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "QUERY_INIT_APPLIED"
+            },
+            {
+              "number": 2,
+              "name": "QUERY_INIT_ALREADY_APPLIED"
+            },
+            {
+              "number": 3,
+              "name": "QUERY_INIT_REJECTED_CONFLICT"
+            },
+            {
+              "number": 4,
+              "name": "QUERY_INIT_REJECTED_STALE_BACKEND"
+            },
+            {
+              "number": 5,
+              "name": "QUERY_INIT_REJECTED_CAPACITY"
+            },
+            {
+              "number": 6,
+              "name": "QUERY_INIT_REJECTED_INVALID_MANIFEST"
+            },
+            {
+              "number": 7,
+              "name": "QUERY_INIT_REJECTED_TERMINATED"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryParticipantRole": {
+          "values": [
+            {
+              "number": 0,
+              "name": "QUERY_PARTICIPANT_ROLE_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "FRAGMENT_EXECUTOR"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_SERVICE"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "QueryTerminationReason": {
+          "values": [
+            {
+              "number": 0,
+              "name": "QUERY_TERMINATION_REASON_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "QUERY_TERMINATION_COORDINATOR_ABORT"
+            },
+            {
+              "number": 2,
+              "name": "QUERY_TERMINATION_COORDINATOR_FINALIZE"
+            },
+            {
+              "number": 3,
+              "name": "QUERY_TERMINATION_COORDINATOR_STREAM_LOST"
+            },
+            {
+              "number": 4,
+              "name": "QUERY_TERMINATION_COORDINATOR_HEARTBEAT_TIMEOUT"
+            },
+            {
+              "number": 5,
+              "name": "QUERY_TERMINATION_LOCAL_FAILURE"
+            },
+            {
+              "number": 6,
+              "name": "QUERY_TERMINATION_PRE_START_TIMEOUT"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
         }
       },
       "services": {
         "NovaRocksGrpc": {
           "rpcs": {
-            "AbortRuntimeFilterDeployment": {
-              "request": "novarocks.filter.AbortRuntimeFilterDeploymentRequest",
-              "response": "novarocks.filter.AbortRuntimeFilterDeploymentResponse",
+            "AbortQuery": {
+              "request": "AbortQueryRequest",
+              "response": "AbortQueryResponse",
               "client_streaming": false,
               "server_streaming": false
             },
@@ -9470,9 +10002,9 @@
               "client_streaming": false,
               "server_streaming": false
             },
-            "InstallRuntimeFilterDeployment": {
-              "request": "novarocks.filter.InstallRuntimeFilterDeploymentRequest",
-              "response": "novarocks.filter.InstallRuntimeFilterDeploymentResponse",
+            "InitQuery": {
+              "request": "InitQueryRequest",
+              "response": "InitQueryResponse",
               "client_streaming": false,
               "server_streaming": false
             },
@@ -9481,6 +10013,12 @@
               "response": "novarocks.filter.LookupResponse",
               "client_streaming": false,
               "server_streaming": false
+            },
+            "QueryControlStream": {
+              "request": "QueryControlRequest",
+              "response": "QueryControlResponse",
+              "client_streaming": true,
+              "server_streaming": true
             },
             "ReportExecStatus": {
               "request": "ReportExecStatusRequest",

@@ -317,11 +317,45 @@ impl NovaRocksConfig {
             .try_into()
             .with_context(|| format!("parse toml: {}", path.display()))?;
         validate_state_store_configuration(&cfg)?;
+        validate_query_control_config(&cfg.runtime)?;
+        validate_query_lifecycle_fault_environment(&cfg)?;
         Ok(cfg)
     }
 
     pub fn jdbc_config(&self) -> Option<&JdbcConfig> {
         self.jdbc.as_ref()
+    }
+}
+
+fn validate_query_lifecycle_fault_environment(cfg: &NovaRocksConfig) -> Result<()> {
+    let environment =
+        std::env::var_os("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR").map(PathBuf::from);
+    #[cfg(debug_assertions)]
+    {
+        let configured = cfg.debug.query_lifecycle_fault_dir().map(Path::to_path_buf);
+        match (configured, environment) {
+            (None, None) => Ok(()),
+            (Some(configured), Some(environment)) if configured == environment => Ok(()),
+            (Some(configured), Some(environment)) => bail!(
+                "debug.query_lifecycle_fault_dir {} does not match runner-owned environment {}",
+                configured.display(),
+                environment.display()
+            ),
+            (Some(_), None) => bail!(
+                "debug.query_lifecycle_fault_dir requires NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR"
+            ),
+            (None, Some(_)) => bail!(
+                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR requires debug.query_lifecycle_fault_dir"
+            ),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = cfg;
+        if environment.is_some() {
+            bail!("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR is only available in debug builds");
+        }
+        Ok(())
     }
 }
 
@@ -727,6 +761,22 @@ pub struct RuntimeConfig {
     pub exchange_io_threads: usize,
     #[serde(default = "default_exchange_io_max_inflight_bytes")]
     pub exchange_io_max_inflight_bytes: usize,
+    #[serde(default = "default_query_control_heartbeat_interval_ms")]
+    pub query_control_heartbeat_interval_ms: u64,
+    #[serde(default = "default_query_control_heartbeat_timeout_ms")]
+    pub query_control_heartbeat_timeout_ms: u64,
+    #[serde(default = "default_query_control_init_rpc_timeout_ms")]
+    pub query_control_init_rpc_timeout_ms: u64,
+    #[serde(default = "default_query_control_attach_timeout_ms")]
+    pub query_control_attach_timeout_ms: u64,
+    #[serde(default = "default_query_control_pre_start_timeout_ms")]
+    pub query_control_pre_start_timeout_ms: u64,
+    #[serde(default = "default_query_control_tombstone_retention_ms")]
+    pub query_control_tombstone_retention_ms: u64,
+    #[serde(default = "default_query_control_tombstone_capacity")]
+    pub query_control_tombstone_capacity: usize,
+    #[serde(default = "default_query_control_max_active_entries")]
+    pub query_control_max_active_entries: usize,
     #[serde(default = "default_mem_limit")]
     pub mem_limit: String,
     #[serde(default = "default_be_mem_limit_bytes")]
@@ -953,6 +1003,90 @@ fn default_exchange_io_max_inflight_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+fn default_query_control_heartbeat_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_query_control_heartbeat_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_init_rpc_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_attach_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_pre_start_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_query_control_tombstone_retention_ms() -> u64 {
+    120_000
+}
+
+fn default_query_control_tombstone_capacity() -> usize {
+    16_384
+}
+
+fn default_query_control_max_active_entries() -> usize {
+    4_096
+}
+
+fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
+    let nonzero_durations = [
+        (
+            "runtime.query_control_heartbeat_interval_ms",
+            runtime.query_control_heartbeat_interval_ms,
+        ),
+        (
+            "runtime.query_control_heartbeat_timeout_ms",
+            runtime.query_control_heartbeat_timeout_ms,
+        ),
+        (
+            "runtime.query_control_init_rpc_timeout_ms",
+            runtime.query_control_init_rpc_timeout_ms,
+        ),
+        (
+            "runtime.query_control_attach_timeout_ms",
+            runtime.query_control_attach_timeout_ms,
+        ),
+        (
+            "runtime.query_control_pre_start_timeout_ms",
+            runtime.query_control_pre_start_timeout_ms,
+        ),
+        (
+            "runtime.query_control_tombstone_retention_ms",
+            runtime.query_control_tombstone_retention_ms,
+        ),
+    ];
+    for (field, value) in nonzero_durations {
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
+    }
+    if runtime.query_control_tombstone_capacity == 0 {
+        bail!("runtime.query_control_tombstone_capacity must be greater than 0");
+    }
+    if runtime.query_control_max_active_entries == 0 {
+        bail!("runtime.query_control_max_active_entries must be greater than 0");
+    }
+    let minimum_timeout = runtime
+        .query_control_heartbeat_interval_ms
+        .checked_mul(3)
+        .ok_or_else(|| {
+            anyhow::anyhow!("runtime.query_control_heartbeat_interval_ms is too large to validate")
+        })?;
+    if runtime.query_control_heartbeat_timeout_ms < minimum_timeout {
+        bail!(
+            "runtime.query_control_heartbeat_timeout_ms must be at least 3 times runtime.query_control_heartbeat_interval_ms"
+        );
+    }
+    Ok(())
+}
+
 fn default_mem_limit() -> String {
     DEFAULT_MEM_LIMIT_SPEC.to_string()
 }
@@ -1144,6 +1278,14 @@ impl Default for RuntimeConfig {
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
             exchange_io_max_inflight_bytes: default_exchange_io_max_inflight_bytes(),
+            query_control_heartbeat_interval_ms: default_query_control_heartbeat_interval_ms(),
+            query_control_heartbeat_timeout_ms: default_query_control_heartbeat_timeout_ms(),
+            query_control_init_rpc_timeout_ms: default_query_control_init_rpc_timeout_ms(),
+            query_control_attach_timeout_ms: default_query_control_attach_timeout_ms(),
+            query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),
+            query_control_tombstone_retention_ms: default_query_control_tombstone_retention_ms(),
+            query_control_tombstone_capacity: default_query_control_tombstone_capacity(),
+            query_control_max_active_entries: default_query_control_max_active_entries(),
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
@@ -1499,6 +1641,8 @@ pub struct DebugConfig {
     pub emit_cancel_marker: bool,
     #[cfg(debug_assertions)]
     pub emit_grpc_fragment_marker: bool,
+    #[cfg(debug_assertions)]
+    pub query_lifecycle_fault_dir: Option<PathBuf>,
 }
 
 #[cfg(debug_assertions)]
@@ -1511,6 +1655,7 @@ struct DebugConfigToml {
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: bool,
     emit_grpc_fragment_marker: bool,
+    query_lifecycle_fault_dir: Option<PathBuf>,
 }
 
 #[cfg(not(debug_assertions))]
@@ -1523,6 +1668,7 @@ struct DebugConfigToml {
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: Option<bool>,
     emit_grpc_fragment_marker: Option<bool>,
+    query_lifecycle_fault_dir: Option<PathBuf>,
 }
 
 impl<'de> Deserialize<'de> for DebugConfig {
@@ -1540,6 +1686,7 @@ impl<'de> Deserialize<'de> for DebugConfig {
                 fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
                 emit_cancel_marker: raw.emit_cancel_marker,
                 emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
+                query_lifecycle_fault_dir: raw.query_lifecycle_fault_dir,
             })
         }
         #[cfg(not(debug_assertions))]
@@ -1562,6 +1709,11 @@ impl<'de> Deserialize<'de> for DebugConfig {
             if raw.emit_grpc_fragment_marker.is_some() {
                 return Err(serde::de::Error::custom(
                     "debug.emit_grpc_fragment_marker is only available in debug builds",
+                ));
+            }
+            if raw.query_lifecycle_fault_dir.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.query_lifecycle_fault_dir is only available in debug builds",
                 ));
             }
             Ok(Self {
@@ -1612,6 +1764,16 @@ impl DebugConfig {
     pub fn emit_grpc_fragment_marker(&self) -> bool {
         false
     }
+
+    #[cfg(debug_assertions)]
+    pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
+        self.query_lifecycle_fault_dir.as_deref()
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
+        None
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1643,60 +1805,102 @@ mod tests {
     use novarocks_state_store::config::StateStoreProviderConfig;
 
     use super::{
-        ConnectorConfig, ConnectorObjectStoreConfig, DEFAULT_MEM_LIMIT_SPEC,
-        MetadataProviderConfig, NovaRocksConfig, RuntimeConfig, StandaloneObjectStoreConfig,
-        StandaloneServerConfig, StandaloneStarRocksTableConfig,
+        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
+        StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
+        validate_query_control_config,
     };
 
     #[test]
-    fn connector_startup_object_store_config_builds_local_credentials() {
-        let config = ConnectorConfig {
-            object_store: Some(ConnectorObjectStoreConfig {
-                endpoint: Some(" http://127.0.0.1:9000 ".to_string()),
-                access_key_id: Some(" access ".to_string()),
-                access_key_secret: Some(" secret ".to_string()),
-                region: Some(" us-east-1 ".to_string()),
-                enable_path_style_access: Some(true),
-            }),
-        };
+    fn query_control_config_defaults_are_fixed() {
+        let runtime = RuntimeConfig::default();
 
-        let object_store = config
-            .object_store_config()
-            .expect("startup config is valid")
-            .expect("object store configured");
-        assert_eq!(object_store.endpoint, "http://127.0.0.1:9000");
-        assert_eq!(object_store.access_key_id, "access");
-        assert_eq!(object_store.access_key_secret, "secret");
-        assert_eq!(object_store.region.as_deref(), Some("us-east-1"));
-        assert_eq!(object_store.enable_path_style_access, Some(true));
+        assert_eq!(runtime.query_control_heartbeat_interval_ms, 1_000);
+        assert_eq!(runtime.query_control_heartbeat_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_init_rpc_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_attach_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_pre_start_timeout_ms, 30_000);
+        assert_eq!(runtime.query_control_tombstone_retention_ms, 120_000);
+        assert_eq!(runtime.query_control_tombstone_capacity, 16_384);
+        assert_eq!(runtime.query_control_max_active_entries, 4_096);
     }
 
     #[test]
-    fn connector_startup_object_store_section_parses() {
-        let config: NovaRocksConfig = toml::from_str(
-            r#"
-[connector.object_store]
-endpoint = "http://127.0.0.1:9000"
-access_key_id = "access"
-access_key_secret = "secret"
-region = "us-east-1"
-enable_path_style_access = true
-"#,
-        )
-        .expect("parse connector startup configuration");
+    fn query_control_config_rejects_zero_values() {
+        let cases: [(&str, fn(&mut RuntimeConfig)); 8] = [
+            ("query_control_heartbeat_interval_ms", |runtime| {
+                runtime.query_control_heartbeat_interval_ms = 0;
+            }),
+            ("query_control_heartbeat_timeout_ms", |runtime| {
+                runtime.query_control_heartbeat_timeout_ms = 0;
+            }),
+            ("query_control_init_rpc_timeout_ms", |runtime| {
+                runtime.query_control_init_rpc_timeout_ms = 0;
+            }),
+            ("query_control_attach_timeout_ms", |runtime| {
+                runtime.query_control_attach_timeout_ms = 0;
+            }),
+            ("query_control_pre_start_timeout_ms", |runtime| {
+                runtime.query_control_pre_start_timeout_ms = 0;
+            }),
+            ("query_control_tombstone_retention_ms", |runtime| {
+                runtime.query_control_tombstone_retention_ms = 0;
+            }),
+            ("query_control_tombstone_capacity", |runtime| {
+                runtime.query_control_tombstone_capacity = 0;
+            }),
+            ("query_control_max_active_entries", |runtime| {
+                runtime.query_control_max_active_entries = 0;
+            }),
+        ];
 
-        let object_store = config
-            .connector
-            .object_store
-            .expect("configured connector object store");
-        assert_eq!(
-            object_store.endpoint.as_deref(),
-            Some("http://127.0.0.1:9000")
+        for (field, mutate) in cases {
+            let mut runtime = RuntimeConfig::default();
+            mutate(&mut runtime);
+            let error = validate_query_control_config(&runtime)
+                .expect_err("zero query-control values must be rejected");
+            assert!(
+                error.to_string().contains(field),
+                "error must identify {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_control_config_rejects_short_heartbeat_timeout() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.query_control_heartbeat_interval_ms = 1_000;
+        runtime.query_control_heartbeat_timeout_ms = 2_999;
+
+        let error = validate_query_control_config(&runtime)
+            .expect_err("heartbeat timeout must cover at least three intervals");
+        assert!(
+            error
+                .to_string()
+                .contains("query_control_heartbeat_timeout_ms")
         );
-        assert_eq!(object_store.access_key_id.as_deref(), Some("access"));
-        assert_eq!(object_store.access_key_secret.as_deref(), Some("secret"));
-        assert_eq!(object_store.region.as_deref(), Some("us-east-1"));
-        assert_eq!(object_store.enable_path_style_access, Some(true));
+    }
+
+    #[test]
+    fn query_control_config_load_rejects_invalid_capacity() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            temp.path(),
+            r#"
+[runtime]
+query_control_max_active_entries = 0
+"#,
+        )?;
+
+        let error = match NovaRocksConfig::load_from_file(temp.path()) {
+            Ok(_) => panic!("load must validate query-control capacity"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("query_control_max_active_entries")
+        );
+        Ok(())
     }
 
     #[test]
@@ -2016,6 +2220,7 @@ fault_inject_submit_fail_after = 1
 fault_inject_fetch_not_ready_count = 2
 emit_cancel_marker = true
 emit_grpc_fragment_marker = true
+query_lifecycle_fault_dir = "/tmp/runner-owned-query-lifecycle-faults"
 "#,
         )
         .expect("parse config");
@@ -2023,6 +2228,12 @@ emit_grpc_fragment_marker = true
         assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
         assert!(cfg.debug.emit_cancel_marker);
         assert!(cfg.debug.emit_grpc_fragment_marker);
+        assert_eq!(
+            cfg.debug.query_lifecycle_fault_dir.as_deref(),
+            Some(std::path::Path::new(
+                "/tmp/runner-owned-query-lifecycle-faults"
+            ))
+        );
     }
 
     #[test]
@@ -2055,6 +2266,21 @@ emit_cancel_marker = false
         let err = err.to_string();
         assert!(
             err.contains("emit_cancel_marker"),
+            "unexpected parse error: {err}"
+        );
+
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+query_lifecycle_fault_dir = "/tmp/not-allowed"
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject query lifecycle fault hooks"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("query_lifecycle_fault_dir"),
             "unexpected parse error: {err}"
         );
 

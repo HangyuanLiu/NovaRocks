@@ -60,6 +60,68 @@ static BACKENDS_BY_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_backends")
 });
 
+static BACKEND_QUERY_LIFECYCLE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_lifecycle_entries",
+        "Number of backend query lifecycle entries by state.",
+        &["state"]
+    )
+    .expect("register novarocks_backend_query_lifecycle_entries")
+});
+
+static BACKEND_QUERY_LIFECYCLE_REJECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_lifecycle_rejections",
+        "Cumulative backend query lifecycle rejections by reason.",
+        &["reason"]
+    )
+    .expect("register novarocks_backend_query_lifecycle_rejections")
+});
+
+static BACKEND_QUERY_LIFECYCLE_TERMINATIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_lifecycle_terminations",
+        "Cumulative backend query lifecycle terminations by reason.",
+        &["reason"]
+    )
+    .expect("register novarocks_backend_query_lifecycle_terminations")
+});
+
+static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "novarocks_frontend_query_lifecycle_active_attempts",
+        "Number of frontend-owned query lifecycle attempts."
+    )
+    .expect("register novarocks_frontend_query_lifecycle_active_attempts")
+});
+
+static FRONTEND_QUERY_LIFECYCLE_INIT: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_frontend_query_lifecycle_init_total",
+        "Cumulative frontend query initialization outcomes.",
+        &["outcome"]
+    )
+    .expect("register novarocks_frontend_query_lifecycle_init_total")
+});
+
+static FRONTEND_QUERY_LIFECYCLE_CONTROL: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_frontend_query_lifecycle_control_total",
+        "Cumulative frontend query control outcomes.",
+        &["outcome"]
+    )
+    .expect("register novarocks_frontend_query_lifecycle_control_total")
+});
+
+static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_frontend_query_lifecycle_latency_micros",
+        "Cumulative frontend query lifecycle latency and sample counts.",
+        &["phase", "measure"]
+    )
+    .expect("register novarocks_frontend_query_lifecycle_latency_micros")
+});
+
 pub(crate) fn observe_fragment_scheduled() {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc();
 }
@@ -81,6 +143,93 @@ pub(crate) fn publish_backend_topology_metrics(
         BACKENDS_BY_STATE
             .with_label_values(&[state_name])
             .set(count as i64);
+    }
+}
+
+pub fn publish_backend_query_lifecycle_metrics(
+    snapshot: crate::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot,
+    termination_reasons: [u64; 6],
+) {
+    for (state_name, count) in [
+        ("initializing", snapshot.initializing),
+        ("initialized", snapshot.initialized),
+        ("control_attached", snapshot.control_attached),
+        ("terminating", snapshot.terminating),
+        ("tombstone", snapshot.tombstones),
+    ] {
+        BACKEND_QUERY_LIFECYCLE_ENTRIES
+            .with_label_values(&[state_name])
+            .set(count as i64);
+    }
+    for (reason, count) in [
+        ("admission", snapshot.admission_rejected),
+        ("init_conflict", snapshot.init_conflicts),
+        ("heartbeat_timeout", snapshot.heartbeat_timeouts),
+    ] {
+        BACKEND_QUERY_LIFECYCLE_REJECTIONS
+            .with_label_values(&[reason])
+            .set(count as i64);
+    }
+    for (reason, count) in [
+        ("coordinator_abort", termination_reasons[0]),
+        ("coordinator_finalize", termination_reasons[1]),
+        ("coordinator_stream_lost", termination_reasons[2]),
+        ("coordinator_heartbeat_timeout", termination_reasons[3]),
+        ("local_failure", termination_reasons[4]),
+        ("pre_start_timeout", termination_reasons[5]),
+    ] {
+        BACKEND_QUERY_LIFECYCLE_TERMINATIONS
+            .with_label_values(&[reason])
+            .set(count as i64);
+    }
+}
+
+pub fn publish_frontend_query_lifecycle_metrics(
+    snapshot: crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+) {
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS).set(snapshot.active_attempts as i64);
+    for (outcome, count) in [
+        ("applied", snapshot.init_applied),
+        ("already_applied", snapshot.init_idempotent),
+        ("failed", snapshot.init_failed),
+        ("uncertain_cleanup", snapshot.init_uncertain_cleanup),
+        ("manifest_conflict", snapshot.manifest_conflicts),
+    ] {
+        FRONTEND_QUERY_LIFECYCLE_INIT
+            .with_label_values(&[outcome])
+            .set(count as i64);
+    }
+    for (outcome, count) in [
+        ("control_ready", snapshot.control_ready),
+        ("attach_failed", snapshot.attach_failed),
+        ("heartbeat_timeout", snapshot.heartbeat_timeouts),
+        ("coordinator_lost", snapshot.coordinator_lost),
+        ("local_failure", snapshot.local_failures),
+        ("backend_epoch_mismatch", snapshot.backend_epoch_mismatches),
+        ("cleanup_failure", snapshot.cleanup_failures),
+    ] {
+        FRONTEND_QUERY_LIFECYCLE_CONTROL
+            .with_label_values(&[outcome])
+            .set(count as i64);
+    }
+    for (phase, total, samples) in [
+        (
+            "init",
+            snapshot.init_latency_micros_total,
+            snapshot.init_latency_samples,
+        ),
+        (
+            "attach",
+            snapshot.attach_latency_micros_total,
+            snapshot.attach_latency_samples,
+        ),
+    ] {
+        FRONTEND_QUERY_LIFECYCLE_LATENCY
+            .with_label_values(&[phase, "total"])
+            .set(total as i64);
+        FRONTEND_QUERY_LIFECYCLE_LATENCY
+            .with_label_values(&[phase, "samples"])
+            .set(samples as i64);
     }
 }
 
@@ -175,6 +324,13 @@ fn refresh_backend_gauges() {
     Lazy::force(&HEARTBEAT_RTT_SECONDS);
     Lazy::force(&LIVE_BACKENDS);
     Lazy::force(&BACKENDS_BY_STATE);
+    Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES);
+    Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS);
+    Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
+    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_LATENCY);
 }
 
 #[cfg(test)]
@@ -242,5 +398,78 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 == Some("novarocks_fragment_scheduled_total")
         }));
+    }
+
+    #[test]
+    fn frontend_query_lifecycle_metrics_publish_structured_snapshot() {
+        publish_frontend_query_lifecycle_metrics(
+            crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot {
+                active_attempts: 2,
+                init_applied: 3,
+                init_idempotent: 4,
+                init_failed: 5,
+                init_uncertain_cleanup: 6,
+                manifest_conflicts: 7,
+                init_latency_micros_total: 8,
+                init_latency_samples: 9,
+                control_ready: 10,
+                attach_failed: 11,
+                attach_latency_micros_total: 12,
+                attach_latency_samples: 13,
+                heartbeat_timeouts: 14,
+                coordinator_lost: 15,
+                local_failures: 16,
+                backend_epoch_mismatches: 17,
+                cleanup_failures: 18,
+            },
+        );
+
+        let body = render_metrics().expect("render frontend query lifecycle metrics");
+        assert!(
+            body.contains("novarocks_frontend_query_lifecycle_active_attempts 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_init_total{outcome=\"already_applied\"} 4"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"heartbeat_timeout\"} 14"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_latency_micros{measure=\"samples\",phase=\"attach\"} 13"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"local_failure\"} 16"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"cleanup_failure\"} 18"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_init_total{outcome=\"uncertain_cleanup\"} 6"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "novarocks_frontend_query_lifecycle_control_total{outcome=\"backend_epoch_mismatch\"} 17"
+            ),
+            "{body}"
+        );
     }
 }

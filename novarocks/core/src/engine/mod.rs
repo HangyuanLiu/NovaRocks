@@ -4591,6 +4591,7 @@ fn ensure_standalone_exchange_server(
         "127.0.0.1",
         default_port,
         crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+        crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
         Arc::clone(&native_report_handler),
     ) {
         Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
@@ -4610,6 +4611,7 @@ fn ensure_standalone_exchange_server(
                 "127.0.0.1",
                 fallback_port,
                 crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+                crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
                 native_report_handler,
             )
             .map_err(|start_err| {

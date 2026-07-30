@@ -22,6 +22,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::sync::mpsc::SyncSender;
 
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::transport::Channel;
 
@@ -42,6 +43,13 @@ pub use crate::proto;
 pub struct NovaRocksGrpcRemoteClient {
     host: String,
     port: u16,
+}
+
+#[derive(Debug)]
+pub(crate) enum QueryLifecycleRpcError {
+    PreSubmission(String),
+    PostSubmissionDeadlineExceeded(String),
+    PostSubmissionStatus(tonic::Status),
 }
 
 impl NovaRocksGrpcRemoteClient {
@@ -136,6 +144,95 @@ impl NovaRocksGrpcRemoteClient {
         proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
             .max_encoding_message_size(GRPC_MAX_ENCODING_BYTES)
             .max_decoding_message_size(GRPC_MAX_DECODING_BYTES)
+    }
+
+    pub(crate) async fn init_query_async(
+        &self,
+        request: proto::novarocks::InitQueryRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::InitQueryResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("init_query", deadline_at)
+            .await
+            .map_err(QueryLifecycleRpcError::PreSubmission)?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::PreSubmission(
+                "init_query deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.init_query(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(
+                    "init_query deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
+    }
+
+    pub(crate) async fn abort_query_async(
+        &self,
+        request: proto::novarocks::AbortQueryRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::AbortQueryResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("abort_query", deadline_at)
+            .await
+            .map_err(QueryLifecycleRpcError::PreSubmission)?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::PreSubmission(
+                "abort_query deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.abort_query(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(
+                    "abort_query deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
+    }
+
+    pub(crate) async fn attach_query_control_async(
+        &self,
+        outbound: ReceiverStream<proto::novarocks::QueryControlRequest>,
+        timeout: Duration,
+    ) -> Result<tonic::Streaming<proto::novarocks::QueryControlResponse>, QueryLifecycleRpcError>
+    {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("query_control_attach", deadline_at)
+            .await
+            .map_err(QueryLifecycleRpcError::PreSubmission)?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::PreSubmission(
+                "query_control_attach deadline exceeded before stream RPC submission".to_string(),
+            ));
+        }
+        tokio::time::timeout_at(
+            deadline_at,
+            client.query_control_stream(Request::new(outbound)),
+        )
+        .await
+        .map_err(|_| {
+            QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(
+                "query_control_attach deadline exceeded during stream RPC".to_string(),
+            )
+        })?
+        .map(|response| response.into_inner())
+        .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
     }
 
     pub fn blocking_submit_fragment(
@@ -317,57 +414,6 @@ impl NovaRocksGrpcRemoteClient {
             .await
             .map(|r| r.into_inner())
             .map_err(|e| format!("heartbeat rpc failed: {e}"))
-    }
-
-    pub(crate) async fn install_runtime_filter_deployment_async(
-        &self,
-        request: proto::filter::InstallRuntimeFilterDeploymentRequest,
-        deadline: Duration,
-    ) -> Result<proto::filter::InstallRuntimeFilterDeploymentResponse, String> {
-        let deadline_at = tokio::time::Instant::now() + deadline;
-        let mut client = self
-            .make_runtime_filter_async_client("install", deadline_at)
-            .await?;
-        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(
-                "runtime filter install deadline exceeded before unary RPC submission".to_string(),
-            );
-        }
-        let mut request = Request::new(request);
-        request.set_timeout(remaining);
-        tokio::time::timeout_at(
-            deadline_at,
-            client.install_runtime_filter_deployment(request),
-        )
-        .await
-        .map_err(|_| "runtime filter install deadline exceeded during unary RPC".to_string())?
-        .map(|response| response.into_inner())
-        .map_err(|error| format!("install_runtime_filter_deployment rpc failed: {error}"))
-    }
-
-    pub(crate) async fn abort_runtime_filter_deployment_async(
-        &self,
-        request: proto::filter::AbortRuntimeFilterDeploymentRequest,
-        deadline: Duration,
-    ) -> Result<proto::filter::AbortRuntimeFilterDeploymentResponse, String> {
-        let deadline_at = tokio::time::Instant::now() + deadline;
-        let mut client = self
-            .make_runtime_filter_async_client("abort", deadline_at)
-            .await?;
-        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(
-                "runtime filter abort deadline exceeded before unary RPC submission".to_string(),
-            );
-        }
-        let mut request = Request::new(request);
-        request.set_timeout(remaining);
-        tokio::time::timeout_at(deadline_at, client.abort_runtime_filter_deployment(request))
-            .await
-            .map_err(|_| "runtime filter abort deadline exceeded during unary RPC".to_string())?
-            .map(|response| response.into_inner())
-            .map_err(|error| format!("abort_runtime_filter_deployment rpc failed: {error}"))
     }
 
     pub(crate) async fn transmit_runtime_filter_envelope_async(
@@ -644,6 +690,7 @@ mod pr3_tests {
             });
             let service = GrpcService::with_fragment_execution(
                 crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
+                crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
                 report_handler,
             );
             tokio::spawn(
@@ -832,68 +879,6 @@ mod pr3_tests {
         );
         assert!(elapsed < Duration::from_millis(200), "elapsed={elapsed:?}");
     }
-
-    #[test]
-    fn runtime_filter_install_deadline_bounds_channel_acquisition_and_rpc() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve endpoint");
-        let addr = listener.local_addr().expect("reserved endpoint address");
-        drop(listener);
-        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr).expect("test client");
-        let deadline = Duration::from_millis(30);
-        let (started_tx, started_rx) = sync_channel(1);
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        set_runtime_filter_channel_acquisition_test_hook(
-            format!("{}:{}", addr.ip(), addr.port()),
-            started_tx,
-            release_rx,
-        );
-        let (result_tx, result_rx) = sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let started_at = Instant::now();
-            let result = data_block_on(async move {
-                client
-                    .install_runtime_filter_deployment_async(
-                        proto::filter::InstallRuntimeFilterDeploymentRequest::default(),
-                        deadline,
-                    )
-                    .await
-            })
-            .and_then(|result| result);
-            result_tx.send((result, started_at.elapsed())).unwrap();
-        });
-
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("fake channel acquisition starts");
-        let outcome = match result_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = release_tx.send(());
-                let (_, elapsed) = result_rx
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("released legacy acquisition completes");
-                worker.join().expect("deadline worker");
-                panic!(
-                    "runtime filter deadline did not bound channel acquisition: {error}; elapsed={elapsed:?}"
-                );
-            }
-        };
-        drop(release_tx);
-        worker.join().expect("deadline worker");
-
-        let error = outcome
-            .0
-            .expect_err("fake acquisition must exceed the deadline");
-        assert!(
-            error.contains("runtime filter install deadline exceeded during channel acquisition"),
-            "{error}"
-        );
-        assert!(
-            outcome.1 < Duration::from_millis(200),
-            "elapsed={:?}",
-            outcome.1
-        );
-    }
 }
 
 /// Synchronous exchange send — blocks until the server acknowledges receipt.
@@ -1000,6 +985,8 @@ mod lookup_tests {
                         proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
                             GrpcService::with_fragment_execution(
                                 crate::service::grpc_server::rejecting_test_native_fragment_ingress(
+                                ),
+                                crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(
                                 ),
                                 Arc::new(super::pr3_tests::DelayedReportHandler(Duration::ZERO)),
                             ),

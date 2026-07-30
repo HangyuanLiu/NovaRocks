@@ -44,12 +44,6 @@ service NovaRocksGrpc {
   // Native runtime-filter envelope propagation.
   rpc TransmitRuntimeFilterEnvelope(novarocks.filter.RuntimeFilterEnvelope)
       returns (novarocks.filter.RuntimeFilterEnvelopeResponse);
-  rpc InstallRuntimeFilterDeployment(
-      novarocks.filter.InstallRuntimeFilterDeploymentRequest)
-      returns (novarocks.filter.InstallRuntimeFilterDeploymentResponse);
-  rpc AbortRuntimeFilterDeployment(
-      novarocks.filter.AbortRuntimeFilterDeploymentRequest)
-      returns (novarocks.filter.AbortRuntimeFilterDeploymentResponse);
   // Point lookup (fetch-by-key).
   rpc Lookup(novarocks.filter.LookupRequest)
       returns (novarocks.filter.LookupResponse);
@@ -61,6 +55,12 @@ service NovaRocksGrpc {
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
   // Coordinator cancels one or more fragment instances.
   rpc CancelFragment(CancelFragmentRequest) returns (CancelFragmentResponse);
+  // Coordinator establishes and owns one backend-local query attempt before
+  // any native fragment is accepted.
+  rpc InitQuery(InitQueryRequest) returns (InitQueryResponse);
+  rpc AbortQuery(AbortQueryRequest) returns (AbortQueryResponse);
+  rpc QueryControlStream(stream QueryControlRequest)
+      returns (stream QueryControlResponse);
   // FE-pull cluster heartbeat (unary). Consumer: src/runtime/heartbeat_mgr.rs.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
@@ -72,6 +72,150 @@ service NovaRocksGrpc {
   // Batched variant of ReportExecStatus.
   rpc BatchReportExecStatus(BatchReportExecStatusRequest)
       returns (BatchReportExecStatusResponse);
+}
+
+// Immutable identity for one physical execution attempt of a logical query.
+message QueryExecutionId {
+  novarocks.common.UniqueId query_id = 1;
+  uint64 attempt_id = 2;
+}
+
+enum QueryParticipantRole {
+  QUERY_PARTICIPANT_ROLE_UNSPECIFIED = 0;
+  FRAGMENT_EXECUTOR = 1;
+  RUNTIME_FILTER_SERVICE = 2;
+}
+
+message QueryControlEndpoint {
+  string host = 1;
+  uint32 port = 2;
+}
+
+message ParticipantBackendIdentity {
+  uint64 backend_id = 1;
+  QueryControlEndpoint endpoint = 2;
+  uint64 start_epoch = 3;
+}
+
+message ExchangeRouteManifest {
+  novarocks.common.UniqueId source_fragment_instance_id = 1;
+  novarocks.common.UniqueId destination_fragment_instance_id = 2;
+  int32 destination_node_id = 3;
+  uint32 sender_ordinal = 4;
+  uint32 sender_count = 5;
+}
+
+message RuntimeFilterContribution {
+  uint32 participant_id = 1;
+  novarocks.filter.RuntimeFilterQueryLifecycleOptions lifecycle = 2;
+  novarocks.filter.RuntimeFilterParticipantInstall install = 3;
+  bytes contribution_digest = 4;
+}
+
+message ParticipantManifest {
+  QueryExecutionId execution_id = 1;
+  ParticipantBackendIdentity backend = 2;
+  repeated QueryParticipantRole participant_roles = 3;
+  repeated novarocks.common.UniqueId expected_fragment_instance_ids = 4;
+  QueryOptions query_options = 5;
+  uint64 query_deadline_unix_ms = 6;
+  repeated ExchangeRouteManifest exchange_routes = 7;
+  RuntimeFilterContribution runtime_filter = 8;
+  uint64 pre_start_timeout_ms = 9;
+  QueryControlEndpoint report_endpoint = 10;
+}
+
+enum QueryInitOutcome {
+  QUERY_INIT_OUTCOME_UNSPECIFIED = 0;
+  QUERY_INIT_APPLIED = 1;
+  QUERY_INIT_ALREADY_APPLIED = 2;
+  QUERY_INIT_REJECTED_CONFLICT = 3;
+  QUERY_INIT_REJECTED_STALE_BACKEND = 4;
+  QUERY_INIT_REJECTED_CAPACITY = 5;
+  QUERY_INIT_REJECTED_INVALID_MANIFEST = 6;
+  QUERY_INIT_REJECTED_TERMINATED = 7;
+}
+
+enum QueryTerminationReason {
+  QUERY_TERMINATION_REASON_UNSPECIFIED = 0;
+  QUERY_TERMINATION_COORDINATOR_ABORT = 1;
+  QUERY_TERMINATION_COORDINATOR_FINALIZE = 2;
+  QUERY_TERMINATION_COORDINATOR_STREAM_LOST = 3;
+  QUERY_TERMINATION_COORDINATOR_HEARTBEAT_TIMEOUT = 4;
+  QUERY_TERMINATION_LOCAL_FAILURE = 5;
+  QUERY_TERMINATION_PRE_START_TIMEOUT = 6;
+}
+
+message InitQueryRequest {
+  ParticipantManifest manifest = 1;
+  bytes init_digest = 2;
+}
+
+message InitQueryResponse {
+  QueryExecutionId execution_id = 1;
+  bytes init_digest = 2;
+  QueryInitOutcome outcome = 3;
+}
+
+message AbortQueryRequest {
+  QueryExecutionId execution_id = 1;
+  bytes init_digest = 2;
+  string reason = 3;
+}
+
+message AbortQueryResponse {
+  QueryExecutionId execution_id = 1;
+  QueryTerminationReason accepted_reason = 2;
+}
+
+message QueryControlAttach {
+  QueryExecutionId execution_id = 1;
+  bytes init_digest = 2;
+  uint64 frontend_owner_epoch = 3;
+}
+
+message QueryControlHeartbeat {
+  uint64 sequence = 1;
+  uint64 sent_mono_ns = 2;
+}
+
+message QueryControlAbort {
+  string reason = 1;
+}
+
+message QueryControlFinalize {}
+
+message QueryControlRequest {
+  oneof command {
+    QueryControlAttach attach = 1;
+    QueryControlHeartbeat heartbeat = 2;
+    QueryControlAbort abort = 3;
+    QueryControlFinalize finalize = 4;
+  }
+}
+
+message QueryControlReady {}
+
+message QueryControlHeartbeatAck {
+  uint64 sequence = 1;
+}
+
+message QueryControlLocalFailure {
+  string code = 1;
+  string detail = 2;
+}
+
+message QueryControlTerminationAccepted {
+  QueryTerminationReason reason = 1;
+}
+
+message QueryControlResponse {
+  oneof event {
+    QueryControlReady control_ready = 1;
+    QueryControlHeartbeatAck heartbeat_ack = 2;
+    QueryControlLocalFailure local_failure = 3;
+    QueryControlTerminationAccepted termination_accepted = 4;
+  }
 }
 
 // One exchange shuffle chunk in flight from a sender to a receiver instance.
@@ -96,6 +240,7 @@ message ExchangeResponse {
 message SubmitFragmentRequest {
   novarocks.plan.PlanFragment plan = 1;        // native static plan shared across instances
   InstanceParams instance_params = 2;          // native per-instance dynamic parameters
+  QueryExecutionId execution_id = 3;           // required immutable query-attempt identity
 }
 
 // Native per-instance fragment parameters. Complements the static PlanFragment
@@ -232,6 +377,10 @@ message QueryOptions {
   int64 runtime_profile_report_interval = 23;
   optional bool enable_join_runtime_bitset_filter = 24;
   int64 global_runtime_filter_build_max_size = 25;
+  bool orc_use_column_names = 26;
+  bool enable_file_metacache = 27;
+  bool enable_file_pagecache = 28;
+  bool enable_parquet_reader_page_index = 29;
 }
 
 // Spill options consumed by NovaRocks native runtime.

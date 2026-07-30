@@ -23,6 +23,7 @@ use std::sync::Arc;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::query_execution::contract::QueryId;
+use crate::query_execution::lifecycle::QueryExecutionId;
 
 /// Opaque data-plane batch returned by a fragment dispatcher.
 ///
@@ -116,19 +117,26 @@ pub fn new_grpc_fragment_dispatcher(
 }
 
 pub struct NativeFragmentEnvelope {
+    execution_id: QueryExecutionId,
     plan: crate::proto::plan::PlanFragment,
     instance_params: crate::proto::novarocks::InstanceParams,
 }
 
 impl NativeFragmentEnvelope {
     pub(crate) fn new(
+        execution_id: QueryExecutionId,
         plan: crate::proto::plan::PlanFragment,
         instance_params: crate::proto::novarocks::InstanceParams,
     ) -> Self {
         Self {
+            execution_id,
             plan,
             instance_params,
         }
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
     }
 
     #[cfg(test)]
@@ -191,10 +199,16 @@ impl NativeFragmentEnvelope {
 mod tests {
     use super::*;
     use crate::proto::common::UniqueId as ProtoUniqueId;
+    use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 
     #[test]
     fn native_fragment_envelope_preserves_native_plan_and_instance_params() {
         let envelope = NativeFragmentEnvelope::new(
+            QueryExecutionId::new(
+                QueryId::new(7, 9),
+                AttemptId::new(3).expect("nonzero attempt"),
+            )
+            .expect("valid execution id"),
             crate::proto::plan::PlanFragment {
                 fragment_id: 9,
                 ..Default::default()
@@ -207,6 +221,7 @@ mod tests {
             },
         );
 
+        assert_eq!(envelope.execution_id().attempt_id().get(), 3);
         assert_eq!(
             envelope.query_id().expect("native query id"),
             UniqueId { hi: 7, lo: 9 }

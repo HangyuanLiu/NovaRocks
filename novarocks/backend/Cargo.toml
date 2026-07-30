@@ -9,3 +9,8 @@ doctest = false
 [dependencies]
 novarocks = { path = "../core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[dev-dependencies]
+novarocks = { path = "../core", features = ["query-execution-contract-test-support"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["transport"] }

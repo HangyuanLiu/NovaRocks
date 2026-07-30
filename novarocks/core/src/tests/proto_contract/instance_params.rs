@@ -169,6 +169,10 @@ fn query_options() -> novarocks::QueryOptions {
         runtime_profile_report_interval: 7,
         enable_join_runtime_bitset_filter: Some(true),
         global_runtime_filter_build_max_size: 1 << 20,
+        orc_use_column_names: true,
+        enable_file_metacache: true,
+        enable_file_pagecache: true,
+        enable_parquet_reader_page_index: true,
         ..Default::default()
     }
 }
@@ -191,8 +195,8 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
 
     assert_eq!(
         fields,
-        (1..=25).collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=25"
+        (1..=29).collect::<Vec<_>>(),
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29"
     );
 }
 
@@ -275,15 +279,18 @@ fn submit_fragment_request_carries_native_fields_only() {
             report_endpoint: Some("10.0.0.10:9070".to_string()),
             typed_result_sink: true,
         }),
-        ..Default::default()
+        execution_id: Some(novarocks::QueryExecutionId {
+            query_id: Some(id(1, 2)),
+            attempt_id: 1,
+        }),
     };
     let fields = encoded_field_numbers(&request);
 
     assert!(fields.contains(&1), "plan must use reset tag 1");
     assert!(fields.contains(&2), "instance_params must use reset tag 2");
     assert!(
-        !fields.contains(&3),
-        "pre-release reset must not keep old instance_params tag 3"
+        fields.contains(&3),
+        "execution_id must use SubmitFragmentRequest tag 3"
     );
 
     let decoded: novarocks::SubmitFragmentRequest = roundtrip_message(&request);

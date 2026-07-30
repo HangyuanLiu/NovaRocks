@@ -1015,17 +1015,102 @@ fn execute_target_query_with_fault(
     query_timeout: u64,
     sql: &str,
     db: Option<&str>,
+    fault_deadline: Option<Instant>,
 ) -> (bool, Option<QueryExecution>, String) {
-    fault_injection::execute_with_post_fragment_start_fault(meta, server_handle, || {
-        session.execute_query(query_timeout, sql, db)
-    })
+    let query_timeout = bounded_fault_query_timeout(query_timeout, fault_deadline);
+    let result = fault_injection::execute_with_post_fragment_start_fault(
+        meta,
+        server_handle,
+        Some(session.connection_id()),
+        fault_deadline,
+        || session.execute_query(query_timeout, sql, db),
+    )
     .unwrap_or_else(|error| {
         (
             false,
             None,
             format!("FAIL (runner fault injection): {error:#}"),
         )
-    })
+    });
+    if meta.kill_fe_after_control_ready_count.is_some() {
+        if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return (
+                false,
+                None,
+                fault_timeout_diagnostics(
+                    server_handle,
+                    "runner FE restart reconnect: shared lifecycle deadline expired",
+                ),
+            );
+        }
+        if let Err(error) = session.reconnect() {
+            return (
+                false,
+                None,
+                fault_timeout_diagnostics(
+                    server_handle,
+                    &format!("runner FE restart reconnect failed: {error:#}"),
+                ),
+            );
+        }
+        if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return (
+                false,
+                None,
+                fault_timeout_diagnostics(
+                    server_handle,
+                    "runner FE restart reconnect exceeded shared lifecycle deadline",
+                ),
+            );
+        }
+    }
+    result
+}
+
+fn fault_timeout_diagnostics(
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    message: &str,
+) -> String {
+    let Ok(server) = server_handle.lock() else {
+        return format!("FAIL ({message}); server handle mutex is poisoned");
+    };
+    let tail = |contents: String| {
+        contents
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let fe_tail = server
+        .fe_log_contents()
+        .map(tail)
+        .unwrap_or_else(|error| format!("<read failed: {error:#}>"));
+    let be_tails = (0..server.be_count())
+        .map(|index| {
+            server
+                .be_log_contents(index)
+                .map(tail)
+                .unwrap_or_else(|error| format!("<read failed: {error:#}>"))
+        })
+        .collect::<Vec<_>>();
+    format!("FAIL ({message}); fe_tail={fe_tail:?}; be_tails={be_tails:?}")
+}
+
+fn bounded_fault_query_timeout(query_timeout: u64, fault_deadline: Option<Instant>) -> u64 {
+    const TERMINAL_EVIDENCE_RESERVE: Duration = Duration::from_secs(2);
+    let Some(deadline) = fault_deadline else {
+        return query_timeout;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let bounded = remaining
+        .saturating_sub(TERMINAL_EVIDENCE_RESERVE)
+        .as_secs()
+        .max(1);
+    query_timeout.min(bounded)
 }
 
 fn finish_expected_error_step(
@@ -1399,6 +1484,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             step.query_number, order_sensitive, epsilon
         );
 
+        let compat_deadline = compat_directive::step_evidence_deadline(&step.meta);
         if fault_injection::has_fault(&step.meta) {
             let fault_result = ctx
                 .server_handle
@@ -1421,9 +1507,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             &step.meta,
             Arc::clone(&ctx.server_handle),
         );
+        let _query_lifecycle_fault_guard = fault_injection::query_lifecycle_fault_step_guard(
+            &step.meta,
+            Arc::clone(&ctx.server_handle),
+        );
 
         let compat_snapshot = match ctx.server_handle.lock() {
-            Ok(server_handle) => compat_directive::snapshot(&step.meta, server_handle.as_ref()),
+            Ok(server_handle) => compat_directive::snapshot_with_deadline(
+                &step.meta,
+                server_handle.as_ref(),
+                compat_deadline,
+            ),
             Err(_) => Err(anyhow::anyhow!("server handle mutex is poisoned")),
         };
         let compat_snapshot = match compat_snapshot {
@@ -1466,6 +1560,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     let elapsed = execution
@@ -1761,6 +1856,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 ctx.query_timeout,
                                 &step.sql,
                                 step.meta.db.as_deref(),
+                                compat_snapshot.evidence_deadline(),
                             )
                         }
                     } else if shell::is_shell_step(&step.sql) {
@@ -1965,6 +2061,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2025,6 +2122,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2080,6 +2178,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
+                            compat_snapshot.evidence_deadline(),
                         )
                     };
                     if !ok_t || execution_t.is_none() {
@@ -2480,6 +2579,84 @@ fn validate_fault_injection_jobs(cases: &[SqlCase], jobs: usize) -> Result<()> {
     Ok(())
 }
 
+fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
+    const DIRECTIVES: &[&str] = &[
+        "drop_next_init_ack_be_index",
+        "stop_query_control_heartbeat_be_index",
+        "kill_fe_after_control_ready_count",
+        "restart_be_after_init_ack_index",
+        "kill_query_after_control_ready_count",
+        "query_control_fragment_backend_limit",
+    ];
+    sql.lines().any(|line| {
+        let line = line.trim_start();
+        DIRECTIVES
+            .iter()
+            .any(|directive| line.starts_with(&format!("-- @{directive}=")))
+    })
+}
+
+fn validate_selected_suite_cluster(
+    suite_names: &[String],
+    mode: ClusterMode,
+    cluster_size: usize,
+) -> Result<()> {
+    if suite_names
+        .iter()
+        .any(|suite| suite == "distributed-resilience")
+        && (mode != ClusterMode::CrossProcess || cluster_size != 3)
+    {
+        bail!(
+            "distributed-resilience requires --cluster-mode cross-process --cluster-size 3"
+        );
+    }
+    Ok(())
+}
+
+fn selected_cases_require_query_lifecycle_faults(
+    cli: &Cli,
+    suite_names: &[String],
+    suite_configs: &BTreeMap<String, SuiteConfig>,
+    base_dir: &std::path::Path,
+) -> Result<bool> {
+    for suite_name in suite_names {
+        let suite = suite_configs
+            .get(suite_name)
+            .with_context(|| format!("selected suite {suite_name} is missing"))?;
+        let sql_dir = resolve_path(cli.sql_dir.as_deref(), base_dir)
+            .unwrap_or_else(|| suite.sql_dir.clone());
+        let sql_glob = cli
+            .sql_glob
+            .clone()
+            .unwrap_or_else(|| suite.sql_glob.clone());
+        let mut files = list_sql_files(&sql_dir, &sql_glob)?;
+        let available = files
+            .iter()
+            .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
+        let only = parse_selector_list(cli.only.as_deref(), &available, "--only")?;
+        let skip = parse_selector_list(cli.skip.as_deref(), &available, "--skip")?;
+        files.retain(|path| {
+            let Some(case_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                return false;
+            };
+            (only.is_empty() || only.contains(case_id)) && !skip.contains(case_id)
+        });
+        if let Some(limit) = cli.limit {
+            files.truncate(limit.min(files.len()));
+        }
+        for path in files {
+            let sql = fs::read_to_string(&path)
+                .with_context(|| format!("read lifecycle fault preflight {}", path.display()))?;
+            if sql_text_has_query_lifecycle_fault_directive(&sql) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2576,6 +2753,12 @@ fn run() -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    if let Err(error) =
+        validate_selected_suite_cluster(&suite_names, selected_cluster_mode, selected_cluster_size)
+    {
+        println!("❌ ERROR: {error}");
+        return Ok(1);
+    }
 
     // Validate: per-suite path overrides conflict with multi-suite
     let multi_suite = suite_names.len() > 1;
@@ -2599,6 +2782,13 @@ fn run() -> Result<i32> {
         rebuild: cli.benchmark_bootstrap_rebuild,
         scales: parse_scale_overrides(&cli.benchmark_scale)?,
     };
+    let query_lifecycle_faults_enabled = !cli.dry_run
+        && selected_cases_require_query_lifecycle_faults(
+            &cli,
+            &suite_names,
+            &suite_configs,
+            &base_dir,
+        )?;
 
     let launch_cluster_mode = if cli.dry_run {
         ClusterMode::AllInOne
@@ -2621,6 +2811,7 @@ fn run() -> Result<i32> {
         &base_dir,
         &runner_config,
         compat_artifact,
+        query_lifecycle_faults_enabled,
     )?;
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
@@ -3206,8 +3397,10 @@ mod tests {
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
         Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
-        execute_target_session_sql_with, expected_engine_error_code_diff_result,
+        bounded_fault_query_timeout, execute_target_session_sql_with,
+        expected_engine_error_code_diff_result,
         expected_engine_error_code_result, finish_expected_error_step, validate_fault_injection_jobs,
+        sql_text_has_query_lifecycle_fault_directive, validate_selected_suite_cluster,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3215,7 +3408,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn test_runtime_dir() -> PathBuf {
         let dir = crate::resolve_repo_root()
@@ -3284,6 +3477,42 @@ mod tests {
         validate_fault_injection_jobs(&cases, 1).expect("serial jobs should be accepted");
         validate_fault_injection_jobs(&[test_case_with_meta(QueryMeta::default())], 8)
             .expect("cases without fault directives should allow parallel jobs");
+    }
+
+    #[test]
+    fn lifecycle_fault_preflight_only_matches_explicit_directives() {
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @drop_next_init_ack_be_index=1\nSELECT 1;"
+        ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @kill_query_after_control_ready_count=3\nSELECT 1;"
+        ));
+        assert!(!sql_text_has_query_lifecycle_fault_directive(
+            "-- query-control-heartbeat-loss is only a case name\nSELECT 1;"
+        ));
+    }
+
+    #[test]
+    fn distributed_resilience_requires_exact_native_three_be_topology() {
+        let suites = vec!["distributed-resilience".to_string()];
+        validate_selected_suite_cluster(&suites, ClusterMode::CrossProcess, 3)
+            .expect("canonical distributed topology");
+        for (mode, size) in [
+            (ClusterMode::CrossProcess, 2),
+            (ClusterMode::CrossProcess, 4),
+            (ClusterMode::AllInOne, 1),
+        ] {
+            let error = validate_selected_suite_cluster(&suites, mode, size)
+                .expect_err("distributed-resilience must reject noncanonical topology");
+            assert!(
+                error
+                    .to_string()
+                    .contains("distributed-resilience requires --cluster-mode cross-process --cluster-size 3"),
+                "unexpected error: {error}"
+            );
+        }
+        validate_selected_suite_cluster(&["join".to_string()], ClusterMode::AllInOne, 1)
+            .expect("other suites retain their own topology");
     }
 
     #[test]
@@ -4098,6 +4327,15 @@ enable_path_style_access = true
     fn transient_iceberg_commit_error_matches_missing_metadata() {
         let message = "ERROR 1064 (HY000) at line 11: Metadata file for version 2 is missing under file:/tmp/table/metadata";
         assert!(is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn fault_query_timeout_reserves_time_for_terminal_evidence() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        assert!(bounded_fault_query_timeout(120, Some(deadline)) <= 28);
+        assert_eq!(bounded_fault_query_timeout(5, Some(deadline)), 5);
+        assert_eq!(bounded_fault_query_timeout(120, None), 120);
     }
 
     #[test]

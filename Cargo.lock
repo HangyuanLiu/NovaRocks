@@ -3267,6 +3267,8 @@ version = "0.1.0"
 dependencies = [
  "novarocks",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -3314,6 +3316,8 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "tokio",
+ "tonic",
+ "tracing",
  "uuid",
 ]
 

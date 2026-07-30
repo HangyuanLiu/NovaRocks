@@ -150,17 +150,17 @@ impl ResultRegistration {
         self.cleanup_should_fail = false;
     }
 
-    fn finish_failure(&mut self, _error: String) {
+    fn finish_failure(&mut self, error: String) {
         if self.active {
-            self.session.abort(ResultAbort::Failed);
+            self.session.abort(ResultAbort::Failed(error));
             self.active = false;
         }
         self.cleanup_should_fail = false;
     }
 
-    fn finish_cancelled(&mut self) {
+    fn finish_cancelled(&mut self, reason: String) {
         if self.active {
-            self.session.abort(ResultAbort::Cancelled);
+            self.session.abort(ResultAbort::Cancelled(reason));
             self.active = false;
         }
         self.cleanup_should_fail = false;
@@ -366,12 +366,12 @@ impl FragmentResources {
         }
     }
 
-    pub(crate) fn finish_cancelled(&mut self) {
+    pub(crate) fn finish_cancelled(&mut self, reason: String) {
         if let Some(mut exchange) = self.exchange.take() {
             exchange.finish_cancelled();
         }
         if let Some(mut result) = self.result.take() {
-            result.finish_cancelled();
+            result.finish_cancelled(reason);
         }
     }
 }

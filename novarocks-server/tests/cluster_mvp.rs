@@ -24,9 +24,7 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
-use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
-};
+use novarocks_frontend::{FrontendApplicationHost, FrontendExecutionConfig};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
     StateStoreProviderConfig,
@@ -311,6 +309,15 @@ fn assert_fe_report_only_endpoint_rejects_local_submit(port: u16) {
             novarocks::service::grpc_client::proto::novarocks::SubmitFragmentRequest {
                 plan: None,
                 instance_params: None,
+                execution_id: Some(
+                    novarocks::service::grpc_client::proto::novarocks::QueryExecutionId {
+                        query_id: Some(novarocks::service::grpc_client::proto::common::UniqueId {
+                            hi: 1,
+                            lo: 2,
+                        }),
+                        attempt_id: 1,
+                    },
+                ),
             },
         )
         .expect_err("role=fe report-only endpoint must reject local fragment submission");
@@ -324,7 +331,7 @@ struct ClusterHarness {
     be: ProcessGuard,
     _fe: ProcessGuard,
     fe_mysql: u16,
-    _state_store_root: TempDir,
+    be_grpc: u16,
 }
 
 impl ClusterHarness {
@@ -339,11 +346,6 @@ impl ClusterHarness {
         let fe_mysql_port = fe_mysql.port();
         let fe_http_port = fe_http.port();
         let fe_grpc_port = fe_grpc.port();
-        let state_store_root = TempFileBuilder::new()
-            .prefix("cluster-state-store-")
-            .tempdir_in(runtime_dir())
-            .expect("create cluster StateStore root");
-        let state_store_path = state_store_root.path().join("state.sqlite");
 
         let be_config = write_config(
             "be",
@@ -375,15 +377,8 @@ mysql_port = {fe_mysql_port}
 [cluster]
 role = "fe"
 backends = ["127.0.0.1:{be_grpc_port}"]
-
-[state_store]
-provider = "sqlite"
-path = "{}"
-cluster_id = "cluster-harness-{fe_mysql_port}"
-deployment_owner = "fe-1"
 {fe_extra}
-"#,
-                state_store_path.display()
+"#
             ),
         );
 
@@ -402,7 +397,7 @@ deployment_owner = "fe-1"
             be,
             _fe: fe,
             fe_mysql: fe_mysql_port,
-            _state_store_root: state_store_root,
+            be_grpc: be_grpc_port,
         }
     }
 }
@@ -423,50 +418,6 @@ struct MultiBeClusterHarness {
 
 impl MultiBeClusterHarness {
     fn start_n_be(n: usize, be_debug: &str, fe_extra: &str) -> Self {
-        Self::start_n_be_with_options(n, be_debug, fe_extra, true, true)
-    }
-
-    /// Negative fixtures that verify the FE StateStore precondition must opt
-    /// out explicitly rather than inheriting the ordinary isolated store.
-    fn start_n_be_without_state_store(n: usize, be_debug: &str, fe_extra: &str) -> Self {
-        Self::start_n_be_with_options(n, be_debug, fe_extra, true, false)
-    }
-
-    /// Authority fixtures use a caller-owned StateStore and may start from an
-    /// empty configured seed set. Reusing the same path across `restart_fe`
-    /// exercises durable membership restoration without sharing data between
-    /// unrelated tests.
-    fn start_n_be_with_sqlite_state_store(
-        n: usize,
-        state_store_path: &Path,
-        cluster_id: &str,
-        seed_backends: bool,
-    ) -> Self {
-        assert!(
-            state_store_path.is_absolute(),
-            "SQLite StateStore path must be absolute: {}",
-            state_store_path.display()
-        );
-        let state_store_config = format!(
-            r#"
-[state_store]
-provider = "sqlite"
-path = "{}"
-cluster_id = "{cluster_id}"
-deployment_owner = "fe-1"
-"#,
-            state_store_path.display()
-        );
-        Self::start_n_be_with_options(n, "", &state_store_config, seed_backends, false)
-    }
-
-    fn start_n_be_with_options(
-        n: usize,
-        be_debug: &str,
-        fe_extra: &str,
-        seed_backends: bool,
-        default_state_store: bool,
-    ) -> Self {
         assert!(n >= 1, "must spawn at least one BE");
 
         // Reserve all ports up front before releasing any of them.
@@ -498,21 +449,6 @@ deployment_owner = "fe-1"
             .map(|index| log_root.path().join(format!("be-{index}")))
             .collect::<Vec<_>>();
         let fe_log_dir = log_root.path().join("fe");
-        let default_state_store_config = if default_state_store {
-            format!(
-                r#"
-[state_store]
-provider = "sqlite"
-path = "{}"
-cluster_id = "cluster-mvp-{}"
-deployment_owner = "fe-1"
-"#,
-                log_root.path().join("frontend-state.sqlite").display(),
-                fe_mysql_port,
-            )
-        } else {
-            String::new()
-        };
 
         // Write all BE configs (while ports are still reserved).
         let be_configs: Vec<NamedTempFile> = be_port_sets
@@ -543,15 +479,11 @@ role = "be"
             .collect();
 
         // Build the backends list for the FE config.
-        let backends_list: String = if seed_backends {
-            be_grpc_ports
-                .iter()
-                .map(|p| format!("\"127.0.0.1:{p}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            String::new()
-        };
+        let backends_list: String = be_grpc_ports
+            .iter()
+            .map(|p| format!("\"127.0.0.1:{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let fe_config = write_config(
             "fe",
             &format!(
@@ -569,7 +501,6 @@ mysql_port = {fe_mysql_port}
 [cluster]
 role = "fe"
 backends = [{backends_list}]
-{default_state_store_config}
 {fe_extra}
 "#,
                 fe_log_dir.display()
@@ -634,7 +565,7 @@ deployment_owner = "fe-1"
 "#,
             state_store_path.display()
         );
-        Self::start_n_be_with_options(3, "", &state_store_config, true, false)
+        Self::start_n_be(3, "", &state_store_config)
     }
 
     fn start_three_be_sqlite_state_store_with_metadata(
@@ -667,7 +598,7 @@ deployment_owner = "fe-1"
             metadata_path.display(),
             state_store_path.display(),
         );
-        Self::start_n_be_with_options(3, "", &fe_extra, true, false)
+        Self::start_n_be(3, "", &fe_extra)
     }
 
     fn fe_mysql_port(&self) -> u16 {
@@ -699,22 +630,20 @@ deployment_owner = "fe-1"
         self.fe = Some(fe);
     }
 
-    fn wait_for_be_submit_cancel_coverage(
+    fn wait_for_be_submit_termination_coverage(
         &mut self,
         expected_submit_count: usize,
-        expected_cancel_count: usize,
-        cancel_detail: &str,
+        termination_reasons: &[&str],
         timeout: Duration,
     ) {
         let deadline = Instant::now() + timeout;
         let mut stdout = vec![Vec::new(); self.bes.len()];
         let mut submitted = vec![0usize; self.bes.len()];
-        let mut canceled = vec![0usize; self.bes.len()];
         loop {
             for (index, be) in self.bes.iter_mut().enumerate() {
                 if let Some(status) = be.child.try_wait().expect("poll BE child") {
                     panic!(
-                        "BE {index} exited before submit/cancel pairing completed with status {status}; stdout={:?}; stderr={}",
+                        "BE {index} exited before submit/termination pairing completed with status {status}; stdout={:?}; stderr={}",
                         stdout[index],
                         be.read_stderr()
                     );
@@ -723,31 +652,26 @@ deployment_owner = "fe-1"
                     if line.starts_with("NOVAROCKS_GRPC_SUBMIT call=") {
                         submitted[index] += 1;
                     }
-                    if line.contains("NOVAROCKS_CANCEL") && line.contains(cancel_detail) {
-                        let finsts = line
-                            .split_ascii_whitespace()
-                            .find_map(|field| field.strip_prefix("finsts="))
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .unwrap_or_else(|| panic!("cancel marker lacks finsts count: {line}"));
-                        canceled[index] += finsts;
-                    }
                     stdout[index].push(line);
                 }
             }
             let submitted_total = submitted.iter().sum::<usize>();
-            let canceled_total = canceled.iter().sum::<usize>();
-            if submitted_total == expected_submit_count
-                && canceled_total == expected_cancel_count
-                && submitted
-                    .iter()
-                    .zip(&canceled)
-                    .all(|(submitted, canceled)| canceled >= submitted)
-            {
+            let submitted_backends_terminated =
+                submitted.iter().enumerate().all(|(index, submitted)| {
+                    *submitted == 0
+                        || termination_reasons.iter().any(|reason| {
+                            backend_query_lifecycle_termination_count(
+                                self.be_grpc_ports[index],
+                                reason,
+                            ) >= 1
+                        })
+                });
+            if submitted_total == expected_submit_count && submitted_backends_terminated {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "expected {expected_submit_count} submitted instances covered by {expected_cancel_count} canceled instances; submitted={submitted:?} canceled={canceled:?} stdout={stdout:?}"
+                "expected {expected_submit_count} submitted instances covered by lifecycle termination reasons={termination_reasons:?}; submitted={submitted:?} stdout={stdout:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -990,16 +914,6 @@ fn backend_row_by_port(rows: &[Row], port: u16) -> Option<&Row> {
         .find(|row| row.get::<String, usize>(2).as_deref() == Some(port.as_str()))
 }
 
-fn backend_id_by_port(rows: &[Row], port: u16) -> u32 {
-    backend_row_by_port(rows, port)
-        .and_then(|row| row.get::<String, usize>(0))
-        .unwrap_or_else(|| panic!("SHOW BACKENDS has no BackendId for port {port}; rows={rows:?}"))
-        .parse::<u32>()
-        .unwrap_or_else(|error| {
-            panic!("SHOW BACKENDS BackendId is not a u32 for port {port}: {error}; rows={rows:?}")
-        })
-}
-
 fn wait_for_backend_state(conn: &mut MysqlConn, port: u16, expected_state: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1046,6 +960,47 @@ fn fetch_http_text(port: u16, path: &str) -> String {
         .unwrap_or_else(|err| panic!("GET {url} status failed: {err}"))
         .text()
         .unwrap_or_else(|err| panic!("read {url} text failed: {err}"))
+}
+
+fn backend_query_lifecycle_termination_count(port: u16, reason: &str) -> u64 {
+    let metric = "novarocks_backend_query_lifecycle_terminations";
+    let reason_label = format!("reason=\"{reason}\"");
+    fetch_http_text(port, "/metrics")
+        .lines()
+        .find(|line| line.starts_with(metric) && line.contains(&reason_label))
+        .and_then(|line| line.split_ascii_whitespace().last())
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|value| value as u64)
+        .unwrap_or(0)
+}
+
+fn wait_for_backend_query_lifecycle_termination(port: u16, reason: &str, timeout: Duration) {
+    wait_for_backend_query_lifecycle_termination_any(port, &[reason], timeout);
+}
+
+fn wait_for_backend_query_lifecycle_termination_any(
+    port: u16,
+    reasons: &[&str],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if reasons
+            .iter()
+            .any(|reason| backend_query_lifecycle_termination_count(port, reason) >= 1)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend {port} did not publish query lifecycle termination reasons={reasons:?}; termination_metrics={:?}",
+            fetch_http_text(port, "/metrics")
+                .lines()
+                .filter(|line| line.starts_with("novarocks_backend_query_lifecycle_terminations"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -1113,11 +1068,6 @@ fn cross_process_remote_dispatcher_smoke() {
     let fe_mysql_port = fe_mysql.port();
     let fe_http_port = fe_http.port();
     let fe_grpc_port = fe_grpc.port();
-    let state_store_root = TempFileBuilder::new()
-        .prefix("remote-dispatcher-state-store-")
-        .tempdir_in(runtime_dir())
-        .expect("create remote dispatcher StateStore root");
-    let state_store_path = state_store_root.path().join("state.sqlite");
 
     let be_config = write_config(
         "be",
@@ -1150,14 +1100,7 @@ mysql_port = {fe_mysql_port}
 [cluster]
 role = "fe"
 backends = ["127.0.0.1:{be_grpc_port}"]
-
-[state_store]
-provider = "sqlite"
-path = "{}"
-cluster_id = "remote-dispatcher-{fe_mysql_port}"
-deployment_owner = "fe-1"
-"#,
-            state_store_path.display()
+"#
         ),
     );
 
@@ -1264,11 +1207,6 @@ fn d4_dynamic_backend_sql_and_metrics_smoke() {
     let fe_mysql_port = fe_mysql.port();
     let fe_http_port = fe_http.port();
     let fe_grpc_port = fe_grpc.port();
-    let state_store_root = TempFileBuilder::new()
-        .prefix("dynamic-backend-state-store-")
-        .tempdir_in(runtime_dir())
-        .expect("create dynamic backend StateStore root");
-    let state_store_path = state_store_root.path().join("state.sqlite");
 
     let be_config = write_config(
         "d4-be",
@@ -1301,14 +1239,7 @@ role = "fe"
 backends = []
 heartbeat_interval_ms = 200
 heartbeat_timeout_retries = 2
-
-[state_store]
-provider = "sqlite"
-path = "{}"
-cluster_id = "dynamic-backend-{fe_mysql_port}"
-deployment_owner = "fe-1"
-"#,
-            state_store_path.display()
+"#
         ),
     );
 
@@ -1365,11 +1296,8 @@ fn submit_half_failure_cancels_attempted_submissions() {
     }
     let _lock = lock_cluster_mvp();
 
-    let mut cluster = ClusterHarness::start(
-        r#"
-[debug]
-emit_cancel_marker = true
-"#,
+    let cluster = ClusterHarness::start(
+        "",
         r#"
 [debug]
 fault_inject_submit_fail_after = 1
@@ -1389,8 +1317,9 @@ fault_inject_submit_fail_after = 1
         err_str.contains("debug submit fault injected"),
         "expected injected submit failure, got: {err_str}"
     );
-    cluster.be.wait_for_output_contains(
-        "NOVAROCKS_CANCEL count=1 finsts=2 reason=coordinator cancel",
+    wait_for_backend_query_lifecycle_termination(
+        cluster.be_grpc,
+        "coordinator_abort",
         Duration::from_secs(3),
     );
 }
@@ -1406,7 +1335,6 @@ fn mysql_disconnect_triggers_cancel() {
     let mut cluster = ClusterHarness::start(
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         "",
@@ -1420,9 +1348,11 @@ emit_grpc_fragment_marker = true
         .shutdown(Shutdown::Both)
         .expect("shutdown raw mysql client");
 
-    cluster
-        .be
-        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(3));
+    wait_for_backend_query_lifecycle_termination(
+        cluster.be_grpc,
+        "coordinator_abort",
+        Duration::from_secs(3),
+    );
 }
 
 #[test]
@@ -1433,13 +1363,7 @@ fn query_timeout_triggers_cancel() {
     }
     let _lock = lock_cluster_mvp();
 
-    let mut cluster = ClusterHarness::start(
-        r#"
-[debug]
-emit_cancel_marker = true
-"#,
-        "",
-    );
+    let cluster = ClusterHarness::start("", "");
 
     let mut conn = connect_mysql(cluster.fe_mysql);
     conn.query_drop("SET query_timeout = 1")
@@ -1453,9 +1377,11 @@ emit_cancel_marker = true
         "expected timeout error, got: {err_str}"
     );
 
-    cluster
-        .be
-        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(5));
+    wait_for_backend_query_lifecycle_termination_any(
+        cluster.be_grpc,
+        &["coordinator_abort", "local_failure"],
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
@@ -1470,7 +1396,6 @@ fn three_be_query_timeout_cancels_remote_fragments() {
         3,
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         "",
@@ -1489,10 +1414,9 @@ emit_grpc_fragment_marker = true
         "expected timeout error, got: {err_str}"
     );
 
-    cluster.wait_for_be_submit_cancel_coverage(
+    cluster.wait_for_be_submit_termination_coverage(
         2,
-        2,
-        "reason=coordinator cancel",
+        &["coordinator_abort", "local_failure"],
         Duration::from_secs(5),
     );
 }
@@ -1518,7 +1442,6 @@ path = "{}"
         3,
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         &metadata_config,
@@ -1580,7 +1503,13 @@ emit_grpc_fragment_marker = true
         .expect("target query must terminate after KILL QUERY")
         .expect_err("target query must not succeed after KILL QUERY");
     assert_mysql_server_error(target_error, 1317);
-    cluster.wait_for_every_be_output_contains("NOVAROCKS_CANCEL", Duration::from_secs(10));
+    for port in &cluster.be_grpc_ports {
+        wait_for_backend_query_lifecycle_termination(
+            *port,
+            "coordinator_abort",
+            Duration::from_secs(10),
+        );
+    }
 
     let idle_error = control
         .query_drop(format!("KILL QUERY {target_connection_id}"))
@@ -1613,7 +1542,6 @@ fn three_be_partial_submit_failure_cancels_attempted_fragments() {
         3,
         r#"
 [debug]
-emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
         r#"
@@ -1637,10 +1565,9 @@ fault_inject_submit_fail_after = 2
         "expected injected submit failure, got: {err_str}"
     );
 
-    cluster.wait_for_be_submit_cancel_coverage(
+    cluster.wait_for_be_submit_termination_coverage(
         2,
-        3,
-        "reason=coordinator cancel",
+        &["coordinator_abort"],
         Duration::from_secs(5),
     );
 }
@@ -1814,7 +1741,7 @@ path = "{}"
 
 #[cfg(unix)]
 #[test]
-fn cross_process_three_be_backend_membership_state_store_lifecycle() {
+fn cross_process_three_be_sqlite_state_store_lifecycle() {
     let _guard = lock_cluster_mvp();
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create state store tempdir");
     let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
@@ -1823,22 +1750,19 @@ fn cross_process_three_be_backend_membership_state_store_lifecycle() {
         "SQLite StateStore path must be absolute: {}",
         state_store_path.display()
     );
-    let mut cluster = MultiBeClusterHarness::start_n_be_with_sqlite_state_store(
-        3,
-        &state_store_path,
-        "cluster-mvp-membership",
-        false,
+    let state_store_config = format!(
+        r#"
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "cluster-mvp"
+deployment_owner = "fe-1"
+"#,
+        state_store_path.display()
     );
+    let mut cluster = MultiBeClusterHarness::start_n_be(3, "", &state_store_config);
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
-    assert!(
-        show_backends(&mut conn).is_empty(),
-        "an explicit empty seed set must start with no backend membership"
-    );
-    for grpc_port in &cluster.be_grpc_ports {
-        conn.query_drop(format!("ADD BACKEND '127.0.0.1:{grpc_port}'"))
-            .expect("ADD BACKEND through the production frontend session");
-    }
     assert_exact_live_backends(&mut conn, 3);
     let rows: Vec<i64> = conn
         .query(multi_submit_query_sql())
@@ -1848,31 +1772,6 @@ fn cross_process_three_be_backend_membership_state_store_lifecycle() {
         vec![1i64, 2i64],
         "3-BE multi-fragment query must return sorted results [1, 2]"
     );
-    let scheduled_rows = show_backends(&mut conn);
-    assert!(
-        scheduled_rows
-            .iter()
-            .filter(|row| {
-                row.get::<String, usize>(3).as_deref() == Some("Live")
-                    && row
-                        .get::<String, usize>(4)
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .is_some_and(|count| count > 0)
-            })
-            .count()
-            > 0,
-        "the captured 3-BE topology must schedule at least one live durable backend; rows={scheduled_rows:?}"
-    );
-    let initial_backend_ids = cluster
-        .be_grpc_ports
-        .iter()
-        .map(|grpc_port| {
-            (
-                *grpc_port,
-                backend_id_by_port(&show_backends(&mut conn), *grpc_port),
-            )
-        })
-        .collect::<Vec<_>>();
     drop(conn);
 
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
@@ -1884,44 +1783,9 @@ fn cross_process_three_be_backend_membership_state_store_lifecycle() {
     cluster.restart_fe();
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
-    for (grpc_port, expected_id) in &initial_backend_ids {
-        assert_eq!(
-            backend_id_by_port(&show_backends(&mut conn), *grpc_port),
-            *expected_id,
-            "clean FE restart must preserve durable backend identity"
-        );
-    }
     let rows: Vec<i64> = conn
         .query(multi_submit_query_sql())
         .expect("distributed query must succeed after immediate FE restart");
-    assert_eq!(rows, vec![1i64, 2i64]);
-
-    let dropped_port = cluster.be_grpc_ports[0];
-    let dropped_id = backend_id_by_port(&show_backends(&mut conn), dropped_port);
-    conn.query_drop(format!("DROP BACKEND '127.0.0.1:{dropped_port}' FORCE"))
-        .expect("force DROP BACKEND through the production frontend session");
-    wait_until_backend_removed(&mut conn, dropped_port);
-    drop(conn);
-    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
-
-    cluster.restart_fe();
-    let mut conn = connect_mysql(cluster.fe_mysql_port());
-    assert_exact_live_backends(&mut conn, 2);
-    assert!(
-        backend_row_by_port(&show_backends(&mut conn), dropped_port).is_none(),
-        "a force-dropped backend must not be restored after FE restart"
-    );
-    conn.query_drop(format!("ADD BACKEND '127.0.0.1:{dropped_port}'"))
-        .expect("re-ADD BACKEND through the production frontend session");
-    wait_for_backend_state(&mut conn, dropped_port, "Live");
-    assert_exact_live_backends(&mut conn, 3);
-    assert!(
-        backend_id_by_port(&show_backends(&mut conn), dropped_port) > dropped_id,
-        "re-added backend must receive a new, never-reused BackendId"
-    );
-    let rows: Vec<i64> = conn
-        .query(multi_submit_query_sql())
-        .expect("distributed query must succeed after durable re-add");
     assert_eq!(rows, vec![1i64, 2i64]);
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
@@ -2167,14 +2031,6 @@ fn cross_process_three_be_mv_state_store_restart() {
                 "mv-state-store-restart",
             )),
             frontend_execution_config(),
-            ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
-                Vec::new(),
-                Duration::from_secs(1),
-                1,
-                Duration::from_secs(1),
-            )
-            .expect("valid StateStore inspection backend config"),
         ))
         .expect("reopen MV StateStore after clean FE shutdown");
     let definitions = host

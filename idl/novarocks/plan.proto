@@ -259,9 +259,11 @@ message RuntimeFilterAggregateTopNKey {
 message RuntimeFilterProducerRole {
   repeated RuntimeFilterContributionKind contribution_kinds = 1;
   RuntimeFilterCompletionRequirement completion_requirement = 2;
+  reserved 3;
+  reserved "join_key_ordinal";
   oneof target {
-    RuntimeFilterJoinBuildKey join_build_key = 3;
-    RuntimeFilterAggregateTopNKey aggregate_topn_key = 4;
+    RuntimeFilterJoinBuildKey join_build_key = 4;
+    RuntimeFilterAggregateTopNKey aggregate_topn_key = 5;
   }
 }
 

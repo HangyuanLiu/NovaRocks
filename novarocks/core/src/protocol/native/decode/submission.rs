@@ -29,6 +29,8 @@ use crate::exec::fragment::program::{
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
+use crate::query_execution::contract::QueryId as ExecutionQueryId;
+use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use crate::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
     FragmentInstanceSpec, FragmentRuntimeOptions, ScanAssignments,
@@ -177,6 +179,26 @@ pub(crate) fn decode_fragment_submission(
     let submission = FragmentSubmission::try_new(Arc::new(program), instance)
         .map_err(NativeFragmentDecodeError::Binding)?;
     Ok(DecodedNativeFragment::new(submission, metadata))
+}
+
+pub(crate) fn decode_query_execution_id(
+    execution_id: &novarocks::QueryExecutionId,
+) -> Result<QueryExecutionId, NativeFragmentDecodeError> {
+    let root = FieldPath::root("execution_id");
+    let query_id = execution_id.query_id.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            root.clone().field("query_id"),
+            "native fragment execution_id requires query_id",
+        )
+    })?;
+    let attempt_id = AttemptId::new(execution_id.attempt_id).map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            root.clone().field("attempt_id"),
+            error.to_string(),
+        )
+    })?;
+    QueryExecutionId::new(ExecutionQueryId::new(query_id.hi, query_id.lo), attempt_id)
+        .map_err(|error| NativeFragmentDecodeError::invalid_value(root, error.to_string()))
 }
 
 fn validate_node_required_fields(

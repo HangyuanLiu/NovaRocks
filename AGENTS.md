@@ -172,10 +172,11 @@ SQL client / SQL test runner
   FE heartbeat service (`heartbeat_port`).
 
 - `src/service/grpc_server.rs`
-  gRPC server for exchange, runtime filters, lookup, and related internal RPCs.
+  gRPC server for exchange, query lifecycle Init/Abort/control streams, runtime
+  filters, lookup, and related internal RPCs.
 
 - `src/service/grpc_client.rs`
-  gRPC client for exchange and runtime filter transmission.
+  gRPC client for exchange, query lifecycle, and runtime filter transmission.
 
 ### 4.2 Standalone SQL Engine
 
@@ -374,6 +375,26 @@ SQL client / SQL test runner
 3. `ExchangeScanOp` blocks until all senders reach EOS.
 4. On cancellation, `exchange::cancel_*` clears exchange keys and wakes blocked waiters.
 
+### 5.5 Native Distributed Query Lifecycle Path
+
+1. `novarocks/frontend/src/coordinator/execution.rs` freezes a
+   `QueryExecutionId` and participant manifests from one live backend snapshot.
+2. `novarocks/frontend/src/coordinator/query_lifecycle/` concurrently sends
+   `InitQuery`, attaches every `QueryControlStream`, and waits for every
+   `ControlReady`.
+3. Only the resulting control-ready execution exposes native fragment
+   submission; each `SubmitFragmentRequest` carries the same execution id.
+4. `novarocks/backend/src/query_lifecycle/registry.rs` owns the BE-local wire
+   lifecycle entry, exact fragment admission, heartbeat fail-close, bounded
+   tombstones, and the single termination latch.
+5. Runtime-filter state is installed as an Init contribution. Client
+   cancellation remains `KILL QUERY` through the frontend query-control owner
+   and is delivered as lifecycle Abort; compat does not synthesize lifecycle
+   entries.
+6. QLC-2 still submits and immediately starts fragments one by one after the
+   barrier. Atomic Stage/Start is a later lifecycle phase, so this path must not
+   be described as global atomic startup.
+
 ---
 
 ## 6. Core Data Structures (Current Implementation)
@@ -403,6 +424,16 @@ SQL client / SQL test runner
 - `QueryResult` / `QueryResultColumn`: `src/runtime/query_result.rs`
   Generic result type used by standalone SQL execution and MySQL response
   encoding.
+
+- `QueryExecutionId` / `ParticipantManifest`:
+  `novarocks/core/src/query_execution/lifecycle/`
+  Immutable native query-attempt identity, participant contract, digest, and
+  wire codec shared across the process boundary.
+
+- `QueryLifecycleRegistry`:
+  `novarocks/backend/src/query_lifecycle/registry.rs`
+  BE-owned lifecycle state, fragment admission, heartbeat/pre-start timeout,
+  termination, and bounded tombstone registry.
 
 ---
 
@@ -795,6 +826,14 @@ env NO_PROXY=127.0.0.1,localhost \
 - **Execution semantics/operator behavior**: inspect `src/exec/node/*` and `src/exec/operators/*`.
 - **Scheduling/parallelism**: inspect `src/exec/pipeline/*`.
 - **Exchange behavior**: inspect `src/runtime/exchange.rs`, `src/runtime/exchange_scan.rs`, `src/service/grpc_*.rs`.
+- **Native distributed query lifecycle**: inspect
+  `novarocks/frontend/src/coordinator/execution.rs`,
+  `novarocks/frontend/src/coordinator/query_lifecycle/**`,
+  `novarocks/backend/src/query_lifecycle/**`,
+  `novarocks/core/src/query_execution/lifecycle/**`, and
+  `novarocks/core/src/query_execution/fragment_transport.rs`. Preserve the
+  Init + ControlReady production barrier; do not add a compat lifecycle shim,
+  standalone direct-call path, or no-runtime-filter retry inside an attempt.
 - **Connector behavior**: inspect `src/connector/*`, `src/connector/iceberg/**`,
   `src/connector/starrocks/managed/**`, and `src/formats/*`.
 - **FE/BE interface behavior**: inspect `src/service/internal_service.rs`, `src/service/backend_service.rs`, `src/service/engine_ffi.rs`, `src/shim/compat.h`.

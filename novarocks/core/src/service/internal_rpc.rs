@@ -306,10 +306,14 @@ pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter:
 
 pub(crate) fn handle_submit_fragment(
     ingress: &dyn NativeFragmentIngress,
+    execution_id: proto::novarocks::QueryExecutionId,
     fragment: proto::plan::PlanFragment,
     instance_params: proto::novarocks::InstanceParams,
 ) -> Result<NativeFragmentAccepted, NativeFragmentIngressError> {
+    let execution_id = crate::protocol::native::decode::decode_query_execution_id(&execution_id)
+        .map_err(NativeFragmentIngressError::new)?;
     ingress.submit(NativeFragmentRequest::try_decode(
+        execution_id,
         fragment,
         instance_params,
     )?)

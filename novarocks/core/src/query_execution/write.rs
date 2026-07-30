@@ -55,6 +55,7 @@ pub struct WriteCommitInput {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriterCommitInput {
     pub(crate) writer_id: usize,
+    pub(crate) fragment_id: u32,
     pub(crate) writer_key: WriterKey,
     pub(crate) iceberg_commits: Vec<novarocks::IcebergCommitInfo>,
     pub(crate) load_counters: BTreeMap<String, String>,
@@ -203,7 +204,7 @@ impl WriteReportOutcome {
 /// completion payload.
 pub struct WriteReportBuilder {
     write_id: UniqueId,
-    expected: BTreeMap<WriterKey, usize>,
+    expected: BTreeMap<WriterKey, (usize, u32)>,
     completed: BTreeMap<WriterKey, WriterCommitInput>,
     failure: Option<String>,
 }
@@ -227,7 +228,10 @@ impl WriteReportBuilder {
                     "writer registrations contain multiple query ids",
                 ));
             }
-            if expected.insert(key, writer_id).is_some() {
+            if expected
+                .insert(key, (writer_id, registration.fragment_id))
+                .is_some()
+            {
                 return Err(contract_violation(
                     "writer registrations contain duplicate writer identities",
                 ));
@@ -248,7 +252,7 @@ impl WriteReportBuilder {
             fragment_instance_id: report.fragment_instance_id,
             backend_num: report.backend_num,
         };
-        let Some(writer_id) = self.expected.get(&key).copied() else {
+        let Some((writer_id, fragment_id)) = self.expected.get(&key).copied() else {
             self.failure.get_or_insert_with(|| {
                 format!(
                     "native report references an unregistered writer {}/{}",
@@ -274,6 +278,7 @@ impl WriteReportBuilder {
         }
         let output = WriterCommitInput {
             writer_id,
+            fragment_id,
             writer_key: key.clone(),
             iceberg_commits: report.iceberg_commits,
             load_counters: report.load_counters,

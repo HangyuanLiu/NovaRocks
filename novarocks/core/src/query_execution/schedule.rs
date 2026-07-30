@@ -20,9 +20,13 @@
 //! Scheduling policy belongs to the frontend. Core only consumes this sealed
 //! description while preparing protocol payloads and runtime-filter routes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use crate::common::types::UniqueId;
+use crate::query_execution::backend::LiveBackendTarget;
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::lifecycle::{ExchangeRouteManifest, QueryInitPlanHeader};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::FragmentId;
@@ -60,5 +64,115 @@ impl SchedulingPlan {
         fragment_id: FragmentId,
     ) -> Option<&[FragmentInstancePlacement]> {
         self.by_fragment.get(&fragment_id).map(Vec::as_slice)
+    }
+}
+
+/// Immutable lifecycle-only projection of a validated schedule.
+///
+/// It deliberately contains neither the mutable scheduling plan nor the
+/// native plan tree.
+#[derive(Clone, Debug)]
+pub(crate) struct FragmentLifecycleProjection {
+    pub(crate) instances_by_backend: BTreeMap<usize, BTreeSet<UniqueId>>,
+    pub(crate) endpoints_by_backend: BTreeMap<usize, RuntimeEndpoint>,
+    pub(crate) frozen_live_backends: BTreeMap<usize, LiveBackendTarget>,
+    pub(crate) exchange_routes: Vec<ExchangeRouteManifest>,
+    query_init_header: OnceLock<QueryInitPlanHeader>,
+}
+
+impl FragmentLifecycleProjection {
+    pub(crate) fn new(
+        instances_by_backend: BTreeMap<usize, BTreeSet<UniqueId>>,
+        endpoints_by_backend: BTreeMap<usize, RuntimeEndpoint>,
+        mut exchange_routes: Vec<ExchangeRouteManifest>,
+    ) -> Self {
+        exchange_routes.sort();
+        Self {
+            instances_by_backend,
+            endpoints_by_backend,
+            frozen_live_backends: BTreeMap::new(),
+            exchange_routes,
+            query_init_header: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn freeze_query_init_header(
+        &self,
+        candidate: QueryInitPlanHeader,
+    ) -> Result<(), DistributedQueryError> {
+        let frozen = self.query_init_header.get_or_init(|| candidate);
+        if *frozen != candidate {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                format!(
+                    "query initialization header differs from first construction for execution {:?}",
+                    frozen.execution_id()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_frozen_live_backends(
+        mut self,
+        live_backends: Vec<LiveBackendTarget>,
+    ) -> Result<Self, DistributedQueryError> {
+        if live_backends.is_empty() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "lifecycle projection requires a nonempty frozen live-backend topology",
+            ));
+        }
+        let mut endpoints = BTreeSet::new();
+        for target in live_backends {
+            if target.start_epoch() == 0 {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!(
+                        "lifecycle projection backend {} has zero start epoch",
+                        target.backend_idx()
+                    ),
+                ));
+            }
+            if !endpoints.insert(target.endpoint()) {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!(
+                        "lifecycle projection repeats endpoint {}",
+                        target.endpoint()
+                    ),
+                ));
+            }
+            if self
+                .frozen_live_backends
+                .insert(target.backend_idx(), target)
+                .is_some()
+            {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!(
+                        "lifecycle projection repeats backend {}",
+                        target.backend_idx()
+                    ),
+                ));
+            }
+        }
+        for (&backend_idx, endpoint) in &self.endpoints_by_backend {
+            let target = self.frozen_live_backends.get(&backend_idx).ok_or_else(|| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!("scheduled backend {backend_idx} is absent from frozen topology"),
+                )
+            })?;
+            if RuntimeEndpoint::from_socket_addr(target.endpoint()) != *endpoint {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!(
+                        "scheduled backend {backend_idx} endpoint differs from frozen topology"
+                    ),
+                ));
+            }
+        }
+        Ok(self)
     }
 }

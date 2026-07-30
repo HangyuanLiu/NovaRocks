@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::net::TcpListener;
@@ -67,6 +68,7 @@ struct BackendTopologyRow {
     state: String,
     alive: bool,
     scheduled_fragments: u64,
+    start_epoch: u64,
 }
 
 fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopologyRow> {
@@ -85,11 +87,17 @@ fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopol
         .context("SHOW BACKENDS row missing ScheduledFragments")?
         .parse::<u64>()
         .context("parse SHOW BACKENDS ScheduledFragments")?;
+    let start_epoch = values
+        .get(5)
+        .context("SHOW BACKENDS row missing StartEpoch")?
+        .parse::<u64>()
+        .context("parse SHOW BACKENDS StartEpoch")?;
     Ok(BackendTopologyRow {
         grpc_port,
         state,
         alive,
         scheduled_fragments,
+        start_epoch,
     })
 }
 
@@ -114,7 +122,7 @@ fn query_frontend_backend_topology(
         .context("query SHOW BACKENDS from cross-process FE")?;
     rows.into_iter()
         .map(|row| {
-            let values = (0..5)
+            let values = (0..6)
                 .map(|index| {
                     row.get::<String, usize>(index)
                         .with_context(|| format!("SHOW BACKENDS row missing column {index}"))
@@ -142,6 +150,14 @@ fn topology_mysql_io_timeout(remaining: Duration) -> Duration {
     remaining
         .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP)
         .max(TOPOLOGY_MYSQL_IO_TIMEOUT_MIN)
+}
+
+fn remaining_until(deadline: Instant, operation: &str) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("30s query lifecycle fault deadline expired before {operation}");
+    }
+    Ok(remaining)
 }
 
 fn validate_live_backend_topology(
@@ -226,6 +242,7 @@ fn wait_for_live_backend_topology(
     be_config_paths: &[PathBuf],
     fe_process: &mut ManagedProcess,
     be_processes: &mut [ManagedProcess],
+    timeout: Duration,
 ) -> Result<()> {
     let expected_ports = runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
     let expected = expected_ports.len();
@@ -233,7 +250,7 @@ fn wait_for_live_backend_topology(
     let port = runtime.fe_mysql_port;
     let rows = wait_for_live_backend_topology_with(
         &expected_ports,
-        startup_timeout(),
+        timeout,
         || {
             process_runtime_diagnostics(
                 fe_process,
@@ -274,12 +291,69 @@ pub(crate) trait ServerHandle: Send {
     fn restart_be(&mut self, index: usize) -> Result<()> {
         bail!("BE restart is unsupported by this server mode (index={index})")
     }
+    fn restart_be_until(&mut self, index: usize, _deadline: Instant) -> Result<()> {
+        self.restart_be(index)
+    }
+    fn kill_fe(&mut self) -> Result<()> {
+        bail!("FE kill is unsupported by this server mode")
+    }
+    fn restart_fe(&mut self) -> Result<()> {
+        bail!("FE restart is unsupported by this server mode")
+    }
+    fn restart_fe_until(&mut self, _deadline: Instant) -> Result<()> {
+        self.restart_fe()
+    }
+    fn kill_query(&mut self, connection_id: u32) -> Result<()> {
+        bail!("KILL QUERY is unsupported by this server mode (connection_id={connection_id})")
+    }
+    fn kill_query_until(&mut self, connection_id: u32, _deadline: Instant) -> Result<()> {
+        self.kill_query(connection_id)
+    }
+    fn backend_start_epoch(&self, index: usize) -> Result<u64> {
+        bail!("backend start epoch is unsupported by this server mode (index={index})")
+    }
+    fn fe_log_count(&self, needle: &str) -> Result<usize> {
+        bail!("FE log counting is unsupported by this server mode (pattern={needle:?})")
+    }
+    fn fe_log_contents(&self) -> Result<String> {
+        bail!("FE log reading is unsupported by this server mode")
+    }
+    fn clear_query_lifecycle_faults(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn armed_query_lifecycle_fault_token(
+        &self,
+        index: usize,
+        kind: &'static str,
+    ) -> Result<Option<String>> {
+        bail!(
+            "query lifecycle fault token is unsupported by this server mode (index={index}, kind={kind})"
+        )
+    }
+    fn arm_init_ack_drop(&mut self, index: usize) -> Result<()> {
+        bail!("InitAck drop is unsupported by this server mode (index={index})")
+    }
+    fn arm_query_control_heartbeat_stop(&mut self, index: usize) -> Result<()> {
+        bail!("query-control heartbeat stop is unsupported by this server mode (index={index})")
+    }
+    fn arm_fe_crash_after_control_ready(&mut self, count: usize) -> Result<()> {
+        bail!("FE crash is unsupported by this server mode (ready_count={count})")
+    }
+    fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
+        bail!("BE restart-after-InitAck is unsupported by this server mode (index={index})")
+    }
+    fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
+        bail!(
+            "query-control fragment backend limit is unsupported by this server mode (limit={limit})"
+        )
+    }
     fn be_count(&self) -> usize {
         self.be_endpoints().len()
     }
     fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
         bail!("scheduled fragment telemetry is unsupported by this server mode (index={index})")
     }
+
     fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
         bail!(
             "fragment executor failure injection is unsupported by this server mode (index={index})"
@@ -316,6 +390,9 @@ pub(crate) trait ServerHandle: Send {
     fn be_log_contents(&self, index: usize) -> Result<String> {
         bail!("BE log reading is unsupported by this server mode (index={index})")
     }
+    fn be_current_log_contents(&self, index: usize) -> Result<String> {
+        self.be_log_contents(index)
+    }
     #[allow(dead_code)]
     fn run_compat_probe(&self, probe: &str, _endpoint: &CompatBeEndpoint) -> Result<()> {
         bail!("compatibility probes are unsupported by this server mode (probe={probe})")
@@ -334,6 +411,7 @@ pub(crate) fn launch_server(
     repo_root: &Path,
     runner_config: &RunnerConfig,
     compat_artifact: Option<CompatArtifact>,
+    query_lifecycle_faults_enabled: bool,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
@@ -341,6 +419,7 @@ pub(crate) fn launch_server(
             cluster_size,
             repo_root,
             runner_config,
+            query_lifecycle_faults_enabled,
         )?)),
         ClusterMode::StarRocksCompat => {
             let artifact = compat_artifact.context(
@@ -542,9 +621,7 @@ pub(crate) fn render_cross_process_config(
 /// a second FE launch at a fresh, empty SQLite path while keeping every other
 /// section (server ports, object store, warehouse) identical to a normal
 /// `render_cross_process_config` render — so the second launch talks to the
-/// same lake but starts with no cached IMV definitions. Launch-only rendering
-/// also replaces the FE StateStore path with a runtime-local SQLite file so
-/// membership rows cannot leak across ordinary SQL-test clusters.
+/// same lake but starts with no cached IMV definitions.
 pub(crate) fn render_cross_process_config_with_metadata_db_override(
     base_config: &str,
     role: ClusterProcessRole,
@@ -577,6 +654,7 @@ fn render_cross_process_launch_config(
     runtime: &CrossProcessRuntime,
     runtime_dir: &Path,
     metadata_mode: CrossProcessMetadataMode<'_>,
+    query_lifecycle_faults_enabled: bool,
 ) -> Result<String> {
     let rendered = match metadata_mode {
         CrossProcessMetadataMode::Isolated => {
@@ -602,36 +680,25 @@ fn render_cross_process_launch_config(
             )
         }
     }?;
-
     let mut value = rendered
         .parse::<Value>()
-        .context("parse rendered cross-process config for launch StateStore isolation")?;
-    let root = value.as_table_mut().ok_or_else(|| {
-        anyhow::anyhow!("rendered cross-process config root must be a TOML table")
-    })?;
-    if role == ClusterProcessRole::Fe {
-        let state_store_path = runtime_dir.join("state-store.sqlite");
-        let state_store_path = state_store_path
-            .to_str()
-            .context("cross-process runtime StateStore path must be valid UTF-8")?;
-        let state_store = table_mut(root, "state_store");
-        state_store
-            .entry("provider".to_string())
-            .or_insert_with(|| Value::String("sqlite".to_string()));
-        state_store.insert(
-            "path".to_string(),
-            Value::String(state_store_path.to_string()),
+        .context("parse rendered cross-process launch config")?;
+    let root = value
+        .as_table_mut()
+        .context("rendered cross-process launch config root must be a TOML table")?;
+    if query_lifecycle_faults_enabled {
+        let debug = table_mut(root, "debug");
+        debug.insert(
+            "query_lifecycle_fault_dir".to_string(),
+            Value::String(
+                runtime_dir
+                    .join("query-lifecycle-faults")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         );
-        state_store
-            .entry("cluster_id".to_string())
-            .or_insert_with(|| Value::String("sql-tests-cross-process".to_string()));
-        state_store
-            .entry("deployment_owner".to_string())
-            .or_insert_with(|| Value::String("fe-1".to_string()));
     }
-
-    toml::to_string(&value)
-        .context("serialize cross-process launch config with isolated StateStore")
+    toml::to_string(&value).context("serialize cross-process launch config")
 }
 
 struct NoopServerHandle;
@@ -646,6 +713,113 @@ impl ServerHandle for NoopServerHandle {
     }
 }
 
+struct QueryLifecycleFaultFiles {
+    root: PathBuf,
+    be_count: usize,
+}
+
+impl QueryLifecycleFaultFiles {
+    fn new(root: &Path, be_count: usize) -> Result<Self> {
+        if be_count == 0 {
+            bail!("query lifecycle fault scope requires at least one BE");
+        }
+        fs::create_dir_all(root)
+            .with_context(|| format!("create query lifecycle fault scope {}", root.display()))?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            be_count,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn init_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "init-ack-drop")
+    }
+
+    fn heartbeat_stop_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "heartbeat-stop")
+    }
+
+    fn restart_after_init_ack_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "restart-after-init-ack")
+    }
+
+    fn fe_crash_path(&self) -> PathBuf {
+        self.root.join("fe-crash-after-control-ready.trigger")
+    }
+
+    fn fragment_backend_limit_path(&self) -> PathBuf {
+        self.root.join("fragment-backend-limit.trigger")
+    }
+
+    fn publish_init_ack_drop(&self, index: usize) -> Result<String> {
+        self.publish(self.init_ack_drop_path(index)?, index, None)
+    }
+
+    fn publish_heartbeat_stop(&self, index: usize) -> Result<String> {
+        self.publish(self.heartbeat_stop_path(index)?, index, None)
+    }
+
+    fn publish_restart_after_init_ack(&self, index: usize) -> Result<String> {
+        self.publish(self.restart_after_init_ack_path(index)?, index, None)
+    }
+
+    fn publish_fe_crash(&self, count: usize) -> Result<String> {
+        self.publish(self.fe_crash_path(), self.be_count, Some(count))
+    }
+
+    fn publish_fragment_backend_limit(&self, limit: usize) -> Result<String> {
+        self.publish(
+            self.fragment_backend_limit_path(),
+            self.be_count,
+            Some(limit),
+        )
+    }
+
+    fn publish(&self, path: PathBuf, identity: usize, value: Option<usize>) -> Result<String> {
+        let token = next_fragment_failure_token(identity);
+        let contents = match value {
+            Some(value) => format!("{token}\n{value}\n"),
+            None => format!("token={token}\nbackend_index={identity}\n"),
+        };
+        publish_query_lifecycle_fault_token(&path, &token, contents.as_bytes())?;
+        Ok(token)
+    }
+
+    fn clear(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.root)
+            .with_context(|| format!("read query lifecycle fault scope {}", self.root.display()))?
+        {
+            let path = entry?.path();
+            if path.is_file() {
+                remove_fragment_failure_file(&path).with_context(|| {
+                    format!("remove query lifecycle fault trigger {}", path.display())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn be_path(&self, index: usize, kind: &str) -> Result<PathBuf> {
+        if index >= self.be_count {
+            bail!(
+                "BE index {index} is out of bounds for query lifecycle fault scope with {} BE(s)",
+                self.be_count
+            );
+        }
+        Ok(self.root.join(format!("be-{index}.{kind}.arm")))
+    }
+}
+
+impl Drop for QueryLifecycleFaultFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
 pub(crate) struct CrossProcessServerHandle {
     target_host: String,
     target_port: u16,
@@ -653,18 +827,25 @@ pub(crate) struct CrossProcessServerHandle {
     be_grpc_ports: Vec<u16>,
     fragment_failure_trigger_paths: Vec<PathBuf>,
     fragment_failure_tokens: Vec<Option<String>>,
+    query_lifecycle_fault_files: QueryLifecycleFaultFiles,
+    query_lifecycle_fault_tokens: BTreeMap<(usize, &'static str), String>,
+    query_lifecycle_faults_enabled: bool,
     runtime_dir: PathBuf,
+    runtime: CrossProcessRuntime,
     novarocks_bin: PathBuf,
     be_config_paths: Vec<PathBuf>,
+    fe_config_path: PathBuf,
     be_processes: Vec<ManagedProcess>,
     fe_process: ManagedProcess,
+    be_log_history: Vec<String>,
+    fe_log_history: String,
 }
 
 #[derive(Clone, Copy)]
 enum CrossProcessMetadataMode<'a> {
     /// Ephemeral SQL-test clusters, including IMV L2 cluster A, must never
-    /// restore metadata or backend membership from another launch whose
-    /// dynamically reserved endpoints are already stale.
+    /// restore backend rows from another launch whose dynamically reserved
+    /// endpoints are already stale.
     Isolated,
     Explicit(&'a str),
 }
@@ -704,12 +885,14 @@ impl CrossProcessServerHandle {
         cluster_size: usize,
         repo_root: &Path,
         runner_config: &RunnerConfig,
+        query_lifecycle_faults_enabled: bool,
     ) -> Result<Self> {
         Self::launch_impl(
             cluster_size,
             repo_root,
             runner_config,
             CrossProcessMetadataMode::Isolated,
+            query_lifecycle_faults_enabled,
         )
     }
 
@@ -735,6 +918,7 @@ impl CrossProcessServerHandle {
             repo_root,
             runner_config,
             CrossProcessMetadataMode::Explicit(metadata_db_path),
+            false,
         )
     }
 
@@ -743,9 +927,14 @@ impl CrossProcessServerHandle {
         repo_root: &Path,
         runner_config: &RunnerConfig,
         metadata_mode: CrossProcessMetadataMode<'_>,
+        query_lifecycle_faults_enabled: bool,
     ) -> Result<Self> {
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(repo_root)?);
         let reserved = ReservedRuntimePorts::new(cluster_size)?;
+        let query_lifecycle_fault_files = QueryLifecycleFaultFiles::new(
+            &runtime_dir.path().join("query-lifecycle-faults"),
+            cluster_size,
+        )?;
 
         // Build runtime port record from reserved ports (before releasing any).
         let runtime = CrossProcessRuntime {
@@ -790,6 +979,7 @@ impl CrossProcessServerHandle {
                 &runtime,
                 runtime_dir.path(),
                 metadata_mode,
+                query_lifecycle_faults_enabled,
             )
         };
 
@@ -832,6 +1022,8 @@ impl CrossProcessServerHandle {
                 "NOVAROCKS_READY role=be",
                 runtime_dir.path().join(format!("be_{i}.log")),
                 Some(&fragment_failure_trigger_paths[i]),
+                query_lifecycle_faults_enabled
+                    .then_some((query_lifecycle_fault_files.root(), Some(i))),
             )?;
             println!(
                 "started cross-process BE[{i}] pid={} grpc_port={} config={}",
@@ -853,6 +1045,8 @@ impl CrossProcessServerHandle {
             "NOVAROCKS_READY mysql_port=",
             runtime_dir.path().join("fe.log"),
             None,
+            query_lifecycle_faults_enabled
+                .then_some((query_lifecycle_fault_files.root(), None)),
         )?;
         println!(
             "started cross-process FE pid={} mysql_port={} config={}",
@@ -867,6 +1061,7 @@ impl CrossProcessServerHandle {
             &be_config_paths,
             &mut fe_process,
             &mut be_processes,
+            startup_timeout(),
         )
         .context("cross-process backend topology barrier")?;
 
@@ -877,11 +1072,18 @@ impl CrossProcessServerHandle {
             be_grpc_ports: runtime.be.iter().map(|be| be.grpc).collect(),
             fragment_failure_trigger_paths,
             fragment_failure_tokens: vec![None; cluster_size],
+            query_lifecycle_fault_files,
+            query_lifecycle_fault_tokens: BTreeMap::new(),
+            query_lifecycle_faults_enabled,
             runtime_dir: runtime_dir.into_path(),
+            runtime,
             novarocks_bin,
             be_config_paths,
+            fe_config_path,
             be_processes,
             fe_process,
+            be_log_history: vec![String::new(); cluster_size],
+            fe_log_history: String::new(),
         })
     }
 
@@ -914,6 +1116,88 @@ impl ServerHandle for CrossProcessServerHandle {
         self.be_processes.len()
     }
 
+    fn arm_init_ack_drop(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_init_ack_drop(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "init-ack-drop"), token.clone());
+        println!(
+            "armed InitAck drop for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .init_ack_drop_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_query_control_heartbeat_stop(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_heartbeat_stop(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "heartbeat-stop"), token.clone());
+        println!(
+            "armed query-control heartbeat stop for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .heartbeat_stop_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_fe_crash_after_control_ready(&mut self, count: usize) -> Result<()> {
+        if !(1..=self.be_processes.len()).contains(&count) {
+            bail!(
+                "FE crash ControlReady count {count} is outside 1..={}",
+                self.be_processes.len()
+            );
+        }
+        let token = self.query_lifecycle_fault_files.publish_fe_crash(count)?;
+        println!(
+            "armed FE crash after {count} ControlReady marker(s) token={token} trigger={}",
+            self.query_lifecycle_fault_files.fe_crash_path().display()
+        );
+        Ok(())
+    }
+
+    fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_restart_after_init_ack(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "restart-after-init-ack"), token.clone());
+        println!(
+            "armed BE[{index}] restart after InitAck token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .restart_after_init_ack_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
+        if !(1..=self.be_processes.len()).contains(&limit) {
+            bail!(
+                "query-control fragment backend limit {limit} is outside 1..={}",
+                self.be_processes.len()
+            );
+        }
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_fragment_backend_limit(limit)?;
+        println!(
+            "armed query-control fragment backend limit={limit} token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .fragment_backend_limit_path()
+                .display()
+        );
+        Ok(())
+    }
+
     fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
@@ -931,6 +1215,25 @@ impl ServerHandle for CrossProcessServerHandle {
                     "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
                 )
             })
+    }
+
+    fn backend_start_epoch(&self, index: usize) -> Result<u64> {
+        self.ensure_be_index(index)?;
+        let grpc_port = self.be_grpc_ports[index];
+        query_frontend_backend_topology(
+            &self.mysql_user,
+            &self.target_host,
+            self.target_port,
+            TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+        )?
+        .into_iter()
+        .find(|row| row.grpc_port == grpc_port)
+        .map(|row| row.start_epoch)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
+            )
+        })
     }
 
     fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
@@ -1010,17 +1313,56 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn assert_be_log(&self, index: usize, needle: &str) -> Result<()> {
         self.ensure_be_index(index)?;
+        if self.be_log_history[index].contains(needle) {
+            return Ok(());
+        }
         self.be_processes[index].assert_log_contains(needle)
     }
 
     fn be_log_count(&self, index: usize, needle: &str) -> Result<usize> {
         self.ensure_be_index(index)?;
-        self.be_processes[index].log_count(needle)
+        Ok(self.be_log_history[index].match_indices(needle).count()
+            + self.be_processes[index].log_count(needle)?)
     }
 
     fn be_log_contents(&self, index: usize) -> Result<String> {
         self.ensure_be_index(index)?;
+        let current = self.be_processes[index].log_contents()?;
+        Ok(format!("{}{}", self.be_log_history[index], current))
+    }
+
+    fn be_current_log_contents(&self, index: usize) -> Result<String> {
+        self.ensure_be_index(index)?;
         self.be_processes[index].log_contents()
+    }
+
+    fn fe_log_count(&self, needle: &str) -> Result<usize> {
+        Ok(
+            self.fe_log_history.match_indices(needle).count()
+                + self.fe_process.log_count(needle)?,
+        )
+    }
+
+    fn fe_log_contents(&self) -> Result<String> {
+        let current = self.fe_process.log_contents()?;
+        Ok(format!("{}{}", self.fe_log_history, current))
+    }
+
+    fn clear_query_lifecycle_faults(&mut self) -> Result<()> {
+        self.query_lifecycle_fault_tokens.clear();
+        self.query_lifecycle_fault_files.clear()
+    }
+
+    fn armed_query_lifecycle_fault_token(
+        &self,
+        index: usize,
+        kind: &'static str,
+    ) -> Result<Option<String>> {
+        self.ensure_be_index(index)?;
+        Ok(self
+            .query_lifecycle_fault_tokens
+            .get(&(index, kind))
+            .cloned())
     }
 
     fn kill_be(&mut self, index: usize) -> Result<()> {
@@ -1037,7 +1379,16 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 
     fn restart_be(&mut self, index: usize) -> Result<()> {
+        self.restart_be_until(index, Instant::now() + startup_timeout())
+    }
+
+    fn restart_be_until(&mut self, index: usize, deadline: Instant) -> Result<()> {
         self.ensure_be_index(index)?;
+        let old_start_epoch = self.backend_start_epoch(index)?;
+        let prior_log = self.be_processes[index]
+            .log_contents()
+            .with_context(|| format!("preserve cross-process BE[{index}] log before restart"))?;
+        self.be_log_history[index].push_str(&prior_log);
         {
             let be_process = self
                 .be_processes
@@ -1061,6 +1412,17 @@ impl ServerHandle for CrossProcessServerHandle {
             "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
             &self.fragment_failure_trigger_paths[index],
         );
+        if self.query_lifecycle_faults_enabled {
+            command
+                .env(
+                    "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+                    self.query_lifecycle_fault_files.root(),
+                )
+                .env(
+                    "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+                    index.to_string(),
+                );
+        }
         let log_path = self.runtime_dir.join(format!("be_{index}.log"));
         let be_process = self
             .be_processes
@@ -1070,7 +1432,7 @@ impl ServerHandle for CrossProcessServerHandle {
             .restart(
                 command,
                 ReadyMarker::StdoutContains(marker.to_string()),
-                startup_timeout(),
+                remaining_until(deadline, "BE readiness")?,
                 log_path,
             )
             .map_err(|error| map_novarocks_process_error(&self.novarocks_bin, "be", marker, error))
@@ -1080,6 +1442,137 @@ impl ServerHandle for CrossProcessServerHandle {
             be_process.pid(),
             config_path.display()
         );
+        wait_for_live_backend_topology(
+            &self.mysql_user,
+            &self.runtime,
+            &self.fe_config_path,
+            &self.be_config_paths,
+            &mut self.fe_process,
+            &mut self.be_processes,
+            remaining_until(deadline, "BE topology barrier")?,
+        )
+        .context("cross-process backend topology barrier after BE restart")?;
+        loop {
+            let remaining = remaining_until(deadline, "BE start-epoch barrier")?;
+            let observed = query_frontend_backend_topology(
+                &self.mysql_user,
+                &self.target_host,
+                self.target_port,
+                topology_mysql_io_timeout(remaining),
+            )
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| row.grpc_port == self.be_grpc_ports[index])
+            });
+            if observed
+                .as_ref()
+                .is_some_and(|row| row.alive && row.start_epoch != 0 && row.start_epoch != old_start_epoch)
+            {
+                println!(
+                    "cross-process BE[{index}] start-epoch barrier PASS: old_epoch={old_start_epoch} new_epoch={}",
+                    observed.expect("observed row checked").start_epoch
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                let diagnostics = process_runtime_diagnostics(
+                    &mut self.fe_process,
+                    &mut self.be_processes,
+                    &self.fe_config_path,
+                    &self.be_config_paths,
+                    &self.runtime,
+                )?;
+                bail!(
+                    "timed out waiting for BE[{index}] start epoch to change from {old_start_epoch}; observed={observed:?}; {diagnostics}"
+                );
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            );
+        }
+        Ok(())
+    }
+
+    fn kill_fe(&mut self) -> Result<()> {
+        self.fe_process
+            .kill_now()
+            .context("kill cross-process FE")?;
+        println!("killed cross-process FE");
+        Ok(())
+    }
+
+    fn restart_fe(&mut self) -> Result<()> {
+        self.restart_fe_until(Instant::now() + startup_timeout())
+    }
+
+    fn restart_fe_until(&mut self, deadline: Instant) -> Result<()> {
+        let prior_log = self
+            .fe_process
+            .log_contents()
+            .context("preserve cross-process FE log before restart")?;
+        self.fe_log_history.push_str(&prior_log);
+        let marker = "NOVAROCKS_READY mysql_port=";
+        let mut command = build_novarocks_command(&self.novarocks_bin, "fe", &self.fe_config_path);
+        if self.query_lifecycle_faults_enabled {
+            command.env(
+                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+                self.query_lifecycle_fault_files.root(),
+            );
+        }
+        self.fe_process
+            .restart(
+                command,
+                ReadyMarker::StdoutContains(marker.to_string()),
+                remaining_until(deadline, "FE readiness")?,
+                self.runtime_dir.join("fe.log"),
+            )
+            .map_err(|error| map_novarocks_process_error(&self.novarocks_bin, "fe", marker, error))
+            .context("restart cross-process FE")?;
+        println!(
+            "restarted cross-process FE pid={} config={}",
+            self.fe_process.pid(),
+            self.fe_config_path.display()
+        );
+        wait_for_live_backend_topology(
+            &self.mysql_user,
+            &self.runtime,
+            &self.fe_config_path,
+            &self.be_config_paths,
+            &mut self.fe_process,
+            &mut self.be_processes,
+            remaining_until(deadline, "FE topology barrier")?,
+        )
+        .context("cross-process backend topology barrier after FE restart")?;
+        Ok(())
+    }
+
+    fn kill_query(&mut self, connection_id: u32) -> Result<()> {
+        self.kill_query_until(connection_id, Instant::now() + startup_timeout())
+    }
+
+    fn kill_query_until(&mut self, connection_id: u32, deadline: Instant) -> Result<()> {
+        let io_timeout = topology_mysql_io_timeout(remaining_until(deadline, "KILL QUERY connect")?);
+        let builder = OptsBuilder::new()
+            .ip_or_hostname(Some(self.target_host.clone()))
+            .tcp_port(self.target_port)
+            .prefer_socket(false)
+            .user(Some(self.mysql_user.clone()))
+            .tcp_connect_timeout(Some(io_timeout))
+            .read_timeout(Some(io_timeout))
+            .write_timeout(Some(io_timeout));
+        let mut control = MysqlConn::new(builder).with_context(|| {
+            format!(
+                "connect KILL QUERY control session to {}:{}",
+                self.target_host, self.target_port
+            )
+        })?;
+        control
+            .query_drop(format!("KILL QUERY {connection_id}"))
+            .with_context(|| format!("execute KILL QUERY {connection_id}"))?;
+        println!("executed KILL QUERY {connection_id} through a separate control session");
         Ok(())
     }
 }
@@ -1170,6 +1663,7 @@ fn spawn_novarocks_process(
     marker: &str,
     log_path: PathBuf,
     fragment_failure_trigger: Option<&Path>,
+    query_lifecycle_fault_scope: Option<(&Path, Option<usize>)>,
 ) -> Result<ManagedProcess> {
     let mut command = build_novarocks_command(binary, role, config_path);
     if let Some(trigger_path) = fragment_failure_trigger {
@@ -1177,6 +1671,15 @@ fn spawn_novarocks_process(
             "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
             trigger_path,
         );
+    }
+    if let Some((fault_dir, backend_index)) = query_lifecycle_fault_scope {
+        command.env("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR", fault_dir);
+        if let Some(backend_index) = backend_index {
+            command.env(
+                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+                backend_index.to_string(),
+            );
+        }
     }
     let result = ManagedProcess::spawn(
         "novarocks".to_string(),
@@ -1241,6 +1744,45 @@ fn publish_fragment_failure_token(trigger_path: &Path, token: &str) -> Result<()
         return Err(error).with_context(|| {
             format!(
                 "publish fragment executor failure trigger {}",
+                trigger_path.display()
+            )
+        });
+    }
+    let _ = fs::remove_file(staging_path);
+    Ok(())
+}
+
+fn publish_query_lifecycle_fault_token(
+    trigger_path: &Path,
+    token: &str,
+    contents: &[u8],
+) -> Result<()> {
+    let staging_path = trigger_path.with_extension(format!("arming-{token}"));
+    let mut staging = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging_path)
+        .with_context(|| {
+            format!(
+                "create query lifecycle fault staging file {}",
+                staging_path.display()
+            )
+        })?;
+    if let Err(error) = staging.write_all(contents) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error).with_context(|| {
+            format!(
+                "write query lifecycle fault token to staging file {}",
+                staging_path.display()
+            )
+        });
+    }
+    drop(staging);
+    if let Err(error) = fs::hard_link(&staging_path, trigger_path) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error).with_context(|| {
+            format!(
+                "publish query lifecycle fault trigger {}",
                 trigger_path.display()
             )
         });
@@ -1394,17 +1936,19 @@ mod tests {
             state: state.to_string(),
             alive,
             scheduled_fragments: 0,
+            start_epoch: 17,
         }
     }
 
     #[test]
-    fn frontend_five_column_show_backends_derives_alive_from_state() {
+    fn frontend_six_column_show_backends_includes_start_epoch() {
         let row = parse_frontend_show_backends_values(&[
             "0".to_string(),
             "127.0.0.1".to_string(),
             "19070".to_string(),
             "Live".to_string(),
             "41".to_string(),
+            "17".to_string(),
         ])
         .expect("parse frontend SHOW BACKENDS row");
 
@@ -1412,6 +1956,7 @@ mod tests {
         assert_eq!(row.state, "Live");
         assert!(row.alive);
         assert_eq!(row.scheduled_fragments, 41);
+        assert_eq!(row.start_epoch, 17);
     }
 
     #[test]
@@ -1617,6 +2162,74 @@ mod tests {
                 .contains("BE restart is unsupported"),
             "unexpected error: {restart_err}"
         );
+
+        let kill_fe_err = handle.kill_fe().expect_err("noop FE kill should fail");
+        assert!(
+            kill_fe_err.to_string().contains("FE kill is unsupported"),
+            "unexpected error: {kill_fe_err}"
+        );
+
+        let restart_fe_err = handle
+            .restart_fe()
+            .expect_err("noop FE restart should fail");
+        assert!(
+            restart_fe_err
+                .to_string()
+                .contains("FE restart is unsupported"),
+            "unexpected error: {restart_fe_err}"
+        );
+    }
+
+    #[test]
+    fn query_lifecycle_fault_files_publish_isolated_tokens_and_clean_up_on_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-query-lifecycle-fault-test-{}",
+            next_fragment_failure_token(99)
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+        let trigger_dir = root.join("query-lifecycle-faults");
+        let paths = QueryLifecycleFaultFiles::new(&trigger_dir, 3)
+            .expect("create query lifecycle fault paths");
+        let init_token = paths
+            .publish_init_ack_drop(1)
+            .expect("publish init ack token");
+        let heartbeat_token = paths
+            .publish_heartbeat_stop(2)
+            .expect("publish heartbeat stop token");
+
+        assert_ne!(init_token, heartbeat_token);
+        assert_eq!(
+            fs::read_to_string(paths.init_ack_drop_path(1).expect("init path"))
+                .expect("read init token"),
+            format!("token={init_token}\nbackend_index=1\n")
+        );
+        assert_eq!(
+            fs::read_to_string(paths.heartbeat_stop_path(2).expect("heartbeat path"))
+                .expect("read heartbeat token"),
+            format!("token={heartbeat_token}\nbackend_index=2\n")
+        );
+        assert!(!paths.init_ack_drop_path(0).expect("init path 0").exists());
+        assert!(
+            !paths
+                .heartbeat_stop_path(1)
+                .expect("heartbeat path 1")
+                .exists()
+        );
+
+        let duplicate = paths
+            .publish_init_ack_drop(1)
+            .expect_err("an armed trigger must not be clobbered");
+        assert!(
+            format!("{duplicate:#}").contains("publish query lifecycle fault trigger"),
+            "unexpected duplicate error: {duplicate:#}"
+        );
+
+        drop(paths);
+        assert!(
+            !trigger_dir.exists(),
+            "dropping the runner-owned fault scope must remove every trigger"
+        );
+        fs::remove_dir(&root).expect("remove empty temp root");
     }
 
     fn make_runtime_1be() -> CrossProcessRuntime {
@@ -1670,11 +2283,6 @@ endpoint = "http://127.0.0.1:9000"
 access_key_id = "admin"
 enable_path_style_access = true
 
-[connector.object_store]
-endpoint = "http://127.0.0.1:9000"
-access_key_id = "admin"
-enable_path_style_access = true
-
 [debug]
 exec_node_output = true
 "#;
@@ -1706,10 +2314,6 @@ exec_node_output = true
         );
         assert_eq!(
             fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
-            Some("http://127.0.0.1:9000")
-        );
-        assert_eq!(
-            fe_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
         assert_eq!(fe_value["debug"]["exec_node_output"].as_bool(), Some(true));
@@ -1747,10 +2351,6 @@ exec_node_output = true
         );
         assert_eq!(
             be_value["standalone_server"]["object_store"]["endpoint"].as_str(),
-            Some("http://127.0.0.1:9000")
-        );
-        assert_eq!(
-            be_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
         assert_eq!(be_value["debug"]["exec_node_output"].as_bool(), Some(true));
@@ -1914,7 +2514,7 @@ exec_node_output = true
     }
 
     #[test]
-    fn ordinary_cross_process_launches_isolate_metadata_and_backend_state_store() {
+    fn ordinary_cross_process_launches_do_not_share_persisted_backend_rows() {
         let runtime = make_runtime_1be();
         let first_runtime = Path::new("/tmp/novarocks-cross-process-run-a");
         let second_runtime = Path::new("/tmp/novarocks-cross-process-run-b");
@@ -1926,6 +2526,7 @@ exec_node_output = true
             &runtime,
             first_runtime,
             CrossProcessMetadataMode::Isolated,
+            false,
         )
         .unwrap()
         .parse::<Value>()
@@ -1937,6 +2538,7 @@ exec_node_output = true
             &runtime,
             second_runtime,
             CrossProcessMetadataMode::Isolated,
+            false,
         )
         .unwrap()
         .parse::<Value>()
@@ -1952,19 +2554,40 @@ exec_node_output = true
         );
         assert_ne!(
             first["metadata"]["path"], second["metadata"]["path"],
-            "ephemeral clusters must not restore stale metadata from another launch"
+            "ephemeral clusters must not restore stale backend rows from another launch"
         );
+        assert!(
+            first["debug"].get("query_lifecycle_fault_dir").is_none(),
+            "ordinary cross-process config must remain usable by release binaries"
+        );
+        assert!(
+            second["debug"].get("query_lifecycle_fault_dir").is_none(),
+            "ordinary cross-process config must not enable lifecycle fault hooks"
+        );
+    }
+
+    #[test]
+    fn lifecycle_fault_cross_process_config_requires_explicit_debug_preflight() {
+        let runtime = make_runtime_1be();
+        let runtime_dir = Path::new("/tmp/novarocks-cross-process-lifecycle-fault");
+        let rendered = render_cross_process_launch_config(
+            BASE_CONFIG,
+            ClusterProcessRole::Be,
+            0,
+            &runtime,
+            runtime_dir,
+            CrossProcessMetadataMode::Isolated,
+            true,
+        )
+        .expect("render explicit lifecycle fault config")
+        .parse::<Value>()
+        .expect("parse lifecycle fault config");
+
         assert_eq!(
-            first["state_store"]["path"].as_str(),
-            first_runtime.join("state-store.sqlite").to_str()
-        );
-        assert_eq!(
-            second["state_store"]["path"].as_str(),
-            second_runtime.join("state-store.sqlite").to_str()
-        );
-        assert_ne!(
-            first["state_store"]["path"], second["state_store"]["path"],
-            "ephemeral clusters must not restore stale backend membership from another launch"
+            rendered["debug"]["query_lifecycle_fault_dir"].as_str(),
+            runtime_dir
+                .join("query-lifecycle-faults")
+                .to_str()
         );
     }
 
@@ -1982,6 +2605,7 @@ exec_node_output = true
             &runtime,
             cluster_a_runtime,
             CrossProcessMetadataMode::Isolated,
+            false,
         )
         .unwrap()
         .parse::<Value>()
@@ -1993,6 +2617,7 @@ exec_node_output = true
             &runtime,
             Path::new("/tmp/novarocks-imv-l2-cluster-b"),
             CrossProcessMetadataMode::Explicit(cluster_b_metadata),
+            false,
         )
         .unwrap()
         .parse::<Value>()
@@ -2001,7 +2626,7 @@ exec_node_output = true
         assert_eq!(
             cluster_a["metadata"]["path"].as_str(),
             cluster_a_runtime.join("metadata.sqlite").to_str(),
-            "cluster A must not inherit metadata from the base database"
+            "cluster A must not inherit backend topology rows from the base metadata database"
         );
         assert_eq!(
             cluster_b["metadata"]["path"].as_str(),
@@ -2010,18 +2635,6 @@ exec_node_output = true
         assert_ne!(cluster_a["metadata"]["path"], base["metadata"]["path"]);
         assert_ne!(cluster_b["metadata"]["path"], base["metadata"]["path"]);
         assert_ne!(cluster_a["metadata"]["path"], cluster_b["metadata"]["path"]);
-        assert_eq!(
-            cluster_a["state_store"]["path"].as_str(),
-            cluster_a_runtime.join("state-store.sqlite").to_str()
-        );
-        assert_eq!(
-            cluster_b["state_store"]["path"].as_str(),
-            Some("/tmp/novarocks-imv-l2-cluster-b/state-store.sqlite")
-        );
-        assert_ne!(
-            cluster_a["state_store"]["path"], cluster_b["state_store"]["path"],
-            "independent launch runtime directories must isolate backend membership"
-        );
         assert_eq!(
             cluster_a["standalone_server"]["warehouse_uri"],
             base["standalone_server"]["warehouse_uri"]

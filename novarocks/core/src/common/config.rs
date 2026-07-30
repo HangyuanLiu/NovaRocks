@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::novarocks_config::config as novarocks_app_config;
+use std::path::PathBuf;
 
 pub(crate) fn debug_exec_node_output() -> bool {
     novarocks_app_config()
@@ -62,6 +63,13 @@ pub(crate) fn sql_test_fragment_failure_harness_enabled() -> bool {
     std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
 }
 
+pub(crate) fn sql_test_query_lifecycle_fault_dir() -> Option<PathBuf> {
+    novarocks_app_config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+        .map(PathBuf::from)
+}
+
 pub(crate) fn exchange_wait_ms() -> u64 {
     novarocks_app_config()
         .ok()
@@ -88,6 +96,62 @@ pub(crate) fn exchange_io_max_inflight_bytes() -> usize {
         .ok()
         .map(|c| c.runtime.exchange_io_max_inflight_bytes)
         .unwrap_or(64 * 1024 * 1024)
+}
+
+pub(crate) fn query_control_heartbeat_interval_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_heartbeat_interval_ms)
+        .unwrap_or(1_000)
+}
+
+pub(crate) fn query_control_heartbeat_timeout_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_heartbeat_timeout_ms)
+        .unwrap_or(5_000)
+}
+
+pub(crate) fn query_control_init_rpc_timeout_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_init_rpc_timeout_ms)
+        .unwrap_or(5_000)
+}
+
+pub(crate) fn query_control_attach_timeout_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_attach_timeout_ms)
+        .unwrap_or(5_000)
+}
+
+pub(crate) fn query_control_pre_start_timeout_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_pre_start_timeout_ms)
+        .unwrap_or(30_000)
+}
+
+pub(crate) fn query_control_tombstone_retention_ms() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_tombstone_retention_ms)
+        .unwrap_or(120_000)
+}
+
+pub(crate) fn query_control_tombstone_capacity() -> usize {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_tombstone_capacity)
+        .unwrap_or(16_384)
+}
+
+pub(crate) fn query_control_max_active_entries() -> usize {
+    novarocks_app_config()
+        .ok()
+        .map(|config| config.runtime.query_control_max_active_entries)
+        .unwrap_or(4_096)
 }
 
 pub(crate) fn optimizer_query_mem_limit_bytes() -> u64 {

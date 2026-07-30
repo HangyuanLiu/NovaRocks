@@ -42,7 +42,7 @@ struct FragmentControlRegistryState {
 }
 
 #[derive(Default)]
-pub(super) struct FragmentControlRegistry {
+pub(crate) struct FragmentControlRegistry {
     state: Mutex<FragmentControlRegistryState>,
 }
 
@@ -97,7 +97,7 @@ impl FragmentControlRegistry {
         }
     }
 
-    pub(super) fn cancel_many(&self, fragment_instance_ids: &[UniqueId], reason: &str) {
+    pub(crate) fn cancel_many(&self, fragment_instance_ids: &[UniqueId], reason: &str) {
         for fragment_instance_id in fragment_instance_ids {
             self.cancel(*fragment_instance_id, reason);
         }

@@ -9,9 +9,9 @@ date: 2026-07-27
 provenance:
   - "discussion: 2026-07-27 three-phase distributed query startup"
 code-anchors:
-  - "novarocks/core/src/coordinator/execution.rs (ExecutionCoordinator::execute_with_profile_collection)"
-  - "novarocks/core/src/coordinator/dispatch.rs (FragmentDispatcher::submit_fragment)"
-  - "novarocks/core/src/runtime/query_context.rs (QueryContextManager)"
+  - "novarocks/frontend/src/coordinator/execution.rs (FrontendDistributedQueryCoordinator::execute_request)"
+  - "novarocks/core/src/query_execution/fragment_transport.rs (FragmentDispatcher::submit_fragment)"
+  - "novarocks/backend/src/query_lifecycle/registry.rs (QueryLifecycleRegistry)"
 ---
 
 ## 问题
@@ -21,17 +21,18 @@ NovaRocks 的分布式查询应如何在所有参与方建立 query-level 控制
 
 ## 背景与执行事实
 
-当前 `ExecutionCoordinator::execute_with_profile_collection` 位于
-`novarocks/core/src/coordinator/execution.rs`，并通过
-`novarocks/core/src/coordinator/dispatch.rs` 中的 `FragmentDispatcher::submit_fragment` 逐个提交 fragment。提交成功的
-fragment 可以先于同一 BE 的其余 fragment 进入执行；如果后续提交失败或 unary RPC 的结果未知，coordinator 无法仅凭
-已返回的 ACK 证明该 BE 获得了完整的本地 fragment 集合，也无法撤销已经对外可见的局部构建。
+当前 `FrontendDistributedQueryCoordinator::execute_request` 位于
+`novarocks/frontend/src/coordinator/execution.rs`，并通过
+`novarocks/core/src/query_execution/fragment_transport.rs` 中的 `FragmentDispatcher::submit_fragment` 逐个提交
+fragment。提交成功的 fragment 可以先于同一 BE 的其余 fragment 进入执行；如果后续提交失败或 unary RPC 的结果未知，
+coordinator 无法仅凭已返回的 ACK 证明该 BE 获得了完整的本地 fragment 集合，也无法撤销已经对外可见的局部构建。
 
-BE 的 query-scoped 状态由
-`novarocks/core/src/runtime/query_context.rs` 中的 `QueryContextManager` 管理。分布式查询除了 fragment executor，还可能
-有只承载 runtime filter、exchange 或其他 query-scoped 服务的参与方。这些 service-only participant 合法地拥有空
-fragment 集合，却仍需要在任何数据面流量到达前建立 query identity、角色、控制连接和资源所有权。Fragment submit
-本身无法表达这种参与方；伪造空 fragment 又会把服务角色错误地包装成执行实例。
+BE 的 query-level participant entry 由
+`novarocks/backend/src/query_lifecycle/registry.rs` 中的 `QueryLifecycleRegistry` 管理，本地 query-scoped 执行资源仍由
+core runtime 承担。分布式查询除了 fragment executor，还可能有只承载 runtime filter、exchange 或其他 query-scoped
+服务的参与方。这些 service-only participant 合法地拥有空 fragment 集合，却仍需要在任何数据面流量到达前建立 query
+identity、角色、控制连接和资源所有权。Fragment submit 本身无法表达这种参与方；伪造空 fragment 又会把服务角色错误地
+包装成执行实例。
 
 Exchange 连接、result/report binding 和其他数据面接收方也必须在 driver 开始产生流量之前准备好。即使 coordinator
 作出一个全局启动裁决，各 BE 收到启动请求的物理时间仍不同，因此启动协议只能建立明确的 happens-before 屏障，不能

@@ -497,6 +497,74 @@ mod tests {
 
     struct RejectingNativeFragmentIngress;
 
+    struct ReadyQueryLifecycleIngress;
+
+    struct ReadyQueryControl {
+        events: tokio::sync::mpsc::Sender<novarocks::query_execution::lifecycle::QueryControlEvent>,
+    }
+
+    impl novarocks::query_execution::lifecycle::BackendQueryControl for ReadyQueryControl {
+        fn heartbeat(
+            &self,
+            sequence: u64,
+        ) -> Result<(), novarocks::query_execution::lifecycle::QueryLifecycleError> {
+            self.events
+                .try_send(
+                    novarocks::query_execution::lifecycle::QueryControlEvent::HeartbeatAck {
+                        sequence,
+                    },
+                )
+                .map_err(|error| {
+                    novarocks::query_execution::lifecycle::QueryLifecycleError::new(
+                        novarocks::query_execution::lifecycle::QueryLifecycleErrorCode::Internal,
+                        error.to_string(),
+                    )
+                })
+        }
+
+        fn abort(
+            &self,
+            _reason: String,
+        ) -> Result<(), novarocks::query_execution::lifecycle::QueryLifecycleError> {
+            self.events
+                .try_send(
+                    novarocks::query_execution::lifecycle::QueryControlEvent::TerminationAccepted {
+                        reason: novarocks::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
+                    },
+                )
+                .map_err(|error| {
+                    novarocks::query_execution::lifecycle::QueryLifecycleError::new(
+                        novarocks::query_execution::lifecycle::QueryLifecycleErrorCode::Internal,
+                        error.to_string(),
+                    )
+                })
+        }
+
+        fn finalize(
+            &self,
+        ) -> Result<(), novarocks::query_execution::lifecycle::QueryLifecycleError> {
+            self.events
+                .try_send(
+                    novarocks::query_execution::lifecycle::QueryControlEvent::TerminationAccepted {
+                        reason: novarocks::query_execution::lifecycle::QueryTerminationReason::CoordinatorFinalize,
+                    },
+                )
+                .map_err(|error| {
+                    novarocks::query_execution::lifecycle::QueryLifecycleError::new(
+                        novarocks::query_execution::lifecycle::QueryLifecycleErrorCode::Internal,
+                        error.to_string(),
+                    )
+                })
+        }
+
+        fn coordinator_lost(
+            &self,
+            _reason: novarocks::query_execution::lifecycle::QueryTerminationReason,
+        ) -> Result<(), novarocks::query_execution::lifecycle::QueryLifecycleError> {
+            Ok(())
+        }
+    }
+
     impl novarocks::service::native_fragment_ingress::NativeFragmentIngress
         for RejectingNativeFragmentIngress
     {
@@ -520,6 +588,60 @@ mod tests {
         ) -> Result<(), novarocks::service::native_fragment_ingress::NativeFragmentIngressError>
         {
             Ok(())
+        }
+    }
+
+    impl novarocks::query_execution::lifecycle::QueryLifecycleIngress for ReadyQueryLifecycleIngress {
+        fn bind_backend_identity(
+            &self,
+            _backend_id: u64,
+        ) -> Result<(), novarocks::query_execution::lifecycle::QueryLifecycleError> {
+            Ok(())
+        }
+
+        fn init_query(
+            &self,
+            request: novarocks::query_execution::lifecycle::QueryInitRequest,
+        ) -> novarocks::query_execution::lifecycle::QueryInitAck {
+            novarocks::query_execution::lifecycle::QueryInitAck::new(
+                request.manifest().execution_id(),
+                request.digest(),
+                novarocks::query_execution::lifecycle::QueryInitOutcome::Applied,
+            )
+        }
+
+        fn abort_query(
+            &self,
+            request: novarocks::query_execution::lifecycle::QueryAbortRequest,
+        ) -> Result<
+            novarocks::query_execution::lifecycle::QueryTerminationAck,
+            novarocks::query_execution::lifecycle::QueryLifecycleError,
+        > {
+            Ok(
+                novarocks::query_execution::lifecycle::QueryTerminationAck::new(
+                    request.execution_id(),
+                    novarocks::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
+                ),
+            )
+        }
+
+        fn attach_control(
+            &self,
+            _attach: novarocks::query_execution::lifecycle::QueryControlAttach,
+        ) -> Result<
+            novarocks::query_execution::lifecycle::QueryControlAttachment,
+            novarocks::query_execution::lifecycle::QueryLifecycleError,
+        > {
+            let (events, receiver) = tokio::sync::mpsc::channel(32);
+            events
+                .try_send(novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady)
+                .expect("publish test ControlReady");
+            Ok(
+                novarocks::query_execution::lifecycle::QueryControlAttachment {
+                    control: Arc::new(ReadyQueryControl { events }),
+                    events: receiver,
+                },
+            )
         }
     }
 
@@ -548,6 +670,7 @@ mod tests {
             &config.server.host,
             config.server.grpc_port,
             Arc::new(RejectingNativeFragmentIngress),
+            Arc::new(ReadyQueryLifecycleIngress),
             Arc::clone(&services.native_report_handler),
         )
         .expect("start production-composed all-in-one gRPC endpoint");
