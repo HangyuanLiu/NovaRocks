@@ -692,7 +692,7 @@ impl ScanOp for SchemaScanOp {
 /// `should_scan` assignment gate. That gate is NOT static: it arrives via
 /// [`BoundScanRanges::SchemaSelection`] at bind time. Every other field is
 /// fixed at decode time and stored here.
-pub(crate) struct SchemaScanSource {
+pub struct SchemaScanSource {
     table: SchemaTable,
     context: SchemaScanContext,
     output_chunk_schema: ChunkSchemaRef,
@@ -701,7 +701,7 @@ pub(crate) struct SchemaScanSource {
 }
 
 impl SchemaScanSource {
-    pub(crate) fn new(
+    pub fn new(
         table: SchemaTable,
         context: SchemaScanContext,
         output_chunk_schema: ChunkSchemaRef,

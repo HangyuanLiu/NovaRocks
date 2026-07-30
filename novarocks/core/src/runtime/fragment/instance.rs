@@ -29,23 +29,23 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FragmentInstanceId(UniqueId);
+pub struct FragmentInstanceId(UniqueId);
 
 impl FragmentInstanceId {
-    pub(crate) const fn new(value: UniqueId) -> Self {
+    pub const fn new(value: UniqueId) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> UniqueId {
+    pub const fn get(self) -> UniqueId {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendNum(i32);
+pub struct BackendNum(i32);
 
 impl BackendNum {
-    pub(crate) fn try_new(value: i32) -> Result<Self, FragmentBindingError> {
+    pub fn try_new(value: i32) -> Result<Self, FragmentBindingError> {
         if value < 0 {
             return Err(FragmentBindingError::new(
                 FragmentBindingTarget::Instance,
@@ -56,7 +56,7 @@ impl BackendNum {
         Ok(Self(value))
     }
 
-    pub(crate) const fn get(self) -> i32 {
+    pub const fn get(self) -> i32 {
         self.0
     }
 }
@@ -69,7 +69,7 @@ impl BackendNum {
 /// kind guards read the transient `(ScanAssignmentKind, Vec<ScanRangeParams>)`
 /// carrier instead.) jdbc/mysql scans legitimately have no `ScanAssignmentKind`.
 #[derive(Clone, Debug)]
-pub(crate) struct ScanAssignment {
+pub struct ScanAssignment {
     ranges: BoundScanRanges,
 }
 
@@ -80,13 +80,13 @@ impl ScanAssignment {
 
     /// The instance's enriched connector ranges. `materialize_scan_bindings`
     /// clones these into `ScanSource::bind` to produce this instance's op.
-    pub(crate) fn ranges(&self) -> &BoundScanRanges {
+    pub fn ranges(&self) -> &BoundScanRanges {
         &self.ranges
     }
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ScanAssignments(BTreeMap<FragmentNodeId, ScanAssignment>);
+pub struct ScanAssignments(BTreeMap<FragmentNodeId, ScanAssignment>);
 
 impl ScanAssignments {
     /// Carry the already-enriched `BoundScanRanges` per plan scan node. No
@@ -95,7 +95,7 @@ impl ScanAssignments {
     /// `FragmentSubmission::try_new`, and variant-vs-source correctness is
     /// enforced at materialize time by `ScanSource::bind`.
     #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn try_new(
+    pub fn try_new(
         assignments: BTreeMap<FragmentNodeId, BoundScanRanges>,
     ) -> Result<Self, FragmentBindingError> {
         let bound_assignments = assignments
@@ -105,65 +105,65 @@ impl ScanAssignments {
         Ok(Self(bound_assignments))
     }
 
-    pub(crate) fn get(&self, node_id: &FragmentNodeId) -> Option<&ScanAssignment> {
+    pub fn get(&self, node_id: &FragmentNodeId) -> Option<&ScanAssignment> {
         self.0.get(node_id)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&FragmentNodeId, &ScanAssignment)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&FragmentNodeId, &ScanAssignment)> {
         self.0.iter()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.0.len()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ExchangeInputAssignment {
+pub struct ExchangeInputAssignment {
     sender_count: NonZeroUsize,
 }
 
 impl ExchangeInputAssignment {
-    pub(crate) const fn new(sender_count: NonZeroUsize) -> Self {
+    pub const fn new(sender_count: NonZeroUsize) -> Self {
         Self { sender_count }
     }
 
-    pub(crate) const fn sender_count(&self) -> NonZeroUsize {
+    pub const fn sender_count(&self) -> NonZeroUsize {
         self.sender_count
     }
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ExchangeInputAssignments(BTreeMap<FragmentNodeId, ExchangeInputAssignment>);
+pub struct ExchangeInputAssignments(BTreeMap<FragmentNodeId, ExchangeInputAssignment>);
 
 impl ExchangeInputAssignments {
-    pub(crate) fn new(assignments: BTreeMap<FragmentNodeId, ExchangeInputAssignment>) -> Self {
+    pub fn new(assignments: BTreeMap<FragmentNodeId, ExchangeInputAssignment>) -> Self {
         Self(assignments)
     }
 
-    pub(crate) fn get(&self, node_id: &FragmentNodeId) -> Option<&ExchangeInputAssignment> {
+    pub fn get(&self, node_id: &FragmentNodeId) -> Option<&ExchangeInputAssignment> {
         self.0.get(node_id)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&FragmentNodeId, &ExchangeInputAssignment)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&FragmentNodeId, &ExchangeInputAssignment)> {
         self.0.iter()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.0.len()
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentSinkAssignment {
+pub enum FragmentSinkAssignment {
     None,
     StreamDestinations {
         destinations: Vec<FragmentDestination>,
@@ -177,18 +177,14 @@ pub(crate) enum FragmentSinkAssignment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StarRocksTableSinkAssignment {
+pub struct StarRocksTableSinkAssignment {
     txn_id: i64,
     load_id: UniqueId,
     frontend: Option<RuntimeEndpoint>,
 }
 
 impl StarRocksTableSinkAssignment {
-    pub(crate) const fn new(
-        txn_id: i64,
-        load_id: UniqueId,
-        frontend: Option<RuntimeEndpoint>,
-    ) -> Self {
+    pub const fn new(txn_id: i64, load_id: UniqueId, frontend: Option<RuntimeEndpoint>) -> Self {
         Self {
             txn_id,
             load_id,
@@ -196,28 +192,28 @@ impl StarRocksTableSinkAssignment {
         }
     }
 
-    pub(crate) const fn txn_id(&self) -> i64 {
+    pub const fn txn_id(&self) -> i64 {
         self.txn_id
     }
 
-    pub(crate) const fn load_id(&self) -> UniqueId {
+    pub const fn load_id(&self) -> UniqueId {
         self.load_id
     }
 
-    pub(crate) const fn frontend(&self) -> Option<&RuntimeEndpoint> {
+    pub const fn frontend(&self) -> Option<&RuntimeEndpoint> {
         self.frontend.as_ref()
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FragmentRuntimeOptions {
+pub struct FragmentRuntimeOptions {
     query_options: QueryOptions,
     report_endpoint: Option<RuntimeEndpoint>,
     typed_result_sink: bool,
 }
 
 impl FragmentRuntimeOptions {
-    pub(crate) fn new(
+    pub fn new(
         query_options: QueryOptions,
         report_endpoint: Option<RuntimeEndpoint>,
         typed_result_sink: bool,
@@ -229,21 +225,21 @@ impl FragmentRuntimeOptions {
         }
     }
 
-    pub(crate) fn query_options(&self) -> &QueryOptions {
+    pub fn query_options(&self) -> &QueryOptions {
         &self.query_options
     }
 
-    pub(crate) fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
+    pub fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
         self.report_endpoint.as_ref()
     }
 
-    pub(crate) const fn typed_result_sink(&self) -> bool {
+    pub const fn typed_result_sink(&self) -> bool {
         self.typed_result_sink
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct FragmentInstanceSpec {
+pub struct FragmentInstanceSpec {
     contract_version: FragmentContractVersion,
     query_id: QueryId,
     fragment_instance_id: FragmentInstanceId,
@@ -257,7 +253,7 @@ pub(crate) struct FragmentInstanceSpec {
 
 impl FragmentInstanceSpec {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_native(
+    pub fn new_native(
         contract_version: FragmentContractVersion,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
@@ -281,39 +277,39 @@ impl FragmentInstanceSpec {
         }
     }
 
-    pub(crate) const fn contract_version(&self) -> FragmentContractVersion {
+    pub const fn contract_version(&self) -> FragmentContractVersion {
         self.contract_version
     }
 
-    pub(crate) const fn query_id(&self) -> QueryId {
+    pub const fn query_id(&self) -> QueryId {
         self.query_id
     }
 
-    pub(crate) const fn fragment_instance_id(&self) -> FragmentInstanceId {
+    pub const fn fragment_instance_id(&self) -> FragmentInstanceId {
         self.fragment_instance_id
     }
 
-    pub(crate) const fn scan_assignments(&self) -> &ScanAssignments {
+    pub const fn scan_assignments(&self) -> &ScanAssignments {
         &self.scan_assignments
     }
 
-    pub(crate) const fn exchange_inputs(&self) -> &ExchangeInputAssignments {
+    pub const fn exchange_inputs(&self) -> &ExchangeInputAssignments {
         &self.exchange_inputs
     }
 
-    pub(crate) const fn sink_assignment(&self) -> &FragmentSinkAssignment {
+    pub const fn sink_assignment(&self) -> &FragmentSinkAssignment {
         &self.sink_assignment
     }
 
-    pub(crate) const fn runtime_options(&self) -> &FragmentRuntimeOptions {
+    pub const fn runtime_options(&self) -> &FragmentRuntimeOptions {
         &self.runtime_options
     }
 
-    pub(crate) const fn pipeline_dop(&self) -> NonZeroUsize {
+    pub const fn pipeline_dop(&self) -> NonZeroUsize {
         self.pipeline_dop
     }
 
-    pub(crate) const fn backend_num(&self) -> BackendNum {
+    pub const fn backend_num(&self) -> BackendNum {
         self.backend_num
     }
 }

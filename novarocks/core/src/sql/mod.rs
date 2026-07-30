@@ -16,7 +16,7 @@
 // under the License.
 
 pub(crate) mod agg_mergeability;
-pub(crate) mod common;
+pub mod common;
 
 pub(crate) mod analysis;
 pub(crate) mod catalog;

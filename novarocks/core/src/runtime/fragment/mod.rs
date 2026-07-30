@@ -19,14 +19,14 @@ pub(crate) mod error;
 pub(crate) mod exchange;
 pub(crate) mod fact;
 pub(crate) mod handle;
-pub(crate) mod instance;
+pub mod instance;
 pub mod io;
 pub(crate) mod native_execution;
 pub(crate) mod resources;
 pub(crate) mod runtime_state;
 pub(crate) mod scan;
 pub(crate) mod sink;
-pub(crate) mod submission;
+pub mod submission;
 
 #[cfg(test)]
 mod io_contract_tests;

@@ -37,21 +37,21 @@ pub enum IcebergSinkMode {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PositionDeleteDataFilePartition {
+pub struct PositionDeleteDataFilePartition {
     pub(crate) partition_spec_id: i32,
     pub(crate) partition_values: Struct,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DeferredPositionDeleteDataFilePartitionIndex {
-    pub(crate) metadata: TableMetadata,
-    pub(crate) target_snapshot_id: Option<i64>,
-    pub(crate) table_location: String,
-    pub(crate) object_store_s3: Option<IcebergSinkObjectStoreConfig>,
+pub struct DeferredPositionDeleteDataFilePartitionIndex {
+    pub metadata: TableMetadata,
+    pub target_snapshot_id: Option<i64>,
+    pub table_location: String,
+    pub object_store_s3: Option<IcebergSinkObjectStoreConfig>,
 }
 
 impl DeferredPositionDeleteDataFilePartitionIndex {
-    pub(crate) fn new(
+    pub fn new(
         metadata: TableMetadata,
         target_snapshot_id: Option<i64>,
         table_location: String,
@@ -67,23 +67,23 @@ impl DeferredPositionDeleteDataFilePartitionIndex {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IcebergSinkObjectStoreConfig {
-    pub(crate) endpoint: String,
-    pub(crate) bucket: String,
-    pub(crate) access_key_id: String,
-    pub(crate) access_key_secret: String,
-    pub(crate) session_token: Option<String>,
-    pub(crate) region: Option<String>,
-    pub(crate) enable_path_style_access: Option<bool>,
-    pub(crate) retry_max_times: Option<usize>,
-    pub(crate) retry_min_delay_ms: Option<u64>,
-    pub(crate) retry_max_delay_ms: Option<u64>,
-    pub(crate) timeout_ms: Option<u64>,
-    pub(crate) io_timeout_ms: Option<u64>,
+pub struct IcebergSinkObjectStoreConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub access_key_secret: String,
+    pub session_token: Option<String>,
+    pub region: Option<String>,
+    pub enable_path_style_access: Option<bool>,
+    pub retry_max_times: Option<usize>,
+    pub retry_min_delay_ms: Option<u64>,
+    pub retry_max_delay_ms: Option<u64>,
+    pub timeout_ms: Option<u64>,
+    pub io_timeout_ms: Option<u64>,
 }
 
 impl IcebergSinkObjectStoreConfig {
-    pub(crate) fn from_credentials(bucket: String, credentials: ObjectStoreCredentials) -> Self {
+    pub fn from_credentials(bucket: String, credentials: ObjectStoreCredentials) -> Self {
         Self {
             endpoint: credentials.endpoint,
             bucket,
@@ -100,7 +100,7 @@ impl IcebergSinkObjectStoreConfig {
         }
     }
 
-    pub(crate) fn to_object_store_config(&self) -> ObjectStoreConfig {
+    pub fn to_object_store_config(&self) -> ObjectStoreConfig {
         ObjectStoreConfig {
             endpoint: self.endpoint.clone(),
             access_key_id: self.access_key_id.clone(),
@@ -118,35 +118,34 @@ impl IcebergSinkObjectStoreConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct IcebergSinkPlan {
-    pub(crate) mode: IcebergSinkMode,
-    pub(crate) table_location: String,
-    pub(crate) data_location: String,
-    pub(crate) target_partition_spec_id: i32,
-    pub(crate) target_table_metadata: Option<TableMetadata>,
-    pub(crate) target_snapshot_id: Option<i64>,
-    pub(crate) position_delete_data_file_partitions:
-        HashMap<String, PositionDeleteDataFilePartition>,
-    pub(crate) position_delete_data_file_partition_index_input:
+pub struct IcebergSinkPlan {
+    pub mode: IcebergSinkMode,
+    pub table_location: String,
+    pub data_location: String,
+    pub target_partition_spec_id: i32,
+    pub target_table_metadata: Option<TableMetadata>,
+    pub target_snapshot_id: Option<i64>,
+    pub position_delete_data_file_partitions: HashMap<String, PositionDeleteDataFilePartition>,
+    pub position_delete_data_file_partition_index_input:
         Option<DeferredPositionDeleteDataFilePartitionIndex>,
-    pub(crate) object_store_s3: Option<IcebergSinkObjectStoreConfig>,
-    pub(crate) file_format: IcebergFileFormat,
-    pub(crate) report_file_format: String,
-    pub(crate) compression: Compression,
-    pub(crate) output_schema: SchemaRef,
-    pub(crate) target_schema: SchemaRef,
-    pub(crate) equality_delete_columns: Vec<EqualityDeleteColumn>,
-    pub(crate) row_lineage_data: bool,
-    pub(crate) output_exprs: Vec<ExprId>,
-    pub(crate) partition_exprs: Vec<ExprId>,
-    pub(crate) partition_source_column_names: Vec<String>,
-    pub(crate) partition_column_names: Vec<String>,
-    pub(crate) transform_exprs: Vec<String>,
-    pub(crate) position_delete_binding: Option<PositionDeleteDescriptorBinding>,
+    pub object_store_s3: Option<IcebergSinkObjectStoreConfig>,
+    pub file_format: IcebergFileFormat,
+    pub report_file_format: String,
+    pub compression: Compression,
+    pub output_schema: SchemaRef,
+    pub target_schema: SchemaRef,
+    pub equality_delete_columns: Vec<EqualityDeleteColumn>,
+    pub row_lineage_data: bool,
+    pub output_exprs: Vec<ExprId>,
+    pub partition_exprs: Vec<ExprId>,
+    pub partition_source_column_names: Vec<String>,
+    pub partition_column_names: Vec<String>,
+    pub transform_exprs: Vec<String>,
+    pub position_delete_binding: Option<PositionDeleteDescriptorBinding>,
 }
 
-pub(crate) struct IcebergSinkFactoryInput {
-    pub(crate) name: String,
-    pub(crate) arena: ExprArena,
-    pub(crate) plan: IcebergSinkPlan,
+pub struct IcebergSinkFactoryInput {
+    pub name: String,
+    pub arena: ExprArena,
+    pub plan: IcebergSinkPlan,
 }

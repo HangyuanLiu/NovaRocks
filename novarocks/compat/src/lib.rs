@@ -5,6 +5,7 @@ mod frontend_rpc;
 mod internal_rpc_client;
 mod lake_agent_tasks;
 mod load;
+mod protocol;
 mod report;
 mod schema_fe_tables;
 mod schema_frontend;

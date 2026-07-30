@@ -77,7 +77,7 @@ pub(crate) fn sql_test_query_lifecycle_fault_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-pub(crate) fn exchange_wait_ms() -> u64 {
+pub fn exchange_wait_ms() -> u64 {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.exchange_wait_ms)

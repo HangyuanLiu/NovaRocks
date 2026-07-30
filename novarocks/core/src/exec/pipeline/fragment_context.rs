@@ -39,7 +39,7 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
 
 /// Fragment-scoped runtime context shared across drivers and operator instances.
-pub(crate) struct FragmentContext {
+pub struct FragmentContext {
     next_driver_id: AtomicI32,
     profiler: Option<Profiler>,
     runtime_state: Arc<RuntimeState>,
@@ -135,7 +135,7 @@ impl FragmentContext {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn fe_addr(&self) -> Option<&RuntimeEndpoint> {
+    pub fn fe_addr(&self) -> Option<&RuntimeEndpoint> {
         self.fe_addr.as_ref()
     }
 

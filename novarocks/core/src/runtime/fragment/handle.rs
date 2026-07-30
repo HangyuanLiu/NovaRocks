@@ -150,7 +150,7 @@ impl FragmentPrepareContext {
         self
     }
 
-    pub(crate) fn new_with_execution_overrides(
+    pub fn new_with_execution_overrides(
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
         result_spec: Option<ResultWriteSpec>,

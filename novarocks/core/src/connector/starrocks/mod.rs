@@ -18,6 +18,7 @@
 pub mod fe_v2_meta;
 pub(crate) mod fs_access;
 pub mod lake;
+pub mod lake_meta;
 pub mod lake_meta_storage;
 mod object_store_profile;
 pub mod ports;
@@ -29,7 +30,8 @@ pub(crate) mod table_schema_service;
 
 pub(crate) use object_store_profile::ObjectStoreProfile;
 pub(crate) use scan::build_native_object_store_profile_from_properties;
+pub use scan::plan_compat_starrocks_read_source;
+pub(crate) use scan::plan_native_starrocks_read_source;
 pub use scan::{
     LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange, StarRocksSchemaColumnHint,
 };
-pub(crate) use scan::{plan_compat_starrocks_read_source, plan_native_starrocks_read_source};

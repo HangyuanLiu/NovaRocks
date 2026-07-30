@@ -26,29 +26,29 @@ use crate::connector::starrocks::sink::partition_key::{PartitionExprPlan, Partit
 use crate::exec::expr::{ExprArena, ExprId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FrontendAddress {
-    pub(crate) hostname: String,
-    pub(crate) port: i32,
+pub struct FrontendAddress {
+    pub hostname: String,
+    pub port: i32,
 }
 
 #[derive(Clone)]
-pub(crate) struct StarRocksSinkFactoryInput {
-    pub(crate) name: String,
-    pub(crate) descriptor: StarRocksSinkDescriptor,
-    pub(crate) output_projection: Option<SinkOutputProjectionPlan>,
-    pub(crate) output_expr_slot_name_map: HashMap<String, SlotId>,
-    pub(crate) output_expr_slot_ids: Vec<Option<SlotId>>,
-    pub(crate) literal_partition_values: Option<Vec<String>>,
+pub struct StarRocksSinkFactoryInput {
+    pub name: String,
+    pub descriptor: StarRocksSinkDescriptor,
+    pub output_projection: Option<SinkOutputProjectionPlan>,
+    pub output_expr_slot_name_map: HashMap<String, SlotId>,
+    pub output_expr_slot_ids: Vec<Option<SlotId>>,
+    pub literal_partition_values: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
-pub(crate) struct StarRocksTableSinkProgram {
-    pub(crate) name: String,
-    pub(crate) descriptor: StarRocksTableSinkDescriptor,
-    pub(crate) output_projection: Option<SinkOutputProjectionPlan>,
-    pub(crate) output_expr_slot_name_map: HashMap<String, SlotId>,
-    pub(crate) output_expr_slot_ids: Vec<Option<SlotId>>,
-    pub(crate) literal_partition_values: Option<Vec<String>>,
+pub struct StarRocksTableSinkProgram {
+    pub name: String,
+    pub descriptor: StarRocksTableSinkDescriptor,
+    pub output_projection: Option<SinkOutputProjectionPlan>,
+    pub output_expr_slot_name_map: HashMap<String, SlotId>,
+    pub output_expr_slot_ids: Vec<Option<SlotId>>,
+    pub literal_partition_values: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for StarRocksTableSinkProgram {
@@ -63,7 +63,7 @@ impl std::fmt::Debug for StarRocksTableSinkProgram {
 }
 
 impl StarRocksTableSinkProgram {
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("StarRocks table sink program name must not be empty".to_string());
         }
@@ -83,146 +83,144 @@ impl StarRocksTableSinkProgram {
 }
 
 #[derive(Clone)]
-pub(crate) struct StarRocksTableSinkDescriptor {
-    pub(crate) db_id: i64,
-    pub(crate) table_id: i64,
-    pub(crate) db_name: Option<String>,
-    pub(crate) table_name: Option<String>,
-    pub(crate) keys_type: StarRocksKeysType,
-    pub(crate) is_lake_table: bool,
-    pub(crate) dynamic_overwrite: bool,
-    pub(crate) partial_update_mode:
-        crate::connector::starrocks::lake::context::PartialUpdateWriteMode,
-    pub(crate) merge_condition: Option<String>,
-    pub(crate) null_expr_in_auto_increment: bool,
-    pub(crate) miss_auto_increment_column: bool,
-    pub(crate) schema: SinkSchemaDescriptor,
-    pub(crate) partition: SinkPartitionDescriptor,
-    pub(crate) location: SinkLocationDescriptor,
-    pub(crate) nodes: SinkNodesDescriptor,
-    pub(crate) frontend_provider: Option<Arc<dyn SinkFrontendProvider>>,
-    pub(crate) starlet_metadata_provider:
+pub struct StarRocksTableSinkDescriptor {
+    pub db_id: i64,
+    pub table_id: i64,
+    pub db_name: Option<String>,
+    pub table_name: Option<String>,
+    pub keys_type: StarRocksKeysType,
+    pub is_lake_table: bool,
+    pub dynamic_overwrite: bool,
+    pub partial_update_mode: crate::connector::starrocks::lake::context::PartialUpdateWriteMode,
+    pub merge_condition: Option<String>,
+    pub null_expr_in_auto_increment: bool,
+    pub miss_auto_increment_column: bool,
+    pub schema: SinkSchemaDescriptor,
+    pub partition: SinkPartitionDescriptor,
+    pub location: SinkLocationDescriptor,
+    pub nodes: SinkNodesDescriptor,
+    pub frontend_provider: Option<Arc<dyn SinkFrontendProvider>>,
+    pub starlet_metadata_provider:
         Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
-    pub(crate) storage_metadata_provider:
+    pub storage_metadata_provider:
         Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
 #[derive(Clone)]
-pub(crate) struct StarRocksSinkDescriptor {
-    pub(crate) db_id: i64,
-    pub(crate) table_id: i64,
-    pub(crate) db_name: Option<String>,
-    pub(crate) table_name: Option<String>,
-    pub(crate) txn_id: i64,
-    pub(crate) load_id: UniqueId,
-    pub(crate) keys_type: StarRocksKeysType,
-    pub(crate) is_lake_table: bool,
-    pub(crate) dynamic_overwrite: bool,
-    pub(crate) partial_update_mode:
-        crate::connector::starrocks::lake::context::PartialUpdateWriteMode,
-    pub(crate) merge_condition: Option<String>,
-    pub(crate) null_expr_in_auto_increment: bool,
-    pub(crate) miss_auto_increment_column: bool,
-    pub(crate) schema: SinkSchemaDescriptor,
-    pub(crate) partition: SinkPartitionDescriptor,
-    pub(crate) location: SinkLocationDescriptor,
-    pub(crate) nodes: SinkNodesDescriptor,
-    pub(crate) frontend: Option<FrontendAddress>,
-    pub(crate) frontend_provider: Option<Arc<dyn SinkFrontendProvider>>,
-    pub(crate) starlet_metadata_provider:
+pub struct StarRocksSinkDescriptor {
+    pub db_id: i64,
+    pub table_id: i64,
+    pub db_name: Option<String>,
+    pub table_name: Option<String>,
+    pub txn_id: i64,
+    pub load_id: UniqueId,
+    pub keys_type: StarRocksKeysType,
+    pub is_lake_table: bool,
+    pub dynamic_overwrite: bool,
+    pub partial_update_mode: crate::connector::starrocks::lake::context::PartialUpdateWriteMode,
+    pub merge_condition: Option<String>,
+    pub null_expr_in_auto_increment: bool,
+    pub miss_auto_increment_column: bool,
+    pub schema: SinkSchemaDescriptor,
+    pub partition: SinkPartitionDescriptor,
+    pub location: SinkLocationDescriptor,
+    pub nodes: SinkNodesDescriptor,
+    pub frontend: Option<FrontendAddress>,
+    pub frontend_provider: Option<Arc<dyn SinkFrontendProvider>>,
+    pub starlet_metadata_provider:
         Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
-    pub(crate) storage_metadata_provider:
+    pub storage_metadata_provider:
         Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SinkSlotDescriptor {
-    pub(crate) id: Option<SlotId>,
-    pub(crate) col_name: Option<String>,
-    pub(crate) col_physical_name: Option<String>,
+pub struct SinkSlotDescriptor {
+    pub id: Option<SlotId>,
+    pub col_name: Option<String>,
+    pub col_physical_name: Option<String>,
 }
 
 #[derive(Clone)]
-pub(crate) struct SinkSchemaDescriptor {
-    pub(crate) slot_descs: Vec<SinkSlotDescriptor>,
-    pub(crate) indexes: Vec<SinkIndexDescriptor>,
+pub struct SinkSchemaDescriptor {
+    pub slot_descs: Vec<SinkSlotDescriptor>,
+    pub indexes: Vec<SinkIndexDescriptor>,
 }
 
 #[derive(Clone)]
-pub(crate) struct SinkIndexDescriptor {
-    pub(crate) index_id: i64,
-    pub(crate) schema_id: i64,
-    pub(crate) column_names: Vec<String>,
-    pub(crate) tablet_schema: StarRocksTabletSchema,
-    pub(crate) column_to_expr_value: HashMap<String, String>,
-    pub(crate) is_shadow: bool,
-    pub(crate) where_clause: Option<SinkPredicatePlan>,
+pub struct SinkIndexDescriptor {
+    pub index_id: i64,
+    pub schema_id: i64,
+    pub column_names: Vec<String>,
+    pub tablet_schema: StarRocksTabletSchema,
+    pub column_to_expr_value: HashMap<String, String>,
+    pub is_shadow: bool,
+    pub where_clause: Option<SinkPredicatePlan>,
 }
 
 #[derive(Clone)]
-pub(crate) struct SinkPredicatePlan {
-    pub(crate) arena: Arc<ExprArena>,
-    pub(crate) expr_id: ExprId,
+pub struct SinkPredicatePlan {
+    pub arena: Arc<ExprArena>,
+    pub expr_id: ExprId,
 }
 
 #[derive(Clone)]
-pub(crate) struct SinkOutputProjectionPlan {
-    pub(crate) arena: Arc<ExprArena>,
-    pub(crate) expr_ids: Vec<ExprId>,
-    pub(crate) output_slot_ids: Vec<SlotId>,
-    pub(crate) output_field_names: Vec<String>,
+pub struct SinkOutputProjectionPlan {
+    pub arena: Arc<ExprArena>,
+    pub expr_ids: Vec<ExprId>,
+    pub output_slot_ids: Vec<SlotId>,
+    pub output_field_names: Vec<String>,
 }
 
 #[derive(Clone)]
-pub(crate) struct SinkPartitionDescriptor {
-    pub(crate) enable_automatic_partition: bool,
-    pub(crate) partition_columns: Vec<String>,
-    pub(crate) distributed_columns: Vec<String>,
-    pub(crate) partition_exprs: Option<Arc<PartitionExprPlan>>,
-    pub(crate) partitions: Vec<SinkPartitionEntry>,
+pub struct SinkPartitionDescriptor {
+    pub enable_automatic_partition: bool,
+    pub partition_columns: Vec<String>,
+    pub distributed_columns: Vec<String>,
+    pub partition_exprs: Option<Arc<PartitionExprPlan>>,
+    pub partitions: Vec<SinkPartitionEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SinkPartitionEntry {
-    pub(crate) partition_id: i64,
-    pub(crate) is_shadow: bool,
-    pub(crate) indexes: Vec<SinkPartitionIndex>,
-    pub(crate) start_key: Option<Vec<PartitionKeyValue>>,
-    pub(crate) end_key: Option<Vec<PartitionKeyValue>>,
-    pub(crate) in_keys: Vec<Vec<PartitionKeyValue>>,
+pub struct SinkPartitionEntry {
+    pub partition_id: i64,
+    pub is_shadow: bool,
+    pub indexes: Vec<SinkPartitionIndex>,
+    pub start_key: Option<Vec<PartitionKeyValue>>,
+    pub end_key: Option<Vec<PartitionKeyValue>>,
+    pub in_keys: Vec<Vec<PartitionKeyValue>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SinkPartitionIndex {
-    pub(crate) index_id: i64,
-    pub(crate) tablet_ids: Vec<i64>,
+pub struct SinkPartitionIndex {
+    pub index_id: i64,
+    pub tablet_ids: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SinkLocationDescriptor {
-    pub(crate) tablets: Vec<SinkTabletLocation>,
+pub struct SinkLocationDescriptor {
+    pub tablets: Vec<SinkTabletLocation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SinkTabletLocation {
-    pub(crate) tablet_id: i64,
-    pub(crate) node_ids: Vec<i64>,
+pub struct SinkTabletLocation {
+    pub tablet_id: i64,
+    pub node_ids: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SinkNodesDescriptor {
-    pub(crate) nodes: Vec<SinkNodeInfo>,
+pub struct SinkNodesDescriptor {
+    pub nodes: Vec<SinkNodeInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SinkNodeInfo {
-    pub(crate) id: i64,
-    pub(crate) option: i32,
+pub struct SinkNodeInfo {
+    pub id: i64,
+    pub option: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CreatePartitionResult {
-    pub(crate) partitions: Vec<SinkPartitionEntry>,
-    pub(crate) tablets: Vec<SinkTabletLocation>,
-    pub(crate) nodes: Vec<SinkNodeInfo>,
+pub struct CreatePartitionResult {
+    pub partitions: Vec<SinkPartitionEntry>,
+    pub tablets: Vec<SinkTabletLocation>,
+    pub nodes: Vec<SinkNodeInfo>,
 }

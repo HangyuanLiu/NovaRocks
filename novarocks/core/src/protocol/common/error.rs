@@ -19,7 +19,7 @@ use std::error::Error;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProtocolFamily {
+pub enum ProtocolFamily {
     Native,
     StarRocks,
 }
@@ -37,7 +37,7 @@ impl fmt::Display for ProtocolFamily {
 pub struct FieldPath(Vec<FieldPathSegment>);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum FieldPathSegment {
+pub enum FieldPathSegment {
     Field(&'static str),
     Index(usize),
     MapKey(String),
@@ -53,24 +53,21 @@ impl FieldPath {
         self
     }
 
-    pub(crate) fn index(mut self, index: usize) -> Self {
+    pub fn index(mut self, index: usize) -> Self {
         self.0.push(FieldPathSegment::Index(index));
         self
     }
 
-    pub(crate) fn map_key(mut self, key: impl Into<String>) -> Self {
+    pub fn map_key(mut self, key: impl Into<String>) -> Self {
         self.0.push(FieldPathSegment::MapKey(key.into()));
         self
     }
 
-    pub(crate) fn segments(&self) -> &[FieldPathSegment] {
+    pub fn segments(&self) -> &[FieldPathSegment] {
         &self.0
     }
 
-    pub(crate) fn append_segments(
-        mut self,
-        segments: impl IntoIterator<Item = FieldPathSegment>,
-    ) -> Self {
+    pub fn append_segments(mut self, segments: impl IntoIterator<Item = FieldPathSegment>) -> Self {
         self.0.extend(segments);
         self
     }
@@ -153,7 +150,7 @@ impl fmt::Display for TransportDecodeError {
 impl Error for TransportDecodeError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProtocolErrorKind {
+pub enum ProtocolErrorKind {
     MissingField,
     InvalidEnum,
     InvalidValue,
@@ -178,7 +175,7 @@ impl fmt::Display for ProtocolErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProtocolError {
+pub struct ProtocolError {
     family: ProtocolFamily,
     path: FieldPath,
     kind: ProtocolErrorKind,
@@ -186,7 +183,7 @@ pub(crate) struct ProtocolError {
 }
 
 impl ProtocolError {
-    pub(crate) fn new(
+    pub fn new(
         family: ProtocolFamily,
         path: FieldPath,
         kind: ProtocolErrorKind,
@@ -200,19 +197,19 @@ impl ProtocolError {
         }
     }
 
-    pub(crate) fn family(&self) -> ProtocolFamily {
+    pub fn family(&self) -> ProtocolFamily {
         self.family
     }
 
-    pub(crate) fn path(&self) -> &FieldPath {
+    pub fn path(&self) -> &FieldPath {
         &self.path
     }
 
-    pub(crate) fn kind(&self) -> ProtocolErrorKind {
+    pub fn kind(&self) -> ProtocolErrorKind {
         self.kind
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }

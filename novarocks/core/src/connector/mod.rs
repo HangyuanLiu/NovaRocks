@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 pub(crate) mod backend;
-pub(crate) mod file_execution;
+pub mod file_execution;
 pub(crate) mod host;
 pub mod iceberg;
 pub mod jdbc;
-pub(crate) mod runtime;
+pub mod runtime;
 pub(crate) mod scan_model;
 pub mod schema;
 #[cfg(feature = "compat")]
@@ -424,6 +424,24 @@ impl ConnectorRegistry {
         }
     }
 
+    /// Creates an otherwise empty registry with the static Iceberg reader used
+    /// by the StarRocks compatibility path. This is intentionally limited to
+    /// tests that exercise normalized Iceberg scan ranges without a process
+    /// startup configuration or generated connector declaration.
+    #[doc(hidden)]
+    pub fn for_compat_iceberg_decode_test() -> Result<Self, String> {
+        let registry = Self::new();
+        let binding = iceberg::provider::IcebergReadBinding::default_binding(None)
+            .map_err(|error| error.to_string())?;
+        registry
+            .register_connector_instance(
+                iceberg::provider::compose_compat_read_instance(binding)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(registry)
+    }
+
     pub(crate) fn register_connector_instance(
         &self,
         instance: ConnectorInstance,
@@ -444,7 +462,7 @@ impl ConnectorRegistry {
             .unregister(instance_id)
     }
 
-    pub(crate) fn connector_instance(
+    pub fn connector_instance(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<Arc<ConnectorInstance>, ConnectorHostError> {

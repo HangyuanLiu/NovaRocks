@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod common;
+pub mod common;
 pub(crate) mod native;
-#[cfg(feature = "compat")]
-pub mod starrocks;
 
-pub use common::error::FieldPath;
+pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};

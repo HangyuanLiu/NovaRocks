@@ -19,7 +19,7 @@ use std::error::Error;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExecPlanInvariant {
+pub enum ExecPlanInvariant {
     Node,
     Expression,
     Layout,
@@ -42,24 +42,24 @@ impl fmt::Display for ExecPlanInvariant {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ExecPlanBuildError {
+pub struct ExecPlanBuildError {
     invariant: ExecPlanInvariant,
     detail: String,
 }
 
 impl ExecPlanBuildError {
-    pub(crate) fn new(invariant: ExecPlanInvariant, detail: impl Into<String>) -> Self {
+    pub fn new(invariant: ExecPlanInvariant, detail: impl Into<String>) -> Self {
         Self {
             invariant,
             detail: detail.into(),
         }
     }
 
-    pub(crate) fn invariant(&self) -> ExecPlanInvariant {
+    pub fn invariant(&self) -> ExecPlanInvariant {
         self.invariant
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
@@ -77,7 +77,7 @@ impl fmt::Display for ExecPlanBuildError {
 impl Error for ExecPlanBuildError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentBindingTarget {
+pub enum FragmentBindingTarget {
     Program,
     Instance,
     ScanNode(i32),
@@ -100,7 +100,7 @@ impl fmt::Display for FragmentBindingTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FragmentBindingErrorKind {
+pub enum FragmentBindingErrorKind {
     MissingAssignment,
     ExtraAssignment,
     WrongAssignmentKind,
@@ -129,14 +129,14 @@ impl fmt::Display for FragmentBindingErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentBindingError {
+pub struct FragmentBindingError {
     target: FragmentBindingTarget,
     kind: FragmentBindingErrorKind,
     detail: String,
 }
 
 impl FragmentBindingError {
-    pub(crate) fn new(
+    pub fn new(
         target: FragmentBindingTarget,
         kind: FragmentBindingErrorKind,
         detail: impl Into<String>,
@@ -148,15 +148,15 @@ impl FragmentBindingError {
         }
     }
 
-    pub(crate) fn target(&self) -> FragmentBindingTarget {
+    pub fn target(&self) -> FragmentBindingTarget {
         self.target
     }
 
-    pub(crate) fn kind(&self) -> FragmentBindingErrorKind {
+    pub fn kind(&self) -> FragmentBindingErrorKind {
         self.kind
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }

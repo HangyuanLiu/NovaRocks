@@ -55,8 +55,17 @@ pub(crate) struct NativeJoinRuntimeFilterProducerSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct JoinRuntimeFilterExecution {
+pub struct JoinRuntimeFilterExecution {
     pub(crate) producers: Vec<NativeJoinRuntimeFilterProducerSpec>,
+}
+
+impl JoinRuntimeFilterExecution {
+    /// Compat fragments do not carry native runtime-filter producers.
+    pub const fn empty() -> Self {
+        Self {
+            producers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -75,7 +84,7 @@ pub struct JoinNode {
     /// `true` means this key uses null-safe equality (`<=>` / EQ_FOR_NULL).
     pub eq_null_safe: Vec<bool>,
     pub residual_predicate: Option<ExprId>,
-    pub(crate) runtime_filter_execution: JoinRuntimeFilterExecution,
+    pub runtime_filter_execution: JoinRuntimeFilterExecution,
 }
 
 impl JoinNode {

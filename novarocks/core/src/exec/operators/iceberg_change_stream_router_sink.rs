@@ -169,16 +169,16 @@ pub(crate) fn route_indices_for_test(
     route_indices(change_op.as_ref(), data_route.as_deref(), branch_map)
 }
 
-pub(crate) struct IcebergChangeStreamRouterBranchFactoryInput {
-    pub(crate) branch_id: i32,
-    pub(crate) branch_kind: ChangeStreamBranchKind,
-    pub(crate) stream_sink: DataStreamSinkFactoryInput,
+pub struct IcebergChangeStreamRouterBranchFactoryInput {
+    pub branch_id: i32,
+    pub branch_kind: ChangeStreamBranchKind,
+    pub stream_sink: DataStreamSinkFactoryInput,
 }
 
-pub(crate) struct IcebergChangeStreamRouterSinkFactoryInput {
-    pub(crate) change_op_slot_id: i32,
-    pub(crate) data_route_slot_id: Option<i32>,
-    pub(crate) branches: Vec<IcebergChangeStreamRouterBranchFactoryInput>,
+pub struct IcebergChangeStreamRouterSinkFactoryInput {
+    pub change_op_slot_id: i32,
+    pub data_route_slot_id: Option<i32>,
+    pub branches: Vec<IcebergChangeStreamRouterBranchFactoryInput>,
 }
 
 /// Factory for typed Iceberg change-stream router sinks.

@@ -49,10 +49,10 @@ pub use context::{SchemaFrontend, SchemaUserIdentity, SchemaUserRoles};
 // Re-exported for the StarRocks (compat) schema-scan decoder; in non-compat
 // builds these are reached directly via the `op` module (e.g. from tests).
 #[cfg(feature = "compat")]
-pub(crate) use op::{SchemaScanOp, SchemaScanSource};
+pub use op::SchemaScanSource;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum BeSchemaTable {
+pub enum BeSchemaTable {
     TabletWriteLog,
     Txns,
     Compactions,
@@ -67,7 +67,7 @@ pub(crate) enum BeSchemaTable {
 }
 
 impl BeSchemaTable {
-    pub(crate) fn from_table_name(table_name: &str) -> Option<Self> {
+    pub fn from_table_name(table_name: &str) -> Option<Self> {
         let normalized = table_name.trim().to_ascii_lowercase();
         if !normalized.starts_with("be_") {
             return None;
@@ -87,7 +87,7 @@ impl BeSchemaTable {
         })
     }
 
-    pub(crate) fn table_name(&self) -> &str {
+    pub fn table_name(&self) -> &str {
         match self {
             Self::TabletWriteLog => "be_tablet_write_log",
             Self::Txns => "be_txns",
@@ -163,7 +163,7 @@ pub enum SchemaTable {
 }
 
 impl SchemaTable {
-    pub(crate) fn from_table_name(table_name: &str) -> Option<Self> {
+    pub fn from_table_name(table_name: &str) -> Option<Self> {
         let normalized = table_name.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "loads" => Some(Self::Loads),

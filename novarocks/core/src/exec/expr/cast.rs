@@ -1790,7 +1790,7 @@ fn cast_list_to_map(
     Ok(Arc::new(out) as ArrayRef)
 }
 
-pub(crate) fn cast_with_special_rules(
+pub fn cast_with_special_rules(
     array: &ArrayRef,
     target_type: &DataType,
 ) -> Result<ArrayRef, String> {

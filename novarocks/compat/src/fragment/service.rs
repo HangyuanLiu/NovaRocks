@@ -19,21 +19,22 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 use novarocks::novarocks_logging::{error, info, warn};
 
+use crate::protocol::starrocks::thrift_codec::thrift_binary_deserialize;
 use novarocks::common::app_config;
 use novarocks::common::config::debug_exec_batch_plan_json;
 use novarocks::connector::starrocks::ports::LakeMetaStorageResolver;
-use novarocks::protocol::starrocks::thrift_codec::{thrift_binary_deserialize, thrift_named_json};
+use novarocks::service::thrift_debug::thrift_named_json;
 
-use novarocks::cache::CacheOptions;
-use novarocks::common::types::UniqueId;
-use novarocks::protocol::FieldPath;
-use novarocks::protocol::starrocks::compat::endpoint::destination_address;
-use novarocks::protocol::starrocks::compat::request::backfill_per_node_scan_ranges;
-use novarocks::protocol::starrocks::decode::{
+use crate::protocol::starrocks::compat::endpoint::destination_address;
+use crate::protocol::starrocks::compat::request::backfill_per_node_scan_ranges;
+use crate::protocol::starrocks::decode::{
     StarRocksDecodeInput, StarRocksFragmentDraft, StarRocksReportDestination,
     StarRocksSubmissionMetadata, decode_incremental_scan_ranges, decode_runtime_endpoint,
     finish_fragment_submission, prepare_fragment_submission, snapshot_decode_facts,
 };
+use novarocks::cache::CacheOptions;
+use novarocks::common::types::UniqueId;
+use novarocks::protocol::FieldPath;
 use novarocks::runtime::exchange;
 use novarocks::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentReportRegistration,
@@ -870,7 +871,7 @@ fn resolve_starrocks_draft(
     draft: &StarRocksFragmentDraftEnvelope,
     token: &PrelaunchCancellationToken,
     lake_meta_resolver: &dyn LakeMetaStorageResolver,
-) -> Result<novarocks::protocol::starrocks::decode::StarRocksResolvedDependencies, String> {
+) -> Result<crate::protocol::starrocks::decode::StarRocksResolvedDependencies, String> {
     resolve_dependencies(
         draft.draft.external_dependencies(),
         token,
@@ -881,7 +882,7 @@ fn resolve_starrocks_draft(
 
 fn finish_starrocks_draft(
     draft: StarRocksFragmentDraftEnvelope,
-    resolved: novarocks::protocol::starrocks::decode::StarRocksResolvedDependencies,
+    resolved: crate::protocol::starrocks::decode::StarRocksResolvedDependencies,
 ) -> Result<PreparedStarRocksFragment, String> {
     let decoded =
         finish_fragment_submission(draft.draft, resolved).map_err(|error| error.to_string())?;
@@ -2218,10 +2219,10 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use novarocks::common::types::UniqueId;
-    use novarocks::protocol::starrocks::thrift_codec::{
+    use crate::protocol::starrocks::thrift_codec::{
         thrift_binary_deserialize, thrift_binary_serialize,
     };
+    use novarocks::common::types::UniqueId;
     use novarocks::runtime::fragment::io::SyncFragmentExecutor;
     use novarocks::runtime::query_context::QueryId;
     use novarocks::thrift::{

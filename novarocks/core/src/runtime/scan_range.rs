@@ -18,15 +18,15 @@
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
-pub(crate) struct ScanRangeParams {
-    pub(crate) range: ScanRange,
-    pub(crate) volume_id: Option<i32>,
-    pub(crate) empty: Option<bool>,
-    pub(crate) has_more: Option<bool>,
+pub struct ScanRangeParams {
+    pub range: ScanRange,
+    pub volume_id: Option<i32>,
+    pub empty: Option<bool>,
+    pub has_more: Option<bool>,
 }
 
 impl ScanRangeParams {
-    pub(crate) fn file(file: FileScanRange) -> Self {
+    pub fn file(file: FileScanRange) -> Self {
         Self {
             range: ScanRange::File(file),
             volume_id: None,
@@ -36,7 +36,7 @@ impl ScanRangeParams {
     }
 
     #[cfg(feature = "compat")]
-    pub(crate) fn broker_file(file: BrokerFileScanRange) -> Self {
+    pub fn broker_file(file: BrokerFileScanRange) -> Self {
         Self {
             range: ScanRange::BrokerFile(file),
             volume_id: None,
@@ -46,7 +46,7 @@ impl ScanRangeParams {
     }
 
     #[cfg(feature = "compat")]
-    pub(crate) fn schema_selection(selected: bool) -> Self {
+    pub fn schema_selection(selected: bool) -> Self {
         Self {
             range: ScanRange::SchemaSelection(SchemaScanSelection { selected }),
             volume_id: None,
@@ -56,7 +56,7 @@ impl ScanRangeParams {
     }
 
     #[cfg_attr(not(feature = "compat"), allow(dead_code))]
-    pub(crate) fn starrocks_tablet(
+    pub fn starrocks_tablet(
         tablet_id: i64,
         partition_id: i64,
         version: i64,
@@ -72,7 +72,7 @@ impl ScanRangeParams {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ScanRange {
+pub enum ScanRange {
     File(FileScanRange),
     #[cfg(feature = "compat")]
     BrokerFile(BrokerFileScanRange),
@@ -84,13 +84,13 @@ pub(crate) enum ScanRange {
 
 #[cfg(feature = "compat")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SchemaScanSelection {
-    pub(crate) selected: bool,
+pub struct SchemaScanSelection {
+    pub selected: bool,
 }
 
 #[cfg(feature = "compat")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BrokerFileFormat {
+pub enum BrokerFileFormat {
     Csv,
     Json,
     Parquet,
@@ -99,26 +99,26 @@ pub(crate) enum BrokerFileFormat {
 
 #[cfg(feature = "compat")]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BrokerFileScanRange {
-    pub(crate) path: String,
-    pub(crate) file_size: i64,
-    pub(crate) offset: i64,
-    pub(crate) length: i64,
-    pub(crate) format: BrokerFileFormat,
-    pub(crate) strip_outer_array: bool,
-    pub(crate) jsonpaths: Option<String>,
+pub struct BrokerFileScanRange {
+    pub path: String,
+    pub file_size: i64,
+    pub offset: i64,
+    pub length: i64,
+    pub format: BrokerFileFormat,
+    pub strip_outer_array: bool,
+    pub jsonpaths: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StarRocksTabletScanRange {
-    pub(crate) tablet_id: i64,
-    pub(crate) partition_id: i64,
-    pub(crate) version: i64,
+pub struct StarRocksTabletScanRange {
+    pub tablet_id: i64,
+    pub partition_id: i64,
+    pub version: i64,
 }
 
 impl StarRocksTabletScanRange {
     #[cfg_attr(not(feature = "compat"), allow(dead_code))]
-    pub(crate) fn try_new(tablet_id: i64, partition_id: i64, version: i64) -> Result<Self, String> {
+    pub fn try_new(tablet_id: i64, partition_id: i64, version: i64) -> Result<Self, String> {
         for (field, value) in [
             ("tablet_id", tablet_id),
             ("partition_id", partition_id),
@@ -139,14 +139,14 @@ impl StarRocksTabletScanRange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileFormat {
+pub enum FileFormat {
     Parquet,
     #[allow(dead_code)]
     Orc,
 }
 
 impl FileFormat {
-    pub(crate) fn as_native_name(self) -> &'static str {
+    pub fn as_native_name(self) -> &'static str {
         match self {
             Self::Parquet => "PARQUET",
             Self::Orc => "ORC",
@@ -155,35 +155,35 @@ impl FileFormat {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FileScanRange {
-    pub(crate) file_format: FileFormat,
-    pub(crate) full_path: Option<String>,
-    pub(crate) relative_path: Option<String>,
-    pub(crate) table_id: Option<i64>,
-    pub(crate) offset: i64,
-    pub(crate) length: i64,
-    pub(crate) file_length: i64,
-    pub(crate) delete_files: Vec<IcebergDeleteFile>,
-    pub(crate) deletion_vector_descriptor: Option<DeletionVectorDescriptor>,
-    pub(crate) first_row_id: Option<i64>,
-    pub(crate) data_sequence_number: Option<i64>,
-    pub(crate) modification_time: Option<i64>,
-    pub(crate) datacache_options: Option<DatacacheOptions>,
-    pub(crate) candidate_node: Option<String>,
-    pub(crate) included_positions: Vec<i64>,
-    pub(crate) serialized_split: Option<String>,
-    pub(crate) use_iceberg_jni_metadata_reader: bool,
-    pub(crate) ivm_change_op: Option<i8>,
-    pub(crate) file_pruning_min_max_values: Option<BTreeMap<i32, FilePruningMinMaxValue>>,
+pub struct FileScanRange {
+    pub file_format: FileFormat,
+    pub full_path: Option<String>,
+    pub relative_path: Option<String>,
+    pub table_id: Option<i64>,
+    pub offset: i64,
+    pub length: i64,
+    pub file_length: i64,
+    pub delete_files: Vec<IcebergDeleteFile>,
+    pub deletion_vector_descriptor: Option<DeletionVectorDescriptor>,
+    pub first_row_id: Option<i64>,
+    pub data_sequence_number: Option<i64>,
+    pub modification_time: Option<i64>,
+    pub datacache_options: Option<DatacacheOptions>,
+    pub candidate_node: Option<String>,
+    pub included_positions: Vec<i64>,
+    pub serialized_split: Option<String>,
+    pub use_iceberg_jni_metadata_reader: bool,
+    pub ivm_change_op: Option<i8>,
+    pub file_pruning_min_max_values: Option<BTreeMap<i32, FilePruningMinMaxValue>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IcebergFileFormat {
+pub enum IcebergFileFormat {
     Parquet,
 }
 
 impl IcebergFileFormat {
-    pub(crate) fn as_native_name(self) -> &'static str {
+    pub fn as_native_name(self) -> &'static str {
         match self {
             Self::Parquet => "PARQUET",
         }
@@ -191,13 +191,13 @@ impl IcebergFileFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IcebergFileContent {
+pub enum IcebergFileContent {
     PositionDeletes,
     EqualityDeletes,
 }
 
 impl IcebergFileContent {
-    pub(crate) fn as_native_name(self) -> &'static str {
+    pub fn as_native_name(self) -> &'static str {
         match self {
             Self::PositionDeletes => "POSITION_DELETES",
             Self::EqualityDeletes => "EQUALITY_DELETES",
@@ -206,44 +206,44 @@ impl IcebergFileContent {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergDeleteFile {
-    pub(crate) full_path: Option<String>,
-    pub(crate) file_format: IcebergFileFormat,
-    pub(crate) file_content: IcebergFileContent,
-    pub(crate) length: Option<i64>,
+pub struct IcebergDeleteFile {
+    pub full_path: Option<String>,
+    pub file_format: IcebergFileFormat,
+    pub file_content: IcebergFileContent,
+    pub length: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DeletionVectorDescriptor {
-    pub(crate) storage_type: Option<String>,
-    pub(crate) path_or_inline_dv: Option<String>,
-    pub(crate) offset: Option<i64>,
-    pub(crate) size_in_bytes: Option<i64>,
-    pub(crate) cardinality: Option<i64>,
+pub struct DeletionVectorDescriptor {
+    pub storage_type: Option<String>,
+    pub path_or_inline_dv: Option<String>,
+    pub offset: Option<i64>,
+    pub size_in_bytes: Option<i64>,
+    pub cardinality: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DatacacheOptions {
-    pub(crate) enable_populate_datacache: Option<bool>,
-    pub(crate) priority: Option<i32>,
+pub struct DatacacheOptions {
+    pub enable_populate_datacache: Option<bool>,
+    pub priority: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FilePruningValueKind {
+pub enum FilePruningValueKind {
     Bool,
     Int,
     Float,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FilePruningMinMaxValue {
-    pub(crate) value_kind: FilePruningValueKind,
-    pub(crate) has_null: bool,
-    pub(crate) all_null: bool,
-    pub(crate) min_int_value: Option<i64>,
-    pub(crate) max_int_value: Option<i64>,
-    pub(crate) min_float_value: Option<f64>,
-    pub(crate) max_float_value: Option<f64>,
+pub struct FilePruningMinMaxValue {
+    pub value_kind: FilePruningValueKind,
+    pub has_null: bool,
+    pub all_null: bool,
+    pub min_int_value: Option<i64>,
+    pub max_int_value: Option<i64>,
+    pub min_float_value: Option<f64>,
+    pub max_float_value: Option<f64>,
 }
 
 #[cfg(test)]

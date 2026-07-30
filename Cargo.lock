@@ -3285,13 +3285,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-buffer",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
+ "csv",
  "hex",
+ "iceberg",
  "libc",
  "novarocks",
  "novarocks-fs",
+ "novarocks-spi",
+ "novarocks-types",
+ "parquet",
  "prost 0.13.5",
  "rand 0.8.5",
  "reqwest",
@@ -3299,6 +3306,7 @@ dependencies = [
  "thrift",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

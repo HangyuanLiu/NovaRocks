@@ -64,7 +64,7 @@ const DEFAULT_ACCESS_BINDING: &str = "default";
 /// Compat has no NovaRocks catalog instance identity on the wire.  Its
 /// read-only Iceberg binding is therefore composed once per BE process, not
 /// synthesized for each query or inferred from an HDFS path.
-pub(crate) const COMPAT_ICEBERG_INSTANCE_ID: &str = "iceberg.compat.default";
+pub const COMPAT_ICEBERG_INSTANCE_ID: &str = "iceberg.compat.default";
 const COMPAT_ICEBERG_INCARNATION: [u8; 16] = [0; 16];
 
 /// Provider-owned, secret-free declaration used to install an Iceberg read
@@ -266,7 +266,7 @@ pub(crate) fn compose_compat_read_instance(
 
 /// Encode compat-normalized data-file facts as provider-owned opaque splits.
 /// The caller cannot alter provider identity, incarnation, or payload layout.
-pub(crate) fn build_compat_read_splits(
+pub fn build_compat_read_splits(
     files: impl IntoIterator<Item = IcebergDataFileInfo>,
 ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
     let owner = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
@@ -306,7 +306,7 @@ pub(crate) fn build_compat_read_splits(
 /// Encode compat-normalized snapshot-delta facts as ordinary provider-owned
 /// splits.  The stable compat instance owns the startup access binding; the
 /// Thrift plan contributes no object-store configuration or runtime handle.
-pub(crate) fn build_compat_delta_read_splits(
+pub fn build_compat_delta_read_splits(
     sources: impl IntoIterator<Item = super::delta::DeltaSourceFile>,
     delete_side: Option<super::delta::DeltaScanDeleteSide>,
 ) -> Result<Vec<ConnectorSplit>, ConnectorError> {

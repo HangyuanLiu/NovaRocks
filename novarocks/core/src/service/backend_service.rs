@@ -37,14 +37,13 @@ use thrift::transport::{
 use crate::common::network;
 use crate::connector::starrocks::lake::{
     create_lake_tablet_from_req_with_storage_metadata_provider,
-    execute_alter_tablet_task_with_storage_metadata_provider,
     execute_update_tablet_meta_info_task_with_storage_metadata_provider,
 };
 use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_table;
 use crate::novarocks_config::config as novarocks_app_config;
-use crate::protocol::starrocks::thrift_codec::thrift_named_json;
 use crate::runtime::starlet_shard_registry;
 use crate::service::disk_report;
+use crate::service::thrift_debug::thrift_named_json;
 use crate::thrift::master_service;
 use crate::thrift::{
     agent_service,
@@ -129,10 +128,13 @@ pub fn execute_lake_create_tablet(
 /// Core execution capability used only by the temporary compat lake-agent
 /// adapter. RCI-5G removes this callback boundary with BackendService.
 pub fn execute_lake_alter_tablet(
-    request: &agent_service::TAlterTabletReqV2,
+    task: crate::connector::starrocks::lake::schema_change::LakeAlterTabletTask,
     storage_metadata_provider: Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
 ) -> Result<(), String> {
-    execute_alter_tablet_task_with_storage_metadata_provider(request, storage_metadata_provider)
+    crate::connector::starrocks::lake::schema_change::execute_lake_alter_tablet_task(
+        task,
+        storage_metadata_provider,
+    )
 }
 
 /// Core execution capability used only by the temporary compat lake-agent

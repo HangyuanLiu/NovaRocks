@@ -42,10 +42,10 @@ impl LakeTableIdentity {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct LakeScanTabletRef {
-    pub(crate) tablet_id: i64,
-    pub(crate) partition_id: i64,
-    pub(crate) version: i64,
+pub struct LakeScanTabletRef {
+    pub tablet_id: i64,
+    pub partition_id: i64,
+    pub version: i64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -86,7 +86,7 @@ pub(crate) fn cache_table_identity_names(table: &LakeTableIdentity) {
     }
 }
 
-pub(crate) fn find_cached_table_identity_names(
+pub fn find_cached_table_identity_names(
     catalog: &str,
     db_id: i64,
     table_id: i64,
@@ -126,7 +126,7 @@ pub(crate) fn resolve_tablet_paths_for_lake_scan(
     resolve_tablet_paths_for_refs_with_provider(query_id, table, &refs, starlet_metadata_provider)
 }
 
-pub(crate) fn lake_scan_execution_properties(
+pub fn lake_scan_execution_properties(
     query_id: Option<QueryId>,
     table: &LakeTableIdentity,
     ranges: &[LakeScanTabletRef],

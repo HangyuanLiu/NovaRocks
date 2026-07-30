@@ -25,7 +25,7 @@ pub(crate) mod compact;
 pub(crate) mod data_writer;
 pub(crate) mod default_value;
 pub mod delete_file;
-pub(crate) mod delta;
+pub mod delta;
 pub(crate) mod delta_reader;
 pub mod equality_delete;
 pub(crate) mod file_pruning;
@@ -38,7 +38,7 @@ pub(crate) mod metadata_read;
 pub(crate) mod operation_lifecycle;
 pub(crate) mod partition_spec;
 pub mod position_delete;
-pub(crate) mod position_delete_descriptor;
+pub mod position_delete_descriptor;
 pub(crate) mod provider;
 pub(crate) mod read;
 pub(crate) mod reader;
@@ -48,7 +48,7 @@ pub mod scan_deletes;
 pub mod scan_model;
 pub mod schema;
 pub mod sink;
-pub(crate) mod sink_plan;
+pub mod sink_plan;
 pub(crate) mod stats;
 pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;
@@ -56,12 +56,14 @@ pub(crate) mod theta_sketch;
 pub(crate) mod variant_write;
 pub(crate) mod write_descriptor;
 
+pub use metadata::plan_compat_iceberg_metadata_read_source;
+pub(crate) use metadata::plan_native_iceberg_metadata_read_source;
 pub use metadata::{
     IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanRange,
     IcebergMetadataTableType,
 };
-pub(crate) use metadata::{
-    plan_compat_iceberg_metadata_read_source, plan_native_iceberg_metadata_read_source,
+pub use provider::{
+    COMPAT_ICEBERG_INSTANCE_ID, build_compat_delta_read_splits, build_compat_read_splits,
 };
 pub(crate) use schema::build_projected_output_schema_from_descriptor;
 pub use schema::{

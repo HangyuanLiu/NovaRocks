@@ -349,14 +349,14 @@ impl ConnectorSplitAppend {
 
 /// A queued provider split plus provider-neutral core row-position identity.
 #[derive(Clone)]
-pub(crate) struct ConnectorScheduledSplit {
+pub struct ConnectorScheduledSplit {
     split: ConnectorSplit,
     row_position: Option<ConnectorRowPosition>,
     storage_tablet_id: Option<i64>,
 }
 
 impl ConnectorScheduledSplit {
-    pub(crate) fn plain(split: ConnectorSplit) -> Self {
+    pub fn plain(split: ConnectorSplit) -> Self {
         Self {
             split,
             row_position: None,
@@ -366,7 +366,7 @@ impl ConnectorScheduledSplit {
 
     /// Attach a protocol-neutral storage tablet identity for execution paths
     /// that synthesize per-row positions. The provider payload stays opaque.
-    pub(crate) fn storage_tablet(split: ConnectorSplit, tablet_id: i64) -> Self {
+    pub fn storage_tablet(split: ConnectorSplit, tablet_id: i64) -> Self {
         Self {
             split,
             row_position: None,
@@ -374,10 +374,7 @@ impl ConnectorScheduledSplit {
         }
     }
 
-    pub(crate) fn with_row_position(
-        split: ConnectorSplit,
-        row_position: ConnectorRowPosition,
-    ) -> Self {
+    pub fn with_row_position(split: ConnectorSplit, row_position: ConnectorRowPosition) -> Self {
         Self {
             split,
             row_position: Some(row_position),
@@ -385,7 +382,7 @@ impl ConnectorScheduledSplit {
         }
     }
 
-    pub(crate) fn split(&self) -> &ConnectorSplit {
+    pub fn split(&self) -> &ConnectorSplit {
         &self.split
     }
 
@@ -601,7 +598,7 @@ impl Drop for ConnectorBatchReaderIter {
 /// The source owns no provider-specific type.  Wire decoders resolve the
 /// opaque split to its typed host instance, while core owns scheduling and
 /// adapts the returned Arrow batches into `Chunk`s.
-pub(crate) struct ConnectorReadScanSource {
+pub struct ConnectorReadScanSource {
     instance: Arc<ConnectorInstance>,
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
@@ -611,7 +608,7 @@ pub(crate) struct ConnectorReadScanSource {
 }
 
 impl ConnectorReadScanSource {
-    pub(crate) fn new(
+    pub fn new(
         instance: Arc<ConnectorInstance>,
         splits: Vec<ConnectorSplit>,
         request: ConnectorOpenReaderRequest,
@@ -630,7 +627,7 @@ impl ConnectorReadScanSource {
         }
     }
 
-    pub(crate) fn new_with_incremental(
+    pub fn new_with_incremental(
         instance: Arc<ConnectorInstance>,
         splits: Vec<ConnectorSplit>,
         request: ConnectorOpenReaderRequest,
@@ -651,7 +648,7 @@ impl ConnectorReadScanSource {
         }
     }
 
-    pub(crate) fn new_scheduled(
+    pub fn new_scheduled(
         instance: Arc<ConnectorInstance>,
         scheduled: Vec<ConnectorScheduledSplit>,
         request: ConnectorOpenReaderRequest,
