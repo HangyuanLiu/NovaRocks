@@ -761,10 +761,12 @@ fn profile_report_interval_ns(
 fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryLifecycleRegistry> {
     let registry = QueryLifecycleRegistry::new_unbound(
         1,
-        Arc::new(crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
-            controls,
-            Arc::new(ConnectorExecutionHost::new()),
-        )),
+        Arc::new(
+            crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
+                controls,
+                Arc::new(ConnectorExecutionHost::new()),
+            ),
+        ),
         crate::query_lifecycle::QueryLifecycleRegistryConfig::from_runtime_config(
             &novarocks::common::app_config::RuntimeConfig::default(),
         ),
