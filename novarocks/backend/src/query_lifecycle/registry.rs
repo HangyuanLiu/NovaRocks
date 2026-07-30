@@ -32,6 +32,7 @@ use novarocks::query_execution::lifecycle::{
     RuntimeFilterContribution, StageDigest, StageDigestVersion,
 };
 use novarocks::runtime::fragment::FragmentOutcome;
+use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 
@@ -97,6 +98,11 @@ pub(crate) struct QueryLifecycleRegistryConfig {
     pub(crate) tombstone_retention: Duration,
     pub(crate) heartbeat_timeout: Duration,
     pub(crate) pre_start_timeout: Duration,
+    pub(crate) stage_max_fragments: usize,
+    pub(crate) max_active_staging: usize,
+    pub(crate) stage_max_encoded_bytes: usize,
+    pub(crate) stage_max_inflight_encoded_bytes: usize,
+    pub(crate) stage_max_dormant_workers: usize,
 }
 
 impl QueryLifecycleRegistryConfig {
@@ -111,7 +117,100 @@ impl QueryLifecycleRegistryConfig {
             ),
             heartbeat_timeout: Duration::from_millis(runtime.query_control_heartbeat_timeout_ms),
             pre_start_timeout: Duration::from_millis(runtime.query_control_pre_start_timeout_ms),
+            stage_max_fragments: runtime.query_control_stage_max_fragments,
+            max_active_staging: runtime.query_control_max_active_staging,
+            stage_max_encoded_bytes: runtime.query_control_stage_max_encoded_bytes,
+            stage_max_inflight_encoded_bytes: runtime
+                .query_control_stage_max_inflight_encoded_bytes,
+            stage_max_dormant_workers: runtime.query_control_stage_max_dormant_workers,
         }
+    }
+}
+
+/// Global, backend-local accounting for QLC-3 work which exists before a
+/// query is allowed to run.  The counters deliberately cover the full
+/// pre-start lifetime, not only the RPC handler: a completed Stage still owns
+/// decoded plans and dormant workers until Start or Abort wins the lifecycle
+/// race.
+#[derive(Default)]
+struct StageResourceLedger {
+    active_builders: usize,
+    encoded_bytes: usize,
+    dormant_workers: usize,
+}
+
+/// RAII reservation for one participant-local Stage bundle.  It first owns a
+/// builder slot, then transfers the encoded-byte and dormant-worker portions
+/// to the lifecycle entry after a successful commit.  Drop is intentionally
+/// sufficient for every failure path, including panics while materializing a
+/// fragment bundle.
+pub(crate) struct StageResourceReservation {
+    ledger: Arc<Mutex<StageResourceLedger>>,
+    encoded_bytes: usize,
+    dormant_workers: usize,
+    builder_active: bool,
+}
+
+impl StageResourceReservation {
+    fn try_acquire(
+        ledger: Arc<Mutex<StageResourceLedger>>,
+        config: QueryLifecycleRegistryConfig,
+        encoded_bytes: usize,
+        dormant_workers: usize,
+    ) -> Result<Self, &'static str> {
+        let mut state = ledger
+            .lock()
+            .expect("query lifecycle Stage resource ledger lock");
+        if state.active_builders >= config.max_active_staging {
+            return Err("backend has reached its active Stage builder limit");
+        }
+        let Some(next_bytes) = state.encoded_bytes.checked_add(encoded_bytes) else {
+            return Err("backend Stage encoded-byte accounting overflowed");
+        };
+        if next_bytes > config.stage_max_inflight_encoded_bytes {
+            return Err("backend has reached its Stage encoded-byte budget");
+        }
+        let Some(next_workers) = state.dormant_workers.checked_add(dormant_workers) else {
+            return Err("backend Stage dormant-worker accounting overflowed");
+        };
+        if next_workers > config.stage_max_dormant_workers {
+            return Err("backend has reached its dormant worker limit");
+        }
+        state.active_builders += 1;
+        state.encoded_bytes = next_bytes;
+        state.dormant_workers = next_workers;
+        Ok(Self {
+            ledger,
+            encoded_bytes,
+            dormant_workers,
+            builder_active: true,
+        })
+    }
+
+    fn release_builder(&mut self) {
+        if !self.builder_active {
+            return;
+        }
+        let mut state = self
+            .ledger
+            .lock()
+            .expect("query lifecycle Stage resource ledger lock");
+        state.active_builders = state.active_builders.saturating_sub(1);
+        self.builder_active = false;
+    }
+}
+
+impl Drop for StageResourceReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .ledger
+            .lock()
+            .expect("query lifecycle Stage resource ledger lock");
+        if self.builder_active {
+            state.active_builders = state.active_builders.saturating_sub(1);
+        }
+        state.encoded_bytes = state.encoded_bytes.saturating_sub(self.encoded_bytes);
+        state.dormant_workers = state.dormant_workers.saturating_sub(self.dormant_workers);
     }
 }
 
@@ -123,6 +222,7 @@ pub(crate) struct QueryLifecycleRegistry {
     local_start_epoch: u64,
     clock: Arc<dyn MonotonicClock>,
     metrics: Arc<dyn QueryLifecycleMetricsSink>,
+    stage_resources: Arc<Mutex<StageResourceLedger>>,
     self_weak: Weak<QueryLifecycleRegistry>,
 }
 
@@ -191,6 +291,7 @@ pub(crate) struct StageBuildPermit {
     execution_id: QueryExecutionId,
     digest: StageDigest,
     gate: Arc<super::stage::StartGate>,
+    resources: Option<StageResourceReservation>,
     committed: bool,
 }
 
@@ -314,6 +415,11 @@ impl QueryLifecycleRegistry {
         assert!(!config.tombstone_retention.is_zero());
         assert!(!config.heartbeat_timeout.is_zero());
         assert!(!config.pre_start_timeout.is_zero());
+        assert!(config.stage_max_fragments > 0);
+        assert!(config.max_active_staging > 0);
+        assert!(config.stage_max_encoded_bytes > 0);
+        assert!(config.stage_max_inflight_encoded_bytes >= config.stage_max_encoded_bytes);
+        assert!(config.stage_max_dormant_workers >= config.stage_max_fragments);
         Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
@@ -322,6 +428,7 @@ impl QueryLifecycleRegistry {
             local_start_epoch,
             clock,
             metrics,
+            stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
             self_weak: self_weak.clone(),
         })
     }
@@ -726,6 +833,28 @@ impl QueryLifecycleRegistry {
         let execution_id = request.execution_id();
         let digest_version = request.digest_version();
         let stage_digest = request.digest();
+        let fragment_count = request.fragments().len();
+        if fragment_count > self.config.stage_max_fragments {
+            return StageBuildDecision::Complete(QueryStageAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                QueryStageOutcome::RejectedCapacity,
+                "stage fragment count exceeds the backend Stage limit",
+            ));
+        }
+        let stage_encoded_bytes =
+            novarocks::query_execution::lifecycle::contract::encode_query_stage_request(&request)
+                .encoded_len();
+        if stage_encoded_bytes > self.config.stage_max_encoded_bytes {
+            return StageBuildDecision::Complete(QueryStageAck::new(
+                execution_id,
+                digest_version,
+                stage_digest,
+                QueryStageOutcome::RejectedCapacity,
+                "stage request encoded bytes exceed the backend Stage limit",
+            ));
+        }
         let entry = self
             .state
             .lock()
@@ -848,17 +977,46 @@ impl QueryLifecycleRegistry {
         };
         drop(state);
         match build {
-            Some(gate) => StageBuildDecision::Build(StageBuildPermit {
-                registry: self
-                    .self_weak
-                    .upgrade()
-                    .expect("query lifecycle registry owns active entry"),
-                entry,
-                execution_id,
-                digest: stage_digest,
-                gate,
-                committed: false,
-            }),
+            Some(gate) => {
+                let resources = match StageResourceReservation::try_acquire(
+                    Arc::clone(&self.stage_resources),
+                    self.config,
+                    stage_encoded_bytes,
+                    fragment_count,
+                ) {
+                    Ok(resources) => resources,
+                    Err(detail) => {
+                        let mut state = entry.state.lock().expect("query lifecycle entry lock");
+                        if state.phase == QueryLifecyclePhase::Staging
+                            && state.stage_digest == Some(stage_digest)
+                        {
+                            state.phase = QueryLifecyclePhase::ControlAttached;
+                            state.stage_digest = None;
+                            state.start_gate = None;
+                            entry.stage_completed.notify_all();
+                        }
+                        return StageBuildDecision::Complete(QueryStageAck::new(
+                            execution_id,
+                            digest_version,
+                            stage_digest,
+                            QueryStageOutcome::RejectedCapacity,
+                            detail,
+                        ));
+                    }
+                };
+                StageBuildDecision::Build(StageBuildPermit {
+                    registry: self
+                        .self_weak
+                        .upgrade()
+                        .expect("query lifecycle registry owns active entry"),
+                    entry,
+                    execution_id,
+                    digest: stage_digest,
+                    gate,
+                    resources: Some(resources),
+                    committed: false,
+                })
+            }
             None => StageBuildDecision::Complete(QueryStageAck::new(
                 execution_id,
                 digest_version,
@@ -894,6 +1052,7 @@ impl QueryLifecycleRegistry {
         };
 
         let mut state = entry.state.lock().expect("query lifecycle entry lock");
+        let mut released_stage_resources = None;
         let (outcome, detail) = match state.phase {
             QueryLifecyclePhase::Staged => {
                 if state.stage_digest != Some(stage_digest) {
@@ -906,6 +1065,7 @@ impl QueryLifecycleRegistry {
                     state.pre_start_deadline = None;
                     let released = gate.release();
                     debug_assert!(released, "a staged start gate must be pending");
+                    released_stage_resources = state.stage_resources.take();
                     (QueryStartOutcome::Applied, "query participant started")
                 } else {
                     (
@@ -940,6 +1100,10 @@ impl QueryLifecycleRegistry {
             ),
         };
         drop(state);
+        // The gate has been released under the entry lock.  Once Running is
+        // visible there can be no dormant workers or retained stage payload,
+        // so return the Stage reservation outside lifecycle locks.
+        drop(released_stage_resources);
         QueryStartAck::new(execution_id, digest_version, stage_digest, outcome, detail)
     }
 
@@ -1164,7 +1328,14 @@ impl QueryLifecycleRegistry {
         terminal_event: Option<QueryControlEvent>,
         detail: String,
     ) -> QueryTerminationReason {
-        let (execution_id, expected_instances, initializing, terminal_event_permit, start_gate) = {
+        let (
+            execution_id,
+            expected_instances,
+            initializing,
+            terminal_event_permit,
+            start_gate,
+            stage_resources,
+        ) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if let Some(reason) = state.termination_reason {
                 return reason;
@@ -1187,6 +1358,7 @@ impl QueryLifecycleRegistry {
                 initializing,
                 state.terminal_event_permit.take(),
                 state.start_gate.clone(),
+                state.stage_resources.take(),
             )
         };
 
@@ -1195,6 +1367,9 @@ impl QueryLifecycleRegistry {
             // wake every dormant worker without allowing it to start.
             gate.abort();
         }
+        // Abort is terminal for a pre-start bundle.  Free the associated
+        // ledger reservation only after its gate has been fail-closed.
+        drop(stage_resources);
         if let Some(permit) = terminal_event_permit {
             drop(permit.send(
                 terminal_event.unwrap_or(QueryControlEvent::TerminationAccepted {
@@ -1791,6 +1966,13 @@ impl StageBuildPermit {
         } else if state.phase == QueryLifecyclePhase::Staging
             && state.stage_digest == Some(self.digest)
         {
+            let mut resources = self
+                .resources
+                .take()
+                .expect("Stage build permit owns its resource reservation");
+            resources.release_builder();
+            debug_assert!(state.stage_resources.is_none());
+            state.stage_resources = Some(resources);
             state.phase = QueryLifecyclePhase::Staged;
             (QueryStageOutcome::Applied, "query participant staged")
         } else {

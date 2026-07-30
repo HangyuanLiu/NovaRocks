@@ -67,6 +67,9 @@ pub(crate) struct QueryLifecycleEntryState {
     /// workspace yet, but it still has to make Stage and Start idempotent.
     pub(crate) stage_digest: Option<StageDigest>,
     pub(crate) start_gate: Option<Arc<StartGate>>,
+    /// Backend-global accounting retained for a successfully staged bundle.
+    /// It is released exactly when Start or terminal cleanup wins.
+    pub(crate) stage_resources: Option<super::registry::StageResourceReservation>,
 }
 
 impl QueryLifecycleEntry {
@@ -95,6 +98,7 @@ impl QueryLifecycleEntry {
                 terminal_event_permit: None,
                 stage_digest: None,
                 start_gate: None,
+                stage_resources: None,
             }),
             init_completed: Condvar::new(),
             stage_completed: Condvar::new(),
