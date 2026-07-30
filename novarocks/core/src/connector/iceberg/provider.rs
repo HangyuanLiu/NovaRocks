@@ -2331,7 +2331,7 @@ pub(crate) fn register_planned_table_files_fixture(
         seen_projections: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
     }
 
-    impl ConnectorRead for Fixture {
+    impl ConnectorScanPlanning for Fixture {
         fn instance_id(&self) -> &ConnectorInstanceId {
             &self.instance_id
         }
@@ -2417,15 +2417,44 @@ pub(crate) fn register_planned_table_files_fixture(
                 })
                 .collect()
         }
+    }
 
-        fn open_reader(
-            &self,
-            _: &ConnectorSplit,
-            _: novarocks_spi::connector::ConnectorOpenReaderRequest,
-        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+    impl ConnectorMetadata for Fixture {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
-                "planned-files fixture does not open readers",
+                "planned-files fixture does not implement metadata",
+            ))
+        }
+
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "planned-files fixture does not implement metadata",
+            ))
+        }
+
+        fn list_tables(
+            &self,
+            _: ConnectorListTablesRequest,
+        ) -> Result<Vec<novarocks_spi::connector::ConnectorTableIdentity>, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "planned-files fixture does not implement metadata",
+            ))
+        }
+
+        fn load_table(
+            &self,
+            _: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "planned-files fixture does not implement metadata",
             ))
         }
     }
@@ -2442,14 +2471,17 @@ pub(crate) fn register_planned_table_files_fixture(
         instance_id,
     };
     let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
-    registry
-        .register_connector_instance(
-            ConnectorInstance::try_new(descriptor.clone(), None, read)
-                .expect("fixture connector instance")
-                .with_distribution(Arc::new(IcebergInstanceDistribution {
-                    descriptor,
-                    incarnation,
-                })),
+    registry.register_fixture_control(
+        ConnectorControlBinding::try_new(
+            descriptor.clone(),
+            incarnation,
+            read.clone(),
+            read,
+            Arc::new(IcebergInstanceDistribution {
+                descriptor,
+                incarnation,
+            }),
         )
-        .expect("register planned-files fixture");
+        .expect("fixture connector control binding"),
+    );
 }

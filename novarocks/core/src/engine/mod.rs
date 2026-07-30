@@ -8002,27 +8002,27 @@ path = "meta/operations.sqlite"
         session
             .execute_in_database(&create_catalog_sql, "default")
             .expect("create catalog");
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice_one")
-            .expect("connector instance ID");
         let state = engine.state_for_test();
-        {
-            let connectors = state
-                .connectors
+        assert!(
+            state
+                .iceberg_catalogs
                 .read()
-                .expect("connector registry read lock");
-            connectors
-                .connector_instance(&instance_id)
-                .expect("Iceberg connector instance must be registered");
-        }
+                .expect("iceberg catalog registry")
+                .get("ice_one")
+                .is_ok()
+        );
 
         session
             .execute_in_database("drop catalog Ice_One", "default")
             .expect("drop catalog");
-        let connectors = state
-            .connectors
-            .read()
-            .expect("connector registry read lock");
-        assert!(connectors.connector_instance(&instance_id).is_err());
+        assert!(
+            state
+                .iceberg_catalogs
+                .read()
+                .expect("iceberg catalog registry")
+                .get("ice_one")
+                .is_err()
+        );
     }
 
     fn open_row_lineage_iceberg_session_with_table(

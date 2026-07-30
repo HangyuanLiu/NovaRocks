@@ -43,9 +43,9 @@ pub(crate) use starrocks_table_stub::{
     runtime_registered,
 };
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use novarocks_spi::connector::{
@@ -405,6 +405,12 @@ pub struct ConnectorRegistry {
     catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
+    #[cfg(test)]
+    fixture_controls: Arc<
+        Mutex<
+            BTreeMap<ConnectorInstanceId, Arc<novarocks_spi::connector::ConnectorControlBinding>>,
+        >,
+    >,
 }
 
 impl ConnectorRegistry {
@@ -414,7 +420,48 @@ impl ConnectorRegistry {
             catalog_backends: HashMap::new(),
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
+            #[cfg(test)]
+            fixture_controls: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_fixture_control(
+        &self,
+        binding: novarocks_spi::connector::ConnectorControlBinding,
+    ) {
+        self.fixture_controls
+            .lock()
+            .expect("fixture connector control lock")
+            .insert(binding.descriptor().instance_id.clone(), Arc::new(binding));
+    }
+
+    #[cfg(test)]
+    fn acquire_fixture_control(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .fixture_controls
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "fixture connector control lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "test fixture did not register a connector control binding",
+                )
+            })?;
+        Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
     }
 
     #[cfg(feature = "compat")]
@@ -495,6 +542,7 @@ impl LegacyFixtureControlResolver {
 }
 
 #[cfg(test)]
+#[cfg(any())]
 impl novarocks_spi::connector::ConnectorControlResolver for LegacyFixtureControlResolver {
     fn acquire_current(
         &self,
@@ -544,6 +592,19 @@ impl novarocks_spi::connector::ConnectorControlResolver for LegacyFixtureControl
             execution_distribution,
         )?;
         Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(Arc::new(binding), || {}))
+    }
+}
+
+#[cfg(test)]
+impl novarocks_spi::connector::ConnectorControlResolver for LegacyFixtureControlResolver {
+    fn acquire_current(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        self.registry.acquire_fixture_control(instance_id)
     }
 }
 
