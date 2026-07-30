@@ -320,7 +320,9 @@ impl AttemptControl {
         &self,
         snapshot: QueryTerminalSnapshot,
     ) -> Result<TerminalSnapshotStoreOutcome, DistributedQueryError> {
-        snapshot.validate().map_err(|error| failed(error.to_string()))?;
+        snapshot
+            .validate()
+            .map_err(|error| failed(error.to_string()))?;
         if snapshot.execution_id() != self.execution_id {
             return Err(contract_violation(
                 "query terminal snapshot execution id differs from active lifecycle attempt",
@@ -612,7 +614,11 @@ impl AttemptControl {
             if let Some(error) = &terminal.reader_failure {
                 return Some(Err(error.clone()));
             }
-            terminal.termination_accepted.get(&backend_idx).copied().map(Ok)
+            terminal
+                .termination_accepted
+                .get(&backend_idx)
+                .copied()
+                .map(Ok)
         })
         .ok_or_else(|| {
             format!("query lifecycle abort acknowledgement timed out on backend {backend_idx}")
@@ -631,7 +637,9 @@ impl AttemptControl {
             }
             (terminal.locally_drained.len() == expected).then_some(Ok(()))
         })
-        .ok_or_else(|| "query lifecycle timed out waiting for all participants to drain".to_string())?
+        .ok_or_else(|| {
+            "query lifecycle timed out waiting for all participants to drain".to_string()
+        })?
     }
 
     fn wait_for_all_snapshots(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
@@ -814,7 +822,10 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 if matches!(
                     error.kind(),
                     QueryLifecycleTransportErrorKind::DeadlineExceeded
-                ) => continue,
+                ) =>
+            {
+                continue;
+            }
             Err(error) => {
                 control.record_reader_failure(format!(
                     "query lifecycle control stream lost on backend {} digest {}: {error}",
@@ -925,9 +936,8 @@ impl AttemptControl {
 
     fn join_readers(&self) {
         self.stop_readers();
-        let readers = std::mem::take(
-            &mut *self.readers.lock().expect("query control event readers"),
-        );
+        let readers =
+            std::mem::take(&mut *self.readers.lock().expect("query control event readers"));
         for reader in readers {
             let _ = reader.join();
         }

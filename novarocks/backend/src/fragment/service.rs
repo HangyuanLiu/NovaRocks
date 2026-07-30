@@ -24,9 +24,9 @@ use std::sync::{Arc, Mutex};
 
 use novarocks::common::app_config;
 use novarocks::connector::ConnectorRegistry;
+use novarocks::novarocks_logging::error;
 #[cfg(test)]
 use novarocks::novarocks_logging::warn;
-use novarocks::novarocks_logging::{error, info};
 use novarocks::query_execution::lifecycle::StageFragment;
 use novarocks::query_execution::native_fragment_report;
 use novarocks::runtime::fragment::io::{
@@ -691,44 +691,21 @@ fn consume_terminal_fact(
     let fact = running.join();
     let query_id = fact.query_id();
     let fragment_instance_id = fact.fragment_instance_id();
-    let report_error = match fact.outcome() {
-        FragmentOutcome::Succeeded => {
-            if let Some(profile) = fact.profile() {
-                info!(
-                    target: "novarocks::profile",
-                    finst_id = %fragment_instance_id,
-                    profile = ?profile,
-                    "native_fragment_profile"
-                );
-            }
-            None
-        }
-        FragmentOutcome::Failed(execution_error) => {
-            let report_error = execution_error.to_string();
-            error!(
-                target: "novarocks::exec",
-                finst_id = %fragment_instance_id,
-                error = %execution_error,
-                "native fragment execution failed"
-            );
-            Some(report_error)
-        }
-        FragmentOutcome::Cancelled { reason } => Some(reason.detail().to_string()),
-    };
+    if let FragmentOutcome::Failed(execution_error) = fact.outcome() {
+        error!(target: "novarocks::exec", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
+    }
+    let sink = novarocks::runtime::sink_commit::report_snapshot(fragment_instance_id);
+    // QLC-4 transfers the final facts to the query lifecycle before any
+    // reporter or sink registry cleanup. Native ReportExecStatus remains a
+    // periodic observation channel and must not own query completion.
+    lifecycle.record_fragment_terminal_fact(execution_id, fact, 0, sink);
+    native_fragment_report::unregister(fragment_instance_id);
     let report_decision = queries.finish_fragment_for_report(query_id);
-    native_fragment_report::report_terminal(
-        fragment_instance_id,
-        novarocks::runtime::fragment::io::FragmentTerminalReport::new(
-            report_error,
-            report_decision.include_runtime_filter_profile(),
-        ),
-    );
     queries.unregister_fragment(fragment_instance_id);
     queries.cleanup_after_fragment_report(query_id, report_decision);
     // Publish the terminal report before this fact can fail-close the local
     // lifecycle. Otherwise a sibling cancelled by the first terminal fact may
     // win the report slot and hide the fragment that actually failed.
-    lifecycle.record_fragment_terminal(execution_id, fragment_instance_id, fact.outcome());
     token.complete();
 }
 

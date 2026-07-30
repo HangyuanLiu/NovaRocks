@@ -48,7 +48,7 @@ use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_tr
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
 use super::query_registry::FrontendQueryRegistry;
-use super::report::FrontendCoordinatorReportHandler;
+use super::report::{FrontendCoordinatorReportHandler, FrontendCoordinatorTerminalIngress};
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
@@ -630,6 +630,10 @@ impl FrontendDistributedQueryCoordinator {
 
     pub fn report_handler(&self) -> FrontendCoordinatorReportHandler {
         FrontendCoordinatorReportHandler::new(Arc::clone(&self.registry))
+    }
+
+    pub fn terminal_ingress(&self) -> FrontendCoordinatorTerminalIngress {
+        FrontendCoordinatorTerminalIngress::new(Arc::clone(&self.registry))
     }
 
     pub fn backend_query_activity(&self) -> BackendQueryActivity {

@@ -256,6 +256,7 @@ fn registry_config(max_active_entries: usize) -> QueryLifecycleRegistryConfig {
         stage_max_encoded_bytes: 48 * 1024 * 1024,
         stage_max_inflight_encoded_bytes: 256 * 1024 * 1024,
         stage_max_dormant_workers: 512,
+        terminal_max_encoded_bytes: 48 * 1024 * 1024,
     }
 }
 

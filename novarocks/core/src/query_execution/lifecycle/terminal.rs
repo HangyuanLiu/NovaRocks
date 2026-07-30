@@ -30,7 +30,9 @@ use crate::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 
-use super::{ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId, QueryLifecycleError};
+use super::{
+    ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId, QueryLifecycleError,
+};
 
 pub const QUERY_TERMINAL_SNAPSHOT_VERSION_V1: u32 = 1;
 const QUERY_TERMINAL_SNAPSHOT_V1_DOMAIN: &[u8] =
@@ -221,7 +223,9 @@ impl QueryTerminalSnapshot {
     }
 
     pub fn is_success(&self) -> bool {
-        self.fragments.iter().all(|fragment| fragment.outcome.is_success())
+        self.fragments
+            .iter()
+            .all(|fragment| fragment.outcome.is_success())
     }
 
     pub fn validate(&self) -> Result<(), QueryLifecycleError> {
@@ -300,7 +304,10 @@ pub struct ImmutableQueryTerminalRecord {
 }
 
 impl ImmutableQueryTerminalRecord {
-    pub fn new(snapshot: QueryTerminalSnapshot, max_encoded_bytes: usize) -> Result<Self, QueryLifecycleError> {
+    pub fn new(
+        snapshot: QueryTerminalSnapshot,
+        max_encoded_bytes: usize,
+    ) -> Result<Self, QueryLifecycleError> {
         snapshot.validate()?;
         let encoded = snapshot.canonical_bytes();
         if encoded.len() > max_encoded_bytes {
@@ -367,33 +374,68 @@ impl QueryTerminalSet {
 }
 
 fn put_sink(bytes: &mut Vec<u8>, sink: &SinkCommitReportSnapshot) {
-    let mut iceberg = sink.iceberg_commits.iter().map(Message::encode_to_vec).collect::<Vec<_>>();
+    let mut iceberg = sink
+        .iceberg_commits
+        .iter()
+        .map(Message::encode_to_vec)
+        .collect::<Vec<_>>();
     iceberg.sort();
     put_u64(bytes, iceberg.len() as u64);
     for fact in iceberg {
         put_bytes(bytes, &fact);
     }
-    let mut committed = sink.tablet_commit_infos.iter().map(|fact| (fact.tablet_id, fact.backend_id)).collect::<Vec<_>>();
+    let mut committed = sink
+        .tablet_commit_infos
+        .iter()
+        .map(|fact| (fact.tablet_id, fact.backend_id))
+        .collect::<Vec<_>>();
     committed.sort_unstable();
     put_u64(bytes, committed.len() as u64);
-    for (tablet, backend) in committed { put_i64(bytes, tablet); put_i64(bytes, backend); }
-    let mut failed = sink.tablet_fail_infos.iter().map(|fact| (fact.tablet_id, fact.backend_id)).collect::<Vec<_>>();
+    for (tablet, backend) in committed {
+        put_i64(bytes, tablet);
+        put_i64(bytes, backend);
+    }
+    let mut failed = sink
+        .tablet_fail_infos
+        .iter()
+        .map(|fact| (fact.tablet_id, fact.backend_id))
+        .collect::<Vec<_>>();
     failed.sort_unstable();
     put_u64(bytes, failed.len() as u64);
-    for (tablet, backend) in failed { put_i64(bytes, tablet); put_i64(bytes, backend); }
+    for (tablet, backend) in failed {
+        put_i64(bytes, tablet);
+        put_i64(bytes, backend);
+    }
     put_i64(bytes, sink.load_stats.loaded_rows);
     put_i64(bytes, sink.load_stats.loaded_bytes);
     put_i64(bytes, sink.load_stats.filtered_rows);
 }
 
-fn put_u8(bytes: &mut Vec<u8>, value: u8) { bytes.push(value); }
-fn put_u16(bytes: &mut Vec<u8>, value: u16) { bytes.extend_from_slice(&value.to_be_bytes()); }
-fn put_u32(bytes: &mut Vec<u8>, value: u32) { bytes.extend_from_slice(&value.to_be_bytes()); }
-fn put_i32(bytes: &mut Vec<u8>, value: i32) { bytes.extend_from_slice(&value.to_be_bytes()); }
-fn put_u64(bytes: &mut Vec<u8>, value: u64) { bytes.extend_from_slice(&value.to_be_bytes()); }
-fn put_i64(bytes: &mut Vec<u8>, value: i64) { bytes.extend_from_slice(&value.to_be_bytes()); }
-fn put_bytes(bytes: &mut Vec<u8>, value: &[u8]) { put_u64(bytes, value.len() as u64); bytes.extend_from_slice(value); }
-fn put_string(bytes: &mut Vec<u8>, value: &str) { put_bytes(bytes, value.as_bytes()); }
+fn put_u8(bytes: &mut Vec<u8>, value: u8) {
+    bytes.push(value);
+}
+fn put_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+fn put_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+fn put_i32(bytes: &mut Vec<u8>, value: i32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+fn put_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+fn put_i64(bytes: &mut Vec<u8>, value: i64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+fn put_bytes(bytes: &mut Vec<u8>, value: &[u8]) {
+    put_u64(bytes, value.len() as u64);
+    bytes.extend_from_slice(value);
+}
+fn put_string(bytes: &mut Vec<u8>, value: &str) {
+    put_bytes(bytes, value.as_bytes());
+}
 
 #[cfg(test)]
 mod tests {
@@ -402,19 +444,34 @@ mod tests {
     use crate::query_execution::lifecycle::{AttemptId, QueryControlEndpoint};
 
     fn snapshot(fragment_ids: &[i64]) -> QueryTerminalSnapshot {
-        let execution = QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
+        let execution =
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
         let backend = ParticipantBackendIdentity::new(
             1,
             QueryControlEndpoint::new("127.0.0.1", 9030).unwrap(),
             1,
-        ).unwrap();
-        let facts = fragment_ids.iter().map(|low| {
-            FragmentTerminalSnapshot::new(
-                UniqueId { hi: 0, lo: *low }, 0, FragmentTerminalOutcome::Succeeded,
-                SinkCommitReportSnapshot::default(), None,
-            ).unwrap()
-        }).collect();
-        QueryTerminalSnapshot::new(execution, backend, ParticipantManifestDigest::new([7; 32]), facts).unwrap()
+        )
+        .unwrap();
+        let facts = fragment_ids
+            .iter()
+            .map(|low| {
+                FragmentTerminalSnapshot::new(
+                    UniqueId { hi: 0, lo: *low },
+                    0,
+                    FragmentTerminalOutcome::Succeeded,
+                    SinkCommitReportSnapshot::default(),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        QueryTerminalSnapshot::new(
+            execution,
+            backend,
+            ParticipantManifestDigest::new([7; 32]),
+            facts,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -427,10 +484,31 @@ mod tests {
 
     #[test]
     fn terminal_snapshot_rejects_duplicate_fragments() {
-        let execution = QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
-        let backend = ParticipantBackendIdentity::new(1, QueryControlEndpoint::new("127.0.0.1", 9030).unwrap(), 1).unwrap();
-        let fact = FragmentTerminalSnapshot::new(UniqueId { hi: 0, lo: 1 }, 0, FragmentTerminalOutcome::Succeeded, SinkCommitReportSnapshot::default(), None).unwrap();
-        assert!(QueryTerminalSnapshot::new(execution, backend, ParticipantManifestDigest::new([7; 32]), vec![fact.clone(), fact]).is_err());
+        let execution =
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
+        let backend = ParticipantBackendIdentity::new(
+            1,
+            QueryControlEndpoint::new("127.0.0.1", 9030).unwrap(),
+            1,
+        )
+        .unwrap();
+        let fact = FragmentTerminalSnapshot::new(
+            UniqueId { hi: 0, lo: 1 },
+            0,
+            FragmentTerminalOutcome::Succeeded,
+            SinkCommitReportSnapshot::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            QueryTerminalSnapshot::new(
+                execution,
+                backend,
+                ParticipantManifestDigest::new([7; 32]),
+                vec![fact.clone(), fact]
+            )
+            .is_err()
+        );
     }
 
     #[test]

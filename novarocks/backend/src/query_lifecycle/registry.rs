@@ -24,14 +24,17 @@ use novarocks::UniqueId;
 use novarocks::novarocks_logging::{info, warn};
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    BackendQueryControl, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
+    BackendQueryControl, FragmentTerminalOutcome, FragmentTerminalSnapshot,
+    ImmutableQueryTerminalRecord, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
     QueryControlAttach, QueryControlAttachment, QueryControlEvent, QueryExecutionId, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryLifecycleIngress, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
-    QueryStartOutcome, QueryStartRequest, QueryTerminationAck, QueryTerminationReason,
-    RuntimeFilterContribution, StageDigest, StageDigestVersion,
+    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminalSnapshot,
+    QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
+    StageDigestVersion,
 };
-use novarocks::runtime::fragment::FragmentOutcome;
+use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
+use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
@@ -103,6 +106,7 @@ pub(crate) struct QueryLifecycleRegistryConfig {
     pub(crate) stage_max_encoded_bytes: usize,
     pub(crate) stage_max_inflight_encoded_bytes: usize,
     pub(crate) stage_max_dormant_workers: usize,
+    pub(crate) terminal_max_encoded_bytes: usize,
 }
 
 impl QueryLifecycleRegistryConfig {
@@ -123,6 +127,7 @@ impl QueryLifecycleRegistryConfig {
             stage_max_inflight_encoded_bytes: runtime
                 .query_control_stage_max_inflight_encoded_bytes,
             stage_max_dormant_workers: runtime.query_control_stage_max_dormant_workers,
+            terminal_max_encoded_bytes: runtime.query_control_terminal_max_encoded_bytes,
         }
     }
 }
@@ -323,6 +328,30 @@ impl fmt::Debug for FragmentAdmissionPermit {
 struct RegistryQueryControl {
     registry: Weak<QueryLifecycleRegistry>,
     execution_id: QueryExecutionId,
+}
+
+fn fragment_snapshot_from_outcome(
+    fragment_instance_id: UniqueId,
+    backend_num: i32,
+    outcome: &FragmentOutcome,
+) -> Result<FragmentTerminalSnapshot, QueryLifecycleError> {
+    let outcome = match outcome {
+        FragmentOutcome::Succeeded => FragmentTerminalOutcome::Succeeded,
+        FragmentOutcome::Failed(error) => FragmentTerminalOutcome::Failed {
+            code: "FRAGMENT_EXECUTION_FAILED".to_string(),
+            detail: error.to_string(),
+        },
+        FragmentOutcome::Cancelled { reason } => FragmentTerminalOutcome::Cancelled {
+            detail: reason.detail().to_string(),
+        },
+    };
+    FragmentTerminalSnapshot::new(
+        fragment_instance_id,
+        backend_num,
+        outcome,
+        SinkCommitReportSnapshot::default(),
+        None,
+    )
 }
 
 impl QueryLifecycleRegistry {
@@ -1420,6 +1449,44 @@ impl QueryLifecycleRegistry {
         fragment_instance_id: UniqueId,
         outcome: &FragmentOutcome,
     ) {
+        let snapshot = match fragment_snapshot_from_outcome(
+            fragment_instance_id,
+            self.local_backend_id().unwrap_or_default() as i32,
+            outcome,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(target: "novarocks::query_lifecycle", error = %error, "rejecting terminal fragment fact");
+                return;
+            }
+        };
+        self.record_fragment_terminal_snapshot(execution_id, snapshot);
+    }
+
+    pub(crate) fn record_fragment_terminal_fact(
+        &self,
+        execution_id: QueryExecutionId,
+        fact: FragmentTerminalFact,
+        backend_num: i32,
+        sink: SinkCommitReportSnapshot,
+    ) {
+        let snapshot = match FragmentTerminalSnapshot::from_fact(fact, backend_num, sink) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(target: "novarocks::query_lifecycle", error = %error, "rejecting terminal fragment fact");
+                return;
+            }
+        };
+        self.record_fragment_terminal_snapshot(execution_id, snapshot);
+    }
+
+    fn record_fragment_terminal_snapshot(
+        &self,
+        execution_id: QueryExecutionId,
+        snapshot: FragmentTerminalSnapshot,
+    ) {
+        let fragment_instance_id = snapshot.fragment_instance_id();
+        let outcome = snapshot.outcome().clone();
         let committed_execution_id = {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
             match state
@@ -1468,9 +1535,21 @@ impl QueryLifecycleRegistry {
         let local_drained = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             state.completed_fragments.insert(fragment_instance_id);
+            if state
+                .terminal_facts
+                .insert(fragment_instance_id, snapshot)
+                .is_some()
+            {
+                return;
+            }
             let expected = entry.manifest.expected_fragment_instance_ids();
-            let complete = expected.iter().all(|id| state.completed_fragments.contains(id));
-            if complete && matches!(outcome, FragmentOutcome::Succeeded) && !state.local_drained_emitted {
+            let complete = expected
+                .iter()
+                .all(|id| state.completed_fragments.contains(id));
+            if complete
+                && matches!(outcome, FragmentTerminalOutcome::Succeeded)
+                && !state.local_drained_emitted
+            {
                 state.local_drained_emitted = true;
                 state.events.clone()
             } else {
@@ -1480,24 +1559,133 @@ impl QueryLifecycleRegistry {
         if let Some(events) = local_drained {
             let _ = events.try_send(QueryControlEvent::LocalDrained);
         }
-        if matches!(outcome, FragmentOutcome::Succeeded) {
+        if matches!(outcome, FragmentTerminalOutcome::Succeeded) {
             return;
         }
         let (code, detail) = match outcome {
-            FragmentOutcome::Failed(error) => {
-                ("FRAGMENT_EXECUTION_FAILED".to_string(), error.to_string())
+            FragmentTerminalOutcome::Failed { code, detail } => (code, detail),
+            FragmentTerminalOutcome::Cancelled { detail } => {
+                ("FRAGMENT_CANCELLED".to_string(), detail)
             }
-            FragmentOutcome::Cancelled { reason } => (
-                "FRAGMENT_CANCELLED".to_string(),
-                reason.detail().to_string(),
-            ),
-            FragmentOutcome::Succeeded => return,
+            FragmentTerminalOutcome::IncompleteDrain { detail } => {
+                ("INCOMPLETE_DRAIN".to_string(), detail)
+            }
+            FragmentTerminalOutcome::Succeeded => return,
         };
         self.request_termination_with_event(
             entry,
             QueryTerminationReason::LocalFailure,
             Some(QueryControlEvent::LocalFailure { code, detail }),
         );
+    }
+
+    fn finalize_from_control(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<(), QueryLifecycleError> {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned()
+            .ok_or_else(|| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "query lifecycle entry is not active",
+                )
+            })?;
+        let (record, expected, events) = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.phase != QueryLifecyclePhase::Running || !state.local_drained_emitted {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "Finalize requires locally drained participant",
+                ));
+            }
+            let expected = entry.manifest.expected_fragment_instance_ids();
+            if expected.len() != state.terminal_facts.len() {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Internal,
+                    "locally drained participant is missing terminal facts",
+                ));
+            }
+            let backend = entry.manifest.backend().clone();
+            let snapshot = QueryTerminalSnapshot::new(
+                execution_id,
+                backend,
+                entry.digest,
+                state.terminal_facts.values().cloned().collect(),
+            )?;
+            let record = ImmutableQueryTerminalRecord::new(
+                snapshot,
+                self.config.terminal_max_encoded_bytes,
+            )?;
+            state.terminal_record = Some(record.clone());
+            (
+                record,
+                expected.iter().copied().collect::<Vec<_>>(),
+                state.events.clone(),
+            )
+        };
+        // All execution-owned resources are detached before the immutable record is delivered.
+        self.local_runtime.terminate_query(
+            execution_id,
+            &expected,
+            QueryTerminationReason::CoordinatorFinalize,
+            "query finalized after local drain",
+        );
+        let _ = self.local_runtime.abort_runtime_filter(execution_id);
+        if let Some(events) = events {
+            let _ = events.try_send(QueryControlEvent::TerminalSnapshot {
+                snapshot: record.snapshot().clone(),
+            });
+            // Retain the QLC-3 acknowledgement as a compatibility latch. The
+            // immutable snapshot above is the terminal payload; FE v4 stores
+            // it before acknowledging the retained record.
+            let _ = events.try_send(QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorFinalize,
+            });
+        }
+        Ok(())
+    }
+
+    fn terminal_ack_from_control(&self, ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&ack.execution_id())
+            .cloned()
+            .ok_or_else(|| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "query terminal record is gone",
+                )
+            })?;
+        let mut state = entry.state.lock().expect("query lifecycle entry lock");
+        let record = state.terminal_record.as_ref().ok_or_else(|| {
+            QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Terminated,
+                "query terminal record is not retained",
+            )
+        })?;
+        let snapshot = record.snapshot();
+        if ack.init_digest() != snapshot.init_digest()
+            || ack.version() != snapshot.version()
+            || ack.digest() != snapshot.digest()
+        {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "query terminal ACK identity conflicts with retained snapshot",
+            ));
+        }
+        state.phase = QueryLifecyclePhase::Tombstone;
+        state.terminated_at = Some(self.clock.now());
+        state.terminal_record = None;
+        Ok(())
     }
 
     fn try_complete_runtime_filter_cleanup(
@@ -2167,13 +2355,29 @@ impl BackendQueryControl for RegistryQueryControl {
     }
 
     fn finalize(&self) -> Result<(), QueryLifecycleError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?;
+        match registry.finalize_from_control(self.execution_id) {
+            Ok(()) => Ok(()),
+            // QLC-3 callers may still finalize an attempt which never reached
+            // Running.  Preserve their fail-close cleanup path; QLC-4 only
+            // freezes a snapshot after LocalDrained.
+            Err(error) if error.code() == QueryLifecycleErrorCode::Terminated => registry
+                .terminate_from_control(
+                    self.execution_id,
+                    QueryTerminationReason::CoordinatorFinalize,
+                ),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn terminal_ack(&self, ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
         self.registry
             .upgrade()
             .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?
-            .terminate_from_control(
-                self.execution_id,
-                QueryTerminationReason::CoordinatorFinalize,
-            )
+            .terminal_ack_from_control(ack)
     }
 
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {

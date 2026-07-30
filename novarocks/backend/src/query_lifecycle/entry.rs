@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use novarocks::UniqueId;
 use novarocks::query_execution::lifecycle::{
-    ParticipantManifest, ParticipantManifestDigest, QueryControlEvent, QueryInitOutcome,
-    QueryTerminationReason, StageDigest,
+    FragmentTerminalSnapshot, ImmutableQueryTerminalRecord, ParticipantManifest,
+    ParticipantManifestDigest, QueryControlEvent, QueryInitOutcome, QueryTerminationReason,
+    StageDigest,
 };
 
 use super::stage::StartGate;
@@ -63,6 +64,8 @@ pub(crate) struct QueryLifecycleEntryState {
     /// it is intentionally separate from routing removal.
     pub(crate) completed_fragments: BTreeSet<UniqueId>,
     pub(crate) local_drained_emitted: bool,
+    pub(crate) terminal_facts: BTreeMap<UniqueId, FragmentTerminalSnapshot>,
+    pub(crate) terminal_record: Option<ImmutableQueryTerminalRecord>,
     pub(crate) pre_start_deadline: Option<Instant>,
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
@@ -98,6 +101,8 @@ impl QueryLifecycleEntry {
                 accepted_fragments: BTreeSet::new(),
                 completed_fragments: BTreeSet::new(),
                 local_drained_emitted: false,
+                terminal_facts: BTreeMap::new(),
+                terminal_record: None,
                 pre_start_deadline: None,
                 last_heartbeat: None,
                 frontend_owner_epoch: None,

@@ -36,7 +36,10 @@ use crate::common::config::http_port;
 use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 use crate::novarocks_logging::{error, info};
-use crate::query_execution::lifecycle::QueryLifecycleIngress;
+use crate::query_execution::lifecycle::{
+    QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
+    decode_query_terminal_snapshot,
+};
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 #[cfg(all(test, feature = "compat"))]
 use crate::runtime::fragment::io::SyncFragmentExecutor;
@@ -183,6 +186,7 @@ pub struct GrpcService {
     query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
     report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
 }
 
@@ -260,6 +264,7 @@ impl GrpcService {
             query_lifecycle_ingress,
             query_control_shutdown: None,
             report_handler,
+            terminal_ingress: None,
             runtime_filter_envelope_ingress,
         }
     }
@@ -331,6 +336,11 @@ impl GrpcService {
 
     fn with_query_control_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
         self.query_control_shutdown = Some(shutdown);
+        self
+    }
+
+    pub fn with_terminal_ingress(mut self, ingress: Arc<dyn QueryTerminalIngress>) -> Self {
+        self.terminal_ingress = Some(ingress);
         self
     }
 }
@@ -1079,16 +1089,45 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
 
     async fn report_query_terminal(
         &self,
-        _request: tonic::Request<proto::novarocks::ReportQueryTerminalRequest>,
+        request: tonic::Request<proto::novarocks::ReportQueryTerminalRequest>,
     ) -> Result<tonic::Response<proto::novarocks::ReportQueryTerminalResponse>, tonic::Status> {
-        // QLC-4 wires this endpoint separately from NativeReportHandler.  A
-        // process that has not installed the FE-owned terminal ingress must
-        // reject the fallback rather than accidentally accepting it as a
-        // fragment report.
+        let Some(ingress) = self.terminal_ingress.clone() else {
+            return Ok(tonic::Response::new(
+                proto::novarocks::ReportQueryTerminalResponse {
+                    outcome: proto::novarocks::ReportQueryTerminalOutcome::RejectedGone as i32,
+                    detail: "query terminal ingress is not installed for this role".to_string(),
+                },
+            ));
+        };
+        let snapshot = request.into_inner().snapshot.ok_or_else(|| {
+            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing snapshot")
+        })?;
+        let snapshot =
+            decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
+        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(snapshot))
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
+            })?
+            .map_err(status_from_lifecycle_error)?;
+        let outcome = match ack.outcome() {
+            QueryTerminalReportOutcome::Accepted => {
+                proto::novarocks::ReportQueryTerminalOutcome::Accepted
+            }
+            QueryTerminalReportOutcome::AlreadyAccepted => {
+                proto::novarocks::ReportQueryTerminalOutcome::AlreadyAccepted
+            }
+            QueryTerminalReportOutcome::RejectedConflict => {
+                proto::novarocks::ReportQueryTerminalOutcome::RejectedConflict
+            }
+            QueryTerminalReportOutcome::RejectedGone => {
+                proto::novarocks::ReportQueryTerminalOutcome::RejectedGone
+            }
+        };
         Ok(tonic::Response::new(
             proto::novarocks::ReportQueryTerminalResponse {
-                outcome: proto::novarocks::ReportQueryTerminalOutcome::RejectedGone as i32,
-                detail: "query terminal ingress is not installed for this role".to_string(),
+                outcome: outcome as i32,
+                detail: ack.detail().to_string(),
             },
         ))
     }

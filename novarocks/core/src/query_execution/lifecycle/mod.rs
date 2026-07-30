@@ -30,9 +30,10 @@ pub use contract::{
     QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
     QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError,
     QueryLifecycleTransportErrorKind, QueryTerminalAck, QueryTerminalFallbackTransport,
-    QueryTerminalIngress, QueryTerminalReportAck, QueryTerminalReportOutcome,
-    QueryTerminationAck, QueryTerminationReason,
+    QueryTerminalIngress, QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
+    QueryTerminationReason,
 };
+pub use contract::{decode_query_terminal_snapshot, encode_query_terminal_snapshot};
 pub use identity::{AttemptId, QueryExecutionId};
 pub(crate) use init_plan::QueryInitPlanHeader;
 pub use init_plan::{
@@ -51,6 +52,6 @@ pub use stage::{
 };
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
-    QueryTerminalProfileContributionV1, QueryTerminalSet, QueryTerminalSnapshot,
-    QueryTerminalSnapshotDigest, QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
+    QUERY_TERMINAL_SNAPSHOT_VERSION_V1, QueryTerminalProfileContributionV1, QueryTerminalSet,
+    QueryTerminalSnapshot, QueryTerminalSnapshotDigest,
 };

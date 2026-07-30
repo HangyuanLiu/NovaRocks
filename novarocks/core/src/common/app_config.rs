@@ -1073,16 +1073,36 @@ fn default_query_control_tombstone_capacity() -> usize {
     16_384
 }
 
-fn default_query_control_terminal_drain_timeout_ms() -> u64 { 30_000 }
-fn default_query_control_terminal_ack_timeout_ms() -> u64 { 5_000 }
-fn default_query_control_terminal_fallback_rpc_timeout_ms() -> u64 { 5_000 }
-fn default_query_control_terminal_fallback_max_attempts() -> usize { 5 }
-fn default_query_control_terminal_fallback_initial_backoff_ms() -> u64 { 100 }
-fn default_query_control_terminal_fallback_max_backoff_ms() -> u64 { 1_000 }
-fn default_query_control_terminal_max_encoded_bytes() -> usize { 48 * 1024 * 1024 }
-fn default_query_control_terminal_max_retained_bytes() -> usize { 256 * 1024 * 1024 }
-fn default_query_control_terminal_retained_capacity() -> usize { 4_096 }
-fn default_query_control_terminal_retention_ms() -> u64 { 120_000 }
+fn default_query_control_terminal_drain_timeout_ms() -> u64 {
+    30_000
+}
+fn default_query_control_terminal_ack_timeout_ms() -> u64 {
+    5_000
+}
+fn default_query_control_terminal_fallback_rpc_timeout_ms() -> u64 {
+    5_000
+}
+fn default_query_control_terminal_fallback_max_attempts() -> usize {
+    5
+}
+fn default_query_control_terminal_fallback_initial_backoff_ms() -> u64 {
+    100
+}
+fn default_query_control_terminal_fallback_max_backoff_ms() -> u64 {
+    1_000
+}
+fn default_query_control_terminal_max_encoded_bytes() -> usize {
+    48 * 1024 * 1024
+}
+fn default_query_control_terminal_max_retained_bytes() -> usize {
+    256 * 1024 * 1024
+}
+fn default_query_control_terminal_retained_capacity() -> usize {
+    4_096
+}
+fn default_query_control_terminal_retention_ms() -> u64 {
+    120_000
+}
 
 fn default_query_control_max_active_entries() -> usize {
     4_096
@@ -1175,18 +1195,34 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
         bail!("runtime.query_control_max_active_entries must be greater than 0");
     }
     let terminal_limits = [
-        ("runtime.query_control_terminal_fallback_max_attempts", runtime.query_control_terminal_fallback_max_attempts),
-        ("runtime.query_control_terminal_max_encoded_bytes", runtime.query_control_terminal_max_encoded_bytes),
-        ("runtime.query_control_terminal_max_retained_bytes", runtime.query_control_terminal_max_retained_bytes),
-        ("runtime.query_control_terminal_retained_capacity", runtime.query_control_terminal_retained_capacity),
+        (
+            "runtime.query_control_terminal_fallback_max_attempts",
+            runtime.query_control_terminal_fallback_max_attempts,
+        ),
+        (
+            "runtime.query_control_terminal_max_encoded_bytes",
+            runtime.query_control_terminal_max_encoded_bytes,
+        ),
+        (
+            "runtime.query_control_terminal_max_retained_bytes",
+            runtime.query_control_terminal_max_retained_bytes,
+        ),
+        (
+            "runtime.query_control_terminal_retained_capacity",
+            runtime.query_control_terminal_retained_capacity,
+        ),
     ];
     for (field, value) in terminal_limits {
-        if value == 0 { bail!("{field} must be greater than 0"); }
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
     }
     if runtime.query_control_terminal_fallback_initial_backoff_ms
         > runtime.query_control_terminal_fallback_max_backoff_ms
     {
-        bail!("runtime.query_control_terminal_fallback_initial_backoff_ms must not exceed runtime.query_control_terminal_fallback_max_backoff_ms");
+        bail!(
+            "runtime.query_control_terminal_fallback_initial_backoff_ms must not exceed runtime.query_control_terminal_fallback_max_backoff_ms"
+        );
     }
     let nonzero_limits = [
         (
@@ -1447,15 +1483,23 @@ impl Default for RuntimeConfig {
             query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),
             query_control_tombstone_retention_ms: default_query_control_tombstone_retention_ms(),
             query_control_tombstone_capacity: default_query_control_tombstone_capacity(),
-            query_control_terminal_drain_timeout_ms: default_query_control_terminal_drain_timeout_ms(),
+            query_control_terminal_drain_timeout_ms:
+                default_query_control_terminal_drain_timeout_ms(),
             query_control_terminal_ack_timeout_ms: default_query_control_terminal_ack_timeout_ms(),
-            query_control_terminal_fallback_rpc_timeout_ms: default_query_control_terminal_fallback_rpc_timeout_ms(),
-            query_control_terminal_fallback_max_attempts: default_query_control_terminal_fallback_max_attempts(),
-            query_control_terminal_fallback_initial_backoff_ms: default_query_control_terminal_fallback_initial_backoff_ms(),
-            query_control_terminal_fallback_max_backoff_ms: default_query_control_terminal_fallback_max_backoff_ms(),
-            query_control_terminal_max_encoded_bytes: default_query_control_terminal_max_encoded_bytes(),
-            query_control_terminal_max_retained_bytes: default_query_control_terminal_max_retained_bytes(),
-            query_control_terminal_retained_capacity: default_query_control_terminal_retained_capacity(),
+            query_control_terminal_fallback_rpc_timeout_ms:
+                default_query_control_terminal_fallback_rpc_timeout_ms(),
+            query_control_terminal_fallback_max_attempts:
+                default_query_control_terminal_fallback_max_attempts(),
+            query_control_terminal_fallback_initial_backoff_ms:
+                default_query_control_terminal_fallback_initial_backoff_ms(),
+            query_control_terminal_fallback_max_backoff_ms:
+                default_query_control_terminal_fallback_max_backoff_ms(),
+            query_control_terminal_max_encoded_bytes:
+                default_query_control_terminal_max_encoded_bytes(),
+            query_control_terminal_max_retained_bytes:
+                default_query_control_terminal_max_retained_bytes(),
+            query_control_terminal_retained_capacity:
+                default_query_control_terminal_retained_capacity(),
             query_control_terminal_retention_ms: default_query_control_terminal_retention_ms(),
             query_control_max_active_entries: default_query_control_max_active_entries(),
             query_control_stage_max_encoded_bytes: default_query_control_stage_max_encoded_bytes(),
@@ -2004,12 +2048,27 @@ mod tests {
         assert_eq!(runtime.query_control_tombstone_capacity, 16_384);
         assert_eq!(runtime.query_control_terminal_drain_timeout_ms, 30_000);
         assert_eq!(runtime.query_control_terminal_ack_timeout_ms, 5_000);
-        assert_eq!(runtime.query_control_terminal_fallback_rpc_timeout_ms, 5_000);
+        assert_eq!(
+            runtime.query_control_terminal_fallback_rpc_timeout_ms,
+            5_000
+        );
         assert_eq!(runtime.query_control_terminal_fallback_max_attempts, 5);
-        assert_eq!(runtime.query_control_terminal_fallback_initial_backoff_ms, 100);
-        assert_eq!(runtime.query_control_terminal_fallback_max_backoff_ms, 1_000);
-        assert_eq!(runtime.query_control_terminal_max_encoded_bytes, 48 * 1024 * 1024);
-        assert_eq!(runtime.query_control_terminal_max_retained_bytes, 256 * 1024 * 1024);
+        assert_eq!(
+            runtime.query_control_terminal_fallback_initial_backoff_ms,
+            100
+        );
+        assert_eq!(
+            runtime.query_control_terminal_fallback_max_backoff_ms,
+            1_000
+        );
+        assert_eq!(
+            runtime.query_control_terminal_max_encoded_bytes,
+            48 * 1024 * 1024
+        );
+        assert_eq!(
+            runtime.query_control_terminal_max_retained_bytes,
+            256 * 1024 * 1024
+        );
         assert_eq!(runtime.query_control_terminal_retained_capacity, 4_096);
         assert_eq!(runtime.query_control_terminal_retention_ms, 120_000);
         assert_eq!(runtime.query_control_max_active_entries, 4_096);
