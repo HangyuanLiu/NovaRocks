@@ -304,6 +304,7 @@ fn bind_query_lifecycle_fault_scopes(
             QueryLifecycleFaultKind::HeartbeatStop,
             QueryLifecycleFaultKind::HeartbeatStopAfterStage,
             QueryLifecycleFaultKind::RestartAfterInitAck,
+            QueryLifecycleFaultKind::TerminalAckDrop,
         ] {
             if let Some(scope) = bind_armed_fault(
                 root,

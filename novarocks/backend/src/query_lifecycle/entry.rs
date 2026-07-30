@@ -65,6 +65,10 @@ pub(crate) struct QueryLifecycleEntryState {
     /// it is intentionally separate from routing removal.
     pub(crate) completed_fragments: BTreeSet<UniqueId>,
     pub(crate) local_drained_emitted: bool,
+    /// A running attempt that has observed a failed/cancelled fragment keeps
+    /// its entry until terminal facts drain or the bounded drain deadline
+    /// synthesizes explicit IncompleteDrain facts.
+    pub(crate) failure_drain_scheduled: bool,
     pub(crate) terminal_facts: BTreeMap<UniqueId, FragmentTerminalSnapshot>,
     pub(crate) terminal_record: Option<ImmutableQueryTerminalRecord>,
     pub(crate) pre_start_deadline: Option<Instant>,
@@ -102,6 +106,7 @@ impl QueryLifecycleEntry {
                 accepted_fragments: BTreeSet::new(),
                 completed_fragments: BTreeSet::new(),
                 local_drained_emitted: false,
+                failure_drain_scheduled: false,
                 terminal_facts: BTreeMap::new(),
                 terminal_record: None,
                 pre_start_deadline: None,

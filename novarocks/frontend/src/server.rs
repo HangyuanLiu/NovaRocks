@@ -85,6 +85,7 @@ fn standalone_open_services(
         host.connector_control_registry(),
         0,
     )
+    .with_terminal_ingress(host.terminal_ingress())
 }
 
 /// Opens the frontend services once for an externally composed server. The

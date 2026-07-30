@@ -210,11 +210,13 @@ where
     B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
 {
     let native_report_handler = Arc::clone(&services.native_report_handler);
+    let terminal_ingress = services.terminal_ingress.clone();
     let grpc_endpoint = start_standalone_grpc_endpoint(
         &resolved.grpc_bind_host,
         resolved.grpc_port,
         resolved.grpc_endpoint,
         native_report_handler,
+        terminal_ingress,
     )?;
     let report_port = grpc_endpoint
         .as_ref()
@@ -407,15 +409,17 @@ fn start_standalone_grpc_endpoint(
     grpc_port: u16,
     ownership: StandaloneGrpcEndpointOwnership,
     native_report_handler: Arc<dyn crate::query_execution::report::NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>>,
 ) -> Result<Option<StartedStandaloneGrpcEndpoint>, String> {
     if !ownership.hosts_report_endpoint() {
         return Ok(None);
     }
 
-    crate::service::grpc_server::start_grpc_report_server(
+    crate::service::grpc_server::start_grpc_report_server_with_terminal_ingress(
         grpc_bind_host,
         grpc_port,
         native_report_handler,
+        terminal_ingress,
     )
     .map_err(|error| {
         format!(

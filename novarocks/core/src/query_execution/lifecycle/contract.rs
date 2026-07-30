@@ -1553,14 +1553,15 @@ fn decode_termination_reason(reason: i32) -> Result<QueryTerminationReason, Quer
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
 
     use super::{
         QueryInitRequest, decode_query_init_request, decode_query_stage_request,
         decode_query_stage_response, decode_query_start_request, decode_query_start_response,
-        encode_query_init_request, encode_query_stage_request, encode_query_stage_response,
-        encode_query_start_request, encode_query_start_response,
+        decode_query_terminal_snapshot, encode_query_init_request, encode_query_stage_request,
+        encode_query_stage_response, encode_query_start_request, encode_query_start_response,
+        encode_query_terminal_snapshot,
     };
     use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::query_execution::contract::QueryId;
@@ -1573,7 +1574,9 @@ mod tests {
         QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
         QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
     };
+    use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
     use crate::runtime::query_options::{QueryCacheOptions, QueryOptions};
+    use crate::runtime::sink_commit::SinkCommitReportSnapshot;
     use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
     use crate::runtime_filter::port::install::{
         RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
@@ -1586,6 +1589,54 @@ mod tests {
             AttemptId::new(7).expect("nonzero attempt"),
         )
         .expect("nonzero query id")
+    }
+
+    #[test]
+    fn terminal_snapshot_wire_round_trips_digest_with_profile_and_sink_facts() {
+        let profile = RuntimeProfile::new("terminal-profile");
+        profile.counter_set("RowsRead", ProfileUnit::Unit, 7);
+        let sink = SinkCommitReportSnapshot {
+            iceberg_commits: vec![crate::proto::novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
+                    path: Some("s3://warehouse/table/data.parquet".to_string()),
+                    column_stats: Some(crate::proto::novarocks::IcebergColumnStats {
+                        column_sizes: HashMap::from([(2, 20), (1, 10)]),
+                        value_counts: HashMap::from([(2, 2), (1, 1)]),
+                        lower_bounds: HashMap::from([(2, vec![2]), (1, vec![1])]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                is_overwrite: Some(false),
+                is_rewrite: Some(false),
+            }],
+            ..Default::default()
+        };
+        let fragment = crate::query_execution::lifecycle::FragmentTerminalSnapshot::new(
+            crate::common::types::UniqueId { hi: 7, lo: 9 },
+            3,
+            crate::query_execution::lifecycle::FragmentTerminalOutcome::Succeeded,
+            sink,
+            Some(profile.to_native_tree()),
+        )
+        .expect("terminal fragment");
+        let snapshot = crate::query_execution::lifecycle::QueryTerminalSnapshot::new(
+            execution_id(),
+            ParticipantBackendIdentity::new(
+                3,
+                QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+                11,
+            )
+            .expect("backend identity"),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([9; 32]),
+            vec![fragment],
+        )
+        .expect("terminal snapshot");
+
+        let decoded = decode_query_terminal_snapshot(&encode_query_terminal_snapshot(&snapshot))
+            .expect("terminal snapshot wire round trip");
+        assert_eq!(decoded.digest(), snapshot.digest());
+        assert_eq!(decoded.canonical_bytes(), snapshot.canonical_bytes());
     }
 
     fn service_only_request() -> QueryInitRequest {

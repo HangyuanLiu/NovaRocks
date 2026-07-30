@@ -74,10 +74,16 @@ impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
         )
     }
 
-    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> String {
+    fn abort_preserving(
+        mut self: Box<Self>,
+        primary_error: String,
+    ) -> crate::query_execution::lifecycle::QueryLifecycleAbortOutcome {
         self.armed = false;
         self.aborts.fetch_add(1, Ordering::SeqCst);
-        format!("{primary_error}; query lifecycle rollback completed")
+        crate::query_execution::lifecycle::QueryLifecycleAbortOutcome::new(
+            format!("{primary_error}; query lifecycle rollback completed"),
+            None,
+        )
     }
 }
 

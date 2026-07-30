@@ -102,3 +102,16 @@ JOIN ${case_db}.stage_start right_side
 -- Health query after the failed attempt.
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.stage_start;
+
+-- query 10
+-- The FE persists the terminal snapshot before its ACK. Dropping that ACK
+-- must leave the query successful and force the selected BE to deliver the
+-- same immutable snapshot through the unary fallback exactly once.
+-- @drop_next_terminal_ack_be_index=1
+-- @query_control_fragment_backend_limit=2
+-- @result_contains=60
+-- @be_log_contains=NOVAROCKS_QUERY_TERMINAL_FALLBACK_ACCEPTED
+SELECT SUM(left_side.payload) AS total
+FROM ${case_db}.stage_start left_side
+JOIN ${case_db}.stage_start right_side
+  ON left_side.id = right_side.id;

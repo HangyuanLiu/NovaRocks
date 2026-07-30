@@ -112,6 +112,7 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.drop_next_stage_ack_be_index.is_some()
         || meta.drop_next_start_ack_be_index.is_some()
         || meta.suppress_start_ack_be_index.is_some()
+        || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta
@@ -155,6 +156,7 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.drop_next_stage_ack_be_index.is_some()
         || meta.drop_next_start_ack_be_index.is_some()
         || meta.suppress_start_ack_be_index.is_some()
+        || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta
@@ -189,6 +191,7 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.drop_next_stage_ack_be_index.is_some(),
         meta.drop_next_start_ack_be_index.is_some(),
         meta.suppress_start_ack_be_index.is_some(),
+        meta.drop_next_terminal_ack_be_index.is_some(),
         meta.kill_query_at_lifecycle_phase.is_some(),
         meta.kill_fe_at_lifecycle_phase.is_some(),
         meta.stop_query_control_heartbeat_after_stage_be_index
@@ -246,6 +249,10 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
             meta.suppress_start_ack_be_index,
         ),
         (
+            "drop_next_terminal_ack_be_index",
+            meta.drop_next_terminal_ack_be_index,
+        ),
+        (
             "stop_query_control_heartbeat_after_stage_be_index",
             meta.stop_query_control_heartbeat_after_stage_be_index,
         ),
@@ -300,6 +307,9 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     if let Some(index) = meta.suppress_start_ack_be_index {
         server.arm_start_ack_suppress(index)?;
+    }
+    if let Some(index) = meta.drop_next_terminal_ack_be_index {
+        server.arm_terminal_ack_drop(index)?;
     }
     if let Some(phase) = meta.kill_query_at_lifecycle_phase {
         server.arm_kill_query_at_lifecycle_phase(phase)?;
@@ -1128,6 +1138,11 @@ mod tests {
             Ok(())
         }
 
+        fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
+            self.events.push(format!("arm-terminal-ack-drop:{index}"));
+            Ok(())
+        }
+
         fn arm_kill_query_at_lifecycle_phase(
             &mut self,
             phase: crate::types::QueryLifecyclePhase,
@@ -1528,6 +1543,13 @@ mod tests {
                     ..QueryMeta::default()
                 },
                 "arm-start-ack-suppress:1",
+            ),
+            (
+                QueryMeta {
+                    drop_next_terminal_ack_be_index: Some(1),
+                    ..QueryMeta::default()
+                },
+                "arm-terminal-ack-drop:1",
             ),
             (
                 QueryMeta {

@@ -102,6 +102,9 @@ pub struct QueryMeta {
     pub drop_next_stage_ack_be_index: Option<usize>,
     pub drop_next_start_ack_be_index: Option<usize>,
     pub suppress_start_ack_be_index: Option<usize>,
+    /// Store the immutable terminal snapshot but deliberately omit the stream
+    /// ACK for this participant, requiring BE unary fallback delivery.
+    pub drop_next_terminal_ack_be_index: Option<usize>,
     pub kill_query_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     pub kill_fe_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,

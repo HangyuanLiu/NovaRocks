@@ -116,6 +116,7 @@ fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
         || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.restart_be_after_init_ack_index.is_some()
+        || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.query_control_fragment_backend_limit.is_some()
 }
@@ -535,6 +536,34 @@ fn parse_identity_markers(log: &str, marker: &str) -> Result<Vec<FragmentIdentit
         .collect()
 }
 
+fn parse_query_terminal_ack_markers(log: &str) -> Result<Vec<QueryIdentity>> {
+    const MARKER: &str = "NOVAROCKS_QUERY_TERMINAL_ACK";
+    log.lines()
+        .filter_map(|line| marker_payload(line, MARKER))
+        .map(|payload| {
+            let fields = marker_fields(payload, MARKER)?;
+            // Validate the complete terminal identity, while only query id is
+            // needed to relate a terminal ACK to the injected fragment.
+            parse_i64_field(&fields, MARKER, "query_hi")?;
+            parse_i64_field(&fields, MARKER, "query_lo")?;
+            fields
+                .get("attempt")
+                .with_context(|| format!("{MARKER} is missing attempt"))?
+                .parse::<u64>()
+                .with_context(|| format!("{MARKER} has invalid attempt"))?;
+            fields
+                .get("backend_id")
+                .with_context(|| format!("{MARKER} is missing backend_id"))?
+                .parse::<u64>()
+                .with_context(|| format!("{MARKER} has invalid backend_id"))?;
+            Ok(QueryIdentity {
+                hi: parse_i64_field(&fields, MARKER, "query_hi")?,
+                lo: parse_i64_field(&fields, MARKER, "query_lo")?,
+            })
+        })
+        .collect()
+}
+
 fn parse_stage_fragment_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
     const MARKER: &str = "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED";
     log.lines()
@@ -710,25 +739,46 @@ fn exact_fragment_cancellation_evidence(
         .flatten()
         .filter(|identity| **identity == anchor)
         .count();
-    match acknowledgements_total {
-        0 => {
+    if acknowledgements_total == 0 {
+        // Native QLC-4 stops final ReportExecStatus delivery. Its terminal
+        // acknowledgement is query-scoped, immutable, and can arrive through
+        // either the stream or unary fallback. Compat continues to use the
+        // fragment-scoped legacy marker above.
+        let terminal_acks = logs
+            .iter()
+            .map(|log| parse_query_terminal_ack_markers(log))
+            .collect::<Result<Vec<_>>>();
+        let terminal_acks = match terminal_acks {
+            Ok(markers) => markers,
+            Err(error) => {
+                return Ok(LogEvidenceCheck::Pending(format!(
+                    "malformed query-terminal ACK marker: {error:#}"
+                )));
+            }
+        };
+        let on_failure_be = terminal_acks[anchor_be_index]
+            .iter()
+            .filter(|identity| **identity == anchor.query)
+            .count();
+        if on_failure_be != 1 {
             return Ok(LogEvidenceCheck::Pending(format!(
-                "no explicit frontend ACK matches injected fragment {anchor:?}"
+                "no terminal ACK for injected fragment query {:?} on failure BE[{anchor_be_index}]",
+                anchor.query
             )));
         }
-        1 => {}
-        count => {
+    } else {
+        if acknowledgements_total != 1 {
             bail!(
-                "injected fragment {anchor:?} has {count} explicit frontend ACK markers; expected exactly one"
+                "injected fragment {anchor:?} has {acknowledgements_total} explicit frontend ACK markers; expected exactly one"
             );
         }
-    }
-    let acknowledgements_on_failure_be = acknowledgements[anchor_be_index]
-        .iter()
-        .filter(|identity| **identity == anchor)
-        .count();
-    if acknowledgements_on_failure_be != 1 {
-        bail!("injected fragment {anchor:?} ACK is not on failure BE[{anchor_be_index}]");
+        let acknowledgements_on_failure_be = acknowledgements[anchor_be_index]
+            .iter()
+            .filter(|identity| **identity == anchor)
+            .count();
+        if acknowledgements_on_failure_be != 1 {
+            bail!("injected fragment {anchor:?} ACK is not on failure BE[{anchor_be_index}]");
+        }
     }
 
     let mut total = 0usize;
@@ -1216,6 +1266,33 @@ mod tests {
             ),
             "{log}"
         );
+    }
+
+    #[test]
+    fn exact_injected_query_cancellation_accepts_native_terminal_ack() {
+        let handle = FakeCompatHandle::new(vec!["", "", ""])
+            .with_fragment_failure_token("terminal-token");
+        let step = step(QueryMeta {
+            fail_fragment_after_start_be_index: Some(1),
+            be_log_exact_fragment_cancellation: Some(3),
+            ..QueryMeta::default()
+        });
+        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
+        handle.append_log(
+            0,
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=0 finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
+        );
+        handle.append_log(
+            1,
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=1 finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=terminal-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_QUERY_TERMINAL_ACK query_hi=10 query_lo=20 attempt=1 backend_id=1\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
+        );
+        handle.append_log(
+            2,
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=2 finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
+        );
+
+        run(&step, &handle, &before, &mut String::new())
+            .expect("native terminal ACK must replace native final-report ACK evidence");
     }
 
     #[test]

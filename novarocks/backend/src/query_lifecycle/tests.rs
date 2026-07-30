@@ -22,12 +22,12 @@ use novarocks::UniqueId;
 use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-    ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
-    QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
-    QueryStartRequest, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
-    StageDigestVersion, StageFragment,
+    AttemptId, FragmentTerminalOutcome, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
+    QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest,
+    QueryStartOutcome, QueryStartRequest, QueryTerminationReason, RuntimeFilterContribution,
+    StageDigest, StageDigestVersion, StageFragment,
 };
 use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -257,6 +257,7 @@ fn registry_config(max_active_entries: usize) -> QueryLifecycleRegistryConfig {
         stage_max_inflight_encoded_bytes: 256 * 1024 * 1024,
         stage_max_dormant_workers: 512,
         terminal_max_encoded_bytes: 48 * 1024 * 1024,
+        terminal_drain_timeout: Duration::from_secs(30),
         terminal_ack_timeout: Duration::from_millis(5_000),
         terminal_fallback_rpc_timeout: Duration::from_millis(5_000),
         terminal_fallback_max_attempts: 5,
@@ -1238,6 +1239,67 @@ fn fragment_failure_emits_query_local_failure() {
             "fragment execution error (pipeline): pipeline worker failed".to_string(),
         )]
     );
+}
+
+#[test]
+fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
+    let runtime = RecordingLocalRuntime::default();
+    let mut config = registry_config(8);
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    let registry = registry_with_config(runtime, config);
+    let expected = UniqueId { hi: 76, lo: 2 };
+    let request = fragment_init_request_fixture(76_002, &[expected]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    assert_eq!(
+        attachment.events.try_recv().expect("ControlReady event"),
+        QueryControlEvent::ControlReady
+    );
+    registry
+        .admit_fragment(execution_id, expected)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+
+    registry.record_fragment_terminal(
+        execution_id,
+        expected,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "pipeline worker failed",
+        )),
+    );
+
+    assert!(matches!(
+        attachment.events.try_recv().expect("LocalFailure event"),
+        QueryControlEvent::LocalFailure { .. }
+    ));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let snapshot = loop {
+        match attachment.events.try_recv() {
+            Ok(event) => break event,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("failed terminal snapshot is not delivered after drain: {error}"),
+        }
+    };
+    let QueryControlEvent::TerminalSnapshot { snapshot } = snapshot else {
+        panic!("expected failed terminal snapshot");
+    };
+    assert_eq!(snapshot.execution_id(), execution_id);
+    assert!(matches!(
+        snapshot
+            .fragments()
+            .first()
+            .expect("one fragment")
+            .outcome(),
+        FragmentTerminalOutcome::Failed { .. }
+    ));
 }
 
 #[test]

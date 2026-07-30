@@ -365,6 +365,9 @@ pub(crate) trait ServerHandle: Send {
     fn arm_start_ack_suppress(&mut self, index: usize) -> Result<()> {
         bail!("StartAck suppression is unsupported by this server mode (index={index})")
     }
+    fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
+        bail!("TerminalAck drop is unsupported by this server mode (index={index})")
+    }
     fn arm_kill_query_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
             "KILL QUERY lifecycle phase fault is unsupported by this server mode (phase={})",
@@ -821,6 +824,10 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, "start-ack-suppress")
     }
 
+    fn terminal_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "terminal-ack-drop")
+    }
+
     fn heartbeat_stop_after_stage_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, "heartbeat-stop-after-stage")
     }
@@ -873,6 +880,10 @@ impl QueryLifecycleFaultFiles {
 
     fn publish_start_ack_suppress(&self, index: usize) -> Result<String> {
         self.publish(self.start_ack_suppress_path(index)?, index, None)
+    }
+
+    fn publish_terminal_ack_drop(&self, index: usize) -> Result<String> {
+        self.publish(self.terminal_ack_drop_path(index)?, index, None)
     }
 
     fn publish_heartbeat_stop_after_stage(&self, index: usize) -> Result<String> {
@@ -1398,6 +1409,22 @@ impl ServerHandle for CrossProcessServerHandle {
             "armed StartAck suppression for cross-process BE[{index}] token={token} trigger={}",
             self.query_lifecycle_fault_files
                 .start_ack_suppress_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_terminal_ack_drop(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "terminal-ack-drop"), token.clone());
+        println!(
+            "armed TerminalAck drop for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .terminal_ack_drop_path(index)?
                 .display()
         );
         Ok(())

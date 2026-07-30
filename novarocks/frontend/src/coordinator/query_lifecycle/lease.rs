@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,8 +25,8 @@ use novarocks::query_execution::contract::{DistributedQueryError, DistributedQue
 use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
     ParticipantManifestDigest, QueryAbortRequest, QueryControlCommand, QueryControlEvent,
-    QueryExecutionId, QueryLifecycleLease, QueryLifecycleLeaseGuard, QueryTerminalSet,
-    QueryTerminalSnapshot, QueryTerminationReason,
+    QueryExecutionId, QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
+    QueryTerminalSet, QueryTerminalSnapshot, QueryTerminationReason,
 };
 
 use super::barrier::FrontendQueryLifecycleConfig;
@@ -230,6 +230,11 @@ pub(super) struct AttemptControl {
     attempted: Mutex<BTreeMap<usize, MaterializedParticipant>>,
     sessions: Mutex<BTreeMap<usize, ActiveSession>>,
     state: AtomicU8,
+    // A running abort may finish its caller before every BE has delivered an
+    // immutable terminal snapshot. Keep the active ingress binding alive so
+    // stream delivery and unary fallback remain valid for the bounded BE
+    // retention interval.
+    retain_terminal_ingress: AtomicBool,
     primary_error: Mutex<Option<String>>,
     stop: (Mutex<bool>, Condvar),
     terminal: (Mutex<TerminalState>, Condvar),
@@ -254,6 +259,7 @@ impl AttemptControl {
             attempted: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(BTreeMap::new()),
             state: AtomicU8::new(ACTIVE),
+            retain_terminal_ingress: AtomicBool::new(false),
             primary_error: Mutex::new(None),
             stop: (Mutex::new(false), Condvar::new()),
             terminal: (Mutex::new(TerminalState::default()), Condvar::new()),
@@ -391,6 +397,15 @@ impl AttemptControl {
 
     pub fn abort_preserving(&self, primary_error: String) -> String {
         self.abort(primary_error, false)
+    }
+
+    fn abort_with_terminal_outcome(&self, primary_error: String) -> QueryLifecycleAbortOutcome {
+        self.retain_terminal_ingress.store(true, Ordering::Release);
+        let primary_error = self.abort_preserving(primary_error);
+        // A failed running query is allowed to finish draining after the
+        // abort acknowledgement.  Preserve a set already delivered on the
+        // stream without ever delaying or replacing the original failure.
+        QueryLifecycleAbortOutcome::new(primary_error, self.terminal_set().ok())
     }
 
     fn abort(&self, primary_error: String, force_unary: bool) -> String {
@@ -846,7 +861,11 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 ),
                 SupervisorFailureKind::LocalFailure,
             );
-            return;
+            // A running failure fences the attempt but does not end terminal
+            // delivery: the BE still drains facts and may send a failed
+            // immutable snapshot (or its unary retry) before this reader
+            // leaves the stream.
+            continue;
         }
         if let Err(error) = control.handle_control_event(&session, event) {
             control.record_reader_failure(error);
@@ -895,6 +914,9 @@ impl AttemptControl {
             QueryControlEvent::TerminalSnapshot { snapshot } => {
                 self.store_terminal_snapshot(snapshot.clone())
                     .map_err(|error| error.to_string())?;
+                if claim_terminal_ack_drop(session, &snapshot)? {
+                    return Ok(());
+                }
                 session
                     .session
                     .send(QueryControlCommand::TerminalAck {
@@ -947,6 +969,55 @@ impl AttemptControl {
     }
 }
 
+#[cfg(debug_assertions)]
+fn claim_terminal_ack_drop(
+    session: &ActiveSession,
+    snapshot: &QueryTerminalSnapshot,
+) -> Result<bool, String> {
+    use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, claim_matching_fault};
+
+    let Some(root) = novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(false);
+    };
+    let backend_index = session.target.backend_idx();
+    let backend_id = u64::try_from(backend_index)
+        .map_err(|_| "backend index does not fit terminal ACK fault identity".to_string())?;
+    let Some(scope) = claim_matching_fault(
+        root,
+        QueryLifecycleFaultKind::TerminalAckDrop,
+        snapshot.execution_id(),
+        backend_index,
+        backend_id,
+        session.target.start_epoch(),
+    )
+    .map_err(|error| format!("claim terminal ACK drop fault: {error}"))?
+    else {
+        return Ok(false);
+    };
+    eprintln!(
+        "NOVAROCKS_QUERY_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+        snapshot.execution_id().query_id().high(),
+        snapshot.execution_id().query_id().low(),
+        snapshot.execution_id().attempt_id().get(),
+        backend_index,
+        backend_id,
+        session.target.start_epoch(),
+        scope.token,
+    );
+    Ok(true)
+}
+
+#[cfg(not(debug_assertions))]
+fn claim_terminal_ack_drop(
+    _session: &ActiveSession,
+    _snapshot: &QueryTerminalSnapshot,
+) -> Result<bool, String> {
+    Ok(false)
+}
+
 impl ActiveQueryAttemptControl for AttemptControl {
     fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
@@ -965,6 +1036,10 @@ impl ActiveQueryAttemptControl for AttemptControl {
     ) -> Result<bool, DistributedQueryError> {
         self.store_terminal_snapshot(snapshot)
             .map(|outcome| outcome == TerminalSnapshotStoreOutcome::Accepted)
+    }
+
+    fn retain_terminal_ingress(&self) -> bool {
+        self.retain_terminal_ingress.load(Ordering::Acquire) || self.terminal_set().is_ok()
     }
 }
 
@@ -1096,9 +1171,9 @@ impl QueryLifecycleLeaseGuard for FrontendQueryLifecycleLeaseGuard {
         self.control.finalize()
     }
 
-    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> String {
+    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome {
         self.stop_and_join();
-        self.control.abort_preserving(primary_error)
+        self.control.abort_with_terminal_outcome(primary_error)
     }
 }
 

@@ -1652,12 +1652,25 @@ pub fn start_grpc_report_server(
     port: u16,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
+    start_grpc_report_server_with_terminal_ingress(host, port, report_handler, None)
+}
+
+/// Starts a report-only standalone NovaRocksGrpc endpoint with the optional
+/// FE-owned terminal fallback ingress. Backend-only and compat roles must
+/// pass `None` so they reject `ReportQueryTerminal` rather than accepting a
+/// terminal record locally.
+pub fn start_grpc_report_server_with_terminal_ingress(
+    host: &str,
+    port: u16,
+    report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
+) -> Result<(), String> {
     start_standalone_grpc_server(
         host,
         port,
         StandaloneGrpcMode::ReportOnly,
         report_handler,
-        None,
+        terminal_ingress,
     )
 }
 

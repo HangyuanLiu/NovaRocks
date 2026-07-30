@@ -26,6 +26,7 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
+use crate::proto::novarocks;
 use crate::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
@@ -383,7 +384,7 @@ fn put_sink(bytes: &mut Vec<u8>, sink: &SinkCommitReportSnapshot) {
     let mut iceberg = sink
         .iceberg_commits
         .iter()
-        .map(Message::encode_to_vec)
+        .map(canonical_iceberg_commit)
         .collect::<Vec<_>>();
     iceberg.sort();
     put_u64(bytes, iceberg.len() as u64);
@@ -415,6 +416,154 @@ fn put_sink(bytes: &mut Vec<u8>, sink: &SinkCommitReportSnapshot) {
     put_i64(bytes, sink.load_stats.loaded_rows);
     put_i64(bytes, sink.load_stats.loaded_bytes);
     put_i64(bytes, sink.load_stats.filtered_rows);
+}
+
+/// Iceberg commit facts contain protobuf map fields. Prost represents those as
+/// HashMaps, so Message::encode_to_vec is not a stable digest input after a
+/// network decode. Terminal identity requires semantic, not hash-iteration,
+/// order; encode every field and sort all map entries by their typed key.
+fn canonical_iceberg_commit(commit: &novarocks::IcebergCommitInfo) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match &commit.iceberg_data_file {
+        Some(file) => {
+            put_u8(&mut bytes, 1);
+            put_iceberg_data_file(&mut bytes, file);
+        }
+        None => put_u8(&mut bytes, 0),
+    }
+    put_optional_bool(&mut bytes, commit.is_overwrite);
+    put_optional_bool(&mut bytes, commit.is_rewrite);
+    bytes
+}
+
+fn put_iceberg_data_file(bytes: &mut Vec<u8>, file: &novarocks::IcebergDataFile) {
+    put_optional_string(bytes, file.path.as_deref());
+    put_optional_string(bytes, file.format.as_deref());
+    put_optional_i64(bytes, file.record_count);
+    put_optional_i64(bytes, file.file_size_in_bytes);
+    put_optional_string(bytes, file.partition_path.as_deref());
+    match &file.split_offsets {
+        Some(values) => {
+            put_u8(bytes, 1);
+            put_u64(bytes, values.values.len() as u64);
+            for value in &values.values {
+                put_i64(bytes, *value);
+            }
+        }
+        None => put_u8(bytes, 0),
+    }
+    match &file.column_stats {
+        Some(stats) => {
+            put_u8(bytes, 1);
+            put_i64_map(bytes, &stats.column_sizes);
+            put_i64_map(bytes, &stats.value_counts);
+            put_i64_map(bytes, &stats.null_value_counts);
+            put_i64_map(bytes, &stats.nan_value_counts);
+            put_bytes_map(bytes, &stats.lower_bounds);
+            put_bytes_map(bytes, &stats.upper_bounds);
+        }
+        None => put_u8(bytes, 0),
+    }
+    put_optional_string(bytes, file.partition_null_fingerprint.as_deref());
+    put_i32(bytes, file.file_content);
+    put_optional_string(bytes, file.referenced_data_file.as_deref());
+    put_optional_i64(bytes, file.first_row_id);
+    match &file.equality_ids {
+        Some(values) => {
+            put_u8(bytes, 1);
+            put_u64(bytes, values.values.len() as u64);
+            for value in &values.values {
+                put_i32(bytes, *value);
+            }
+        }
+        None => put_u8(bytes, 0),
+    }
+    put_optional_bytes(bytes, file.key_metadata.as_deref());
+    put_optional_i32(bytes, file.partition_spec_id);
+    match &file.partition_values_descriptor {
+        Some(partition) => {
+            put_u8(bytes, 1);
+            put_u64(bytes, partition.values.len() as u64);
+            for value in &partition.values {
+                put_optional_bool(bytes, value.is_null);
+                put_optional_bytes(bytes, value.datum_bytes.as_deref());
+            }
+        }
+        None => put_u8(bytes, 0),
+    }
+    put_optional_i64(bytes, file.content_offset);
+    put_optional_i64(bytes, file.content_size_in_bytes);
+    put_optional_i64(bytes, file.cardinality);
+}
+
+fn put_i64_map(bytes: &mut Vec<u8>, values: &std::collections::HashMap<i32, i64>) {
+    let mut entries = values.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(key, _)| **key);
+    put_u64(bytes, entries.len() as u64);
+    for (key, value) in entries {
+        put_i32(bytes, *key);
+        put_i64(bytes, *value);
+    }
+}
+
+fn put_bytes_map(bytes: &mut Vec<u8>, values: &std::collections::HashMap<i32, Vec<u8>>) {
+    let mut entries = values.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(key, _)| **key);
+    put_u64(bytes, entries.len() as u64);
+    for (key, value) in entries {
+        put_i32(bytes, *key);
+        put_bytes(bytes, value);
+    }
+}
+
+fn put_optional_bool(bytes: &mut Vec<u8>, value: Option<bool>) {
+    match value {
+        Some(value) => {
+            put_u8(bytes, 1);
+            put_u8(bytes, u8::from(value));
+        }
+        None => put_u8(bytes, 0),
+    }
+}
+
+fn put_optional_string(bytes: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            put_u8(bytes, 1);
+            put_string(bytes, value);
+        }
+        None => put_u8(bytes, 0),
+    }
+}
+
+fn put_optional_bytes(bytes: &mut Vec<u8>, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            put_u8(bytes, 1);
+            put_bytes(bytes, value);
+        }
+        None => put_u8(bytes, 0),
+    }
+}
+
+fn put_optional_i64(bytes: &mut Vec<u8>, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            put_u8(bytes, 1);
+            put_i64(bytes, value);
+        }
+        None => put_u8(bytes, 0),
+    }
+}
+
+fn put_optional_i32(bytes: &mut Vec<u8>, value: Option<i32>) {
+    match value {
+        Some(value) => {
+            put_u8(bytes, 1);
+            put_i32(bytes, value);
+        }
+        None => put_u8(bytes, 0),
+    }
 }
 
 fn put_u8(bytes: &mut Vec<u8>, value: u8) {

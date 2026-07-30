@@ -37,8 +37,8 @@ pub use contract::{decode_query_terminal_snapshot, encode_query_terminal_snapsho
 pub use identity::{AttemptId, QueryExecutionId};
 pub(crate) use init_plan::QueryInitPlanHeader;
 pub use init_plan::{
-    QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan, QueryLifecycleLease,
-    QueryLifecycleLeaseGuard,
+    QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan,
+    QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
 };
 pub use manifest::{
     ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,

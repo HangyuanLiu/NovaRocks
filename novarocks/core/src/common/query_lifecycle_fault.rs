@@ -32,6 +32,9 @@ pub enum QueryLifecycleFaultKind {
     HeartbeatStop,
     HeartbeatStopAfterStage,
     RestartAfterInitAck,
+    /// The frontend stores the snapshot but deliberately withholds its stream
+    /// acknowledgement, forcing the BE's unary terminal fallback.
+    TerminalAckDrop,
 }
 
 impl QueryLifecycleFaultKind {
@@ -44,6 +47,7 @@ impl QueryLifecycleFaultKind {
             Self::HeartbeatStop => "heartbeat-stop",
             Self::HeartbeatStopAfterStage => "heartbeat-stop-after-stage",
             Self::RestartAfterInitAck => "restart-after-init-ack",
+            Self::TerminalAckDrop => "terminal-ack-drop",
         }
     }
 }

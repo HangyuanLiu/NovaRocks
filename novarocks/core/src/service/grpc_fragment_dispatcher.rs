@@ -432,6 +432,7 @@ mod tests {
         EnsureConnectorExecutionBindingRequest, EnsureConnectorExecutionBindingResponse,
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
         HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
+        ReportQueryTerminalRequest, ReportQueryTerminalResponse,
         RetireConnectorExecutionBindingRequest, RetireConnectorExecutionBindingResponse,
     };
     use tonic::{Request, Response, Status, Streaming};
@@ -565,6 +566,13 @@ mod tests {
             &self,
             _request: Request<proto::novarocks::AbortQueryRequest>,
         ) -> Result<Response<proto::novarocks::AbortQueryResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn report_query_terminal(
+            &self,
+            _request: Request<ReportQueryTerminalRequest>,
+        ) -> Result<Response<ReportQueryTerminalResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
