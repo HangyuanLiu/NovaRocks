@@ -1417,6 +1417,10 @@ fn reconcile_iceberg_mutation_evidence(
         ),
         evidence: evidence.clone(),
     };
+    let ambiguous = |message: String| ExternalMutationOutcome::CommitUnknown {
+        failure: ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message),
+        evidence: evidence.clone(),
+    };
     let uncommitted = |message: String| ExternalMutationOutcome::KnownUncommitted {
         failure: ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message),
     };
@@ -1426,9 +1430,13 @@ fn reconcile_iceberg_mutation_evidence(
             namespace,
             should_exist,
         } => match namespace_exists(entry, &namespace).map_err(map_iceberg_error) {
-            Ok(exists) if exists == should_exist => {
-                known_committed(ExternalMutationEffect::Applied)
-            }
+            // Namespaces do not have an immutable catalog identity.  A matching
+            // presence bit could have been produced by a concurrent creator or
+            // dropper, so an authoritative reread cannot attribute it to this
+            // operation.
+            Ok(exists) if exists == should_exist => Ok(ambiguous(format!(
+                "authoritative namespace state for `{namespace}` matches but cannot be attributed to this mutation"
+            ))),
             Ok(_) => Ok(uncommitted(format!(
                 "authoritative namespace state for `{namespace}` does not match mutation"
             ))),
@@ -1440,10 +1448,16 @@ fn reconcile_iceberg_mutation_evidence(
             should_exist,
             before_uuid,
         } => match load_existing_table_for_reconcile(entry, &namespace, &table) {
-            Ok(current) if should_exist && current.is_some() => {
-                known_committed(ExternalMutationEffect::Applied)
-            }
-            Ok(None) if !should_exist => known_committed(ExternalMutationEffect::Applied),
+            // A table created after an absent pre-state has no operation marker
+            // in the catalog protocol.  Its existence alone could belong to a
+            // concurrent creator.  Likewise, absence after a drop cannot prove
+            // which actor removed the object.
+            Ok(current) if should_exist && current.is_some() => Ok(ambiguous(format!(
+                "authoritative table `{namespace}.{table}` exists but cannot be attributed to this create"
+            ))),
+            Ok(None) if !should_exist => Ok(ambiguous(format!(
+                "authoritative table `{namespace}.{table}` is absent but cannot be attributed to this drop"
+            ))),
             Ok(Some(current)) if !should_exist => {
                 if before_uuid.as_deref()
                     == Some(current.table.metadata().uuid().to_string().as_str())
@@ -1474,9 +1488,11 @@ fn reconcile_iceberg_mutation_evidence(
             view,
             should_exist,
         } => match views::view_exists(entry, &namespace, &view).map_err(map_iceberg_error) {
-            Ok(exists) if exists == should_exist => {
-                known_committed(ExternalMutationEffect::Applied)
-            }
+            // The current view adapter exposes only presence here.  Do not turn
+            // a concurrent same-name view mutation into a false commit proof.
+            Ok(exists) if exists == should_exist => Ok(ambiguous(format!(
+                "authoritative view state for `{namespace}.{view}` matches but cannot be attributed to this mutation"
+            ))),
             Ok(_) => Ok(uncommitted(format!(
                 "authoritative view state for `{namespace}.{view}` does not match mutation"
             ))),
@@ -1491,7 +1507,14 @@ fn reconcile_iceberg_mutation_evidence(
             Ok(Some(current)) if current.table.metadata().uuid().to_string() == table_uuid => {
                 if current.table.metadata_location().map(str::to_string) != before_metadata_location
                 {
-                    known_committed(ExternalMutationEffect::Applied)
+                    // A metadata-location advance proves that *some* commit
+                    // happened, not that it contains this schema/partition/
+                    // properties change.  The provider intentionally keeps the
+                    // result uncertain until the evidence format carries a
+                    // semantic postcondition digest for these operations.
+                    Ok(ambiguous(format!(
+                        "authoritative metadata version for `{namespace}.{table}` advanced without a matching semantic postcondition"
+                    )))
                 } else {
                     Ok(uncommitted(format!(
                         "authoritative metadata version for `{namespace}.{table}` did not advance"
