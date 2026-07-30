@@ -636,6 +636,7 @@ fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
         novarocks::query_execution::lifecycle::contract::encode_query_stage_request(&first_stage)
             .encoded_len();
     let mut config = registry_config(8);
+    config.stage_max_fragments = 1;
     config.stage_max_encoded_bytes = encoded_bytes;
     config.stage_max_inflight_encoded_bytes = encoded_bytes;
     config.stage_max_dormant_workers = 1;

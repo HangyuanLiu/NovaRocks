@@ -58,8 +58,8 @@ pub struct QueryLifecycleFaultScope {
 }
 
 /// Runner-owned one-shot failure for a local Stage build. Unlike ACK faults,
-/// this is intentionally claimed by the backend that wins the first Stage
-/// build; the selected fragment ordinal is local to that Stage bundle.
+/// the runner does not preselect a backend: the first non-empty batch that
+/// contains the requested local ordinal claims it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagePrepareFailure {
     pub token: String,
@@ -74,7 +74,10 @@ pub fn trigger_path(root: &Path, backend_index: usize, kind: QueryLifecycleFault
     root.join(format!("be-{backend_index}.{}.trigger", kind.file_stem()))
 }
 
-pub fn claim_stage_prepare_failure(root: &Path) -> Result<Option<StagePrepareFailure>, String> {
+pub fn claim_stage_prepare_failure(
+    root: &Path,
+    available_fragments: usize,
+) -> Result<Option<StagePrepareFailure>, String> {
     let path = root.join("stage-prepare-fail.trigger");
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -88,6 +91,9 @@ pub fn claim_stage_prepare_failure(root: &Path) -> Result<Option<StagePrepareFai
     };
     if failure.ordinal == 0 {
         return Err("stage prepare fault ordinal must be at least one".to_string());
+    }
+    if failure.ordinal > available_fragments {
+        return Ok(None);
     }
     match fs::remove_file(&path) {
         Ok(()) => Ok(Some(failure)),
@@ -403,6 +409,43 @@ mod tests {
             );
         }
         assert!(trigger_path(&root, 1, QueryLifecycleFaultKind::StartAckSuppress).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_prepare_fault_waits_for_a_batch_with_the_requested_ordinal() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-stage-prepare-fault-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create scope root");
+        let trigger = root.join("stage-prepare-fail.trigger");
+        fs::write(&trigger, "token=stage-ordinal\nordinal=2\n").expect("write trigger");
+
+        assert!(
+            claim_stage_prepare_failure(&root, 0)
+                .expect("empty batch check")
+                .is_none()
+        );
+        assert!(trigger.exists());
+        assert!(
+            claim_stage_prepare_failure(&root, 1)
+                .expect("short batch check")
+                .is_none()
+        );
+        assert!(trigger.exists());
+        assert_eq!(
+            claim_stage_prepare_failure(&root, 2)
+                .expect("eligible batch check")
+                .expect("eligible batch claims fault")
+                .ordinal,
+            2
+        );
+        assert!(!trigger.exists());
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

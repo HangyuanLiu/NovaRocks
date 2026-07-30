@@ -34,6 +34,19 @@ pub(super) fn start_with_configured_fragment_failure_trigger(
     start_with_fragment_failure_trigger(dormant, trigger.as_deref(), failure_injection_eligible)
 }
 
+/// Claims the runner-owned failure rendezvous without making the fragment
+/// terminal. Stage workers use this form so the SQL runner can first observe
+/// the successful Stage batch and explicitly release the post-Start failure.
+pub(super) fn claim_configured_fragment_failure_trigger(
+    failure_injection_eligible: bool,
+) -> Result<Option<FragmentFailureRelease>, String> {
+    if !failure_injection_eligible {
+        return Ok(None);
+    }
+    let trigger = configured_fragment_failure_trigger();
+    consume_fragment_failure_trigger(trigger.as_deref())
+}
+
 pub(super) fn start_with_fragment_failure_trigger(
     dormant: DormantFragmentHandle,
     failure_trigger: Option<&Path>,

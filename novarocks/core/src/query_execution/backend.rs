@@ -35,7 +35,10 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
         expected: &BackendTopologySnapshot,
     ) -> Result<(), BackendTopologyValidationError>;
 
-    fn record_successful_fragment_submission(&self, backend_idx: usize);
+    /// Records one successfully acknowledged Stage batch.  `fragment_count`
+    /// remains separate from the batch boundary so service-only participants
+    /// are visible to lifecycle accounting without inflating fragment counts.
+    fn record_successful_stage(&self, backend_idx: usize, fragment_count: usize);
 
     fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
 
@@ -186,8 +189,8 @@ pub enum HeartbeatOutcome {
 
 /// Core-local scheduling metric. Topology accounting is performed by the
 /// frontend-owned port at the composition boundary.
-pub fn record_successful_fragment_submission(_backend_idx: usize) {
-    crate::service::metrics_http::observe_fragment_scheduled();
+pub fn record_successful_stage(_backend_idx: usize, fragment_count: usize) {
+    crate::service::metrics_http::observe_fragments_scheduled(fragment_count);
 }
 
 /// Resolves the report endpoint after the coordinator gRPC listener has bound.
@@ -375,7 +378,7 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
         }
     }
 
-    fn record_successful_fragment_submission(&self, _backend_idx: usize) {}
+    fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
 
     fn add_backend(&self, _endpoint: SocketAddr) -> Result<(), String> {
         Err("backend topology port is not installed".to_string())

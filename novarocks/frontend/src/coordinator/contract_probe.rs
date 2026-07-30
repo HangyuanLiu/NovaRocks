@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_fragment_submission_updates_frontend_topology_telemetry() {
+    fn successful_stage_updates_frontend_topology_fragment_telemetry() {
         let fixture = non_empty_result_contract_fixture();
         let backends = fixture.backends().to_vec();
         let batch = fixture.result_batch();
@@ -764,7 +764,7 @@ mod tests {
             assert_eq!(
                 topology.scheduled_fragment_count_for_test(backend_idx),
                 expected,
-                "frontend topology telemetry must count successful submissions per backend"
+                "frontend topology telemetry must count fragments in successful Stage batches per backend"
             );
         }
     }

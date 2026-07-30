@@ -1030,7 +1030,7 @@ fn execute_target_query_with_fault(
             format!("FAIL (runner fault injection): {error:#}"),
         )
     });
-    if meta.kill_fe_after_control_ready_count.is_some() {
+    if meta.kill_fe_after_control_ready_count.is_some() || meta.kill_fe_at_lifecycle_phase.is_some() {
         if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return (
                 false,

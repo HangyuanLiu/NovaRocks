@@ -535,6 +535,80 @@ fn parse_identity_markers(log: &str, marker: &str) -> Result<Vec<FragmentIdentit
         .collect()
 }
 
+fn parse_stage_fragment_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
+    const MARKER: &str = "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED";
+    log.lines()
+        .filter_map(|line| marker_payload(line, MARKER))
+        .map(|payload| {
+            let fields = marker_fields(payload, MARKER)?;
+            let execution_id = fields
+                .get("execution_id")
+                .with_context(|| format!("{MARKER} is missing execution_id"))?;
+            let mut execution_parts = execution_id.split(':');
+            let query_hi = execution_parts
+                .next()
+                .context(format!("{MARKER} has malformed execution_id"))?
+                .parse::<i64>()
+                .with_context(|| format!("{MARKER} has invalid execution_id query high bits"))?;
+            let query_lo = execution_parts
+                .next()
+                .context(format!("{MARKER} has malformed execution_id"))?
+                .parse::<i64>()
+                .with_context(|| format!("{MARKER} has invalid execution_id query low bits"))?;
+            let attempt = execution_parts
+                .next()
+                .context(format!("{MARKER} has malformed execution_id"))?;
+            attempt
+                .parse::<u64>()
+                .with_context(|| format!("{MARKER} has invalid execution_id attempt"))?;
+            if execution_parts.next().is_some() {
+                bail!("{MARKER} has malformed execution_id");
+            }
+
+            let finst_id = fields
+                .get("finst_id")
+                .with_context(|| format!("{MARKER} is missing finst_id"))?;
+            let bytes = finst_id.as_bytes();
+            if bytes.len() != 36
+                || bytes.get(8) != Some(&b'-')
+                || bytes.get(13) != Some(&b'-')
+                || bytes.get(18) != Some(&b'-')
+                || bytes.get(23) != Some(&b'-')
+            {
+                bail!("{MARKER} has malformed finst_id");
+            }
+            let compact = finst_id.replace('-', "");
+            if compact.len() != 32 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("{MARKER} has malformed finst_id");
+            }
+            let hi = u64::from_str_radix(&compact[..16], 16)
+                .with_context(|| format!("{MARKER} has invalid finst_id high bits"))?;
+            let lo = u64::from_str_radix(&compact[16..], 16)
+                .with_context(|| format!("{MARKER} has invalid finst_id low bits"))?;
+            Ok(FragmentIdentity {
+                query: QueryIdentity {
+                    hi: query_hi,
+                    lo: query_lo,
+                },
+                finst_hi: hi as i64,
+                finst_lo: lo as i64,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn parse_legacy_submit_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
+    parse_identity_markers(log, "NOVAROCKS_GRPC_SUBMIT_ACCEPTED")
+}
+
+fn parse_fragment_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
+    let mut accepted = parse_stage_fragment_acceptance_markers(log)?;
+    #[cfg(test)]
+    accepted.extend(parse_legacy_submit_acceptance_markers(log)?);
+    Ok(accepted)
+}
+
 fn parse_failure_markers(log: &str) -> Result<Vec<(String, FragmentIdentity)>> {
     const MARKER: &str = "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED";
     log.lines()
@@ -660,7 +734,7 @@ fn exact_fragment_cancellation_evidence(
     let mut total = 0usize;
     let mut mismatches = Vec::new();
     for (index, log) in logs.iter().enumerate() {
-        let accepted = match parse_identity_markers(log, "NOVAROCKS_GRPC_SUBMIT_ACCEPTED") {
+        let accepted = match parse_fragment_acceptance_markers(log) {
             Ok(identities) => identity_multiset(identities, anchor.query),
             Err(error) => {
                 return Ok(LogEvidenceCheck::Pending(format!(
@@ -688,11 +762,7 @@ fn exact_fragment_cancellation_evidence(
             .iter()
             .filter(|(_, count)| **count != 1)
             .collect::<Vec<_>>();
-        if accepted.is_empty() {
-            mismatches.push(format!(
-                "BE[{index}] accepted no fragment for the injected query"
-            ));
-        } else if accepted != cancelled {
+        if accepted != cancelled {
             mismatches.push(format!(
                 "BE[{index}] identity mismatch accepted={accepted:?} cancelled={cancelled:?}"
             ));
@@ -1108,7 +1178,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_compares_per_be_identity_multisets() {
         let handle = FakeCompatHandle::new(vec![
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=1 query_lo=2 finst_hi=3 finst_lo=4\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=1:2:1 backend_id=0 finst_id=00000000-0000-0003-0000-000000000004\n",
             "",
             "",
         ])
@@ -1121,19 +1191,19 @@ mod tests {
         let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
         handle.append_log(
             0,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=7 query_lo=8 finst_hi=9 finst_lo=10\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=7:8:1 backend_id=0 finst_id=00000000-0000-0009-0000-00000000000a\n",
         );
         handle.append_log(
             0,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=0 finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
         );
         handle.append_log(
             1,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=1 finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
         );
         handle.append_log(
             2,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=104 finst_lo=204\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=104 finst_lo=204\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=2 finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=2 finst_id=00000000-0000-0068-0000-0000000000cc\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=104 finst_lo=204\n",
         );
         let mut log = String::new();
 

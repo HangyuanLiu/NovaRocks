@@ -46,7 +46,10 @@ use novarocks_spi::connector::{
 };
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
-use super::failure_injection::start_with_configured_fragment_failure_trigger;
+use super::failure_injection::{
+    FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
+    start_with_configured_fragment_failure_trigger,
+};
 use crate::ConnectorExecutionHost;
 use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
 
@@ -62,7 +65,9 @@ pub(super) enum NativeFragmentLifecycleEvent {
 type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>;
 
 #[cfg(debug_assertions)]
-fn runner_stage_prepare_failure() -> Result<
+fn runner_stage_prepare_failure(
+    available_fragments: usize,
+) -> Result<
     Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
     NativeFragmentIngressError,
 > {
@@ -72,12 +77,14 @@ fn runner_stage_prepare_failure() -> Result<
     else {
         return Ok(None);
     };
-    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(root)
+    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(root, available_fragments)
         .map_err(NativeFragmentIngressError::new)
 }
 
 #[cfg(not(debug_assertions))]
-fn runner_stage_prepare_failure() -> Result<
+fn runner_stage_prepare_failure(
+    _available_fragments: usize,
+) -> Result<
     Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
     NativeFragmentIngressError,
 > {
@@ -218,7 +225,7 @@ impl NativeFragmentService {
         fragments: &[StageFragment],
         gate: Arc<StartGate>,
     ) -> Result<(), NativeFragmentIngressError> {
-        let injected_failure = runner_stage_prepare_failure()?;
+        let injected_failure = runner_stage_prepare_failure(fragments.len())?;
         for (index, fragment) in fragments.iter().enumerate() {
             if injected_failure
                 .as_ref()
@@ -349,16 +356,33 @@ impl NativeFragmentService {
                         report_endpoint,
                     );
                 }
-                let (running, failure_release) = start_with_configured_fragment_failure_trigger(
-                    dormant,
+                let staged_failure = claim_configured_fragment_failure_trigger(
                     failure_injection_eligible,
                 );
+                let (running, staged_failure_token) = match staged_failure {
+                    Ok(Some(release)) => match release.wait() {
+                        Ok(token) => (
+                            dormant.start_failed(FRAGMENT_EXECUTOR_FAILURE_MESSAGE),
+                            Some(token),
+                        ),
+                        Err(error) => (dormant.start_failed(error), None),
+                    },
+                    Ok(None) => (dormant.start(), None),
+                    Err(error) => (dormant.start_failed(error), None),
+                };
                 pending_control.attach(running.clone());
                 if let Some(observer) = observer.as_ref() {
                     observer(NativeFragmentLifecycleEvent::Started);
                 }
-                if let Some(release) = failure_release {
-                    let _ = release.wait();
+                if let Some(token) = staged_failure_token {
+                    eprintln!(
+                        "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token={} query_hi={} query_lo={} finst_hi={} finst_lo={}",
+                        token,
+                        query_id.hi(),
+                        query_id.lo(),
+                        fragment_instance_id.hi,
+                        fragment_instance_id.lo
+                    );
                 }
                 consume_terminal_fact(running, token, queries, lifecycle, execution_id);
             })
@@ -666,7 +690,6 @@ fn consume_terminal_fact(
     let fact = running.join();
     let query_id = fact.query_id();
     let fragment_instance_id = fact.fragment_instance_id();
-    lifecycle.record_fragment_terminal(execution_id, fragment_instance_id, fact.outcome());
     let report_error = match fact.outcome() {
         FragmentOutcome::Succeeded => {
             if let Some(profile) = fact.profile() {
@@ -701,6 +724,10 @@ fn consume_terminal_fact(
     );
     queries.unregister_fragment(fragment_instance_id);
     queries.cleanup_after_fragment_report(query_id, report_decision);
+    // Publish the terminal report before this fact can fail-close the local
+    // lifecycle. Otherwise a sibling cancelled by the first terminal fact may
+    // win the report slot and hide the fragment that actually failed.
+    lifecycle.record_fragment_terminal(execution_id, fragment_instance_id, fact.outcome());
     token.complete();
 }
 

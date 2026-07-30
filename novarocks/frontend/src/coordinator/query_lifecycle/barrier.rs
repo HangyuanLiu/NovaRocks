@@ -375,6 +375,7 @@ impl QueryLaunchBarrier for FrontendQueryLifecycleBarrier {
             .map_or(Ok(()), |(_, error)| Err(failed(error)));
         if outcome.is_ok() {
             record_lifecycle_phase_marker("staged", batches)?;
+            record_stage_barrier_marker(batches)?;
         }
         outcome
     }
@@ -572,6 +573,32 @@ fn record_lifecycle_phase_marker(
             )));
         }
     }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn record_stage_barrier_marker(batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
+    let Some(execution_id) = batches.first().map(|batch| batch.request().execution_id()) else {
+        return Ok(());
+    };
+    if novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+        .is_some()
+    {
+        eprintln!(
+            "NOVAROCKS_QUERY_STAGE_BARRIER execution_id={}:{}:{} participants={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            batches.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn record_stage_barrier_marker(_batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
     Ok(())
 }
 

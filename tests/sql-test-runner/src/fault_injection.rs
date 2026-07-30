@@ -365,6 +365,9 @@ where
 
     enum FaultBaseline {
         ScheduledFragments(Vec<(usize, u64)>),
+        FrontendStage {
+            marker_count: u64,
+        },
         FrontendReady {
             ready_count: u64,
             coordinator_lost: Vec<u64>,
@@ -456,11 +459,9 @@ where
                         server.be_count()
                     );
                 }
-                FaultBaseline::ScheduledFragments(
-                    (0..server.be_count())
-                        .map(|backend| Ok((backend, server.scheduled_fragment_count(backend)?)))
-                        .collect::<Result<Vec<_>>>()?,
-                )
+                FaultBaseline::FrontendStage {
+                    marker_count: server.fe_log_count("NOVAROCKS_QUERY_STAGE_BARRIER")? as u64,
+                }
             }
             PostQueryFault::KillFrontendAfterControlReady(_) => FaultBaseline::FrontendReady {
                 ready_count: server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")? as u64,
@@ -550,6 +551,10 @@ where
                             all_fresh &= current > baseline;
                         }
                         all_fresh
+                    }
+                    FaultBaseline::FrontendStage { marker_count } => {
+                        server.fe_log_count("NOVAROCKS_QUERY_STAGE_BARRIER")?
+                            > *marker_count as usize
                     }
                     FaultBaseline::FrontendReady { ready_count, .. } => {
                         let target = match fault {
@@ -1824,6 +1829,13 @@ mod tests {
             }
         }
 
+        fn fe_log_count(&self, marker: &str) -> Result<usize> {
+            assert_eq!(marker, "NOVAROCKS_QUERY_STAGE_BARRIER");
+            let (lock, _) = self.state.as_ref();
+            let state = lock.lock().expect("all-backend release state");
+            Ok(usize::from(state.query_started))
+        }
+
         fn release_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
             let (lock, wake) = self.state.as_ref();
             let mut state = lock.lock().expect("all-backend release state");
@@ -1835,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn fragment_failure_release_waits_for_fresh_counts_on_every_backend() {
+    fn fragment_failure_release_waits_for_the_stage_barrier() {
         let state = Arc::new((
             Mutex::new(AllBackendsReleaseState::default()),
             Condvar::new(),
@@ -1866,14 +1878,8 @@ mod tests {
 
         assert_eq!(result, 42);
         let state = state.0.lock().expect("all-backend release state");
-        assert_eq!(state.baseline_reads, vec![0, 1, 2]);
-        assert!(
-            [0, 1, 2]
-                .into_iter()
-                .all(|index| state.fresh_reads.contains(&index)),
-            "release must observe a fresh ScheduledFragments count on every BE: {:?}",
-            state.fresh_reads
-        );
+        assert!(state.baseline_reads.is_empty());
+        assert!(state.fresh_reads.is_empty());
         assert_eq!(state.released_index, Some(1));
         assert_eq!(state.events, vec!["query:start", "release", "query:end"]);
     }

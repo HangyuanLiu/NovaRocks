@@ -27,14 +27,18 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.stage_start VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO ${case_db}.stage_start VALUES (1, 10);
+INSERT INTO ${case_db}.stage_start VALUES (2, 20);
+INSERT INTO ${case_db}.stage_start VALUES (3, 30);
 
 -- query 3
 -- A normal 1FE+3BE query: every participant reaches ControlReady, prepares
 -- its Stage batch, then releases only through StartPreparedQuery.
 -- @result_contains=60
+-- @query_control_fragment_backend_limit=2
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_CONTROL_READY,3
--- @be_log_be_count_at_least=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED,3
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED,2
+-- @be_log_contains=expected_fragments=0
 SELECT SUM(left_side.payload) AS total
 FROM ${case_db}.stage_start left_side
 JOIN ${case_db}.stage_start right_side
@@ -44,6 +48,7 @@ JOIN ${case_db}.stage_start right_side
 -- The first Stage response is lost after the backend committed its bundle;
 -- FE retries the same digest and the query must still complete once.
 -- @drop_next_stage_ack_be_index=1
+-- @query_control_fragment_backend_limit=2
 -- @result_contains=60
 -- @be_log_contains=NOVAROCKS_STAGE_ACK_DROPPED
 SELECT SUM(left_side.payload) AS total
@@ -55,6 +60,7 @@ JOIN ${case_db}.stage_start right_side
 -- Start response loss is also retry-safe: the retry observes the same gate
 -- rather than starting a second worker bundle.
 -- @drop_next_start_ack_be_index=1
+-- @query_control_fragment_backend_limit=2
 -- @result_contains=60
 -- @be_log_contains=NOVAROCKS_START_ACK_DROPPED
 SELECT SUM(left_side.payload) AS total
@@ -67,6 +73,7 @@ JOIN ${case_db}.stage_start right_side
 -- unknown across the idempotent retry. The frontend must Abort every
 -- participant instead of accepting a partial Start.
 -- @suppress_start_ack_be_index=2
+-- @query_control_fragment_backend_limit=2
 -- @expect_error=StartPreparedQuery retry failed after unknown outcome
 -- @be_log_contains=NOVAROCKS_START_ACK_SUPPRESSED
 SELECT SUM(left_side.payload) AS total
@@ -80,9 +87,10 @@ JOIN ${case_db}.stage_start right_side
 SELECT COUNT(*) FROM ${case_db}.stage_start;
 
 -- query 8
--- Fail the first local Stage prepare. The Stage barrier must reject before
+-- Fail the second local Stage prepare. The Stage barrier must reject before
 -- any participant can pass StartPreparedQuery.
--- @fail_stage_prepare_ordinal=1
+-- @fail_stage_prepare_ordinal=2
+-- @query_control_fragment_backend_limit=2
 -- @expect_error=StageFragments rejected
 -- @be_log_contains=NOVAROCKS_STAGE_PREPARE_FAILED
 SELECT SUM(left_side.payload) AS total

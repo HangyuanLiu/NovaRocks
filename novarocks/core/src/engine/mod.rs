@@ -5537,9 +5537,11 @@ mod tests {
             }
         }
 
-        fn record_successful_fragment_submission(&self, backend_idx: usize) {
+        fn record_successful_stage(&self, backend_idx: usize, fragment_count: usize) {
             if let Some(entry) = self.state.lock().unwrap().entries.get_mut(&backend_idx) {
-                entry.scheduled_fragments = entry.scheduled_fragments.saturating_add(1);
+                entry.scheduled_fragments = entry
+                    .scheduled_fragments
+                    .saturating_add(fragment_count as u64);
             }
         }
 

@@ -122,8 +122,8 @@ static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_frontend_query_lifecycle_latency_micros")
 });
 
-pub(crate) fn observe_fragment_scheduled() {
-    Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc();
+pub(crate) fn observe_fragments_scheduled(count: usize) {
+    Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc_by(count as u64);
 }
 
 pub(crate) fn observe_heartbeat_rtt(duration: Duration) {
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn rendered_metrics_include_cluster_core_names() {
-        observe_fragment_scheduled();
+        observe_fragments_scheduled(1);
         crate::runtime::fragment::io::exchange_metrics::observe_exchange_shuffle_bytes(7);
         observe_heartbeat_rtt(Duration::from_millis(5));
 
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn rendered_json_metrics_are_fe_metrics_compatible_array() {
-        observe_fragment_scheduled();
+        observe_fragments_scheduled(1);
         let body = render_metrics_json().expect("render json metrics");
         let value: serde_json::Value = serde_json::from_str(&body).expect("parse json metrics");
         let rows = value.as_array().expect("json metrics array");

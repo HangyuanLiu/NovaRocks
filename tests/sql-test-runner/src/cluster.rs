@@ -112,9 +112,10 @@ fn query_frontend_backend_topology(
         .tcp_port(port)
         .prefer_socket(false)
         .user(Some(mysql_user))
-        .tcp_connect_timeout(Some(io_timeout))
-        .read_timeout(Some(io_timeout))
-        .write_timeout(Some(io_timeout));
+        // The synchronous mysql client maps macOS socket read/write timeouts
+        // to EAGAIN while decoding a valid response. The enclosing topology
+        // barrier owns the deadline; retain only a bounded connect timeout.
+        .tcp_connect_timeout(Some(io_timeout));
     let mut conn = MysqlConn::new(builder)
         .with_context(|| format!("connect to cross-process FE MySQL at {host}:{port}"))?;
     let rows: Vec<mysql::Row> = conn
@@ -728,7 +729,6 @@ fn render_cross_process_launch_config(
     let root = value
         .as_table_mut()
         .context("rendered cross-process launch config root must be a TOML table")?;
-
     // `role = fe` persists backend membership in StateStore.  Isolating only
     // `[metadata].path` leaves an ephemeral SQL-test FE restoring membership
     // rows from a previous launch, whose dynamically allocated BE endpoints
@@ -2905,6 +2905,18 @@ exec_node_output = true
         assert_ne!(
             first["state_store"]["path"], second["state_store"]["path"],
             "ephemeral clusters must not restore stale backend rows from another launch"
+        );
+        assert_eq!(
+            first["state_store"]["path"].as_str(),
+            first_runtime.join("state-store.sqlite").to_str()
+        );
+        assert_eq!(
+            second["state_store"]["path"].as_str(),
+            second_runtime.join("state-store.sqlite").to_str()
+        );
+        assert_ne!(
+            first["state_store"]["path"], second["state_store"]["path"],
+            "ephemeral clusters must not restore stale backend membership from another launch"
         );
         assert!(
             first["debug"].get("query_lifecycle_fault_dir").is_none(),

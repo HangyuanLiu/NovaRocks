@@ -24,43 +24,61 @@ CREATE TABLE ${case_db}.stage_phase_kill (
   delay_s BIGINT
 )
 TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.stage_phase_kill VALUES (1, 10), (2, 10), (3, 10);
+INSERT INTO ${case_db}.stage_phase_kill VALUES (1, 10);
+INSERT INTO ${case_db}.stage_phase_kill VALUES (2, 10);
+INSERT INTO ${case_db}.stage_phase_kill VALUES (3, 10);
 
 -- query 2
+-- @query_control_fragment_backend_limit=2
 -- @kill_query_at_lifecycle_phase=staging
 -- @expect_error=Query execution was interrupted
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
-SELECT COUNT(*) FROM ${case_db}.stage_phase_kill WHERE sleep(delay_s);
+SELECT SUM(left_side.id)
+FROM ${case_db}.stage_phase_kill left_side
+JOIN ${case_db}.stage_phase_kill right_side ON left_side.id = right_side.id
+WHERE sleep(left_side.delay_s);
 
 -- query 3
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.stage_phase_kill;
 
 -- query 4
+-- @query_control_fragment_backend_limit=2
 -- @kill_query_at_lifecycle_phase=staged
 -- @expect_error=Query execution was interrupted
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
-SELECT COUNT(*) FROM ${case_db}.stage_phase_kill WHERE sleep(delay_s);
+SELECT SUM(left_side.id)
+FROM ${case_db}.stage_phase_kill left_side
+JOIN ${case_db}.stage_phase_kill right_side ON left_side.id = right_side.id
+WHERE sleep(left_side.delay_s);
 
 -- query 5
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.stage_phase_kill;
 
 -- query 6
+-- @query_control_fragment_backend_limit=2
 -- @kill_query_at_lifecycle_phase=starting
 -- @expect_error=Query execution was interrupted
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
-SELECT COUNT(*) FROM ${case_db}.stage_phase_kill WHERE sleep(delay_s);
+SELECT SUM(left_side.id)
+FROM ${case_db}.stage_phase_kill left_side
+JOIN ${case_db}.stage_phase_kill right_side ON left_side.id = right_side.id
+WHERE sleep(left_side.delay_s);
 
 -- query 7
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.stage_phase_kill;
 
 -- query 8
+-- @query_control_fragment_backend_limit=2
 -- @kill_query_at_lifecycle_phase=running
 -- @expect_error=Query execution was interrupted
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
-SELECT COUNT(*) FROM ${case_db}.stage_phase_kill WHERE sleep(delay_s);
+SELECT SUM(left_side.id)
+FROM ${case_db}.stage_phase_kill left_side
+JOIN ${case_db}.stage_phase_kill right_side ON left_side.id = right_side.id
+WHERE sleep(left_side.delay_s);
 
 -- query 9
 -- @result_contains=3

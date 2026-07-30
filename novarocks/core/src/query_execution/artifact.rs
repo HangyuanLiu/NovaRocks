@@ -1121,6 +1121,10 @@ pub struct StagedDistributedQuery {
 }
 
 impl StagedDistributedQuery {
+    pub fn batches(&self) -> &[StageBatch] {
+        &self.batches
+    }
+
     pub fn start(
         self,
         barrier: &dyn QueryLaunchBarrier,
