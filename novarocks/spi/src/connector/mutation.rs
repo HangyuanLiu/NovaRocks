@@ -260,33 +260,48 @@ pub enum ConnectorPartitionTransform {
     Void { column: Arc<str> },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorColumnPath {
+    pub segments: Vec<Arc<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorColumnPosition {
+    Default,
+    First,
+    After { column: Arc<str> },
+    Before { column: Arc<str> },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectorSchemaChange {
     AddColumn {
+        parent: ConnectorColumnPath,
         column: ConnectorColumnDefinition,
+        position: ConnectorColumnPosition,
     },
     DropColumn {
-        name: Arc<str>,
-        if_exists: bool,
+        path: ConnectorColumnPath,
     },
     RenameColumn {
-        from: Arc<str>,
+        path: ConnectorColumnPath,
         to: Arc<str>,
     },
     ModifyColumn {
-        column: ConnectorColumnDefinition,
+        path: ConnectorColumnPath,
+        data_type: ConnectorDataType,
     },
     SetColumnNullability {
-        name: Arc<str>,
+        path: ConnectorColumnPath,
         nullable: bool,
     },
     ReorderColumn {
-        name: Arc<str>,
-        after: Option<Arc<str>>,
+        path: ConnectorColumnPath,
+        position: ConnectorColumnPosition,
     },
     SetColumnComment {
-        name: Arc<str>,
-        comment: Option<Arc<str>>,
+        path: ConnectorColumnPath,
+        comment: Arc<str>,
     },
 }
 
