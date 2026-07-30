@@ -410,7 +410,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 #[cfg(test)]
 mod tests {
     use super::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-    use novarocks::query_execution::contract::QueryId;
+    use novarocks::query_execution::contract::{DistributedQueryErrorKind, QueryId};
     use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 
     fn execution_id(attempt: u64) -> QueryExecutionId {
@@ -454,16 +454,10 @@ mod tests {
                 .all(|(left, right)| left != &right)
         );
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::FrontendBackendSnapshot;
-    use novarocks::query_execution::contract::DistributedQueryErrorKind;
 
     #[test]
     fn empty_captured_topology_rejects_distributed_scheduling() {
-        let error = match FrontendBackendSnapshot::new(Vec::new()) {
+        let error = match FrontendBackendSnapshot::for_test(Vec::new()) {
             Ok(_) => panic!("distributed scheduling requires at least one captured backend"),
             Err(error) => error,
         };

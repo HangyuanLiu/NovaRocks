@@ -50,7 +50,7 @@ mod tests {
     use crate::coordinator::execution::ready_lifecycle_transport_for_test;
     use crate::coordinator::query_registry::FrontendQueryRegistry;
     use crate::coordinator::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-    use crate::topology::FrontendTopologyController;
+    use crate::topology::ClusterBackendService;
 
     fn report_endpoint() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19040)
@@ -633,17 +633,12 @@ mod tests {
         let backends = fixture.backends().to_vec();
         let batch = fixture.result_batch();
         let request = fixture.into_request();
-        let topology = Arc::new(FrontendTopologyController::new(1));
-        for (_, endpoint) in &backends {
-            novarocks::query_execution::backend::BackendTopologyPort::add_backend(
-                topology.as_ref(),
-                *endpoint,
-            )
-            .unwrap();
-        }
         let dispatcher = Arc::new(RecordingDispatcher::with_result(batch));
         let scheduler =
             FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
+        let topology = Arc::new(ClusterBackendService::from_captured_targets_for_test(
+            &scheduler.live_targets(),
+        ));
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
             QueryId::new(41, 73),
             report_endpoint(),
