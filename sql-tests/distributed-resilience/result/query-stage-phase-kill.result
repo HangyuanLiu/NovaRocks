@@ -3,23 +3,23 @@
 -- query 2
 
 -- query 3
-total
-60
+count(*)
+3
 
 -- query 4
-total
-60
 
 -- query 5
-total
-60
+count(*)
+3
 
 -- query 6
-total
-60
 
 -- query 7
+count(*)
+3
 
 -- query 8
+
+-- query 9
 count(*)
 3

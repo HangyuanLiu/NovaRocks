@@ -63,6 +63,18 @@ JOIN ${case_db}.stage_start right_side
   ON left_side.id = right_side.id;
 
 -- query 6
+-- Start ACK suppression exercises the same unknown-outcome retry boundary as
+-- a dropped response. This is intentionally a success case while the current
+-- handler consumes one runner-owned suppression token.
+-- @suppress_start_ack_be_index=2
+-- @result_contains=60
+-- @be_log_contains=NOVAROCKS_START_ACK_SUPPRESSED
+SELECT SUM(left_side.payload) AS total
+FROM ${case_db}.stage_start left_side
+JOIN ${case_db}.stage_start right_side
+  ON left_side.id = right_side.id;
+
+-- query 7
 -- Fail the first local Stage prepare. The Stage barrier must reject before
 -- any participant can pass StartPreparedQuery.
 -- @fail_stage_prepare_ordinal=1
@@ -73,7 +85,7 @@ FROM ${case_db}.stage_start left_side
 JOIN ${case_db}.stage_start right_side
   ON left_side.id = right_side.id;
 
--- query 7
+-- query 8
 -- Health query after the failed attempt.
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.stage_start;
