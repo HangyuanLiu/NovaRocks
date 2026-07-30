@@ -17,6 +17,8 @@
 
 use super::super::{collect_scan_bindings, store_planned_starrocks_scan};
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 struct RejectResolver;
 
@@ -55,6 +57,27 @@ impl ScanBindingResolver for EmptyResolver {
 }
 
 #[test]
+fn scan_preparation_propagates_caller_cancellation() {
+    let context =
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(true)))
+            .expect("cancelled request context");
+    let err = match super::super::prepare_scan_bindings(
+        &plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot)),
+        &registry(vec![data_file("s3://bucket/current.parquet")]),
+        &context,
+        None,
+    ) {
+        Ok(_) => panic!("caller cancellation must reach the connector provider"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains("planned-files fixture observed caller cancellation"),
+        "{err}"
+    );
+}
+
+#[test]
 fn ordinary_current_snapshot_is_immutable_and_does_not_invoke_resolver() {
     let plan = plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot));
     let before = format!("{plan:#?}");
@@ -76,11 +99,13 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let registry = registry(vec![data_file("s3://bucket/explicit.parquet")]);
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
+    let context = crate::connector::test_request_context();
 
     collect_scan_bindings(
         0,
         &root,
         &registry,
+        &context,
         None,
         &mut seen_scan_node_ids,
         &mut bindings,
@@ -90,6 +115,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         0,
         &root,
         &registry,
+        &context,
         None,
         &mut seen_scan_node_ids,
         &mut bindings,

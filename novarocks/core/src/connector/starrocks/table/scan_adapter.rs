@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::starrocks::{
@@ -23,21 +24,22 @@ use crate::connector::scan_model::starrocks::{
     StarRocksScanSourceDescriptor, StarRocksStorageColumnDescriptor,
     StarRocksTabletSchemaDescriptor, validate_starrocks_source_descriptor,
 };
-use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext};
 use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
-};
-use crate::connector::starrocks::table::scan_planner::{
-    StarRocksTableScanPlanner, starrocks_scan_handle, starrocks_split,
 };
 use crate::runtime::scan_range;
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorReadSelector,
+    ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+};
 
 pub(crate) fn plan_native_starrocks_scan_with_compat(
     scan_node_id: i32,
     scan: &PlanScanNode,
     connectors: &ConnectorRegistry,
+    context: ConnectorRequestContext,
 ) -> Result<PlannedNativeStarRocksScan, String> {
     let ScanSource::StarRocks { db_id, table_id } = &scan.table.source else {
         return Err(format!(
@@ -52,15 +54,42 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
         }
     }
 
-    let planner = connectors.scan_planner("starrocks")?;
-    let table_handle = StarRocksTableScanPlanner::table_handle_from_source(
-        &scan.database,
-        &scan.table.name,
-        *db_id,
-        *table_id,
-    );
-    let scan_handle = planner.begin_scan(table_handle, BeginScanContext::default())?;
-    let handle = starrocks_scan_handle(&scan_handle)?;
+    let instance_id = super::provider::instance_id().map_err(|error| error.to_string())?;
+    let instance = connectors
+        .connector_instance(&instance_id)
+        .map_err(|error| error.to_string())?;
+    let table_handle = ConnectorTableHandle::try_new(
+        instance_id,
+        serde_json::to_vec(&super::provider::TablePayload {
+            database: scan.database.clone(),
+            table: scan.table.name.clone(),
+            db_id: *db_id,
+            table_id: *table_id,
+        })
+        .map(bytes::Bytes::from)
+        .map_err(|error| format!("encode StarRocks table handle: {error}"))?,
+    )
+    .map_err(|error| error.to_string())?;
+    let planned_scan = instance
+        .read()
+        .begin_scan(
+            &table_handle,
+            ConnectorBeginScanRequest {
+                projection: Vec::new(),
+                selector: ConnectorReadSelector::Current,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1).expect("nonzero"),
+                    max_bytes: NonZeroUsize::new(
+                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                    )
+                    .expect("nonzero"),
+                },
+                context: context.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let handle = super::provider::decode_scan(&planned_scan.handle)?;
     if handle.table.db_id != *db_id || handle.table.table_id != *table_id {
         return Err(format!(
             "StarRocks ScanNode node_id={scan_node_id} planned scan handle identity mismatch: source=({db_id}, {table_id}) handle=({}, {})",
@@ -68,26 +97,20 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
         ));
     }
 
-    let native_source = handle.native_source();
-    let source = StarRocksScanSourceDescriptor {
-        catalog_name: native_source.catalog_name,
-        db_id: native_source.db_id,
-        table_id: native_source.table_id,
-        schema_id: native_source.schema_id,
-        storage_columns: native_source
-            .storage_columns
-            .into_iter()
-            .map(|column| StarRocksStorageColumnDescriptor {
-                name: column.name,
-                unique_id: column.unique_id,
-                default_value: column.default_value,
-            })
-            .collect(),
-        tablet_schema: tablet_schema_descriptor(native_source.tablet_schema),
-    };
+    let source = handle.source;
     validate_starrocks_source_descriptor(scan_node_id, *db_id, *table_id, &source)?;
 
-    let splits = planner.plan_splits(&scan_handle, SplitPlanningContext::default())?;
+    let splits = instance
+        .read()
+        .plan_splits(
+            &planned_scan.handle,
+            ConnectorSplitPlanningRequest {
+                target_parallelism: NonZeroUsize::new(1).expect("parallelism is nonzero"),
+                max_split_bytes: None,
+                context,
+            },
+        )
+        .map_err(|error| error.to_string())?;
     if splits.is_empty() {
         return Err(format!(
             "StarRocks table {}.{} has no selected tablet splits",
@@ -97,7 +120,7 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
     let mut tablets = HashSet::new();
     let mut ranges = Vec::with_capacity(splits.len());
     for split in &splits {
-        let split = starrocks_split(split)?;
+        let split = super::provider::decode_split(split)?;
         if !tablets.insert(split.tablet_id) {
             return Err(format!(
                 "StarRocks ScanNode node_id={scan_node_id} has duplicate tablet_id={}",
@@ -111,6 +134,44 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
         )?);
     }
     Ok(PlannedNativeStarRocksScan { ranges, source })
+}
+
+pub(crate) fn source_descriptor(
+    runtime: &super::catalog::StarRocksTableRuntime,
+) -> Result<StarRocksScanSourceDescriptor, String> {
+    let storage_columns = runtime
+        .tablet_schema
+        .column
+        .iter()
+        .filter(|column| column.visible != Some(false))
+        .map(|column| {
+            let name = column
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| "StarRocks storage column name must not be empty".to_string())?;
+            Ok(StarRocksStorageColumnDescriptor {
+                name,
+                unique_id: column.unique_id,
+                default_value: column
+                    .default_value
+                    .as_ref()
+                    .map(|value| String::from_utf8(value.clone()))
+                    .transpose()
+                    .map_err(|error| {
+                        format!("StarRocks storage column default is not valid UTF-8: {error}")
+                    })?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(StarRocksScanSourceDescriptor {
+        catalog_name: super::INTERNAL_CATALOG_NAME.to_string(),
+        db_id: runtime.table.db_id,
+        table_id: runtime.table.table_id,
+        schema_id: runtime.table.current_schema_id,
+        storage_columns,
+        tablet_schema: tablet_schema_descriptor(runtime.tablet_schema.clone()),
+    })
 }
 
 fn tablet_schema_descriptor(schema: StarRocksTabletSchema) -> StarRocksTabletSchemaDescriptor {

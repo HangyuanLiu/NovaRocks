@@ -17,6 +17,7 @@
 
 //! Neutral frontend-facing backend topology and lifecycle boundary.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -27,14 +28,14 @@ use crate::runtime::endpoint::RuntimeEndpoint;
 /// Core intentionally has no registry singleton, heartbeat loop, or role-aware
 /// backend-management implementation. Composition roots inject this port.
 pub trait BackendTopologyPort: Send + Sync + 'static {
-    fn live_backends(&self) -> Vec<LiveBackendTarget>;
+    fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError>;
+
+    fn validate_snapshot(
+        &self,
+        expected: &BackendTopologySnapshot,
+    ) -> Result<(), BackendTopologyValidationError>;
 
     fn record_successful_fragment_submission(&self, backend_idx: usize);
-
-    fn install_metadata_store(
-        &self,
-        store: Arc<dyn BackendTopologyMetadataStore>,
-    ) -> Result<(), String>;
 
     fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
 
@@ -46,79 +47,96 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
 pub type BackendTopologyService = Arc<dyn BackendTopologyPort>;
 pub type BeId = u32;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendLifecycleState {
-    Registering,
-    Live,
-    Lost,
-    Decommissioning,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendTopologyError {
+    DuplicateBackendId { backend_idx: usize },
+    RevisionExhausted,
+    Unavailable { message: String },
 }
 
-impl BackendLifecycleState {
-    pub const fn as_str(self) -> &'static str {
+impl fmt::Display for BackendTopologyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Registering => "Registering",
-            Self::Live => "Live",
-            Self::Lost => "Lost",
-            Self::Decommissioning => "Decommissioning",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "Registering" => Ok(Self::Registering),
-            "Live" => Ok(Self::Live),
-            "Lost" => Ok(Self::Lost),
-            "Decommissioning" => Ok(Self::Decommissioning),
-            other => Err(format!("invalid persisted backend state '{other}'")),
+            Self::DuplicateBackendId { backend_idx } => {
+                write!(
+                    f,
+                    "backend topology snapshot contains duplicate backend id {backend_idx}"
+                )
+            }
+            Self::RevisionExhausted => write!(f, "backend topology revision space is exhausted"),
+            Self::Unavailable { message } => {
+                write!(f, "backend topology is unavailable: {message}")
+            }
         }
     }
 }
+
+impl std::error::Error for BackendTopologyError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PersistedBackendTopology {
-    backend_idx: usize,
-    endpoint: SocketAddr,
-    state: BackendLifecycleState,
+pub enum BackendTopologyValidationError {
+    RevisionChanged {
+        captured_revision: u64,
+        current_revision: u64,
+    },
+    GenerationChanged {
+        backend_idx: usize,
+        captured_generation: u64,
+        current_generation: u64,
+        captured_revision: u64,
+        current_revision: u64,
+    },
+    TargetMissing {
+        backend_idx: usize,
+        captured_generation: u64,
+        captured_revision: u64,
+        current_revision: u64,
+    },
+    ContentChangedWithoutRevision {
+        revision: u64,
+    },
+    Unavailable(BackendTopologyError),
 }
 
-impl PersistedBackendTopology {
-    pub const fn new(
-        backend_idx: usize,
-        endpoint: SocketAddr,
-        state: BackendLifecycleState,
-    ) -> Self {
-        Self {
-            backend_idx,
-            endpoint,
-            state,
+impl fmt::Display for BackendTopologyValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RevisionChanged {
+                captured_revision,
+                current_revision,
+            } => write!(
+                f,
+                "backend topology changed: captured revision {captured_revision}, current revision {current_revision}"
+            ),
+            Self::GenerationChanged {
+                backend_idx,
+                captured_generation,
+                current_generation,
+                captured_revision,
+                current_revision,
+            } => write!(
+                f,
+                "backend {backend_idx} generation changed: captured {captured_generation} at revision {captured_revision}, current {current_generation} at revision {current_revision}"
+            ),
+            Self::TargetMissing {
+                backend_idx,
+                captured_generation,
+                captured_revision,
+                current_revision,
+            } => write!(
+                f,
+                "backend {backend_idx} generation {captured_generation} from revision {captured_revision} is no longer live at revision {current_revision}"
+            ),
+            Self::ContentChangedWithoutRevision { revision } => write!(
+                f,
+                "backend topology content changed without a revision advance at revision {revision}"
+            ),
+            Self::Unavailable(error) => error.fmt(f),
         }
     }
-
-    pub const fn backend_idx(&self) -> usize {
-        self.backend_idx
-    }
-
-    pub const fn endpoint(&self) -> SocketAddr {
-        self.endpoint
-    }
-
-    pub const fn state(&self) -> BackendLifecycleState {
-        self.state
-    }
 }
 
-/// Synchronous metadata boundary used by the frontend topology owner.
-///
-/// Core supplies the adapter over its existing metadata repository; frontend
-/// owns lifecycle policy and never imports the repository implementation.
-pub trait BackendTopologyMetadataStore: Send + Sync + 'static {
-    fn load_backends(&self) -> Result<Vec<PersistedBackendTopology>, String>;
-
-    fn upsert_backend(&self, backend: PersistedBackendTopology) -> Result<(), String>;
-
-    fn delete_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
-}
+impl std::error::Error for BackendTopologyValidationError {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendTopologyMetricsSnapshot {
@@ -240,6 +258,58 @@ impl LiveBackendTarget {
     }
 }
 
+/// An immutable, versioned view of the backend targets available when a
+/// request was admitted. The owner is responsible for advancing `revision`
+/// for every membership or generation change.
+// Design: ADR-0011 (docs/adr/ADR-0011-immutable-request-execution-context.md)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendTopologySnapshot {
+    revision: u64,
+    targets: Arc<[LiveBackendTarget]>,
+}
+
+impl BackendTopologySnapshot {
+    pub fn try_new(
+        revision: u64,
+        mut targets: Vec<LiveBackendTarget>,
+    ) -> Result<Self, BackendTopologyError> {
+        targets.sort_by_key(|target| target.backend_idx());
+        for pair in targets.windows(2) {
+            if pair[0].backend_idx() == pair[1].backend_idx() {
+                return Err(BackendTopologyError::DuplicateBackendId {
+                    backend_idx: pair[0].backend_idx(),
+                });
+            }
+        }
+        Ok(Self {
+            revision,
+            targets: targets.into(),
+        })
+    }
+
+    pub fn empty(revision: u64) -> Self {
+        Self {
+            revision,
+            targets: Arc::from([]),
+        }
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn targets(&self) -> &[LiveBackendTarget] {
+        &self.targets
+    }
+
+    pub fn target(&self, backend_idx: usize) -> Option<LiveBackendTarget> {
+        self.targets
+            .binary_search_by_key(&backend_idx, |target| target.backend_idx())
+            .ok()
+            .map(|index| self.targets[index])
+    }
+}
+
 /// Frontend-owned query activity consumed by the core backend registry.
 ///
 /// The sink owns query-wide failure and exact remote cancellation. Core only
@@ -283,18 +353,29 @@ pub(crate) struct NoopBackendTopologyPort;
 
 #[cfg(test)]
 impl BackendTopologyPort for NoopBackendTopologyPort {
-    fn live_backends(&self) -> Vec<LiveBackendTarget> {
-        Vec::new()
+    fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+        Ok(BackendTopologySnapshot::empty(0))
+    }
+
+    fn validate_snapshot(
+        &self,
+        expected: &BackendTopologySnapshot,
+    ) -> Result<(), BackendTopologyValidationError> {
+        let current = self
+            .snapshot()
+            .map_err(BackendTopologyValidationError::Unavailable)?;
+        if current == *expected {
+            Ok(())
+        } else {
+            Err(
+                BackendTopologyValidationError::ContentChangedWithoutRevision {
+                    revision: expected.revision(),
+                },
+            )
+        }
     }
 
     fn record_successful_fragment_submission(&self, _backend_idx: usize) {}
-
-    fn install_metadata_store(
-        &self,
-        _store: Arc<dyn BackendTopologyMetadataStore>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
 
     fn add_backend(&self, _endpoint: SocketAddr) -> Result<(), String> {
         Err("backend topology port is not installed".to_string())
@@ -311,11 +392,53 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 
 #[cfg(test)]
 mod tests {
-    use super::CoordinatorReportEndpoint;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::{
+        BackendTopologyError, BackendTopologySnapshot, CoordinatorReportEndpoint, LiveBackendTarget,
+    };
 
     #[test]
     fn coordinator_report_endpoint_accepts_advertised_dns_hostnames() {
         CoordinatorReportEndpoint::new("frontend.internal", 19070)
             .expect("advertised DNS hostname is a valid same-wire endpoint");
+    }
+
+    #[test]
+    fn topology_snapshot_sorts_targets_by_backend_id() {
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030);
+        let snapshot = BackendTopologySnapshot::try_new(
+            7,
+            vec![
+                LiveBackendTarget::new(9, endpoint, 1),
+                LiveBackendTarget::new(2, endpoint, 3),
+            ],
+        )
+        .expect("distinct targets form a snapshot");
+
+        assert_eq!(snapshot.revision(), 7);
+        assert_eq!(
+            snapshot
+                .targets()
+                .iter()
+                .map(|target| target.backend_idx())
+                .collect::<Vec<_>>(),
+            vec![2, 9]
+        );
+    }
+
+    #[test]
+    fn topology_snapshot_rejects_duplicate_backend_ids() {
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030);
+        assert_eq!(
+            BackendTopologySnapshot::try_new(
+                7,
+                vec![
+                    LiveBackendTarget::new(2, endpoint, 1),
+                    LiveBackendTarget::new(2, endpoint, 2),
+                ],
+            ),
+            Err(BackendTopologyError::DuplicateBackendId { backend_idx: 2 })
+        );
     }
 }

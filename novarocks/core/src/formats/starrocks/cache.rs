@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::cache::{DataCacheManager, DataCachePageKey};
+use novarocks_fs::{DataCacheManager, DataCachePageKey};
 
 use super::segment::StarRocksSegmentFooter;
 

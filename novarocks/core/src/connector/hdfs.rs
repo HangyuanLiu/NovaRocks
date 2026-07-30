@@ -14,30 +14,730 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array,
     TimestampMicrosecondArray, new_null_array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCancellation,
+    ConnectorError, ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
+    ConnectorReaderMetricsSnapshot, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
 
+use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::runtime_scan_predicate::RuntimeScanPredicateCounters;
+use crate::connector::ConnectorRegistry;
+use crate::connector::file_execution::{
+    FileScanContext, FileScanRange, bind_foundation_file, foundation_read_context,
+};
+use crate::connector::host::ConnectorTransportFactory;
 use crate::connector::iceberg::delete_file::{IcebergDeleteFileSpec, IcebergFileContent};
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningCounters};
 use crate::connector::iceberg::position_delete::load_position_deletes;
-use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{
-    BoundScanRanges, HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
-    ScanMorselPruneDecision, ScanMorsels, ScanOp, ScanSource,
+use crate::connector::runtime::{
+    ConnectorReadAuxiliary, ConnectorReadCoreFacet, ConnectorReadScanSource,
+    ConnectorScheduledSplit, ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
-use crate::formats::{FileFormatConfig, build_format_iter};
-use crate::fs::scan_context::{FileScanContext, FileScanRange};
+use crate::exec::node::scan::{
+    HdfsScanFileFormat, IncrementalScanRange, ScanMorsel, ScanMorselPruneDecision, ScanMorsels,
+    ScanSource,
+};
+use crate::formats::FileFormatConfig;
+use crate::formats::parquet::{
+    FoundationParquetAdapter, ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind,
+    foundation_scan_predicates,
+};
 use crate::runtime::profile::RuntimeProfile;
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime_filter::exec::ordered_range_predicate::NativeOrderedRangePredicate;
+use novarocks_fs::{
+    DataCacheContext, FileBatchReader as FoundationBatchReader, FileCancellation, FileError,
+    FileErrorKind, FileFormat, FileProjection, FileReadBudget, FileReadContext, FileReadRequest,
+    FileTask, PhysicalPruning, open_file_reader,
+};
+
+const HDFS_SPI_PROVIDER_ID: &str = "hdfs";
+
+/// BE-local native transport factory for file-backed connector reads. The
+/// provider reads object-store access from startup config; transport payloads
+/// are limited to provider-owned scan state and core file sidecars.
+pub(crate) struct HdfsNativeTransportFactory {
+    provider_id: ConnectorProviderId,
+}
+
+impl HdfsNativeTransportFactory {
+    pub(crate) fn new() -> Self {
+        Self {
+            provider_id: ConnectorProviderId::parse(HDFS_SPI_PROVIDER_ID)
+                .expect("static HDFS provider ID is valid"),
+        }
+    }
+}
+
+impl ConnectorTransportFactory for HdfsNativeTransportFactory {
+    fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
+    }
+
+    fn materialize(
+        &self,
+        instance_id: ConnectorInstanceId,
+        scan_payload: bytes::Bytes,
+        file_ranges: &[FileScanRange],
+        output_schema: crate::exec::chunk::ChunkSchemaRef,
+    ) -> Result<ConnectorInstance, ConnectorError> {
+        if !scan_payload.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS native transport scan payload must be empty",
+            ));
+        }
+        let cache_options = CacheOptions::from_query_options(None).map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+        })?;
+        let object_store_config = crate::common::app_config::config()
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error.to_string()))?
+            .connector
+            .object_store_config()
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
+        let parquet = ParquetScanConfig {
+            columns: output_schema
+                .slots()
+                .iter()
+                .map(|slot| slot.name().to_string())
+                .collect(),
+            chunk_schema: output_schema.clone(),
+            slot_kinds: output_schema
+                .slots()
+                .iter()
+                .map(|_| ParquetSlotKind::Regular)
+                .collect(),
+            case_sensitive: true,
+            enable_page_index: false,
+            min_max_predicates: Vec::new(),
+            runtime_min_max_filter_columns: HashMap::new(),
+            variant_path_predicates: Vec::new(),
+            batch_size: None,
+            datacache: DataCacheContext::external(cache_options.to_file_cache_options()),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: Some("native_connector_hdfs".to_string()),
+            iceberg_output_schema: Some(output_schema.arrow_schema_ref()),
+            variant_path_columns: Vec::new(),
+            query_global_dicts: Default::default(),
+        };
+        Arc::new(HdfsConnectorInstance::new(
+            instance_id,
+            HdfsInstanceConfig {
+                scan: HdfsScanConfig {
+                    original_range_count: file_ranges.len(),
+                    ranges: file_ranges.to_vec(),
+                    has_more: false,
+                    limit: None,
+                    profile_label: Some("native_connector_hdfs".to_string()),
+                    format: Some(FileFormatConfig::Parquet(parquet)),
+                    object_store_config,
+                    iceberg_table_locations: HashMap::new(),
+                    query_global_dicts: Default::default(),
+                    iceberg_runtime_pruning: None,
+                },
+                chunk_schema: output_schema,
+            },
+        ))
+        .connector_instance()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HdfsInstanceConfig {
+    pub(crate) scan: HdfsScanConfig,
+    pub(crate) chunk_schema: crate::exec::chunk::ChunkSchemaRef,
+}
+
+impl HdfsInstanceConfig {
+    fn reader_chunk_schema(&self) -> crate::exec::chunk::ChunkSchemaRef {
+        match self.scan.format.as_ref() {
+            Some(FileFormatConfig::Parquet(config)) => Arc::clone(&config.chunk_schema),
+            Some(FileFormatConfig::Orc(config)) => Arc::clone(&config.chunk_schema),
+            None => Arc::clone(&self.chunk_schema),
+        }
+    }
+}
+
+pub(crate) struct HdfsConnectorInstance {
+    instance_id: ConnectorInstanceId,
+    config: HdfsInstanceConfig,
+    ranges: Mutex<Vec<FileScanRange>>,
+    next_scan_range_id: AtomicI32,
+    incremental_lock: Mutex<()>,
+}
+
+impl HdfsConnectorInstance {
+    pub(crate) fn new(instance_id: ConnectorInstanceId, config: HdfsInstanceConfig) -> Self {
+        let next_scan_range_id = config
+            .scan
+            .ranges
+            .iter()
+            .filter_map(|range| (range.scan_range_id >= 0).then_some(range.scan_range_id))
+            .max()
+            .map(|value| value.saturating_add(1))
+            .unwrap_or(0);
+        let ranges = config.scan.ranges.clone();
+        Self {
+            instance_id,
+            config,
+            ranges: Mutex::new(ranges),
+            next_scan_range_id: AtomicI32::new(next_scan_range_id),
+            incremental_lock: Mutex::new(()),
+        }
+    }
+
+    pub(crate) fn connector_instance(self: Arc<Self>) -> Result<ConnectorInstance, ConnectorError> {
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(HDFS_SPI_PROVIDER_ID)?,
+                instance_id: self.instance_id.clone(),
+            },
+            None,
+            self,
+        )
+    }
+
+    fn validate_context(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
+        if context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn split_for_index(&self, index: usize) -> Result<ConnectorSplit, ConnectorError> {
+        let ranges = self.ranges.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "HDFS range state lock poisoned",
+            )
+        })?;
+        let range = ranges.get(index).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS split index is out of bounds",
+            )
+        })?;
+        ConnectorSplit::try_new(
+            self.instance_id.clone(),
+            format!("hdfs-{index}"),
+            bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+            Some(range.length),
+        )
+    }
+
+    fn range_for_index(&self, index: usize) -> Result<FileScanRange, ConnectorError> {
+        self.ranges
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "HDFS range state lock poisoned",
+                )
+            })?
+            .get(index)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "HDFS split index is out of bounds",
+                )
+            })
+    }
+
+    fn range_count(&self) -> Result<usize, ConnectorError> {
+        self.ranges.lock().map(|ranges| ranges.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "HDFS range state lock poisoned",
+            )
+        })
+    }
+
+    fn split_index(&self, split: &ConnectorSplit) -> Result<usize, ConnectorError> {
+        if split.owner() != &self.instance_id || split.payload().len() != 8 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid HDFS split payload",
+            ));
+        }
+        let bytes: [u8; 8] = split
+            .payload()
+            .as_ref()
+            .try_into()
+            .expect("payload length checked");
+        usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS split index overflows usize",
+            )
+        })
+    }
+
+    fn prepare_incremental_ranges(
+        &self,
+        scan_ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String> {
+        let _append = self
+            .incremental_lock
+            .lock()
+            .map_err(|_| "HDFS incremental range lock poisoned".to_string())?;
+        let ranges = self
+            .ranges
+            .lock()
+            .map_err(|_| "HDFS range state lock poisoned".to_string())?;
+        let row_position_scan = ranges
+            .iter()
+            .any(|range| range.scan_range_id >= 0 || range.first_row_id.is_some());
+        let expected_file_format = match self.config.scan.format.as_ref() {
+            Some(FileFormatConfig::Parquet(_)) => Some(HdfsScanFileFormat::Parquet),
+            Some(FileFormatConfig::Orc(_)) => Some(HdfsScanFileFormat::Orc),
+            None => None,
+        };
+        let mut next_scan_range_id = self.next_scan_range_id.load(Ordering::Acquire);
+        let mut has_more = false;
+        let mut appended = Vec::new();
+
+        for scan_range in scan_ranges {
+            if let Some(value) = scan_range.has_more() {
+                has_more = value;
+            }
+            let IncrementalScanRange::Hdfs {
+                range: hdfs_range, ..
+            } = scan_range
+            else {
+                continue;
+            };
+            if let Some(expected) = expected_file_format {
+                let file_format = hdfs_range.file_format.ok_or_else(|| {
+                    "incremental hdfs scan range is missing file_format".to_string()
+                })?;
+                if file_format != expected {
+                    return Err(format!(
+                        "incremental hdfs scan range file_format mismatch: expected {:?}, got {:?}",
+                        expected, file_format
+                    ));
+                }
+            }
+            let path = if let Some(path) = hdfs_range
+                .full_path
+                .as_ref()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+            {
+                path.to_string()
+            } else if let Some(relative_path) = hdfs_range
+                .relative_path
+                .as_ref()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+            {
+                let table_id = hdfs_range.table_id.ok_or_else(|| {
+                    "incremental hdfs scan range has relative_path but missing table_id".to_string()
+                })?;
+                let base = self
+                    .config
+                    .scan
+                    .iceberg_table_locations
+                    .get(&table_id)
+                    .map(|location| location.trim_end_matches('/'))
+                    .ok_or_else(|| {
+                        format!(
+                            "incremental hdfs scan range missing cached iceberg location for table_id={table_id}"
+                        )
+                    })?;
+                let relative_path = relative_path.trim_start_matches('/');
+                if relative_path.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base}/{relative_path}")
+                }
+            } else {
+                return Err(
+                    "incremental hdfs scan range requires non-empty full_path or relative_path"
+                        .to_string(),
+                );
+            };
+            let file_len = u64::try_from(hdfs_range.file_length).unwrap_or(0);
+            let offset = u64::try_from(hdfs_range.offset).unwrap_or(0);
+            let mut length = u64::try_from(hdfs_range.length).unwrap_or(0);
+            if length == 0 && file_len > offset {
+                length = file_len - offset;
+            }
+            let (scan_range_id, first_row_id) = if row_position_scan {
+                let first_row_id = hdfs_range.first_row_id.ok_or_else(|| {
+                    "incremental hdfs scan range missing first_row_id for row position scan"
+                        .to_string()
+                })?;
+                let scan_range_id = next_scan_range_id;
+                next_scan_range_id = next_scan_range_id.saturating_add(1);
+                (scan_range_id, Some(first_row_id))
+            } else {
+                (-1, None)
+            };
+            let delete_files = if let Some(range) = ranges.iter().find(|range| {
+                range.path == path && range.offset == offset && range.length == length
+            }) {
+                range.delete_files.clone()
+            } else {
+                let same_path_delete_file_count = ranges
+                    .iter()
+                    .filter(|range| range.path == path && !range.delete_files.is_empty())
+                    .count();
+                if same_path_delete_file_count > 0 {
+                    return Err(format!(
+                        "incremental HDFS range cannot safely reuse lowered Iceberg delete files for \
+                         path={path} offset={offset} length={length}; found \
+                         {same_path_delete_file_count} same-path lowered range(s) with delete files but \
+                         no exact match"
+                    ));
+                }
+                Vec::new()
+            };
+            appended.push(FileScanRange {
+                path,
+                file_len,
+                offset,
+                length,
+                scan_range_id,
+                first_row_id,
+                data_sequence_number: None,
+                ivm_change_op: hdfs_range.ivm_change_op,
+                included_positions: None,
+                external_datacache: hdfs_range.external_datacache.clone(),
+                delete_files,
+                iceberg_file_pruning: None,
+            });
+        }
+
+        let start = ranges.len();
+        let scheduled = appended
+            .into_iter()
+            .enumerate()
+            .map(|(offset, range)| {
+                let index = start + offset;
+                ConnectorSplit::try_new(
+                    self.instance_id.clone(),
+                    format!("hdfs-{index}"),
+                    bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+                    Some(range.length),
+                )
+                .map(|split| ConnectorScheduledSplit::file(split, range))
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ConnectorSplitAppend::Scheduled {
+            scheduled,
+            has_more,
+        })
+    }
+
+    fn commit_incremental_ranges(&self, append: &ConnectorSplitAppend) -> Result<(), String> {
+        let scheduled = append.scheduled_file_splits().ok_or_else(|| {
+            "HDFS incremental append must retain scheduled file split sidecars".to_string()
+        })?;
+        let _append = self
+            .incremental_lock
+            .lock()
+            .map_err(|_| "HDFS incremental range lock poisoned".to_string())?;
+        let mut ranges = self
+            .ranges
+            .lock()
+            .map_err(|_| "HDFS range state lock poisoned".to_string())?;
+        let start = ranges.len();
+        let mut next_scan_range_id = self.next_scan_range_id.load(Ordering::Acquire);
+        let mut prepared_ranges = Vec::with_capacity(scheduled.len());
+
+        for (offset, scheduled) in scheduled.iter().enumerate() {
+            let index = start + offset;
+            let expected_payload = bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes());
+            let split = scheduled.split();
+            if split.owner() != &self.instance_id
+                || split.split_id() != format!("hdfs-{index}")
+                || split.payload() != &expected_payload
+            {
+                return Err(
+                    "HDFS incremental append no longer matches provider range state".to_string(),
+                );
+            }
+            let range = scheduled.file_range().ok_or_else(|| {
+                "HDFS incremental append is missing its file range sidecar".to_string()
+            })?;
+            if range.scan_range_id >= 0 {
+                let next = range
+                    .scan_range_id
+                    .checked_add(1)
+                    .ok_or_else(|| "HDFS scan range ID overflowed".to_string())?;
+                next_scan_range_id = next_scan_range_id.max(next);
+            }
+            prepared_ranges.push(range.clone());
+        }
+
+        ranges.extend(prepared_ranges);
+        self.next_scan_range_id
+            .store(next_scan_range_id, Ordering::Release);
+        Ok(())
+    }
+}
+
+struct HdfsIncrementalSplitAdapter {
+    provider: Arc<HdfsConnectorInstance>,
+}
+
+impl IncrementalConnectorSplitAdapter for HdfsIncrementalSplitAdapter {
+    fn prepare_incremental_ranges(
+        &self,
+        ranges: &[IncrementalScanRange],
+    ) -> Result<ConnectorSplitAppend, String> {
+        self.provider.prepare_incremental_ranges(ranges)
+    }
+
+    fn commit_incremental_ranges(&self, append: &ConnectorSplitAppend) -> Result<(), String> {
+        self.provider.commit_incremental_ranges(append)
+    }
+}
+
+pub(crate) fn plan_hdfs_read_source(
+    connectors: &ConnectorRegistry,
+    instance_id: ConnectorInstanceId,
+    config: HdfsInstanceConfig,
+    batch: ConnectorBatchBudget,
+    context: ConnectorRequestContext,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let provider = Arc::new(HdfsConnectorInstance::new(instance_id, config));
+    let auxiliary = Arc::new(HdfsDeleteAuxiliary::new(
+        provider.config.scan.object_store_config.clone(),
+    ));
+    let scheduled = (0..provider.range_count()?)
+        .map(|index| {
+            Ok(ConnectorScheduledSplit::file(
+                provider.split_for_index(index)?,
+                provider.range_for_index(index)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    // File readers return only their physical/core-adapted read schema. Iceberg virtual and
+    // row-lineage columns belong to the core scan runner and are appended after this SPI
+    // boundary, so validating against the final scan output schema would reject valid batches.
+    let chunk_schema = provider.config.reader_chunk_schema();
+    let expected_schema = chunk_schema.arrow_schema_ref();
+    let has_more = provider.config.scan.has_more;
+    let incremental = has_more.then(|| {
+        Arc::new(HdfsIncrementalSplitAdapter {
+            provider: Arc::clone(&provider),
+        }) as Arc<dyn IncrementalConnectorSplitAdapter>
+    });
+    let instance = Arc::clone(&provider).connector_instance()?;
+    let (instance, lifecycle) = connectors
+        .register_ephemeral_connector_instance(instance)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string()))?;
+    let facet = Arc::new(HdfsRuntimePruningFacet::new(provider.config.scan.clone()));
+    Ok(Arc::new(
+        ConnectorReadScanSource::new_scheduled_ephemeral_with_incremental(
+            instance,
+            scheduled,
+            ConnectorOpenReaderRequest {
+                expected_schema,
+                batch,
+                context,
+            },
+            chunk_schema,
+            lifecycle,
+            incremental,
+            has_more,
+            Some(auxiliary),
+        )
+        .with_core_facet(facet),
+    ))
+}
+
+struct HdfsQueryCancellation {
+    query_id: QueryId,
+}
+
+impl ConnectorCancellation for HdfsQueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        query_context_manager().is_query_canceled(self.query_id)
+    }
+}
+
+pub(crate) fn plan_starrocks_hdfs_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: QueryId,
+    node_id: i32,
+    config: HdfsInstanceConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let batch = ConnectorBatchBudget {
+        max_rows: rows,
+        max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+            .expect("SPI handle maximum is nonzero"),
+    };
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(HdfsQueryCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )?;
+    plan_hdfs_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("hdfs.{query_id}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
+}
+
+struct NativeHdfsCancellation {
+    query_id: Option<QueryId>,
+}
+
+impl ConnectorCancellation for NativeHdfsCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.query_id
+            .is_some_and(|query_id| query_context_manager().is_query_canceled(query_id))
+    }
+}
+
+pub(crate) fn plan_native_hdfs_read_source(
+    connectors: &ConnectorRegistry,
+    query_id: Option<QueryId>,
+    node_id: i32,
+    config: HdfsInstanceConfig,
+    query_options: &QueryOptions,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let rows = query_options
+        .batch_size
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(4096).expect("default batch size is nonzero"));
+    let batch = ConnectorBatchBudget {
+        max_rows: rows,
+        max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+            .expect("SPI handle maximum is nonzero"),
+    };
+    let (_, query_expire) = query_expire_durations(Some(query_options));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + query_expire,
+        Arc::new(NativeHdfsCancellation { query_id }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )?;
+    let instance_query_id = query_id
+        .map(|query_id| query_id.to_string())
+        .unwrap_or_else(|| "unidentified".to_string());
+    plan_hdfs_read_source(
+        connectors,
+        ConnectorInstanceId::parse(&format!("hdfs.native.{instance_query_id}.{node_id}"))?,
+        config,
+        batch,
+        context,
+    )
+}
+
+impl ConnectorRead for HdfsConnectorInstance {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        table: &ConnectorTableHandle,
+        request: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        self.validate_context(&request.context)?;
+        if table.owner() != &self.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS table handle belongs to another instance",
+            ));
+        }
+        Ok(ConnectorScan {
+            handle: ConnectorScanHandle::try_new(self.instance_id.clone(), bytes::Bytes::new())?,
+            output_schema: self.config.reader_chunk_schema().arrow_schema_ref(),
+        })
+    }
+
+    fn plan_splits(
+        &self,
+        scan: &ConnectorScanHandle,
+        request: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        if scan.owner() != &self.instance_id || !scan.payload().is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid HDFS scan handle",
+            ));
+        }
+        (0..self.range_count()?)
+            .map(|index| self.split_for_index(index))
+            .collect()
+    }
+
+    fn open_reader(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        if request.expected_schema.as_ref()
+            != self
+                .config
+                .reader_chunk_schema()
+                .arrow_schema_ref()
+                .as_ref()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HDFS reader expected schema does not match decoded output schema",
+            ));
+        }
+        let index = self.split_index(split)?;
+        let range = self.range_for_index(index)?;
+        let mut scan = self.config.scan.clone();
+        scan.original_range_count = 1;
+        scan.ranges = vec![range];
+        Ok(Box::new(HdfsFileBatchReader::new(
+            scan,
+            request.context,
+            request.batch.max_rows.get(),
+            request.batch.max_bytes.get(),
+        )?))
+    }
+}
 
 fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
     delete_files
@@ -189,7 +889,7 @@ pub struct HdfsScanConfig {
     /// OSS credentials supplied by FE via `THdfsScanNode.cloud_configuration`.
     /// Used as a fallback when the shard registry has no entry for the scanned path
     /// (typical for Iceberg external tables whose files are not tracked as lake tablets).
-    pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    pub object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
     /// Cached Iceberg table locations keyed by `table_id`, used to resolve incremental
     /// scan ranges that only carry `relative_path`.
     pub iceberg_table_locations: HashMap<i64, String>,
@@ -201,8 +901,520 @@ pub struct HdfsScanConfig {
     pub iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
 }
 
+/// Provider-owned pull reader for file ranges. It deliberately has no core
+/// `ScanOp` dependency and returns Arrow batches to the SPI boundary.
+pub(crate) struct HdfsFileBatchReader {
+    cfg: HdfsScanConfig,
+    ranges: VecDeque<FileScanRange>,
+    current: Option<FoundationCurrentReader>,
+    context: ConnectorRequestContext,
+    file_context: FileReadContext,
+    cancellation_watch: Option<FileTask>,
+    max_rows: usize,
+    max_bytes: usize,
+    completed_metrics: ConnectorReaderMetricsSnapshot,
+    closed: bool,
+}
+
+enum FoundationCurrentReader {
+    Parquet {
+        reader: Box<dyn FoundationBatchReader>,
+        adapter: FoundationParquetAdapter,
+    },
+    Orc {
+        reader: Box<dyn FoundationBatchReader>,
+        cfg: crate::formats::orc::OrcScanConfig,
+    },
+}
+
+impl FoundationCurrentReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        match self {
+            Self::Parquet { reader, adapter } => reader
+                .next_batch()
+                .map_err(map_file_error)?
+                .map(|physical| {
+                    adapter
+                        .adapt(physical.batch)
+                        .map(|(batch, _)| batch)
+                        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+                })
+                .transpose(),
+            Self::Orc { reader, cfg } => reader
+                .next_batch()
+                .map_err(map_file_error)?
+                .map(|physical| {
+                    crate::formats::orc::adapt_foundation_batch(cfg, physical.batch)
+                        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+                })
+                .transpose(),
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        match self {
+            Self::Parquet { reader, .. } | Self::Orc { reader, .. } => {
+                reader.close().map_err(map_file_error)
+            }
+        }
+    }
+
+    fn metrics_snapshot(&self) -> ConnectorReaderMetricsSnapshot {
+        match self {
+            Self::Parquet { reader, .. } | Self::Orc { reader, .. } => {
+                connector_file_metrics(reader.metrics_snapshot())
+            }
+        }
+    }
+}
+
+impl HdfsFileBatchReader {
+    pub(crate) fn new(
+        mut cfg: HdfsScanConfig,
+        context: ConnectorRequestContext,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self, ConnectorError> {
+        let ranges = std::mem::take(&mut cfg.ranges);
+        let cancellation = FileCancellation::new();
+        let file_context = foundation_read_context(cancellation.clone(), Some(context.deadline()))
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+        let spi_cancellation = Arc::clone(context.cancellation());
+        let watch_cancellation = cancellation.clone();
+        let cancellation_watch = file_context
+            .task_spawner
+            .spawn(Box::pin(async move {
+                loop {
+                    if spi_cancellation.is_cancelled() {
+                        watch_cancellation.cancel();
+                        break;
+                    }
+                    if watch_cancellation.is_cancelled() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }))
+            .map_err(map_file_error)?;
+        Ok(Self {
+            cfg,
+            ranges: VecDeque::from(ranges),
+            current: None,
+            context,
+            file_context,
+            cancellation_watch: Some(cancellation_watch),
+            max_rows,
+            max_bytes,
+            completed_metrics: ConnectorReaderMetricsSnapshot::default(),
+            closed: false,
+        })
+    }
+
+    fn validate_context(&self) -> Result<(), ConnectorError> {
+        if self.context.cancellation().is_cancelled() {
+            self.file_context.cancellation.cancel();
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= self.context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_range(&self, range: FileScanRange) -> Result<FoundationCurrentReader, ConnectorError> {
+        let external_datacache = range
+            .external_datacache
+            .as_ref()
+            .map(novarocks_fs::ExternalDataCacheRangeOptions::from);
+        let (file, read_range) = bind_foundation_file(
+            &range,
+            self.cfg.object_store_config.as_ref(),
+            &self.file_context,
+        )
+        .map_err(map_file_error)?;
+        let format = self.cfg.format.clone().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "file reader is missing its physical format",
+            )
+        })?;
+        let budget = foundation_file_budget(self.max_rows, self.max_bytes)?;
+        match format {
+            FileFormatConfig::Parquet(mut cfg) => {
+                cfg.datacache = cfg
+                    .datacache
+                    .with_external_range_options(external_datacache.as_ref())
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                cfg.query_global_dicts = self.cfg.query_global_dicts.clone();
+                apply_parquet_pruning_gate_for_delete_files(&mut cfg, &range.delete_files);
+                // SPI-3R1 snapshots only provider-owned static predicates here. Core runtime
+                // filters remain correctness-preserving residuals until a provider-neutral
+                // Connector pushdown capability is designed; passing RuntimeFilterContext or a
+                // core callback into novarocks-fs would invert the dependency boundary.
+                let predicates = foundation_scan_predicates(&cfg, None)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                let adapter = FoundationParquetAdapter::try_new(cfg.clone())
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                let cache = (cfg.cache_policy.enable_metacache
+                    || cfg.cache_policy.enable_pagecache)
+                    .then_some(cfg.datacache);
+                let reader = open_file_reader(FileReadRequest {
+                    file,
+                    format: FileFormat::Parquet,
+                    range: read_range,
+                    projection: FileProjection::All,
+                    budget,
+                    predicates,
+                    pruning: PhysicalPruning::default(),
+                    cache,
+                    context: self.file_context.clone(),
+                })
+                .map_err(map_file_error)?;
+                Ok(FoundationCurrentReader::Parquet { reader, adapter })
+            }
+            FileFormatConfig::Orc(mut cfg) => {
+                cfg.datacache = cfg
+                    .datacache
+                    .with_external_range_options(external_datacache.as_ref())
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+                let reader = open_file_reader(FileReadRequest {
+                    file,
+                    format: FileFormat::Orc,
+                    range: read_range,
+                    projection: FileProjection::All,
+                    budget,
+                    predicates: Vec::new(),
+                    pruning: PhysicalPruning::default(),
+                    cache: Some(cfg.datacache.clone()),
+                    context: self.file_context.clone(),
+                })
+                .map_err(map_file_error)?;
+                Ok(FoundationCurrentReader::Orc { reader, cfg })
+            }
+        }
+    }
+}
+
+impl ConnectorBatchReader for HdfsFileBatchReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        self.validate_context()?;
+        if self.closed {
+            return Ok(None);
+        }
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                match current.next_batch()? {
+                    Some(batch) => {
+                        if batch.num_rows() > self.max_rows
+                            || batch.get_array_memory_size() > self.max_bytes
+                        {
+                            return Err(ConnectorError::new(
+                                ConnectorErrorKind::ResourceExhausted,
+                                "HDFS reader exceeded its batch budget",
+                            ));
+                        }
+                        return Ok(Some(batch));
+                    }
+                    None => {
+                        self.completed_metrics = self
+                            .completed_metrics
+                            .saturating_add(current.metrics_snapshot());
+                        current.close()?;
+                        self.current = None;
+                    }
+                }
+            }
+            let Some(range) = self.ranges.pop_front() else {
+                self.closed = true;
+                return Ok(None);
+            };
+            self.current = Some(self.open_range(range)?);
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.file_context.cancellation.cancel();
+        if let Some(mut current) = self.current.take() {
+            self.completed_metrics = self
+                .completed_metrics
+                .saturating_add(current.metrics_snapshot());
+            current.close()?;
+        }
+        self.ranges.clear();
+        if let Some(mut watch) = self.cancellation_watch.take() {
+            watch.abort();
+        }
+        self.closed = true;
+        Ok(())
+    }
+
+    fn metrics_snapshot(&self) -> ConnectorReaderMetricsSnapshot {
+        self.current
+            .as_ref()
+            .map(FoundationCurrentReader::metrics_snapshot)
+            .map(|current| self.completed_metrics.saturating_add(current))
+            .unwrap_or(self.completed_metrics)
+    }
+}
+
+impl Drop for HdfsFileBatchReader {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn map_file_error(error: FileError) -> ConnectorError {
+    let kind = match error.kind() {
+        FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
+        FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
+        FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
+        FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
+        FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
+        FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
+        FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
+        FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
+        FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
+        FileErrorKind::Internal => ConnectorErrorKind::Internal,
+    };
+    let mapped = ConnectorError::new(kind, error.to_string());
+    if error.kind() == FileErrorKind::Transient {
+        mapped.with_retryable_before_progress()
+    } else {
+        mapped
+    }
+}
+
+fn foundation_file_budget(
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<FileReadBudget, ConnectorError> {
+    Ok(FileReadBudget {
+        max_rows: NonZeroUsize::new(max_rows).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "file reader row budget must be positive",
+            )
+        })?,
+        max_bytes: NonZeroUsize::new(max_bytes).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "file reader byte budget must be positive",
+            )
+        })?,
+    })
+}
+
+fn connector_file_metrics(
+    metrics: novarocks_fs::FileMetricsSnapshot,
+) -> ConnectorReaderMetricsSnapshot {
+    ConnectorReaderMetricsSnapshot {
+        bytes_read: metrics.bytes_read,
+        read_requests: metrics.read_requests,
+        rows_decoded: metrics.rows_decoded,
+        batches_delivered: metrics.batches_delivered,
+        cache_hits: metrics.cache_hits,
+        cache_misses: metrics.cache_misses,
+        io_time_ns: metrics.io_time_ns,
+        decode_time_ns: metrics.decode_time_ns,
+        row_groups_read: metrics.row_groups_read,
+        row_groups_pruned: metrics.row_groups_pruned,
+        delayed_materialization_ranges: metrics.delayed_materialization_ranges,
+    }
+}
+
+#[cfg(test)]
+mod file_read_contract_tests {
+    use super::*;
+
+    #[test]
+    fn file_read_maps_non_retryable_error_kinds() {
+        for (file_kind, connector_kind) in [
+            (FileErrorKind::Invalid, ConnectorErrorKind::InvalidRequest),
+            (FileErrorKind::Unsupported, ConnectorErrorKind::Unsupported),
+            (FileErrorKind::NotFound, ConnectorErrorKind::NotFound),
+            (
+                FileErrorKind::Permission,
+                ConnectorErrorKind::PermissionDenied,
+            ),
+            (FileErrorKind::Corrupt, ConnectorErrorKind::CorruptData),
+            (
+                FileErrorKind::ResourceExhausted,
+                ConnectorErrorKind::ResourceExhausted,
+            ),
+            (FileErrorKind::Cancelled, ConnectorErrorKind::Cancelled),
+            (
+                FileErrorKind::DeadlineExceeded,
+                ConnectorErrorKind::DeadlineExceeded,
+            ),
+            (FileErrorKind::Internal, ConnectorErrorKind::Internal),
+        ] {
+            let mapped = map_file_error(FileError::new(file_kind, "contract"));
+            assert_eq!(mapped.kind(), connector_kind);
+            assert!(!mapped.retryable_before_progress());
+        }
+    }
+
+    #[test]
+    fn file_read_maps_transient_error_as_retryable_unavailable() {
+        let mapped = map_file_error(FileError::new(FileErrorKind::Transient, "retry"));
+        assert_eq!(mapped.kind(), ConnectorErrorKind::Unavailable);
+        assert!(mapped.retryable_before_progress());
+    }
+
+    #[test]
+    fn file_read_converts_foundation_metrics_without_core_types() {
+        let mapped = connector_file_metrics(novarocks_fs::FileMetricsSnapshot {
+            bytes_read: 1,
+            read_requests: 2,
+            rows_decoded: 3,
+            batches_delivered: 4,
+            cache_hits: 5,
+            cache_misses: 6,
+            io_time_ns: 7,
+            decode_time_ns: 8,
+            row_groups_read: 9,
+            row_groups_pruned: 10,
+            delayed_materialization_ranges: 11,
+        });
+        assert_eq!(mapped.bytes_read, 1);
+        assert_eq!(mapped.decode_time_ns, 8);
+        assert_eq!(mapped.row_groups_pruned, 10);
+        assert_eq!(mapped.delayed_materialization_ranges, 11);
+    }
+
+    #[test]
+    fn file_read_maps_spi_budget_to_foundation_budget() {
+        let budget = foundation_file_budget(17, 23).expect("valid budget");
+        assert_eq!(budget.max_rows.get(), 17);
+        assert_eq!(budget.max_bytes.get(), 23);
+        assert_eq!(
+            foundation_file_budget(0, 23).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            foundation_file_budget(17, 0).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+}
+
+/// Provider-private Iceberg delete-file loader. It keeps credential resolution
+/// in the HDFS provider while the core scan runner owns delete filtering.
+pub(crate) struct HdfsDeleteAuxiliary {
+    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+}
+
+impl HdfsDeleteAuxiliary {
+    pub(crate) fn new(object_store_config: Option<novarocks_fs::ObjectStoreConfig>) -> Self {
+        Self {
+            object_store_config,
+        }
+    }
+
+    fn normalized_delete_specs(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<
+        (
+            String,
+            Vec<IcebergDeleteFileSpec>,
+            crate::connector::file_execution::FileScanContext,
+        ),
+        String,
+    > {
+        let mut loader_ranges = Vec::with_capacity(1 + range.delete_files.len());
+        loader_ranges.push(FileScanRange {
+            path: range.path.clone(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        });
+        for delete_file in &range.delete_files {
+            loader_ranges.push(FileScanRange {
+                path: delete_file.path.clone(),
+                file_len: delete_file.length.unwrap_or(0),
+                offset: 0,
+                length: delete_file.length.unwrap_or(0),
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: None,
+            });
+        }
+        let context =
+            FileScanContext::build(loader_ranges, None, self.object_store_config.as_ref())?;
+        let delete_specs = context
+            .ranges
+            .iter()
+            .skip(1)
+            .zip(range.delete_files.iter())
+            .map(|(resolved, original)| IcebergDeleteFileSpec {
+                path: resolved.path.clone(),
+                file_format: original.file_format,
+                file_content: original.file_content,
+                length: original.length,
+                content_offset: original.content_offset,
+                content_size_in_bytes: original.content_size_in_bytes,
+            })
+            .collect();
+        Ok((range.path.clone(), delete_specs, context))
+    }
+}
+
+impl ConnectorReadAuxiliary for HdfsDeleteAuxiliary {
+    fn load_iceberg_position_deletes(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        if range.delete_files.is_empty() {
+            return Ok(None);
+        }
+        let (data_file_path, delete_specs, context) = self.normalized_delete_specs(range)?;
+        let deleted = load_position_deletes(&delete_specs, &data_file_path, &context.access)?;
+        Ok((!deleted.is_empty()).then_some(deleted))
+    }
+
+    fn load_iceberg_equality_deletes(
+        &self,
+        range: &FileScanRange,
+    ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
+    {
+        if !range
+            .delete_files
+            .iter()
+            .any(|file| file.file_content == IcebergFileContent::EqualityDeletes)
+        {
+            return Ok(None);
+        }
+        let (_, delete_specs, context) = self.normalized_delete_specs(range)?;
+        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+            &delete_specs,
+            &context.access,
+        )?;
+        Ok((!sets.is_empty()).then_some(sets))
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct HdfsScanOp {
+struct HdfsRuntimePruningFacet {
     cfg: HdfsScanConfig,
     row_position_scan: bool,
     next_scan_range_id: Arc<AtomicI32>,
@@ -299,8 +1511,8 @@ impl HdfsIcebergRuntimePruningCounters {
     }
 }
 
-impl HdfsScanOp {
-    pub fn new(cfg: HdfsScanConfig) -> Self {
+impl HdfsRuntimePruningFacet {
+    fn new(cfg: HdfsScanConfig) -> Self {
         let row_position_scan = cfg
             .ranges
             .iter()
@@ -473,105 +1685,16 @@ impl HdfsScanOp {
     ) -> HdfsIcebergRuntimePruningCounterSnapshot {
         self.iceberg_runtime_pruning_counters.snapshot()
     }
-}
-
-impl ScanOp for HdfsScanOp {
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        let ScanMorsel::FileRange {
-            path,
-            file_len,
-            offset,
-            length,
-            scan_range_id,
-            first_row_id,
-            data_sequence_number,
-            ivm_change_op,
-            included_positions,
-            external_datacache,
-            delete_files,
-            iceberg_file_pruning,
-        } = morsel
-        else {
-            return Err("hdfs scan received unexpected morsel".to_string());
-        };
-        let ranges = vec![FileScanRange {
-            path,
-            file_len,
-            offset,
-            length,
-            scan_range_id,
-            first_row_id,
-            data_sequence_number,
-            ivm_change_op,
-            included_positions,
-            external_datacache: external_datacache.clone(),
-            delete_files,
-            iceberg_file_pruning,
-        }];
-        let scan = FileScanContext::build(
-            ranges,
-            profile.clone(),
-            self.cfg.object_store_config.as_ref(),
-        )?;
-        if let Some(profile) = profile.as_ref() {
-            profile.add_info_string(
-                "OriginalRangeCount",
-                format!("{}", self.cfg.original_range_count),
-            );
-            profile.add_info_string("RangeCount", format!("{}", scan.ranges.len()));
-        }
-        let current_delete_files = scan
-            .ranges
-            .first()
-            .map(|range| range.delete_files.as_slice())
-            .unwrap_or(&[]);
-
-        let Some(mut format) = self.cfg.format.clone() else {
-            return Err("hdfs scan missing file format for non-empty morsel".to_string());
-        };
-        format = match format {
-            FileFormatConfig::Parquet(mut parquet_cfg) => {
-                parquet_cfg.datacache = parquet_cfg
-                    .datacache
-                    .with_external_range_options(external_datacache.as_ref())?;
-                parquet_cfg.query_global_dicts = self.cfg.query_global_dicts.clone();
-                apply_parquet_pruning_gate_for_delete_files(&mut parquet_cfg, current_delete_files);
-                FileFormatConfig::Parquet(parquet_cfg)
-            }
-            FileFormatConfig::Orc(mut orc_cfg) => {
-                orc_cfg.datacache = orc_cfg
-                    .datacache
-                    .with_external_range_options(external_datacache.as_ref())?;
-                FileFormatConfig::Orc(orc_cfg)
-            }
-        };
-        build_format_iter(scan, format, None, profile, runtime_filters)
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        self.build_morsels_from_ordered_ranges(self.ordered_initial_ranges())
-    }
-
-    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
-        self.flush_iceberg_runtime_pruning_profile(profile);
-    }
-
     fn late_prune_morsel_with_ordered_predicate(
         &self,
         morsel: &ScanMorsel,
         slot_id: SlotId,
         predicate: &NativeOrderedRangePredicate,
     ) -> Result<ScanMorselPruneDecision, String> {
-        let ScanMorsel::FileRange {
-            iceberg_file_pruning: Some(metadata),
-            ..
-        } = morsel
-        else {
+        let Some(range) = morsel.file_range() else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let Some(metadata) = range.iceberg_file_pruning.as_ref() else {
             return Ok(ScanMorselPruneDecision::Keep);
         };
         let Some(pruning) = self.cfg.iceberg_runtime_pruning.as_ref() else {
@@ -606,10 +1729,7 @@ impl ScanOp for HdfsScanOp {
         }
     }
 
-    fn supports_incremental_scan_ranges(&self) -> bool {
-        true
-    }
-
+    #[cfg(test)]
     fn build_incremental_morsels(
         &self,
         scan_ranges: &[IncrementalScanRange],
@@ -726,243 +1846,24 @@ impl ScanOp for HdfsScanOp {
         Ok(ScanMorsels::new(morsels, has_more))
     }
 
-    fn profile_name(&self) -> Option<String> {
-        let prefix = "HDFS_SCAN";
-        if let Some(label) = self.cfg.profile_label.as_deref()
-            && let Some(id) = label
-                .strip_prefix("hdfs_scan_node_id=")
-                .and_then(|s| s.parse::<i32>().ok())
-        {
-            return Some(format!("{prefix} (id={id})"));
-        }
-        Some(prefix.to_string())
+    #[cfg(test)]
+    fn build_morsels(&self) -> Result<ScanMorsels, String> {
+        self.build_morsels_from_ordered_ranges(self.ordered_initial_ranges())
+    }
+}
+
+impl ConnectorReadCoreFacet for HdfsRuntimePruningFacet {
+    fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
+        self.flush_iceberg_runtime_pruning_profile(profile);
     }
 
-    fn load_iceberg_position_deletes(
+    fn late_prune_morsel_with_ordered_predicate(
         &self,
         morsel: &ScanMorsel,
-    ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        let ScanMorsel::FileRange {
-            path, delete_files, ..
-        } = morsel
-        else {
-            return Ok(None);
-        };
-        if delete_files.is_empty() {
-            return Ok(None);
-        }
-        // Build a one-off scan context across the data file and all its delete
-        // files so a single OpenDAL operator resolves OSS / HDFS credentials
-        // for the entire set. We reuse `FileScanContext::build` for scheme
-        // classification and credential resolution, passing zero-length
-        // ranges because we never read the data file through this context —
-        // only the delete parquet files are read.
-        let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
-            Vec::with_capacity(1 + delete_files.len());
-        loader_ranges.push(crate::fs::scan_context::FileScanRange {
-            path: path.clone(),
-            file_len: 0,
-            offset: 0,
-            length: 0,
-            scan_range_id: -1,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
-            external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
-        });
-        for del in delete_files {
-            loader_ranges.push(crate::fs::scan_context::FileScanRange {
-                path: del.path.clone(),
-                file_len: del.length.unwrap_or(0),
-                offset: 0,
-                length: del.length.unwrap_or(0),
-                scan_range_id: -1,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            });
-        }
-        let ctx = crate::fs::scan_context::FileScanContext::build(
-            loader_ranges,
-            None,
-            self.cfg.object_store_config.as_ref(),
-        )?;
-        // After credential resolution `ctx.ranges` carries scheme-normalized
-        // paths suitable for the OpenDAL operator, but the delete parquet
-        // files record the data-file path exactly as the Iceberg writer saw
-        // it (`oss://bucket/...`, `hdfs://ns/...`, or an absolute filesystem
-        // path). Compare against the original morsel path so writer-recorded
-        // rows match regardless of how OpenDAL normalized the prefix.
-        let data_file_path = path.clone();
-        let normalized_delete_specs: Vec<IcebergDeleteFileSpec> = ctx
-            .ranges
-            .iter()
-            .skip(1)
-            .zip(delete_files.iter())
-            .map(|(resolved, original)| IcebergDeleteFileSpec {
-                path: resolved.path.clone(),
-                file_format: original.file_format,
-                file_content: original.file_content,
-                length: original.length,
-                content_offset: original.content_offset,
-                content_size_in_bytes: original.content_size_in_bytes,
-            })
-            .collect();
-        let deleted =
-            load_position_deletes(&normalized_delete_specs, &data_file_path, &ctx.factory)?;
-        if deleted.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(deleted))
-        }
-    }
-
-    fn load_iceberg_equality_deletes(
-        &self,
-        morsel: &ScanMorsel,
-    ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
-    {
-        let ScanMorsel::FileRange {
-            path, delete_files, ..
-        } = morsel
-        else {
-            return Ok(None);
-        };
-        if !delete_files
-            .iter()
-            .any(|file| file.file_content == IcebergFileContent::EqualityDeletes)
-        {
-            return Ok(None);
-        }
-        let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
-            Vec::with_capacity(1 + delete_files.len());
-        loader_ranges.push(crate::fs::scan_context::FileScanRange {
-            path: path.clone(),
-            file_len: 0,
-            offset: 0,
-            length: 0,
-            scan_range_id: -1,
-            first_row_id: None,
-            data_sequence_number: None,
-            ivm_change_op: None,
-            included_positions: None,
-            external_datacache: None,
-            delete_files: Vec::new(),
-            iceberg_file_pruning: None,
-        });
-        for del in delete_files {
-            loader_ranges.push(crate::fs::scan_context::FileScanRange {
-                path: del.path.clone(),
-                file_len: del.length.unwrap_or(0),
-                offset: 0,
-                length: del.length.unwrap_or(0),
-                scan_range_id: -1,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            });
-        }
-        let ctx = crate::fs::scan_context::FileScanContext::build(
-            loader_ranges,
-            None,
-            self.cfg.object_store_config.as_ref(),
-        )?;
-        let normalized_delete_specs: Vec<IcebergDeleteFileSpec> = ctx
-            .ranges
-            .iter()
-            .skip(1)
-            .zip(delete_files.iter())
-            .map(|(resolved, original)| IcebergDeleteFileSpec {
-                path: resolved.path.clone(),
-                file_format: original.file_format,
-                file_content: original.file_content,
-                length: original.length,
-                content_offset: original.content_offset,
-                content_size_in_bytes: original.content_size_in_bytes,
-            })
-            .collect();
-        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
-            &normalized_delete_specs,
-            &ctx.factory,
-        )?;
-        if sets.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(sets))
-        }
-    }
-}
-
-/// Static [`ScanSource`] for HDFS / Iceberg-data file scans.
-///
-/// Everything except the file ranges is fixed at decode time and stored here.
-/// The per-instance `ranges` / `has_more` arrive via [`BoundScanRanges::File`]
-/// at bind time. `original_range_count` is not carried on the source: every
-/// decoder sets it to `ranges.len()` at construction (compat captures it before
-/// `apply_path_rewrite`, which rewrites paths in place without changing the
-/// count), so `bind` recomputes it from the bound ranges identically.
-pub(crate) struct HdfsScanSource {
-    limit: Option<usize>,
-    profile_label: Option<String>,
-    format: Option<FileFormatConfig>,
-    object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
-    iceberg_table_locations: HashMap<i64, String>,
-    query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
-    iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
-}
-
-impl HdfsScanSource {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        limit: Option<usize>,
-        profile_label: Option<String>,
-        format: Option<FileFormatConfig>,
-        object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
-        iceberg_table_locations: HashMap<i64, String>,
-        query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
-        iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
-    ) -> Self {
-        Self {
-            limit,
-            profile_label,
-            format,
-            object_store_config,
-            iceberg_table_locations,
-            query_global_dicts,
-            iceberg_runtime_pruning,
-        }
-    }
-}
-
-impl ScanSource for HdfsScanSource {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
-        let BoundScanRanges::File { ranges, has_more } = ranges else {
-            return Err("hdfs scan source requires File scan ranges".to_string());
-        };
-        let cfg = HdfsScanConfig {
-            original_range_count: ranges.len(),
-            ranges,
-            has_more,
-            limit: self.limit,
-            profile_label: self.profile_label.clone(),
-            format: self.format.clone(),
-            object_store_config: self.object_store_config.clone(),
-            iceberg_table_locations: self.iceberg_table_locations.clone(),
-            query_global_dicts: self.query_global_dicts.clone(),
-            iceberg_runtime_pruning: self.iceberg_runtime_pruning.clone(),
-        };
-        Ok(Arc::new(HdfsScanOp::new(cfg)))
+        slot_id: SlotId,
+        predicate: &NativeOrderedRangePredicate,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        self.late_prune_morsel_with_ordered_predicate(morsel, slot_id, predicate)
     }
 }
 
@@ -973,9 +1874,10 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use crate::cache::{CacheOptions, DataCacheManager};
+    use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+    use crate::connector::file_execution::FileScanRange;
     use crate::connector::iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
@@ -989,26 +1891,28 @@ mod tests {
     use crate::connector::iceberg::scan_model::IcebergColumnStats;
     #[cfg(feature = "compat")]
     use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
-    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::node::scan::{
-        BoundScanRanges, HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange,
-        ScanMorsel, ScanMorselPruneDecision, ScanOp, ScanSource,
+        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel,
+        ScanMorselPruneDecision, ScanOp,
     };
     use crate::formats::parquet::{
         ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathPruningPredicate,
     };
-    use crate::fs::scan_context::FileScanRange;
     use crate::runtime_filter::exec::ordered_range_predicate::{
         NativeOrderedRangePredicate, OrderedRangePredicateContract,
     };
     use crate::runtime_filter::model::contract::{ChannelId, NullOrder, SortDirection};
     use crate::runtime_filter::port::identity::LogicalVersion;
     use crate::runtime_filter::port::ordered_bound::OrderedScalar;
+    use novarocks_fs::DataCacheManager;
 
     use super::{
-        HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp, HdfsScanSource,
+        HdfsConnectorInstance, HdfsDeleteAuxiliary, HdfsIcebergRuntimePruningConfig,
+        HdfsIncrementalSplitAdapter, HdfsInstanceConfig, HdfsRuntimePruningFacet, HdfsScanConfig,
         apply_parquet_pruning_gate_for_delete_files,
     };
+    use crate::connector::runtime::{ConnectorReadAuxiliary, IncrementalConnectorSplitAdapter};
 
     fn plain_file_range(path: &str) -> FileScanRange {
         FileScanRange {
@@ -1027,53 +1931,83 @@ mod tests {
         }
     }
 
-    fn hdfs_scan_source_for_test() -> HdfsScanSource {
-        HdfsScanSource::new(
-            None,
-            None,
-            None,
-            None,
-            HashMap::new(),
-            Default::default(),
-            None,
-        )
-    }
-
     #[test]
-    fn hdfs_scan_source_bind_file_ranges_yields_file_morsels() {
-        let source = hdfs_scan_source_for_test();
-        let op = source
-            .bind(BoundScanRanges::File {
-                ranges: vec![
-                    plain_file_range("s3://bucket/path/a.parquet"),
-                    plain_file_range("s3://bucket/path/b.parquet"),
-                ],
-                has_more: false,
-            })
-            .expect("hdfs scan source bind should succeed");
+    fn hdfs_delete_auxiliary_skips_ranges_without_delete_files() {
+        let auxiliary = HdfsDeleteAuxiliary::new(None);
+        let range = plain_file_range("s3://bucket/path/data.parquet");
 
-        let morsels = op.build_morsels().expect("build morsels");
-        assert!(!morsels.has_more);
-        assert_eq!(morsels.morsels.len(), 2);
         assert!(
-            morsels
-                .morsels
-                .iter()
-                .all(|morsel| matches!(morsel, ScanMorsel::FileRange { .. })),
-            "expected all FileRange morsels, got {:?}",
-            morsels.morsels
+            auxiliary
+                .load_iceberg_position_deletes(&range)
+                .expect("no delete files should not open storage")
+                .is_none()
+        );
+        assert!(
+            auxiliary
+                .load_iceberg_equality_deletes(&range)
+                .expect("no delete files should not open storage")
+                .is_none()
         );
     }
 
     #[test]
-    fn hdfs_scan_source_bind_rejects_wrong_variant() {
-        let source = hdfs_scan_source_for_test();
-        let Err(err) = source.bind(BoundScanRanges::None) else {
-            panic!("non-File scan ranges must be rejected");
+    fn hdfs_incremental_adapter_registers_file_sidecars_before_reading() {
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse("hdfs.test").expect("instance ID");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("value", DataType::Int32, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let provider = Arc::new(HdfsConnectorInstance::new(
+            instance_id,
+            HdfsInstanceConfig {
+                scan: HdfsScanConfig {
+                    ranges: vec![plain_file_range("s3://bucket/path/seed.parquet")],
+                    original_range_count: 1,
+                    has_more: true,
+                    limit: None,
+                    profile_label: None,
+                    format: None,
+                    object_store_config: None,
+                    iceberg_table_locations: HashMap::new(),
+                    query_global_dicts: Default::default(),
+                    iceberg_runtime_pruning: None,
+                },
+                chunk_schema,
+            },
+        ));
+        let adapter = HdfsIncrementalSplitAdapter {
+            provider: Arc::clone(&provider),
         };
-        assert!(
-            err.contains("hdfs scan source requires File scan ranges"),
-            "err={err}"
+
+        let appended = adapter
+            .prepare_incremental_ranges(&[
+                make_hdfs_range("s3://bucket/path/next.parquet", None),
+                make_end_marker(false),
+            ])
+            .expect("prepare HDFS range");
+        let crate::connector::runtime::ConnectorSplitAppend::Scheduled {
+            scheduled,
+            has_more,
+        } = &appended
+        else {
+            panic!("HDFS adapter must schedule file sidecars");
+        };
+        assert!(!has_more);
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(provider.range_count().expect("range count"), 1);
+        adapter
+            .commit_incremental_ranges(&appended)
+            .expect("commit HDFS range");
+        assert_eq!(provider.range_count().expect("range count"), 2);
+        assert_eq!(
+            provider.range_for_index(1).expect("registered range").path,
+            "s3://bucket/path/next.parquet"
         );
     }
 
@@ -1109,9 +2043,9 @@ mod tests {
         }
     }
 
-    fn test_datacache_context() -> crate::cache::DataCacheContext {
+    fn test_datacache_context() -> novarocks_fs::DataCacheContext {
         let cache_options = CacheOptions::from_query_options(None).expect("cache options");
-        DataCacheManager::instance().external_context(cache_options)
+        DataCacheManager::instance().external_context(cache_options.to_file_cache_options())
     }
 
     fn test_delete_file(file_content: IcebergFileContent) -> IcebergDeleteFileSpec {
@@ -1289,7 +2223,7 @@ mod tests {
     fn native_scan_ordered_live_hdfs_skips_only_exact_file_range_evidence() {
         let mut cfg = hdfs_cfg_with_two_iceberg_files_for_test();
         cfg.ranges = Vec::new();
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
         let predicate = ordered_i32_predicate(50);
 
         let exact_miss = iceberg_file_range_for_runtime_pruning_test(
@@ -1298,7 +2232,7 @@ mod tests {
                 "k1", 90, 110,
             )),
         );
-        let exact_miss = HdfsScanOp::new(HdfsScanConfig {
+        let exact_miss = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![exact_miss],
             ..op.cfg.clone()
         })
@@ -1321,7 +2255,7 @@ mod tests {
             "s3://bucket/path/explicit-no-nulls.parquet",
             Some(explicit_no_nulls),
         );
-        let explicit_no_nulls = HdfsScanOp::new(HdfsScanConfig {
+        let explicit_no_nulls = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![explicit_no_nulls],
             ..op.cfg.clone()
         })
@@ -1344,7 +2278,7 @@ mod tests {
             "s3://bucket/path/missing-counts.parquet",
             Some(iceberg_file_pruning_metadata_for_i32_range("k1", 90, 110)),
         );
-        let missing_counts = HdfsScanOp::new(HdfsScanConfig {
+        let missing_counts = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![missing_counts],
             ..op.cfg.clone()
         })
@@ -1363,7 +2297,7 @@ mod tests {
             ScanMorselPruneDecision::Keep
         );
 
-        let missing_metadata = HdfsScanOp::new(HdfsScanConfig {
+        let missing_metadata = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![iceberg_file_range_for_runtime_pruning_test(
                 "s3://bucket/path/missing-metadata.parquet",
                 None,
@@ -1398,7 +2332,7 @@ mod tests {
             )]),
             null_states: HashMap::new(),
         };
-        let unsupported = HdfsScanOp::new(HdfsScanConfig {
+        let unsupported = HdfsRuntimePruningFacet::new(HdfsScanConfig {
             ranges: vec![iceberg_file_range_for_runtime_pruning_test(
                 "s3://bucket/path/unsupported-string-bounds.parquet",
                 Some(unsupported_metadata),
@@ -1466,7 +2400,7 @@ mod tests {
         );
         let mut cfg = hdfs_cfg_with_two_iceberg_files_for_test();
         cfg.ranges = vec![range];
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
         let morsel = op
             .build_morsels()
             .expect("thrift roundtrip morsel")
@@ -1630,7 +2564,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[
@@ -1681,7 +2615,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[
@@ -1744,7 +2678,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[
@@ -1792,7 +2726,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let err = op
             .build_incremental_morsels(&[make_hdfs_range("s3://bucket/path/file.parquet", None)])
@@ -1831,7 +2765,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[make_hdfs_range("s3://bucket/path/file.parquet", None)])
@@ -1859,7 +2793,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op
             .build_incremental_morsels(&[make_hdfs_range_with_change_op(
@@ -1935,7 +2869,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op.build_morsels().expect("build morsels");
 
@@ -1984,7 +2918,7 @@ mod tests {
             query_global_dicts: Default::default(),
             iceberg_runtime_pruning: None,
         };
-        let op = HdfsScanOp::new(cfg);
+        let op = HdfsRuntimePruningFacet::new(cfg);
 
         let morsels = op.build_morsels().expect("build morsels");
 

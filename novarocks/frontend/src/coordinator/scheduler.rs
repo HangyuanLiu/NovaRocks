@@ -450,3 +450,19 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FrontendBackendSnapshot;
+    use novarocks::query_execution::contract::DistributedQueryErrorKind;
+
+    #[test]
+    fn empty_captured_topology_rejects_distributed_scheduling() {
+        let error = match FrontendBackendSnapshot::new(Vec::new()) {
+            Ok(_) => panic!("distributed scheduling requires at least one captured backend"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), DistributedQueryErrorKind::Rejected);
+        assert_eq!(error.message(), "no live backend available");
+    }
+}

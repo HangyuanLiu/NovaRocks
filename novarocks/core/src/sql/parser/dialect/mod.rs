@@ -1293,7 +1293,7 @@ fn match_keyword_sequence_ci(bytes: &[u8], start: usize, words: &[&str]) -> Opti
 ///
 /// Iceberg's `t$snapshots` syntax cannot be lexed by sqlparser without dialect
 /// hacks. The analyzer detects the `__nr_meta_*__` last-part suffix and
-/// dispatches to `IcebergMetadataScanOp`.
+/// dispatches to the Iceberg metadata SPI reader.
 ///
 /// Restricted to the four BE-supported types: snapshots, history, refs,
 /// partitions. An unrecognised type errors at normalize time.
@@ -2273,7 +2273,11 @@ fn collect_set_user_variable_assignments(
     Ok(())
 }
 
-pub(crate) fn substitute_user_variables(
+/// Substitute frontend-session user variables before SQL compilation.
+///
+/// The frontend owns connection state; the parser owns SQL-token-aware
+/// substitution so router code does not reimplement lexical rules.
+pub fn substitute_user_variables(
     sql: &str,
     assignments: &[(String, String)],
 ) -> Result<String, String> {

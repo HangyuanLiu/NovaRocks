@@ -463,6 +463,16 @@ pub fn build_native_read_plan(
     )
 }
 
+/// Tooling entrypoint for inspecting a physical StarRocks read plan when no
+/// tablet schema binding is available.
+pub fn build_native_read_plan_without_tablet_schema(
+    snapshot: &StarRocksTabletSnapshot,
+    footers: &[StarRocksSegmentFooter],
+    output_schema: &SchemaRef,
+) -> Result<StarRocksNativeReadPlan, String> {
+    build_native_read_plan(snapshot, footers, output_schema, None)
+}
+
 pub fn build_native_read_plan_with_output_hints(
     snapshot: &StarRocksTabletSnapshot,
     segment_footers: &[StarRocksSegmentFooter],

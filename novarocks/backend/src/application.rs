@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
-use novarocks::service::{grpc_server, report_worker};
+use novarocks::service::grpc_server;
 
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
@@ -389,7 +389,7 @@ fn cleanup_after_primary_error(primary: BackendApplicationError) -> BackendAppli
 
 fn stop_backend_resources() -> Result<(), String> {
     let grpc_result = grpc_server::stop_grpc_server();
-    report_worker::stop();
+    novarocks::query_execution::native_fragment_report::stop();
     grpc_result
 }
 

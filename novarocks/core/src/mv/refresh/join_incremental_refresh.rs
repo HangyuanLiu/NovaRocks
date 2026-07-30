@@ -68,7 +68,10 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
         crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
             mv_ctx: Arc::clone(rewrite),
-            disabled_rules: logical_execution_disabled_rules(is_aggregate_refresh),
+            disabled_rules: logical_execution_disabled_rules(
+                is_aggregate_refresh,
+                &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            ),
             deadline: None,
             column_ref_factory: Rc::clone(&factory_cell),
         },
@@ -143,10 +146,11 @@ where
     })
 }
 
-fn logical_execution_disabled_rules(is_aggregate_refresh: bool) -> Vec<String> {
-    let mut disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
-        .disabled_rules
-        .clone();
+fn logical_execution_disabled_rules(
+    is_aggregate_refresh: bool,
+    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+) -> Vec<String> {
+    let mut disabled_rules = optimizer_settings.disabled_rules.clone();
     if !disabled_rules
         .iter()
         .any(|rule| rule == "InjectTargetLocatorJoin")

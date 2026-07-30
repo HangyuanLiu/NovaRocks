@@ -60,8 +60,9 @@ pub(crate) fn prepare_mv_rewrite_candidates(
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
     query_stats: &mut QueryStatsPlan,
+    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Vec<MvRewriteCandidate> {
-    if !crate::sql::optimizer::options::current_session_optimizer_settings().mv_rewrite_enabled() {
+    if !optimizer_settings.mv_rewrite_enabled() {
         return Vec::new();
     }
     match try_prepare(
@@ -226,18 +227,21 @@ fn build_candidate(
     ) else {
         return Ok(None);
     };
-    let (catalog_backend, table_source) = {
-        let registry = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock");
-        (
-            registry.catalog_backend("iceberg")?,
-            registry.table_source("iceberg")?,
-        )
-    };
-    let resolved_tbl = catalog_backend.load_table(cat, ns, tbl)?;
-    let target_table = table_source.build_schema_table_def(&resolved_tbl)?;
+    let connectors = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let (target_table, _) = crate::connector::iceberg::provider::load_schema_table_def(
+        &connectors,
+        crate::connector::connector_request_context(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
+        cat,
+        ns,
+        tbl,
+    )?;
 
     // Duplicate output names break the by-name visible-column mapping.
     let mut names: Vec<&str> = mv_desc.outputs.iter().map(|o| o.name.as_str()).collect();

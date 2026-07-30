@@ -327,7 +327,7 @@ mod tests {
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 
     #[test]
-    fn encode_batch_with_query_global_dicts_maps_utf8_to_ids() {
+    fn file_read_dictionary_adapter_maps_utf8_to_ids() {
         let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Utf8, true)]));
         let chunk_schema = Arc::new(

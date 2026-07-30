@@ -178,7 +178,10 @@ mod tests {
         use std::rc::Rc;
         let rule = AggregatePushdownRule;
         let plan = dummy_aggregate();
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
         set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         assert!(
@@ -291,7 +294,10 @@ mod tests {
         );
 
         let rule = AggregatePushdownRule;
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = RewriteContext::new(
+            RewriteConsumer::Query,
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
         set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
 

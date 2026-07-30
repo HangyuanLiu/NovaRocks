@@ -294,6 +294,9 @@ pub struct NovaRocksConfig {
     pub standalone_server: Option<StandaloneServerConfig>,
 
     #[serde(default)]
+    pub connector: ConnectorConfig,
+
+    #[serde(default)]
     pub spill: SpillStorageConfig,
 
     #[serde(default)]
@@ -385,6 +388,7 @@ impl Default for NovaRocksConfig {
             state_store: None,
             foundationdb_client: None,
             standalone_server: None,
+            connector: ConnectorConfig::default(),
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
             cluster: ClusterConfig::default(),
@@ -502,6 +506,50 @@ pub struct StandaloneObjectStoreConfig {
     pub region: Option<String>,
     #[serde(default)]
     pub enable_path_style_access: Option<bool>,
+}
+
+/// Shared object-store credentials loaded independently by every backend at
+/// startup. Native plans may reference this binding but must never carry its
+/// values.
+#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
+pub struct ConnectorObjectStoreConfig {
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub access_key_secret: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub enable_path_style_access: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConnectorConfig {
+    pub object_store: Option<ConnectorObjectStoreConfig>,
+}
+
+impl ConnectorConfig {
+    pub fn object_store_config(
+        &self,
+    ) -> std::result::Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
+        let Some(object_store) = self.object_store.as_ref() else {
+            return Ok(None);
+        };
+        let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
+            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::ConnectorStartupConfig,
+            object_store.endpoint.as_deref().unwrap_or_default(),
+            object_store.access_key_id.as_deref().unwrap_or_default(),
+            object_store.access_key_secret.as_deref().unwrap_or_default(),
+            object_store.region.as_deref(),
+            object_store.enable_path_style_access,
+        )?;
+        let mut config = credentials.to_object_store_config();
+        crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
+        Ok(Some(config))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

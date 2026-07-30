@@ -160,8 +160,8 @@ pub enum ScanSource {
     /// (`t$snapshots` / `t$history` / `t$refs` / `t$partitions`). The
     /// analyzer rewrites such references into a regular `Scan` over a
     /// synthetic `TableDef` whose source is this variant; codegen then
-    /// emits an `HDFS_SCAN_NODE` whose lowering builds an
-    /// `IcebergMetadataScanOp` that reads `iceberg::spec::TableMetadata`
+    /// emits an `HDFS_SCAN_NODE` whose lowering builds an Iceberg metadata
+    /// SPI reader that reads `iceberg::spec::TableMetadata`
     /// natively in Rust (no JVM / JNI bridge — the embedded-JVM path
     /// was removed in favor of iceberg-rust) — see
     /// `src/connector/iceberg/metadata.rs`.

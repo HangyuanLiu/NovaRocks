@@ -42,13 +42,9 @@ impl QueryStatsProviders {
         Self::default()
     }
 
-    pub(crate) fn from_connectors(connectors: &crate::connector::ConnectorRegistry) -> Self {
-        let iceberg = connectors
-            .table_source("iceberg")
-            .ok()
-            .and_then(|source| source.stats_provider());
+    pub(crate) fn from_connectors(_connectors: &crate::connector::ConnectorRegistry) -> Self {
         Self {
-            iceberg,
+            iceberg: None,
             catalog_statistics: None,
         }
     }
@@ -65,16 +61,11 @@ impl QueryStatsProviders {
     }
 
     pub(crate) fn from_standalone_state(state: &Arc<super::StandaloneState>) -> Self {
-        let iceberg = {
-            let connectors = state
-                .connectors
-                .read()
-                .expect("standalone connectors read lock");
-            connectors
-                .table_source("iceberg")
-                .ok()
-                .and_then(|source| source.stats_provider())
-        };
+        let iceberg = Some(
+            crate::connector::iceberg::catalog::iceberg_table_stats_provider(Arc::clone(
+                &state.iceberg_catalogs,
+            )),
+        );
         Self {
             iceberg,
             catalog_statistics: Some(Arc::clone(&state.statistics_service)),
@@ -731,6 +722,7 @@ mod tests {
             &plan.snapshot,
             ColumnRefFactory::default(),
             Vec::new(),
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         )
         .expect("optimizer should consume bound catalog stats");
         assert_eq!(optimized_tree.stats.output_row_count, 3.0);

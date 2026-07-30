@@ -3215,6 +3215,7 @@ dependencies = [
  "mysql",
  "mysql_common 0.32.4",
  "novarocks-catalog",
+ "novarocks-fs",
  "novarocks-spi",
  "novarocks-state-store",
  "novarocks-types",
@@ -3282,12 +3283,16 @@ name = "novarocks-compat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "hex",
  "novarocks",
+ "novarocks-fs",
  "prost 0.13.5",
+ "rand 0.8.5",
  "serde_json",
  "thrift",
+ "tokio",
 ]
 
 [[package]]
@@ -3317,6 +3322,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-fs"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "crc32c",
+ "libc",
+ "opendal",
+ "orc-rust",
+ "parquet",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
@@ -3328,6 +3350,7 @@ dependencies = [
  "novarocks-backend",
  "novarocks-compat",
  "novarocks-frontend",
+ "novarocks-fs",
  "novarocks-state-store",
  "reqwest",
  "tempfile",
@@ -3339,6 +3362,7 @@ dependencies = [
 name = "novarocks-spi"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "bytes",
  "sha2",

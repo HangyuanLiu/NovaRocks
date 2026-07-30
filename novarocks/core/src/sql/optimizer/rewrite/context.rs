@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::optimizer::options::SessionOptimizerSettings;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::stats_input::OptimizerStatsInput;
@@ -58,6 +59,7 @@ impl Default for RewritePolicy {
 pub(crate) struct RewriteContext {
     consumer: RewriteConsumer,
     disabled_rules: HashSet<String>,
+    session_settings: SessionOptimizerSettings,
     policy: RewritePolicy,
     trace: RewriteTrace,
     extension: Option<Arc<dyn Any + Send + Sync>>,
@@ -71,10 +73,14 @@ pub(crate) struct RewriteContext {
 }
 
 impl RewriteContext {
-    pub(crate) fn new(consumer: RewriteConsumer) -> Self {
+    pub(crate) fn new(
+        consumer: RewriteConsumer,
+        session_settings: SessionOptimizerSettings,
+    ) -> Self {
         Self {
             consumer,
-            disabled_rules: HashSet::new(),
+            disabled_rules: session_settings.disabled_rules.iter().cloned().collect(),
+            session_settings,
             policy: RewritePolicy::default(),
             trace: RewriteTrace::default(),
             extension: None,
@@ -85,17 +91,30 @@ impl RewriteContext {
         }
     }
 
-    pub(crate) fn for_query(disabled_rules: impl IntoIterator<Item = String>) -> Self {
-        let mut ctx = Self::new(RewriteConsumer::Query);
-        ctx.disabled_rules = disabled_rules.into_iter().collect();
+    pub(crate) fn for_query_with_settings(session_settings: SessionOptimizerSettings) -> Self {
+        Self::new(RewriteConsumer::Query, session_settings)
+    }
+
+    pub(crate) fn for_mv_refresh_with_settings(session_settings: SessionOptimizerSettings) -> Self {
+        let mut ctx = Self::new(RewriteConsumer::MaterializedViewRefresh, session_settings);
+        ctx.policy.failure_policy = RewriteFailurePolicy::FailFast;
         ctx
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_query(disabled_rules: impl IntoIterator<Item = String>) -> Self {
+        Self::for_query_with_settings(SessionOptimizerSettings {
+            disabled_rules: disabled_rules.into_iter().collect(),
+            ..Default::default()
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_mv_refresh(disabled_rules: impl IntoIterator<Item = String>) -> Self {
-        let mut ctx = Self::new(RewriteConsumer::MaterializedViewRefresh);
-        ctx.disabled_rules = disabled_rules.into_iter().collect();
-        ctx.policy.failure_policy = RewriteFailurePolicy::FailFast;
-        ctx
+        Self::for_mv_refresh_with_settings(SessionOptimizerSettings {
+            disabled_rules: disabled_rules.into_iter().collect(),
+            ..Default::default()
+        })
     }
 
     pub(crate) fn consumer(&self) -> RewriteConsumer {
@@ -112,6 +131,10 @@ impl RewriteContext {
 
     pub(crate) fn is_rule_enabled(&self, rule_name: &str) -> bool {
         !self.disabled_rules.contains(rule_name)
+    }
+
+    pub(crate) fn session_settings(&self) -> &SessionOptimizerSettings {
+        &self.session_settings
     }
 
     pub(crate) fn trace(&self) -> &RewriteTrace {

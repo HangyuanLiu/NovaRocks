@@ -729,7 +729,11 @@ impl MetadataRefreshExecutor {
 impl RefreshExecutor for MetadataRefreshExecutor {
     fn execute_refresh(&mut self, mv_id: i64) -> Result<(), String> {
         let target = load_refresh_execution_target(&self.state, mv_id)?;
-        crate::engine::mv_flow::refresh_mv(
+        let connector_context = crate::connector::connector_request_context(
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?;
+        crate::engine::mv_flow::refresh_mv_with_connector_context(
             &self.state,
             target.current_catalog.as_deref(),
             &target.current_database,
@@ -737,6 +741,7 @@ impl RefreshExecutor for MetadataRefreshExecutor {
                 name: target.name,
                 full: false,
             },
+            &connector_context,
         )?;
         Ok(())
     }

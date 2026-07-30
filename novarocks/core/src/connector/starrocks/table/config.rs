@@ -18,7 +18,7 @@
 use crate::common::app_config::StandaloneStarRocksTableConfig as AppStarRocksTableConfig;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
-use crate::fs::access::parse_object_store_path_parse_only;
+use novarocks_fs::parse_object_store_path_parse_only;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StarRocksTableConfig {
@@ -41,7 +41,8 @@ impl StarRocksTableConfig {
         // The warehouse path component lives in `warehouse_uri` and is
         // reused by `tablet_root_path` to mint absolute tablet URIs; the
         // OpenDAL operator never depends on it as a builder root.
-        let (bucket, _warehouse_path) = parse_object_store_path_parse_only(&warehouse_uri)?;
+        let (bucket, _warehouse_path) = parse_object_store_path_parse_only(&warehouse_uri)
+            .map_err(|error| error.to_string())?;
         let mv_default_storage_engine = config
             .mv_default_storage_engine
             .as_deref()

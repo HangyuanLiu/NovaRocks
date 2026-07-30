@@ -620,7 +620,7 @@ fn encode_scan_source(
                     .iter()
                     .map(encode_iceberg_data_file_info)
                     .collect::<Result<Vec<_>, _>>()?,
-                cloud_properties: files.cloud_properties.clone().into_iter().collect(),
+                cloud_properties: Default::default(),
                 binding: match files.binding {
                     iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
@@ -668,7 +668,7 @@ fn encode_scan_source(
             table_model::ScanSource::IcebergDataFiles {
                 table,
                 files,
-                cloud_properties,
+                cloud_properties: _,
                 binding,
             } => Kind::IcebergDataFiles(plan::IcebergDataFiles {
                 table: Some(encode_iceberg_table_info(table)?),
@@ -676,7 +676,7 @@ fn encode_scan_source(
                     .iter()
                     .map(encode_iceberg_data_file_info)
                     .collect::<Result<Vec<_>, _>>()?,
-                cloud_properties: cloud_properties.clone().into_iter().collect(),
+                cloud_properties: Default::default(),
                 binding: match binding {
                     iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
@@ -690,13 +690,13 @@ fn encode_scan_source(
                 table,
                 metadata_table_type,
                 serialized_table,
-                cloud_properties,
+                cloud_properties: _,
                 metadata_payload,
             } => Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
                 table: Some(encode_iceberg_table_info(table)?),
                 metadata_table_type: encode_iceberg_metadata_table_type(metadata_table_type),
                 serialized_table: serialized_table.clone(),
-                cloud_properties: cloud_properties.clone().into_iter().collect(),
+                cloud_properties: Default::default(),
                 metadata_payload: metadata_payload.clone(),
             }),
             table_model::ScanSource::IcebergDeltaTable {

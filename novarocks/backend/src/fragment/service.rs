@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use novarocks::common::app_config;
 use novarocks::novarocks_logging::{error, info, warn};
+use novarocks::query_execution::native_fragment_report;
 use novarocks::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
@@ -30,7 +31,6 @@ use novarocks::runtime::fragment::{
 };
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::profile::Profiler;
-use novarocks::service::fe_report;
 use novarocks::service::native_fragment_ingress::{
     NativeFragmentAccepted, NativeFragmentCancelRequest, NativeFragmentIngress,
     NativeFragmentIngressError, NativeFragmentRequest,
@@ -258,7 +258,13 @@ impl NativeFragmentIngress for NativeFragmentService {
             .spawn(move || {
                 if start_rx.recv().is_err() {
                     let error = "native fragment start signal was dropped".to_string();
-                    fe_report::report_fragment_done(fragment_instance_id, Some(error), false);
+                    native_fragment_report::report_terminal(
+                        fragment_instance_id,
+                        novarocks::runtime::fragment::io::FragmentTerminalReport::new(
+                            Some(error),
+                            false,
+                        ),
+                    );
                     queries.unregister_fragment(fragment_instance_id);
                     token.complete();
                     return;
@@ -306,16 +312,18 @@ impl NativeFragmentIngress for NativeFragmentService {
         registration.into_running();
 
         if let Some(report_endpoint) = report_endpoint {
-            fe_report::register_novarocks_instance(
-                fragment_instance_id,
-                query_id,
+            native_fragment_report::register(
+                novarocks::runtime::fragment::io::FragmentReportRegistration::new(
+                    fragment_instance_id,
+                    query_id,
+                    backend_num,
+                    enable_profile,
+                    profiler,
+                    Some(fragment_mem_tracker),
+                    Some(query_mem_tracker),
+                    report_interval_ns,
+                ),
                 report_endpoint,
-                backend_num,
-                enable_profile,
-                profiler,
-                Some(fragment_mem_tracker),
-                Some(query_mem_tracker),
-                report_interval_ns,
             );
         } else {
             warn!(
@@ -454,10 +462,12 @@ fn consume_terminal_fact(
         FragmentOutcome::Cancelled { reason } => Some(reason.detail().to_string()),
     };
     let report_decision = queries.finish_fragment_for_report(query_id);
-    fe_report::report_fragment_done(
+    native_fragment_report::report_terminal(
         fragment_instance_id,
-        report_error,
-        report_decision.include_runtime_filter_profile(),
+        novarocks::runtime::fragment::io::FragmentTerminalReport::new(
+            report_error,
+            report_decision.include_runtime_filter_profile(),
+        ),
     );
     queries.unregister_fragment(fragment_instance_id);
     queries.cleanup_after_fragment_report(query_id, report_decision);

@@ -41,7 +41,7 @@ use crate::engine::StandaloneState;
 use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
 };
-use crate::fs::object_store::ObjectStoreConfig;
+use novarocks_fs::ObjectStoreConfig;
 
 /// Connector handles shared by synchronous and worker-driven maintenance.
 pub(crate) type MaintenanceCatalogTriple =
@@ -391,16 +391,24 @@ fn resolve_maintenance_table_name(
     namespace: &str,
     table: &str,
 ) -> Result<String, String> {
-    let backend = {
+    let (resolved, _) = {
         let connectors = state
             .connectors
             .read()
             .expect("connector registry read lock");
-        connectors.catalog_backend("iceberg")?
+        crate::connector::metadata_load_table(
+            &connectors,
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+            catalog_name,
+            namespace,
+            table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
     };
-    backend
-        .current_schema_id_for_read(catalog_name, namespace, table)
-        .map(|(resolved_table, _schema_id)| resolved_table)
+    Ok(resolved.table)
 }
 
 fn action_target(target: &MaintenanceTarget) -> String {

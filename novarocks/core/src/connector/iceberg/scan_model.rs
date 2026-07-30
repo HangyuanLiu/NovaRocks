@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct IcebergColumnStats {
     pub null_count: Option<i64>,
     /// Total value count (including nulls) from manifest `value_counts`. The
@@ -30,7 +30,7 @@ pub struct IcebergColumnStats {
     pub upper_bound: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergPartitionValue {
     Boolean(bool),
     Int32(i32),
@@ -41,7 +41,7 @@ pub enum IcebergPartitionValue {
     Binary(Vec<u8>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergPartitionFieldValue {
     pub source_column: String,
     pub field_name: String,
@@ -61,19 +61,19 @@ impl IcebergPartitionFieldValue {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergDeleteFileFormat {
     Parquet,
     Puffin,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IcebergDeleteFileContent {
     Position,
     Equality,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergDeleteFileInfo {
     pub path: String,
     pub file_format: IcebergDeleteFileFormat,
@@ -88,11 +88,13 @@ pub struct IcebergDeleteFileInfo {
     pub equality_field_ids: Vec<i32>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergSchemaFieldDef {
     pub field_id: i32,
     pub name: String,
+    #[serde(skip)]
     pub initial_default: Option<iceberg::spec::Literal>,
+    #[serde(skip)]
     pub write_default: Option<iceberg::spec::Literal>,
     /// Spec-compliant JSON encoding of `initial_default` precomputed at the
     /// point of construction where the iceberg `Type` is still available.
@@ -107,12 +109,12 @@ pub struct IcebergSchemaFieldDef {
     pub children: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergSchemaDef {
     pub fields: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergTableInfo {
     pub catalog: String,
     pub namespace: String,
@@ -125,7 +127,7 @@ pub struct IcebergTableInfo {
     /// JSON-serialized iceberg `TableMetadata`. Required when the table
     /// is referenced as an Iceberg metadata table (`t$snapshots`,
     /// `t$history`, `t$refs`, `t$partitions`) — the native-Rust
-    /// `IcebergMetadataScanOp` parses this string back via
+    /// The Iceberg metadata SPI reader parses this string back via
     /// `serde_json::from_str::<TableMetadata>` to materialise the
     /// metadata rows. The native scan plan carries this payload directly;
     /// there is no JNI bridge on the NovaRocks side. `None` for tables
@@ -138,7 +140,7 @@ pub struct IcebergTableInfo {
     pub serialized_metadata_rows: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct IcebergDataFileInfo {
     pub path: String,
     pub size: i64,

@@ -18,6 +18,7 @@
 mod common;
 mod delete_files;
 mod file_range;
+mod generic;
 mod iceberg_data;
 mod iceberg_delta;
 mod iceberg_metadata;
@@ -162,6 +163,12 @@ pub(crate) fn lower_scan_node(
                 ))
             }
         }
+        plan::scan_source::Kind::ConnectorRead(source) => {
+            reject_variant_columns_for_source(scan, "ConnectorReadSource")
+                .map_err(|error| error.into_native(path.clone()))?;
+            generic::lower_connector_read_scan(node, scan, source, &output_columns, ctx, arena)
+                .map_err(|error| error.into_native(source_path.field("connector_read")))
+        }
     }
 }
 
@@ -215,9 +222,16 @@ pub(crate) fn scan_read_binding_for_test(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
+    use arrow::record_batch::RecordBatch;
+    use novarocks_spi::connector::{
+        ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorInstance,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorOpenReaderRequest,
+        ConnectorProviderId, ConnectorRead, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+        ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::super::node::{
@@ -228,16 +242,13 @@ mod tests {
     use crate::common::ids::SlotId;
     #[cfg(feature = "compat")]
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-    #[cfg(feature = "compat")]
-    use crate::connector::StarRocksScanConfig;
+    use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
-    use crate::connector::{ConnectorRegistry, HdfsScanConfig, ScanConfig, ScanConnector};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
     use crate::exec::node::scan::ScanMorsel;
-    use crate::formats::FileFormatConfig;
     use crate::proto::{common, expr, novarocks, plan};
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
@@ -349,6 +360,248 @@ mod tests {
         }
     }
 
+    struct EmptyConnectorReader;
+
+    impl ConnectorBatchReader for EmptyConnectorReader {
+        fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    struct NativeCarrierTestRead {
+        instance_id: ConnectorInstanceId,
+    }
+
+    impl ConnectorRead for NativeCarrierTestRead {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn begin_scan(
+            &self,
+            _table: &ConnectorTableHandle,
+            _request: ConnectorBeginScanRequest,
+        ) -> Result<ConnectorScan, ConnectorError> {
+            unreachable!("native carrier starts after split planning")
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &ConnectorScanHandle,
+            _request: ConnectorSplitPlanningRequest,
+        ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+            unreachable!("native carrier starts after split planning")
+        }
+
+        fn open_reader(
+            &self,
+            _split: &ConnectorSplit,
+            _request: ConnectorOpenReaderRequest,
+        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+            Ok(Box::new(EmptyConnectorReader))
+        }
+    }
+
+    fn connector_read_registry(instance_id: &str) -> Arc<ConnectorRegistry> {
+        let instance_id = ConnectorInstanceId::parse(instance_id).expect("instance ID");
+        let instance = ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(NativeCarrierTestRead { instance_id }),
+        )
+        .expect("connector instance");
+        let mut registry = ConnectorRegistry::new();
+        registry
+            .register_connector_instance(instance)
+            .expect("register connector instance");
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn native_connector_read_carrier_resolves_the_typed_host_and_executes_its_split() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "test.native".to_string(),
+                scan_payload: vec![0],
+                splits: vec![plan::ConnectorReadSplit {
+                    split_id: "split-1".to_string(),
+                    split_payload: vec![1, 2, 3],
+                    estimated_bytes: Some(3),
+                    file_execution: None,
+                }],
+                max_batch_rows: 128,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+                provider_id: "test".to_string(),
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(connector_read_registry("test.native"))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 9 });
+        let decoded = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect("decode ConnectorReadSource");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("expected decoded scan node");
+        };
+        let op = scan
+            .source()
+            .bind(context.captured_ranges_for_test(node.node_id))
+            .expect("bind generic connector source");
+        let rows = op
+            .execute_iter(ScanMorsel::ConnectorSplit { index: 0 }, None, None)
+            .expect("open typed reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read typed split");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn native_connector_read_carrier_rejects_zero_batch_budget() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "test.native".to_string(),
+                scan_payload: Vec::new(),
+                splits: Vec::new(),
+                max_batch_rows: 0,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+                provider_id: "test".to_string(),
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(connector_read_registry("test.native"))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 10 });
+        let error = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect_err("zero batch budget must fail native decoding");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+        assert!(
+            protocol
+                .path()
+                .to_string()
+                .ends_with("connector_read.max_batch_rows")
+        );
+    }
+
+    #[test]
+    fn native_connector_read_carrier_restores_core_file_sidecar_without_provider_decoding() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "test.native".to_string(),
+                scan_payload: vec![0],
+                splits: vec![plan::ConnectorReadSplit {
+                    split_id: "file-1".to_string(),
+                    split_payload: vec![1, 2, 3],
+                    estimated_bytes: Some(3),
+                    file_execution: Some(plan::FileExecutionSidecar {
+                        version: 1,
+                        file_format: plan::FileExecutionFormat::Parquet as i32,
+                        path: "s3://bucket/table/data.parquet".to_string(),
+                        file_length: 100,
+                        offset: 7,
+                        length: 31,
+                        delete_files: Vec::new(),
+                        deletion_vector: None,
+                        first_row_id: Some(11),
+                        data_sequence_number: Some(12),
+                        included_positions: vec![13, 17],
+                        change_op: Some(1),
+                        file_pruning_min_max_values: Default::default(),
+                    }),
+                }],
+                max_batch_rows: 128,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+                provider_id: "test".to_string(),
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(connector_read_registry("test.native"))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 11 });
+        let decoded = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect("decode ConnectorReadSource with a core file sidecar");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("expected decoded scan node");
+        };
+        let op = scan
+            .source()
+            .bind(context.captured_ranges_for_test(node.node_id))
+            .expect("bind generic connector source");
+        let morsels = op.build_morsels().expect("build generic connector morsels");
+        assert!(matches!(
+            &morsels.morsels[..],
+            [ScanMorsel::ConnectorFileSplit { range, .. }]
+                if range.path == "s3://bucket/table/data.parquet"
+                    && range.offset == 7
+                    && range.length == 31
+                    && range.first_row_id == Some(11)
+                    && range.data_sequence_number == Some(12)
+                    && range.included_positions == Some(vec![13, 17])
+        ));
+    }
+
+    #[test]
+    fn native_hdfs_carrier_rehydrates_a_be_local_transport_instance() {
+        let node = scan_node(plan::scan_source::Kind::ConnectorRead(
+            plan::ConnectorReadSource {
+                instance_id: "hdfs.native.7.12".to_string(),
+                scan_payload: Vec::new(),
+                splits: vec![plan::ConnectorReadSplit {
+                    split_id: "file-1".to_string(),
+                    split_payload: Vec::new(),
+                    estimated_bytes: Some(100),
+                    file_execution: Some(plan::FileExecutionSidecar {
+                        version: 1,
+                        file_format: plan::FileExecutionFormat::Parquet as i32,
+                        path: "s3://bucket/table/data.parquet".to_string(),
+                        file_length: 100,
+                        offset: 0,
+                        length: 100,
+                        delete_files: Vec::new(),
+                        deletion_vector: None,
+                        first_row_id: None,
+                        data_sequence_number: None,
+                        included_positions: Vec::new(),
+                        change_op: None,
+                        file_pruning_min_max_values: Default::default(),
+                    }),
+                }],
+                max_batch_rows: 128,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+                provider_id: "hdfs".to_string(),
+            },
+        ));
+        let context = NativePlanDecodeContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
+        let decoded = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect("rehydrate HDFS transport instance from the BE host");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("expected decoded scan node");
+        };
+        let op = scan
+            .source()
+            .bind(context.captured_ranges_for_test(node.node_id))
+            .expect("bind generic HDFS connector source");
+        assert!(matches!(
+            op.build_morsels().expect("build HDFS connector morsels").morsels.as_slice(),
+            [ScanMorsel::ConnectorFileSplit { range, .. }]
+                if range.path == "s3://bucket/table/data.parquet"
+        ));
+    }
+
     fn assert_scan_column_type_error(
         columns: Vec<common::OutputColumn>,
         required_columns: Vec<String>,
@@ -435,70 +688,6 @@ mod tests {
                 })),
             })),
         }
-    }
-
-    #[derive(Clone)]
-    struct CapturingHdfsConnector {
-        captured: Arc<Mutex<Option<HdfsScanConfig>>>,
-    }
-
-    impl ScanConnector for CapturingHdfsConnector {
-        fn name(&self) -> &'static str {
-            "hdfs"
-        }
-
-        fn create_scan_node(
-            &self,
-            cfg: ScanConfig,
-        ) -> Result<
-            (
-                std::sync::Arc<dyn crate::exec::node::scan::ScanSource>,
-                crate::exec::node::scan::BoundScanRanges,
-            ),
-            String,
-        > {
-            let ScanConfig::Hdfs(cfg) = cfg else {
-                return Err("capturing hdfs connector received non-HDFS config".to_string());
-            };
-            let cfg = *cfg;
-            *self.captured.lock().expect("captured hdfs config lock") = Some(cfg.clone());
-            // Mirror the real HdfsConnector split: static source + file ranges.
-            let crate::connector::HdfsScanConfig {
-                ranges,
-                original_range_count: _,
-                has_more,
-                limit,
-                profile_label,
-                format,
-                object_store_config,
-                iceberg_table_locations,
-                query_global_dicts,
-                iceberg_runtime_pruning,
-            } = cfg;
-            let source: std::sync::Arc<dyn crate::exec::node::scan::ScanSource> =
-                std::sync::Arc::new(crate::connector::hdfs::HdfsScanSource::new(
-                    limit,
-                    profile_label,
-                    format,
-                    object_store_config,
-                    iceberg_table_locations,
-                    query_global_dicts,
-                    iceberg_runtime_pruning,
-                ));
-            Ok((
-                source,
-                crate::exec::node::scan::BoundScanRanges::File { ranges, has_more },
-            ))
-        }
-    }
-
-    fn capturing_hdfs_registry() -> (Arc<ConnectorRegistry>, Arc<Mutex<Option<HdfsScanConfig>>>) {
-        let captured = Arc::new(Mutex::new(None));
-        let mut registry = ConnectorRegistry::default();
-        registry.register_scan_connector(Arc::new(CapturingHdfsConnector {
-            captured: Arc::clone(&captured),
-        }));
-        (Arc::new(registry), captured)
     }
 
     fn column_ref(column_id: u32, name: &str, data_type: DataType) -> expr::Expr {
@@ -695,94 +884,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "compat")]
-    #[derive(Clone)]
-    struct CapturingStarRocksConnector {
-        captured: Arc<Mutex<Option<StarRocksScanConfig>>>,
-    }
-
-    #[cfg(feature = "compat")]
-    impl ScanConnector for CapturingStarRocksConnector {
-        fn name(&self) -> &'static str {
-            "starrocks"
-        }
-
-        fn create_scan_node(
-            &self,
-            cfg: ScanConfig,
-        ) -> Result<
-            (
-                std::sync::Arc<dyn crate::exec::node::scan::ScanSource>,
-                crate::exec::node::scan::BoundScanRanges,
-            ),
-            String,
-        > {
-            let ScanConfig::StarRocks(cfg) = cfg else {
-                return Err("capturing StarRocks connector received non-StarRocks config".into());
-            };
-            let cfg = *cfg;
-            *self
-                .captured
-                .lock()
-                .expect("captured StarRocks config lock") = Some(cfg.clone());
-            // Mirror the real StarRocksConnector split: static source + tablets.
-            let StarRocksScanConfig {
-                db_name,
-                table_name,
-                properties,
-                ranges,
-                has_more,
-                required_chunk_schema,
-                output_chunk_schema,
-                query_global_dicts,
-                limit,
-                batch_size,
-                query_timeout,
-                mem_limit,
-                profile_label,
-                min_max_predicates,
-                lake_schema_meta,
-                deferred_lake_resolution,
-                topn_filter_column_map,
-            } = cfg;
-            let source: std::sync::Arc<dyn crate::exec::node::scan::ScanSource> =
-                std::sync::Arc::new(crate::connector::starrocks::StarRocksScanSource {
-                    db_name,
-                    table_name,
-                    properties,
-                    required_chunk_schema,
-                    output_chunk_schema,
-                    query_global_dicts,
-                    limit,
-                    batch_size,
-                    query_timeout,
-                    mem_limit,
-                    profile_label,
-                    min_max_predicates,
-                    lake_schema_meta,
-                    deferred_lake_resolution,
-                    topn_filter_column_map,
-                });
-            Ok((
-                source,
-                crate::exec::node::scan::BoundScanRanges::StarRocksTablet { ranges, has_more },
-            ))
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    fn capturing_starrocks_registry() -> (
-        Arc<ConnectorRegistry>,
-        Arc<Mutex<Option<StarRocksScanConfig>>>,
-    ) {
-        let captured = Arc::new(Mutex::new(None));
-        let mut registry = ConnectorRegistry::new();
-        registry.register_scan_connector(Arc::new(CapturingStarRocksConnector {
-            captured: Arc::clone(&captured),
-        }));
-        (Arc::new(registry), captured)
-    }
-
     #[cfg(not(feature = "compat"))]
     #[test]
     fn rejects_starrocks_native_scan_without_compat_feature() {
@@ -806,7 +907,7 @@ mod tests {
             lo: 8_700_000_000_000_003,
         };
         let node = scan_node(starrocks_source());
-        let (connectors, captured) = capturing_starrocks_registry();
+        let connectors = Arc::new(ConnectorRegistry::new());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(connectors)
             .with_query_id(query_id)
@@ -817,13 +918,6 @@ mod tests {
         decode_node(&node, &mut arena, &ctx)
             .expect("valid StarRocks scan decode must defer tablet-path resolution");
 
-        let cfg = captured
-            .lock()
-            .expect("captured StarRocks config lock")
-            .clone()
-            .expect("StarRocks connector config");
-        assert!(!cfg.properties.contains_key("partition_storage_paths"));
-        assert!(cfg.deferred_lake_resolution.is_some());
         assert!(crate::runtime::starlet_shard_registry::select_paths(&[tablet_id]).is_empty());
     }
 
@@ -1239,9 +1333,10 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [ScanMorsel::FileRange { delete_files, .. }] = morsels.morsels.as_slice() else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
+        let delete_files = &morsel.file_range().expect("file sidecar").delete_files;
         assert_eq!(delete_files.len(), 1);
         let dv = &delete_files[0];
         assert_eq!(dv.file_format, IcebergFileFormat::Puffin);
@@ -1278,21 +1373,16 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [
-            ScanMorsel::FileRange {
-                ivm_change_op,
-                iceberg_file_pruning,
-                ..
-            },
-        ] = morsels.morsels.as_slice()
-        else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
+        let range = morsel.file_range().expect("file sidecar");
         assert_eq!(
-            *ivm_change_op,
+            range.ivm_change_op,
             Some(crate::exec::change_op::CHANGE_OP_DELETE)
         );
-        let pruning = iceberg_file_pruning
+        let pruning = range
+            .iceberg_file_pruning
             .as_ref()
             .expect("file pruning metadata");
         let stats = pruning.columns.get("id").expect("id stats");
@@ -1355,16 +1445,12 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [
-            ScanMorsel::FileRange {
-                iceberg_file_pruning,
-                ..
-            },
-        ] = morsels.morsels.as_slice()
-        else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
-        let stats = iceberg_file_pruning
+        let range = morsel.file_range().expect("file sidecar");
+        let stats = range
+            .iceberg_file_pruning
             .as_ref()
             .expect("file pruning metadata")
             .columns
@@ -1429,17 +1515,15 @@ mod tests {
             .expect("bind scan source")
             .build_morsels()
             .expect("build morsels");
-        let [
-            ScanMorsel::FileRange {
-                iceberg_file_pruning,
-                ..
-            },
-        ] = morsels.morsels.as_slice()
-        else {
+        let [morsel] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
         assert!(
-            iceberg_file_pruning.is_none(),
+            morsel
+                .file_range()
+                .expect("file sidecar")
+                .iceberg_file_pruning
+                .is_none(),
             "one-byte negative Int8 bounds must not reach the untyped shared pruning decoder"
         );
     }
@@ -1461,54 +1545,34 @@ mod tests {
                 upper_bound: Some(110_i32.to_le_bytes().to_vec()),
             },
         )]));
-        let connector_table = crate::connector::iceberg::scan_planner::IcebergTableHandle {
+        let table = crate::connector::iceberg::scan_model::IcebergTableInfo {
             catalog: "rest".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),
-            snapshot_id: Some(1),
-            table_info: crate::connector::iceberg::scan_model::IcebergTableInfo {
-                catalog: "rest".to_string(),
-                namespace: "db".to_string(),
-                table: "t".to_string(),
-                table_uuid: None,
-                current_snapshot_id: Some(1),
-                schema_id: 7,
-                location: "s3://bucket/warehouse/db/t".to_string(),
-                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
-                    fields: vec![
-                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
-                            field_id: 10,
-                            name: "id".to_string(),
-                            initial_default: None,
-                            write_default: None,
-                            initial_default_json: None,
-                            write_default_json: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                },
-                serialized_metadata: None,
-                serialized_metadata_rows: None,
+            table_uuid: None,
+            current_snapshot_id: Some(1),
+            schema_id: 7,
+            location: "s3://bucket/warehouse/db/t".to_string(),
+            schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                fields: vec![
+                    crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                        field_id: 10,
+                        name: "id".to_string(),
+                        initial_default: None,
+                        write_default: None,
+                        initial_default_json: None,
+                        write_default_json: None,
+                        children: Vec::new(),
+                    },
+                ],
             },
-            split_source:
-                crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(vec![
-                    file.clone(),
-                ]),
-            column_names: vec!["id".to_string()],
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
         };
-        let scan_handle = crate::connector::scan_planning::ScanHandle::new(
-            "iceberg",
-            crate::connector::iceberg::scan_planner::IcebergScanHandle {
-                table: connector_table,
-            },
-        );
-        let split = crate::connector::scan_planning::Split::new(
-            "iceberg",
-            crate::connector::iceberg::scan_planner::IcebergSplit { data_file: file },
-        );
         let planned = crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(
-            &scan_handle,
-            &[split],
+            &table,
+            &[file],
+            &["id".to_string()],
             crate::connector::iceberg::scan_range::IcebergScanRangeContext {
                 min_max_predicates: Vec::new(),
                 columns: vec![novarocks_catalog::schema::ColumnDef {
@@ -1709,10 +1773,11 @@ mod tests {
     #[test]
     fn lowers_native_iceberg_scan_variant_path_columns() {
         let node = variant_scan_node();
-        let (registry, captured_hdfs) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 11 });
         let mut arena = ExprArena::default();
 
         let lowered = decode_node(&node, &mut arena, &ctx)
@@ -1732,65 +1797,32 @@ mod tests {
             other => panic!("expected Scan or Project over Scan, got {other:?}"),
         };
         assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(2)]);
-
-        let hdfs_cfg = captured_hdfs
-            .lock()
-            .expect("captured hdfs config lock")
-            .clone()
-            .expect("captured hdfs config");
-        let Some(FileFormatConfig::Parquet(parquet_cfg)) = hdfs_cfg.format else {
-            panic!("expected parquet scan config");
-        };
-        assert_eq!(parquet_cfg.columns, vec!["v".to_string()]);
-        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(3)]);
-        assert_eq!(parquet_cfg.variant_path_columns.len(), 1);
-        let spec = &parquet_cfg.variant_path_columns[0];
-        assert_eq!(spec.source_slot_id, SlotId::new(1));
-        assert_eq!(spec.source_read_slot_id, SlotId::new(3));
-        assert_eq!(spec.output_slot_id, SlotId::new(2));
-        assert_eq!(spec.source_name, "v");
-        assert_eq!(spec.output_name, "__nr_var_v_0");
-        assert_eq!(spec.canonical_path, "$.a.b");
-        assert_eq!(spec.requested_type, DataType::Int64);
-        assert!(spec.strict);
-        assert_eq!(spec.source_field_id, Some(101));
     }
 
     #[test]
     fn native_variant_source_hidden_slot_reserves_source_slot_id() {
         let node = variant_scan_node_with_source_ids(3, 3);
-        let (registry, captured_hdfs) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
         let mut arena = ExprArena::default();
 
         let lowered = decode_node(&node, &mut arena, &ctx)
             .expect("lower native scan with colliding source slot");
 
         assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(2)]);
-        let hdfs_cfg = captured_hdfs
-            .lock()
-            .expect("captured hdfs config lock")
-            .clone()
-            .expect("captured hdfs config");
-        let Some(FileFormatConfig::Parquet(parquet_cfg)) = hdfs_cfg.format else {
-            panic!("expected parquet scan config");
-        };
-        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(4)]);
-        let spec = &parquet_cfg.variant_path_columns[0];
-        assert_eq!(spec.source_slot_id, SlotId::new(3));
-        assert_eq!(spec.source_read_slot_id, SlotId::new(4));
-        assert_ne!(spec.source_read_slot_id, spec.source_slot_id);
     }
 
     #[test]
     fn rejects_native_variant_source_id_name_mismatch() {
         let node = variant_scan_node_with_source_ids(4, 3);
-        let (registry, _) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 13 });
         let mut arena = ExprArena::default();
 
         let err = decode_node(&node, &mut arena, &ctx).expect_err("reject source id/name drift");
@@ -2093,10 +2125,11 @@ mod tests {
                 binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
             }),
         );
-        let (registry, captured) = capturing_hdfs_registry();
+        let registry = Arc::new(ConnectorRegistry::default());
         let ctx = NativePlanDecodeContext::default()
             .with_connector_registry(registry)
-            .with_scan_ranges(10, vec![file_range()]);
+            .with_scan_ranges(10, vec![file_range()])
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 14 });
         let mut arena = ExprArena::default();
         let lowered = decode_node(&node, &mut arena, &ctx).expect("lower virtual-only native scan");
 
@@ -2115,17 +2148,6 @@ mod tests {
         );
         let virtual_spec = scan.iceberg_virtual().expect("iceberg virtual spec");
         assert_eq!(virtual_spec.row_id_slot, Some(SlotId::new(4)));
-
-        let cfg = captured
-            .lock()
-            .expect("captured hdfs config lock")
-            .clone()
-            .expect("captured hdfs config");
-        let Some(FileFormatConfig::Parquet(parquet_cfg)) = cfg.format else {
-            panic!("expected parquet scan config");
-        };
-        assert_eq!(parquet_cfg.columns, ["___count___".to_string()]);
-        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(5)]);
     }
 
     #[test]

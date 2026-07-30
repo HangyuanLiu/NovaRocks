@@ -34,10 +34,10 @@ use crate::formats::starrocks::writer::layout::{
     BUNDLE_TABLET_ID, INITIAL_VERSION, META_DIR, bundle_meta_file_path, initial_meta_file_path,
     join_tablet_path, standalone_meta_file_path, tablet_meta_rel_path,
 };
-use crate::fs::access::FsScheme;
 use crate::service::grpc_client::proto::starrocks::{
     BundleTabletMetadataPb, PagePointerPb, RowsetMetadataPb, TabletMetadataPb,
 };
+use novarocks_fs::FsScheme;
 
 const BUNDLE_METADATA_FOOTER_SIZE: usize = 8;
 

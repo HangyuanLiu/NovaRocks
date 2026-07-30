@@ -18,13 +18,14 @@
 use crate::query_execution::artifact::{
     BackendPlacement, FragmentScheduleDraft, ValidatedFragmentSchedule,
 };
+use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
-    build_distributed_query_request,
+    build_distributed_query_request_with_execution,
 };
 use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryExecutionId};
 use crate::query_execution::lifecycle::{
@@ -32,6 +33,7 @@ use crate::query_execution::lifecycle::{
     QueryLifecycleLeaseGuard,
 };
 use crate::query_execution::outcome::QueryOutcomeFactory;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use crate::runtime::query_options::QueryOptions;
@@ -42,6 +44,16 @@ use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
+    QueryExecutionContext::new(
+        crate::common::app_config::ClusterRole::AllInOne,
+        BackendTopologySnapshot::empty(0),
+        None,
+        cancellation,
+        crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    )
+}
 
 struct RecordingQueryLifecycleGuard {
     finalizes: Arc<AtomicUsize>,
@@ -178,7 +190,7 @@ fn execution_id(query_id: crate::query_execution::contract::QueryId) -> QueryExe
 #[test]
 fn request_owns_prepared_and_native_artifacts() {
     let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         Some(QueryOptions {
@@ -186,7 +198,7 @@ fn request_owns_prepared_and_native_artifacts() {
             ..Default::default()
         }),
         DistributedQueryIntent::Result,
-        QueryCancellationView::never_cancelled(),
+        &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("valid production artifacts form an owned request");
 
@@ -222,12 +234,12 @@ fn query_control_typestate_initializes_before_native_assembly() {
         aborts: aborts.clone(),
     };
     let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         None,
         DistributedQueryIntent::Result,
-        QueryCancellationView::never_cancelled(),
+        &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("build request");
     let parts = request.into_parts();
@@ -675,12 +687,12 @@ fn query_execution_service_uses_explicitly_injected_coordinator() {
         calls: calls.clone(),
     }));
     let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request(
+    let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         None,
         DistributedQueryIntent::Result,
-        QueryCancellationView::never_cancelled(),
+        &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("build service request");
 

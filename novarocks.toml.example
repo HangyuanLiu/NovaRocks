@@ -10,7 +10,9 @@ log_level = "info"
 # Example: "info,novarocks=debug,h2=off,hyper=off,tonic=off"
 # log_filter = "info"
 
-# Optional durable state store. Select exactly one provider configuration.
+# Durable StateStore provider. It is required for `cluster.role = "fe"`, where it
+# is the sole durable owner of backend membership; it remains optional for
+# `all-in-one` and `be`. Select exactly one provider configuration.
 # SQLite is restricted to deployments with exactly one active FE.
 # [state_store]
 # provider = "sqlite"
@@ -56,6 +58,17 @@ log_level = "info"
 # pool_min = 1
 # pool_max = 16
 # inactive_connection_ttl_ms = 30000
+
+# Distributed FE membership example. `backends` are additive seeds only: missing
+# endpoints are added to the StateStore-backed membership, but existing durable
+# entries are never deleted or reactivated by configuration. SQL ADD/DROP changes
+# persist across FE restart. `role = "be"` and `role = "all-in-one"` must not set
+# `backends`; all-in-one keeps its loopback backend transient.
+# [cluster]
+# role = "fe"
+# backends = ["10.0.0.11:9080", "10.0.0.12:9080"]
+# heartbeat_interval_ms = 1000
+# heartbeat_timeout_retries = 3
 
 [server]
 # Service bind host. Default: "127.0.0.1".
@@ -143,6 +156,16 @@ profile_report_interval = 30
 retry_log_first_n = 3
 # Summary window in milliseconds for suppressed retry warnings. Default: 30000.
 retry_log_summary_interval_ms = 30000
+
+# Native connector readers obtain object-store access from this local BE startup
+# configuration. Every BE in a distributed deployment must use the same values;
+# native fragment plans never carry endpoint or credential configuration.
+# [connector.object_store]
+# endpoint = "http://127.0.0.1:9000"
+# access_key_id = "admin"
+# access_key_secret = "admin123"
+# region = "us-east-1"
+# enable_path_style_access = true
 
 [runtime.cache]
 # Generic page cache switch. Default: true.

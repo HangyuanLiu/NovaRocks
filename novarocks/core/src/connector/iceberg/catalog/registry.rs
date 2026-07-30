@@ -97,7 +97,7 @@ pub(crate) struct IcebergCatalogEntry {
     #[allow(dead_code)]
     pub(crate) hms_uris: Option<String>,
     pub(crate) properties: Vec<(String, String)>,
-    s3_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    s3_config: Option<novarocks_fs::ObjectStoreConfig>,
     pub(crate) warehouse_path: PathBuf,
     table_cache: Arc<std::sync::RwLock<HashMap<(String, String), IcebergLoadedTable>>>,
     data_files_cache:
@@ -111,7 +111,7 @@ pub(crate) struct IcebergLoadedTable {
     pub logical_types: HashMap<String, SqlType>,
     pub key_desc: Option<TableKeyDesc>,
     pub column_aggregations: HashMap<String, ColumnAggregation>,
-    pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    pub object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
 }
 
 const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
@@ -187,9 +187,7 @@ impl IcebergCatalogEntry {
         )
     }
 
-    pub(crate) fn object_store_config(
-        &self,
-    ) -> Option<&crate::fs::object_store::ObjectStoreConfig> {
+    pub(crate) fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
         self.s3_config.as_ref()
     }
 
@@ -1617,16 +1615,15 @@ pub(crate) fn build_catalog_entry(
 
     // Detect object-store storage through the shared fs classifier so catalog
     // initialization follows the same scheme rules as runtime IO.
-    let is_object_store =
-        match crate::fs::access::is_object_store_location_parse_only(&raw_warehouse) {
-            Ok(is_object_store) => is_object_store,
-            Err(e) if e.contains("unsupported fs location scheme") => false,
-            Err(e) => {
-                return Err(format!(
-                    "parse iceberg catalog warehouse URI {raw_warehouse}: {e}"
-                ));
-            }
-        };
+    let is_object_store = match novarocks_fs::is_object_store_location_parse_only(&raw_warehouse) {
+        Ok(is_object_store) => is_object_store,
+        Err(e) if e.to_string().contains("unsupported fs location scheme") => false,
+        Err(e) => {
+            return Err(format!(
+                "parse iceberg catalog warehouse URI {raw_warehouse}: {e}"
+            ));
+        }
+    };
 
     let (warehouse_uri, warehouse_path, s3_config) = if is_object_store {
         let props_vec = sorted_properties(&props);
@@ -1692,7 +1689,7 @@ fn normalize_catalog_property_key(key: &str) -> String {
 fn optional_object_store_config_from_props(
     props: &HashMap<String, String>,
     _warehouse: &str,
-) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
+) -> Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
     let props_vec = sorted_properties(props);
     fs_io::object_store_config_from_catalog_properties(&props_vec)
 }

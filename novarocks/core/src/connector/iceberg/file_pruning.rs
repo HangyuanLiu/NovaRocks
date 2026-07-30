@@ -21,10 +21,10 @@ use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMa
 use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
+use crate::connector::file_execution::FileScanRange;
 use crate::connector::iceberg::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue,
 };
-use crate::fs::scan_context::FileScanRange;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IcebergFileNullState {

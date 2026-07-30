@@ -231,7 +231,7 @@ pub(crate) fn resolve_native_sink_s3_config(
     data_location: &str,
     cloud_properties: &HashMap<String, String>,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, NativeFragmentLeafDecodeError> {
-    if !crate::fs::access::is_object_store_location_parse_only(data_location).map_err(|e| {
+    if !novarocks_fs::is_object_store_location_parse_only(data_location).map_err(|e| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
             "data_location",
@@ -240,7 +240,7 @@ pub(crate) fn resolve_native_sink_s3_config(
     })? {
         return Ok(None);
     }
-    let (bucket, _data_root) = crate::fs::access::parse_object_store_path_parse_only(data_location)
+    let (bucket, _data_root) = novarocks_fs::parse_object_store_path_parse_only(data_location)
         .map_err(|e| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InvalidValue,

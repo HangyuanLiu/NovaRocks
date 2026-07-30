@@ -1147,7 +1147,7 @@ fn framework_locator_local_warehouse_uri(
 #[cfg(test)]
 fn framework_locator_loaded_table(
     target_table: &iceberg::table::Table,
-    object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
 ) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
     let iceberg_schema = target_table.metadata().current_schema();
     let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)

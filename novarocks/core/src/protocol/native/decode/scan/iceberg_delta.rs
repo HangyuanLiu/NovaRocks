@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::super::node::DecodedNode;
 use super::common::{
-    DecodedScanOutputColumns, lower_scan_predicate, resolve_cloud_object_store_config,
+    DecodedScanOutputColumns, lower_scan_predicate, resolve_native_connector_object_store_config,
 };
 use super::delete_files::{
     lower_delta_delete_side_payload_from_native, lower_equality_delete_target_from_native,
@@ -93,8 +93,9 @@ pub(super) fn lower_iceberg_delta_table_scan(
     };
     let change_files = lower_delta_source_files_from_native(&delta_plan.change_files)
         .map_err(|error| error.prepend_field("delta_plan"))?;
-    let object_store_config = resolve_cloud_object_store_config(&delta_plan.cloud_properties)
-        .map_err(|error| error.prepend_field("delta_plan"))?;
+    let object_store_config =
+        resolve_native_connector_object_store_config(&delta_plan.cloud_properties)
+            .map_err(|error| error.prepend_field("delta_plan"))?;
     let delete_side_payload =
         lower_delta_delete_side_payload_from_native(delta_plan.delete_side.as_ref())
             .map_err(|error| error.prepend_field("delta_plan"))?;

@@ -45,6 +45,7 @@ use novarocks_catalog::identifier::TableIdentity;
 /// handles only the refresh path needs.
 pub(crate) struct IcebergMvRefreshContext {
     pub rewrite: Arc<IcebergMvRewriteContext>,
+    pub(crate) connector_context: Option<novarocks_spi::connector::ConnectorRequestContext>,
     pub(crate) target_bindings: IcebergMvTargetBindings,
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
@@ -275,6 +276,7 @@ impl IcebergMvRefreshContext {
             IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, target_table)?;
         Ok(Self {
             rewrite,
+            connector_context: None,
             target_bindings,
             base_catalog_entries,
             iceberg_catalog,
@@ -920,6 +922,7 @@ pub(crate) mod tests_support {
         .expect("target fixture bindings");
         IcebergMvRefreshContext {
             rewrite,
+            connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog: fixture.iceberg_catalog.clone(),
@@ -948,6 +951,7 @@ pub(crate) mod tests_support {
                 .expect("target bindings");
         IcebergMvRefreshContext {
             rewrite,
+            connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
@@ -1086,6 +1090,7 @@ pub(crate) mod tests_support {
                 .expect("aggregate target bindings");
         let ctx = IcebergMvRefreshContext {
             rewrite,
+            connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
@@ -1311,6 +1316,7 @@ pub(crate) mod tests_support {
             warehouse,
             IcebergMvRefreshContext {
                 rewrite,
+                connector_context: None,
                 target_bindings,
                 base_catalog_entries,
                 iceberg_catalog,
@@ -1403,11 +1409,7 @@ mod tests {
                 let optimized_tree = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_join_refresh_coalesce_plan_for_lowering(
                     &refresh_ctx.rewrite,
                 );
-                let mut connectors = crate::connector::ConnectorRegistry::default();
-                connectors.register_scan_planner(Arc::new(
-                    crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-                ));
-
+                let connectors = crate::connector::ConnectorRegistry::default();
                 let physical_plan =
                     crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
                         .expect("convert optimizer physical plan");
@@ -1417,6 +1419,7 @@ mod tests {
                 let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
                     &connectors,
+                    &crate::connector::test_request_context(),
                     Some(&refresh_ctx),
                 )
                 .expect("join projection coalesce plan must prepare");
@@ -1779,6 +1782,7 @@ mod tests {
                 .expect("target bindings");
         let mut ctx = IcebergMvRefreshContext {
             rewrite,
+            connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,

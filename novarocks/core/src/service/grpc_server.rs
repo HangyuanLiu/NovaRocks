@@ -63,13 +63,9 @@ use crate::service::grpc_query_lifecycle_adapter::{
 };
 use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
 use crate::service::internal_rpc;
+use crate::service::metrics_http;
 use crate::service::native_fragment_ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
-#[cfg(feature = "compat")]
-use crate::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress;
-#[cfg(feature = "compat")]
-use crate::service::stream_load_http;
-use crate::service::{load_tracking_http, metrics_http};
 
 pub(crate) use crate::common::engine_error::{
     REPORT_EXEC_STATUS_OK, REPORT_EXEC_STATUS_QUERY_GONE,
@@ -94,19 +90,6 @@ struct RejectingTestNativeFragmentIngress;
 
 #[cfg(test)]
 struct RejectingTestQueryLifecycleIngress;
-
-#[cfg(all(test, feature = "compat"))]
-struct RejectingTestStarRocksFragmentSyncIngress;
-
-#[cfg(all(test, feature = "compat"))]
-impl StarRocksFragmentSyncIngress for RejectingTestStarRocksFragmentSyncIngress {
-    fn execute(
-        &self,
-        _request: crate::thrift::internal_service::TExecPlanFragmentParams,
-    ) -> Result<crate::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
-        Err("test StarRocks fragment sync ingress is not configured".to_string())
-    }
-}
 
 #[cfg(test)]
 pub(crate) fn rejecting_test_native_fragment_ingress() -> Arc<dyn NativeFragmentIngress> {
@@ -601,10 +584,7 @@ impl IndependentGrpcRuntimeFilterNode {
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                 #[cfg(feature = "compat")]
-                let app = build_novarocks_http_app(
-                    Routes::new(service),
-                    Arc::new(RejectingTestStarRocksFragmentSyncIngress),
-                );
+                let app = build_novarocks_http_app(Routes::new(service), Router::new());
                 #[cfg(not(feature = "compat"))]
                 let app = build_novarocks_http_app(Routes::new(service));
                 let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -1380,41 +1360,17 @@ where
 }
 
 #[cfg(feature = "compat")]
-fn build_novarocks_http_app(
-    grpc_routes: Routes,
-    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
-) -> Router {
+fn build_novarocks_http_app(grpc_routes: Routes, compat_routes: Router) -> Router {
     grpc_routes
         .into_axum_router()
-        .route(
-            "/api/:db/:table/_stream_load",
-            put(stream_load_http::handle_stream_load),
-        )
-        .route(
-            "/api/transaction/load",
-            put(stream_load_http::handle_transaction_load),
-        )
-        .route(
-            "/api/transaction/:txn_op",
-            post(stream_load_http::handle_transaction_op)
-                .put(stream_load_http::handle_transaction_op),
-        )
-        .route(
-            "/api/_load_tracking/:hi/:lo",
-            get(load_tracking_http::handle_load_tracking_log),
-        )
+        .merge(compat_routes)
         .route("/metrics", get(metrics_http::handle_metrics))
-        .layer(Extension(fragment_sync_ingress))
 }
 
 #[cfg(not(feature = "compat"))]
 fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
     grpc_routes
         .into_axum_router()
-        .route(
-            "/api/_load_tracking/:hi/:lo",
-            get(load_tracking_http::handle_load_tracking_log),
-        )
         .route("/metrics", get(metrics_http::handle_metrics))
 }
 
@@ -1578,7 +1534,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
 #[cfg(feature = "compat")]
 pub fn start_grpc_server(
     host: &str,
-    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+    compat_routes: Router,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     start_grpc_server_on_ports(
@@ -1586,7 +1542,7 @@ pub fn start_grpc_server(
         http_port(),
         grpc_port(),
         starlet_port(),
-        fragment_sync_ingress,
+        compat_routes,
         report_handler,
     )
 }
@@ -1763,7 +1719,7 @@ fn start_grpc_server_on_ports(
     http_port: u16,
     grpc_port: u16,
     starlet_port: u16,
-    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+    compat_routes: Router,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     {
@@ -1838,8 +1794,7 @@ fn start_grpc_server_on_ports(
                 )
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                let http_app =
-                    build_novarocks_http_app(Routes::new(http_svc), fragment_sync_ingress);
+                let http_app = build_novarocks_http_app(Routes::new(http_svc), compat_routes);
                 let grpc_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
                     GrpcService::execution_without_native_fragment_ingress(report_handler),
                 )
@@ -2282,10 +2237,6 @@ fn start_standalone_grpc_server(
                 let grpc_service = AxumGrpcService::new(svc);
                 let app = Router::new()
                     .route_service(&grpc_path, grpc_service)
-                    .route(
-                        "/api/_load_tracking/:hi/:lo",
-                        get(load_tracking_http::handle_load_tracking_log),
-                    )
                     .route("/metrics", get(metrics_http::handle_metrics))
                     .fallback(grpc_unimplemented_fallback);
                 axum::serve(listener, app)

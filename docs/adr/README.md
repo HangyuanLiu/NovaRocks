@@ -77,6 +77,7 @@ code-anchors:
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
 - ADR-0006 — 可替换 provider 契约为何统一进入一个系统 SPI，而普通跨 crate port 不进入（active）
+- ADR-0012 — 共享文件访问与 Parquet/ORC 物理解码为何属于无 Connector identity 的独立基础（active）
 
 ### distributed-query-lifecycle
 
@@ -88,6 +89,17 @@ code-anchors:
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
 - ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（active）
 - ADR-0010 — 显式 query cancellation surface 为何以 MySQL KILL QUERY 和 frontend session owner 实现（active）
+- ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
+- ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
+
+### cluster-membership
+
+领域哲学：backend membership 的 durable desired state 与 heartbeat/live/generation 等运行期 observation 必须分离。
+frontend 的 `ClusterBackendService` 通过 StateStore 成为唯一 membership authority；core 只消费稳定的
+`BackendTopologyPort`，不保留 metadata bridge、global registry 或内存 durable fallback。配置的 backend 是 additive
+seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来多 FE fencing/takeover 分阶段裁决。
+
+- ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（active）
 
 ### table-maintenance
 

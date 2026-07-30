@@ -14,12 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::RuntimeFilterContext;
-use crate::fs::scan_context::FileScanContext;
-use crate::runtime::profile::RuntimeProfile;
-
 pub mod orc;
+#[path = "parquet_adapter.rs"]
 pub mod parquet;
 #[cfg(feature = "compat")]
 pub mod starrocks;
@@ -28,21 +24,4 @@ pub mod starrocks;
 pub enum FileFormatConfig {
     Parquet(parquet::ParquetScanConfig),
     Orc(orc::OrcScanConfig),
-}
-
-pub fn build_format_iter(
-    scan: FileScanContext,
-    format: FileFormatConfig,
-    limit: Option<usize>,
-    profile: Option<RuntimeProfile>,
-    runtime_filters: Option<&RuntimeFilterContext>,
-) -> Result<BoxedExecIter, String> {
-    match format {
-        FileFormatConfig::Parquet(cfg) => {
-            parquet::build_parquet_iter(scan, cfg, limit, profile, runtime_filters)
-        }
-        FileFormatConfig::Orc(cfg) => {
-            orc::build_orc_iter(scan, cfg, limit, profile, runtime_filters)
-        }
-    }
 }

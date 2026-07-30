@@ -17,11 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::fs::access::{FsAccessHandle, FsAccessResolver, FsScheme};
-use novarocks::fs::object_store::ObjectStoreConfig;
 use novarocks::fs::object_store_credentials::{
     ObjectStoreCredentials, ObjectStoreCredentialsSource,
 };
+use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig};
 
 pub fn object_store_config_from_fs_options(
     fs_options: &BTreeMap<String, String>,
@@ -42,10 +41,16 @@ pub fn resolve_tool_location(
     object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<FsAccessHandle, String> {
     let resolver = FsAccessResolver::new();
-    let parsed = resolver.parse_location(location)?;
+    let parsed = resolver
+        .parse_location(location)
+        .map_err(|error| error.to_string())?;
     match parsed.scheme() {
-        FsScheme::Local => resolver.resolve_location(location, None),
-        FsScheme::ObjectStore => resolver.resolve_location(location, object_store_config),
+        FsScheme::Local => resolver
+            .resolve_location(location, None)
+            .map_err(|error| error.to_string()),
+        FsScheme::ObjectStore => resolver
+            .resolve_location(location, object_store_config)
+            .map_err(|error| error.to_string()),
         FsScheme::Hdfs => Err(format!(
             "tools do not support hdfs location yet: {location}"
         )),

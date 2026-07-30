@@ -31,8 +31,10 @@ use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
-    NoopFragmentEventSink, ResultPresentation, ResultWriteSpec, UnavailableFragmentLookupClient,
+    LoadTrackingLogSink, ResultPresentation, ResultWriteSpec,
 };
+#[cfg(test)]
+use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
 use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaults};
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -53,6 +55,7 @@ pub struct FragmentPrepareContext {
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
+    load_tracking_sink: Option<Arc<dyn LoadTrackingLogSink>>,
     result_spec: Option<ResultWriteSpec>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
@@ -76,6 +79,7 @@ impl Default for FragmentPrepareContext {
             lookup_client: Arc::new(UnavailableFragmentLookupClient),
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
+            load_tracking_sink: None,
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -107,6 +111,7 @@ impl FragmentPrepareContext {
             lookup_client,
             result_writer,
             event_sink,
+            load_tracking_sink: None,
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -117,6 +122,32 @@ impl FragmentPrepareContext {
             #[cfg(test)]
             start_failure: None,
         }
+    }
+
+    /// Builds a context for callers that do not participate in native
+    /// runtime-filter execution (including backend integration tests).
+    pub fn without_runtime_filter(
+        profiler: Option<Profiler>,
+        mem_tracker: Option<Arc<MemTracker>>,
+        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+        lookup_client: Arc<dyn FragmentLookupClient>,
+        result_writer: Arc<dyn FragmentResultWriter>,
+        event_sink: Arc<dyn FragmentEventSink>,
+    ) -> Self {
+        Self::new(
+            profiler,
+            mem_tracker,
+            None,
+            exchange_transmitter,
+            lookup_client,
+            result_writer,
+            event_sink,
+        )
+    }
+
+    pub fn with_load_tracking_sink(mut self, sink: Arc<dyn LoadTrackingLogSink>) -> Self {
+        self.load_tracking_sink = Some(sink);
+        self
     }
 
     pub(crate) fn new_with_execution_overrides(
@@ -138,6 +169,7 @@ impl FragmentPrepareContext {
             lookup_client,
             result_writer,
             event_sink,
+            load_tracking_sink: None,
             result_spec,
             root_sink_dop,
             group_execution_scan_dop,
@@ -448,6 +480,7 @@ pub fn prepare_fragment(
                 backend_num: Some(instance.backend_num().get()),
                 mem_tracker: context.mem_tracker.clone(),
                 native_runtime_filter_context: context.runtime_filter.clone(),
+                load_tracking_sink: context.load_tracking_sink.clone(),
             },
             context.profiler.as_ref(),
         )
@@ -851,11 +884,6 @@ mod tests {
 
         running.cancel(FragmentCancelReason::new("test cleanup"));
         let _ = running.join();
-        assert_eq!(
-            crate::service::fe_report::progress_report_call_count_for_test(finst_id),
-            0,
-            "kernel handle path must not invoke the legacy progress reporter"
-        );
     }
 
     #[test]
@@ -903,11 +931,6 @@ mod tests {
         assert_eq!(
             be_number, 37,
             "EOS sender identity must preserve the submission backend number"
-        );
-        assert_eq!(
-            crate::service::fe_report::progress_report_call_count_for_test(finst_id),
-            0,
-            "kernel data-stream path must keep legacy progress reporting disabled"
         );
     }
 

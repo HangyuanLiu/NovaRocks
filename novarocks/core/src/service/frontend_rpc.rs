@@ -156,6 +156,39 @@ impl Display for FrontendRpcError {
 
 impl std::error::Error for FrontendRpcError {}
 
+/// Error surface for the temporary, named compat load transport operations.
+/// It preserves the pre-existing distinction between missing heartbeat state and
+/// a failed control RPC without exposing the frontend client pool.
+#[derive(Debug)]
+pub enum LoadFrontendRpcError {
+    MissingFeAddress,
+    Rpc(String),
+}
+
+impl Display for LoadFrontendRpcError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFeAddress => {
+                f.write_str("missing FE address (heartbeat not established yet)")
+            }
+            Self::Rpc(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for LoadFrontendRpcError {}
+
+fn call_latest_control<T, F>(mut call: F) -> Result<T, LoadFrontendRpcError>
+where
+    F: FnMut(&mut dyn TFrontendServiceSyncClient) -> Result<T, FrontendRpcError>,
+{
+    let fe_addr = crate::service::disk_report::latest_fe_addr()
+        .ok_or(LoadFrontendRpcError::MissingFeAddress)?;
+    FrontendRpcManager::shared()
+        .call(FrontendRpcKind::Control, &fe_addr, |client| call(client))
+        .map_err(|error| LoadFrontendRpcError::Rpc(error.to_string()))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FrontendRpcSettings {
     connect_timeout: Duration,
@@ -596,6 +629,116 @@ impl FrontendRpcManager {
             .and_then(|guard| guard.get(host_key).map(|pool| pool.idle.len()))
             .unwrap_or(0)
     }
+}
+
+/// Narrow StarRocks FE operations used by compat-owned protocol adapters.
+/// The pooled Thrift client remains private to the core transport owner.
+pub fn fetch_query_profile(
+    coord: &types::TNetworkAddress,
+    query_id: &str,
+) -> Result<String, String> {
+    let request =
+        crate::thrift::frontend_service::TGetProfileRequest::new(Some(vec![query_id.to_string()]));
+    let result = FrontendRpcManager::shared()
+        .call(FrontendRpcKind::SchemaQuery, coord, |client| {
+            client
+                .get_query_profile(request.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map_err(|error| format!("getQueryProfile RPC failed: {error}"))?;
+    if let Some(status) = result.status
+        && status.status_code != crate::thrift::status_code::TStatusCode::OK
+    {
+        return Err(format!("FE returned error: {status:?}"));
+    }
+    Ok(result
+        .query_result
+        .and_then(|mut profiles| profiles.drain(..).next())
+        .unwrap_or_default())
+}
+
+/// Temporary compat transport seam for the stream-load ingress owner.
+/// RCI-5G moves the FE client pool out of core and removes these operations.
+pub fn load_txn_begin(
+    request: crate::thrift::frontend_service::TLoadTxnBeginRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnBeginResult, LoadFrontendRpcError> {
+    call_latest_control(|client| {
+        client
+            .load_txn_begin(request.clone())
+            .map_err(FrontendRpcError::from_thrift)
+    })
+}
+
+/// Temporary compat transport seam for the stream-load ingress owner.
+pub fn stream_load_put(
+    request: crate::thrift::frontend_service::TStreamLoadPutRequest,
+) -> Result<crate::thrift::frontend_service::TStreamLoadPutResult, LoadFrontendRpcError> {
+    call_latest_control(|client| {
+        client
+            .stream_load_put(request.clone())
+            .map_err(FrontendRpcError::from_thrift)
+    })
+}
+
+/// Temporary compat transport seam for the stream-load ingress owner.
+pub fn load_txn_prepare(
+    request: crate::thrift::frontend_service::TLoadTxnCommitRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
+    call_latest_control(|client| {
+        client
+            .load_txn_prepare(request.clone())
+            .map_err(FrontendRpcError::from_thrift)
+    })
+}
+
+/// Temporary compat transport seam for the stream-load ingress owner.
+pub fn load_txn_commit(
+    request: crate::thrift::frontend_service::TLoadTxnCommitRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
+    call_latest_control(|client| {
+        client
+            .load_txn_commit(request.clone())
+            .map_err(FrontendRpcError::from_thrift)
+    })
+}
+
+/// Temporary compat transport seam for the stream-load ingress owner.
+pub fn load_txn_rollback(
+    request: crate::thrift::frontend_service::TLoadTxnRollbackRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnRollbackResult, LoadFrontendRpcError> {
+    call_latest_control(|client| {
+        client
+            .load_txn_rollback(request.clone())
+            .map_err(FrontendRpcError::from_thrift)
+    })
+}
+
+pub fn batch_report_exec_status(
+    coord: &types::TNetworkAddress,
+    params: crate::thrift::frontend_service::TBatchReportExecStatusParams,
+) -> Result<Option<Vec<crate::thrift::status::TStatus>>, String> {
+    FrontendRpcManager::shared()
+        .call(FrontendRpcKind::ExecStatus, coord, |client| {
+            client
+                .batch_report_exec_status(params.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map(|response| response.status_list)
+        .map_err(|error| error.to_string())
+}
+
+pub fn report_exec_status(
+    coord: &types::TNetworkAddress,
+    params: crate::thrift::frontend_service::TReportExecStatusParams,
+) -> Result<Option<crate::thrift::status::TStatus>, String> {
+    FrontendRpcManager::shared()
+        .call(FrontendRpcKind::ExecStatus, coord, |client| {
+            client
+                .report_exec_status(params.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map(|response| response.status)
+        .map_err(|error| error.to_string())
 }
 
 pub fn init_frontend_rpc_manager() {

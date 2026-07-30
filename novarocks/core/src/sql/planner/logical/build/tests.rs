@@ -1164,6 +1164,7 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
         &std::collections::HashMap::new(),
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )
     .expect("optimizer should produce a physical plan");
 
@@ -1193,6 +1194,7 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
         &std::collections::HashMap::new(),
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )
     .expect("optimizer should produce a physical plan");
 
@@ -1235,6 +1237,7 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
         &std::collections::HashMap::new(),
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )
     .expect("optimizer should produce a physical plan");
 
@@ -1267,6 +1270,7 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
         &std::collections::HashMap::new(),
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )
     .expect("optimizer should produce a physical plan");
 

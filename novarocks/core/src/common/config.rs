@@ -245,35 +245,35 @@ pub(crate) fn table_schema_service_cache_capacity() -> u64 {
         .unwrap_or(4_096)
 }
 
-pub(crate) fn exec_state_report_max_threads() -> usize {
+pub fn exec_state_report_max_threads() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.exec_state_report_max_threads.max(1))
         .unwrap_or(2)
 }
 
-pub(crate) fn priority_exec_state_report_max_threads() -> usize {
+pub fn priority_exec_state_report_max_threads() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.priority_exec_state_report_max_threads.max(1))
         .unwrap_or(2)
 }
 
-pub(crate) fn report_exec_rpc_request_retry_num() -> usize {
+pub fn report_exec_rpc_request_retry_num() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.report_exec_rpc_request_retry_num.max(1))
         .unwrap_or(10)
 }
 
-pub(crate) fn report_exec_batch_flush_interval_ms() -> u64 {
+pub fn report_exec_batch_flush_interval_ms() -> u64 {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.report_exec_batch_flush_interval_ms.max(1))
         .unwrap_or(50)
 }
 
-pub(crate) fn report_exec_batch_max_size() -> usize {
+pub fn report_exec_batch_max_size() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.report_exec_batch_max_size.max(1))

@@ -25,8 +25,8 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fs_access::{
     StarRocksFsAccess, resolve_runtime_path, resolve_with_profile,
 };
-use crate::fs::access::{FsAccessResolver, FsScheme};
-use crate::fs::object_store::ObjectStoreConfig;
+use novarocks_fs::ObjectStoreConfig;
+use novarocks_fs::{FsAccessResolver, FsScheme};
 
 const BUCKET_ROOT_COMPAT_MARKER: &str = "__novarocks_tablet_root_compat__";
 
@@ -101,7 +101,10 @@ pub(crate) fn resolve_format_tablet_access_with_object_store_config(
                 "local StarRocks fs path must not be resolved with object-store config; path={tablet_root_path}"
             ));
         }
-        let operator = crate::fs::local::build_fs_operator("/").map_err(|e| e.to_string())?;
+        let operator = FsAccessResolver::new()
+            .resolve_location("/__novarocks_local_root__", None)
+            .map_err(|error| error.to_string())?
+            .operator();
         return Ok(StarRocksFormatTabletAccess {
             root_location: "/".to_string(),
             root_relative_path: String::new(),
@@ -115,7 +118,8 @@ pub(crate) fn resolve_format_tablet_access_with_object_store_config(
         // path in the same bucket to build the operator while preserving the old
         // bucket-root tablet semantics at this facade boundary.
         let handle = FsAccessResolver::new()
-            .resolve_location(&bucket_root.synthetic_path, object_store_config)?;
+            .resolve_location(&bucket_root.synthetic_path, object_store_config)
+            .map_err(|error| error.to_string())?;
         return Ok(StarRocksFormatTabletAccess {
             root_location: bucket_root.normalized_root,
             root_relative_path: String::new(),
@@ -150,7 +154,9 @@ pub(crate) fn resolve_format_tablet_access_with_object_store_config(
         }
     }
 
-    let handle = resolver.resolve_location(tablet_root_path, object_store_config)?;
+    let handle = resolver
+        .resolve_location(tablet_root_path, object_store_config)
+        .map_err(|error| error.to_string())?;
     let root_relative_path = handle
         .paths()
         .first()
@@ -178,7 +184,9 @@ pub(crate) fn operator_relative_path_for_tablet_root(
         return Ok(rel_path.trim_start_matches('/').to_string());
     }
 
-    let location = FsAccessResolver::new().parse_location(tablet_root_path)?;
+    let location = FsAccessResolver::new()
+        .parse_location(tablet_root_path)
+        .map_err(|error| error.to_string())?;
     let rel = rel_path.trim_start_matches('/');
     match location.scheme() {
         FsScheme::Local => {

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
-use crate::connector::iceberg::IcebergMetadataScanRange;
+use crate::connector::file_execution::FileScanRange;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 #[cfg(feature = "compat")]
@@ -30,7 +30,6 @@ use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
-use crate::fs::scan_context::FileScanRange;
 use crate::runtime::profile::RuntimeProfile;
 
 #[derive(Clone, Debug)]
@@ -63,6 +62,19 @@ pub enum ScanMorsel {
     JdbcSingle,
     IcebergMetadata {
         index: usize,
+    },
+    /// Provider-neutral scheduled connector split. The generic core adapter
+    /// resolves the index to an SPI-owned split; no provider payload appears
+    /// in the core morsel contract.
+    ConnectorSplit {
+        index: usize,
+    },
+    /// A scheduled SPI split with file metadata retained by core. The opaque
+    /// provider payload is selected by `index`; `range` remains available to
+    /// core row-position, virtual-column, and delete filtering logic.
+    ConnectorFileSplit {
+        index: usize,
+        range: FileScanRange,
     },
     Schema {
         table_name: String,
@@ -109,8 +121,51 @@ impl ScanMorsel {
             ScanMorsel::IcebergMetadata { index } => {
                 format!("iceberg_metadata_index={index}")
             }
+            ScanMorsel::ConnectorSplit { index } => {
+                format!("connector_split_index={index}")
+            }
+            ScanMorsel::ConnectorFileSplit { index, range } => format!(
+                "connector_file_split_index={index} path={} offset={} length={}",
+                range.path, range.offset, range.length
+            ),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),
+        }
+    }
+
+    /// Returns the core-owned file metadata for both legacy and SPI-scheduled
+    /// file morsels. It intentionally excludes every provider payload.
+    pub fn file_range(&self) -> Option<FileScanRange> {
+        match self {
+            Self::FileRange {
+                path,
+                file_len,
+                offset,
+                length,
+                scan_range_id,
+                first_row_id,
+                data_sequence_number,
+                ivm_change_op,
+                included_positions,
+                external_datacache,
+                delete_files,
+                iceberg_file_pruning,
+            } => Some(FileScanRange {
+                path: path.clone(),
+                file_len: *file_len,
+                offset: *offset,
+                length: *length,
+                scan_range_id: *scan_range_id,
+                first_row_id: *first_row_id,
+                data_sequence_number: *data_sequence_number,
+                ivm_change_op: *ivm_change_op,
+                included_positions: included_positions.clone(),
+                external_datacache: external_datacache.clone(),
+                delete_files: delete_files.clone(),
+                iceberg_file_pruning: iceberg_file_pruning.clone(),
+            }),
+            Self::ConnectorFileSplit { range, .. } => Some(range.clone()),
+            _ => None,
         }
     }
 }
@@ -358,16 +413,6 @@ pub enum BoundScanRanges {
         ranges: Vec<FileScanRange>,
         has_more: bool,
     },
-    /// StarRocks lake/tablet ranges (compat mode only).
-    #[cfg(feature = "compat")]
-    StarRocksTablet {
-        ranges: Vec<StarRocksScanRange>,
-        has_more: bool,
-    },
-    /// Iceberg metadata-table ranges.
-    IcebergMetadata {
-        ranges: Vec<IcebergMetadataScanRange>,
-    },
 }
 
 /// Static, proto-free description of a scan source that materializes a
@@ -407,7 +452,7 @@ pub struct RowPositionScanConfig {
     pub enable_file_pagecache: bool,
     /// OSS credentials for re-scanning the source file during late-materialisation lookups.
     /// `None` for local / HDFS paths; must be `Some` for `oss://` / `s3://` paths.
-    pub oss_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    pub oss_config: Option<novarocks_fs::ObjectStoreConfig>,
 }
 
 #[derive(Clone)]
@@ -620,7 +665,8 @@ impl std::fmt::Debug for ScanNode {
 mod tests {
     use std::sync::Arc;
 
-    use super::RuntimeFilterContext;
+    use super::{RuntimeFilterContext, ScanMorsel};
+    use crate::connector::file_execution::FileScanRange;
     use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
 
     #[test]
@@ -638,5 +684,31 @@ mod tests {
         );
 
         assert_eq!(ctx.min_max_filters().len(), 1);
+    }
+
+    #[test]
+    fn connector_file_split_preserves_core_file_metadata() {
+        let morsel = ScanMorsel::ConnectorFileSplit {
+            index: 3,
+            range: FileScanRange {
+                path: "s3://bucket/data.parquet".to_string(),
+                file_len: 99,
+                offset: 7,
+                length: 11,
+                scan_range_id: 5,
+                first_row_id: Some(13),
+                data_sequence_number: Some(17),
+                ivm_change_op: Some(2),
+                included_positions: Some(vec![1, 4]),
+                external_datacache: None,
+                delete_files: Vec::new(),
+                iceberg_file_pruning: None,
+            },
+        };
+        let range = morsel.file_range().expect("file metadata");
+        assert_eq!(range.path, "s3://bucket/data.parquet");
+        assert_eq!(range.scan_range_id, 5);
+        assert_eq!(range.first_row_id, Some(13));
+        assert_eq!(range.included_positions, Some(vec![1, 4]));
     }
 }

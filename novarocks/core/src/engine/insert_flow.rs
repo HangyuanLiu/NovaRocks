@@ -32,6 +32,7 @@ use crate::engine::statistics::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::expr::cast_with_special_rules;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
@@ -48,6 +49,8 @@ pub(crate) fn run_insert(
     current_catalog: Option<&str>,
     current_database: &str,
     query_opts: Option<&QueryOptions>,
+    execution: Option<&QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let is_overwrite = matches!(
         overwrite_mode,
@@ -76,14 +79,21 @@ pub(crate) fn run_insert(
     };
 
     let target = resolve_existing_table_target(state, name, current_catalog, current_database)?;
-    let (catalog, sink) = {
+    let (resolved, sink) = {
         let reg = state.connectors.read().expect("connector registry read");
         (
-            reg.catalog_backend(target.backend_name)?,
+            crate::connector::metadata_load_table(
+                &reg,
+                connector_context.clone(),
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            )?
+            .0,
             reg.table_sink(target.backend_name)?,
         )
     };
-    let resolved = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
     crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
         state,
         &target,
@@ -148,6 +158,8 @@ pub(crate) fn run_insert(
             source,
             overwrite_mode,
             &target_ref,
+            execution.cloned(),
+            connector_context,
         );
     }
 
@@ -172,6 +184,8 @@ pub(crate) fn run_insert(
                     current_catalog,
                     current_database,
                     query_opts,
+                    execution,
+                    connector_context,
                 )?;
             }
         }
@@ -190,6 +204,7 @@ pub(crate) fn run_insert(
                 columns,
                 query,
                 query_opts,
+                connector_context,
             )?;
             if batch.num_rows() > 0 {
                 sink.append_batch(&resolved, batch)?;
@@ -268,13 +283,15 @@ pub(crate) fn execute_insert_from_query_on_pipeline(
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
     query_opts: Option<&QueryOptions>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RecordBatch, String> {
-    let query_result = crate::engine::execute_query_with_catalog_service(
+    let query_result = crate::engine::execute_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         &target.namespace,
         query,
         query_opts.cloned(),
+        connector_context,
     )?;
 
     align_query_result_to_target(&query_result, insert_columns, &resolved.columns)

@@ -183,7 +183,7 @@ pub(crate) fn collect_actuals_by_plan_node_id_multi(
 ) -> HashMap<i32, ActualMetrics> {
     let trees = profilers
         .iter()
-        .map(|profiler| crate::service::fe_report::merge_pipeline_profiles_for_fe(profiler))
+        .map(crate::runtime::profile::merge_pipeline_profiles)
         .map(|profiler| profiler.to_native_tree())
         .collect::<Vec<_>>();
     collect_actuals_by_plan_node_id_from_profile_trees(&trees)
@@ -642,8 +642,7 @@ mod tests {
             .child("PipelineDriver (id=0)");
         add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 10, 5, 64);
         add_dictionary_metrics(&driver, "SCAN (plan_node_id=2)", 101, 4, 81, 3, 21, 2, 5);
-        let tree =
-            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_native_tree();
+        let tree = crate::runtime::profile::merge_pipeline_profiles(&profiler).to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
         let metrics = actuals.get(&2).expect("node 2 metrics");
@@ -860,8 +859,7 @@ mod tests {
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
         add_operator_metrics(&driver, "HASH JOIN (plan_node_id=4)", 8, 900_000, 4096);
-        let tree =
-            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_native_tree();
+        let tree = crate::runtime::profile::merge_pipeline_profiles(&profiler).to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
 
@@ -885,8 +883,7 @@ mod tests {
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
         add_operator_metrics(&driver, "HASH JOIN (plan_node_id=4)", 8, 900_000, 4096);
-        let tree =
-            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_native_tree();
+        let tree = crate::runtime::profile::merge_pipeline_profiles(&profiler).to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
 

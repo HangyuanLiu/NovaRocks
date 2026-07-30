@@ -47,12 +47,8 @@ pub use connector::hdfs as novarocks_connector_iceberg;
 pub use connector::jdbc as novarocks_connector_jdbc;
 #[cfg(feature = "compat")]
 pub use connector::starrocks as novarocks_connector_starrocks;
-pub use formats::parquet as novarocks_format_parquet;
-pub use fs::local as novarocks_fs_local;
-pub use fs::opendal as novarocks_fs_opendal;
 
 pub use common::types::{FetchResult, UniqueId};
-pub use service::fragment_control::cancel;
 pub use service::grpc_server::start_grpc_exchange_server;
 #[cfg(feature = "compat")]
 pub use service::grpc_server::start_grpc_server;

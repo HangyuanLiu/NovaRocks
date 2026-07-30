@@ -16,9 +16,10 @@
 // under the License.
 use std::collections::HashMap;
 
+use crate::connector::jdbc::provider::{JdbcInstanceConfig, plan_starrocks_jdbc_read_source};
 use crate::exec::node::scan::ScanNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig, ScanConfig};
+use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig};
 use crate::protocol::starrocks::decode::layout::{
     chunk_schema_for_layout, layout_for_row_tuples, layout_for_tuple_columns, resolve_mysql_table,
 };
@@ -33,6 +34,7 @@ pub(crate) fn lower_mysql_scan_node(
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     query_opts: &QueryOptions,
     connectors: &ConnectorRegistry,
+    query_id: Option<crate::runtime::query_context::QueryId>,
     scan_ranges: Option<ScanRangeCarrier>,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
@@ -76,11 +78,21 @@ pub(crate) fn lower_mysql_scan_node(
         chunk_schema: output_chunk_schema.clone(),
     };
     let connector_io_tasks_per_scan_operator = query_opts.connector_io_tasks_per_scan_operator;
-    let (source, bound_ranges) = connectors.create_scan_node("mysql", ScanConfig::Jdbc(cfg))?;
+    let query_id = query_id.ok_or_else(|| {
+        "MYSQL_SCAN_NODE requires a query identity for connector cancellation".to_string()
+    })?;
+    let source = plan_starrocks_jdbc_read_source(
+        connectors,
+        query_id,
+        node.node_id,
+        JdbcInstanceConfig { scan: cfg },
+        query_opts,
+    )
+    .map_err(|error| error.to_string())?;
     // Range-less scan: still route the (empty) ranges to the instance so the
     // materializer binds one op per instance uniformly.
     if let Some(scan_ranges) = scan_ranges {
-        scan_ranges.capture(node.node_id, bound_ranges);
+        scan_ranges.capture(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
     }
     let scan = ScanNode::new(source)
         .with_node_id(node.node_id)

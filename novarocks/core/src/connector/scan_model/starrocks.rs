@@ -19,14 +19,14 @@ use std::collections::HashSet;
 
 use crate::runtime::scan_range;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StarRocksStorageColumnDescriptor {
     pub(crate) name: String,
     pub(crate) unique_id: i32,
     pub(crate) default_value: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[cfg_attr(not(feature = "compat"), allow(dead_code))]
 pub(crate) enum StarRocksKeysTypeDescriptor {
     Duplicate,
@@ -35,7 +35,7 @@ pub(crate) enum StarRocksKeysTypeDescriptor {
     Primary,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StarRocksColumnSchemaDescriptor {
     pub(crate) unique_id: i32,
     pub(crate) name: Option<String>,
@@ -50,7 +50,7 @@ pub(crate) struct StarRocksColumnSchemaDescriptor {
     pub(crate) children: Vec<StarRocksColumnSchemaDescriptor>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StarRocksTabletSchemaDescriptor {
     pub(crate) schema_id: i64,
     pub(crate) keys_type: StarRocksKeysTypeDescriptor,
@@ -60,7 +60,7 @@ pub(crate) struct StarRocksTabletSchemaDescriptor {
     pub(crate) columns: Vec<StarRocksColumnSchemaDescriptor>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StarRocksScanSourceDescriptor {
     pub(crate) catalog_name: String,
     pub(crate) db_id: i64,

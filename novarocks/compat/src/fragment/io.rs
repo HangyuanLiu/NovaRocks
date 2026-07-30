@@ -20,7 +20,7 @@ impl ExchangeFrameTransmitter for BrpcExchangeFrameTransmitter {
                 format!("invalid BRPC exchange destination port: {error}"),
             )
         })?;
-        novarocks::service::internal_rpc_client::send_chunks(
+        crate::internal_rpc_client::send_chunks(
             frame.destination.host(),
             port,
             frame.destination_fragment_instance_id,

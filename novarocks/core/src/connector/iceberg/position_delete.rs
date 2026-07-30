@@ -28,16 +28,13 @@
 //! that set to drop deleted rows from each scanned chunk.
 
 use arrow::array::{Array, Int64Array, StringArray};
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringTreemap;
 
-use crate::cache::CachedRangeReader;
+use crate::connector::file_execution::{read_foundation_bytes, read_foundation_parquet_batches};
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
-use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
-use crate::fs::opendal::OpendalRangeReaderFactory;
+use novarocks_fs::{FileProjection, FileReadRange, FsAccessHandle};
 
 /// The only two column names a position-delete Parquet file is allowed to
 /// have (equality-delete files carry a different schema and are rejected in
@@ -52,14 +49,14 @@ const POS_COLUMN: &str = "pos";
 pub fn load_position_deletes(
     specs: &[IcebergDeleteFileSpec],
     data_file_path: &str,
-    factory: &OpendalRangeReaderFactory,
+    access: &FsAccessHandle,
 ) -> Result<RoaringTreemap, String> {
     let mut deleted = RoaringTreemap::new();
     for spec in specs {
         if spec.file_content != IcebergFileContent::PositionDeletes {
             continue;
         }
-        accumulate_deletes_from_file(spec, data_file_path, factory, &mut deleted)?;
+        accumulate_deletes_from_file(spec, data_file_path, access, &mut deleted)?;
     }
     Ok(deleted)
 }
@@ -67,7 +64,7 @@ pub fn load_position_deletes(
 fn accumulate_deletes_from_file(
     spec: &IcebergDeleteFileSpec,
     data_file_path: &str,
-    factory: &OpendalRangeReaderFactory,
+    access: &FsAccessHandle,
     deleted: &mut RoaringTreemap,
 ) -> Result<(), String> {
     if spec.content_offset.is_some() || spec.content_size_in_bytes.is_some() {
@@ -85,12 +82,15 @@ fn accumulate_deletes_from_file(
         })?;
         let start = u64::try_from(offset)
             .map_err(|_| format!("Puffin deletion vector {} has negative offset", spec.path))?;
-        let size_usize = usize::try_from(size)
+        let length = u64::try_from(size)
             .map_err(|_| format!("Puffin deletion vector {} size is too large", spec.path))?;
-        let reader = factory
-            .open_with_len(&spec.path, spec.length)
-            .map_err(|e| format!("open Puffin deletion vector {} failed: {}", spec.path, e))?;
-        let payload = reader.read_remote_bytes(start, size_usize).map_err(|e| {
+        let payload = read_foundation_bytes(
+            access,
+            &spec.path,
+            spec.length,
+            FileReadRange::bounded(start, length).map_err(|error| error.to_string())?,
+        )
+        .map_err(|e| {
             format!(
                 "read Puffin deletion vector {} at {}+{} failed: {}",
                 spec.path, offset, size, e
@@ -111,68 +111,14 @@ fn accumulate_deletes_from_file(
         ));
     }
 
-    let reader = factory
-        .open_with_len(&spec.path, spec.length)
-        .map_err(|e| {
-            format!(
-                "open iceberg position-delete file {} failed: {}",
-                spec.path, e
-            )
-        })?;
+    let batches = read_foundation_parquet_batches(
+        access,
+        &spec.path,
+        spec.length,
+        FileProjection::RootNames(vec![FILE_PATH_COLUMN.to_string(), POS_COLUMN.to_string()]),
+    )?;
 
-    // Position-delete files are small enough that we just skip the parquet data
-    // cache — every byte is consumed exactly once per scan.
-    let reader = ParquetCachedReader::new(
-        CachedRangeReader::new(reader, None),
-        ParquetReadCachePolicy::with_flags(false, false, None),
-    );
-
-    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
-        format!(
-            "read iceberg position-delete file {} metadata failed: {}",
-            spec.path, e
-        )
-    })?;
-
-    // Resolve the two required columns by name against the Arrow schema the
-    // parquet reader exposes; this avoids pulling in the parquet
-    // `schema::types::Type` API just for name-to-index lookup.
-    let arrow_schema = builder.schema();
-    let file_path_field_idx = arrow_schema.index_of(FILE_PATH_COLUMN).map_err(|e| {
-        format!(
-            "iceberg position-delete file {} missing `{}`: {}",
-            spec.path, FILE_PATH_COLUMN, e
-        )
-    })?;
-    let pos_field_idx = arrow_schema.index_of(POS_COLUMN).map_err(|e| {
-        format!(
-            "iceberg position-delete file {} missing `{}`: {}",
-            spec.path, POS_COLUMN, e
-        )
-    })?;
-
-    // `ProjectionMask::leaves` takes leaf (physical) indices, which map 1:1 to
-    // top-level fields for the `(string, bigint)` schema used by Iceberg
-    // position-delete files.
-    let projection = ProjectionMask::leaves(
-        builder.parquet_schema(),
-        [file_path_field_idx, pos_field_idx].iter().copied(),
-    );
-
-    let reader = builder.with_projection(projection).build().map_err(|e| {
-        format!(
-            "build iceberg position-delete reader for {} failed: {}",
-            spec.path, e
-        )
-    })?;
-
-    for batch_result in reader {
-        let batch: arrow::record_batch::RecordBatch = batch_result.map_err(|e| {
-            format!(
-                "read iceberg position-delete file {} batch failed: {}",
-                spec.path, e
-            )
-        })?;
+    for batch in batches {
         // After projection the two columns retain their original schema
         // order, so we resolve them by name against the projected batch schema
         // (which is what `index_of` sees).
@@ -253,8 +199,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
 
-    use crate::fs::opendal::build_fs_operator;
-
     fn write_delete_parquet(path: &std::path::Path, file_paths: &[&str], positions: &[i64]) {
         let schema = Arc::new(Schema::new(vec![
             Field::new(FILE_PATH_COLUMN, DataType::Utf8, false),
@@ -285,9 +229,10 @@ mod tests {
         dir
     }
 
-    fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
-        let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("operator");
-        OpendalRangeReaderFactory::from_operator(op).expect("factory")
+    fn factory_for_dir(dir: &std::path::Path) -> novarocks_fs::FsAccessHandle {
+        novarocks_fs::FsAccessResolver::new()
+            .resolve_location(dir.join("__binding__").to_string_lossy(), None)
+            .expect("access")
     }
 
     #[test]

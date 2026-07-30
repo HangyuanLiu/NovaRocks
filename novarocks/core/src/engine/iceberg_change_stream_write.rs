@@ -88,6 +88,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
             prepared,
             native_bundle,
             build_input.query_opts.clone(),
+            None,
         )
     }
 

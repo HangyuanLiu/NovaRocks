@@ -21,13 +21,6 @@ pub mod cluster_heartbeat;
 pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
-#[cfg(feature = "compat")]
-pub(crate) mod exec_state_reporter;
-#[cfg(feature = "compat")]
-pub(crate) mod exec_status_report;
-pub mod fe_report;
-#[cfg(feature = "compat")]
-pub mod fe_report_compat;
 pub mod fragment_control;
 #[cfg(feature = "compat")]
 pub mod frontend_rpc;
@@ -41,10 +34,7 @@ pub mod grpc_server;
 #[cfg(feature = "compat")]
 pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
-#[cfg(feature = "compat")]
-pub mod internal_rpc_client;
 pub(crate) mod internal_rpc_transport;
-pub mod load_tracking_http;
 pub(crate) mod metrics_http;
 pub use metrics_http::{
     publish_backend_query_lifecycle_metrics, publish_frontend_query_lifecycle_metrics,
@@ -52,21 +42,6 @@ pub use metrics_http::{
 pub mod native_fragment_ingress;
 #[cfg(test)]
 pub(crate) mod native_fragment_service_test_fixture;
-pub mod report_worker;
 pub(crate) mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
-#[cfg(feature = "compat")]
-pub mod starrocks_fragment_dependency_resolver;
-#[cfg(feature = "compat")]
-pub mod starrocks_fragment_sync_ingress;
-#[cfg(feature = "compat")]
-pub mod starrocks_fragment_transport;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks_sink_commit_wire;
-#[cfg(feature = "compat")]
-pub mod stream_load;
-#[cfg(feature = "compat")]
-pub mod stream_load_http;
-#[cfg(feature = "compat")]
-pub(crate) mod stream_load_registry;

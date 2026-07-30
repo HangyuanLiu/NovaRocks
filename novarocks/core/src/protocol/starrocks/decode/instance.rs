@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 
+use novarocks_fs::DataCacheManager;
+
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -248,7 +250,7 @@ impl StarRocksObjectStoreDefaults {
         }
     }
 
-    pub(crate) fn apply_to(&self, config: &mut crate::fs::object_store::ObjectStoreConfig) {
+    pub(crate) fn apply_to(&self, config: &mut novarocks_fs::ObjectStoreConfig) {
         config.retry_max_times = config.retry_max_times.or(self.retry_max_times);
         config.retry_min_delay_ms = config.retry_min_delay_ms.or(self.retry_min_delay_ms);
         config.retry_max_delay_ms = config.retry_max_delay_ms.or(self.retry_max_delay_ms);
@@ -348,6 +350,45 @@ impl StarRocksDecodeFacts {
     pub(crate) fn object_store_defaults(&self) -> &StarRocksObjectStoreDefaults {
         &self.object_store_defaults
     }
+}
+
+/// Captures process-local values required by the StarRocks decoder.
+///
+/// This remains with the decoder until RCI-5F moves the protocol owner to
+/// `novarocks-compat`; it is deliberately not part of fragment admission state.
+pub fn snapshot_decode_facts(
+    stream_load_paths: BTreeMap<UniqueId, String>,
+) -> Result<StarRocksDecodeFacts, String> {
+    let config = crate::common::app_config::config().map_err(|error| error.to_string())?;
+    let rewrite = &config.runtime.path_rewrite;
+    let path_rewrite = rewrite.enable.then(|| {
+        StarRocksPathRewriteFacts::new(rewrite.from_prefix.clone(), rewrite.to_prefix.clone())
+    });
+    let datacache_available = config.runtime.cache.datacache_enable
+        && DataCacheManager::instance().block_cache().is_some();
+    let jdbc = config.jdbc_config().map(|jdbc| {
+        StarRocksJdbcFacts::new(
+            jdbc.url.clone(),
+            jdbc.user.clone(),
+            jdbc.password.clone(),
+            jdbc.default_db.clone(),
+        )
+    });
+    let object_storage = &config.runtime.object_storage;
+    let object_store_defaults = StarRocksObjectStoreDefaults::new(
+        object_storage.retry_max_times,
+        object_storage.retry_min_delay_ms,
+        object_storage.retry_max_delay_ms,
+        object_storage.timeout_ms,
+        object_storage.io_timeout_ms,
+    );
+    Ok(StarRocksDecodeFacts::new(
+        stream_load_paths,
+        path_rewrite,
+        datacache_available,
+        jdbc,
+        object_store_defaults,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

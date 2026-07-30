@@ -17,7 +17,6 @@
 
 //! Per-optimize-call configuration shared by logical rewrite and CBO drivers.
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -25,7 +24,7 @@ use crate::sql::optimizer::cascades_rules::multi_join_reorder::ReorderOptions;
 use crate::sql::optimizer::cost::CostOptions;
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SessionOptimizerSettings {
+pub struct SessionOptimizerSettings {
     pub enable_ukfk_opt: bool,
     pub enable_query_rewrite_table_prune: bool,
     pub enable_cbo_table_prune: bool,
@@ -82,6 +81,22 @@ pub(crate) struct SessionOptimizerSettings {
 }
 
 impl SessionOptimizerSettings {
+    pub fn set_disabled_rules(&mut self, rules: Vec<String>) {
+        self.disabled_rules = rules;
+    }
+
+    pub fn set_enable_eliminate_agg(&mut self, enabled: bool) {
+        self.enable_eliminate_agg = enabled;
+    }
+
+    pub fn set_enable_ukfk_opt(&mut self, enabled: bool) {
+        self.enable_ukfk_opt = enabled;
+    }
+
+    pub fn set_broadcast_backend_count(&mut self, count: f64) {
+        self.cbo_broadcast_backend_count = Some(count);
+    }
+
     pub(crate) fn global_runtime_filter_enabled(&self) -> bool {
         self.enable_global_runtime_filter.unwrap_or(true)
     }
@@ -89,33 +104,6 @@ impl SessionOptimizerSettings {
     pub(crate) fn mv_rewrite_enabled(&self) -> bool {
         self.enable_materialized_view_rewrite.unwrap_or(true)
     }
-}
-
-thread_local! {
-    static SESSION_OPTIMIZER_SETTINGS: RefCell<SessionOptimizerSettings> =
-        RefCell::new(SessionOptimizerSettings::default());
-}
-
-pub(crate) fn with_session_optimizer_settings<T>(
-    settings: SessionOptimizerSettings,
-    f: impl FnOnce() -> T,
-) -> T {
-    SESSION_OPTIMIZER_SETTINGS.with(|cell| {
-        let previous = cell.replace(settings);
-        let result = f();
-        cell.replace(previous);
-        result
-    })
-}
-
-pub(crate) fn current_session_optimizer_settings() -> SessionOptimizerSettings {
-    SESSION_OPTIMIZER_SETTINGS.with(|cell| cell.borrow().clone())
-}
-
-pub(crate) fn install_session_optimizer_settings(settings: SessionOptimizerSettings) {
-    SESSION_OPTIMIZER_SETTINGS.with(|cell| {
-        *cell.borrow_mut() = settings;
-    });
 }
 
 /// Controls which rules fire and bounds resource use.
@@ -309,29 +297,6 @@ mod tests {
         let opts = OptimizerOptions::from_session(&settings);
         assert!(opts.is_enabled("JoinCommutativity"));
         assert!(opts.is_enabled("AnyRuleAtAll"));
-    }
-
-    struct SessionOptimizerSettingsRestore {
-        previous: SessionOptimizerSettings,
-    }
-
-    impl Drop for SessionOptimizerSettingsRestore {
-        fn drop(&mut self) {
-            install_session_optimizer_settings(self.previous.clone());
-        }
-    }
-
-    #[test]
-    fn install_session_optimizer_settings_updates_current_settings() {
-        let _restore = SessionOptimizerSettingsRestore {
-            previous: current_session_optimizer_settings(),
-        };
-        let settings = SessionOptimizerSettings {
-            effective_backend_count: Some(5.0),
-            ..Default::default()
-        };
-        install_session_optimizer_settings(settings.clone());
-        assert_eq!(current_session_optimizer_settings(), settings);
     }
 
     #[test]

@@ -20,17 +20,13 @@ mod tests {
     use std::sync::Arc;
 
     use crate::connector::ConnectorRegistry;
-    use crate::connector::backend::{CatalogBackend, CreateTableRequest, ResolvedTable};
+    use crate::connector::backend::{CatalogBackend, CreateTableRequest};
 
     struct DummyCatalog;
 
     impl CatalogBackend for DummyCatalog {
         fn name(&self) -> &'static str {
             "dummy"
-        }
-
-        fn namespace_exists(&self, _catalog: &str, _namespace: &str) -> Result<bool, String> {
-            Ok(false)
         }
 
         fn create_namespace(&self, _catalog: &str, _namespace: &str) -> Result<(), String> {
@@ -50,15 +46,6 @@ mod tests {
             Ok(())
         }
 
-        fn table_exists(
-            &self,
-            _catalog: &str,
-            _namespace: &str,
-            _table: &str,
-        ) -> Result<bool, String> {
-            Ok(false)
-        }
-
         fn drop_table(
             &self,
             _catalog: &str,
@@ -67,15 +54,6 @@ mod tests {
             _if_exists: bool,
         ) -> Result<(), String> {
             Ok(())
-        }
-
-        fn load_table(
-            &self,
-            _catalog: &str,
-            _namespace: &str,
-            _table: &str,
-        ) -> Result<ResolvedTable, String> {
-            Err("dummy".to_string())
         }
     }
 

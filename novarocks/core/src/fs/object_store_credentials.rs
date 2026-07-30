@@ -14,7 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::fs::object_store::{ObjectStoreConfig, ObjectStoreRetrySettings};
+use crate::fs::object_store::ObjectStoreRetrySettings;
+use novarocks_fs::ObjectStoreConfig;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
@@ -57,6 +58,7 @@ pub enum ObjectStoreCredentialsSource {
     S3AProperties,
     IcebergSinkCloudProperties,
     StandaloneConfig,
+    ConnectorStartupConfig,
     StarRocksObjectStoreProfile,
     StarletProfile,
 }
@@ -68,6 +70,7 @@ impl ObjectStoreCredentialsSource {
             Self::S3AProperties => "s3a_properties",
             Self::IcebergSinkCloudProperties => "iceberg_sink_cloud_properties",
             Self::StandaloneConfig => "standalone_config",
+            Self::ConnectorStartupConfig => "connector_startup_config",
             Self::StarRocksObjectStoreProfile => "starrocks_object_store_profile",
             Self::StarletProfile => "starlet_profile",
         }

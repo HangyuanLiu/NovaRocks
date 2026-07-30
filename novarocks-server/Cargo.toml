@@ -13,6 +13,7 @@ novarocks = { path = "../novarocks/core" }
 novarocks-backend = { path = "../novarocks/backend" }
 novarocks-compat = { path = "../novarocks/compat", optional = true }
 novarocks-frontend = { path = "../novarocks/frontend" }
+novarocks-fs = { path = "../novarocks/fs" }
 anyhow = "1"
 ctrlc = "3.4"
 libc = "0.2"

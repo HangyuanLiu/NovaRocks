@@ -1408,6 +1408,7 @@ mod tests {
                 let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
                     &connectors,
+                    &crate::connector::test_request_context(),
                     None,
                 )?;
                 crate::protocol::native::encode::encode_native_fragment_bundle(
@@ -1735,6 +1736,7 @@ mod tests {
             &HashMap::new(),
             factory,
             Vec::new(),
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         )
         .expect("physical optimization")
     }

@@ -2,16 +2,23 @@ use std::sync::Arc;
 
 use novarocks::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
 
-pub(crate) fn compat_fragment_event_sink() -> Arc<dyn FragmentEventSink> {
-    Arc::new(CompatFragmentEventSink)
+use crate::report::CompatReportService;
+
+pub(crate) fn compat_fragment_event_sink(
+    report_service: Arc<CompatReportService>,
+) -> Arc<dyn FragmentEventSink> {
+    Arc::new(CompatFragmentEventSink { report_service })
 }
 
-struct CompatFragmentEventSink;
+struct CompatFragmentEventSink {
+    report_service: Arc<CompatReportService>,
+}
 
 impl FragmentEventSink for CompatFragmentEventSink {
     fn record(&self, event: FragmentEvent) {
         if let FragmentEvent::Progress(progress) = event {
-            novarocks::service::fe_report::report_exec_state(progress.fragment_instance_id());
+            self.report_service
+                .report_progress(progress.fragment_instance_id());
         }
     }
 }

@@ -14,29 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+
+//! Core correctness adapter for connector-neutral ORC physical batches.
+
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use orc_rust::arrow_reader::ArrowReaderBuilder;
-use orc_rust::projection::ProjectionMask;
-use orc_rust::schema::RootDataType;
 
-use crate::cache::{CachedRangeReader, DataCacheContext};
-use crate::common::config;
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::RuntimeFilterContext;
-use crate::fs::coalesce_policy::AdaptiveCoalesceController;
-use crate::fs::opendal::OpendalRangeReaderFactory;
-use crate::fs::range_plan::PlannedIoRanges;
-use crate::fs::scan_context::{FileScanContext, FileScanRange};
-use crate::runtime::profile::{ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
+use crate::exec::chunk::ChunkSchemaRef;
+use novarocks_fs::DataCacheContext;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
-static ORC_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
 
 #[derive(Clone, Debug)]
 pub struct OrcScanConfig {
@@ -49,399 +38,48 @@ pub struct OrcScanConfig {
     pub datacache: DataCacheContext,
 }
 
-pub fn build_orc_iter(
-    scan: FileScanContext,
-    cfg: OrcScanConfig,
-    limit: Option<usize>,
-    profile: Option<RuntimeProfile>,
-    _runtime_filters: Option<&RuntimeFilterContext>,
-) -> Result<BoxedExecIter, String> {
-    if scan.ranges.is_empty() {
-        return Ok(Box::new(std::iter::empty()));
-    }
-    let iter = OrcScanIter::new(cfg, scan.ranges, scan.factory, limit, profile);
-    Ok(Box::new(iter))
-}
-
-#[derive(Clone, Debug)]
-enum OutputColumn {
-    Count,
-    BatchIndex(usize),
-}
-
-struct OrcScanIter {
-    cfg: OrcScanConfig,
-    ranges: Vec<FileScanRange>,
-    factory: OpendalRangeReaderFactory,
-    range_idx: usize,
-    reader: Option<orc_rust::arrow_reader::ArrowReader<CachedRangeReader>>,
-    output_columns: Option<Vec<OutputColumn>>,
-    remaining: usize,
-    profile: Option<RuntimeProfile>,
-}
-
-impl OrcScanIter {
-    fn new(
-        cfg: OrcScanConfig,
-        ranges: Vec<FileScanRange>,
-        factory: OpendalRangeReaderFactory,
-        limit: Option<usize>,
-        profile: Option<RuntimeProfile>,
-    ) -> Self {
-        let remaining = limit.unwrap_or(usize::MAX);
-        Self {
-            cfg,
-            ranges,
-            factory,
-            range_idx: 0,
-            reader: None,
-            output_columns: None,
-            remaining,
-            profile,
-        }
-    }
-
-    fn open_next_reader(&mut self) -> Result<bool, String> {
-        if self.range_idx >= self.ranges.len() {
-            return Ok(false);
-        }
-        let range = self.ranges[self.range_idx].clone();
-        self.range_idx += 1;
-
-        if let Some(profile) = self.profile.as_ref() {
-            profile.counter_add("OrcRanges", ProfileUnit::Unit, 1);
-        }
-
-        let path = range.path.clone();
-        let file_len = range.file_len;
-        let len = (file_len > 0).then_some(file_len);
-        let reader = self
-            .factory
-            .open_with_len(&path, len)
-            .map(|r| {
-                r.with_modification_time_override(
-                    range
-                        .external_datacache
-                        .as_ref()
-                        .and_then(|opts| opts.modification_time),
-                )
-            })
-            .map_err(|e| e.to_string())?;
-        let reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
-        let mut builder = ArrowReaderBuilder::try_new(reader.clone()).map_err(|e| e.to_string())?;
-        let root = builder.file_metadata().root_data_type();
-        let (projection, output_columns) = resolve_projection(&self.cfg, root)?;
-        builder = builder.with_projection(projection);
-        if let Some(bs) = self.cfg.batch_size {
-            builder = builder.with_batch_size(bs);
-        }
-
-        let mut file_byte_range: Option<Range<usize>> = None;
-        if range.length > 0 {
-            let mut end = range
-                .offset
-                .checked_add(range.length)
-                .ok_or_else(|| "orc scan range overflow when computing end offset".to_string())?;
-            if range.file_len > 0 && end > range.file_len {
-                end = range.file_len;
-            }
-            if end < range.offset {
-                return Err("orc scan range end < start".to_string());
-            }
-            let start = range.offset as usize;
-            let end = end as usize;
-            if end > start {
-                file_byte_range = Some(start..end);
-            }
-        }
-        if let Some(scan_range) = file_byte_range.clone() {
-            builder = builder.with_file_byte_range(scan_range);
-        }
-
-        if config::io_coalesce_read_enable() {
-            let io_ranges =
-                collect_orc_coalesce_io_ranges(builder.file_metadata(), file_byte_range.as_ref());
-            if !io_ranges.is_empty() {
-                let coalesce_together = ORC_COALESCE_CONTROLLER.decide_and_record(
-                    config::io_coalesce_adaptive_lazy_active(),
-                    !io_ranges.lazy.is_empty(),
-                );
-                reader.set_coalesce_io_ranges(io_ranges, coalesce_together);
-            }
-        }
-
-        self.reader = Some(builder.build());
-        self.output_columns = Some(output_columns);
-        Ok(true)
-    }
-}
-
-impl Iterator for OrcScanIter {
-    type Item = Result<Chunk, String>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.remaining == 0 {
-                return None;
-            }
-            if self.reader.is_none() {
-                match self.open_next_reader() {
-                    Ok(true) => {}
-                    Ok(false) => return None,
-                    Err(e) => return Some(Err(e)),
-                }
-            }
-
-            let reader = self.reader.as_mut().expect("orc reader");
-            match reader.next() {
-                Some(Ok(batch)) => {
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    let output_columns = match self.output_columns.as_ref() {
-                        Some(cols) => cols,
-                        None => {
-                            return Some(Err("orc scan missing output column mapping".to_string()));
-                        }
-                    };
-                    let batch = match reorder_orc_batch(&self.cfg, output_columns, batch) {
-                        Ok(batch) => batch,
-                        Err(e) => return Some(Err(e)),
-                    };
-
-                    let to_take = std::cmp::min(batch.num_rows(), self.remaining);
-                    let batch = if to_take < batch.num_rows() {
-                        batch.slice(0, to_take)
-                    } else {
-                        batch
-                    };
-                    self.remaining -= to_take;
-                    if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add("OrcBatchesOut", ProfileUnit::Unit, 1);
-                        profile.counter_add(
-                            "OrcRowsOut",
-                            ProfileUnit::Unit,
-                            clamp_u128_to_i64(to_take as u128),
-                        );
-                        profile.counter_add(
-                            "RawRowsRead",
-                            ProfileUnit::Unit,
-                            clamp_u128_to_i64(to_take as u128),
-                        );
-                    }
-                    let chunk_schema = match self.cfg.chunk_schema.with_fields_in_order(
-                        batch
-                            .schema()
-                            .fields()
-                            .iter()
-                            .map(|field| field.as_ref().clone())
-                            .collect(),
-                    ) {
-                        Ok(schema) => Arc::new(schema),
-                        Err(e) => return Some(Err(e)),
-                    };
-                    return Some(Chunk::try_new_with_chunk_schema(batch, chunk_schema));
-                }
-                Some(Err(e)) => {
-                    self.reader = None;
-                    return Some(Err(e.to_string()));
-                }
-                None => {
-                    self.reader = None;
-                    self.output_columns = None;
-                }
-            }
-        }
-    }
-}
-
-fn resolve_projection(
+pub(crate) fn adapt_foundation_batch(
     cfg: &OrcScanConfig,
-    root: &RootDataType,
-) -> Result<(ProjectionMask, Vec<OutputColumn>), String> {
-    let mut output_positions: Vec<Option<usize>> = Vec::with_capacity(cfg.columns.len());
-    let mut requested_positions = HashSet::new();
-
-    let use_orc_column_names = cfg.orc_use_column_names
-        || cfg
-            .hive_column_names
-            .as_ref()
-            .is_none_or(|names| names.is_empty());
-    for col in &cfg.columns {
-        if col == VIRTUAL_COUNT_COLUMN {
-            output_positions.push(None);
-            continue;
-        }
-        let pos = if use_orc_column_names {
-            find_root_pos_by_name(root, col, cfg.case_sensitive)?
-        } else {
-            find_root_pos_by_hive(cfg, col)?
-        };
-        output_positions.push(Some(pos));
-        requested_positions.insert(pos);
-    }
-
-    if requested_positions.is_empty() {
-        let output_columns = output_positions
-            .into_iter()
-            .map(|pos| match pos {
-                None => OutputColumn::Count,
-                Some(_) => OutputColumn::Count,
-            })
-            .collect();
-        return Ok((ProjectionMask::all(), output_columns));
-    }
-
-    let mut projected_positions = Vec::new();
-    for (idx, _) in root.children().iter().enumerate() {
-        if requested_positions.contains(&idx) {
-            projected_positions.push(idx);
-        }
-    }
-
-    let mut pos_to_batch = HashMap::new();
-    for (batch_idx, pos) in projected_positions.iter().enumerate() {
-        pos_to_batch.insert(*pos, batch_idx);
-    }
-
-    let mut output_columns = Vec::with_capacity(output_positions.len());
-    for pos in output_positions {
-        let col = match pos {
-            None => OutputColumn::Count,
-            Some(root_pos) => {
-                let batch_idx = *pos_to_batch.get(&root_pos).ok_or_else(|| {
-                    format!("orc scan output column root_pos {} not projected", root_pos)
-                })?;
-                OutputColumn::BatchIndex(batch_idx)
-            }
-        };
-        output_columns.push(col);
-    }
-
-    let mut column_indices = Vec::with_capacity(projected_positions.len());
-    for pos in projected_positions {
-        let col = root
-            .children()
-            .get(pos)
-            .ok_or_else(|| format!("orc scan column position {} out of range", pos))?;
-        column_indices.push(col.data_type().column_index());
-    }
-
-    Ok((ProjectionMask::roots(root, column_indices), output_columns))
-}
-
-fn collect_orc_coalesce_io_ranges(
-    file_metadata: &orc_rust::reader::metadata::FileMetadata,
-    file_byte_range: Option<&Range<usize>>,
-) -> PlannedIoRanges {
-    let segment_size = config::io_coalesce_read_max_buffer_size().max(1);
-    let mut ranges = PlannedIoRanges::default();
-    let stripe_metadatas = file_metadata.stripe_metadatas();
-    for stripe in stripe_metadatas {
-        if let Some(scan_range) = file_byte_range {
-            let stripe_offset = stripe.offset() as usize;
-            if !scan_range.contains(&stripe_offset) {
-                continue;
-            }
-        }
-
-        let mut offset = stripe.offset();
-        let mut index_remaining = stripe.index_length();
-        while index_remaining > 0 {
-            let size = index_remaining.min(segment_size);
-            ranges.push_active(offset, size);
-            offset = offset.saturating_add(size);
-            index_remaining = index_remaining.saturating_sub(size);
-        }
-
-        let mut data_remaining = stripe.data_length();
-        while data_remaining > 0 {
-            let size = data_remaining.min(segment_size);
-            ranges.push_lazy(offset, size);
-            offset = offset.saturating_add(size);
-            data_remaining = data_remaining.saturating_sub(size);
-        }
-    }
-    ranges
-}
-
-fn find_root_pos_by_name(
-    root: &RootDataType,
-    name: &str,
-    case_sensitive: bool,
-) -> Result<usize, String> {
-    for (idx, col) in root.children().iter().enumerate() {
-        if case_sensitive {
-            if col.name() == name {
-                return Ok(idx);
-            }
-        } else if col.name().eq_ignore_ascii_case(name) {
-            return Ok(idx);
-        }
-    }
-    Err(format!("orc scan missing column in file schema: {}", name))
-}
-
-fn find_root_pos_by_hive(cfg: &OrcScanConfig, name: &str) -> Result<usize, String> {
-    let Some(hive_cols) = cfg.hive_column_names.as_ref() else {
-        return Err("orc scan requires hive_column_names for ordinal mapping".to_string());
-    };
-    for (idx, col_name) in hive_cols.iter().enumerate() {
-        if cfg.case_sensitive {
-            if col_name == name {
-                return Ok(idx);
-            }
-        } else if col_name.eq_ignore_ascii_case(name) {
-            return Ok(idx);
-        }
-    }
-    Err(format!(
-        "orc scan missing column in hive_column_names: {}",
-        name
-    ))
-}
-
-fn reorder_orc_batch(
-    cfg: &OrcScanConfig,
-    output_columns: &[OutputColumn],
     batch: RecordBatch,
 ) -> Result<RecordBatch, String> {
-    if output_columns.is_empty() {
-        return Ok(batch);
-    }
-
-    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(output_columns.len());
-    let mut new_fields: Vec<Arc<Field>> = Vec::with_capacity(output_columns.len());
-
-    for (idx, out) in output_columns.iter().enumerate() {
-        match out {
-            OutputColumn::Count => {
-                let row_count = batch.num_rows();
-                let count_array: ArrayRef = Arc::new(BooleanArray::from(vec![true; row_count]));
-                let count_field = Arc::new(Field::new(
-                    cfg.columns
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or_else(|| VIRTUAL_COUNT_COLUMN.to_string()),
-                    DataType::Boolean,
-                    false,
-                ));
-                new_columns.push(count_array);
-                new_fields.push(count_field);
-            }
-            OutputColumn::BatchIndex(batch_idx) => {
-                let column = batch.column(*batch_idx).clone();
-                let field = batch.schema().field(*batch_idx).clone().into();
-                new_columns.push(column);
-                new_fields.push(field);
-            }
+    let batch_schema = batch.schema();
+    let mut columns = Vec::with_capacity(cfg.columns.len());
+    let mut fields = Vec::with_capacity(cfg.columns.len());
+    for column in &cfg.columns {
+        if column == VIRTUAL_COUNT_COLUMN {
+            columns.push(Arc::new(BooleanArray::from(vec![true; batch.num_rows()])) as ArrayRef);
+            fields.push(Arc::new(Field::new(column, DataType::Boolean, false)));
+            continue;
         }
+        let index = if cfg.orc_use_column_names {
+            if cfg.case_sensitive {
+                batch_schema.index_of(column).ok()
+            } else {
+                batch_schema
+                    .fields()
+                    .iter()
+                    .position(|field| field.name().eq_ignore_ascii_case(column))
+            }
+        } else {
+            cfg.hive_column_names.as_ref().and_then(|names| {
+                names.iter().position(|name| {
+                    if cfg.case_sensitive {
+                        name == column
+                    } else {
+                        name.eq_ignore_ascii_case(column)
+                    }
+                })
+            })
+        }
+        .ok_or_else(|| format!("ORC physical batch missing requested column: {column}"))?;
+        columns.push(batch.column(index).clone());
+        fields.push(batch_schema.field(index).clone().into());
     }
-
-    let new_schema = Arc::new(Schema::new(new_fields));
-    let batch = RecordBatch::try_new(new_schema, new_columns)
-        .map_err(|e: arrow::error::ArrowError| e.to_string())?;
-    validate_batch_slot_count(cfg, batch)
+    validate_batch_slot_count(
+        cfg,
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| error.to_string())?,
+    )
 }
 
 fn validate_batch_slot_count(
@@ -451,14 +89,12 @@ fn validate_batch_slot_count(
     if batch.num_columns() == 0 {
         return Ok(batch);
     }
-
     if cfg.chunk_schema.slot_ids().is_empty() {
         return Err(format!(
             "orc scan missing chunk schema for non-empty batch: num_columns={}",
             batch.num_columns()
         ));
     }
-
     if batch.num_columns() != cfg.chunk_schema.slot_ids().len() {
         return Err(format!(
             "orc scan output columns/chunk schema mismatch: num_columns={}, slot_ids={:?}",
@@ -466,63 +102,5 @@ fn validate_batch_slot_count(
             cfg.chunk_schema.slot_ids()
         ));
     }
-
     Ok(batch)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs::File;
-    use std::sync::Arc;
-
-    use arrow::array::Int32Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use orc_rust::{ArrowReaderBuilder, ArrowWriterBuilder};
-
-    use crate::cache::CachedRangeReader;
-    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-
-    #[test]
-    fn cached_range_reader_smoke_test_for_orc() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("sample.orc");
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .expect("record batch");
-
-        let file = File::create(&file_path).expect("create orc file");
-        let mut writer = ArrowWriterBuilder::new(file, Arc::clone(&schema))
-            .try_build()
-            .expect("orc writer");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-
-        let file_len = std::fs::metadata(&file_path).expect("file metadata").len();
-        let op = build_fs_operator(temp_dir.path().to_str().expect("temp dir path"))
-            .expect("build fs operator");
-        let factory = OpendalRangeReaderFactory::from_operator(op).expect("reader factory");
-        let reader = factory
-            .open_with_len("sample.orc", Some(file_len))
-            .expect("open with len");
-        let reader = CachedRangeReader::new(reader, None);
-        let mut batches = ArrowReaderBuilder::try_new(reader)
-            .expect("orc builder")
-            .build();
-
-        let batch = batches.next().expect("first batch").expect("decode batch");
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("int32 column");
-        assert_eq!(values.values(), &[1, 2, 3]);
-    }
 }

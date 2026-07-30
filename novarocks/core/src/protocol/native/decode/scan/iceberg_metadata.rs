@@ -16,18 +16,21 @@
 // under the License.
 
 use crate::common::ids::SlotId;
-use crate::connector::ScanConfig;
 use crate::connector::iceberg::metadata::{
     IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanRange,
     IcebergMetadataTableType,
 };
+use crate::connector::iceberg::plan_native_iceberg_metadata_read_source;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
-use super::common::{DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit};
+use super::common::{
+    DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit,
+    reject_native_connector_cloud_properties,
+};
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
@@ -39,6 +42,7 @@ pub(super) fn lower_iceberg_metadata_scan(
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
+    reject_native_connector_cloud_properties(&source.cloud_properties)?;
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
     let metadata_table_type = metadata_table_type(source.metadata_table_type).map_err(|error| {
@@ -62,18 +66,22 @@ pub(super) fn lower_iceberg_metadata_scan(
         profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    let (source, bound_ranges) = ctx
-        .connectors()?
-        .create_scan_node("iceberg", ScanConfig::IcebergMetadata(cfg))
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "serialized_table",
-                error,
-            )
-        })?;
-    // Route the enriched ranges to the instance; bind happens at materialize.
-    ctx.capture_scan_ranges(node.node_id, bound_ranges);
+    let query_options = ctx.query_options().cloned().unwrap_or_default();
+    let source = plan_native_iceberg_metadata_read_source(
+        ctx.connectors()?,
+        ctx.query_id(),
+        node.node_id,
+        cfg,
+        &query_options,
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "serialized_table",
+            error,
+        )
+    })?;
+    ctx.capture_scan_ranges(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
     let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_schema.clone())

@@ -29,7 +29,9 @@ pub(crate) fn execute(
     state: &Arc<StandaloneState>,
     _current_database: &str,
     stmt: &AlterIcebergRefStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     // 1. Resolve qualified name — must be 3-part (catalog.namespace.table).
     let (catalog_name, namespace, table_name) = resolve_table_parts(&stmt.table)?;
 
@@ -45,6 +47,7 @@ pub(crate) fn execute(
     //    build a fresh HadoopFileSystemCatalog for the async commit path.
     let loaded =
         crate::connector::iceberg::catalog::registry::load_table(&entry, &namespace, &table_name)?;
+    crate::connector::validate_request_context(connector_context)?;
     let target = crate::engine::backend_resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: catalog_name.clone(),
@@ -107,6 +110,7 @@ pub(crate) fn execute(
 
     // 6. Execute via async bridge.
     //    build_iceberg_catalog dispatches Hadoop / REST / Hive.
+    crate::connector::validate_request_context(connector_context)?;
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
         crate::connector::iceberg::commit::execute_ref_action(catalog.as_ref(), &connector_plan)

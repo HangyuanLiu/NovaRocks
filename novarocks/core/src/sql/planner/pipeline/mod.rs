@@ -22,24 +22,52 @@ use crate::sql::planner::payload::PlanAssertOneRowNode;
 use crate::sql::planner::physical::{PhysicalPlanKind, PhysicalPlanNode, PreExpandKeyedAssertSpec};
 
 pub(crate) fn build_distributed_plan(
-    mut physical: PhysicalPlanNode,
+    physical: PhysicalPlanNode,
 ) -> Result<DistributedPlan, String> {
-    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(&mut physical);
+    build_distributed_plan_with_settings(
+        physical,
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    )
+}
+
+pub(crate) fn build_distributed_plan_with_settings(
+    mut physical: PhysicalPlanNode,
+    settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+) -> Result<DistributedPlan, String> {
+    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
     crate::sql::planner::distributed::build::build_distributed_plan(&physical)
 }
 
 pub(crate) fn build_iceberg_write_distributed_plan(
-    mut physical: PhysicalPlanNode,
+    physical: PhysicalPlanNode,
     sink: crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink,
 ) -> Result<DistributedPlan, String> {
-    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(&mut physical);
+    build_iceberg_write_distributed_plan_with_settings(
+        physical,
+        sink,
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    )
+}
+
+pub(crate) fn build_iceberg_write_distributed_plan_with_settings(
+    mut physical: PhysicalPlanNode,
+    sink: crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink,
+    settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+) -> Result<DistributedPlan, String> {
+    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
     crate::sql::planner::distributed::write::plan::build_iceberg_write_distributed_plan(
         &physical, sink,
     )
 }
 
 pub(crate) fn build_iceberg_change_stream_distributed_plan(
-    mut physical: PhysicalPlanNode,
+    physical: PhysicalPlanNode,
     descriptor_database: &str,
     dag: crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     keyed_assert: Option<PreExpandKeyedAssertSpec>,
@@ -47,10 +75,32 @@ pub(crate) fn build_iceberg_change_stream_distributed_plan(
     crate::sql::planner::distributed::write::plan::PlannedIcebergChangeStreamDistributedPlan,
     String,
 > {
+    build_iceberg_change_stream_distributed_plan_with_settings(
+        physical,
+        descriptor_database,
+        dag,
+        keyed_assert,
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    )
+}
+
+pub(crate) fn build_iceberg_change_stream_distributed_plan_with_settings(
+    mut physical: PhysicalPlanNode,
+    descriptor_database: &str,
+    dag: crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    keyed_assert: Option<PreExpandKeyedAssertSpec>,
+    settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+) -> Result<
+    crate::sql::planner::distributed::write::plan::PlannedIcebergChangeStreamDistributedPlan,
+    String,
+> {
     if let Some(keyed_assert) = keyed_assert {
         insert_pre_expand_keyed_assert(&mut physical, &keyed_assert)?;
     }
-    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(&mut physical);
+    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
     crate::sql::planner::distributed::write::plan::build_iceberg_change_stream_distributed_plan(
         &physical,
         descriptor_database,

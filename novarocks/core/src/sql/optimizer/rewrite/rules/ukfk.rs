@@ -27,7 +27,6 @@ use crate::sql::optimizer::operator::{
     FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::options::current_session_optimizer_settings;
 use crate::sql::optimizer::pattern::{OpKind, Pattern};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -76,7 +75,7 @@ impl LogicalRewriteRule for PruneUkFkJoin {
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let settings = current_session_optimizer_settings();
+        let settings = ctx.session_settings();
         let table_prune_enabled = settings.enable_query_rewrite_table_prune
             || settings.enable_cbo_table_prune
             || settings.enable_table_prune_on_update;
@@ -202,7 +201,7 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let settings = current_session_optimizer_settings();
+        let settings = ctx.session_settings();
         if !settings.enable_eliminate_agg {
             return Ok(RewriteResult::Unchanged);
         }

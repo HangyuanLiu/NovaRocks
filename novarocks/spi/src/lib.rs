@@ -15,4 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod connector;
 pub mod state_store;

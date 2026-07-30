@@ -155,7 +155,7 @@ pub fn load_tablet_snapshot_with_object_store_config(
     tablet_id: i64,
     version: i64,
     tablet_root_path: &str,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<StarRocksTabletSnapshot, String> {
     if tablet_id <= 0 {
         return Err(format!(

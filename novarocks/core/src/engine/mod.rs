@@ -47,7 +47,6 @@ use crate::connector::{
 };
 #[cfg(feature = "compat")]
 use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
-use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
@@ -60,8 +59,6 @@ use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 pub(crate) mod aggregate;
-#[cfg(test)]
-pub(crate) mod backend_ops;
 pub(crate) mod backend_resolver;
 pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;
@@ -303,12 +300,14 @@ pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a StandaloneCatalogService,
     connectors: &'a crate::connector::ConnectorRegistry,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
     lookup_mode: TableLookupMode,
 ) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
     crate::sql::catalog::provider::CatalogServiceProvider::new(
         current_catalog,
         catalog_service,
         connectors,
+        connector_context,
         lookup_mode,
     )
 }
@@ -335,12 +334,142 @@ pub struct StandaloneStarRocksTableInfo {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum StatementResult {
+pub enum StatementResult {
     Query(QueryResult),
     Ok,
 }
 
+/// An opaque, one-shot result of core query compilation.
+///
+/// The frontend owns submission to `QueryExecutionService`, while the core
+/// keeps the native request construction and result formatting capabilities.
+/// This prevents a second router from reconstructing query artifacts or
+/// interpreting coordinator-specific state.
+pub enum PreparedQueryOperation {
+    Immediate(PreparedImmediateQuery),
+    Distributed(PreparedDistributedQuery),
+}
+
+pub struct PreparedImmediateQuery {
+    result: StatementResult,
+}
+
+impl PreparedImmediateQuery {
+    pub fn into_result(self) -> StatementResult {
+        self.result
+    }
+}
+
+pub struct PreparedDistributedQuery {
+    request: crate::query_execution::contract::DistributedQueryRequest,
+    completion: PreparedQueryCompletion,
+}
+
+impl PreparedDistributedQuery {
+    pub fn into_parts(
+        self,
+    ) -> (
+        crate::query_execution::contract::DistributedQueryRequest,
+        PreparedQueryCompletion,
+    ) {
+        (self.request, self.completion)
+    }
+}
+
+/// Core-owned completion formatter paired with a distributed request.
+///
+/// It is deliberately not constructible outside core: frontend can submit the
+/// request exactly once, but cannot substitute a formatter for a different
+/// distributed-query intent.
+pub struct PreparedQueryCompletion {
+    formatter: PreparedQueryFormatter,
+}
+
+enum PreparedQueryFormatter {
+    Result,
+    Profile(PreparedProfileFormatter),
+}
+
+struct PreparedProfileFormatter {
+    distributed_plan: crate::sql::planner::distributed::DistributedPlan,
+    planning_elapsed: std::time::Duration,
+    execution_started_at: std::time::Instant,
+}
+
+impl PreparedQueryCompletion {
+    pub fn complete(
+        self,
+        outcome: crate::query_execution::contract::DistributedQueryOutcome,
+    ) -> Result<StatementResult, String> {
+        match self.formatter {
+            PreparedQueryFormatter::Result => outcome
+                .into_result()
+                .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+                .map(StatementResult::Query)
+                .map_err(|error| error.to_string()),
+            PreparedQueryFormatter::Profile(formatter) => {
+                let outcome = outcome
+                    .into_profile()
+                    .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
+                    .map_err(|error| error.to_string())?;
+                let (query_result, fragment_profiles) = outcome;
+                let fragment_profiles = fragment_profiles.into_profiles();
+                if fragment_profiles.is_empty() {
+                    return Err(
+                        "EXPLAIN ANALYZE completed without fragment runtime profiles".into(),
+                    );
+                }
+                let actuals = crate::query_execution::profile::collect_actuals_by_plan_node_id_from_profile_trees(
+                    &fragment_profiles,
+                );
+                let profile_summary = crate::query_execution::profile::collect_distributed_profile_summary_from_profile_trees(
+                    &fragment_profiles,
+                );
+                let per_fragment =
+                    crate::query_execution::profile::collect_per_fragment_profile_summaries(
+                        &fragment_profiles,
+                    );
+                let mut lines = Vec::new();
+                lines.push(format!(
+                    "Planning: {} / Execution: {} / Rows: {}",
+                    format_explain_analyze_duration(formatter.planning_elapsed),
+                    format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
+                    query_result.row_count()
+                ));
+                lines.push(format_distributed_profile_summary(&profile_summary));
+                if let Some(apply) = crate::query_execution::profile::collect_native_runtime_filter_apply_from_profile_trees(
+                    &fragment_profiles,
+                ) {
+                    lines.push(apply.to_string());
+                }
+                if let Some(counters) =
+                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
+                        &fragment_profiles,
+                        ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
+                        "ProfileCounters",
+                    )
+                {
+                    lines.push(counters);
+                }
+                lines.extend(
+                    crate::sql::explain::distributed::explain_distributed_plan_analyze(
+                        &formatter.distributed_plan,
+                        crate::sql::explain::ExplainLevel::Analyze,
+                        &actuals,
+                        Some(&per_fragment),
+                    ),
+                );
+                build_string_query_result("Explain String", lines).map(StatementResult::Query)
+            }
+        }
+    }
+}
+
 pub(crate) struct StandaloneState {
+    /// Role supplied by the frontend composition root. Maintenance execution
+    /// captures it with the same topology snapshot instead of reading config
+    /// during a request.
+    pub(crate) execution_role: crate::common::app_config::ClusterRole,
     pub(crate) catalog_service: Arc<StandaloneCatalogService>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
@@ -349,7 +478,6 @@ pub(crate) struct StandaloneState {
     pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
     pub(crate) mv_refresh_pruning_limits: MvRefreshPruningLimits,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
-    pub(crate) backend_repo: BackendMetaRepository,
     pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
     pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
     /// Provider-neutral MV metadata boundary. Production wiring is installed by
@@ -397,6 +525,7 @@ pub(crate) struct StandaloneState {
 impl Default for StandaloneState {
     fn default() -> Self {
         Self {
+            execution_role: crate::common::app_config::ClusterRole::AllInOne,
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
@@ -405,7 +534,6 @@ impl Default for StandaloneState {
             starrocks_table_config: None,
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
             metadata_provider: None,
-            backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repository: Arc::new(UnavailableMvRepository),
@@ -530,11 +658,54 @@ pub struct StandaloneSession {
     inner: Arc<StandaloneState>,
 }
 
+/// Narrow core compiler kernel consumed by frontend QueryService.
+///
+/// It deliberately exposes neither `StandaloneState` nor connector internals.
+/// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
+#[derive(Clone)]
+pub struct StandaloneQueryCompiler {
+    session: StandaloneSession,
+}
+
+impl StandaloneQueryCompiler {
+    pub fn prepare(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<PreparedQueryOperation, String> {
+        self.session
+            .prepare_query_with_context(sql, context, query_opts)
+    }
+}
+
+/// Core command kernel for statement families whose application owner has not
+/// moved in this cutover (notably DML and MV maintenance).
+#[derive(Clone)]
+pub struct StandaloneCommandExecutor {
+    session: StandaloneSession,
+}
+
+impl StandaloneCommandExecutor {
+    pub fn execute(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        self.session
+            .execute_command_with_context(sql, context, query_opts)
+    }
+}
+
 /// Explicit application services required to open the core SQL engine.
 ///
 /// The value has no default: the owning frontend must construct every
 /// application-level service, including distributed query execution.
 pub struct StandaloneOpenServices {
+    /// Deployment role validated by the frontend composition root. Request
+    /// execution must not rediscover it from global process configuration.
+    pub execution_role: crate::common::app_config::ClusterRole,
     pub system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
     pub view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     pub statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
@@ -558,6 +729,7 @@ pub struct StandaloneOpenServices {
 
 impl StandaloneOpenServices {
     pub fn new(
+        execution_role: crate::common::app_config::ClusterRole,
         system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
         view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
         statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
@@ -581,6 +753,7 @@ impl StandaloneOpenServices {
         exchange_port: u16,
     ) -> Self {
         Self {
+            execution_role,
             system_catalog,
             view_service,
             statistics_service,
@@ -595,89 +768,6 @@ impl StandaloneOpenServices {
             query_control,
             exchange_port,
         }
-    }
-}
-
-struct EngineBackendTopologyMetadataStore {
-    provider: Arc<dyn crate::meta::MetaStoreProvider>,
-}
-
-impl crate::query_execution::backend::BackendTopologyMetadataStore
-    for EngineBackendTopologyMetadataStore
-{
-    fn load_backends(
-        &self,
-    ) -> Result<Vec<crate::query_execution::backend::PersistedBackendTopology>, String> {
-        let read = self
-            .provider
-            .begin_read()
-            .map_err(|error| format!("open backend metadata read transaction failed: {error}"))?;
-        BackendMetaRepository
-            .list_backends(read.as_ref())
-            .map_err(|error| format!("load backend metadata failed: {error}"))?
-            .into_iter()
-            .map(|stored| {
-                let backend_idx = usize::try_from(stored.be_id)
-                    .map_err(|_| format!("invalid persisted backend id {}", stored.be_id))?;
-                let endpoint = stored.endpoint.parse().map_err(|error| {
-                    format!(
-                        "invalid persisted backend endpoint '{}': {error}",
-                        stored.endpoint
-                    )
-                })?;
-                let state =
-                    crate::query_execution::backend::BackendLifecycleState::parse(&stored.state)?;
-                Ok(
-                    crate::query_execution::backend::PersistedBackendTopology::new(
-                        backend_idx,
-                        endpoint,
-                        state,
-                    ),
-                )
-            })
-            .collect()
-    }
-
-    fn upsert_backend(
-        &self,
-        backend: crate::query_execution::backend::PersistedBackendTopology,
-    ) -> Result<(), String> {
-        let backend_idx = i64::try_from(backend.backend_idx()).map_err(|_| {
-            format!(
-                "backend id {} exceeds metadata range",
-                backend.backend_idx()
-            )
-        })?;
-        let mut txn = self
-            .provider
-            .begin_write("persist backend metadata")
-            .map_err(|error| format!("open backend metadata write transaction failed: {error}"))?;
-        BackendMetaRepository
-            .upsert_backend(
-                txn.as_mut(),
-                &crate::meta::repository::backend::StoredBackend {
-                    be_id: backend_idx,
-                    endpoint: backend.endpoint().to_string(),
-                    state: backend.state().as_str().to_string(),
-                },
-            )
-            .map_err(|error| format!("persist backend metadata failed: {error}"))?;
-        txn.commit()
-            .map(|_| ())
-            .map_err(|error| format!("commit backend metadata failed: {error}"))
-    }
-
-    fn delete_backend(&self, endpoint: std::net::SocketAddr) -> Result<(), String> {
-        let mut txn = self
-            .provider
-            .begin_write("delete backend metadata")
-            .map_err(|error| format!("open backend metadata delete transaction failed: {error}"))?;
-        BackendMetaRepository
-            .delete_backend(txn.as_mut(), &endpoint.to_string())
-            .map_err(|error| format!("delete backend metadata failed: {error}"))?;
-        txn.commit()
-            .map(|_| ())
-            .map_err(|error| format!("commit backend metadata delete failed: {error}"))
     }
 }
 
@@ -751,6 +841,7 @@ impl StandaloneNovaRocks {
         };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
         let StandaloneOpenServices {
+            execution_role,
             system_catalog,
             view_service,
             statistics_service,
@@ -765,16 +856,8 @@ impl StandaloneNovaRocks {
             query_control: _,
             exchange_port,
         } = services;
-        if cfg.cluster.role == crate::common::app_config::ClusterRole::Fe {
-            if let Some(provider) = metadata_provider.as_ref() {
-                backend_topology.install_metadata_store(Arc::new(
-                    EngineBackendTopologyMetadataStore {
-                        provider: Arc::clone(provider),
-                    },
-                ))?;
-            }
-        }
         let inner = Arc::new_cyclic(|self_weak| StandaloneState {
+            execution_role,
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
                 starrocks_table_config.clone(),
@@ -782,7 +865,6 @@ impl StandaloneNovaRocks {
             starrocks_table_config,
             mv_refresh_pruning_limits,
             metadata_provider: metadata_provider.clone(),
-            backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repository,
@@ -824,6 +906,18 @@ impl StandaloneNovaRocks {
     pub fn session(&self) -> StandaloneSession {
         StandaloneSession {
             inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn query_compiler(&self) -> StandaloneQueryCompiler {
+        StandaloneQueryCompiler {
+            session: self.session(),
+        }
+    }
+
+    pub fn command_executor(&self) -> StandaloneCommandExecutor {
+        StandaloneCommandExecutor {
+            session: self.session(),
         }
     }
 
@@ -951,6 +1045,7 @@ fn register_connector_backends(state: &Arc<StandaloneState>) {
 }
 
 impl StandaloneSession {
+    #[cfg(test)]
     pub fn execute(&self, sql: &str) -> Result<(), String> {
         match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Ok => Ok(()),
@@ -958,6 +1053,7 @@ impl StandaloneSession {
         }
     }
 
+    #[cfg(test)]
     pub fn query(&self, sql: &str) -> Result<QueryResult, String> {
         match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Query(result) => Ok(result),
@@ -965,6 +1061,7 @@ impl StandaloneSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_in_database(
         &self,
         sql: &str,
@@ -973,6 +1070,341 @@ impl StandaloneSession {
         self.execute_in_context(sql, None, current_database, None)
     }
 
+    /// Legacy test seam retained only while core parser fixtures migrate to
+    /// frontend QuerySession fixtures. Production callers use the compiler or
+    /// command kernels above.
+    #[cfg(test)]
+    pub fn execute_with_context(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        let connector_context = crate::connector::connector_request_context_for_query(
+            query_opts.as_ref(),
+            context.execution().cancellation().clone(),
+        )?;
+        self.execute_in_context_inner(sql, context, query_opts, connector_context)
+    }
+
+    fn execute_command_with_context(
+        &self,
+        sql: &str,
+        context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<StatementResult, String> {
+        if Self::is_query_sql(sql) {
+            return Err("query statements must be compiled through StandaloneQueryCompiler".into());
+        }
+        let connector_context = crate::connector::connector_request_context_for_query(
+            query_opts.as_ref(),
+            context.execution().cancellation().clone(),
+        )?;
+        self.execute_in_context_inner(sql, context, query_opts, connector_context)
+    }
+
+    fn prepare_query_with_context(
+        &self,
+        sql: &str,
+        request_context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<PreparedQueryOperation, String> {
+        if !Self::is_query_sql(sql) {
+            return Err(
+                "non-query statements must be executed through StandaloneCommandExecutor".into(),
+            );
+        }
+        use crate::sql::parser::dialect::StarRocksDialect;
+        use sqlparser::ast as sqlast;
+
+        let current_catalog = request_context.session().current_catalog();
+        let current_database = request_context.session().current_database();
+        let connector_context = crate::connector::connector_request_context_for_query(
+            query_opts.as_ref(),
+            request_context.execution().cancellation().clone(),
+        )?;
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let (parse_sql, forced_explain_level, force_logical_explain) =
+            if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
+                (rewritten, Some(level), true)
+            } else if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
+                (rewritten, Some(level), false)
+            } else {
+                (normalized.clone(), None, false)
+            };
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&parse_sql)
+            .map_err(|error| format_parser_error(&error.to_string()))?;
+        match stmt {
+            sqlast::Statement::Explain {
+                statement,
+                verbose,
+                analyze: false,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN only supports SELECT queries".to_string());
+                };
+                let prepared = prepare_explain_query(
+                    &self.inner,
+                    current_catalog,
+                    current_database,
+                    query,
+                    &connector_context,
+                )?;
+                let level = forced_explain_level.unwrap_or(if verbose {
+                    crate::sql::explain::ExplainLevel::Verbose
+                } else {
+                    crate::sql::explain::ExplainLevel::Normal
+                });
+                let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+                let catalog_snapshot = catalog_service_snapshot
+                    .local()
+                    .read()
+                    .expect("catalog service snapshot local read lock");
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
+                let analyzer_provider = build_catalog_service_provider(
+                    current_catalog,
+                    &catalog_service_snapshot,
+                    &connectors_snapshot,
+                    connector_context.clone(),
+                    TableLookupMode::ExplainStats,
+                );
+                let result = if force_logical_explain {
+                    explain_logical_query(&prepared, &analyzer_provider, current_database, level)?
+                } else {
+                    explain_query(
+                        &prepared,
+                        &analyzer_provider,
+                        &catalog_snapshot,
+                        &connectors_snapshot,
+                        current_database,
+                        level,
+                        Some(&self.inner),
+                        &optimizer_settings_for_execution(Some(request_context.execution())),
+                    )?
+                };
+                Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                    result: StatementResult::Query(result),
+                }))
+            }
+            sqlast::Statement::Explain {
+                statement,
+                analyze: true,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
+                };
+                self.prepare_explain_analyze_query(
+                    query,
+                    current_catalog,
+                    current_database,
+                    query_opts,
+                    &connector_context,
+                    request_context.execution(),
+                )
+            }
+            sqlast::Statement::Query(ref query) => {
+                if let Some(result) = self.inner.statistics_service.try_query(
+                    &normalized,
+                    query,
+                    statistics::StatisticsRequestContext {
+                        current_catalog,
+                        current_database,
+                    },
+                )? {
+                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                        result: StatementResult::Query(result),
+                    }));
+                }
+                if let Some(result) =
+                    self::information_schema::try_query_materialized_views(&self.inner, query)?
+                {
+                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                        result,
+                    }));
+                }
+                let mut prepared = query.as_ref().clone();
+                self.inner.view_service.rewrite_query(
+                    self.inner.as_ref(),
+                    &mut prepared,
+                    crate::engine::view::ViewRequestContext {
+                        current_catalog,
+                        current_database,
+                    },
+                )?;
+                self::virtual_table::rewrite_query(&self.inner, &mut prepared)?;
+                if has_time_travel_refs(&prepared) {
+                    rewrite_time_travel_refs(
+                        &self.inner,
+                        current_catalog,
+                        current_database,
+                        &mut prepared,
+                        &connector_context,
+                    )?;
+                }
+                let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+                let catalog_snapshot = catalog_service_snapshot
+                    .local()
+                    .read()
+                    .expect("catalog service snapshot local read lock");
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
+                let analyzer_provider = build_catalog_service_provider(
+                    current_catalog,
+                    &catalog_service_snapshot,
+                    &connectors_snapshot,
+                    connector_context.clone(),
+                    TableLookupMode::SchemaOnly,
+                );
+                self.inner
+                    .statistics_service
+                    .observe_query(&prepared, current_database)?;
+                let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
+                    &prepared,
+                    &analyzer_provider,
+                    &catalog_snapshot,
+                    &connectors_snapshot,
+                    current_database,
+                    self.inner.exchange_port,
+                    query_opts,
+                    &connector_context,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&self.inner),
+                    false,
+                    Some(request_context.execution()),
+                )?;
+                Ok(PreparedQueryOperation::Distributed(
+                    PreparedDistributedQuery {
+                        request,
+                        completion: PreparedQueryCompletion {
+                            formatter: PreparedQueryFormatter::Result,
+                        },
+                    },
+                ))
+            }
+            _ => Err("query compiler only supports SELECT and EXPLAIN statements".to_string()),
+        }
+    }
+
+    fn prepare_explain_analyze_query(
+        &self,
+        query: &sqlparser::ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_opts: Option<QueryOptions>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedQueryOperation, String> {
+        let query = prepare_explain_query(
+            &self.inner,
+            current_catalog,
+            current_database,
+            query,
+            connector_context,
+        )?;
+        let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+        let catalog_snapshot = catalog_service_snapshot
+            .local()
+            .read()
+            .expect("catalog service snapshot local read lock");
+        let connectors_snapshot = self
+            .inner
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let analyzer_provider = build_catalog_service_provider(
+            current_catalog,
+            &catalog_service_snapshot,
+            &connectors_snapshot,
+            connector_context.clone(),
+            TableLookupMode::ExplainStats,
+        );
+        let planning_start = std::time::Instant::now();
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &analyzer_provider, current_database)?;
+        let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let mut optimizer_expr =
+            crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+                &logical_plan,
+                &mut scalar_arena,
+            )?;
+        let mut query_stats = query_stats::QueryStatsCollector::new(
+            query_stats::QueryStatsProviders::from_standalone_state(&self.inner),
+        )
+        .collect(&mut optimizer_expr);
+        let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+        let mv_candidates = crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            &self.inner,
+            &analyzer_provider,
+            current_database,
+            &logical_plan,
+            &mut factory,
+            &mut query_stats,
+            &optimizer_settings,
+        );
+        let optimized_tree = crate::sql::optimizer::optimize(
+            optimizer_expr,
+            scalar_arena,
+            &query_stats.snapshot,
+            factory,
+            mv_candidates,
+            &optimizer_settings,
+        )?;
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+            physical_plan,
+            &optimizer_settings,
+        )?;
+        let prepared = crate::query_execution::preparation::prepare_fragments(
+            &distributed_plan,
+            &connectors_snapshot,
+            connector_context,
+            None,
+        )?;
+        let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+            &distributed_plan,
+            &prepared,
+        )?;
+        let request =
+            crate::query_execution::contract::build_distributed_query_request_with_execution(
+                prepared,
+                native_bundle,
+                Some(query_options_for_explain_analyze(query_opts)),
+                crate::query_execution::contract::DistributedQueryIntent::Profile,
+                execution,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(PreparedQueryOperation::Distributed(
+            PreparedDistributedQuery {
+                request,
+                completion: PreparedQueryCompletion {
+                    formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
+                        distributed_plan,
+                        planning_elapsed: planning_start.elapsed(),
+                        execution_started_at: std::time::Instant::now(),
+                    }),
+                },
+            },
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn execute_in_context(
         &self,
         sql: &str,
@@ -980,16 +1412,36 @@ impl StandaloneSession {
         current_database: &str,
         query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
-        self.execute_in_context_inner(sql, current_catalog, current_database, query_opts)
+        let context = test_request_context(current_catalog, current_database);
+        let connector_context = crate::connector::connector_request_context_for_query(
+            query_opts.as_ref(),
+            context.execution().cancellation().clone(),
+        )?;
+        self.execute_in_context_inner(sql, &context, query_opts, connector_context)
     }
 
-    fn execute_in_context_inner(
+    #[cfg(test)]
+    pub(crate) fn execute_in_context_with_connector_context(
         &self,
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
         query_opts: Option<QueryOptions>,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
+        let context = test_request_context(current_catalog, current_database);
+        self.execute_in_context_inner(sql, &context, query_opts, connector_context)
+    }
+
+    fn execute_in_context_inner(
+        &self,
+        sql: &str,
+        request_context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, String> {
+        let current_catalog = request_context.session().current_catalog();
+        let current_database = request_context.session().current_database();
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
             looks_like_create_table, looks_like_drop_statement,
@@ -1057,6 +1509,7 @@ impl StandaloneSession {
                 source,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
         // For MV DDL (CREATE/DROP/REFRESH/SHOW MATERIALIZED VIEW) we must
@@ -1098,6 +1551,8 @@ impl StandaloneSession {
                         current_catalog,
                         current_database,
                         statement,
+                        request_context,
+                        &connector_context,
                     );
                 }
             }
@@ -1106,7 +1561,14 @@ impl StandaloneSession {
             let statement = statements
                 .pop()
                 .ok_or_else(|| "custom parser returned no statements".to_string())?;
-            return dispatch_statement(&self.inner, current_catalog, current_database, statement);
+            return dispatch_statement(
+                &self.inner,
+                current_catalog,
+                current_database,
+                statement,
+                request_context,
+                &connector_context,
+            );
         }
         let (parse_sql, forced_explain_level, force_logical_explain) =
             if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
@@ -1153,6 +1615,7 @@ impl StandaloneSession {
                 result,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
         if looks_like_create_catalog(&parser) {
@@ -1170,11 +1633,12 @@ impl StandaloneSession {
                 &db_name,
                 if_not_exists,
                 current_catalog,
+                &connector_context,
             );
         }
         if looks_like_drop_statement(&parser) {
             let drop = crate::sql::parser::dialect::drop::parse_drop_statement(&mut parser)?;
-            return self.handle_drop(drop, current_catalog, current_database);
+            return self.handle_drop(drop, current_catalog, current_database, &connector_context);
         }
 
         // ALTER TABLE ... SET / UNSET TBLPROPERTIES
@@ -1208,7 +1672,12 @@ impl StandaloneSession {
 
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
-            return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
+            return self.handle_add_equality_delete(
+                &normalized,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // ALTER TABLE ... ADD FILES FROM '...'
@@ -1229,8 +1698,13 @@ impl StandaloneSession {
                 let sqlast::Statement::Query(ref query) = *statement else {
                     return Err("EXPLAIN only supports SELECT queries".to_string());
                 };
-                let prepared =
-                    prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
+                let prepared = prepare_explain_query(
+                    &self.inner,
+                    current_catalog,
+                    current_database,
+                    query,
+                    &connector_context,
+                )?;
                 let level = forced_explain_level.unwrap_or({
                     if verbose {
                         crate::sql::explain::ExplainLevel::Verbose
@@ -1253,6 +1727,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
                 let result = if force_logical_explain {
@@ -1266,6 +1741,7 @@ impl StandaloneSession {
                         current_database,
                         level,
                         Some(&self.inner),
+                        &optimizer_settings_for_execution(Some(request_context.execution())),
                     )?
                 };
                 Ok(StatementResult::Query(result))
@@ -1278,8 +1754,13 @@ impl StandaloneSession {
                 let sqlast::Statement::Query(ref query) = *statement else {
                     return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
                 };
-                let prepared =
-                    prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
+                let prepared = prepare_explain_query(
+                    &self.inner,
+                    current_catalog,
+                    current_database,
+                    query,
+                    &connector_context,
+                )?;
                 let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
                 let catalog_snapshot = catalog_service_snapshot
                     .local()
@@ -1295,6 +1776,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
                 let result = explain_analyze_query(
@@ -1304,8 +1786,10 @@ impl StandaloneSession {
                     &connectors_snapshot,
                     current_database,
                     None,
+                    &connector_context,
                     Some(&self.inner),
                     &self.inner.query_execution,
+                    request_context.execution(),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -1350,6 +1834,7 @@ impl StandaloneSession {
                         current_catalog,
                         current_database,
                         &mut prepared,
+                        &connector_context,
                     )?;
                 }
 
@@ -1374,12 +1859,13 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
                 self.inner
                     .statistics_service
                     .observe_query(&prepared, current_database)?;
-                let result = execute_query_with_catalog_provider(
+                let result = execute_query_with_catalog_provider_with_execution(
                     &prepared,
                     &analyzer_provider,
                     &catalog_snapshot,
@@ -1388,7 +1874,9 @@ impl StandaloneSession {
                     self.inner.exchange_port,
                     query_opts.clone(),
                     &self.inner.query_execution,
+                    &connector_context,
                     Some(&self.inner),
+                    request_context.execution(),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -1397,6 +1885,8 @@ impl StandaloneSession {
                 current_catalog,
                 current_database,
                 query_opts.as_ref(),
+                Some(request_context.execution()),
+                &connector_context,
             ),
             sqlast::Statement::Delete(ref delete) => {
                 let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
@@ -1405,6 +1895,8 @@ impl StandaloneSession {
                     &stmt,
                     current_catalog,
                     current_database,
+                    request_context.execution(),
+                    &connector_context,
                 )
             }
             ref update_stmt @ sqlast::Statement::Update(_) => {
@@ -1419,6 +1911,8 @@ impl StandaloneSession {
                     &stmt,
                     current_catalog,
                     current_database,
+                    request_context.execution(),
+                    &connector_context,
                 )?;
                 self.inner
                     .statistics_service
@@ -1432,6 +1926,8 @@ impl StandaloneSession {
                     &stmt,
                     current_catalog,
                     current_database,
+                    request_context.execution(),
+                    &connector_context,
                 )
             }
             sqlast::Statement::Truncate(truncate) => {
@@ -1445,6 +1941,7 @@ impl StandaloneSession {
                         "main",
                         current_catalog,
                         current_database,
+                        &connector_context,
                     )?;
                 }
                 Ok(StatementResult::Ok)
@@ -1454,6 +1951,17 @@ impl StandaloneSession {
                 sql.chars().take(50).collect::<String>()
             )),
         }
+    }
+
+    fn is_query_sql(sql: &str) -> bool {
+        matches!(
+            sql.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "select" | "with" | "explain"
+        )
     }
 
     /// Handle ALTER TABLE ... ADD FILES FROM '...'
@@ -1708,6 +2216,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let stmt = crate::engine::statement::parse_add_equality_delete_sql(sql)?;
         crate::engine::equality_delete_flow::execute_add_equality_delete_statement(
@@ -1715,6 +2224,7 @@ impl StandaloneSession {
             &stmt,
             current_catalog,
             current_database,
+            connector_context,
         )
     }
 
@@ -1723,35 +2233,55 @@ impl StandaloneSession {
         &self,
         stmt: crate::sql::parser::ast::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
+        let normalized_catalog = normalize_identifier(&stmt.name)?;
         let mut guard = self
             .inner
             .iceberg_catalogs
             .write()
             .expect("standalone iceberg catalog write lock");
+        let created = !guard.contains_catalog(&stmt.name)?;
         guard.create_catalog(&stmt.name, &stmt.properties)?;
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
-        let (backend, source) = {
-            let connectors = self
-                .inner
-                .connectors
-                .read()
-                .expect("connector registry read lock");
-            (
-                connectors.catalog_backend("iceberg")?,
-                connectors.table_source("iceberg")?,
-            )
-        };
+        if let Err(error) = register_iceberg_connector_instance(&self.inner, &normalized_catalog) {
+            if created {
+                self.inner
+                    .iceberg_catalogs
+                    .write()
+                    .expect("standalone iceberg catalog write lock")
+                    .drop_catalog(&normalized_catalog)?;
+            }
+            return Err(error);
+        }
+        let connectors = self
+            .inner
+            .connectors
+            .read()
+            .expect("connector registry read lock")
+            .clone();
         self.inner
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                &stmt.name, backend, source,
+                &stmt.name, connectors,
             ));
-        persist_catalog_attachment_if_needed(
+        if let Err(error) = persist_catalog_attachment_if_needed(
             &self.inner,
-            &normalize_identifier(&stmt.name)?,
+            &normalized_catalog,
             &persisted_properties,
-        )?;
+        ) {
+            unregister_iceberg_connector_instance(&self.inner, &normalized_catalog)?;
+            if created {
+                self.inner
+                    .iceberg_catalogs
+                    .write()
+                    .expect("standalone iceberg catalog write lock")
+                    .drop_catalog(&normalized_catalog)?;
+            }
+            self.inner
+                .catalog_service
+                .unregister_catalog(&normalized_catalog);
+            return Err(error);
+        }
         Ok(StatementResult::Ok)
     }
 
@@ -1761,6 +2291,7 @@ impl StandaloneSession {
         source: crate::sql::parser::ast::ObjectName,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let source_target = crate::engine::backend_resolver::resolve_existing_table_target(
             &self.inner,
@@ -1768,17 +2299,20 @@ impl StandaloneSession {
             current_catalog,
             current_database,
         )?;
-        let backend = self
+        let connectors = self
             .inner
             .connectors
             .read()
-            .expect("connector registry read")
-            .catalog_backend(source_target.backend_name)?;
-        let source_table = backend.load_table(
+            .expect("connector registry read");
+        let source_table = crate::connector::metadata_load_table(
+            &connectors,
+            connector_context.clone(),
             &source_target.catalog,
             &source_target.namespace,
             &source_target.table,
-        )?;
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0;
         let columns = source_table
             .columns
             .iter()
@@ -1812,6 +2346,7 @@ impl StandaloneSession {
             },
             current_catalog,
             current_database,
+            connector_context,
         )
     }
 
@@ -1821,6 +2356,7 @@ impl StandaloneSession {
         drop: crate::sql::parser::dialect::drop::DropResult,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::drop::DropResult;
         match drop {
@@ -1847,6 +2383,7 @@ impl StandaloneSession {
                     current_catalog,
                     stmt.if_exists,
                     stmt.force,
+                    connector_context,
                 )?;
                 self.inner
                     .view_service
@@ -1890,8 +2427,17 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
         query_opts: Option<&QueryOptions>,
+        execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        self.execute_insert_via_custom_parser(insert, current_catalog, current_database, query_opts)
+        self.execute_insert_via_custom_parser(
+            insert,
+            current_catalog,
+            current_database,
+            query_opts,
+            execution,
+            connector_context,
+        )
     }
 
     /// Convert sqlparser INSERT to our custom InsertStmt and delegate to the
@@ -1902,6 +2448,8 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
         query_opts: Option<&QueryOptions>,
+        execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -1913,8 +2461,51 @@ impl StandaloneSession {
             current_catalog,
             current_database,
             query_opts,
+            execution,
+            connector_context,
         )
     }
+}
+
+#[cfg(test)]
+fn test_request_context(
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> crate::query_execution::request_context::RequestContext {
+    test_request_context_with_role(
+        current_catalog,
+        current_database,
+        crate::common::app_config::ClusterRole::AllInOne,
+    )
+}
+
+#[cfg(test)]
+fn test_request_context_with_role(
+    current_catalog: Option<&str>,
+    current_database: &str,
+    role: crate::common::app_config::ClusterRole,
+) -> crate::query_execution::request_context::RequestContext {
+    use crate::query_execution::backend::BackendTopologySnapshot;
+    use crate::query_execution::cancellation::QueryCancellationSource;
+    use crate::query_execution::request_context::{
+        QueryExecutionContext, RequestContext, RequestSessionContext,
+    };
+
+    let cancellation = QueryCancellationSource::new();
+    RequestContext::new(
+        RequestSessionContext::new(
+            current_catalog.map(str::to_string),
+            current_database.to_string(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        ),
+        QueryExecutionContext::new(
+            role,
+            BackendTopologySnapshot::empty(0),
+            None,
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        ),
+    )
 }
 
 fn resolve_default_view_database(
@@ -2106,13 +2697,24 @@ pub(crate) fn dispatch_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     statement: crate::sql::parser::ast::Statement,
+    request_context: &crate::query_execution::request_context::RequestContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     use crate::sql::parser::ast::Statement;
 
+    if connector_context.cancellation().is_cancelled() {
+        return Err("connector request was cancelled".to_string());
+    }
+    if std::time::Instant::now() >= connector_context.deadline() {
+        return Err("connector request deadline elapsed".to_string());
+    }
+
     match statement {
         Statement::CreateMaterializedView(stmt) => {
-            let engine =
-                crate::engine::mv::iceberg_refresh::StandaloneMvEngine::new(Arc::clone(state));
+            let engine = crate::engine::mv::iceberg_refresh::StandaloneMvEngine::new(
+                Arc::clone(state),
+                connector_context.clone(),
+            );
             let statement = crate::mv::application::MvApplicationStatement::Create(
                 crate::mv::application::MvCreateStatement::from(&stmt),
             );
@@ -2133,6 +2735,7 @@ pub(crate) fn dispatch_statement(
                     current_catalog,
                     current_database,
                     &stmt,
+                    connector_context,
                 ),
                 Err(error) => Err(error.to_string()),
             }
@@ -2141,17 +2744,32 @@ pub(crate) fn dispatch_statement(
             crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
         }
         Statement::AlterMaterializedView(stmt) => {
-            crate::engine::mv_flow::alter_mv(state, current_catalog, current_database, &stmt)
+            crate::engine::mv_flow::alter_mv_with_connector_context(
+                state,
+                current_catalog,
+                current_database,
+                &stmt,
+                connector_context,
+            )
         }
         Statement::RefreshMaterializedView(stmt) => {
-            crate::engine::mv_flow::refresh_mv(state, current_catalog, current_database, &stmt)
+            crate::engine::mv_flow::refresh_mv_with_connector_context(
+                state,
+                current_catalog,
+                current_database,
+                &stmt,
+                connector_context,
+            )
         }
         Statement::ShowMaterializedViews(stmt) => {
             crate::engine::mv_flow::list_mvs(state, current_catalog, &stmt)
         }
-        Statement::AlterIcebergRef(stmt) => {
-            crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
-        }
+        Statement::AlterIcebergRef(stmt) => crate::engine::iceberg_ref_flow::execute(
+            state,
+            current_database,
+            &stmt,
+            connector_context,
+        ),
         Statement::Truncate { name, target_ref } => {
             crate::engine::statement::execute_truncate_table_statement(
                 state,
@@ -2159,10 +2777,11 @@ pub(crate) fn dispatch_statement(
                 &target_ref,
                 current_catalog,
                 current_database,
+                connector_context,
             )
         }
         Statement::AddBackend(stmt) => {
-            require_backend_management_role("ADD BACKEND")?;
+            require_backend_management_role("ADD BACKEND", request_context.execution().role())?;
             let endpoint = stmt
                 .addr
                 .parse()
@@ -2171,7 +2790,7 @@ pub(crate) fn dispatch_statement(
             Ok(StatementResult::Ok)
         }
         Statement::DropBackend(stmt) => {
-            require_backend_management_role("DROP BACKEND")?;
+            require_backend_management_role("DROP BACKEND", request_context.execution().role())?;
             let endpoint = stmt
                 .addr
                 .parse()
@@ -2180,10 +2799,7 @@ pub(crate) fn dispatch_statement(
             Ok(StatementResult::Ok)
         }
         Statement::ShowBackends(_) => {
-            let role = crate::novarocks_config::config()
-                .map_err(|error| format!("read config failed: {error}"))?
-                .cluster
-                .role;
+            let role = request_context.execution().role();
             if role == crate::common::app_config::ClusterRole::Be {
                 return Err("SHOW BACKENDS is not available in role=be".to_string());
             }
@@ -2195,12 +2811,11 @@ pub(crate) fn dispatch_statement(
     }
 }
 
-fn require_backend_management_role(statement: &str) -> Result<(), String> {
-    match crate::novarocks_config::config()
-        .map_err(|error| format!("read config failed: {error}"))?
-        .cluster
-        .role
-    {
+fn require_backend_management_role(
+    statement: &str,
+    role: crate::common::app_config::ClusterRole,
+) -> Result<(), String> {
+    match role {
         crate::common::app_config::ClusterRole::Fe => Ok(()),
         crate::common::app_config::ClusterRole::Be => Err(format!(
             "{statement} is not available in role=be; backend management is owned by StarRocks FE"
@@ -2300,35 +2915,72 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
         .catalog_attachment_repo
         .list(read.as_ref())
         .map_err(|e| format!("load catalog attachment metadata failed: {e}"))?;
-    let (backend, source) = {
-        let connectors = state
-            .connectors
-            .read()
-            .expect("connector registry read lock");
-        (
-            connectors.catalog_backend("iceberg")?,
-            connectors.table_source("iceberg")?,
-        )
-    };
+    let connectors = state
+        .connectors
+        .read()
+        .expect("connector registry read lock")
+        .clone();
 
-    {
-        let mut guard = state
-            .iceberg_catalogs
-            .write()
-            .expect("standalone iceberg catalog write lock");
-        for catalog in &catalogs {
+    for catalog in &catalogs {
+        {
+            let mut guard = state
+                .iceberg_catalogs
+                .write()
+                .expect("standalone iceberg catalog write lock");
             guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    &catalog.catalog,
-                    Arc::clone(&backend),
-                    Arc::clone(&source),
-                ));
         }
+        let normalized_catalog = normalize_identifier(&catalog.catalog)?;
+        if let Err(error) = register_iceberg_connector_instance(state, &normalized_catalog) {
+            state
+                .iceberg_catalogs
+                .write()
+                .expect("standalone iceberg catalog write lock")
+                .drop_catalog(&normalized_catalog)?;
+            return Err(error);
+        }
+        state
+            .catalog_service
+            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                &catalog.catalog,
+                connectors.clone(),
+            ));
     }
 
     Ok(())
+}
+
+fn register_iceberg_connector_instance(
+    state: &Arc<StandaloneState>,
+    normalized_catalog: &str,
+) -> Result<(), String> {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    let instance = crate::connector::iceberg::provider::IcebergConnectorInstance::new(
+        instance_id,
+        Arc::clone(&state.iceberg_catalogs),
+    )
+    .map_err(|error| format!("create Iceberg connector instance: {error}"))?;
+    state
+        .connectors
+        .write()
+        .expect("connector registry write lock")
+        .register_connector_instance(instance)
+        .map_err(|error| format!("register Iceberg connector instance: {error}"))
+}
+
+fn unregister_iceberg_connector_instance(
+    state: &Arc<StandaloneState>,
+    normalized_catalog: &str,
+) -> Result<(), String> {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    state
+        .connectors
+        .write()
+        .expect("connector registry write lock")
+        .unregister_connector_instance(&instance_id)
+        .map(|_| ())
+        .map_err(|error| format!("unregister Iceberg connector instance: {error}"))
 }
 
 pub(crate) fn persist_catalog_attachment_if_needed(
@@ -2420,25 +3072,37 @@ fn ensure_mainline_distributed_execution(
     Ok(())
 }
 
-/// Configured BE count for broadcast fanout. The frontend scheduler owns live
-/// topology; core never lazily locates a process-global registry.
-fn live_effective_backend_count() -> f64 {
-    let configured = crate::common::config::optimizer_effective_backend_count();
-    if configured > 0 {
-        return configured as f64;
+fn optimizer_settings_for_execution(
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+) -> crate::sql::optimizer::options::SessionOptimizerSettings {
+    let mut settings = execution
+        .map(|execution| execution.optimizer_settings().clone())
+        .unwrap_or_default();
+    if settings.cbo_broadcast_backend_count.is_none() {
+        if let Some(execution) = execution {
+            settings.effective_backend_count = Some(execution.topology().targets().len() as f64);
+        }
     }
-    1.0
+    settings
 }
 
-/// Fold the live BE count into the TLS session settings before optimize(),
-/// unless the session explicitly SET cbo_broadcast_backend_count (which wins
-/// in from_session). Idempotent; safe to call before every optimize() site.
-fn snapshot_effective_backend_count_into_session() {
-    let mut snapshot = crate::sql::optimizer::options::current_session_optimizer_settings();
-    if snapshot.cbo_broadcast_backend_count.is_none() {
-        snapshot.effective_backend_count = Some(live_effective_backend_count());
-        crate::sql::optimizer::options::install_session_optimizer_settings(snapshot);
-    }
+fn capture_maintenance_execution(
+    state: &StandaloneState,
+) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+    let topology = state
+        .backend_topology
+        .snapshot()
+        .map_err(|error| error.to_string())?;
+    let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+    Ok(
+        crate::query_execution::request_context::QueryExecutionContext::new(
+            state.execution_role,
+            topology,
+            None,
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        ),
+    )
 }
 
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`.
@@ -2447,6 +3111,7 @@ fn prepare_explain_query(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<sqlparser::ast::Query, String> {
     let mut prepared = query.clone();
     state.view_service.rewrite_query(
@@ -2461,7 +3126,13 @@ fn prepare_explain_query(
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
     // remain untouched and resolve through CatalogServiceProvider during analysis.
     if has_time_travel_refs(&prepared) {
-        rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
+        rewrite_time_travel_refs(
+            state,
+            current_catalog,
+            current_database,
+            &mut prepared,
+            connector_context,
+        )?;
     }
 
     Ok(prepared)
@@ -2478,8 +3149,10 @@ fn explain_analyze_query(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     query_opts: Option<QueryOptions>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
     query_execution: &crate::query_execution::service::QueryExecutionService,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::ExplainLevel;
     use crate::sql::explain::distributed::explain_distributed_plan_analyze;
@@ -2498,6 +3171,7 @@ fn explain_analyze_query(
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let mv_candidates = match mv_rewrite_state {
         Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
             state,
@@ -2506,23 +3180,28 @@ fn explain_analyze_query(
             &logical_plan,
             &mut factory,
             &mut query_stats,
+            &optimizer_settings,
         ),
         None => Vec::new(),
     };
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         mv_candidates,
+        &optimizer_settings,
     )?;
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        &optimizer_settings,
+    )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
+        connector_context,
         None,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
@@ -2533,12 +3212,12 @@ fn explain_analyze_query(
 
     let query_opts = query_options_for_explain_analyze(query_opts);
     let execution_start = std::time::Instant::now();
-    let outcome = execute_distributed_profile(
+    let outcome = execute_distributed_profile_with_execution(
         query_execution,
         prepared,
         native_bundle,
         Some(query_opts),
-        current_query_cancellation_view(),
+        execution,
     )?;
     let execution_elapsed = execution_start.elapsed();
     if let Some(abort) = outcome.write_abort.as_ref() {
@@ -2665,6 +3344,7 @@ fn explain_query(
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::ExplainLevel;
     use crate::sql::explain::distributed::explain_distributed_plan;
@@ -2692,16 +3372,17 @@ fn explain_query(
             &logical_plan,
             &mut factory,
             &mut query_stats,
+            optimizer_settings,
         ),
         None => Vec::new(),
     };
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         mv_candidates,
+        optimizer_settings,
     )?;
 
     let mut lines = Vec::new();
@@ -2709,7 +3390,10 @@ fn explain_query(
         lines.extend(query_stats.snapshot.display_rows());
     }
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        optimizer_settings,
+    )?;
     lines.extend(explain_distributed_plan(&distributed_plan, level));
 
     build_string_query_result("Explain String", lines)
@@ -2724,6 +3408,10 @@ pub(crate) fn execute_query(
     query_opts: Option<QueryOptions>,
     query_execution: &crate::query_execution::service::QueryExecutionService,
 ) -> Result<QueryResult, String> {
+    let connector_context = crate::connector::connector_request_context(
+        query_opts.as_ref(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
     execute_query_with_catalog_provider(
         query,
         catalog,
@@ -2733,6 +3421,7 @@ pub(crate) fn execute_query(
         exchange_port,
         query_opts,
         query_execution,
+        &connector_context,
         None,
     )
 }
@@ -2743,6 +3432,28 @@ pub(crate) fn execute_query_with_catalog_service(
     current_database: &str,
     query: &sqlparser::ast::Query,
     query_opts: Option<QueryOptions>,
+) -> Result<QueryResult, String> {
+    let connector_context = crate::connector::connector_request_context(
+        query_opts.as_ref(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    execute_query_with_catalog_service_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        query_opts,
+        &connector_context,
+    )
+}
+
+pub(crate) fn execute_query_with_catalog_service_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    query_opts: Option<QueryOptions>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryResult, String> {
     let catalog_service_snapshot = catalog_service_snapshot(state);
     let catalog_snapshot = catalog_service_snapshot
@@ -2758,6 +3469,7 @@ pub(crate) fn execute_query_with_catalog_service(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
+        connector_context.clone(),
         TableLookupMode::SchemaOnly,
     );
     execute_query_with_catalog_provider(
@@ -2769,6 +3481,7 @@ pub(crate) fn execute_query_with_catalog_service(
         state.exchange_port,
         query_opts,
         &state.query_execution,
+        connector_context,
         Some(state),
     )
 }
@@ -2842,7 +3555,40 @@ pub(crate) fn execute_query_as_iceberg_write(
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<QueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    // This public write helper is also used by non-session transaction executors,
+    // so it owns an operation-scoped context when no request signal is available.
+    let connector_context = crate::connector::connector_request_context(
+        query_opts.as_ref(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    execute_query_as_iceberg_write_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink_spec,
+        query_opts,
+        root_distribution_resolver,
+        execution,
+        &connector_context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    let optimizer_settings = optimizer_settings_for_execution(execution);
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -2853,7 +3599,13 @@ pub(crate) fn execute_query_as_iceberg_write(
     // writes), so those paths are unchanged.
     let mut prepared = query.clone();
     if has_time_travel_refs(&prepared) {
-        rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
+        rewrite_time_travel_refs(
+            state,
+            current_catalog,
+            current_database,
+            &mut prepared,
+            connector_context,
+        )?;
     }
 
     let catalog_service_snapshot = catalog_service_snapshot(state);
@@ -2866,6 +3618,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
+        connector_context.clone(),
         TableLookupMode::SchemaOnly,
     );
 
@@ -2883,7 +3636,6 @@ pub(crate) fn execute_query_as_iceberg_write(
     )?;
     let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
             optimizer_expr,
@@ -2891,6 +3643,7 @@ pub(crate) fn execute_query_as_iceberg_write(
             &query_stats.snapshot,
             factory,
             root_distribution,
+            &optimizer_settings,
         )?,
         None => crate::sql::optimizer::optimize(
             optimizer_expr,
@@ -2898,32 +3651,43 @@ pub(crate) fn execute_query_as_iceberg_write(
             &query_stats.snapshot,
             factory,
             Vec::new(),
+            &optimizer_settings,
         )?,
     };
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan(
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
         physical_plan,
         crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
             descriptor_database: current_database.to_string(),
             spec: sink_spec,
             input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
         },
+        &optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
+        &connector_context,
         None,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
         &prepared,
     )?;
-    execute_distributed_write(
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    execute_distributed_write_with_execution(
         &state.query_execution,
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        execution,
     )
 }
 
@@ -3056,19 +3820,50 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    // Change-stream planning can run from an MV worker without a client request.
+    // Its caller-visible boundary therefore owns this bounded operation context.
+    let connector_context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
+        state,
+        _current_catalog,
+        current_database,
+        optimized_tree,
+        dag,
+        mv_refresh_ctx,
+        pre_expand_keyed_assert,
+        &connector_context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
+    state: &Arc<StandaloneState>,
+    _current_catalog: Option<&str>,
+    current_database: &str,
+    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
+    pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let connectors_snapshot = state
         .connectors
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    snapshot_effective_backend_count_into_session();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
-    let planned_dp = crate::sql::planner::pipeline::build_iceberg_change_stream_distributed_plan(
-        physical_plan,
-        current_database,
-        dag.clone(),
-        pre_expand_keyed_assert,
-    )?;
+    let planned_dp =
+        crate::sql::planner::pipeline::build_iceberg_change_stream_distributed_plan_with_settings(
+            physical_plan,
+            current_database,
+            dag.clone(),
+            pre_expand_keyed_assert,
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        )?;
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
     let scan_binding_resolver = mv_refresh_ctx
@@ -3076,6 +3871,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
+        connector_context,
         scan_binding_resolver,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
@@ -3099,13 +3895,22 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_opts: Option<QueryOptions>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    execute_distributed_write(
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    execute_distributed_write_with_execution(
         &state.query_execution,
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        execution,
     )
 }
 
@@ -3137,6 +3942,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         planned.prepared,
         planned.native_bundle,
         query_opts,
+        None,
     )
 }
 
@@ -3150,6 +3956,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
     query_execution: &crate::query_execution::service::QueryExecutionService,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
@@ -3161,12 +3968,48 @@ pub(crate) fn execute_query_with_catalog_provider(
         exchange_port,
         query_opts,
         query_execution,
+        connector_context,
         None,
         None,
         None,
         None,
         mv_rewrite_state,
         false,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_query_with_catalog_provider_with_execution(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    codegen_catalog: &PlannerMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<QueryOptions>,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<QueryResult, String> {
+    execute_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        analyzer_catalog,
+        codegen_catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        query_execution,
+        connector_context,
+        None,
+        None,
+        None,
+        None,
+        mv_rewrite_state,
+        false,
+        Some(execution),
     )
 }
 
@@ -3195,6 +4038,10 @@ pub(crate) fn execute_query_with_options(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<QueryResult, String> {
+    let connector_context = crate::connector::connector_request_context(
+        query_opts.as_ref(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
     execute_query_with_options_and_imv_validator(
         query,
         catalog,
@@ -3206,6 +4053,7 @@ pub(crate) fn execute_query_with_options(
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
+        &connector_context,
         None,
         None,
     )
@@ -3223,6 +4071,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
@@ -3235,12 +4084,14 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         exchange_port,
         query_opts,
         query_execution,
+        connector_context,
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
         imv_rewrite_validator,
         mv_rewrite_state,
         mv_refresh_ctx.is_some(),
+        None,
     )
 }
 
@@ -3257,6 +4108,10 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<QueryResult, String> {
+    let connector_context = crate::connector::connector_request_context(
+        query_opts.as_ref(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
     execute_query_with_options_and_imv_validator_with_catalog_provider(
         query,
         catalog,
@@ -3266,12 +4121,14 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
         exchange_port,
         query_opts,
         query_execution,
+        &connector_context,
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -3306,10 +4163,8 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
             crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
                 plan: logical_plan,
-                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
-                )
-                .disabled_rules
-                .clone(),
+                disabled_rules: crate::sql::optimizer::options::SessionOptimizerSettings::default()
+                    .disabled_rules,
                 mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
                 deadline: None,
                 column_ref_factory: std::rc::Rc::clone(&factory_cell),
@@ -3335,13 +4190,13 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     )?;
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )?;
     let output_columns = optimized_tree.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
@@ -3367,13 +4222,13 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     )?;
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         Vec::new(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )?;
     let output_columns = optimized_tree.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
@@ -3393,13 +4248,58 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     exchange_port: u16,
     query_opts: Option<QueryOptions>,
     query_execution: &crate::query_execution::service::QueryExecutionService,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
     run_imv_rewrite: bool,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<QueryResult, String> {
+    let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        analyzer_catalog,
+        _codegen_catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        connector_context,
+        terminal_sink,
+        iceberg_catalogs,
+        mv_refresh_ctx,
+        imv_rewrite_validator,
+        mv_rewrite_state,
+        run_imv_rewrite,
+        execution,
+    )?;
+    query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    _codegen_catalog: &PlannerMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<QueryOptions>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
+    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    run_imv_rewrite: bool,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+    let optimizer_settings = optimizer_settings_for_execution(execution);
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let mut logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
@@ -3412,10 +4312,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
             crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
                 plan: logical_plan,
-                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
-                )
-                .disabled_rules
-                .clone(),
+                disabled_rules: optimizer_settings.disabled_rules.clone(),
                 mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
                 deadline: None,
                 column_ref_factory: std::rc::Rc::clone(&factory_cell),
@@ -3455,17 +4352,18 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                 &logical_plan,
                 &mut factory,
                 &mut query_stats,
+                &optimizer_settings,
             )
         }
         _ => Vec::new(),
     };
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         mv_candidates,
+        &optimizer_settings,
     )?;
 
     ensure_mainline_distributed_execution(
@@ -3475,25 +4373,41 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     )?;
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        &optimizer_settings,
+    )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
+        connector_context,
         scan_binding_resolver,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
         &prepared,
     )?;
-    execute_distributed_result(
-        query_execution,
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            let state = mv_rewrite_state.ok_or_else(|| {
+                "distributed execution requires a request execution context".to_string()
+            })?;
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        crate::query_execution::contract::DistributedQueryIntent::Result,
+        execution,
     )
+    .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3510,7 +4424,13 @@ pub(crate) fn execute_logical_plan_with_options(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let connector_context = crate::connector::connector_request_context(
+        query_opts.as_ref(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
     let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
@@ -3520,13 +4440,13 @@ pub(crate) fn execute_logical_plan_with_options(
         .map(query_stats::QueryStatsProviders::from_standalone_state)
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
         Vec::new(),
+        &optimizer_settings,
     )?;
     ensure_mainline_distributed_execution(
         terminal_sink.is_some(),
@@ -3535,48 +4455,44 @@ pub(crate) fn execute_logical_plan_with_options(
     )?;
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan_with_settings(
+        physical_plan,
+        &optimizer_settings,
+    )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
+        &connector_context,
         scan_binding_resolver,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
         &prepared,
     )?;
-    execute_distributed_result(
+    execute_distributed_result_with_execution(
         query_execution,
         prepared,
         native_bundle,
         query_opts,
-        current_query_cancellation_view(),
+        execution,
     )
 }
 
-fn current_query_cancellation_view() -> crate::query_execution::cancellation::QueryCancellationView
-{
-    match crate::runtime::query_cancel::current_query_cancellation_view() {
-        Some(view) => view,
-        None => crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
-    }
-}
-
-fn execute_distributed_result(
+fn execute_distributed_result_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request(
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Result,
-        cancellation,
+        execution,
     )
     .map_err(|error| error.to_string())?;
     query_execution
@@ -3586,19 +4502,19 @@ fn execute_distributed_result(
         .map_err(|error| error.to_string())
 }
 
-fn execute_distributed_write(
+fn execute_distributed_write_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request(
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Write,
-        cancellation,
+        execution,
     )
     .map_err(|error| error.to_string())?;
     let (query_result, write_commit, write_abort) = query_execution
@@ -3614,19 +4530,19 @@ fn execute_distributed_write(
     })
 }
 
-fn execute_distributed_profile(
+fn execute_distributed_profile_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request(
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Profile,
-        cancellation,
+        execution,
     )
     .map_err(|error| error.to_string())?;
     let (query_result, fragment_profiles) = query_execution
@@ -3645,7 +4561,6 @@ fn execute_distributed_profile(
 #[cfg(test)]
 pub(crate) struct StandaloneLoopbackTestBackend {
     pub(crate) exchange_port: u16,
-    _registry_guard: crate::query_execution::backend_registry::BackendRegistryTestGuard,
     _test_guard: TestSerializationGuard,
 }
 
@@ -3653,19 +4568,10 @@ pub(crate) struct StandaloneLoopbackTestBackend {
 pub(crate) fn install_all_in_one_loopback_backend_for_test()
 -> Result<StandaloneLoopbackTestBackend, String> {
     let test_guard = acquire_standalone_test_guard();
-    let registry_guard = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-    let cfg = crate::novarocks_config::install_default_for_test();
+    crate::novarocks_config::install_default_for_test();
     let exchange_port = ensure_standalone_exchange_server(Arc::new(TestNativeReportHandler))?;
-    let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
-        .parse()
-        .map_err(|e| format!("parse all-in-one test loopback endpoint failed: {e}"))?;
-    backend_ops::install_all_in_one_backend_registry(
-        endpoint,
-        cfg.cluster.heartbeat_timeout_retries,
-    )?;
     Ok(StandaloneLoopbackTestBackend {
         exchange_port,
-        _registry_guard: registry_guard,
         _test_guard: test_guard,
     })
 }
@@ -4261,10 +5167,7 @@ mod tests {
         MvEngine, MvRequestContext, UnavailableMvApplicationService,
     };
     use crate::mv::repository::{MvTarget, UnavailableMvRepository};
-    use crate::query_execution::backend::{
-        BackendLifecycleState, BackendTopologyMetadataStore, BackendTopologyPort,
-        LiveBackendTarget, PersistedBackendTopology,
-    };
+    use crate::query_execution::backend::{BackendTopologyPort, LiveBackendTarget};
     use crate::query_execution::contract::{
         DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
         DistributedQueryRequest,
@@ -4280,7 +5183,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     struct AlwaysUnavailableMvApplicationService;
@@ -4432,10 +5335,25 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestBackendStatus {
+        Registering,
+        Live,
+    }
+
+    impl TestBackendStatus {
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::Registering => "Registering",
+                Self::Live => "Live",
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct TestBackendTopologyEntry {
         endpoint: SocketAddr,
-        state: BackendLifecycleState,
+        state: TestBackendStatus,
         scheduled_fragments: u64,
     }
 
@@ -4443,7 +5361,6 @@ mod tests {
     struct TestBackendTopologyState {
         entries: BTreeMap<usize, TestBackendTopologyEntry>,
         next_backend_idx: usize,
-        metadata_store: Option<Arc<dyn BackendTopologyMetadataStore>>,
     }
 
     #[derive(Default)]
@@ -4458,7 +5375,7 @@ mod tests {
                 0,
                 TestBackendTopologyEntry {
                     endpoint,
-                    state: BackendLifecycleState::Live,
+                    state: TestBackendStatus::Live,
                     scheduled_fragments: 0,
                 },
             );
@@ -4466,72 +5383,55 @@ mod tests {
                 state: Mutex::new(TestBackendTopologyState {
                     entries,
                     next_backend_idx: 1,
-                    metadata_store: None,
                 }),
             }
         }
     }
 
     impl BackendTopologyPort for TestBackendTopologyPort {
-        fn live_backends(&self) -> Vec<LiveBackendTarget> {
-            self.state
+        fn snapshot(
+            &self,
+        ) -> Result<
+            crate::query_execution::backend::BackendTopologySnapshot,
+            crate::query_execution::backend::BackendTopologyError,
+        > {
+            let targets = self
+                .state
                 .lock()
                 .unwrap()
                 .entries
                 .iter()
                 .filter_map(|(backend_idx, entry)| {
-                    (entry.state == BackendLifecycleState::Live).then_some(LiveBackendTarget::new(
+                    (entry.state == TestBackendStatus::Live).then_some(LiveBackendTarget::new(
                         *backend_idx,
                         entry.endpoint,
                         1,
                     ))
                 })
-                .collect()
+                .collect();
+            crate::query_execution::backend::BackendTopologySnapshot::try_new(0, targets)
+        }
+
+        fn validate_snapshot(
+            &self,
+            expected: &crate::query_execution::backend::BackendTopologySnapshot,
+        ) -> Result<(), crate::query_execution::backend::BackendTopologyValidationError> {
+            let current = self.snapshot().map_err(
+                crate::query_execution::backend::BackendTopologyValidationError::Unavailable,
+            )?;
+            if current == *expected {
+                Ok(())
+            } else {
+                Err(crate::query_execution::backend::BackendTopologyValidationError::ContentChangedWithoutRevision {
+                    revision: expected.revision(),
+                })
+            }
         }
 
         fn record_successful_fragment_submission(&self, backend_idx: usize) {
             if let Some(entry) = self.state.lock().unwrap().entries.get_mut(&backend_idx) {
                 entry.scheduled_fragments = entry.scheduled_fragments.saturating_add(1);
             }
-        }
-
-        fn install_metadata_store(
-            &self,
-            store: Arc<dyn BackendTopologyMetadataStore>,
-        ) -> Result<(), String> {
-            let persisted = store.load_backends()?;
-            let mut entries = BTreeMap::new();
-            let mut next_backend_idx = 0;
-            for backend in persisted {
-                next_backend_idx = next_backend_idx.max(
-                    backend
-                        .backend_idx()
-                        .checked_add(1)
-                        .ok_or_else(|| "test backend id overflow".to_string())?,
-                );
-                let state = match backend.state() {
-                    BackendLifecycleState::Decommissioning => {
-                        BackendLifecycleState::Decommissioning
-                    }
-                    BackendLifecycleState::Registering
-                    | BackendLifecycleState::Live
-                    | BackendLifecycleState::Lost => BackendLifecycleState::Registering,
-                };
-                entries.insert(
-                    backend.backend_idx(),
-                    TestBackendTopologyEntry {
-                        endpoint: backend.endpoint(),
-                        state,
-                        scheduled_fragments: 0,
-                    },
-                );
-            }
-            *self.state.lock().unwrap() = TestBackendTopologyState {
-                entries,
-                next_backend_idx,
-                metadata_store: Some(store),
-            };
-            Ok(())
         }
 
         fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String> {
@@ -4548,18 +5448,11 @@ mod tests {
                 .next_backend_idx
                 .checked_add(1)
                 .ok_or_else(|| "test backend id overflow".to_string())?;
-            if let Some(store) = state.metadata_store.as_ref() {
-                store.upsert_backend(PersistedBackendTopology::new(
-                    backend_idx,
-                    endpoint,
-                    BackendLifecycleState::Registering,
-                ))?;
-            }
             state.entries.insert(
                 backend_idx,
                 TestBackendTopologyEntry {
                     endpoint,
-                    state: BackendLifecycleState::Registering,
+                    state: TestBackendStatus::Registering,
                     scheduled_fragments: 0,
                 },
             );
@@ -4575,9 +5468,6 @@ mod tests {
                     (entry.endpoint == endpoint).then_some(*backend_idx)
                 })
                 .ok_or_else(|| format!("backend {endpoint} not found"))?;
-            if let Some(store) = state.metadata_store.as_ref() {
-                store.delete_backend(endpoint)?;
-            }
             state.entries.remove(&backend_idx);
             Ok(())
         }
@@ -4675,6 +5565,7 @@ mod tests {
         backend_topology: Arc<dyn BackendTopologyPort>,
     ) -> StandaloneOpenServices {
         StandaloneOpenServices::new(
+            crate::common::app_config::ClusterRole::AllInOne,
             system_catalog,
             view_service,
             statistics_service,
@@ -4747,6 +5638,45 @@ mod tests {
             .query("SELECT 1")
             .expect("injected coordinator serves the planned query");
 
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn compiler_prepares_once_and_frontend_can_submit_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(StandaloneState {
+            exchange_port: 1,
+            query_execution: QueryExecutionService::new(Arc::new(
+                RecordingQueryExecutionCoordinator {
+                    calls: Arc::clone(&calls),
+                },
+            )),
+            ..Default::default()
+        });
+        register_connector_backends(&state);
+        let engine = StandaloneNovaRocks {
+            inner: Arc::clone(&state),
+        };
+        let context = super::test_request_context(None, super::DEFAULT_DATABASE);
+        let operation = engine
+            .query_compiler()
+            .prepare("SELECT 1", &context, None)
+            .expect("compiler prepares distributed query");
+
+        let super::PreparedQueryOperation::Distributed(operation) = operation else {
+            panic!("SELECT must produce one distributed operation");
+        };
+        let (request, completion) = operation.into_parts();
+        let outcome = state
+            .query_execution
+            .execute(request)
+            .expect("frontend submission succeeds");
+        assert!(matches!(
+            completion
+                .complete(outcome)
+                .expect("completion formats result"),
+            StatementResult::Query(_)
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -5094,63 +6024,38 @@ path = "{metadata_path}"
             test_open_services(),
         )
         .expect("open FE engine");
-        let session = engine.session();
+        let context = super::test_request_context_with_role(
+            None,
+            "default",
+            crate::common::app_config::ClusterRole::Fe,
+        );
+        let commands = engine.command_executor();
 
-        session
-            .execute("ADD BACKEND '127.0.0.1:19170'")
+        commands
+            .execute("ADD BACKEND '127.0.0.1:19170'", &context, None)
             .expect("ADD BACKEND");
-        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        let StatementResult::Query(result) = commands
+            .execute("SHOW BACKENDS", &context, None)
+            .expect("SHOW BACKENDS")
+        else {
+            panic!("SHOW BACKENDS must return rows");
+        };
         assert_backend_topology_column_contract(&result);
         assert_eq!(result.row_count(), 1);
         assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
         assert_eq!(string_cell(&result, 0, 2), "19170");
         assert_eq!(string_cell(&result, 0, 3), "Registering");
 
-        session
-            .execute("DROP BACKEND '127.0.0.1:19170' FORCE")
+        commands
+            .execute("DROP BACKEND '127.0.0.1:19170' FORCE", &context, None)
             .expect("DROP BACKEND FORCE");
-        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        let StatementResult::Query(result) = commands
+            .execute("SHOW BACKENDS", &context, None)
+            .expect("SHOW BACKENDS")
+        else {
+            panic!("SHOW BACKENDS must return rows");
+        };
         assert_eq!(result.row_count(), 0);
-    }
-
-    #[test]
-    fn backend_management_sql_restores_persisted_backend_metadata() {
-        let dir = TempDir::new().expect("tempdir");
-        let metadata_path = dir.path().join("meta.sqlite");
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
-        cfg.cluster.backends.clear();
-        cfg.metadata = Some(crate::common::app_config::MetadataConfig {
-            provider: crate::common::app_config::MetadataProviderConfig::Sqlite,
-            path: metadata_path.clone(),
-        });
-
-        let engine = StandaloneNovaRocks::open_with_config(
-            StandaloneOptions::default(),
-            cfg.clone(),
-            test_open_services(),
-        )
-        .expect("open FE engine");
-        engine
-            .session()
-            .execute("ADD BACKEND '127.0.0.1:19172'")
-            .expect("ADD BACKEND");
-        drop(engine);
-
-        let reopened = StandaloneNovaRocks::open_with_config(
-            StandaloneOptions::default(),
-            cfg,
-            test_open_services(),
-        )
-        .expect("reopen FE engine");
-        let result = reopened
-            .session()
-            .query("SHOW BACKENDS")
-            .expect("SHOW BACKENDS");
-        assert_backend_topology_column_contract(&result);
-        assert_eq!(result.row_count(), 1);
-        assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
-        assert_eq!(string_cell(&result, 0, 2), "19172");
     }
 
     #[test]
@@ -5167,14 +6072,24 @@ path = "{metadata_path}"
         let engine =
             StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg, services)
                 .expect("open all-in-one engine");
-        let session = engine.session();
+        let context = super::test_request_context_with_role(
+            None,
+            "default",
+            crate::common::app_config::ClusterRole::AllInOne,
+        );
+        let commands = engine.command_executor();
 
-        let err = session
-            .execute("ADD BACKEND '127.0.0.1:19171'")
+        let err = commands
+            .execute("ADD BACKEND '127.0.0.1:19171'", &context, None)
             .expect_err("ADD BACKEND must require FE role");
         assert!(err.contains("requires role=fe"), "{err}");
 
-        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        let StatementResult::Query(result) = commands
+            .execute("SHOW BACKENDS", &context, None)
+            .expect("SHOW BACKENDS")
+        else {
+            panic!("SHOW BACKENDS must return rows");
+        };
         assert_backend_topology_column_contract(&result);
         assert_eq!(result.row_count(), 1);
         assert_eq!(string_cell(&result, 0, 0), "0");
@@ -5205,220 +6120,6 @@ path = "{metadata_path}"
             .read()
             .expect("catalog service registry");
         assert!(registry.get_catalog("ice").is_ok());
-    }
-
-    #[test]
-    fn explain_costs_iceberg_query_uses_schema_lookup_and_live_stats() {
-        struct TestBackend;
-        impl crate::connector::backend::CatalogBackend for TestBackend {
-            fn name(&self) -> &'static str {
-                "iceberg"
-            }
-
-            fn namespace_exists(&self, _: &str, _: &str) -> Result<bool, String> {
-                Err("unused".to_string())
-            }
-
-            fn create_namespace(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn drop_namespace(&self, _: &str, _: &str, _: bool) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn create_table(
-                &self,
-                _: crate::connector::backend::CreateTableRequest,
-            ) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn table_exists(&self, _: &str, _: &str, _: &str) -> Result<bool, String> {
-                Err("unused".to_string())
-            }
-
-            fn drop_table(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
-                Err("unused".to_string())
-            }
-
-            fn load_table(
-                &self,
-                catalog: &str,
-                namespace: &str,
-                table: &str,
-            ) -> Result<crate::connector::backend::ResolvedTable, String> {
-                Ok(crate::connector::backend::ResolvedTable {
-                    catalog: catalog.to_string(),
-                    namespace: namespace.to_string(),
-                    table: table.to_string(),
-                    columns: vec![novarocks_catalog::schema::ColumnDef {
-                        name: "id".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        write_default: None,
-                        logical_type: None,
-                    }],
-                })
-            }
-        }
-
-        struct FixedStatsProvider {
-            requests: Arc<AtomicUsize>,
-        }
-
-        impl crate::connector::stats::TableStatsProvider for FixedStatsProvider {
-            fn estimate_table_statistics(
-                &self,
-                request: &crate::connector::stats::TableStatsRequest,
-            ) -> Result<
-                crate::sql::optimizer::stats_input::BaseTableStatistics,
-                crate::connector::stats::StatsProviderError,
-            > {
-                assert_eq!(request.catalog.as_deref(), Some("ice"));
-                assert_eq!(request.database, "db");
-                assert_eq!(request.table, "parted");
-                assert_eq!(
-                    request.snapshot,
-                    Some(crate::connector::stats::TableSnapshotRef::Current)
-                );
-                self.requests.fetch_add(1, Ordering::SeqCst);
-                Ok(crate::sql::optimizer::stats_input::BaseTableStatistics {
-                    row_count: crate::sql::optimizer::stats_input::StatValue::known(
-                        73,
-                        crate::sql::optimizer::statistics::Confidence::Exact,
-                        crate::sql::optimizer::stats_input::StatsSource::TestFixture,
-                    ),
-                    columns: Default::default(),
-                    source: crate::sql::optimizer::stats_input::StatsSource::TestFixture,
-                })
-            }
-        }
-
-        struct TestSource {
-            full_calls: Arc<AtomicUsize>,
-            schema_calls: Arc<AtomicUsize>,
-            stats_requests: Arc<AtomicUsize>,
-        }
-
-        impl crate::connector::backend::TableSource for TestSource {
-            fn name(&self) -> &'static str {
-                "iceberg"
-            }
-
-            fn build_table_def(
-                &self,
-                _: &crate::connector::backend::ResolvedTable,
-            ) -> Result<crate::sql::planner::table::TableDef, String> {
-                self.full_calls.fetch_add(1, Ordering::SeqCst);
-                Err("full table builder must not run during EXPLAIN COSTS".to_string())
-            }
-
-            fn build_schema_table_def(
-                &self,
-                table: &crate::connector::backend::ResolvedTable,
-            ) -> Result<crate::sql::planner::table::TableDef, String> {
-                self.schema_calls.fetch_add(1, Ordering::SeqCst);
-                let iceberg = crate::connector::iceberg::scan_model::IcebergTableInfo {
-                    catalog: table.catalog.clone(),
-                    namespace: table.namespace.clone(),
-                    table: table.table.clone(),
-                    table_uuid: Some("uuid-parted".to_string()),
-                    current_snapshot_id: Some(1),
-                    schema_id: 1,
-                    location: "file:///ice/db/parted".to_string(),
-                    schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
-                        fields: vec![],
-                    },
-                    serialized_metadata: None,
-                    serialized_metadata_rows: None,
-                };
-                Ok(crate::sql::planner::table::TableDef {
-                    name: table.table.clone(),
-                    columns: table.columns.clone(),
-                    iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                        table: iceberg,
-                        files: Vec::new(),
-                        cloud_properties: Default::default(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
-                })
-            }
-
-            fn stats_provider(
-                &self,
-            ) -> Option<Arc<dyn crate::connector::stats::TableStatsProvider>> {
-                Some(Arc::new(FixedStatsProvider {
-                    requests: Arc::clone(&self.stats_requests),
-                }))
-            }
-        }
-
-        let state = Arc::new(StandaloneState::default());
-        let full_calls = Arc::new(AtomicUsize::new(0));
-        let schema_calls = Arc::new(AtomicUsize::new(0));
-        let stats_requests = Arc::new(AtomicUsize::new(0));
-        {
-            let mut connectors = state.connectors.write().expect("connectors");
-            connectors.register_catalog_backend(Arc::new(TestBackend));
-            connectors.register_table_source(Arc::new(TestSource {
-                full_calls: Arc::clone(&full_calls),
-                schema_calls: Arc::clone(&schema_calls),
-                stats_requests: Arc::clone(&stats_requests),
-            }));
-        }
-        {
-            let connectors = state.connectors.read().expect("connectors");
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    "ice",
-                    connectors.catalog_backend("iceberg").expect("backend"),
-                    connectors.table_source("iceberg").expect("source"),
-                ));
-        }
-        let session = StandaloneSession {
-            inner: Arc::clone(&state),
-        };
-
-        let StatementResult::Query(result) = session
-            .execute_in_context(
-                "EXPLAIN COSTS SELECT id FROM parted",
-                Some("ice"),
-                "db",
-                None,
-            )
-            .expect("explain costs")
-        else {
-            panic!("EXPLAIN COSTS must return a query result");
-        };
-        let explain_lines = (0..result.row_count())
-            .map(|row| string_cell(&result, row, 0))
-            .collect::<Vec<_>>();
-        assert!(
-            explain_lines.iter().any(|line| {
-                line.contains("TABLE STATS")
-                    && line.contains("table=ice.db.parted")
-                    && line.contains("rows=73")
-                    && line.contains("source=TestFixture")
-            }),
-            "EXPLAIN COSTS must render live connector statistics: {explain_lines:?}"
-        );
-        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(stats_requests.load(Ordering::SeqCst), 1);
-
-        let local = state
-            .catalog_service
-            .local()
-            .read()
-            .expect("catalog service local");
-        assert!(
-            local.get("db", "parted").is_err(),
-            "EXPLAIN analysis must not require global InMemoryCatalog registration"
-        );
     }
 
     #[test]
@@ -5561,249 +6262,6 @@ mysql_port = 47892
         assert!(err.contains("unknown catalog"));
     }
 
-    #[test]
-    fn show_alter_table_optimize_reads_persisted_jobs() {
-        let temp = TempDir::new().expect("metadata temp dir");
-        let config_path = write_test_metadata_config(&temp, "metadata.db");
-        let engine = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("engine");
-        let outcome = crate::meta::repository::job::IcebergOptimizeJobOutcome {
-            target_snapshot_id: Some(124),
-            rewritten_data_files: 3,
-            deleted_data_files: 2,
-            added_data_files: 1,
-            output_record_count: 7,
-        };
-        seed_finished_iceberg_optimize_job(&engine, "ice", "db1", "orders", 123, 1000, outcome);
-
-        let result = engine
-            .session()
-            .query(
-                "SHOW ALTER TABLE OPTIMIZE FROM db1 WHERE TableName = 'orders' \
-                 ORDER BY CreateTime DESC LIMIT 1",
-            )
-            .expect("show optimize jobs");
-
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let table_names = chunk
-            .batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("table name column");
-        let states = chunk
-            .batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("state column");
-        let target_snapshot_ids = chunk
-            .batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("target snapshot column");
-        let input_data_files = chunk
-            .batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("input data files column");
-        let output_data_files = chunk
-            .batch
-            .column(9)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("output data files column");
-        let input_delete_files = chunk
-            .batch
-            .column(10)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("input delete files column");
-        let output_delete_files = chunk
-            .batch
-            .column(11)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("output delete files column");
-        assert_eq!(table_names.value(0), "orders");
-        assert_eq!(states.value(0), "FINISHED");
-        assert_eq!(target_snapshot_ids.value(0), "124");
-        assert_eq!(input_data_files.value(0), "3");
-        assert_eq!(output_data_files.value(0), "1");
-        assert_eq!(input_delete_files.value(0), "2");
-        assert_eq!(output_delete_files.value(0), "0");
-    }
-
-    #[test]
-    fn show_alter_table_optimize_uses_session_catalog_and_database() {
-        let temp = TempDir::new().expect("metadata temp dir");
-        let config_path = write_test_metadata_config(&temp, "metadata.db");
-        let engine = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("engine");
-        seed_pending_iceberg_optimize_job(&engine, "ice1", "db1", "orders", 101, 1_000);
-        seed_pending_iceberg_optimize_job(&engine, "ice2", "db1", "orders", 102, 2_000);
-        seed_pending_iceberg_optimize_job(&engine, "ice1", "db2", "orders", 103, 3_000);
-
-        let session = engine.session();
-        let current = match session
-            .execute_in_context("SHOW ALTER TABLE OPTIMIZE", Some("ice1"), "db1", None)
-            .expect("show current context")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("SHOW returned ok"),
-        };
-        assert_eq!(optimize_show_job_ids(&current), vec!["1"]);
-
-        let from_db = match session
-            .execute_in_context(
-                "SHOW ALTER TABLE OPTIMIZE FROM db1 ORDER BY CreateTime DESC",
-                Some("ice1"),
-                "db2",
-                None,
-            )
-            .expect("show from db under current catalog")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("SHOW returned ok"),
-        };
-        assert_eq!(optimize_show_job_ids(&from_db), vec!["1"]);
-
-        let explicit_catalog = match session
-            .execute_in_context(
-                "SHOW ALTER TABLE OPTIMIZE FROM ice2.db1",
-                Some("ice1"),
-                "db1",
-                None,
-            )
-            .expect("show explicit catalog")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("SHOW returned ok"),
-        };
-        assert_eq!(optimize_show_job_ids(&explicit_catalog), vec!["2"]);
-    }
-
-    fn seed_pending_iceberg_optimize_job(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        base_snapshot_id: i64,
-        created_at_ms: i64,
-    ) -> i64 {
-        let provider = engine
-            .inner
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let mut txn = provider
-            .begin_write("seed pending iceberg optimize job")
-            .expect("write");
-        let job = engine
-            .inner
-            .job_repo
-            .create_iceberg_optimize_job(
-                txn.as_mut(),
-                crate::meta::repository::job::CreateIcebergOptimizeJobRequest {
-                    catalog: catalog.to_string(),
-                    namespace: namespace.to_string(),
-                    table: table.to_string(),
-                    base_snapshot_id,
-                    now_ms: created_at_ms,
-                },
-            )
-            .expect("create optimize job");
-        txn.commit().expect("commit create optimize job");
-        job.id
-    }
-
-    fn seed_finished_iceberg_optimize_job(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        base_snapshot_id: i64,
-        created_at_ms: i64,
-        outcome: crate::meta::repository::job::IcebergOptimizeJobOutcome,
-    ) {
-        let job_id = seed_pending_iceberg_optimize_job(
-            engine,
-            catalog,
-            namespace,
-            table,
-            base_snapshot_id,
-            created_at_ms,
-        );
-        let provider = engine
-            .inner
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-
-        let mut txn = provider
-            .begin_write("claim synthetic optimize job")
-            .expect("claim write");
-        engine
-            .inner
-            .job_repo
-            .claim_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 100)
-            .expect("claim synthetic optimize job");
-        txn.commit().expect("commit claim optimize job");
-
-        let mut txn = provider
-            .begin_write("record synthetic optimize outcome")
-            .expect("outcome write");
-        engine
-            .inner
-            .job_repo
-            .record_iceberg_optimize_job_outcome(
-                txn.as_mut(),
-                job_id,
-                created_at_ms + 200,
-                outcome.clone(),
-            )
-            .expect("record synthetic optimize outcome");
-        txn.commit().expect("commit optimize outcome");
-
-        let mut txn = provider
-            .begin_write("finish synthetic optimize job")
-            .expect("finish write");
-        engine
-            .inner
-            .job_repo
-            .finish_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 300, outcome)
-            .expect("finish synthetic optimize job");
-        txn.commit().expect("commit finish optimize job");
-    }
-
-    fn optimize_show_job_ids(result: &QueryResult) -> Vec<String> {
-        if result.row_count() == 0 {
-            return Vec::new();
-        }
-        let ids = result.chunks[0]
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("job id column");
-        (0..ids.len())
-            .map(|idx| ids.value(idx).to_string())
-            .collect()
-    }
-
     fn query_result_contains_string(result: &QueryResult, expected: &str) -> bool {
         result.chunks.iter().any(|chunk| {
             chunk.batch.columns().iter().any(|column| {
@@ -5816,215 +6274,6 @@ mysql_port = 47892
                     })
             })
         })
-    }
-
-    #[cfg(feature = "compat")]
-    fn build_fragments_for_query(
-        sql: &str,
-    ) -> (
-        crate::query_execution::preparation::PreparedFragmentSet,
-        crate::protocol::native::encode::NativeFragmentBundle,
-    ) {
-        use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
-        use crate::sql::planner::table::{ScanSource, TableDef};
-        use novarocks_catalog::schema::ColumnDef;
-
-        let mut catalog = super::PlannerMemoryCatalog::default();
-        let table = TableDef {
-            name: "tbl".to_string(),
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    write_default: None,
-                    logical_type: None,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: true,
-                    write_default: None,
-                    logical_type: None,
-                },
-            ],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 1,
-                table_id: 2,
-            },
-        };
-        catalog
-            .register("default", table.clone())
-            .expect("register StarRocks tbl");
-        let mut date_dim = table;
-        date_dim.name = "date_dim".to_string();
-        catalog
-            .register("default", date_dim)
-            .expect("register StarRocks date_dim");
-
-        let registry = mock_starrocks_registry_for_engine_test(
-            3,
-            vec![
-                crate::connector::starrocks::table::scan_planner::StarRocksSplit {
-                    tablet_id: 4,
-                    partition_id: 5,
-                    version: 6,
-                },
-            ],
-        );
-
-        let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
-        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql(&normalized)
-            .expect("build parser");
-        let statement = parser.parse_statement().expect("parse statement");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query statement");
-        };
-
-        let (resolved, cte_registry, mut factory) =
-            crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
-        let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
-            .expect("plan query");
-        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let mut optimizer_expr =
-            crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-                &logical_plan,
-                &mut scalar_arena,
-            )
-            .expect("logical to opt expr");
-        let service: Arc<dyn StatisticsService> = Arc::new(FixedCatalogStatisticsService {
-            tables: std::collections::HashMap::from([
-                (
-                    ("default".to_string(), "tbl".to_string()),
-                    CatalogTableStatistics {
-                        columns: vec![CatalogColumnStatistics {
-                            column_name: "id".to_string(),
-                            row_count: 100_000,
-                            min: "1".to_string(),
-                            max: "100000".to_string(),
-                            ndv: "100000".to_string(),
-                        }],
-                    },
-                ),
-                (
-                    ("default".to_string(), "date_dim".to_string()),
-                    CatalogTableStatistics {
-                        columns: vec![CatalogColumnStatistics {
-                            column_name: "id".to_string(),
-                            row_count: 100,
-                            min: "1".to_string(),
-                            max: "100".to_string(),
-                            ndv: "100".to_string(),
-                        }],
-                    },
-                ),
-            ]),
-        });
-        let providers = super::query_stats::QueryStatsProviders::from_parts(None, Some(service));
-        let query_stats =
-            super::query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-        let optimized_tree = crate::sql::optimizer::optimize(
-            optimizer_expr,
-            scalar_arena,
-            &query_stats.snapshot,
-            factory,
-            Vec::new(),
-        )
-        .expect("optimize");
-        let physical_plan =
-            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
-                .expect("convert optimizer physical plan");
-        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
-            .expect("build DistributedPlan");
-        let prepared = crate::query_execution::preparation::prepare_fragments(
-            &distributed_plan,
-            &registry,
-            None,
-        )
-        .expect("prepare fragments");
-        let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-            &distributed_plan,
-            &prepared,
-        )
-        .expect("encode fragments");
-        (prepared, native_bundle)
-    }
-
-    /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
-    /// returns the provided schema_id and tablet splits. Used by
-    /// engine-level tests that build fragments for a StarRocks table but do not
-    /// have a full `StandaloneState` available.
-    #[cfg(feature = "compat")]
-    fn mock_starrocks_registry_for_engine_test(
-        schema_id: i64,
-        splits: Vec<crate::connector::starrocks::table::scan_planner::StarRocksSplit>,
-    ) -> crate::connector::ConnectorRegistry {
-        use crate::connector::scan_planning::{
-            BeginScanContext, ConnectorScanPlanner, SplitPlanningContext,
-        };
-        use crate::connector::starrocks::table::scan_planner::{
-            StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
-        };
-
-        #[derive(Debug)]
-        struct MockPlanner {
-            schema_id: i64,
-            splits: Vec<StarRocksSplit>,
-        }
-
-        impl ConnectorScanPlanner for MockPlanner {
-            fn name(&self) -> &'static str {
-                "starrocks"
-            }
-
-            fn begin_scan(
-                &self,
-                table: crate::connector::scan_planning::TableHandle,
-                _ctx: BeginScanContext,
-            ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
-                let inner = table
-                    .downcast_ref::<StarRocksTableHandle>()
-                    .ok_or_else(|| "MockPlanner expected StarRocksTableHandle".to_string())?
-                    .clone();
-                Ok(crate::connector::scan_planning::ScanHandle::new(
-                    "starrocks",
-                    StarRocksScanHandle {
-                        table: inner,
-                        schema_id: self.schema_id,
-                        storage_columns: vec![
-                            crate::connector::starrocks::table::scan_planner::StarRocksStorageColumn {
-                                name: "id".to_string(),
-                                unique_id: 1,
-                                default_value: None,
-                            },
-                        ],
-                        tablet_schema: crate::connector::starrocks::table::scan_planner::test_native_tablet_schema_for_column(self.schema_id, "id", 1, None),
-                    },
-                ))
-            }
-
-            fn plan_splits(
-                &self,
-                _scan: &crate::connector::scan_planning::ScanHandle,
-                _ctx: SplitPlanningContext,
-            ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
-                Ok(self
-                    .splits
-                    .iter()
-                    .map(|s| crate::connector::scan_planning::Split::new("starrocks", s.clone()))
-                    .collect())
-            }
-        }
-
-        let planner = std::sync::Arc::new(MockPlanner { schema_id, splits });
-        let mut registry = crate::connector::ConnectorRegistry::new();
-        registry.register_scan_planner(planner);
-        registry.register_scan_planner(std::sync::Arc::new(
-            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-        ));
-        registry
     }
 
     fn parse_query_for_engine_test(sql: &str) -> sqlparser::ast::Query {
@@ -6251,6 +6500,7 @@ mysql_port = 47892
             None,
             None,
             Some(&mv_ctx),
+            &crate::connector::test_request_context(),
             Some(&validator),
             None,
         )
@@ -7364,6 +7614,8 @@ mysql_port = 47892
                     full: false,
                 },
             ),
+            &super::test_request_context(None, "analytics"),
+            &crate::connector::test_request_context(),
         )
         .expect_err("refresh should fail without MV runtime prerequisites");
         assert!(
@@ -7391,8 +7643,15 @@ mysql_port = 47892
         .expect("parse materialized-view create")
         .pop()
         .expect("one materialized-view statement");
-        let err = dispatch_statement(&state, None, "analytics", statement)
-            .expect_err("frontend unavailable error must surface directly");
+        let err = dispatch_statement(
+            &state,
+            None,
+            "analytics",
+            statement,
+            &super::test_request_context(None, "analytics"),
+            &crate::connector::test_request_context(),
+        )
+        .expect_err("frontend unavailable error must surface directly");
 
         assert_eq!(err, "injected frontend MV service is unavailable");
         assert!(
@@ -7407,6 +7666,142 @@ mysql_port = 47892
                 .is_none(),
             "frontend service errors must not fall back to legacy target creation or metadata writes"
         );
+    }
+
+    #[test]
+    fn custom_statement_dispatch_honors_caller_cancellation() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let context =
+            crate::connector::connector_request_context(None, cancellation).expect("context");
+
+        let error = dispatch_statement(
+            &state,
+            None,
+            "analytics",
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(
+                crate::sql::parser::ast::RefreshMaterializedViewStmt {
+                    name: crate::sql::parser::ast::ObjectName {
+                        parts: vec!["analytics".to_string(), "orders_mv".to_string()],
+                    },
+                    full: false,
+                },
+            ),
+            &super::test_request_context(None, "analytics"),
+            &context,
+        )
+        .expect_err("cancelled caller must stop custom statement dispatch");
+
+        assert_eq!(error, "connector request was cancelled");
+    }
+
+    struct CancelAfterDispatch {
+        polls: AtomicUsize,
+    }
+
+    impl novarocks_spi::connector::ConnectorCancellation for CancelAfterDispatch {
+        fn is_cancelled(&self) -> bool {
+            self.polls.fetch_add(1, Ordering::SeqCst) > 0
+        }
+    }
+
+    fn cancel_after_dispatch_context() -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            Arc::new(CancelAfterDispatch {
+                polls: AtomicUsize::new(0),
+            }),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("connector request context")
+    }
+
+    #[test]
+    fn materialized_view_dispatch_observes_cancellation_after_entry() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(
+                crate::sql::parser::ast::RefreshMaterializedViewStmt {
+                    name: crate::sql::parser::ast::ObjectName {
+                        parts: vec!["analytics".to_string(), "orders_mv".to_string()],
+                    },
+                    full: false,
+                },
+            ),
+            &super::test_request_context(Some("ice"), "analytics"),
+            &cancel_after_dispatch_context(),
+        )
+        .expect_err("MV work dispatched by a cancelled caller must stop");
+
+        assert_eq!(error, "connector request was cancelled");
+    }
+
+    #[test]
+    fn create_materialized_view_observes_cancellation_after_dispatch() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+        let statement = crate::sql::parser::parse_sql(
+            "CREATE MATERIALIZED VIEW orders_mv
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id FROM ice.analytics.orders",
+        )
+        .expect("parse CREATE MATERIALIZED VIEW")
+        .remove(0);
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            statement,
+            &super::test_request_context(Some("ice"), "analytics"),
+            &cancel_after_dispatch_context(),
+        )
+        .expect_err("CREATE MV work dispatched by a cancelled caller must stop");
+
+        assert_eq!(error, "connector request was cancelled");
+    }
+
+    #[test]
+    fn iceberg_ref_dispatch_observes_cancellation_after_entry() {
+        let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            crate::sql::parser::ast::Statement::AlterIcebergRef(
+                crate::sql::parser::ast::AlterIcebergRefStmt {
+                    table: crate::sql::parser::ast::ObjectName {
+                        parts: vec![
+                            "ice".to_string(),
+                            "analytics".to_string(),
+                            "orders".to_string(),
+                        ],
+                    },
+                    action: crate::sql::parser::ast::AlterIcebergRefAction::CreateBranch {
+                        name: "cancelled".to_string(),
+                        anchor: crate::sql::parser::ast::SnapshotAnchor::CurrentMain,
+                        if_not_exists: false,
+                        replace: false,
+                        ignored_options: Vec::new(),
+                    },
+                },
+            ),
+            &super::test_request_context(Some("ice"), "analytics"),
+            &cancel_after_dispatch_context(),
+        )
+        .expect_err("Iceberg ref work dispatched by a cancelled caller must stop");
+
+        assert_eq!(error, "connector request was cancelled");
     }
 
     // -----------------------------------------------------------------------
@@ -7457,6 +7852,66 @@ path = "meta/operations.sqlite"
             .execute_in_database(&create_table_sql, "default")
             .expect("create table");
         (engine, session)
+    }
+
+    #[test]
+    fn mysql_request_cancellation_reaches_insert_metadata_lookup() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let connector_context =
+            crate::connector::connector_request_context(None, cancellation).expect("context");
+
+        let error = session
+            .execute_in_context_with_connector_context(
+                "insert into ice.db1.t values (1, 'cancelled')",
+                None,
+                "default",
+                None,
+                connector_context,
+            )
+            .expect_err("cancelled MySQL request must abort INSERT metadata lookup");
+
+        assert!(
+            error.contains("cancel"),
+            "unexpected cancellation error: {error}"
+        );
+    }
+
+    #[test]
+    fn iceberg_catalog_lifecycle_registers_and_unregisters_its_connector_instance() {
+        let warehouse = tempfile::tempdir().expect("warehouse tempdir");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
+            .expect("open engine");
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog Ice_One properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create catalog");
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice_one")
+            .expect("connector instance ID");
+        let state = engine.state_for_test();
+        {
+            let connectors = state
+                .connectors
+                .read()
+                .expect("connector registry read lock");
+            connectors
+                .connector_instance(&instance_id)
+                .expect("Iceberg connector instance must be registered");
+        }
+
+        session
+            .execute_in_database("drop catalog Ice_One", "default")
+            .expect("drop catalog");
+        let connectors = state
+            .connectors
+            .read()
+            .expect("connector registry read lock");
+        assert!(connectors.connector_instance(&instance_id).is_err());
     }
 
     fn open_row_lineage_iceberg_session_with_table(
@@ -9197,84 +9652,6 @@ path = "meta/operations.sqlite"
         drop(engine);
     }
 
-    fn install_optimizer_backend_count_config(
-        optimizer_backend_count: u64,
-        cluster_backends: Vec<String>,
-    ) {
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.cluster.backends = cluster_backends;
-        cfg.runtime.optimizer_effective_backend_count = optimizer_backend_count;
-        crate::common::app_config::install_preloaded_config(cfg);
-    }
-
-    #[test]
-    fn live_effective_backend_count_prefers_live_registry_over_runtime_config() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-        use crate::query_execution::backend_registry::{BackendRegistry, BackendState};
-
-        install_optimizer_backend_count_config(7, vec!["127.0.0.1:19080".to_string()]);
-        let registry = Arc::new(BackendRegistry::new(3));
-        registry.restore_backend(2, "127.0.0.1:19081".parse().unwrap(), BackendState::Live);
-        registry.restore_backend(3, "127.0.0.1:19082".parse().unwrap(), BackendState::Live);
-        crate::query_execution::backend_registry::replace_backend_registry_for_test(Some(registry));
-
-        assert_eq!(super::live_effective_backend_count(), 2.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_reads_injected_membership() {
-        let _standalone = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-        let ep1: std::net::SocketAddr = "127.0.0.1:19081".parse().unwrap();
-        let ep2: std::net::SocketAddr = "127.0.0.1:19082".parse().unwrap();
-        crate::query_execution::backend_registry::replace_cluster_membership_for_test(Some(
-            std::sync::Arc::new(
-                crate::query_execution::backend_registry::FakeClusterMembership::new(vec![
-                    (0, ep1),
-                    (1, ep2),
-                ]),
-            ),
-        ));
-
-        assert_eq!(super::live_effective_backend_count(), 2.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_prefers_runtime_config_when_registry_absent() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-
-        install_optimizer_backend_count_config(
-            7,
-            vec!["127.0.0.1:19083".to_string(), "127.0.0.1:19084".to_string()],
-        );
-
-        assert_eq!(super::live_effective_backend_count(), 7.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_prefers_runtime_config_when_registry_empty() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-        let registry = Arc::new(crate::query_execution::backend_registry::BackendRegistry::new(3));
-
-        install_optimizer_backend_count_config(7, vec!["127.0.0.1:19085".to_string()]);
-        crate::query_execution::backend_registry::replace_backend_registry_for_test(Some(registry));
-
-        assert_eq!(super::live_effective_backend_count(), 7.0);
-    }
-
-    #[test]
-    fn live_effective_backend_count_defaults_to_one_without_registry_or_runtime_config() {
-        let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::query_execution::backend_registry::BackendRegistryTestGuard::new();
-
-        install_optimizer_backend_count_config(0, Vec::new());
-
-        assert_eq!(super::live_effective_backend_count(), 1.0);
-    }
-
     #[test]
     fn coordinated_iceberg_insert_requires_exchange_server() {
         let query = parse_query_for_engine_test("SELECT id FROM missing_table");
@@ -9286,7 +9663,7 @@ path = "meta/operations.sqlite"
         );
 
         let result = super::execute_query_as_iceberg_write(
-            &state, None, "default", &query, sink_spec, None, None,
+            &state, None, "default", &query, sink_spec, None, None, None,
         );
 
         let err = result.expect_err("default state should fail before executing the sink");
@@ -9375,6 +9752,7 @@ path = "meta/operations.sqlite"
                 }
                 Err("resolver saw planned _file output".to_string())
             })),
+            None,
         );
 
         let err = match result {

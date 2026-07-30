@@ -17,7 +17,6 @@
 
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::starrocks::PlannedNativeStarRocksScan;
-use crate::connector::scan_planning::starrocks::plan_native_starrocks_scan;
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
@@ -39,6 +38,7 @@ use projection::{resolve_effective_required_reads, resolve_physical_columns};
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
     connectors: &ConnectorRegistry,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<ScanExecutionBindings, String> {
     let mut bindings = ScanExecutionBindings::default();
@@ -48,6 +48,7 @@ pub(super) fn prepare_scan_bindings(
             fragment.fragment_id,
             &fragment.root,
             connectors,
+            context,
             resolver,
             &mut seen_scan_node_ids,
             &mut bindings,
@@ -60,6 +61,7 @@ fn collect_scan_bindings(
     fragment_id: FragmentId,
     node: &DistributedNode,
     connectors: &ConnectorRegistry,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
     bindings: &mut ScanExecutionBindings,
@@ -73,6 +75,7 @@ fn collect_scan_bindings(
             node.node_id,
             scan,
             connectors,
+            context,
             resolver,
             bindings,
         )?;
@@ -83,6 +86,7 @@ fn collect_scan_bindings(
                 fragment_id,
                 child,
                 connectors,
+                context,
                 resolver,
                 seen_scan_node_ids,
                 bindings,
@@ -97,6 +101,7 @@ fn prepare_scan_node(
     node_id: i32,
     scan: &PlanScanNode,
     connectors: &ConnectorRegistry,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
@@ -120,8 +125,18 @@ fn prepare_scan_node(
             );
         }
         ScanSource::StarRocks { .. } => {
-            let planned = plan_native_starrocks_scan(node_id, scan, connectors)?;
-            return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
+            #[cfg(feature = "compat")]
+            {
+                let planned =
+                    crate::connector::starrocks::table::scan_adapter::plan_native_starrocks_scan_with_compat(
+                    node_id, scan, connectors, context.clone(),
+                )?;
+                return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                return Err("StarRocks native scan planning requires feature compat".to_string());
+            }
         }
         source if scan_source_requires_resolver(source) => {
             let source_context = scan_source_context(source);
@@ -154,7 +169,7 @@ fn prepare_scan_node(
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required) = match &execution {
         ResolvedScanExecution::IcebergFiles(_) => {
-            plan_iceberg_file_ranges(connectors, scan, &execution)
+            plan_iceberg_file_ranges(connectors, context.clone(), scan, &execution)
                 .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?
         }
         ResolvedScanExecution::IcebergDelta(_) => {

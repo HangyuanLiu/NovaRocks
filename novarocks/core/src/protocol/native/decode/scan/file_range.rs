@@ -21,12 +21,12 @@ use arrow::datatypes::DataType;
 
 use super::common::column_def_data_type;
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::file_execution::FileScanRange;
 use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use crate::connector::iceberg::file_pruning::{IcebergFileNullState, IcebergFilePruningMetadata};
 use crate::connector::iceberg::scan_model::IcebergColumnStats;
-use crate::fs::scan_context::FileScanRange;
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;

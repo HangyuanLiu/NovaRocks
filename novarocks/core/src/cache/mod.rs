@@ -14,41 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod block_cache;
-pub mod cache_input_stream;
-pub mod cached_reader;
-pub mod data_cache;
-pub mod page_cache;
-
 use crate::runtime::query_options::QueryOptions;
-
-pub use block_cache::{BlockCache, BlockCacheOptions, CacheKey};
-pub use cache_input_stream::{CacheBlockRead, CacheInputStream};
-pub use cached_reader::{CachedRangeReader, CachedRead};
-pub use data_cache::{
-    DataCacheContext, DataCacheManager, DataCacheMetricsRecorder, DataCachePageCache,
-    DataCachePageCacheOptions, DataCachePageKey,
-};
-pub use page_cache::{PageCache, PageCacheStats, PageCacheValue, PageHandle};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CacheDomain {
-    External,
-    Internal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DataCacheIoOptions {
-    pub domain: CacheDomain,
-    pub enable_datacache: bool,
-    pub enable_populate_datacache: bool,
-    pub enable_datacache_async_populate_mode: bool,
-    pub enable_datacache_io_adaptor: bool,
-    pub enable_cache_select: bool,
-    pub datacache_evict_probability: i32,
-    pub datacache_priority: i32,
-    pub datacache_ttl_seconds: i64,
-}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExternalDataCacheRangeOptions {
@@ -107,29 +73,30 @@ impl CacheOptions {
         })
     }
 
+    pub fn to_file_cache_options(&self) -> novarocks_fs::CacheOptions {
+        novarocks_fs::CacheOptions {
+            enable_scan_datacache: self.enable_scan_datacache,
+            enable_populate_datacache: self.enable_populate_datacache,
+            enable_datacache_async_populate_mode: self.enable_datacache_async_populate_mode,
+            enable_datacache_io_adaptor: self.enable_datacache_io_adaptor,
+            enable_cache_select: self.enable_cache_select,
+            datacache_evict_probability: self.datacache_evict_probability,
+            datacache_priority: self.datacache_priority,
+            datacache_ttl_seconds: self.datacache_ttl_seconds,
+            datacache_sharing_work_period: self.datacache_sharing_work_period,
+        }
+    }
+
     pub fn with_external_range_options(
         &self,
         range_options: Option<&ExternalDataCacheRangeOptions>,
     ) -> Result<Self, String> {
-        let mut effective = self.clone();
-        if let Some(range_options) = range_options {
-            if let Some(enable_populate_datacache) = range_options.enable_populate_datacache {
-                effective.enable_populate_datacache = enable_populate_datacache;
-            }
-            if let Some(datacache_priority) = range_options.datacache_priority {
-                effective.datacache_priority = parse_datacache_priority(
-                    "hdfs_scan_range.datacache_options.priority",
-                    datacache_priority,
-                )?;
-            }
-        }
-        if effective.datacache_priority == -1 {
-            effective.enable_scan_datacache = false;
-        }
-        if !effective.enable_scan_datacache {
-            effective.disable_external_datacache();
-        }
-        Ok(effective)
+        let file_range_options =
+            range_options.map(novarocks_fs::ExternalDataCacheRangeOptions::from);
+        let effective = self
+            .to_file_cache_options()
+            .with_external_range_options(file_range_options.as_ref())?;
+        Ok(Self::from_file_cache_options(effective))
     }
 
     pub fn disable_external_datacache(&mut self) {
@@ -139,17 +106,40 @@ impl CacheOptions {
         self.enable_datacache_io_adaptor = false;
     }
 
-    pub fn external_io_options(&self) -> DataCacheIoOptions {
-        DataCacheIoOptions {
-            domain: CacheDomain::External,
-            enable_datacache: self.enable_scan_datacache,
-            enable_populate_datacache: self.enable_populate_datacache,
-            enable_datacache_async_populate_mode: self.enable_datacache_async_populate_mode,
-            enable_datacache_io_adaptor: self.enable_datacache_io_adaptor,
-            enable_cache_select: self.enable_cache_select,
-            datacache_evict_probability: self.datacache_evict_probability,
-            datacache_priority: self.datacache_priority,
-            datacache_ttl_seconds: self.datacache_ttl_seconds,
+    fn from_file_cache_options(options: novarocks_fs::CacheOptions) -> Self {
+        Self {
+            enable_scan_datacache: options.enable_scan_datacache,
+            enable_populate_datacache: options.enable_populate_datacache,
+            enable_datacache_async_populate_mode: options.enable_datacache_async_populate_mode,
+            enable_datacache_io_adaptor: options.enable_datacache_io_adaptor,
+            enable_cache_select: options.enable_cache_select,
+            datacache_evict_probability: options.datacache_evict_probability,
+            datacache_priority: options.datacache_priority,
+            datacache_ttl_seconds: options.datacache_ttl_seconds,
+            datacache_sharing_work_period: options.datacache_sharing_work_period,
+        }
+    }
+}
+
+impl From<CacheOptions> for novarocks_fs::CacheOptions {
+    fn from(options: CacheOptions) -> Self {
+        options.to_file_cache_options()
+    }
+}
+
+impl From<&CacheOptions> for novarocks_fs::CacheOptions {
+    fn from(options: &CacheOptions) -> Self {
+        options.to_file_cache_options()
+    }
+}
+
+impl From<&ExternalDataCacheRangeOptions> for novarocks_fs::ExternalDataCacheRangeOptions {
+    fn from(options: &ExternalDataCacheRangeOptions) -> Self {
+        Self {
+            modification_time: options.modification_time,
+            enable_populate_datacache: options.enable_populate_datacache,
+            datacache_priority: options.datacache_priority,
+            candidate_node: options.candidate_node.clone(),
         }
     }
 }

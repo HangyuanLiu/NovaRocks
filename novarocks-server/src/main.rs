@@ -173,7 +173,7 @@ fn load_config_and_resolve_role(
     let config_path = novarocks::common::app_config::resolve_config_path(
         cli.config_path.as_deref().map(std::path::Path::new),
     );
-    let cfg = match config_path.as_ref() {
+    let mut cfg = match config_path.as_ref() {
         Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(p)
             .map_err(|e| anyhow::anyhow!("{}", e))?,
         None => novarocks::common::app_config::NovaRocksConfig::default(),
@@ -183,12 +183,11 @@ fn load_config_and_resolve_role(
 
     let role = resolve_cluster_role(&cfg, role_override);
 
-    // C1: validate using the *effective* (CLI-overridden) role, not the
-    // config-file role.  Cloning only the small ClusterConfig struct avoids
-    // mutating the returned cfg.
-    let mut effective_cluster = cfg.cluster.clone();
-    effective_cluster.role = role;
-    effective_cluster
+    // Persist the effective role into the owned configuration before any
+    // composition root observes it. Frontend admission and topology ownership
+    // must never disagree with the CLI role override.
+    cfg.cluster.role = role;
+    cfg.cluster
         .validate()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -696,8 +695,8 @@ fn main() {
             eprintln!("NovaRocks {}", novarocks::version::full_version());
 
             let page_cache_initialized = if cfg.runtime.cache.page_cache_enable {
-                novarocks::cache::DataCacheManager::instance().init_page_cache(
-                    novarocks::cache::DataCachePageCacheOptions {
+                novarocks_fs::DataCacheManager::instance().init_page_cache(
+                    novarocks_fs::DataCachePageCacheOptions {
                         capacity: cfg.runtime.cache.page_cache_capacity,
                         evict_probability: cfg.runtime.cache.page_cache_evict_probability,
                     },
@@ -714,18 +713,16 @@ fn main() {
             }
 
             let parquet_cache_initialized =
-                novarocks::formats::parquet::init_datacache_parquet_cache(
-                    novarocks::formats::parquet::ParquetCacheOptions {
-                        enable_metadata: cfg.runtime.cache.parquet_meta_cache_enable,
-                        metadata_ttl: Duration::from_secs(
-                            cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
-                        ),
-                        enable_page: cfg.runtime.cache.parquet_page_cache_enable,
-                    },
-                );
+                novarocks_fs::init_parquet_cache(novarocks_fs::ParquetCacheOptions {
+                    enable_metadata: cfg.runtime.cache.parquet_meta_cache_enable,
+                    metadata_ttl: Duration::from_secs(
+                        cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
+                    ),
+                    enable_page: cfg.runtime.cache.parquet_page_cache_enable,
+                });
             if parquet_cache_initialized {
                 eprintln!(
-                    "Parquet DataCache policy initialized: meta_enabled={}, meta_ttl={}s, page_enabled={}",
+                    "Parquet physical cache policy initialized: meta_enabled={}, meta_ttl={}s, page_enabled={}",
                     cfg.runtime.cache.parquet_meta_cache_enable,
                     cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
                     cfg.runtime.cache.parquet_page_cache_enable,
