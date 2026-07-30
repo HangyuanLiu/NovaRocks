@@ -20621,7 +20621,7 @@ mod tests {
     #[test]
     fn cancelled_refresh_plan_does_not_run_recovery_mutations() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        crate::engine::register_iceberg_connector_instance(&env.state, "ice")
+        crate::engine::register_iceberg_control_binding(&env.state, "ice")
             .expect("register Iceberg connector instance");
         create_base_table(&env.state, "ice", "sales", "orders");
         create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");

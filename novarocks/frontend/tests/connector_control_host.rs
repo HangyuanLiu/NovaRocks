@@ -1,0 +1,170 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use novarocks_frontend::connector::{
+    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
+};
+use novarocks_spi::connector::{
+    ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlResolver, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorTableMetadata, ConnectorTableRequest,
+};
+
+struct TestControl {
+    instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl ConnectorMetadata for TestControl {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn namespace_exists(
+        &self,
+        _request: ConnectorNamespaceRequest,
+    ) -> Result<bool, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn table_exists(&self, _request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn list_tables(
+        &self,
+        _request: ConnectorListTablesRequest,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorTableIdentity>, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn load_table(
+        &self,
+        _request: ConnectorTableRequest,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        Err(unsupported())
+    }
+}
+
+impl ConnectorScanPlanning for TestControl {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        _table: &ConnectorTableHandle,
+        _request: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn plan_splits(
+        &self,
+        _scan: &ConnectorScanHandle,
+        _request: ConnectorSplitPlanningRequest,
+    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        Err(unsupported())
+    }
+}
+
+impl ConnectorExecutionDistribution for TestControl {
+    fn declaration(
+        &self,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+        ConnectorExecutionDeclaration::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                instance_id: self.instance_id.clone(),
+            },
+            self.incarnation,
+            Bytes::from_static(b"binding=default"),
+        )
+    }
+}
+
+fn binding(incarnation: u8) -> ConnectorControlBinding {
+    let provider = Arc::new(TestControl {
+        instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
+    });
+    ConnectorControlBinding::try_new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: provider.instance_id.clone(),
+        },
+        provider.incarnation,
+        provider.clone(),
+        provider.clone(),
+        provider,
+    )
+    .expect("control binding")
+}
+
+#[derive(Default)]
+struct RecordingRetirementSink(Mutex<Vec<ConnectorControlRetirement>>);
+
+impl ConnectorControlRetirementSink for RecordingRetirementSink {
+    fn retire(&self, retirement: ConnectorControlRetirement) {
+        self.0.lock().expect("retirement sink").push(retirement);
+    }
+}
+
+#[test]
+fn lease_drain_dispatches_retirement_to_installed_backends() {
+    let host = ConnectorControlHost::new();
+    let sink = Arc::new(RecordingRetirementSink::default());
+    host.set_retirement_sink(sink.clone());
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    host.register(binding(7)).expect("register old generation");
+    let lease = host.acquire_current(&instance_id).expect("planning lease");
+    let old_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+    };
+    host.record_installed_backend(&old_key, "127.0.0.1:18080")
+        .expect("record ensure acknowledgement");
+    host.retire_current(&instance_id)
+        .expect("retire old generation");
+    assert!(sink.0.lock().expect("retirement sink").is_empty());
+
+    drop(lease);
+
+    let dispatched = sink.0.lock().expect("retirement sink");
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0].key, old_key);
+    assert_eq!(
+        dispatched[0].installed_backends,
+        vec![String::from("127.0.0.1:18080")]
+    );
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+}
+
+fn unsupported() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "test-only control capability",
+    )
+}

@@ -74,6 +74,13 @@ impl ConnectorControlHost {
     }
 
     pub fn set_retirement_sink(&self, sink: Arc<dyn ConnectorControlRetirementSink>) {
+        let Ok(mut slot) = self.retirement_sink.lock() else {
+            return;
+        };
+        *slot = Some(Arc::clone(&sink));
+        // Keep the sink lock while taking the fallback queue. A concurrent
+        // retirement either observes this sink or queues itself before this
+        // drain; it cannot be stranded between the two operations.
         let ready = match self.lock_state() {
             Ok(mut state) => std::mem::take(&mut state.ready_retires),
             Err(error) => {
@@ -81,10 +88,6 @@ impl ConnectorControlHost {
                 return;
             }
         };
-        let Ok(mut slot) = self.retirement_sink.lock() else {
-            return;
-        };
-        *slot = Some(Arc::clone(&sink));
         drop(slot);
         for retirement in ready {
             sink.retire(retirement);
@@ -234,14 +237,16 @@ impl ConnectorControlHost {
 
     fn dispatch_retirement(&self, retirement: Option<ConnectorControlRetirement>) {
         let Some(retirement) = retirement else { return };
-        let sink = self
-            .retirement_sink
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let Ok(slot) = self.retirement_sink.lock() else {
+            return;
+        };
+        let sink = slot.clone();
         if let Some(sink) = sink {
+            drop(slot);
             sink.retire(retirement);
         } else if let Ok(mut state) = self.lock_state() {
+            // Keep the sink lock while publishing the fallback so a sink
+            // installation cannot drain the queue before this push.
             state.ready_retires.push(retirement);
         }
     }
@@ -290,10 +295,16 @@ fn release_planning_lease(
     let Some(slot) = retirement_sink.upgrade() else {
         return;
     };
-    let sink = slot.lock().ok().and_then(|sink| sink.clone());
+    let Ok(slot) = slot.lock() else {
+        return;
+    };
+    let sink = slot.clone();
     if let Some(sink) = sink {
+        drop(slot);
         sink.retire(retirement);
     } else if let Ok(mut state) = host_state.lock() {
+        // See ConnectorControlHost::dispatch_retirement: keep the sink lock
+        // while publishing the fallback queue entry.
         state.ready_retires.push(retirement);
     }
 }

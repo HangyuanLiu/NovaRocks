@@ -2290,7 +2290,7 @@ impl StandaloneSession {
         guard.create_catalog(&stmt.name, &stmt.properties)?;
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
-        if let Err(error) = register_iceberg_connector_instance(&self.inner, &normalized_catalog) {
+        if let Err(error) = register_iceberg_control_binding(&self.inner, &normalized_catalog) {
             if created {
                 self.inner
                     .iceberg_catalogs
@@ -2318,7 +2318,7 @@ impl StandaloneSession {
             &normalized_catalog,
             &persisted_properties,
         ) {
-            unregister_iceberg_connector_instance(&self.inner, &normalized_catalog)?;
+            retire_iceberg_control_binding(&self.inner, &normalized_catalog)?;
             if created {
                 self.inner
                     .iceberg_catalogs
@@ -2974,7 +2974,7 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
             guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
         }
         let normalized_catalog = normalize_identifier(&catalog.catalog)?;
-        if let Err(error) = register_iceberg_connector_instance(state, &normalized_catalog) {
+        if let Err(error) = register_iceberg_control_binding(state, &normalized_catalog) {
             state
                 .iceberg_catalogs
                 .write()
@@ -2994,7 +2994,7 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
     Ok(())
 }
 
-fn register_iceberg_connector_instance(
+fn register_iceberg_control_binding(
     state: &Arc<StandaloneState>,
     normalized_catalog: &str,
 ) -> Result<(), String> {
@@ -3011,7 +3011,7 @@ fn register_iceberg_connector_instance(
         .map_err(|error| format!("register Iceberg connector control binding: {error}"))
 }
 
-fn unregister_iceberg_connector_instance(
+fn retire_iceberg_control_binding(
     state: &Arc<StandaloneState>,
     normalized_catalog: &str,
 ) -> Result<(), String> {
@@ -7990,7 +7990,7 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
-    fn iceberg_catalog_lifecycle_registers_and_unregisters_its_connector_instance() {
+    fn iceberg_catalog_lifecycle_registers_and_retires_its_control_binding() {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
             .expect("open engine");

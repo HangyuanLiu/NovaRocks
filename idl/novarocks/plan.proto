@@ -1006,7 +1006,7 @@ message ScanSource {
 }
 
 // A provider-neutral, already-planned connector read. The opaque handles are
-// decoded only by the selected ConnectorInstance. Metadata resolution and
+// decoded only by the selected ConnectorExecutionBinding. Metadata resolution and
 // split planning occur before this carrier is emitted; core retains split
 // scheduling, batching, cancellation, and Chunk adaptation ownership.
 message ConnectorReadSource {
