@@ -356,7 +356,7 @@ fn register_iceberg_tables_for_mv_analysis(
         };
         drop_local_table_registration_if_exists(state, namespace, table)?;
         let (mut table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
-            &connectors,
+            state.connector_control.as_ref(),
             connector_context.clone(),
             catalog,
             namespace,

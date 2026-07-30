@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::ConnectorRegistry;
 use crate::sql::catalog::CatalogRuntimeMetadata;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_catalog::registry::Catalog;
@@ -23,15 +22,18 @@ use novarocks_catalog::schema_cache::SchemaCache;
 
 pub(super) struct IcebergCatalog {
     name: String,
-    connectors: ConnectorRegistry,
+    controls: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
     cache: SchemaCache<CatalogRuntimeMetadata>,
 }
 
 impl IcebergCatalog {
-    pub(super) fn new(name: &str, connectors: ConnectorRegistry) -> Self {
+    pub(super) fn new(
+        name: &str,
+        controls: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+    ) -> Self {
         Self {
             name: name.to_string(),
-            connectors,
+            controls,
             cache: SchemaCache::new(),
         }
     }
@@ -55,7 +57,7 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
         let identity = TableIdentity::new(&self.name, namespace, table);
         let (table_def, current_schema_id) =
             crate::connector::iceberg::provider::load_schema_table_def(
-                &self.connectors,
+                self.controls.as_ref(),
                 crate::connector::connector_request_context(
                     None,
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -299,14 +299,14 @@ pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> Standalo
 pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a StandaloneCatalogService,
-    connectors: &'a crate::connector::ConnectorRegistry,
+    controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     lookup_mode: TableLookupMode,
 ) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
     crate::sql::catalog::provider::CatalogServiceProvider::new(
         current_catalog,
         catalog_service,
-        connectors,
+        controls,
         connector_context,
         lookup_mode,
     )
@@ -474,6 +474,9 @@ pub(crate) struct StandaloneState {
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
+    /// Frontend composition owns logical connector generations. The engine
+    /// only consumes this SPI lifecycle port.
+    pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
     pub(crate) mv_refresh_pruning_limits: MvRefreshPruningLimits,
@@ -530,6 +533,7 @@ impl Default for StandaloneState {
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
+            connector_control: Arc::new(TestConnectorControlRegistry),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             starrocks_table_config: None,
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
@@ -562,6 +566,42 @@ impl Default for StandaloneState {
             #[cfg(test)]
             _test_guard: None,
         }
+    }
+}
+
+#[cfg(test)]
+struct TestConnectorControlRegistry;
+
+#[cfg(test)]
+impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControlRegistry {
+    fn acquire_current(
+        &self,
+        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            "test connector control registry has no active binding",
+        ))
+    }
+}
+
+#[cfg(test)]
+impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControlRegistry {
+    fn register(
+        &self,
+        _binding: novarocks_spi::connector::ConnectorControlBinding,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        Ok(())
+    }
+
+    fn retire_current(
+        &self,
+        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        Ok(())
     }
 }
 
@@ -722,6 +762,8 @@ pub struct StandaloneOpenServices {
     pub native_report_handler:
         std::sync::Arc<dyn crate::query_execution::report::NativeReportHandler>,
     pub query_control: crate::query_execution::control::QueryControlService,
+    /// Frontend-owned lifecycle port for logical connector control bindings.
+    pub connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     /// Bound by the server composition root before engine open. Zero means no
     /// local fragment endpoint is available to this engine instance.
     pub exchange_port: u16,
@@ -750,6 +792,7 @@ impl StandaloneOpenServices {
             dyn crate::query_execution::report::NativeReportHandler,
         >,
         query_control: crate::query_execution::control::QueryControlService,
+        connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
         exchange_port: u16,
     ) -> Self {
         Self {
@@ -757,6 +800,7 @@ impl StandaloneOpenServices {
             system_catalog,
             view_service,
             statistics_service,
+            connector_control,
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -845,6 +889,7 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            connector_control,
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -875,6 +920,7 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            connector_control,
             table_maintenance_service,
             self_weak: self_weak.clone(),
             query_execution,
@@ -1170,7 +1216,7 @@ impl StandaloneSession {
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service_snapshot,
-                    &connectors_snapshot,
+                    self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
@@ -1262,7 +1308,7 @@ impl StandaloneSession {
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service_snapshot,
-                    &connectors_snapshot,
+                    self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
@@ -1329,7 +1375,7 @@ impl StandaloneSession {
         let analyzer_provider = build_catalog_service_provider(
             current_catalog,
             &catalog_service_snapshot,
-            &connectors_snapshot,
+            self.inner.connector_control.as_ref(),
             connector_context.clone(),
             TableLookupMode::ExplainStats,
         );
@@ -1374,6 +1420,7 @@ impl StandaloneSession {
         let prepared = crate::query_execution::preparation::prepare_fragments(
             &distributed_plan,
             &connectors_snapshot,
+            self.inner.connector_control.as_ref(),
             connector_context,
             None,
         )?;
@@ -1726,7 +1773,7 @@ impl StandaloneSession {
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service_snapshot,
-                    &connectors_snapshot,
+                    self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
@@ -1775,7 +1822,7 @@ impl StandaloneSession {
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service_snapshot,
-                    &connectors_snapshot,
+                    self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
@@ -1858,7 +1905,7 @@ impl StandaloneSession {
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service_snapshot,
-                    &connectors_snapshot,
+                    self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
@@ -2262,7 +2309,9 @@ impl StandaloneSession {
         self.inner
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                &stmt.name, connectors,
+                &stmt.name,
+                Arc::clone(&self.inner.connector_control)
+                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
             ));
         if let Err(error) = persist_catalog_attachment_if_needed(
             &self.inner,
@@ -2942,7 +2991,8 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                 &catalog.catalog,
-                connectors.clone(),
+                Arc::clone(&state.connector_control)
+                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
             ));
     }
 
@@ -2955,17 +3005,15 @@ fn register_iceberg_connector_instance(
 ) -> Result<(), String> {
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let instance = crate::connector::iceberg::provider::IcebergConnectorInstance::new(
+    let binding = crate::connector::iceberg::provider::IcebergConnectorInstance::new_control(
         instance_id,
         Arc::clone(&state.iceberg_catalogs),
     )
-    .map_err(|error| format!("create Iceberg connector instance: {error}"))?;
+    .map_err(|error| format!("create Iceberg connector control binding: {error}"))?;
     state
-        .connectors
-        .write()
-        .expect("connector registry write lock")
-        .register_connector_instance(instance)
-        .map_err(|error| format!("register Iceberg connector instance: {error}"))
+        .connector_control
+        .register(binding)
+        .map_err(|error| format!("register Iceberg connector control binding: {error}"))
 }
 
 fn unregister_iceberg_connector_instance(
@@ -2975,12 +3023,9 @@ fn unregister_iceberg_connector_instance(
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
     state
-        .connectors
-        .write()
-        .expect("connector registry write lock")
-        .unregister_connector_instance(&instance_id)
-        .map(|_| ())
-        .map_err(|error| format!("unregister Iceberg connector instance: {error}"))
+        .connector_control
+        .retire_current(&instance_id)
+        .map_err(|error| format!("retire Iceberg connector control binding: {error}"))
 }
 
 pub(crate) fn persist_catalog_attachment_if_needed(
@@ -3198,9 +3243,15 @@ fn explain_analyze_query(
         physical_plan,
         &optimizer_settings,
     )?;
+    let connector_controls = mv_rewrite_state
+        .map(|state| state.connector_control.as_ref())
+        .ok_or_else(|| {
+            "distributed explain requires a frontend connector control host".to_string()
+        })?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
+        connector_controls,
         connector_context,
         None,
     )?;
@@ -3468,7 +3519,7 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
     let analyzer_provider = build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
-        &connectors_snapshot,
+        state.connector_control.as_ref(),
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
     );
@@ -3666,7 +3717,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
     let analyzer_provider = build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
-        &connectors_snapshot,
+        state.connector_control.as_ref(),
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
     );
@@ -3716,6 +3767,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
+        state.connector_control.as_ref(),
         &connector_context,
         None,
     )?;
@@ -3920,6 +3972,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
+        state.connector_control.as_ref(),
         connector_context,
         scan_binding_resolver,
     )?;
@@ -4428,9 +4481,15 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    let connector_controls = mv_rewrite_state
+        .map(|state| state.connector_control.as_ref())
+        .ok_or_else(|| {
+            "distributed query requires a frontend connector control host".to_string()
+        })?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
+        connector_controls,
         connector_context,
         scan_binding_resolver,
     )?;
@@ -4510,9 +4569,15 @@ pub(crate) fn execute_logical_plan_with_options(
     )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    let connector_controls = mv_rewrite_state
+        .map(|state| state.connector_control.as_ref())
+        .ok_or_else(|| {
+            "distributed query requires a frontend connector control host".to_string()
+        })?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connectors,
+        connector_controls,
         &connector_context,
         scan_binding_resolver,
     )?;
@@ -5627,6 +5692,7 @@ mod tests {
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             Arc::new(super::TestNativeReportHandler),
             crate::query_execution::control::QueryControlService::for_test(),
+            Arc::new(super::TestConnectorControlRegistry),
             0,
         )
     }

@@ -821,7 +821,7 @@ pub(crate) fn analyze_visible_query(
     let provider = crate::engine::build_catalog_service_provider(
         None,
         &catalog_service,
-        &connectors,
+        state.connector_control.as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );

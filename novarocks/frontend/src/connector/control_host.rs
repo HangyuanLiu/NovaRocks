@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
-    ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlResolver,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlRegistry,
+    ConnectorControlResolver, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorInstanceId,
 };
 
 /// FE process owner of logical Connector control generations. It contains no
@@ -209,6 +210,16 @@ impl ConnectorControlResolver for ConnectorControlHost {
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
         self.acquire(instance_id)
+    }
+}
+
+impl ConnectorControlRegistry for ConnectorControlHost {
+    fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError> {
+        Self::register(self, binding)
+    }
+
+    fn retire_current(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError> {
+        Self::retire_current(self, instance_id)
     }
 }
 

@@ -1447,17 +1447,17 @@ fn default_iceberg_split_version() -> u16 {
 }
 
 pub(crate) fn load_schema_table_def(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> Result<(crate::sql::planner::table::TableDef, Option<i32>), String> {
-    load_table_def_at(connectors, context, catalog, namespace, table, None, true)
+    load_table_def_at(controls, context, catalog, namespace, table, None, true)
 }
 
 pub(crate) fn load_table_def_at(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
@@ -1470,12 +1470,12 @@ pub(crate) fn load_table_def_at(
     };
 
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
+    let lease = controls
+        .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
-    let metadata = instance
+    let metadata = lease
+        .binding()
         .metadata()
-        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
@@ -1505,34 +1505,14 @@ pub(crate) fn load_table_def_at(
     let files = if schema_only {
         Vec::new()
     } else {
-        let planned = if snapshot_id.is_some() {
-            plan_native_iceberg_read_with_file_override(
-                connectors,
-                context,
-                &table_info,
-                binding,
-                None,
-                &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
-            )?
-        } else {
-            plan_native_iceberg_read(
-                connectors,
-                context,
-                &table_info,
-                binding,
-                &payload.prepared_files,
-                &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
-            )?
-        };
-        planned
-            .splits
-            .iter()
-            .map(|split| {
-                decode_payload::<SplitPayload>(split.payload(), "split")
-                    .map(|payload| payload.data_file)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        plan_scan_files(
+            controls,
+            context,
+            &table_info,
+            binding,
+            &payload.prepared_files,
+            &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
+        )?
     };
     let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns);
     let table_def = crate::sql::planner::table::TableDef {
@@ -1550,7 +1530,7 @@ pub(crate) fn load_table_def_at(
 }
 
 pub(crate) fn load_metadata_table_def(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
@@ -1561,13 +1541,13 @@ pub(crate) fn load_metadata_table_def(
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
+    let lease = controls
+        .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
     let alias = format!("{table}${}", metadata_table_name(&metadata_table_type));
-    let metadata = instance
+    let metadata = lease
+        .binding()
         .metadata()
-        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
@@ -1666,7 +1646,7 @@ fn metadata_table_name(metadata_type: &super::IcebergMetadataTableType) -> &'sta
 }
 
 pub(crate) fn plan_scan_files(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,
@@ -1674,7 +1654,7 @@ pub(crate) fn plan_scan_files(
     projection: &[usize],
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
     let planned = plan_native_iceberg_read(
-        connectors,
+        controls,
         context,
         table,
         binding,
@@ -1698,7 +1678,7 @@ pub(crate) fn plan_scan_files(
 /// planning so native execution never reconstructs an Iceberg file scan in
 /// core.
 pub(crate) fn plan_native_iceberg_read(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,
@@ -1727,17 +1707,12 @@ fn plan_native_iceberg_read_with_file_override(
 
     let instance_id =
         ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
+    let lease = controls
+        .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
-    let distribution = instance.distribution().ok_or_else(|| {
-        format!(
-            "Iceberg connector instance {} cannot be distributed to native backends",
-            instance_id.as_str()
-        )
-    })?;
-    let declaration = distribution
-        .declaration(&context)
+    let control_binding = lease.binding();
+    let declaration = control_binding
+        .execution_declaration(&context)
         .map_err(|error| error.to_string())?;
     let table_handle = ConnectorTableHandle::try_new(
         instance_id.clone(),
@@ -1763,8 +1738,8 @@ fn plan_native_iceberg_read_with_file_override(
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    let scan = instance
-        .read()
+    let scan = control_binding
+        .planning()
         .begin_scan(
             &table_handle,
             novarocks_spi::connector::ConnectorBeginScanRequest {
@@ -1791,8 +1766,8 @@ fn plan_native_iceberg_read_with_file_override(
             },
         )
         .map_err(|error| error.to_string())?;
-    let splits = instance
-        .read()
+    let splits = control_binding
+        .planning()
         .plan_splits(
             &scan.handle,
             ConnectorSplitPlanningRequest {
@@ -1804,12 +1779,13 @@ fn plan_native_iceberg_read_with_file_override(
         .map_err(|error| error.to_string())?;
     if splits
         .iter()
-        .any(|split| split.owner() != &instance.descriptor().instance_id)
+        .any(|split| split.owner() != &control_binding.descriptor().instance_id)
     {
         return Err("Iceberg connector planned a split for another instance".to_string());
     }
     Ok(PlannedIcebergConnectorRead {
         declaration,
+        planning_lease: lease,
         scan,
         splits,
         batch: novarocks_spi::connector::ConnectorBatchBudget {
@@ -1826,14 +1802,14 @@ fn plan_native_iceberg_read_with_file_override(
 /// splits.  Delta retains its logical planner identity; no native carrier or
 /// core scan operator receives a role-specific file/deletion payload.
 pub(crate) fn plan_native_iceberg_delta_read(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     sources: &[super::delta::DeltaSourceFile],
     delete_side: Option<&super::delta::DeltaScanDeleteSide>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     let mut planned = plan_native_iceberg_read(
-        connectors,
+        controls,
         context.clone(),
         table,
         super::scan_model::IcebergDataFileBinding::ExplicitFiles,
@@ -1893,7 +1869,8 @@ pub(crate) fn plan_native_iceberg_delta_read(
 }
 
 pub(crate) struct PlannedIcebergConnectorRead {
-    pub(crate) declaration: ConnectorInstanceDeclaration,
+    pub(crate) declaration: ConnectorExecutionDeclaration,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     pub(crate) scan: ConnectorScan,
     pub(crate) splits: Vec<ConnectorSplit>,
     pub(crate) batch: novarocks_spi::connector::ConnectorBatchBudget,

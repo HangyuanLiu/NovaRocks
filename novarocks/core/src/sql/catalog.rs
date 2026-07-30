@@ -52,9 +52,9 @@ pub(crate) fn build_internal_catalog(
 
 pub(crate) fn build_iceberg_catalog(
     name: &str,
-    connectors: ConnectorRegistry,
+    controls: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
 ) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
-    Arc::new(iceberg::IcebergCatalog::new(name, connectors))
+    Arc::new(iceberg::IcebergCatalog::new(name, controls))
 }
 
 pub(crate) fn new_standalone_catalog_service() -> StandaloneCatalogService {

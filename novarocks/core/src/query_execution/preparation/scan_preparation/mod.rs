@@ -38,6 +38,7 @@ use projection::{resolve_effective_required_reads, resolve_physical_columns};
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
     connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<ScanExecutionBindings, String> {
@@ -48,6 +49,7 @@ pub(super) fn prepare_scan_bindings(
             fragment.fragment_id,
             &fragment.root,
             connectors,
+            controls,
             context,
             resolver,
             &mut seen_scan_node_ids,
@@ -61,6 +63,7 @@ fn collect_scan_bindings(
     fragment_id: FragmentId,
     node: &DistributedNode,
     connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
@@ -75,6 +78,7 @@ fn collect_scan_bindings(
             node.node_id,
             scan,
             connectors,
+            controls,
             context,
             resolver,
             bindings,
@@ -86,6 +90,7 @@ fn collect_scan_bindings(
                 fragment_id,
                 child,
                 connectors,
+                controls,
                 context,
                 resolver,
                 seen_scan_node_ids,
@@ -101,6 +106,7 @@ fn prepare_scan_node(
     node_id: i32,
     scan: &PlanScanNode,
     connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
     bindings: &mut ScanExecutionBindings,
@@ -168,9 +174,8 @@ fn prepare_scan_node(
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required, connector_read) = match &execution {
         ResolvedScanExecution::IcebergFiles(_) => {
-            let planned =
-                plan_iceberg_connector_read(connectors, context.clone(), scan, &execution)
-                    .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
+            let planned = plan_iceberg_connector_read(controls, context.clone(), scan, &execution)
+                .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             // The provider reader projects physical equality keys internally
             // and drops them before delivery. Core therefore never owns a
             // hidden Iceberg delete column or file range.
@@ -178,7 +183,7 @@ fn prepare_scan_node(
         }
         ResolvedScanExecution::IcebergDelta(_) => {
             let planned =
-                plan_iceberg_delta_connector_read(connectors, context.clone(), scan, &execution)
+                plan_iceberg_delta_connector_read(controls, context.clone(), scan, &execution)
                     .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             (Vec::new(), Vec::new(), Some(planned))
         }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
@@ -134,12 +134,25 @@ pub trait ConnectorControlResolver: Send + Sync {
     ) -> Result<ConnectorControlPlanningLease, ConnectorError>;
 }
 
+/// Lifecycle port owned by the frontend composition root. Core may register
+/// or retire a logical control generation, but it never owns the registry.
+pub trait ConnectorControlRegistry: ConnectorControlResolver {
+    fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError>;
+
+    fn retire_current(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError>;
+}
+
 /// Keeps one control generation live from metadata/planning until the caller
 /// completes the execution-binding barrier. The opaque release action is
 /// frontend-owned and is never part of a wire contract.
+#[derive(Clone)]
 pub struct ConnectorControlPlanningLease {
     binding: Arc<ConnectorControlBinding>,
-    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+    _release: Arc<PlanningLeaseRelease>,
+}
+
+struct PlanningLeaseRelease {
+    release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
 impl ConnectorControlPlanningLease {
@@ -149,7 +162,9 @@ impl ConnectorControlPlanningLease {
     ) -> Self {
         Self {
             binding,
-            release: Some(Box::new(release)),
+            _release: Arc::new(PlanningLeaseRelease {
+                release: Mutex::new(Some(Box::new(release))),
+            }),
         }
     }
 
@@ -158,9 +173,12 @@ impl ConnectorControlPlanningLease {
     }
 }
 
-impl Drop for ConnectorControlPlanningLease {
+impl Drop for PlanningLeaseRelease {
     fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
+        let Ok(mut release) = self.release.lock() else {
+            return;
+        };
+        if let Some(release) = release.take() {
             release();
         }
     }

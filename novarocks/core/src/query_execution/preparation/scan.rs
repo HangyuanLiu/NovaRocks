@@ -18,7 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorExecutionDeclaration, ConnectorScan, ConnectorSplit,
+    ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorExecutionDeclaration,
+    ConnectorScan, ConnectorSplit,
 };
 
 use crate::connector::iceberg::scan_model::{
@@ -69,6 +70,9 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) scan: ConnectorScan,
     pub(crate) splits: Vec<ConnectorSplit>,
     pub(crate) batch: ConnectorBatchBudget,
+    /// Keeps the exact FE control generation alive through the BE ensure
+    /// barrier. It is never encoded into a fragment carrier.
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
